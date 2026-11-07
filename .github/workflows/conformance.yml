@@ -307,6 +307,14 @@ jobs:
     # GitHub's six hours.
     timeout-minutes: 355
     env:
+      # No debug information, as the Linux and macOS jobs above and the landing workflow's Windows
+      # jobs have it: nothing here reads it, and the report builds every suite's test programs in
+      # turn into one directory, with no build cache, on the drive the workspace is on. With debug
+      # information that directory filled the drive in the last two steps of the run of 5 November
+      # ("There is not enough space on the disk", then the linker's "limit exceeded for program
+      # database"), and both steps failed with "the step's tests did not build".
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
       # The plugin runtime's tests run real components, which the steps below build; a component
       # that is not there is a failure here rather than a skip.
@@ -318,6 +326,19 @@ jobs:
       - name: Check out
         timeout-minutes: 5
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # The drives as the job starts and, in the step after the report, as it ends. The hosted
+      # Windows runner's figures for the workspace drive are not documented, and the run that filled
+      # it printed none: this is how much room the build starts with and how much the job takes.
+      # The free space at the end is the most the drive's lowest point can have been, since the
+      # build writes object files before it archives them and a failed build removes what it wrote.
+      - name: What the drives hold
+        timeout-minutes: 2
+        continue-on-error: true
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Where-Object { $null -ne $_.Free } | ForEach-Object {
+            '{0}: {1:N1} GiB used, {2:N1} GiB free of {3:N1} GiB' -f $_.Name, ($_.Used / 1GB), ($_.Free / 1GB), (($_.Used + $_.Free) / 1GB)
+          }
 
       - name: Install the pinned toolchain
         timeout-minutes: 5
@@ -379,13 +400,14 @@ jobs:
       # suites. It took 102 to 143 minutes with 76 to 81 steps (16 to 25 October). With 87, 89 and
       # 91 steps it ran into its limit of 150 minutes on the next three nights, each time in the
       # build of the host-events suite, the last step but one, which started 141 to 142 minutes in.
-      # A run with 91 steps and the limit below took 185 minutes (29 October). The limit is what
-      # this job's limit leaves once the other steps have theirs, less 3 minutes for the set-up and
-      # clean-up that no step limit counts: the limits of the job's steps add up to 352 of its 355
-      # minutes. That is 1.5 times the longest full run; twice it, 370 minutes, does not fit in a job.
+      # A run with 91 steps took 185 minutes (29 October) and one with 92 took 191 (3 November). The
+      # limit is what this job's limit leaves once the other steps have theirs, less 3 minutes for
+      # the set-up and clean-up that no step limit counts: the limits of the job's steps add up to
+      # 352 of its 355 minutes. That is about 1.5 times the longest full run; twice it, 382
+      # minutes, does not fit in a job.
       - name: The conformance report
         if: ${{ !cancelled() }}
-        timeout-minutes: 285
+        timeout-minutes: 281
         env:
           REPORT_GROUPS: ${{ inputs.groups }}
         run: |
@@ -397,6 +419,17 @@ jobs:
             $arguments += $name
           }
           cargo run --locked -p kr-conformance --bin kr-conformance -- run --root $PWD.Path --evidence $env:KR_TEST_ARTIFACTS_DIR @arguments
+
+      # The drives as the report left them; the change in used space since the first reading is what
+      # the job took.
+      - name: What the drives hold at the end
+        if: ${{ !cancelled() }}
+        timeout-minutes: 2
+        continue-on-error: true
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Where-Object { $null -ne $_.Free } | ForEach-Object {
+            '{0}: {1:N1} GiB used, {2:N1} GiB free of {3:N1} GiB' -f $_.Name, ($_.Used / 1GB), ($_.Free / 1GB), (($_.Used + $_.Free) / 1GB)
+          }
 
       - name: Keep the result and the evidence
         if: ${{ !cancelled() }}

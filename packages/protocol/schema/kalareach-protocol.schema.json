@@ -9659,6 +9659,10 @@
           "description": "Named profiles, each a set of the same preferences.",
           "type": "object"
         },
+        "push": {
+          "$ref": "#/$defs/PushSelection",
+          "description": "The push gateways, besides the official one, that a paired device's sender credential\nmay name.\n\nA section of level 7: written when its `gateways` member is not null, and ignored, with\na count, by a release that reads level 6. A release that does not know it registers a\ncredential from the official gateway only, so a device whose app uses another gateway\nwaits for the host to be brought forward; it keeps using a credential it already holds.\nRead whenever the document is put into force, so a gateway taken out of the list loses\nits credentials at once: they are no longer used or renewed, and the host asks the\ngateway to revoke each. No profile, request or environment variable can set it."
+        },
         "relay": {
           "$ref": "#/$defs/RelaySelection",
           "description": "The relay lease service this host asks for a lease for each paired device, and the\naccount that pays for them.\n\nA section of level 4: written only when it selects something, and ignored, with a\ncount, by a release that reads level 3. Read when the daemon starts, so a change\napplies at the next start. No environment variable reaches it."
@@ -31545,6 +31549,28 @@
           "type": "string"
         }
       ]
+    },
+    "PushSelection": {
+      "additionalProperties": false,
+      "description": "The push gateways a paired device's sender credential may name, besides the official one.\n\nAn independently signed app registers with its own gateway, so the credential its\ninstallation was issued names that gateway's origin, and the host sends every notification,\nstatus question and renewal under it to that origin. The host therefore delivers through\nthe official gateway and through the origins listed here, and through no other: a device\ncannot make the host post to an address of the device's choosing. The official gateway is\nalways allowed and is never listed.\n\nTaking a gateway out of the list retires the credentials the host holds for it. The host\nstops using and renewing them at once, forgets them, and keeps a debt to ask the gateway to\nrevoke each authorisation, which it asks for again until the gateway has.\n\nThe section arrived with level 7. A release that reads level 6 does not know it: it applies\nthe rest of the document, counts the section among the members it ignores, and does not\nedit the document. Such a release registers a credential from the official gateway only,\nso a host rolled back to one takes no new credential from a listed gateway until it is\nbrought forward again.",
+      "properties": {
+        "gateways": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The origins, each an `https` origin or an `http` origin on a loopback address, spelled\nas a gateway origin is, with no path and no trailing slash. An empty list names no\ngateway besides the official one. Null or absent leaves the section unused."
+        }
+      },
+      "type": "object"
     },
     "PushSenderBinding": {
       "additionalProperties": false,

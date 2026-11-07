@@ -34,7 +34,6 @@ use std::sync::Arc;
 
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::envelope::{ControlFrame, MutationRequest, ParamsValue};
-use kr_protocol::error::ErrorCode;
 use kr_protocol::hostinfo::export::{ContentClass, Sentence};
 use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus};
 use kr_protocol::ids::{ActionId, ActorId, MachineId};
@@ -368,13 +367,13 @@ impl Controller {
                 // An earlier attempt recorded this action between the lookup that found nothing
                 // and this claim, which waited for the step lock. What it produced goes back only
                 // under authority that has not been withdrawn, as it does from that lookup, and
-                // without the deadline a receipt outlives.
+                // without the deadline a receipt outlives. The check is made here, with the answer
+                // in hand and the step lock held: a fence that lands while this attempt waited for
+                // the lock, or while it holds it, stops the answer.
                 *copied = true;
-                self.check_registration(&crate::authority::AdmittedMutation {
-                    deadline: None,
-                    ..carried
-                })?;
-                return recorded_answer(record);
+                return self
+                    .retained_under_authority(&carried, async { recorded_answer(record) })
+                    .await;
             }
         };
         #[cfg(feature = "testing")]
@@ -799,6 +798,14 @@ impl Controller {
         self.machine.after_the_claim_is_read.arm()
     }
 
+    /// Whether a machine group step holds the lock that serialises steps now. For this host's own
+    /// tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn a_machine_step_holds_the_step_lock(&self) -> bool {
+        self.machine.steps.try_lock().is_err()
+    }
+
     /// Ends the next machine group step after its write and before its receipt, as a daemon that
     /// stopped there would. For this host's own tests.
     #[cfg(feature = "testing")]
@@ -970,10 +977,7 @@ fn recorded_answer(record: crate::grants::ActionRecord) -> Result<ParamsValue> {
         crate::grants::ActionRecord::Refused { code, detail } => {
             Err(ControllerError::Refused { code, detail })
         }
-        crate::grants::ActionRecord::InFlight => Err(ControllerError::Refused {
-            code: ErrorCode::ResourceUnavailable,
-            detail: "another attempt under this action identifier has not finished".to_owned(),
-        }),
+        crate::grants::ActionRecord::InFlight => Err(ControllerError::attempt_still_running()),
         crate::grants::ActionRecord::Unfinished => Err(unfinished_and_unknown()),
     }
 }
@@ -1029,6 +1033,8 @@ fn unfinished_and_unknown() -> ControllerError {
 
 #[cfg(test)]
 mod tests {
+    use kr_protocol::error::ErrorCode;
+
     use super::*;
 
     /// A receipt that cannot be read back does not refuse the step it was kept for: the step was

@@ -99,6 +99,102 @@ fn the_reader_reports_itself_idle_only_once_its_editor_has_the_cursors_reply() {
     shellpkg::a_reader_reports_itself_idle_only_once_its_editor_has_the_cursors_reply(PWSH);
 }
 
+/// KR-REQ-08.48, KR-REQ-08.49: the editor does not start its read until the worker has answered
+/// the entry of the read, so the worker's hold on its answers is in place before the editor asks
+/// where the cursor is.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn the_editor_does_not_start_its_read_until_the_worker_has_answered_its_entry() {
+    shellpkg::the_editor_does_not_start_its_read_until_the_worker_has_answered_its_entry(PWSH);
+}
+
+/// KR-REQ-08.48, KR-REQ-08.49: the host's answers that are in the terminal's input when a read
+/// begins are taken out of it before the editor asks where the cursor is.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn host_answers_in_the_terminal_when_a_read_begins_are_taken_out_before_the_editor_asks() {
+    shellpkg::host_answers_in_the_terminal_when_a_read_begins_are_taken_out_before_the_editor_asks(
+        PWSH,
+    );
+}
+
+/// KR-REQ-08.48: the keys a person typed ahead of a read reach the editor whole and in order, with
+/// the host's answers among them taken out.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn keys_typed_ahead_of_a_read_reach_the_editor_whole_and_in_order_among_the_hosts_answers() {
+    shellpkg::keys_typed_ahead_of_a_read_reach_the_editor_whole_and_in_order_among_the_hosts_answers(
+        PWSH,
+    );
+}
+
+/// KR-REQ-08.48: a chord the person bound on an Escape runs when its keys were typed ahead of a read.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_chord_the_person_bound_on_an_escape_runs_when_it_was_typed_ahead_of_a_read() {
+    shellpkg::a_chord_the_person_bound_on_an_escape_runs_when_it_was_typed_ahead_of_a_read(PWSH);
+}
+
+/// KR-REQ-08.48: a chord the person bound behind another key runs when its keys were typed ahead of a read.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_chord_the_person_bound_behind_another_key_runs_when_it_was_typed_ahead_of_a_read() {
+    shellpkg::a_chord_the_person_bound_behind_another_key_runs_when_it_was_typed_ahead_of_a_read(
+        PWSH,
+    );
+}
+
+/// KR-REQ-08.48: a chord the person binds after the first prompt runs when it was typed ahead of a read.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_chord_the_person_binds_after_the_first_prompt_runs_when_it_was_typed_ahead_of_a_read() {
+    shellpkg::a_chord_the_person_binds_after_the_first_prompt_runs_when_it_was_typed_ahead_of_a_read(
+        PWSH,
+    );
+}
+
+/// KR-REQ-08.48: an Escape the person binds alone after the first prompt leaves the keys behind it theirs.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn an_escape_the_person_binds_after_the_first_prompt_leaves_the_keys_behind_it_theirs() {
+    shellpkg::an_escape_the_person_binds_after_the_first_prompt_leaves_the_keys_behind_it_theirs(
+        PWSH,
+    );
+}
+
+/// KR-REQ-08.48: the keys typed while the module asks the terminal for its settings are the person's own.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn keys_typed_while_the_module_asks_the_terminal_for_its_settings_are_the_persons_own() {
+    shellpkg::keys_typed_while_the_module_asks_the_terminal_for_its_settings_are_the_persons_own(
+        PWSH,
+    );
+}
+
+/// KR-REQ-07.73: a program of the current directory is not run for an empty entry of the path.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_program_of_the_current_directory_is_not_run_for_an_empty_entry_of_the_path() {
+    shellpkg::a_program_of_the_current_directory_is_not_run_for_an_empty_entry_of_the_path(PWSH);
+}
+
+/// KR-REQ-08.48: in the Windows edit mode the keys typed ahead of a read are the person's own.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn keys_typed_ahead_of_a_read_in_the_windows_edit_mode_are_the_persons_own() {
+    shellpkg::keys_typed_ahead_of_a_read_in_the_windows_edit_mode_are_the_persons_own(PWSH);
+}
+
+/// KR-REQ-08.49: a read that the module queues no key for reports itself idle only once its editor
+/// has the cursor's reply.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_read_with_no_key_of_the_modules_own_reports_idle_only_once_its_editor_has_the_cursors_reply() {
+    shellpkg::a_read_with_no_key_of_the_modules_own_reports_idle_only_once_its_editor_has_the_cursors_reply(
+        PWSH,
+    );
+}
+
 /// KR-REQ-07.40: the module holds no secret bytes once the handshake is accepted.
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
@@ -118,6 +214,28 @@ fn the_decoded_secret_is_one_byte_array_that_is_cleared() {
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
 fn an_error_in_the_handshake_leaves_the_bridge_unregistered() {
     shellpkg::an_error_in_the_powershell_handshake_leaves_the_bridge_unregistered();
+}
+
+/// KR-REQ-07.37: a hello the worker refuses is reported to the person, with the reason the worker
+/// gave.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_hello_the_worker_refuses_is_reported_to_the_person() {
+    shellpkg::a_hello_the_worker_refuses_is_reported_to_the_person();
+}
+
+/// KR-REQ-08.48: the keys of an answer the module was reading when its read failed reach the editor.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn the_keys_of_an_answer_the_drain_was_reading_when_it_failed_reach_the_editor() {
+    shellpkg::the_keys_of_an_answer_the_drain_was_reading_when_it_failed_reach_the_editor(PWSH);
+}
+
+/// KR-REQ-08.48: an answer behind one that was cut short is taken out before the editor starts.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn an_answer_behind_one_that_was_cut_short_is_taken_out_before_the_editor_starts() {
+    shellpkg::an_answer_behind_one_that_was_cut_short_is_taken_out_before_the_editor_starts(PWSH);
 }
 
 /// KR-REQ-07.37, KR-REQ-07.85
@@ -722,6 +840,96 @@ try {
     Remove-Item -Recurse -Force $directory
 }
 "#;
+
+/// What the module makes of a refusal that is on the endpoint together with the end of the
+/// connection, as the worker leaves them: it writes the refusal and drops the connection. Both are
+/// there before the module first looks, so the probe does not depend on how the two arrive.
+const REFUSAL_PROBE: &str = r#"
+$ErrorActionPreference = 'Stop'
+Import-Module $env:KR_PROBE_MODULE
+$module = Get-Module KalaReach.ShellBridge
+
+$directory = Join-Path ([System.IO.Path]::GetTempPath()) ("kr-refused-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $directory | Out-Null
+$endpoint = [System.Net.Sockets.UnixDomainSocketEndPoint]::new((Join-Path $directory 's'))
+$listener = [System.Net.Sockets.Socket]::new('Unix', 'Stream', 'Unspecified')
+$listener.Bind($endpoint)
+$listener.Listen(1)
+$client = [System.Net.Sockets.Socket]::new('Unix', 'Stream', 'Unspecified')
+$client.Connect($endpoint)
+$peer = $listener.Accept()
+$client.Blocking = $false
+try {
+    $body = & $module {
+        ConvertTo-KrCbor @{
+            handshake = @{
+                refused = @{
+                    reason = 'process_mismatch'
+                    error  = @{ code = 'PERMISSION_DENIED'; message = 'the connecting process is not the root shell this session started' }
+                }
+            }
+        }
+    }
+    $framed = [byte[]]::new($body.Length + 4)
+    $framed[2] = [byte](($body.Length -shr 8) -band 0xFF)
+    $framed[3] = [byte]($body.Length -band 0xFF)
+    [Array]::Copy($body, 0, $framed, 4, $body.Length)
+    $null = $peer.Send($framed)
+    $peer.Shutdown([System.Net.Sockets.SocketShutdown]::Both)
+    $peer.Dispose()
+    $answer = & $module {
+        param($client)
+        $script:Kr.Socket = $client
+        $script:Kr.Incoming.Clear()
+        $verdict = @(Wait-KrHandshake)[-1]
+        "$verdict"
+    } $client
+    Write-Output "kr-refusal[verdict]=[$answer]"
+} finally {
+    $client.Dispose()
+    $listener.Dispose()
+    Remove-Item -Recurse -Force $directory
+}
+"#;
+
+/// A refusal the worker writes with the end of its connection is read before the end, and the
+/// person is told why the hello was refused.
+///
+/// The probe is [`REFUSAL_PROBE`]. A module that reads the end of the connection in the same look
+/// as the refusal discards the refusal with the connection, and the shell starts without its
+/// integration and without a word.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_refusal_the_worker_writes_with_the_end_of_its_connection_is_read_before_the_end() {
+    let package = shellpkg::Package::built(PWSH);
+    let module = package
+        .directory()
+        .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1");
+    let scratch = tempfile::tempdir().expect("a directory on the internal disk");
+    let probe = scratch.path().join("refusal-probe.ps1");
+    std::fs::write(&probe, REFUSAL_PROBE).expect("the probe is written");
+    let asked = package
+        .command()
+        .args(["-NoProfile", "-NonInteractive", "-File"])
+        .arg(&probe)
+        .env("KR_PROBE_MODULE", &module)
+        .env_remove("KR_SHELL_BRIDGE")
+        .env_remove("KR_SHELL_BRIDGE_SECRET")
+        .env_remove("KR_SESSION")
+        .env_remove("KR_SHELL_BRIDGE_HANDSHAKE_WAIT_MS")
+        .output()
+        .expect("the package's host runs");
+    let said = String::from_utf8_lossy(&asked.stdout).into_owned();
+    let told = String::from_utf8_lossy(&asked.stderr).into_owned();
+    assert!(
+        said.contains("kr-refusal[verdict]=[False]"),
+        "the handshake wait did not end as refused:\n{said}\n{told}"
+    );
+    assert!(
+        told.contains("process_mismatch"),
+        "the person was not told why the hello was refused:\n{said}\n{told}"
+    );
+}
 
 /// The module measures its handshake wait and its send deadline on a clock that only goes forward,
 /// so setting the time of day neither shortens nor lengthens either.
@@ -1350,6 +1558,55 @@ fn a_publish_refused_for_its_host_leaves_nothing_in_the_prefix() {
         0,
         "a refused publish left something in the prefix"
     );
+}
+
+/// KR-REQ-07.34, KR-REQ-07.35: the start of its own process that the module names in the hello is
+/// the microsecond the kernel recorded, whichever side of it the runtime's time falls on.
+///
+/// The worker compares the start the hello names with the one it reads from the kernel for the
+/// connecting process, and refuses a shell that differs by one unit as a different process. The
+/// runtime derives its time for a process from the kernel's by arithmetic that leaves it a few
+/// hundred nanoseconds above or below the kernel's value, so the module takes the nearest
+/// microsecond. These are the runtime's times for four shells and the starts the kernel recorded
+/// for them, taken from running shells on macOS: one a little above its microsecond, two a little
+/// below it, and one exact. The module truncated, and named the second and third one microsecond
+/// too early.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_start_time_the_module_names_is_the_nearest_microsecond_of_the_runtimes() {
+    const TIMES: [(u64, u64); 4] = [
+        (17_939_325_722_104_412, 1_793_932_572_210_441),
+        (17_939_325_736_990_098, 1_793_932_573_699_010),
+        (17_939_325_738_553_938, 1_793_932_573_855_394),
+        (17_939_325_725_070_580, 1_793_932_572_507_058),
+    ];
+    let package = shellpkg::Package::built(PWSH);
+    let module = package
+        .directory()
+        .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1")
+        .display()
+        .to_string();
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; Import-Module '{module}'; \
+         $module = Get-Module KalaReach.ShellBridge; \
+         foreach ($ticks in {ticks}) {{ \
+             $start = & $module {{ param($ticks) ConvertTo-KrStartMicroseconds $ticks }} $ticks; \
+             Write-Output \"kr-start[$ticks]=[$start]\" \
+         }}",
+        ticks = TIMES.map(|(ticks, _)| ticks.to_string()).join(", ")
+    );
+    let asked = package.ask(&script);
+    let said = String::from_utf8_lossy(&asked.stdout).into_owned();
+    for (ticks, kernel) in TIMES {
+        assert_eq!(
+            said.lines()
+                .find_map(|line| line.strip_prefix(&format!("kr-start[{ticks}]=[")))
+                .and_then(|rest| rest.strip_suffix(']')),
+            Some(kernel.to_string().as_str()),
+            "the runtime's time {ticks} is not the kernel's microsecond {kernel}:\n{said}\n{}",
+            String::from_utf8_lossy(&asked.stderr)
+        );
+    }
 }
 
 /// KR-REQ-07.73: the module binds only a chord the editor stores under the spelling it was given,

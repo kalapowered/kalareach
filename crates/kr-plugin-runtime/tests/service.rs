@@ -9,6 +9,7 @@ mod components;
 
 use std::sync::Arc;
 
+use kr_plugin_runtime::runtime::binding::BindingRequest;
 use kr_plugin_runtime::service::host::{HostConfig, MAX_PENDING_UNBINDS, PluginHost};
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_service::client::{PluginClient, new_binding_id};
@@ -25,6 +26,13 @@ use kr_plugin_service::vocabulary::Admission;
 /// registration comes to, and this ends only a registration that never does. The client waits
 /// a little longer than the host, as it does by default, so the answer is the host's own.
 const REGISTRATION_PATIENCE: core::time::Duration = core::time::Duration::from_secs(60 * 60);
+
+/// How long a case waits for something it has made happen: a host's answer, a notice, the blocking
+/// pool's one thread to be held, a pass to stand at its stop, work to run on the pool once it is let
+/// go. None of them is decided by it, because each of them comes when the code under test does what
+/// the case waits for, however long a loaded machine takes. It ends only a wait for something that
+/// never comes, so that a run does not hang for ever.
+const HANG_GUARD: core::time::Duration = core::time::Duration::from_secs(60 * 60);
 
 /// A plugin host serving in this process, with a client connected to it.
 struct Served {
@@ -91,31 +99,19 @@ impl Served {
             Some(deadline) => host.unbinding_within(deadline),
             None => host,
         });
-        let endpoint_for_wait =
-            kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint).expect("an endpoint");
+        // The endpoint is bound here, before the host serves on it, so a client that connects at
+        // once is queued by the socket until the host accepts it: nothing waits for the host to
+        // have bound its endpoint, and no delay stands in for it.
+        let listener = kr_ipc::endpoint::Listener::bind(
+            &kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint).expect("an endpoint"),
+        )
+        .expect("the endpoint is bound");
         let serving = tokio::spawn({
             let host = Arc::clone(&host);
             async move {
-                let _ = host.serve(core::future::pending::<()>()).await;
+                let _ = host.serve_on(listener, core::future::pending::<()>()).await;
             }
         });
-        // The endpoint is bound inside `serve`, so a client that connects at once may arrive
-        // first. Waited for rather than slept through: a fixed delay is a guess about a machine,
-        // and this machine runs other work.
-        let ready = std::time::Instant::now();
-        loop {
-            if kr_ipc::endpoint::Connection::connect(&endpoint_for_wait)
-                .await
-                .is_ok()
-            {
-                break;
-            }
-            assert!(
-                ready.elapsed() < core::time::Duration::from_secs(10),
-                "the host never bound its endpoint"
-            );
-            tokio::time::sleep(core::time::Duration::from_millis(10)).await;
-        }
         Self {
             _temp: temp,
             packages,
@@ -177,33 +173,36 @@ impl Drop for Served {
 /// Documents arrive as notices and a component draws one whenever it has something to say, so a
 /// test that wanted one export's document had to be able to say which. Anything else that arrives
 /// while it waits is returned to the caller's attention by being asserted on: a fault here would be
-/// a test passing for the wrong reason.
+/// a test passing for the wrong reason. The wait ends when the document comes, or when the
+/// connection does.
 async fn documents_until(
     client: &mut PluginClient,
     binding_id: kr_plugin_service::vocabulary::BindingId,
     call: &str,
 ) -> Option<Vec<kr_plugin_service::protocol::WireNode>> {
-    let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        match tokio::time::timeout(core::time::Duration::from_millis(200), client.notice()).await {
-            Ok(Some(Notice::Document {
-                binding_id: bound,
-                call: drew,
-                nodes,
-                ..
-            })) => {
-                assert_eq!(bound, binding_id.get());
-                if drew == call {
-                    return Some(nodes);
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            match client.notice().await? {
+                Notice::Document {
+                    binding_id: bound,
+                    call: drew,
+                    nodes,
+                    ..
+                } => {
+                    assert_eq!(bound, binding_id.get());
+                    if drew == call {
+                        return Some(nodes);
+                    }
                 }
+                other @ (Notice::Fault { .. } | Notice::Disabled { .. }) => {
+                    panic!("the binding produced {other:?}")
+                }
+                Notice::Gap { .. } => {}
             }
-            Ok(Some(other @ (Notice::Fault { .. } | Notice::Disabled { .. }))) => {
-                panic!("the binding produced {other:?}")
-            }
-            Ok(Some(Notice::Gap { .. })) | Ok(None) | Err(_) => {}
         }
-    }
-    None
+    })
+    .await
+    .expect("the document the case waits for never came")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -396,15 +395,10 @@ async fn kr_req_06_06_a_worker_registers_delivers_and_calls_over_the_protocol() 
     assert!(again.cached, "the second registration recompiled");
 }
 
-/// How long the case below lets the host take to answer an unbind that nothing can run. The case
-/// waits for the answer for as long as it takes, so this is only the figure the host is told to be
+/// How long the cases below let the host take to answer an unbind that nothing can run. The cases
+/// wait for the answer for as long as it takes, so this is only the figure the host is told to be
 /// ready by.
 const HELD_UNBIND_DEADLINE: core::time::Duration = core::time::Duration::from_millis(1);
-
-/// How long the case below waits for the blocking pool's one thread to be held, for the host's
-/// answer, and for work to run on the pool's thread once it is let go. None of them is decided by
-/// it: it ends only a wait for something that never comes.
-const POOL_THREAD: core::time::Duration = core::time::Duration::from_secs(60 * 60);
 
 /// A connection that speaks the protocol's frames itself, with no client between it and the host,
 /// so that what it waits for is the host's answer and nothing shorter.
@@ -412,6 +406,8 @@ struct Raw {
     reader: kr_ipc::framed::FrameReader,
     writer: kr_ipc::framed::FrameWriter,
     next: u64,
+    /// Answers that came while the connection waited for another.
+    answers: std::collections::HashMap<u64, ResponseBody>,
 }
 
 impl Raw {
@@ -427,29 +423,43 @@ impl Raw {
             reader,
             writer,
             next: 0,
+            answers: std::collections::HashMap::new(),
         }
     }
 
-    /// Asks the host something and returns its answer, whatever notices come first.
-    async fn ask(&mut self, body: RequestBody) -> ResponseBody {
+    /// Asks the host something without waiting for the answer, and returns what to wait for.
+    async fn send(&mut self, body: RequestBody) -> u64 {
         self.next += 1;
         let request_id = self.next;
         self.writer
             .write_message(&kr_plugin_service::protocol::Request { request_id, body })
             .await
             .expect("the request is written");
-        loop {
+        request_id
+    }
+
+    /// Waits for the answers to the requests named, whatever notices come first.
+    async fn collect(&mut self, requests: &[u64]) -> Vec<ResponseBody> {
+        while !requests.iter().all(|id| self.answers.contains_key(id)) {
             let frame: Frame = self
                 .reader
                 .read_message_without_schema()
                 .await
                 .expect("the host answers");
-            if let Frame::Response { reply_to, body } = frame
-                && reply_to == request_id
-            {
-                return body;
+            if let Frame::Response { reply_to, body } = frame {
+                self.answers.insert(reply_to, body);
             }
         }
+        requests
+            .iter()
+            .map(|id| self.answers.remove(id).expect("the answer is there"))
+            .collect()
+    }
+
+    /// Asks the host something and returns its answer, whatever notices come first.
+    async fn ask(&mut self, body: RequestBody) -> ResponseBody {
+        let request_id = self.send(body).await;
+        self.collect(&[request_id]).await.pop().expect("one answer")
     }
 
     async fn health(&mut self) -> kr_plugin_service::protocol::HostHealth {
@@ -458,128 +468,902 @@ impl Raw {
             other => panic!("the host answered a health request with {other:?}"),
         }
     }
+
+    /// Asks the host for its health until `reached` holds of it. See [`health_until`].
+    async fn health_until(
+        &mut self,
+        reached: impl Fn(&kr_plugin_service::protocol::HostHealth) -> bool,
+    ) -> kr_plugin_service::protocol::HostHealth {
+        tokio::time::timeout(HANG_GUARD, async {
+            loop {
+                let health = self.health().await;
+                if reached(&health) {
+                    return health;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the host never reached the state the case waits for")
+    }
+
+    /// Registers a binding with the component at `component`, and returns the host's answer.
+    async fn register(
+        &mut self,
+        request: &BindingRequest,
+        component: &ComponentSource,
+    ) -> ResponseBody {
+        self.ask(RequestBody::RegisterBinding(Box::new(
+            kr_plugin_service::protocol::BindingRegistration {
+                binding_id: request.binding_id.get(),
+                identity: request.identity.clone(),
+                facts: kr_plugin_service::vocabulary::wire_facts(&request.facts),
+                executable: request.executable.clone(),
+                component: component.clone(),
+            },
+        )))
+        .await
+    }
+
+    /// Asks the host to remove a binding, without waiting for the answer.
+    async fn send_unbind(&mut self, request: &BindingRequest) -> u64 {
+        self.send(RequestBody::Unbind {
+            binding_id: request.binding_id.get(),
+        })
+        .await
+    }
+
+    /// Asks the host to remove a binding and waits for its answer for as long as it takes.
+    async fn unbind(&mut self, request: &BindingRequest) -> ResponseBody {
+        let asked = self.send_unbind(request).await;
+        tokio::time::timeout(HANG_GUARD, self.collect(&[asked]))
+            .await
+            .expect("the host answered the unbind, and did not wait for the pool")
+            .pop()
+            .expect("one answer")
+    }
 }
 
-// An unbind waits for the binding's thread, on the blocking pool. A pool that other work keeps busy
-// leaves it waiting for a thread of its own, and the request is answered at the host's deadline
-// all the same, with its place among the connection's calls given up. The unbind is not taken back:
-// it runs when the pool has a thread, removes the binding and gives the connection its place back.
-// A connection can leave only so many of them behind, and is refused the next one.
-//
-// The pool has one thread, which the case holds once the binding is registered. A task spawned
-// after the unbind runs after it on that thread, so by the time it has run the unbind has too.
-// Nothing in the case is decided by how long anything takes: it waits for the host's answer.
-#[test]
-fn an_unbind_a_busy_blocking_pool_holds_up_is_refused_in_time_and_runs_when_the_pool_has_a_thread()
-{
-    let Some(wasm) = components::well_behaved() else {
-        return;
-    };
-    let executor = tokio::runtime::Builder::new_multi_thread()
+/// An executor whose blocking pool has one thread, so that a case can hold it.
+fn executor_with_one_blocking_thread() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .max_blocking_threads(1)
         .enable_all()
         .build()
-        .expect("an executor with one blocking thread");
-    executor.block_on(async {
-        let served = Served::start_unbinding_within(HELD_UNBIND_DEADLINE).await;
-        let mut host = Raw::connect(&served).await;
-        let (path, digest, bytes) = served.install("well-behaved", &wasm);
-        let request = components::request("well-behaved", 1);
-        let registered = host
-            .ask(RequestBody::RegisterBinding(Box::new(
-                kr_plugin_service::protocol::BindingRegistration {
-                    binding_id: request.binding_id.get(),
-                    identity: request.identity.clone(),
-                    facts: kr_plugin_service::vocabulary::wire_facts(&request.facts),
-                    executable: request.executable.clone(),
-                    component: ComponentSource {
-                        path,
-                        digest,
-                        bytes,
-                    },
-                },
-            )))
-            .await;
-        assert!(
-            matches!(registered, ResponseBody::Registered { .. }),
-            "the binding was answered with {registered:?}"
-        );
-        let health = host.health().await;
-        assert_eq!((health.live_bindings, health.connection_bindings), (1, 1));
+        .expect("an executor with one blocking thread")
+}
 
-        // The pool's only thread is held by work that ends when the case drops `release`.
+/// The blocking pool's only thread, held by work that ends when the hold is let go.
+struct HeldPool {
+    release: std::sync::mpsc::Sender<()>,
+    blocker: tokio::task::JoinHandle<()>,
+}
+
+impl HeldPool {
+    async fn take() -> Self {
         let (running, occupied) = tokio::sync::oneshot::channel::<()>();
         let (release, held) = std::sync::mpsc::channel::<()>();
         let blocker = tokio::task::spawn_blocking(move || {
             let _ = running.send(());
             let _ = held.recv();
         });
-        tokio::time::timeout(POOL_THREAD, occupied)
+        tokio::time::timeout(HANG_GUARD, occupied)
             .await
             .expect("the pool's thread was held")
             .expect("the held work started");
+        Self { release, blocker }
+    }
 
-        let unbind = async |host: &mut Raw| {
-            tokio::time::timeout(
-                POOL_THREAD,
-                host.ask(RequestBody::Unbind {
-                    binding_id: request.binding_id.get(),
-                }),
-            )
-            .await
-            .expect("the host answered the unbind, and did not wait for the pool")
+    /// Gives the pool its thread back, and returns once work spawned after the release has run on
+    /// it, which is after every task that was queued before.
+    async fn let_go(self) {
+        drop(self.release);
+        self.blocker.await.expect("the held work ended");
+        quiet_pool().await;
+    }
+}
+
+/// Returns once work spawned now has run on the blocking pool's thread, which is after every task
+/// that was queued before it.
+async fn quiet_pool() {
+    tokio::time::timeout(HANG_GUARD, tokio::task::spawn_blocking(|| ()))
+        .await
+        .expect("work ran on the pool's thread")
+        .expect("the work ended");
+}
+
+// An unbind waits for the binding's thread, on the blocking pool. A pool that other work keeps busy
+// leaves it waiting for a thread of its own, and the request is answered at the host's deadline
+// all the same: with a refusal that says the binding was taken out of the runtime without the wait,
+// and with the binding out of the runtime, as a worker takes any answer as the binding gone. The
+// removal is not taken back: it runs when the pool has a thread, and finds nothing to remove.
+//
+// The host can have only so many of those removals waiting, whichever connections asked for them: a
+// worker that ends its connection and opens another finds the removals it left still counted. An
+// unbind that finds no place in the time it has queues nothing. It takes its binding out of the
+// runtime the same way, and says so.
+//
+// The pool has one thread, which the case holds once the bindings are registered. A task spawned
+// after the unbinds runs after them on that thread, so by the time it has run they have too.
+// Nothing in the case is decided by how long anything takes: it waits for the host's answer, and
+// for the host's account of its bindings to say what the case waits for.
+#[test]
+fn an_unbind_a_busy_blocking_pool_holds_up_is_refused_in_time_and_runs_when_the_pool_has_a_thread()
+{
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let executor = executor_with_one_blocking_thread();
+    executor.block_on(async {
+        let served = Served::start_unbinding_within(HELD_UNBIND_DEADLINE).await;
+        let (path, digest, bytes) = served.install("well-behaved", &wasm);
+        let component = ComponentSource {
+            path,
+            digest,
+            bytes,
         };
-        let answered = unbind(&mut host).await;
+        // The first connection is the worker that leaves its removals behind, one for each place
+        // the host has; the second is another, that has asked for nothing.
+        let mut host = Raw::connect(&served).await;
+        let mut other = Raw::connect(&served).await;
+        let leaving: Vec<BindingRequest> = (1..=MAX_PENDING_UNBINDS as u8)
+            .map(|seed| components::request("well-behaved", seed))
+            .collect();
+        let second = components::request("well-behaved", 100);
+        for request in &leaving {
+            let registered = host.register(request, &component).await;
+            assert!(
+                matches!(registered, ResponseBody::Registered { .. }),
+                "the binding was answered with {registered:?}"
+            );
+        }
+        let registered = other.register(&second, &component).await;
         assert!(
-            matches!(&answered, ResponseBody::Refused { detail, .. }
-                if detail.contains(&format!("{} ms", HELD_UNBIND_DEADLINE.as_millis()))),
-            "the unbind was answered with {answered:?}"
+            matches!(registered, ResponseBody::Registered { .. }),
+            "the binding was answered with {registered:?}"
         );
-        // A caller that stops waiting leaves its removal behind, and a connection may leave only so
-        // many: each of the unbinds up to that number is answered at the deadline, and the one
-        // after them is refused without being queued.
-        for _ in 1..MAX_PENDING_UNBINDS {
-            let answered = unbind(&mut host).await;
+        let health = host.health().await;
+        assert_eq!(
+            (health.live_bindings, health.connection_bindings),
+            (MAX_PENDING_UNBINDS as u64 + 1, MAX_PENDING_UNBINDS as u64)
+        );
+        let pool = HeldPool::take().await;
+
+        // A caller that stops waiting leaves its removal behind, and the host may have only so many
+        // waiting: each of these is answered at the deadline, and each takes one of the places.
+        for request in &leaving {
+            let answered = host.unbind(request).await;
             assert!(
                 matches!(&answered, ResponseBody::Refused { detail, .. }
                     if detail.contains(&format!("{} ms", HELD_UNBIND_DEADLINE.as_millis()))),
                 "the unbind was answered with {answered:?}"
             );
         }
-        let answered = unbind(&mut host).await;
+        // The host answered, and the removals are still to be run: the bindings are not in the
+        // runtime for them, and their places go as their threads end.
+        let health = host
+            .health_until(|health| health.connection_bindings == 0)
+            .await;
+        assert_eq!(health.live_bindings, 1);
+
+        // The worker's connection ends. Its removals are still on the pool, so the other
+        // connection, which has asked for none, finds no place for its unbind. Nothing is queued,
+        // and the binding is not left in the runtime: it is stopped without the wait.
+        drop(host);
+        let answered = other.unbind(&second).await;
         assert!(
             matches!(&answered, ResponseBody::Refused { detail, .. }
                 if detail.contains("unbinds it may have waiting")),
-            "the unbind past the number a connection may leave behind was answered with {answered:?}"
+            "an unbind on another connection, with the host's places held, was answered with {answered:?}"
         );
-        // The host answered, and the removal is still to be run: the binding is there.
-        let health = host.health().await;
-        assert_eq!((health.live_bindings, health.connection_bindings), (1, 1));
-
-        // The pool gets its thread back. The unbind runs on it ahead of this task.
-        drop(release);
-        blocker.await.expect("the held work ended");
-        tokio::time::timeout(POOL_THREAD, tokio::task::spawn_blocking(|| ()))
-            .await
-            .expect("work ran on the pool's thread once it was free")
-            .expect("the work ended");
-        let health = host.health().await;
+        let health = other
+            .health_until(|health| health.connection_bindings == 0)
+            .await;
         assert_eq!(
-            (health.live_bindings, health.connection_bindings),
-            (0, 0),
-            "the unbind the caller stopped waiting for was not carried out"
+            health.live_bindings, 0,
+            "the binding of the unbind that found no place was left in the runtime"
+        );
+
+        // The pool gets its thread back. The removals run on it ahead of the work that tells the
+        // case they have, and find nothing to remove.
+        pool.let_go().await;
+        let health = other.health().await;
+        assert_eq!((health.live_bindings, health.connection_bindings), (0, 0));
+
+        // The binding the host stopped without the wait is one its worker can register again.
+        let registered = other.register(&second, &component).await;
+        assert!(
+            matches!(registered, ResponseBody::Registered { .. }),
+            "the binding was answered with {registered:?}"
         );
         // The removals that ran gave their places back: one more unbind is not refused for want of
         // one. It is answered at the deadline or with what it found, and either is right here.
-        let answered = unbind(&mut host).await;
+        let answered = other.unbind(&second).await;
         assert!(
             !matches!(&answered, ResponseBody::Refused { detail, .. }
                 if detail.contains("unbinds it may have waiting")),
-            "a connection whose removals have all run was refused for the removals it has waiting"
+            "a host whose removals have all run refused an unbind for the removals it has waiting: {answered:?}"
+        );
+        quiet_pool().await;
+        let health = other
+            .health_until(|health| health.connection_bindings == 0)
+            .await;
+        assert_eq!(
+            health.live_bindings, 0,
+            "the unbind that was asked again was not carried out"
         );
     });
-    executor.shutdown_timeout(POOL_THREAD);
+    executor.shutdown_timeout(HANG_GUARD);
+}
+
+// Removals that many connections ask for at once are not refused for want of a place: an unbind
+// that finds every place taken waits for one, in the time the worker gives it, and is carried out
+// as any other is, with its binding's thread waited for.
+//
+// The host here has the time a worker gives an unbind to be an hour, which only ends an answer that
+// never comes. The pool's one thread is held, and two connections have asked, between them, for as
+// many unbinds as the host has places, each of which takes one and waits for the pool (each stays
+// well under the calls a connection may have running). A third connection asks for its own: it
+// finds no place, and waits. Nothing is answered until the pool is let go.
+#[test]
+fn an_unbind_that_finds_every_place_taken_waits_for_one_and_is_carried_out() {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let executor = executor_with_one_blocking_thread();
+    executor.block_on(async {
+        let served = Served::start_unbinding_within(HANG_GUARD).await;
+        let (path, digest, bytes) = served.install("well-behaved", &wasm);
+        let component = ComponentSource {
+            path,
+            digest,
+            bytes,
+        };
+        let mut host = Raw::connect(&served).await;
+        let mut other = Raw::connect(&served).await;
+        let mut third = Raw::connect(&served).await;
+        let first = components::request("well-behaved", 1);
+        let second = components::request("well-behaved", 2);
+        let third_binding = components::request("well-behaved", 3);
+        for (connection, request) in [
+            (&mut host, &first),
+            (&mut other, &second),
+            (&mut third, &third_binding),
+        ] {
+            let registered = connection.register(request, &component).await;
+            assert!(
+                matches!(registered, ResponseBody::Registered { .. }),
+                "the binding was answered with {registered:?}"
+            );
+        }
+        let pool = HeldPool::take().await;
+
+        // Half of the places are taken by each of two connections, so that neither is near the
+        // calls a connection may have running, whatever its last request has not yet given back.
+        let mut taking = Vec::new();
+        for _ in 0..MAX_PENDING_UNBINDS / 2 {
+            taking.push(host.send_unbind(&first).await);
+        }
+        let mut taking_too = Vec::new();
+        for _ in 0..MAX_PENDING_UNBINDS / 2 {
+            taking_too.push(third.send_unbind(&third_binding).await);
+        }
+        tokio::time::timeout(HANG_GUARD, async {
+            while served.host.unbinds_waiting() < MAX_PENDING_UNBINDS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the host took a place for each unbind");
+
+        // The host says when an unbind has found every place taken, which is before it waits for
+        // one and long before the pool is let go.
+        let waiting = other.send_unbind(&second).await;
+        tokio::time::timeout(HANG_GUARD, async {
+            while served.host.unbinds_found_full() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the host found every place taken");
+        let health = other.health().await;
+        assert_eq!(health.live_bindings, 3, "an unbind was carried out at once");
+
+        pool.let_go().await;
+        for (connection, asked) in [(&mut host, &taking), (&mut third, &taking_too)] {
+            for answered in connection.collect(asked).await {
+                assert!(
+                    matches!(answered, ResponseBody::Unbound { .. }),
+                    "an unbind that took a place was answered with {answered:?}"
+                );
+            }
+        }
+        let answered = other.collect(&[waiting]).await.pop().expect("one answer");
+        assert!(
+            matches!(answered, ResponseBody::Unbound { existed: true }),
+            "an unbind that found every place taken was answered with {answered:?}"
+        );
+        let health = other.health().await;
+        assert_eq!(
+            (health.live_bindings, health.connection_bindings),
+            (0, 0),
+            "the unbinds were not all carried out"
+        );
+    });
+    executor.shutdown_timeout(HANG_GUARD);
+}
+
+/// Asks the host for its health until `reached` holds of it, for a case that waits for the host to
+/// have done something that no answer says it has done. The wait ends when the host gets there, and
+/// only a host that never does is held to the hour.
+async fn health_until(
+    client: &PluginClient,
+    reached: impl Fn(&kr_plugin_service::protocol::HostHealth) -> bool,
+) -> kr_plugin_service::protocol::HostHealth {
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            let health = client.health().await.expect("a health report");
+            if reached(&health) {
+                return health;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the host never reached the state the case waits for")
+}
+
+/// Reads notices until the last piece of `document` that `call` drew for `binding_id`, and returns
+/// everything it read, that document included.
+async fn notices_through(
+    client: &PluginClient,
+    binding_id: kr_plugin_service::vocabulary::BindingId,
+    call: &str,
+    document: u64,
+) -> Vec<Notice> {
+    tokio::time::timeout(HANG_GUARD, async {
+        let mut read = Vec::new();
+        loop {
+            let notice = client
+                .notice()
+                .await
+                .expect("the connection ended before the document came");
+            let ends = matches!(
+                &notice,
+                Notice::Document {
+                    binding_id: named,
+                    call: drew,
+                    document: number,
+                    last: true,
+                    ..
+                } if *named == binding_id.get() && drew == call && *number == document
+            );
+            read.push(notice);
+            if ends {
+                return read;
+            }
+        }
+    })
+    .await
+    .expect("the document the case waits for never came")
+}
+
+/// Registers `request` over `component` on `client`.
+async fn register_on(client: &PluginClient, request: &BindingRequest, component: &ComponentSource) {
+    client
+        .register(
+            request.binding_id,
+            &request.identity,
+            &request.facts,
+            &request.executable,
+            component,
+        )
+        .await
+        .expect("the binding registers");
+}
+
+/// Fills the observation queue of a binding whose next pass over it is stopped, until the queue
+/// has overflowed. The binding owes a fresh snapshot then, and sends the gap and the snapshot's
+/// document once the pass is let go, whether or not the binding has been told to stop by then.
+async fn overflow_behind_a_stopped_pass(
+    served: &Served,
+    client: &PluginClient,
+    request: &BindingRequest,
+) -> kr_plugin_runtime::runtime::binding::PumpStop {
+    let mut stop = served
+        .host
+        .runtime()
+        .stop_next_pump(request.binding_id)
+        .expect("the binding is live");
+    let filler = "z".repeat(64 * 1024);
+    let fitting = kr_plugin_sdk::limits::OBSERVATION_QUEUE_BYTES / filler.len() as u64;
+    client
+        .deliver(request.binding_id, &components::scrape("se-0", &filler))
+        .await
+        .expect("the event is offered");
+    assert!(
+        tokio::time::timeout(HANG_GUARD, stop.reached())
+            .await
+            .expect("the binding's pass stands at the stop"),
+        "the stop was replaced before a pass reached it"
+    );
+    for index in 1..=2 * fitting {
+        let admission = client
+            .deliver(
+                request.binding_id,
+                &components::scrape(&format!("se-{index}"), &filler),
+            )
+            .await
+            .expect("the event is offered");
+        if matches!(admission, Admission::QueuedWithGap { .. }) {
+            return stop;
+        }
+    }
+    panic!("the observation queue never overflowed");
+}
+
+/// What a worker is shown after it registered a binding again while the thread of the binding it
+/// had removed was still finishing a pass: the notices up to and including the document of the new
+/// registration's snapshot.
+///
+/// The documents the two registrations drew when they were bound are read first, one of each, so
+/// that what is left is what came after.
+async fn what_the_new_registration_is_shown(
+    client: &PluginClient,
+    request: &BindingRequest,
+) -> Vec<Notice> {
+    // The caller waits far longer than the call takes, so that what the case decides by is what the
+    // call comes to and not how long a machine took to get to it.
+    let called = client
+        .snapshot(request.binding_id, core::time::Duration::from_secs(20))
+        .await
+        .expect("the snapshot runs");
+    let document = called.document.expect("the snapshot drew a document");
+    notices_through(client, request.binding_id, "snapshot", document).await
+}
+
+// A binding that has been removed can still be finishing a pass on its own thread, and the worker
+// can register the same identifier again before that thread is done. What the removed binding's
+// thread produces after that is the removed registration's, and it reaches nobody: not the queue
+// the new registration's notices go through, and not the new registration as a gap, a document or a
+// fault of its own.
+//
+// The removal here waits for the thread. The first registration's pass over its observation queue
+// is stopped, with the queue overflowed behind it, so that the pass owes a gap and a snapshot, and
+// both are sent whether or not the binding was told to stop. The unbind takes the binding out of the
+// runtime and waits for the thread; the identifier is registered again while it waits; the pass is
+// let go. The unbind is answered after the thread has ended and after everything it produced has
+// been passed on or dropped, so the notice the new registration's snapshot draws is behind
+// anything the removed one left in the queue.
+//
+// The unbind stays open for as long as the case takes to get from the removal to the pass it lets
+// go, so the host and the client are both told to wait for it for the hour that only ends an
+// answer that never comes, and the epoch no time advances.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_the_thread_of_a_removed_binding_produces_after_the_identifier_is_registered_again_reaches_nobody()
+ {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let served = Served::start_unbinding_within(HANG_GUARD).await;
+    let client = Arc::new(served.client().await.unbinding_within(HANG_GUARD));
+    let (path, digest, bytes) = served.install("well-behaved", &wasm);
+    let component = ComponentSource {
+        path,
+        digest,
+        bytes,
+    };
+    let request = components::request("well-behaved", 1);
+    register_on(&client, &request, &component).await;
+    let drawn = notices_through(&client, request.binding_id, "bind", 1).await;
+    assert_eq!(drawn.len(), 1, "the registration drew {drawn:?}");
+
+    let stop = overflow_behind_a_stopped_pass(&served, &client, &request).await;
+
+    // The unbind removes the binding from the runtime and waits for its thread, which stands at the
+    // stop; the case sees the identifier let go by the runtime's count.
+    let removing = tokio::spawn({
+        let client = Arc::clone(&client);
+        let binding_id = request.binding_id;
+        async move { client.unbind(binding_id).await }
+    });
+    health_until(&client, |health| health.live_bindings == 0).await;
+    register_on(&client, &request, &component).await;
+    let bound = notices_through(&client, request.binding_id, "bind", 1).await;
+    assert_eq!(bound.len(), 1, "the new registration drew {bound:?}");
+
+    stop.release();
+    let existed = tokio::time::timeout(HANG_GUARD, removing)
+        .await
+        .expect("the unbind was answered")
+        .expect("the unbind task ended")
+        .expect("the unbind ran");
+    assert!(existed, "the removed binding was not there to remove");
+
+    let shown = what_the_new_registration_is_shown(&client, &request).await;
+    assert!(
+        shown.iter().all(|notice| matches!(
+            notice,
+            Notice::Document { call, .. } if call == "snapshot"
+        )),
+        "the new registration was shown what the removed one's thread sent: {shown:?}"
+    );
+    assert_eq!(
+        shown.len(),
+        1,
+        "the new registration was shown more than its own snapshot: {shown:?}"
+    );
+}
+
+// An unbind that the blocking pool cannot run in the time a worker gives it answers with the
+// binding already out of the runtime, whatever it found: the worker takes any answer to an unbind
+// as the binding gone, and a binding left in the runtime until the queued removal ran would be one
+// it could not register again. The removal stays queued, and finds nothing to remove when it runs.
+//
+// The thread of the binding that was taken out without the wait is a thread still, and it holds
+// the connection's place for the binding until it has ended, so the connection never holds more
+// instances than it may. Here the thread stands at a stopped pass with a gap and a snapshot owed;
+// when it is let go it sends both, and neither reaches the worker, which is shown the next
+// registration of the identifier and nothing of the one that was removed.
+#[test]
+fn an_unbind_the_blocking_pool_cannot_run_in_time_takes_the_binding_out_of_the_runtime_and_keeps_its_place_until_the_thread_has_ended()
+ {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let executor = executor_with_one_blocking_thread();
+    executor.block_on(async {
+        let served = Served::start_unbinding_within(HELD_UNBIND_DEADLINE).await;
+        let client = served.client().await;
+        let (path, digest, bytes) = served.install("well-behaved", &wasm);
+        let component = ComponentSource {
+            path,
+            digest,
+            bytes,
+        };
+        let request = components::request("well-behaved", 1);
+        register_on(&client, &request, &component).await;
+        notices_through(&client, request.binding_id, "bind", 1).await;
+        let stop = overflow_behind_a_stopped_pass(&served, &client, &request).await;
+        let pool = HeldPool::take().await;
+
+        let answered = client.unbind(request.binding_id).await;
+        assert!(
+            matches!(&answered, Err(ServiceError::Protocol { detail })
+                if detail.contains(&format!("{} ms", HELD_UNBIND_DEADLINE.as_millis()))),
+            "the unbind was answered with {answered:?}"
+        );
+        let health = client.health().await.expect("a health report");
+        assert_eq!(
+            health.live_bindings, 0,
+            "the binding was left in the runtime for the removal that is queued"
+        );
+        assert_eq!(
+            health.connection_bindings, 1,
+            "the connection gave the binding's place back while its thread stood"
+        );
+
+        // The thread is let go and ends, and the place goes with it.
+        stop.release();
+        health_until(&client, |health| health.connection_bindings == 0).await;
+
+        // The removal the pool ran has nothing left to remove, and the identifier registers again.
+        pool.let_go().await;
+        register_on(&client, &request, &component).await;
+        let bound = notices_through(&client, request.binding_id, "bind", 1).await;
+        assert_eq!(
+            bound.len(),
+            1,
+            "the new registration was shown more than its own bind: {bound:?}"
+        );
+        let shown = what_the_new_registration_is_shown(&client, &request).await;
+        assert_eq!(
+            shown.len(),
+            1,
+            "the new registration was shown more than its own snapshot: {shown:?}"
+        );
+    });
+    executor.shutdown_timeout(HANG_GUARD);
+}
+
+// A connection that ends takes its bindings out of the runtime without a thread of the blocking
+// pool: the host cannot have more removals waiting than it has connections that ended, and a pool
+// that other work keeps busy would hold them, and the bindings in them, for as long.
+//
+// The pool's one thread is held, the worker's connection ends with a binding on it, and the case
+// waits for the runtime to hold none.
+#[test]
+fn a_connection_that_ends_takes_its_bindings_out_without_a_thread_of_the_blocking_pool() {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let executor = executor_with_one_blocking_thread();
+    executor.block_on(async {
+        let served = Served::start().await;
+        let watching = served.client().await;
+        let worker = served.client().await;
+        let (path, digest, bytes) = served.install("well-behaved", &wasm);
+        let component = ComponentSource {
+            path,
+            digest,
+            bytes,
+        };
+        let request = components::request("well-behaved", 1);
+        register_on(&worker, &request, &component).await;
+        assert_eq!(
+            watching
+                .health()
+                .await
+                .expect("a health report")
+                .live_bindings,
+            1
+        );
+        let pool = HeldPool::take().await;
+
+        drop(worker);
+        health_until(&watching, |health| health.live_bindings == 0).await;
+        pool.let_go().await;
+    });
+    executor.shutdown_timeout(HANG_GUARD);
+}
+
+// An unbind can come between the connection's record of a registration and the runtime's
+// reservation of its identifier. It finds nothing in the runtime to remove and is answered, and the
+// registration then goes live: a binding the worker asked to be rid of, which nothing records. The
+// host takes it out of the runtime again and refuses the registration, so that the identifier can
+// be registered and the worker is not told a binding exists that its unbind took away.
+//
+// The registration is held at the step between the two, and the case lets it go once the unbind
+// has been answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_registration_unbound_before_the_runtime_reserves_its_identifier_is_refused_and_leaves_nothing_behind()
+ {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let served = Served::start().await;
+    let client = Arc::new(served.client().await);
+    let (path, digest, bytes) = served.install("well-behaved", &wasm);
+    let component = ComponentSource {
+        path,
+        digest,
+        bytes,
+    };
+    let request = components::request("well-behaved", 1);
+    let hold = served.host.hold_registrations_before_the_runtime();
+    let registering = tokio::spawn({
+        let client = Arc::clone(&client);
+        let request = request.clone();
+        let component = component.clone();
+        async move {
+            client
+                .register(
+                    request.binding_id,
+                    &request.identity,
+                    &request.facts,
+                    &request.executable,
+                    &component,
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(HANG_GUARD, async {
+        while !hold.parked() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the registration never reached the step before the runtime");
+
+    client
+        .unbind(request.binding_id)
+        .await
+        .expect("the unbind of a binding being registered is answered");
+    hold.release();
+    let registered = tokio::time::timeout(HANG_GUARD, registering)
+        .await
+        .expect("the registration was answered")
+        .expect("the registration task ended");
+    assert!(
+        registered.is_err(),
+        "a registration that was unbound meanwhile was answered as registered"
+    );
+    assert_eq!(
+        client
+            .health()
+            .await
+            .expect("a health report")
+            .live_bindings,
+        0,
+        "the registration left a binding in the runtime"
+    );
+
+    // The identifier is free.
+    register_on(&client, &request, &component).await;
+    assert_eq!(
+        client
+            .health()
+            .await
+            .expect("a health report")
+            .live_bindings,
+        1
+    );
+}
+
+// A connection that has all the calls it may have running is told its next call is refused, and an
+// unbind is among the calls: it is answered with the binding out of the runtime like any other,
+// because the worker takes any answer to an unbind as the binding gone and would otherwise be left
+// with a binding it could not register again.
+//
+// The calls that fill the connection are snapshots that the binding's thread has not got to: its
+// next pass over the observation queue is stopped, so they stay in flight, whatever a component
+// would have done with them, until the case lets the pass go. A snapshot that finds the connection
+// full is refused and answered before the request after it is read, so the case asks for the
+// host's health after each and counts the snapshots that were not answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unbind_a_connection_has_no_place_for_a_call_to_run_is_answered_with_the_binding_out_of_the_runtime()
+ {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let served = Served::start().await;
+    let (path, digest, bytes) = served.install("well-behaved", &wasm);
+    let component = ComponentSource {
+        path,
+        digest,
+        bytes,
+    };
+    let mut raw = Raw::connect(&served).await;
+    let request = components::request("well-behaved", 1);
+    let registered = raw.register(&request, &component).await;
+    assert!(
+        matches!(registered, ResponseBody::Registered { .. }),
+        "the binding was answered with {registered:?}"
+    );
+    let mut stop = served
+        .host
+        .runtime()
+        .stop_next_pump(request.binding_id)
+        .expect("the binding is live");
+    let woken = raw
+        .ask(RequestBody::Event {
+            binding_id: request.binding_id.get(),
+            event: kr_plugin_service::vocabulary::wire_event(&components::scrape("se-0", "x")),
+        })
+        .await;
+    assert!(
+        matches!(woken, ResponseBody::Admitted { .. }),
+        "the event was answered with {woken:?}"
+    );
+    assert!(
+        tokio::time::timeout(HANG_GUARD, stop.reached())
+            .await
+            .expect("the binding's pass stands at the stop"),
+        "the stop was replaced before a pass reached it"
+    );
+
+    let mut calls = Vec::new();
+    while calls.len() < 16 {
+        let asked = raw
+            .send(RequestBody::Snapshot {
+                binding_id: request.binding_id.get(),
+                deadline_ms: u64::try_from(HANG_GUARD.as_millis()).expect("milliseconds"),
+            })
+            .await;
+        let probe = raw.send(RequestBody::Health).await;
+        raw.collect(&[probe]).await;
+        match raw.answers.remove(&asked) {
+            // The registration's own place had not come back yet: ask again.
+            Some(ResponseBody::Refused { .. }) => {}
+            Some(other) => panic!("the snapshot was answered with {other:?}"),
+            None => calls.push(asked),
+        }
+    }
+    let answered = raw.unbind(&request).await;
+    assert!(
+        matches!(&answered, ResponseBody::Refused { detail, .. }
+            if detail.contains("calls it may have running")),
+        "the unbind was answered with {answered:?}"
+    );
+    assert_eq!(
+        raw.health().await.live_bindings,
+        0,
+        "the binding was left in the runtime"
+    );
+
+    // The pass is let go, and the binding's thread, which was told to stop, ends without calling
+    // the component.
+    stop.release();
+    tokio::time::timeout(HANG_GUARD, raw.collect(&calls))
+        .await
+        .expect("the calls were answered");
+}
+
+// Two unbinds of one identifier, and a registration of it, can overlap: the first unbind has taken
+// the first registration out of the runtime and waits for its thread, the identifier is registered
+// again, and the second unbind comes while that registration is being made. It is about the
+// registration being made, and not the one on its way out: it is answered without waiting for the
+// thread of the first, and the registration it is about is refused.
+//
+// The first registration's thread stands at a stopped pass until the case lets it go, and the second
+// registration is held between the connection's record of it and the runtime's reservation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unbind_is_about_the_registration_being_made_and_not_the_one_on_its_way_out() {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let served = Served::start_unbinding_within(HANG_GUARD).await;
+    let client = Arc::new(served.client().await.unbinding_within(HANG_GUARD));
+    let (path, digest, bytes) = served.install("well-behaved", &wasm);
+    let component = ComponentSource {
+        path,
+        digest,
+        bytes,
+    };
+    let request = components::request("well-behaved", 1);
+    register_on(&client, &request, &component).await;
+    notices_through(&client, request.binding_id, "bind", 1).await;
+    let stop = overflow_behind_a_stopped_pass(&served, &client, &request).await;
+
+    let removing = tokio::spawn({
+        let client = Arc::clone(&client);
+        let binding_id = request.binding_id;
+        async move { client.unbind(binding_id).await }
+    });
+    health_until(&client, |health| health.live_bindings == 0).await;
+
+    let hold = served.host.hold_registrations_before_the_runtime();
+    let registering = tokio::spawn({
+        let client = Arc::clone(&client);
+        let request = request.clone();
+        let component = component.clone();
+        async move {
+            client
+                .register(
+                    request.binding_id,
+                    &request.identity,
+                    &request.facts,
+                    &request.executable,
+                    &component,
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(HANG_GUARD, async {
+        while !hold.parked() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the second registration never reached the step before the runtime");
+
+    // The first registration's thread is still at its stop, so an unbind that waited for it would
+    // not be answered.
+    tokio::time::timeout(HANG_GUARD, client.unbind(request.binding_id))
+        .await
+        .expect("the second unbind was answered")
+        .expect("the second unbind ran");
+    hold.release();
+    let registered = tokio::time::timeout(HANG_GUARD, registering)
+        .await
+        .expect("the second registration was answered")
+        .expect("the registration task ended");
+    assert!(
+        registered.is_err(),
+        "the registration the second unbind was about was answered as registered"
+    );
+
+    stop.release();
+    let existed = tokio::time::timeout(HANG_GUARD, removing)
+        .await
+        .expect("the first unbind was answered")
+        .expect("the unbind task ended")
+        .expect("the first unbind ran");
+    assert!(existed, "the first registration was not there to remove");
+    let health = health_until(&client, |health| health.connection_bindings == 0).await;
+    assert_eq!(health.live_bindings, 0);
+    register_on(&client, &request, &component).await;
 }
 
 // KR-REQ-04.07, KR-REQ-11.40: the refusal a worker gets for a component that wants more than the
@@ -747,7 +1531,7 @@ async fn kr_req_11_38_a_worker_is_told_when_the_queue_overflowed() {
         "one observation of 64 KiB overflowed the queue"
     );
     assert!(
-        tokio::time::timeout(core::time::Duration::from_secs(60), stop.reached())
+        tokio::time::timeout(HANG_GUARD, stop.reached())
             .await
             .expect("the binding's pass stands at the stop"),
         "the stop was replaced before a pass reached it"
@@ -832,28 +1616,7 @@ async fn a_binding_belongs_to_the_connection_that_registered_it() {
 
     // A connection that ends takes its own bindings with it and leaves the host running.
     drop(first);
-    let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        if second
-            .health()
-            .await
-            .expect("a health report")
-            .live_bindings
-            == 0
-        {
-            break;
-        }
-        tokio::time::sleep(core::time::Duration::from_millis(20)).await;
-    }
-    assert_eq!(
-        second
-            .health()
-            .await
-            .expect("a health report")
-            .live_bindings,
-        0,
-        "a connection that ended left its binding behind"
-    );
+    health_until(&second, |health| health.live_bindings == 0).await;
 }
 
 /// How many observations are offered before the call and the observation that follow them.
@@ -880,11 +1643,11 @@ const OFFERED_FIRST: usize = 64;
 // entered it and holds there until it is released, and the four interfaces in the SDK's package
 // give a component nothing to wait on, so that handshake needs an import that does not yet exist.
 //
-// Three figures here are lengths of time: the call's own deadline, the watchdog on the loop that
-// samples the count, and the handoff's limit at the end. The call's deadline expiring is one of
-// the outcomes this case accepts, so it decides nothing. The watchdog does decide one thing: a
-// host whose count never grows fails here rather than holding this test for ever. The handoff
-// keeps the limit it already had.
+// The one figure here that is a length of time is the call's own deadline, and its expiring is one
+// of the outcomes this case accepts, so it decides nothing. The loop that samples the count ends
+// when the count grows, and only a host whose count never grows is held to the guard. The handoff
+// at the end is shown not to wait for the connection's writer by holding the writer, and not by
+// timing the handoff.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_39_an_observation_and_a_call_on_one_connection_are_both_answered() {
     let Some(wasm) = components::component("slow-observe") else {
@@ -957,22 +1720,21 @@ async fn kr_req_11_39_an_observation_and_a_call_on_one_connection_are_both_answe
     // between them, is not something the count says, and it may as easily be after the observation
     // was answered as before. Asking again costs nothing and is bounded only so that a host which
     // has stopped answering says so instead of holding this test for ever.
-    let watchdog = std::time::Instant::now();
-    loop {
-        let after = client
-            .health()
-            .await
-            .expect("a health report")
-            .component_calls;
-        if after > before {
-            break;
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            let after = client
+                .health()
+                .await
+                .expect("a health report")
+                .component_calls;
+            if after > before {
+                break;
+            }
+            tokio::task::yield_now().await;
         }
-        assert!(
-            watchdog.elapsed() < core::time::Duration::from_secs(60),
-            "the component completed no call between the two samples of the count"
-        );
-        tokio::task::yield_now().await;
-    }
+    })
+    .await
+    .expect("the component completed no call between the two samples of the count");
 
     let outcome = calling.await.expect("the call finished");
     // The call came back, and as one of the outcomes this case allows: an answer, a fault, the
@@ -993,22 +1755,35 @@ async fn kr_req_11_39_an_observation_and_a_call_on_one_connection_are_both_answe
         ),
     }
 
-    // And the handoff that never waits at all does not even write a frame.
-    let offered = std::time::Instant::now();
-    let handoff = client.offer(request.binding_id, &components::scrape("se-2", "y"));
-    let waited = offered.elapsed();
-    assert!(
-        matches!(
-            handoff,
-            kr_plugin_service::client::Handoff::Accepted
-                | kr_plugin_service::client::Handoff::Refused { .. }
-        ),
-        "the handoff was {handoff:?}"
-    );
-    assert!(
-        waited < core::time::Duration::from_millis(20),
-        "handing an event over took {waited:?}"
-    );
+    // And the handoff that never waits at all does not even write a frame: the writer is held at
+    // an event it took, and the next event is handed over all the same.
+    let hold = client.hold_offered_writes();
+    for index in 2..4 {
+        let handoff = client.offer(
+            request.binding_id,
+            &components::scrape(&format!("se-{index}"), "y"),
+        );
+        assert!(
+            matches!(
+                handoff,
+                kr_plugin_service::client::Handoff::Accepted
+                    | kr_plugin_service::client::Handoff::Refused { .. }
+            ),
+            "the handoff was {handoff:?}"
+        );
+        // The writer stops at the first event it takes, if the first was taken in; a handoff that
+        // was refused left it nothing to stop at.
+        if index == 2 && handoff == kr_plugin_service::client::Handoff::Accepted {
+            tokio::time::timeout(HANG_GUARD, async {
+                while !hold.parked() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the writer never took an event off the queue");
+        }
+    }
+    hold.release();
 
     // Health, too: nothing about this connection is behind the component.
     let health = client.health().await.expect("a health report");
@@ -1100,30 +1875,179 @@ async fn a_client_whose_connection_failed_is_told_without_waiting() {
         .expect("the handshake and the challenge");
     serving.await.expect("the host finished");
 
-    let asked = std::time::Instant::now();
+    // Told that the host is unavailable, which a client that waited out its deadline would not
+    // be: that is a caller's deadline, and a different failure.
     let error = client
         .health()
         .await
         .expect_err("a host that is gone cannot report itself");
-    let waited = asked.elapsed();
     assert!(
         matches!(error, ServiceError::Unavailable { .. }),
         "the failure was {error}"
     );
-    assert!(
-        waited < core::time::Duration::from_secs(2),
-        "the client waited {waited:?} for a connection that had failed"
-    );
 
-    // And a call made afterwards is refused at once too, rather than being written to a socket
-    // nobody is reading.
-    let asked = std::time::Instant::now();
+    // And a call made afterwards is refused as unavailable too, rather than being written to a
+    // socket nobody is reading.
     let error = client
         .unbind(new_binding_id())
         .await
         .expect_err("the connection is gone");
-    assert!(matches!(error, ServiceError::Unavailable { .. }));
-    assert!(asked.elapsed() < core::time::Duration::from_millis(500));
+    assert!(
+        matches!(error, ServiceError::Unavailable { .. }),
+        "the failure was {error}"
+    );
+}
+
+// A worker takes any answer to an unbind as the binding gone, and the client forgets what its queue
+// held for the binding on every answer, a refusal that says the host took the binding out without
+// waiting for the removal among them. What it held is the record of a document it dropped whose last
+// piece had not come: left behind, it would drop the first document of the identifier's next
+// registration, which is numbered from one again.
+//
+// The host here is a program of the case's, because the client's queue drops a document only when
+// it is full and nothing reads it, and what the case needs is the order of the frames: the
+// documents, the refusal, and then, once the client has asked for something else, the next
+// registration's first document and a notice after it that is always read. Frames are read one at
+// a time by the client's reader, so the refusal reaches the caller after the documents are in the
+// queue, and a worker registers an identifier again only after it was told the binding was gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_forgets_what_its_queue_held_for_a_binding_when_the_host_answers_its_unbind_with_a_refusal()
+ {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let identity = HostIdentity::generate(temp.environment_id()).expect("an identity");
+    let endpoint = host_endpoint(&environment, &HostProtocol::THIS).expect("an endpoint");
+    let descriptor = HostDescriptor {
+        protocol: HostProtocol::THIS.name.to_owned(),
+        environment_id: temp.environment_id(),
+        reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
+        endpoint: endpoint.as_text(),
+        boot_identity: identity.boot_identity().clone(),
+        process_start_identity: identity.process_start_identity().clone(),
+        host_public_key: *identity.public_key(),
+    };
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("a listener");
+    let binding_id = new_binding_id();
+    let sentinel = new_binding_id();
+
+    // Pieces of one document, none of them the last, which together fill the client's queue: the
+    // one that does not fit makes the queue drop the document, and remember that it did until the
+    // last piece comes.
+    let piece = move || Notice::Document {
+        binding_id: binding_id.get(),
+        call: "snapshot".to_owned(),
+        document: 1,
+        last: false,
+        nodes: vec![kr_plugin_service::protocol::WireNode {
+            node_id: "n".to_owned(),
+            node_revision: 0,
+            body_json: "x".repeat(900 * 1024),
+        }],
+    };
+    let first_of_the_next = Notice::Document {
+        binding_id: binding_id.get(),
+        call: "snapshot".to_owned(),
+        document: 1,
+        last: true,
+        nodes: Vec::new(),
+    };
+    let after_it = Notice::Disabled {
+        binding_id: sentinel.get(),
+        reason: "the notice that is always read".to_owned(),
+    };
+
+    let serving = tokio::spawn({
+        let descriptor = descriptor.clone();
+        let first_of_the_next = first_of_the_next.clone();
+        let after_it = after_it.clone();
+        async move {
+            let (connection, _peer) = listener.accept().await.expect("a connection");
+            let (mut reader, mut writer) =
+                kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+            // Until the client ends the connection, as the case does.
+            while let Ok(request) = reader
+                .read_message_without_schema::<kr_plugin_service::protocol::Request>()
+                .await
+            {
+                let reply_to = request.request_id;
+                let body = match request.body {
+                    RequestBody::Hello { .. } => ResponseBody::Hello {
+                        protocol: HostProtocol::THIS.name.to_owned(),
+                        descriptor: Box::new(descriptor.clone()),
+                    },
+                    RequestBody::Verify { nonce } => ResponseBody::Verified(Box::new(
+                        identity
+                            .answer(&nonce, &descriptor.endpoint)
+                            .expect("an answer"),
+                    )),
+                    RequestBody::Unbind { .. } => {
+                        for _ in 0..5 {
+                            writer
+                                .write_message(&Frame::Notice(piece()))
+                                .await
+                                .expect("a piece is written");
+                        }
+                        ResponseBody::Refused {
+                            request: "unbind".to_owned(),
+                            detail: "the binding was stopped without waiting for its thread"
+                                .to_owned(),
+                            disabled: false,
+                        }
+                    }
+                    RequestBody::Privacy { private } => {
+                        for notice in [first_of_the_next.clone(), after_it.clone()] {
+                            writer
+                                .write_message(&Frame::Notice(notice))
+                                .await
+                                .expect("a notice is written");
+                        }
+                        ResponseBody::PrivacySet { private }
+                    }
+                    other => panic!("the client asked for {other:?}"),
+                };
+                writer
+                    .write_message(&Frame::Response { reply_to, body })
+                    .await
+                    .expect("the answer is written");
+            }
+        }
+    });
+
+    let connection = kr_ipc::endpoint::Connection::connect(&endpoint)
+        .await
+        .expect("connects");
+    let client = PluginClient::over(connection, descriptor)
+        .await
+        .expect("the handshake and the challenge");
+    let answered = client.unbind(binding_id).await;
+    assert!(
+        matches!(&answered, Err(ServiceError::Protocol { .. })),
+        "the refusal was read as {answered:?}"
+    );
+    // The worker registers the identifier again now; what it is sent for that is asked for by
+    // something it says to the host.
+    client.privacy(false).await.expect("privacy is set");
+
+    let read = tokio::time::timeout(HANG_GUARD, async {
+        let mut read = Vec::new();
+        loop {
+            let notice = client.notice().await.expect("the connection stood");
+            let last = notice == after_it;
+            read.push(notice);
+            if last {
+                return read;
+            }
+        }
+    })
+    .await
+    .expect("the notice that is always read never came");
+    assert!(
+        read.contains(&first_of_the_next),
+        "the queue dropped the first document of the identifier's next registration: {} notices were read",
+        read.len()
+    );
+    drop(client);
+    serving.await.expect("the host program ended");
 }
 
 // KR-REQ-11.38: an event the client was handed is counted until it has been written. A caller that
@@ -1209,14 +2133,13 @@ async fn kr_req_11_38_an_event_handed_over_is_counted_until_it_is_written_and_a_
     let hold = client.hold_offered_writes();
     let handed = client.offer(binding_id, &components::scrape("se-1", "first"));
     assert_eq!(handed, kr_plugin_service::client::Handoff::Accepted);
-    let watchdog = std::time::Instant::now();
-    while !hold.parked() {
-        assert!(
-            watchdog.elapsed() < core::time::Duration::from_secs(60),
-            "the writer never took the event off the queue"
-        );
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(HANG_GUARD, async {
+        while !hold.parked() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the writer never took the event off the queue");
     assert_ne!(
         client.offered_bytes(),
         0,
@@ -1226,13 +2149,13 @@ async fn kr_req_11_38_an_event_handed_over_is_counted_until_it_is_written_and_a_
 
     // Written: the count falls to zero, and a snapshot asked for then is written after the event.
     hold.release();
-    while client.offered_bytes() != 0 {
-        assert!(
-            watchdog.elapsed() < core::time::Duration::from_secs(60),
-            "the event was never written"
-        );
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(HANG_GUARD, async {
+        while client.offered_bytes() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the event was never written");
     client
         .snapshot(binding_id, core::time::Duration::from_secs(5))
         .await
@@ -1777,20 +2700,19 @@ async fn kr_req_11_38_a_decode_and_an_encode_that_never_return_are_stopped_and_t
         matches!(&offered, ServiceError::Disabled { .. }),
         "{offered}"
     );
-    let watchdog = std::time::Instant::now();
-    loop {
-        assert!(
-            watchdog.elapsed() < core::time::Duration::from_secs(30),
-            "the host never said the binding was disabled"
-        );
-        if let Some(Notice::Disabled {
-            binding_id: told, ..
-        }) = client.notice().await
-        {
-            assert_eq!(told, binding_id.get());
-            break;
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            if let Notice::Disabled {
+                binding_id: told, ..
+            } = client.notice().await.expect("the connection is open")
+            {
+                assert_eq!(told, binding_id.get());
+                break;
+            }
         }
-    }
+    })
+    .await
+    .expect("the host never said the binding was disabled");
 }
 
 // KR-REQ-24.27: once the host has acknowledged that privacy mode stands, no document of the
@@ -1813,14 +2735,13 @@ async fn kr_req_24_27_no_document_is_written_after_privacy_mode_is_acknowledged_
         .await
         .expect("the snapshot runs");
     assert_eq!(first.document, Some(1));
-    let watchdog = std::time::Instant::now();
-    while !hold.parked() {
-        assert!(
-            watchdog.elapsed() < core::time::Duration::from_secs(60),
-            "the writer never took the document off the queue"
-        );
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(HANG_GUARD, async {
+        while !hold.parked() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the writer never took the document off the queue");
     client
         .privacy(true)
         .await
@@ -1838,19 +2759,19 @@ async fn kr_req_24_27_no_document_is_written_after_privacy_mode_is_acknowledged_
         )
         .await
         .expect_err("a decode that traps is refused");
-    loop {
-        assert!(
-            watchdog.elapsed() < core::time::Duration::from_secs(60),
-            "the fault was never written"
-        );
-        match client.notice().await.expect("the connection is open") {
-            Notice::Document { document, .. } => {
-                panic!("document {document} was written after privacy mode was acknowledged")
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            match client.notice().await.expect("the connection is open") {
+                Notice::Document { document, .. } => {
+                    panic!("document {document} was written after privacy mode was acknowledged")
+                }
+                Notice::Fault { .. } => break,
+                Notice::Gap { .. } | Notice::Disabled { .. } => {}
             }
-            Notice::Fault { .. } => break,
-            Notice::Gap { .. } | Notice::Disabled { .. } => {}
         }
-    }
+    })
+    .await
+    .expect("the fault was never written");
 
     // Privacy mode ends: the reader is told documents were lost, and a fresh one follows.
     client
@@ -1858,26 +2779,26 @@ async fn kr_req_24_27_no_document_is_written_after_privacy_mode_is_acknowledged_
         .await
         .expect("the end is acknowledged");
     let mut lost = false;
-    loop {
-        assert!(
-            watchdog.elapsed() < core::time::Duration::from_secs(60),
-            "no fresh document followed the end of privacy mode"
-        );
-        match client.notice().await.expect("the connection is open") {
-            Notice::Gap { documents, .. } if documents > 0 => lost = true,
-            Notice::Document { document, last, .. } => {
-                assert!(
-                    lost,
-                    "a document arrived before the reader was told some were lost"
-                );
-                assert_ne!(document, 1, "the document held at the writer was written");
-                if last {
-                    break;
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            match client.notice().await.expect("the connection is open") {
+                Notice::Gap { documents, .. } if documents > 0 => lost = true,
+                Notice::Document { document, last, .. } => {
+                    assert!(
+                        lost,
+                        "a document arrived before the reader was told some were lost"
+                    );
+                    assert_ne!(document, 1, "the document held at the writer was written");
+                    if last {
+                        break;
+                    }
                 }
+                Notice::Gap { .. } | Notice::Fault { .. } | Notice::Disabled { .. } => {}
             }
-            Notice::Gap { .. } | Notice::Fault { .. } | Notice::Disabled { .. } => {}
         }
-    }
+    })
+    .await
+    .expect("no fresh document followed the end of privacy mode");
 }
 
 // KR-REQ-24.27: a decoded request's presentation is a document too, and is not sent while privacy

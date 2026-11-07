@@ -295,6 +295,7 @@ document. The fields below remain the whole contract for a document written by h
 | `mailbox.origin` | the mailbox service this host places the encrypted objects of its notifications in; a section of level 3, so a release that reads level 2 ignores it and its host places nothing, which leaves a notification whose detail does not fit reaching a device without it | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
 | `relay.origin` | the relay lease service this host asks for a lease for each paired device, billed to the account the host is signed in as; a section of level 4 | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
 | `automation.test_suites` | the test suites a workflow's `run_tests` node can name: for each name, the `command` a POSIX shell runs in a private copy of the version under test, and the `outputs` it writes besides the source (a file among them that is a JUnit XML or `go test -json` report is read when the suite ends). This is a section of level 5, so a release that reads only level 4 ignores it, and its host runs no suite | at most 64 suites; a name of letters, digits, `.`, `_` and `-` that starts with a letter or a digit, at most 256 bytes; a command of 1 to 16384 bytes with no control character, line break included (chain commands with `&&` or `;`); at most 16 output paths of at most 1024 bytes each, relative, of names with no `.` or `..` and no backslash, none repeated and none inside another; a name this host does not carry as input (a colon, one of `< > " | ? *`, a trailing dot or space, a Windows device name with or without an extension, over 255 bytes) is accepted here and refused when the suite is dispatched |
+| `push.gateways` | the push gateways, besides the official one, that a paired device's notification credential may name. The host sends every notification, status question and renewal under a credential to the gateway it names, so it delivers through the official gateway, which is always allowed, and through the origins listed here. Taking an origin out of the list retires the credentials the host holds for it as soon as the host next puts the document into force: they are no longer used or renewed, the host forgets them, and it keeps a debt to ask that gateway to revoke each authorisation until it has (`docs/delivery/README.md`). A section of level 7, so a release that reads only level 6 ignores it, registers a credential from the official gateway only and goes on using the credentials it holds. A document that holds the section states `"level": 7`, and `kr host push-gateways` writes it; run `kr doctor` after editing it by hand. One malformed origin makes the whole document unusable: every `kr` edit is then refused until it is put right, and a host that starts over it makes no exchange with any gateway until it is restarted over a usable one | a list of at most 16 origins, each an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash, none the official gateway's and none twice; `[]` lists none and keeps the document at level 7; absent or null leaves the section unused |
 | `shell.mode` | the shell mode a session is created in when its request names none: `managed` or `native_compat`. A section of level 6, so a release that reads only level 5 ignores it and its commands create a session in the mode they name themselves. It takes effect for the sessions created afterwards, and `kr host shell-mode` writes it | `managed` or `native_compat`; absent leaves the choice to the product default, `managed`. No profile carries a shell mode, so that rung of the order below is empty for it |
 
 A field the document does not write selects nothing, because there is no public relay or discovery
@@ -2615,7 +2616,7 @@ The step's authority must be valid when the record is replaced, not just when th
 
 A step is claimed in the receipt store that holds the other actions of the daemon's own, by the actor, the action identifier and a digest of the request. The daemon performs it, keeps its result under the claim, and answers a retry from that receipt on any connection, regardless of which window the retry arrives in. The same action with another request is `ID_CONFLICT`. A step the daemon refused after it claimed the action, including one that could not write, is kept as that action's refusal, so asking again takes a new action. If the daemon refuses a step before claiming the action, because it cannot use the record or cannot confirm the previous change to it, it does not spend the action. A retry on the same connection, inside its window, is refused the same way while the cause lasts. A retry on another connection finds no claim and is refused for its window, so the owner asks again under a new action once the cause is gone.
 
-A step whose attempt ended after it wrote the record and before it kept the result is answered from the record while the record's last change names that actor and action. Before taking each step, and once at the beginning before serving any steps, the daemon will record this answer in a claim. It flushes the state directory first, so a result is never given for a change that a crash can still take back. If flushing the directory or reading the record fails, it will not take any steps and will refuse steps with `STORAGE_UNAVAILABLE` without claiming them, and will answer retries of an unfinished earlier step with `OUTCOME_UNKNOWN`. A retry of a step that has a recorded result or refusal is answered from that record whether or not recovery works, and a retry of a step still running is told so with `RESOURCE_UNAVAILABLE`. A retry whose receipt cannot be looked up, and a receipt that is kept and cannot be read back, are answered with `OUTCOME_UNKNOWN`: whether an earlier attempt took the step is not known. A retry of an unfinished step waits behind the steps in progress and is answered from what its claim holds when its turn comes. If a claim contains no result and the record does not name the action, the daemon will answer retries with `OUTCOME_UNKNOWN` and never perform the action again.
+A step whose attempt ended after it wrote the record and before it kept the result is answered from the record while the record's last change names that actor and action. Before taking each step, and once at the beginning before serving any steps, the daemon will record this answer in a claim. It flushes the state directory first, so a result is never given for a change that a crash can still take back. If flushing the directory or reading the record fails, it will not take any steps and will refuse steps with `STORAGE_UNAVAILABLE` without claiming them, and will answer retries of an unfinished earlier step with `OUTCOME_UNKNOWN`. A retry of a step that has a recorded result or refusal is answered from that record whether or not recovery works, and a retry of a step still running is told so with `OUTCOME_UNKNOWN`. A retry whose receipt cannot be looked up, and a receipt that is kept and cannot be read back, are answered with `OUTCOME_UNKNOWN`: whether an earlier attempt took the step is not known. A retry of an unfinished step waits behind the steps in progress and is answered from what its claim holds when its turn comes. If a claim contains no result and the record does not name the action, the daemon will answer retries with `OUTCOME_UNKNOWN` and never perform the action again.
 
 Two outcomes are answered with no path in them, because an answer can reach a paired device. A step that wrote the record and could not flush its directory is answered `OUTCOME_UNKNOWN`: the record shows the change, but whether it survives a crash is not known, and a retry of the same action will return the answer recorded in the step record once the directory has been flushed. A step that wrote the record and could not keep its receipt is answered with its result. Its claim stays unfinished, and the record, which names the step, answers a retry.
 
@@ -3522,25 +3523,64 @@ happen. An answer kept from an earlier submission, which the daemon finds in a r
 gives from a receipt it held, is told as unknown whatever it was, so that a device that may not read
 it cannot tell a result from a refusal. A repeat is an action the daemon has already routed for the
 device, asked again with the same request, whether the route was there when the request arrived or a
-copy claimed it while the request waited. The daemon writes the route before it dispatches the
-action and keeps no word of whether a dispatch followed, so it cannot show that the earlier copy did
-not run. A refusal it makes of a repeat on its own account is therefore told as unknown too,
-wherever the check sits: a registration withdrawn, a grant gone or narrowed, a connection opened for
-the host or for another session or grant, a window that belongs to another connection, a session
-whose worker has ended, a worker refusal that the worker did not read from a receipt, or a route the
-daemon cannot read. A repeated close is the one the daemon can still answer without its worker: the
-closure record answers it for a device that may read the session's receipts, as it answers a close
-made after the closure. A request the daemon never routed is refused as any request is, and so is a
-reused identifier that carries another request; a request whose route the daemon cannot read counts
-as a repeat. The services behind the door check the registration again where they write, and a copy
-of an action that meets a fence owed there is refused in their words. A service that answers a copy
-of an action from its own record while it carries the action out, because the first copy finished
+copy claimed it while the request waited. A copy that has arrived and not yet claimed counts too:
+the daemon keeps in memory the calls it is serving that have not yet written their route, among them
+a mutation the transport has read from the device's stream, whether it waits in the connection's
+queue or is read ahead and held behind the request being answered, and a refusal of a request that
+meets another such call carrying the same request is told as a repeat's. A close whose route cannot
+be recorded goes on without one, because a stop is let through when storage fails, and its call
+stays among them until the work it started has ended, so a copy that arrives while the close runs is
+told as a repeat's. When the work has ended, the daemon keeps the request, in memory, as a close it
+carried out with no route if its frame was put to the worker, so a copy that arrives later is told
+the same; it keeps the last 256 and none after a restart. A close that never reached the worker, or
+whose frame the check of the device's standing stopped before the worker had all of it, did nothing
+and keeps nothing. The daemon writes the route before it dispatches the action and
+keeps no word of whether a dispatch followed, so it cannot show that the earlier copy did not run. A
+refusal it makes of a repeat on its own account is therefore told as unknown too, wherever the check
+sits: a registration withdrawn, a grant gone or narrowed, a connection opened for the host or for
+another session or grant, a window that belongs to another connection, a session whose worker has
+ended, a worker refusal that the worker did not read from a receipt, or a route the daemon cannot
+read. A repeated close is the one the daemon can still answer without its worker: the closure record
+answers it for a device that may read the session's receipts, as it answers a close made after the
+closure. A request the daemon never routed is refused as any request is, and so is a reused
+identifier that carries another request, whether the daemon finds it at the route or in a service's
+record, and whether or not copies of that request wait behind it. A close, which the daemon lets
+through with no route when storage cannot record one, and a voice delegation whose identifier a
+route that names no session holds, which its challenge gives back, are the exception: a copy of
+either is told as a repeat's when another request holds the identifier. A route that names a
+session is not given back, so a copy of a voice delegation under it keeps its refusal. The refusal
+of a reused identifier is the daemon's word about the identifier and
+names no result, so a device that may not read the record is told it as it is; the change-set
+service's lookups of a capture, an apply, a revert and a materialisation are the exception, and tell
+such a device the outcome is unknown. A request whose route the daemon cannot read counts as a repeat. A repeat of a create
+whose reservation the daemon cannot read, of an action whose record it cannot read in the attention
+store, the workflow journal, the registry's receipts of authority changes or its record of pairing
+actions, or of a rearm whose chain or grant it cannot read, is told `OUTCOME_UNKNOWN` and nothing is
+performed: a record that cannot be read is not one that is absent. Where the daemon cannot read
+such a record it cannot tell a first action from a repeat, and tells both the same.
+The services behind the door check the registration again where they write, and a copy of an
+action that meets a fence owed there is refused in their words. A service that answers a copy of an
+action from its own record while it carries the action out, because the first copy finished
 meanwhile, flags the answer to the door as read from a record. The door then tells it as it tells
 one it found in a record itself. A device that may read the record is given the recorded answer. A
 device that may not is told the outcome is unknown, whatever the answer was, and so is any device
 when the authority feed refuses before the answer is written. The service's refusals that are not
 copies of a record, such as the refusal of a request that reaches no record, are told as a fresh
-answer is.
+answer is. A create is answered from the reservation under its token, and the reservation holds a
+session whether its first attempt launched it or failed to. A repeat of a create whose launch failed
+after it reserved its session is therefore a copy of a record, as a repeat of one that succeeded is:
+the session the reservation holds decides whether the device may read the answer, and a device that
+may not is told the outcome is unknown, and not the phase the launch ended in. A create the host
+refuses before it reserves holds no reservation, and its repeat is decided again.
+
+A transient failure says nothing took effect, so the daemon does not give one for these answers once
+it has dispatched or committed the action. It tells `OUTCOME_UNKNOWN` instead: a decision that could
+not be held while the answer waited to be written; an answer, or a session's closure, that it could
+not record after the action was carried out; and an attempt under the action's identifier that is
+still running when a copy of it arrives. A project action that was refused, when the journal cannot
+keep the refusal, is told as the record of the action where there is one to read, `ID_CONFLICT`
+where the record is another request's, and `OUTCOME_UNKNOWN` where there is none, because the
+refusal can be a word about what another copy of the action did.
 
 A device that falls behind is told rather than waited for. What the daemon holds for one device is
 bounded in bytes, not in messages, at section 9's send queue per peer; a device that reaches that
@@ -3603,13 +3643,13 @@ their own, so they are refused outright for a subject in an environment the gran
 (a narrowed listing is not a way to find an identifier an unnarrowed read would then answer for),
 and the session content they carry is narrowed exactly as the listings' is.
 
-**A paired device is served the five repository operations on a Linux host that has proved it can confine Git, and is refused them on every other host.** The five are `project.init`, `project.clone`, `project.adopt`, `workspace.create` and `workspace.remove`, and each runs the Git program. This host bounds every name it resolves itself to the directories the owner authorised, each reached through a handle it holds. It bounds what Git reaches once Git is running only where it can show that it does. The daemon shows it when it starts and again at each `host.doctor`, by running one Git invocation under the rules a device's invocations run under. That one run needs four things at once: Landlock at filesystem version 3, rules with no ambient read, the loaders and libraries of this host's Git named object by object, and a mount table with nothing mounted beneath a directory the invocation is granted. The door reads the last answer.
+**A paired device is served the five repository operations on a Linux or macOS host that has proved it can confine Git, and is refused them on every other host.** The five are `project.init`, `project.clone`, `project.adopt`, `workspace.create` and `workspace.remove`, and each runs the Git program. This host bounds every name it resolves itself to the directories the owner authorised, each reached through a handle it holds. It bounds what Git reaches once Git is running only where it can show that it does. The daemon shows it when it starts and again at each `host.doctor`, by running one Git invocation under the rules a device's invocations run under. That one run needs four things at once. On Linux they are Landlock at filesystem version 3, rules with no ambient read, the loaders and libraries of this host's Git named object by object, and a mount table with nothing mounted beneath a directory the invocation is granted. On macOS they are the system's sandbox launcher, a profile that reads only what it names (besides a few names and attributes that tell no content, which `crates/kr-project/README.md` lists), the libraries of this host's Git that the system does not supply named by directory, and the same mount check. The door reads the last answer.
 
-A host that has not proved it refuses the five before the project service is reached. That covers macOS and Windows, a kernel older than 6.2, a machine this host holds no system-call numbers for, a host that cannot name its support set, and a host whose mount table puts a filesystem beneath a granted directory. The refusal is `PERMISSION_DENIED` with one sentence, which says that this host cannot confine what the Git program reads and so does not run it for a paired device. It names no library, path or mount. `host.doctor` says which of three causes stopped the proof, in sentences this build wrote, and the daemon's own log carries the detail.
+A host that has not proved it refuses the five before the project service is reached. That covers Windows, a Linux kernel older than 6.2, a machine this host holds no system-call numbers for, a macOS host with no sandbox launcher or whose Git does not start under the profile, a host that cannot name its support set, and a host whose mount table puts a filesystem beneath a granted directory. The refusal is `PERMISSION_DENIED` with one sentence, which says that this host cannot confine what the Git program reads and so does not run it for a paired device. It names no library, path or mount. `host.doctor` says which of three causes stopped the proof, in sentences this build wrote, and the daemon's own log carries the detail.
 
 Where the five are served, a device reaches only the locations the owner authorised for its own grant. The owner authorises each one on the local socket, and the confirmation is bound to the four public keys of the device that holds the grant, so a device that has not declared all four keys has no location until it declares them with `device.keys.complete`. A device names a location and a name beneath it, never a path. The owner's own locations, another device's locations and a path the device spells out are each refused with the project service's own sentence, and a device never clones a remote, because no location says which providers this host may reach for it. Every Git invocation such an operation causes reads only the directories it is lent and a support set named for this host's Git, and the admission the operation was accepted under is asked again inside the transaction that begins its effect.
 
-The confinement is a promise about what the device's own request can reach through repository content: a symbolic link, an alternate object store or an included configuration file that leads outside the location, and a descriptor left open, are each refused. It does not make the location's tree private. A filesystem mounted beneath a granted directory while Git runs, a program running as this host's user account, an automatic mount that Git's own lookup of a path sets off, and a hard link already inside the tree are all read as part of the tree, and the owner accepts that residual when authorising a location for a device. `crates/kr-project/README.md` states it in full. `host.doctor` reports what it finds of the routes by which a mount could be added, which are unprivileged user namespaces, a setuid `fusermount`, automounts and mount units configured for the account. It reads the mount table, the filesystem table, and the unit directories of the administrator and of the account, and not the units a package installs. It says that these narrow the residual and do not close it.
+The confinement is a promise about what the device's own request can reach through repository content: a symbolic link, an alternate object store or an included configuration file that leads outside the location, and a descriptor left open, are each refused. It does not make the location's tree private. A filesystem mounted beneath a granted directory while Git runs, a program running as this host's user account, an automatic mount that Git's own lookup of a path sets off, and a hard link already inside the tree are all read as part of the tree, and the owner accepts that residual when authorising a location for a device. `crates/kr-project/README.md` states it in full. `host.doctor` reports what it finds of the routes by which a mount could be added, which are unprivileged user namespaces, a setuid `fusermount`, automounts and mount units configured for the account. It reads the mount table, the filesystem table, and the unit directories of the administrator and of the account, and not the units a package installs. It says that these narrow the residual and do not close it. On macOS it reports none of those routes, because no setting of the host narrows them: a program running as the account can attach a disk image or a network share to a directory it owns. The report says instead that an invocation refuses a mount that is there when it starts and cannot see one made while Git runs, and that this does not close the residual. It is a warning with no remedy, since there is no setting to change.
 
 Every grant keeps the rights it names. A device keeps the four reads, and `project.operation.cancel` for work it started itself.
 
@@ -6013,11 +6053,13 @@ separates the two, is reading. Git reads the system's shared libraries, its loca
 certificate store, and a read confinement that missed one of those would fail an operation for a
 reason that has nothing to do with safety. What such an operation can reach by reading is what the
 account this host runs as can reach, exactly as before. An operation performed for a caller bounded
-by a grant is confined on Linux: each of its Git invocations reads only the directories it is
+by a grant is confined on both: each of its Git invocations reads only the directories it is
 granted and a support set named for this host's Git, and it is refused when a filesystem is mounted
-beneath a granted directory. On macOS, where no profile tried confined reads and still let the
-system's loader start Git, such an invocation is refused. `crates/kr-project/README.md` says what
-that caller is promised and what it is not.
+beneath a granted directory. On macOS the profile names the paths, where the Linux ruleset holds the
+objects they are, and beyond them lets through only the names and attributes of the root directory,
+of symbolic links and of the directories above a granted path. Such an invocation is refused on
+Windows, which runs no Git. `crates/kr-project/README.md` says what that caller is promised and what
+it is not.
 
 Where a guarantee cannot be enforced from outside Git at all, the operation that needs it is refused
 rather than run under checks that notice afterwards. Two cases are the exception, and
@@ -7398,7 +7440,13 @@ descends only from another device's share. Paired devices can use `grant.list` t
 have issued.
 
 `grant.list` is the list of grants, each of which includes its expiry date as well as its effective
-end date, which is the earlier of its expiry date and the end of the pairing of the grantee.
+end date, which is the earlier of its expiry date and the end of the pairing of the grantee. A grant
+is listed as pending, active, expired or revoked. A revoked grant is listed as revoked, whatever its
+time says. A grant that expires and is not revoked is listed as expired when its end is on record or
+when either of its two deadlines, on the continuous clock or in UTC, has passed. While the host
+cannot decide that for a grant, it refuses the list. `CLOCK_UNTRUSTED` lasts until the owner
+establishes the clock with `host.clock.establish`; `STORAGE_UNAVAILABLE` is transient, and the
+caller asks again.
 `device.list` is the list of devices, each of which indicates the platform of the device, the end of
 the pairing of the device, whether the pairing of the device has run out as far as the host is
 concerned and whether the pairing opens all sessions of the environment. Note that sharing a session
@@ -7437,8 +7485,8 @@ caller whose window has closed, or whose daemon has restarted since, is still to
 * the result the change produced, once it has one;
 * the refusal it was given, when that refusal's code says the same request cannot succeed if it is
   sent again (a refusal that says it might, such as a store that could not be written, is not kept);
-* `RESOURCE_UNAVAILABLE` while the first attempt is still running in this daemon, and the caller
-  asks again;
+* `OUTCOME_UNKNOWN` while the first attempt is still running in this daemon, because that attempt
+  may complete the effect at any moment, and the caller asks again under the same identifier;
 * for an attempt that ended without recording what it did (the daemon stopped, or the attempt's
   task ended, in between), what this host's own records prove it did, and otherwise
   `OUTCOME_UNKNOWN`. A share is answered from the grant and the invitation it wrote, which take

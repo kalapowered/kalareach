@@ -1338,6 +1338,133 @@ async fn a_replayed_mutation_is_answered_from_its_record() {
     host.clients.abort();
 }
 
+/// KR-REQ-19.04: a repeat of an automation action whose record cannot be read is told that what
+/// became of the action is not known. The journal holds the record of every action it performed, so
+/// one it cannot read is not one that holds none: the action may have been carried out, and a
+/// transient word would say that it was not. Once the record can be read the repeat is answered
+/// from it, and the action is not performed again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_whose_record_in_the_journal_cannot_be_read_is_told_the_outcome_is_unknown() {
+    let host = host().await;
+    let mut control = client(&host).await;
+
+    host.issue(grant_id(6), &COMMAND_RIGHTS);
+    let document = definition(
+        workflow_id(6),
+        grant_id(6),
+        "asked when the journal cannot be read",
+        WorkflowNode {
+            node_id: "tests".to_owned(),
+            action_kind: WorkflowActionKind::RunTests,
+            action_params: tests_params(),
+            declared_environment: Nullable::null(),
+        },
+    );
+    let original = control
+        .compose(
+            Method::WorkflowInstall,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &WorkflowInstallParams {
+                workflow_id: document.workflow_id,
+                revision: document.revision,
+                definition: document.clone(),
+                grant_reference: document.grant_reference,
+            },
+        )
+        .await
+        .expect("the mutation is composed");
+    let first: WorkflowInstallResult = typed(
+        &control
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the workflow is installed"),
+    );
+
+    // The table that holds the record of every action is moved aside, as a journal that fails to
+    // read it would leave it.
+    let journal = rusqlite::Connection::open(
+        host._temp
+            .environment()
+            .state_dir()
+            .join(kr_automation::store::WORKFLOW_DB_NAME),
+    )
+    .expect("opens the workflow journal beside the daemon's own handle");
+    journal
+        .busy_timeout(std::time::Duration::from_secs(30))
+        .expect("a busy timeout");
+    journal
+        .execute_batch("ALTER TABLE action_records RENAME TO action_records_aside;")
+        .expect("the record cannot be read");
+    let told = failure(
+        client(&host)
+            .await
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    journal
+        .execute_batch("ALTER TABLE action_records_aside RENAME TO action_records;")
+        .expect("the record can be read again");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+
+    // A record whose answer is not text the journal can read is the same.
+    let kept: String = journal
+        .query_row(
+            "SELECT result_json FROM action_records WHERE result_json IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the action's answer");
+    journal
+        .execute("UPDATE action_records SET result_json = 'not json'", [])
+        .expect("the answer cannot be read");
+    let unreadable = failure(
+        client(&host)
+            .await
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(unreadable.code, ErrorCode::OutcomeUnknown, "{unreadable:?}");
+
+    // A refusal the journal recorded is told as it was recorded, whatever its code: the repeat is
+    // answered, and the host does not say it cannot read what it holds.
+    journal
+        .execute(
+            "UPDATE action_records SET result_json = NULL, error_code = 'STORAGE_UNAVAILABLE',
+                                       error_detail = 'the journal could not be written'",
+            [],
+        )
+        .expect("the action is recorded as refused");
+    let refused = failure(
+        client(&host)
+            .await
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    journal
+        .execute(
+            "UPDATE action_records SET result_json = ?1, error_code = NULL, error_detail = NULL",
+            [&kept],
+        )
+        .expect("the answer is restored");
+    assert_eq!(refused.code, ErrorCode::StorageUnavailable, "{refused:?}");
+
+    let again: WorkflowInstallResult = typed(
+        &client(&host)
+            .await
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the repeat is answered once the record can be read"),
+    );
+    assert_eq!(again, first);
+    host.clients.abort();
+}
+
 /// KR-REQ-19.04: a caller that lost its reply and asks again over a new connection is answered
 /// from the record.
 ///
@@ -4507,6 +4634,42 @@ async fn an_exhausted_chain_stays_paused_until_an_authorised_rearm_gives_it_a_ne
             .expect("the repeat is answered"),
     );
     assert_eq!(repeated, rearmed);
+    // The chain's budget cannot be read when the request comes again on another connection: whether
+    // the rearm was performed is not known, and the repeat is told so and not decided as a new
+    // request, which its freshness window would refuse. Once the budget reads again it is answered.
+    let budgets = rusqlite::Connection::open(
+        host._temp
+            .environment()
+            .state_dir()
+            .join(kr_automation::store::WORKFLOW_DB_NAME),
+    )
+    .expect("opens the workflow journal beside the daemon's own handle");
+    budgets
+        .busy_timeout(std::time::Duration::from_secs(30))
+        .expect("a busy timeout");
+    budgets
+        .execute(
+            "UPDATE causal_budgets SET generation = 'unreadable' WHERE causal_root_id = ?1",
+            [root.to_string()],
+        )
+        .expect("the budget is made unreadable");
+    let unknown = failure(
+        client(&host)
+            .await
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(unknown.code, ErrorCode::OutcomeUnknown, "{unknown:?}");
+    budgets
+        .execute(
+            "UPDATE causal_budgets SET generation = ?1 WHERE causal_root_id = ?2",
+            rusqlite::params![
+                i64::try_from(rearmed.generation.get()).expect("a generation"),
+                root.to_string()
+            ],
+        )
+        .expect("the budget is restored");
     // A request that leaves the generation the chain has left, under an action of its own, which
     // is what `kr` sends when it is run again, is told where the chain is and changes nothing.
     let told: WorkflowRearmResult = typed(

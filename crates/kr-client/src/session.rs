@@ -332,6 +332,16 @@ impl ComposedMutation {
     }
 }
 
+/// A mutation exactly as it went out, window included.
+///
+/// The host keys its record of an action by the request, and the same request under a later window
+/// is a different one. It is what an action the host refused for now is sent again as. It never
+/// prints the request.
+#[derive(Clone, PartialEq, Eq)]
+struct SentRequest(MutationRequest);
+
+crate::debug_fields!(SentRequest {});
+
 /// What this client knows about its own mutations.
 ///
 /// `correlations` is what lets the reader settle an action whose caller has gone: a correlated
@@ -344,6 +354,11 @@ struct Outcomes {
     /// The actions its caller does not hold that the host last refused for now, oldest first. They
     /// stay in `submitted`, and this is what bounds them.
     refused_for_now: VecDeque<ActionId>,
+    /// The request each action its caller does not hold went out as. It goes when the host's
+    /// answer settles the action or leaves it unresolved, and only an action refused for now keeps
+    /// it for good. A send that gets no answer keeps it until the action is settled, within the
+    /// bound on the book.
+    sent: BTreeMap<ActionId, SentRequest>,
 }
 
 impl Outcomes {
@@ -383,14 +398,46 @@ impl Outcomes {
         self.refused_for_now.push_back(action_id);
         while self.refused_for_now.len() > MAX_REFUSED_FOR_NOW {
             if let Some(oldest) = self.refused_for_now.pop_front() {
-                self.submitted.remove(&oldest);
+                self.forget(oldest);
             }
         }
+    }
+
+    /// Leaves the action one correlated answer belongs to on the book, neither settled nor marked:
+    /// the host could not say what became of it, or accepted it and has not finished. The action is
+    /// not sent again under its identifier, so the request it went out as is not kept.
+    fn leave_unresolved(&mut self, request_id: RequestId) {
+        if let Some(action_id) = self.correlations.remove(&request_id) {
+            self.sent.remove(&action_id);
+        }
+    }
+
+    /// The request an action the host refused for now went out as, when `asked` is the same send
+    /// again: the same in everything but the window and the request identifier it carries now.
+    ///
+    /// A send again goes out as it first did. Composed anew it would carry the window the host has
+    /// issued since, and a host that recorded the action under the request would take it for
+    /// another request under the same identifier and refuse it. A request that differs in anything
+    /// else, the evidence a host asked for, say, is another send and goes out as composed.
+    fn sent_before(&self, asked: &MutationRequest) -> Option<MutationRequest> {
+        let marked = self
+            .submitted
+            .get(&asked.action_id)
+            .is_some_and(|action| action.refused_for_now);
+        let SentRequest(sent) = self.sent.get(&asked.action_id).filter(|_| marked)?;
+        let mut same = asked.clone();
+        same.action_window_id = sent.action_window_id.clone();
+        same.request_id = sent.request_id;
+        (same == *sent).then(|| MutationRequest {
+            request_id: asked.request_id,
+            ..sent.clone()
+        })
     }
 
     /// Takes one action off the book.
     fn forget(&mut self, action_id: ActionId) {
         self.submitted.remove(&action_id);
+        self.sent.remove(&action_id);
         self.refused_for_now.retain(|listed| *listed != action_id);
     }
 
@@ -427,8 +474,9 @@ impl Outcomes {
         Ok(())
     }
 
-    /// Records one submission, or refuses when too many are already unresolved.
-    fn submit(&mut self, action: SubmittedAction) -> Result<()> {
+    /// Records one submission and the request it went out as, or refuses when too many are already
+    /// unresolved. An action its caller holds keeps no request here: the caller has it.
+    fn submit(&mut self, action: SubmittedAction, sent: Option<SentRequest>) -> Result<()> {
         // The actions the host refused for now are let go past their own bound, so they are not
         // the ones that fill the book.
         let unresolved = self
@@ -448,6 +496,11 @@ impl Outcomes {
             .insert(action.request_id, action.action_id);
         self.refused_for_now
             .retain(|listed| *listed != action.action_id);
+        if let Some(sent) = sent {
+            self.sent.insert(action.action_id, sent);
+        } else {
+            self.sent.remove(&action.action_id);
+        }
         self.submitted.insert(action.action_id, action);
         Ok(())
     }
@@ -917,7 +970,16 @@ impl Session {
     /// reason. Section 9 forbids forgetting an action, and this is where that would happen. An
     /// action the host refused for now ([`Session::mutate`]) is the exception: the host decided
     /// nothing of it, and sending it again under its own identifier is how a client tries the
-    /// same send again, which the host performs at most once.
+    /// same send again, which the host performs at most once. The same send goes out as it first
+    /// did, with the action window it first carried even when the host has issued a later one,
+    /// because the host keys its record of the action by the request. Sent so, it is a question
+    /// about the action as much as a try: a host that holds an answer for the action gives it
+    /// whatever has become of the window, and one that holds none cannot first-admit the request
+    /// once its window has ended, so it refuses it in its definite word, which settles the send as
+    /// not taken and is the caller's to be told. The library never composes the send anew under a
+    /// later window for the caller, since replacing a window changes the request and is never an
+    /// automatic retry: a caller that still wants the action sends a new request
+    /// ([`Session::mutate`]). A send that differs in anything else goes out as composed now.
     ///
     /// In every other respect this is [`Session::mutate`], including the outstanding bound and the
     /// uncertainty an interrupted send leaves behind.
@@ -1000,7 +1062,7 @@ impl Session {
         let waiter = self.register(request_id)?;
         let target_record = target.clone();
         let params_record = ParamsValue::from_typed(params)?;
-        let mutation = MutationRequest {
+        let mut mutation = MutationRequest {
             request_id,
             method: method.into(),
             method_version: entry.version,
@@ -1012,6 +1074,18 @@ impl Session {
             requested_ttl_ms: requested_ttl,
             params: params_record.clone(),
         };
+        // One lock from the look at what the host refused for now to the record of this send. An
+        // answer that marks the action refused for now in between would otherwise let a send
+        // that was composed anew, under the window the connection holds now, go out in place of
+        // the one the host refused, which is the send the host keyed the action by.
+        let mut outcomes = self.state.outcomes.lock().await;
+        // The same send again, after the host refused it for now, goes out as it first did.
+        if identity.is_continuation()
+            && let Some(sent) = outcomes.sent_before(&mutation)
+        {
+            mutation = sent;
+        }
+        let sent = SentRequest(mutation.clone());
 
         // The frame is built and checked against the negotiated bound *before* the action is
         // recorded. A frame that cannot be sent was never sent, so it is a definite failure rather
@@ -1034,12 +1108,11 @@ impl Session {
         //
         // A continuation is checked against the same book under the same lock, so nothing can
         // submit the action between the check and the record.
-        {
-            let mut outcomes = self.state.outcomes.lock().await;
-            if identity.is_continuation() {
-                outcomes.refuse_replacement(action_id)?;
-            }
-            outcomes.submit(SubmittedAction {
+        if identity.is_continuation() {
+            outcomes.refuse_replacement(action_id)?;
+        }
+        outcomes.submit(
+            SubmittedAction {
                 action_id,
                 method,
                 target: target_record,
@@ -1047,8 +1120,10 @@ impl Session {
                 request_id,
                 held: false,
                 refused_for_now: false,
-            })?;
-        }
+            },
+            Some(sent),
+        )?;
+        drop(outcomes);
         if self.transport.send(&frame).await.is_err() {
             // The frame may or may not have reached the host, so the action stays on the pending
             // list and the caller is told the outcome is unknown.
@@ -1280,15 +1355,18 @@ impl Session {
             outcomes
                 .refuse_replacement(action_id)
                 .map_err(|_| ClientError::StillAccounting)?;
-            outcomes.submit(SubmittedAction {
-                action_id,
-                method,
-                target: composed.request.target.clone(),
-                params: composed.request.params.clone(),
-                request_id,
-                held: true,
-                refused_for_now: false,
-            })?;
+            outcomes.submit(
+                SubmittedAction {
+                    action_id,
+                    method,
+                    target: composed.request.target.clone(),
+                    params: composed.request.params.clone(),
+                    request_id,
+                    held: true,
+                    refused_for_now: false,
+                },
+                None,
+            )?;
         }
         if self.transport.send(&frame).await.is_err() {
             return Err(ClientError::SubmissionUncertain { action_id });
@@ -1618,9 +1696,7 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
             match word_of(&response) {
                 HostWord::Definite => state.outcomes.lock().await.settle(request_id),
                 HostWord::Transient => state.outcomes.lock().await.refuse_for_now(request_id),
-                HostWord::Unknown => {
-                    state.outcomes.lock().await.correlations.remove(&request_id);
-                }
+                HostWord::Unknown => state.outcomes.lock().await.leave_unresolved(request_id),
             }
             state.answer(request_id, Answer::Response(response));
         }
@@ -1630,7 +1706,7 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
             {
                 let mut outcomes = state.outcomes.lock().await;
                 outcomes.receipts.record(receipt.clone());
-                outcomes.correlations.remove(&request_id);
+                outcomes.leave_unresolved(request_id);
                 if receipt.state.is_terminal()
                     && !outcomes
                         .submitted

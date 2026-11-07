@@ -193,6 +193,52 @@ impl ControllerError {
         }
     }
 
+    /// What a repeat of an action is told while the attempt that claimed it is still running.
+    ///
+    /// That attempt carries the action out, or has, so a transient word, which says nothing took
+    /// effect, would be false: what became of the action is not known yet, and the caller asks
+    /// again under the same identifier for the answer.
+    #[must_use]
+    pub fn attempt_still_running() -> Self {
+        Self::Uncertain {
+            detail: "another attempt under this action identifier has not finished, so what \
+                     became of the action is not known yet"
+                .to_owned(),
+        }
+    }
+
+    /// What a repeat of an action is told when the record of its first attempt cannot be read.
+    ///
+    /// `records` names what this host keeps the record in. A record that cannot be read is not one
+    /// that is absent: an earlier attempt may have carried the action out, so the repeat is neither
+    /// performed nor refused for something it did not do, and the caller asks again under the same
+    /// identifier for the answer once the record can be read.
+    #[must_use]
+    pub fn record_unreadable(records: &str) -> Self {
+        Self::Uncertain {
+            detail: format!(
+                "this host's record of its {records} cannot be read now, so whether an earlier \
+                 attempt at this action was carried out is not known; asking again under the \
+                 same action says what it did once the record can be read"
+            ),
+        }
+    }
+
+    /// What a repeat of an action is told of the failure of the read of its first attempt's record.
+    ///
+    /// A store that cannot be read is [`Self::record_unreadable`]: a transient word would say that
+    /// nothing took effect, and an earlier attempt may have carried the action out. Any other
+    /// failure is this host's word about the action, such as a reused identifier, and is told as it
+    /// is.
+    #[must_use]
+    pub fn found_unreadable(self, records: &str) -> Self {
+        if self.code() == ErrorCode::StorageUnavailable {
+            Self::record_unreadable(records)
+        } else {
+            self
+        }
+    }
+
     /// Builds a rendezvous refusal.
     pub fn rendezvous(detail: impl std::fmt::Display) -> Self {
         Self::RendezvousRefused {

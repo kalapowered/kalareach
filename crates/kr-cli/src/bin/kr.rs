@@ -1065,6 +1065,77 @@ async fn run(cli: Cli) -> Result<Completion> {
                 }
                 Ok(Completion::Done)
             }
+            HostCommand::PushGateways(gateways) => {
+                let environment = kr_cli::resolve::select(&paths, None)?;
+                // One validated edit of this user's own configuration document, as the shell mode
+                // is. The edit refuses an origin that is not one, by the name of the setting, and
+                // writes nothing. The daemon is reached and asked first, and must report the
+                // setting, or it would ignore what is written; it is asked again afterwards,
+                // because it is asking that puts the list in force, and a gateway taken out of it
+                // loses its credentials then. What is said is what it reports.
+                let change = if !gateways.set.is_empty() {
+                    Some(Some(gateways.set.clone()))
+                } else if gateways.clear {
+                    Some(None)
+                } else {
+                    None
+                };
+                let mut client = open_controller(&environment.paths, build_id()).await?;
+                let before: HostDoctorResult =
+                    host_read(&mut client, &environment.paths, Method::HostDoctor, &()).await?;
+                // The list the host reports is shown only when the host acts on its document, as a
+                // change says it was made only when the host reports it in force.
+                let mut listed = match change {
+                    Some(_) => kr_cli::doctor::configuration::push_gateways_reported(
+                        &before.configuration,
+                    )?,
+                    None => kr_cli::doctor::configuration::push_gateways_acted_on(
+                        &before.configuration,
+                    )?,
+                };
+                if let Some(chosen) = change {
+                    let written = chosen.clone().unwrap_or_default();
+                    let writers = kr_cli::barrier::hold_for_configuration(&environment.paths)?;
+                    let permit =
+                        kr_cli::barrier::permit(&writers, &kr_cli::doctor::configuration::WRITTEN)?;
+                    kr_cli::doctor::configuration::apply(
+                        &environment.paths,
+                        &kr_protocol::hostinfo::configuration::Change::PushGateways(chosen),
+                        &permit,
+                    )?;
+                    drop(writers);
+                    let after: HostDoctorResult =
+                        host_read(&mut client, &environment.paths, Method::HostDoctor, &()).await?;
+                    listed = kr_cli::doctor::configuration::push_gateways_in_force(
+                        &after.configuration,
+                        &written,
+                    )?;
+                }
+                if cli.json {
+                    output::document(
+                        &Document::new()
+                            .with("ok", true)
+                            .with("environment_id", output::said(&environment.environment_id))
+                            .with(
+                                "push_gateways",
+                                listed
+                                    .iter()
+                                    .map(|origin| Shown::address(origin))
+                                    .collect::<Vec<_>>(),
+                            ),
+                    );
+                } else if listed.is_empty() {
+                    output::say(&Shown::said(
+                        "this host delivers notifications through the official gateway only",
+                    ));
+                } else {
+                    output::say(&shown!(
+                        "this host delivers notifications through the official gateway and {}",
+                        Shown::joined(listed.iter().map(|origin| Shown::address(origin)), ", ")
+                    ));
+                }
+                Ok(Completion::Done)
+            }
             HostCommand::Terminal(terminal) => {
                 let environment = kr_cli::resolve::select(&paths, None)?;
                 let file = environment

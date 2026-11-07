@@ -1354,6 +1354,9 @@ pub enum HostCommand {
     Power(PowerArguments),
     /// Show or choose the shell mode a new session is created in when none is named.
     ShellMode(ShellModeArguments),
+    /// Show or choose the push gateways, besides the official one, that a paired device's
+    /// notification credential may name.
+    PushGateways(PushGatewaysArguments),
     /// Show the terminal applications this host has, and which one a new window opens in.
     Terminal(TerminalArguments),
     /// Show, add or take out the optional profile that makes each new window or tab of one
@@ -1699,6 +1702,22 @@ pub struct ShellModeArguments {
     #[arg(long)]
     pub set: Option<String>,
     /// Remove the choice, so that the product default, `managed`, decides.
+    #[arg(long, conflicts_with = "set")]
+    pub clear: bool,
+}
+
+/// `kr host push-gateways`.
+#[derive(Args)]
+pub struct PushGatewaysArguments {
+    /// The gateways to allow, each an `https` origin, or an `http` origin on a loopback address,
+    /// with no path and no trailing slash. The list replaces the one in force. The official
+    /// gateway is always allowed and is not listed. A gateway taken out of the list loses the
+    /// credentials the host holds for it at once. Without it, the list in force is shown and
+    /// nothing changes.
+    #[arg(long, num_args = 1.., value_name = "ORIGIN")]
+    pub set: Vec<String>,
+    /// Remove the list, so that the official gateway is the only one. Credentials held for the
+    /// gateways that were listed are let go of.
     #[arg(long, conflicts_with = "set")]
     pub clear: bool,
 }

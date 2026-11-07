@@ -42,6 +42,7 @@
 //! after the worker has acknowledged that revision. Local input and stopping owned execution never
 //! depend on that lease, because neither is remote dispatch.
 
+pub(crate) mod arrivals;
 pub mod clock_trust;
 pub mod config;
 mod device_errors;
@@ -70,7 +71,9 @@ use kr_protocol::pairing::NetworkConfig;
 use kr_protocol::scalars::EndpointKey;
 use kr_transport::clock::ContinuousInstant;
 use kr_transport::handshake::{HostEpochs, LocalIdentity, PairedDirectory};
-use kr_transport::listener::{AuthorisedSession, BoxFuture, HostHandler, ListenerConfig};
+use kr_transport::listener::{
+    AuthorisedSession, BoxFuture, FrameHold, HostHandler, ListenerConfig,
+};
 use kr_transport::preauth::PairingSurface;
 use kr_transport::window::AcceptedDeadline;
 
@@ -496,6 +499,26 @@ impl HostHandler for NetworkHost {
         Box::pin(async move {
             self.serve_connection(session).await;
         })
+    }
+
+    fn frame_read(
+        &self,
+        device_id: &DeviceId,
+        frame: &kr_protocol::envelope::ControlFrame,
+    ) -> Option<FrameHold> {
+        // A mutation is on this host from the moment its frame was read, although the connection's
+        // handler has not reached it: it is among the calls that have not claimed the route of
+        // their action ([`arrivals`]) while it waits in the connection's queue. The entry goes
+        // with the frame, and leaves when the call has claimed or the frame is dropped.
+        let kr_protocol::envelope::ControlFrame::Mutation(mutation) = frame else {
+            return None;
+        };
+        let controller = self.controller.upgrade()?;
+        let request = arrivals::request_of(
+            &kr_transport::listener::device_principal(device_id),
+            mutation,
+        )?;
+        Some(Box::new(controller.arrivals().arrive(request)))
     }
 
     fn control_stream_lost(&self, connection_id: ConnectionId) {
@@ -1750,6 +1773,11 @@ impl Controller {
     ///
     /// `receive` is what the device the close came from said it can receive, which the link the
     /// close opens says to the worker; a close with no device behind it says the usual limits.
+    ///
+    /// Returns whether the close's frame was put to the worker, so that the close was carried out
+    /// or may have been. A close of a session that is not running here, or whose deadline had
+    /// passed, or whose link could not be opened, did nothing; nor did one whose frame the check
+    /// of its standing stopped before the worker had all of it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn close_remote_session(
         self: &Arc<Self>,
@@ -1761,8 +1789,9 @@ impl Controller {
         answer: tokio::sync::oneshot::Sender<Result<ClosedRemotely>>,
         delivered: tokio::sync::oneshot::Receiver<()>,
         receive: kr_protocol::hello::ReceiveLimits,
-    ) {
+    ) -> bool {
         let mut link = None;
+        let mut reached_the_worker = false;
         let mut retained = Retained::Not;
         let settled = self
             .close_through(
@@ -1772,6 +1801,7 @@ impl Controller {
                 accepted,
                 observer,
                 &mut link,
+                &mut reached_the_worker,
                 &mut retained,
                 receive,
             )
@@ -1789,9 +1819,11 @@ impl Controller {
             let _ = tokio::time::timeout(CLOSE_DELIVERY, delivered).await;
             proxy.close();
         }
+        reached_the_worker
     }
 
-    /// The close itself. `link` receives the link it opened, whichever way the close ended.
+    /// The close itself. `link` receives the link it opened, whichever way the close ended, and
+    /// `reached_the_worker` whether the close's frame was put to the worker.
     #[allow(clippy::too_many_arguments)]
     async fn close_through(
         self: &Arc<Self>,
@@ -1801,6 +1833,7 @@ impl Controller {
         accepted: AcceptedDeadline,
         observer: Option<&dispatch::ExpiryObserver>,
         link: &mut Option<Arc<WorkerProxy>>,
+        reached_the_worker: &mut bool,
         retained: &mut Retained,
         receive: kr_protocol::hello::ReceiveLimits,
     ) -> Result<kr_protocol::envelope::ParamsValue> {
@@ -1871,11 +1904,21 @@ impl Controller {
         // at this machine can stop any session. It is asked of the standing the close took when it
         // was admitted, because this task outlives the connection that asked for it, and a
         // connection that has ended is in no table.
-        let answered = proxy
+        let withdrawn = std::sync::atomic::AtomicBool::new(false);
+        let forwarded = proxy
             .forward_mutation(mutation, vouched, deadline, &|| {
-                self.refuse_while_the_feed_refuses(standing)
+                let admitted = self.refuse_while_the_feed_refuses(standing);
+                if admitted.is_err() {
+                    withdrawn.store(true, std::sync::atomic::Ordering::Release);
+                }
+                admitted
             })
-            .await?;
+            .await;
+        // The check stops the frame whole or part way: the worker has none of it, or a part it acts
+        // on nothing of, and the close did nothing. Any other end of the exchange leaves the close
+        // carried out, or possibly carried out.
+        *reached_the_worker = !withdrawn.load(std::sync::atomic::Ordering::Acquire);
+        let answered = forwarded?;
         // Whether this came from the worker's journal rather than from a close it performed now.
         // The connection that asked decides whether it may be told a retained result; the close
         // itself happened either way, which is what section 7 asks of a stop.
@@ -1911,7 +1954,17 @@ impl Controller {
             .map_err(|_| unreadable_close_answer())?;
         // The worker's description of the session goes on in the answer as it came: what a device
         // is shown of it is decided where its answer is written.
-        self.settle_close_answer(session_id, &reply).await?;
+        //
+        // The worker took the close, so a closure it carries that this host cannot record leaves
+        // the close made: the caller is not told the store failed, which says nothing took effect.
+        self.settle_close_answer(session_id, &reply)
+            .await
+            .map_err(|unrecorded| ControllerError::Uncertain {
+                detail: format!(
+                    "the worker closed the session and this host could not record its closure: \
+                     {unrecorded}"
+                ),
+            })?;
         crate::service::encode(&reply)
     }
 

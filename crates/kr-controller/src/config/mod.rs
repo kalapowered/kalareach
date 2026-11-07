@@ -139,6 +139,11 @@ pub struct Accepted {
     pub not_in_force: Option<Sentence>,
     /// The rights ceiling a paired device's request is decided against.
     pub rights: EnforcedRights,
+    /// The push gateways besides the official one that this host delivers through right now.
+    ///
+    /// What is in force, which is the document's list when the reading produced one and the list
+    /// before it when it did not: a document nobody can read retires nothing.
+    pub push_gateways: Vec<String>,
 }
 
 /// The rights ceiling a paired device's request is decided against, and where it came from.
@@ -238,6 +243,11 @@ impl Accepted {
                 from_document: true,
             },
         );
+        let push_gateways = resolver
+            .loaded()
+            .document
+            .as_ref()
+            .map_or_else(Vec::new, |document| document.push.gateways().to_vec());
         Self {
             resolver,
             sessions,
@@ -249,6 +259,7 @@ impl Accepted {
             effects_applied: true,
             not_in_force: None,
             rights,
+            push_gateways,
         }
     }
 }
@@ -745,6 +756,13 @@ pub fn effective(
     ));
     // The test suites workflows can run, by name and declared output paths, and never by command.
     values.extend(configuration::automation_rows(
+        resolver.loaded().document.as_ref(),
+        &resolver.document().display().to_string(),
+    ));
+    // The push gateways besides the official one that a credential may name, which the host takes
+    // whenever the document is put into force.
+    values.push(configuration::push_row(
+        &accepted.push_gateways,
         resolver.loaded().document.as_ref(),
         &resolver.document().display().to_string(),
     ));

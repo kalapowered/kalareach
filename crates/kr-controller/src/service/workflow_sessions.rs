@@ -136,7 +136,8 @@ impl Controller {
                 Some(launch),
                 &|registry| admit(registry).map(|_| ()),
             )
-            .await?;
+            .await
+            .into_answer()?;
         parse(&created)
     }
 

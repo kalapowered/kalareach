@@ -78,6 +78,9 @@ $script:Kr = @{
     AcceptAnswered     = $false
     TokenPresent       = $false
     Token              = ''
+    # The entry of the read that is about to start, and whether the worker has answered it.
+    EnterId            = [uint64]0
+    EnterAnswered      = $true
     # The question last asked about a command, and the answer to it.
     ResolveId          = [uint64]0
     ResolveAnswered    = $false
@@ -194,13 +197,21 @@ function Get-KrProcessIdentity {
     }
     $ticks = ([System.DateTimeOffset]$process.StartTime).UtcTicks -
              [System.DateTimeOffset]::UnixEpoch.UtcTicks
-    # This platform's kernel records microseconds, and reports the value truncated. The truncation
-    # is written out because PowerShell divides whole numbers as doubles and a cast to an integer
-    # rounds the result: a shell started after the half unit would name a start one unit later than
-    # the one the worker read from the kernel, and the handshake would be refused as a different
-    # process.
-    $start = [uint64][Math]::Floor([decimal]$ticks / [decimal]10)
-    @{ pid = [uint64]$process.Id; source = 'macos_proc_bsd_info'; start_value = $start }
+    @{ pid = [uint64]$process.Id; source = 'macos_proc_bsd_info'; start_value = (ConvertTo-KrStartMicroseconds $ticks) }
+}
+
+# The start of a process in the microseconds this platform's kernel records, from the runtime's
+# time for it in hundreds of nanoseconds.
+#
+# The runtime derives its time from the kernel's by arithmetic that leaves it a few hundred
+# nanoseconds above or below the kernel's value: 17939325736990098 is the kernel's 1793932573699010,
+# and truncating it names 1793932573699009. The nearest microsecond is the kernel's, and the worker
+# refuses a shell whose start differs from the one it read by a unit as a different process. Half a
+# unit is added and the rest dropped, with the division written out because PowerShell divides
+# whole numbers as doubles and a cast to an integer rounds the result.
+function ConvertTo-KrStartMicroseconds {
+    param([int64]$Ticks)
+    [uint64][Math]::Floor(([decimal]$Ticks + [decimal]5) / [decimal]10)
 }
 
 function ConvertFrom-KrBase64Url {
@@ -478,12 +489,20 @@ function Receive-KrPipeAvailable {
     while ($true) {
         $pending = $script:Kr.PipeRead
         if ($null -eq $pending) {
-            if (-not $Pipe.IsConnected) { Disconnect-KrEndpoint; return $false }
+            # The worker has closed its end. What it sent before that is read first: the
+            # disconnection discards the bytes not yet read, a refusal among them, and the next
+            # look finds the end alone and disconnects then.
+            if (-not $Pipe.IsConnected) {
+                if ($taken -gt 0) { return $true }
+                Disconnect-KrEndpoint
+                return $false
+            }
             if ($null -eq $script:Kr.PipeBuffer) { $script:Kr.PipeBuffer = [byte[]]::new(8192) }
             try {
                 $pending = $Pipe.ReadAsync(
                     $script:Kr.PipeBuffer, 0, $script:Kr.PipeBuffer.Length)
             } catch {
+                if ($taken -gt 0) { return $true }
                 Disconnect-KrEndpoint
                 return $false
             }
@@ -495,9 +514,17 @@ function Receive-KrPipeAvailable {
         # Nothing has arrived. The read stays in flight and the reader goes back to its own work.
         if (-not $pending.IsCompleted) { return $true }
         $script:Kr.PipeRead = $null
-        if ($pending.IsFaulted -or $pending.IsCanceled) { Disconnect-KrEndpoint; return $false }
+        if ($pending.IsFaulted -or $pending.IsCanceled) {
+            if ($taken -gt 0) { return $true }
+            Disconnect-KrEndpoint
+            return $false
+        }
         $count = $pending.Result
-        if ($count -le 0) { Disconnect-KrEndpoint; return $false }
+        if ($count -le 0) {
+            if ($taken -gt 0) { return $true }
+            Disconnect-KrEndpoint
+            return $false
+        }
         $buffer = $script:Kr.PipeBuffer
         for ($i = 0; $i -lt $count; $i++) { $script:Kr.Incoming.Add($buffer[$i]) }
         $taken += $count
@@ -513,14 +540,24 @@ function Receive-KrAvailable {
         return (Receive-KrPipeAvailable $socket)
     }
     $buffer = [byte[]]::new(8192)
+    $collected = $false
     while ($true) {
         try {
             if (-not $socket.Poll(0, [System.Net.Sockets.SelectMode]::SelectRead)) { break }
             $count = $socket.Receive($buffer, 0, $buffer.Length, 'None')
-            if ($count -eq 0) { Disconnect-KrEndpoint; return $false }
+            if ($count -eq 0) {
+                # The worker has closed its end. What it sent before that is read first: the
+                # disconnection discards the bytes not yet read, a refusal among them, and the next
+                # look finds the end alone and disconnects then.
+                if ($collected) { break }
+                Disconnect-KrEndpoint
+                return $false
+            }
+            $collected = $true
             for ($i = 0; $i -lt $count; $i++) { $script:Kr.Incoming.Add($buffer[$i]) }
         } catch [System.Net.Sockets.SocketException] {
             if ($_.Exception.SocketErrorCode -eq [System.Net.Sockets.SocketError]::WouldBlock) { break }
+            if ($collected) { break }
             Disconnect-KrEndpoint
             return $false
         } catch {
@@ -676,6 +713,22 @@ function Get-KrHandshakeWaitMs {
     [uint64]$script:KR_HANDSHAKE_WAIT_MS
 }
 
+# What the worker said when it refused the hello: the reason and its message, or what stands in their
+# place when the refusal does not carry them.
+function Get-KrRefusalText {
+    param($Payload)
+    $reason = 'refused'
+    $detail = 'the worker refused the hello'
+    if ($Payload -is [System.Collections.IDictionary]) {
+        if ($Payload.Contains('reason') -and $Payload['reason'] -is [string]) { $reason = $Payload['reason'] }
+        if ($Payload.Contains('error') -and $Payload['error'] -is [System.Collections.IDictionary] -and
+            $Payload['error'].Contains('message') -and $Payload['error']['message'] -is [string]) {
+            $detail = $Payload['error']['message']
+        }
+    }
+    @{ Reason = $reason; Detail = $detail }
+}
+
 function Wait-KrHandshake {
     $deadline = (Get-KrTickMs) + (Get-KrHandshakeWaitMs)
     while ($true) {
@@ -691,6 +744,12 @@ function Wait-KrHandshake {
             $verdict = Get-KrVariant $outcome.Payload
             if ($null -eq $verdict -or $verdict.Name -ne 'accepted') {
                 Write-KrTrace "refused: $(if ($null -eq $verdict) { 'a verdict that is not a variant' } else { $verdict.Name })"
+                # The shell goes on as the person's own, and the person is told why it has no
+                # integration, in the worker's words.
+                if ($null -ne $verdict -and $verdict.Name -eq 'refused') {
+                    $why = Get-KrRefusalText $verdict.Payload
+                    Write-KrDiagnostic $why.Reason $why.Detail
+                }
                 return $false
             }
             Read-KrAccept $verdict.Payload
@@ -757,7 +816,39 @@ function Send-KrEditorEnter {
         reader_revision   = $reader.reader_revision
         prompt_generation = $reader.prompt_generation
     }
+    $script:Kr.EnterId = $script:Kr.LastEventId
+    $script:Kr.EnterAnswered = $false
     Invoke-KrService
+}
+
+# Waits for the worker's answer to the entry just sent, so that the editor does not start its read
+# before the worker has applied the entry.
+#
+# Outside Windows the editor asks the terminal where the cursor is as it starts, and the worker
+# holds every other answer it writes for the terminal back until it has written the reply to that
+# question. It holds them only once it has applied the entry. The entry and the terminal's output
+# reach the worker by two paths in no fixed order, so a read that started at once could ask its
+# question before the entry was applied, and the worker would let the question go by.
+#
+# The wait is the length of one answer budget at most, and is not made again while an earlier
+# answer is owed: a worker that has stopped answering costs this once.
+function Wait-KrEntryAnswered {
+    if ($IsWindows -or -not $script:Kr.Registered) { return }
+    $id = $script:Kr.EnterId
+    if ($id -eq 0 -or $script:Kr.EnterAnswered) { return }
+    Read-KrAnswers
+    if ($script:Kr.EnterAnswered) { return }
+    if ($script:Kr.Owed -ne 0) {
+        Write-KrTrace "entry ${id}: not waited for: event $($script:Kr.Owed) is still unanswered"
+        return
+    }
+    Write-KrTrace "entry ${id}: waiting for the worker's answer"
+    $deadline = (Get-KrTickMs) + $script:KR_ANSWER_WAIT_MS
+    if (Wait-KrAnswer $id { $script:Kr.EnterAnswered } $deadline) {
+        Write-KrTrace "entry ${id}: answered"
+    } else {
+        Write-KrTrace "entry ${id}: no answer; the read starts"
+    }
 }
 
 function Send-KrEditorLeave {
@@ -1282,6 +1373,11 @@ function Read-KrEventResult {
     # The worker answers in the order it was asked, so this answer, or a later one, is the owed one
     # having come.
     if ($script:Kr.Owed -ne 0 -and $Id -ge $script:Kr.Owed) { $script:Kr.Owed = [uint64]0 }
+    if ($Id -ne 0 -and $Id -eq $script:Kr.EnterId -and -not $script:Kr.EnterAnswered) {
+        # Whatever the worker says of the entry, it has dealt with it: the read may start.
+        $script:Kr.EnterAnswered = $true
+        return
+    }
     $variant = Get-KrVariant $Result
     if ($null -eq $variant) { return }
     $detach = $script:Kr.DetachIds.IndexOf($Id)
@@ -1400,6 +1496,7 @@ function Read-KrAnswers {
                 return
             }
             if (($id -eq $script:Kr.AcceptId -and -not $script:Kr.AcceptAnswered) -or
+                ($id -eq $script:Kr.EnterId -and -not $script:Kr.EnterAnswered) -or
                 ($id -eq $script:Kr.ResolveId -and -not $script:Kr.ResolveAnswered)) {
                 Read-KrEventResult $id $variant.Payload['result']
                 $taken = $true

@@ -75,6 +75,12 @@
       "file": "patches/0004-fish-command-resolve.patch",
       "revision": "1",
       "purpose": "The line the root shell runs is reported as a command block, with the capability minted for it exported to its commands and removed with it, and a line the person cancels while the worker is told of it is ended before it runs; and the question in front of each command of that line, asked in the executor before the fork, with the launcher its answer can name started in the command's place."
+    },
+    {
+      "name": "fish-host-answers",
+      "file": "patches/0005-fish-host-answers.patch",
+      "revision": "1",
+      "purpose": "A terminal's tertiary device attributes and its report of a setting, device control strings the reader does not use, are read to their terminator (outside a bracketed paste) once their header says which they are, so none of them is left in the input to be typed into the line (the byte read to tell a header from text is read again from the start, as a key or the start of a sequence), and a control sequence with parameters that ends in `t`, such as a report of the window, is no longer taken for a mouse report that takes the next two bytes with it."
     }
   ],
   "sources": [

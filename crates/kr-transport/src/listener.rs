@@ -225,7 +225,24 @@ pub trait HostHandler: PairedDirectory + Send + Sync + 'static {
     /// stops remote lease renewal. The data streams are revoked by the listener before this runs;
     /// stopping renewal is the host's half, because the host owns the leases.
     fn control_stream_lost(&self, _connection_id: ConnectionId) {}
+
+    /// Called by the task that reads a device's control stream, once for each frame it reads and
+    /// before the frame is queued for [`Self::serve`].
+    ///
+    /// A frame waits in the connection's queue for a handler that is answering an earlier one, and
+    /// until the handler reaches it the host has not seen it. What this returns travels with the
+    /// frame ([`ReceivedFrame::take_hold`]) and is dropped with it, so a host can account for a
+    /// request from the moment it was read, and its accounting ends with the frame wherever that
+    /// is: answered, dropped from a full queue, or left in the queue of a connection that ended.
+    /// It runs on the reader and must not wait.
+    fn frame_read(&self, _device_id: &DeviceId, _frame: &ControlFrame) -> Option<FrameHold> {
+        None
+    }
 }
+
+/// What a host holds for a control frame from the moment the stream's reader has read it. The
+/// transport does not look inside it.
+pub type FrameHold = Box<dyn std::any::Any + Send + Sync>;
 
 /// The control stream of an authorised connection.
 ///
@@ -248,18 +265,30 @@ pub struct ControlChannel {
 /// connection's queue for a handler that is answering an earlier one, and a lifetime measured from
 /// the moment the handler reaches it would hand back what that wait spent. The stamp is made by the
 /// task that reads the stream, before the frame is queued, and a handler cannot make one.
-#[derive(Debug)]
 pub struct ReceivedFrame {
     frame: ControlFrame,
     received_at: ContinuousInstant,
+    hold: Option<FrameHold>,
+}
+
+impl std::fmt::Debug for ReceivedFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReceivedFrame")
+            .field("frame", &self.frame)
+            .field("received_at", &self.received_at)
+            .field("held", &self.hold.is_some())
+            .finish()
+    }
 }
 
 impl ReceivedFrame {
-    /// A frame the stream reader has just read.
-    fn read(frame: ControlFrame, clock: &dyn ContinuousClock) -> Self {
+    /// A frame the stream reader has just read, with what the host holds for it.
+    fn read(frame: ControlFrame, clock: &dyn ContinuousClock, hold: Option<FrameHold>) -> Self {
         Self {
             received_at: clock.now(),
             frame,
+            hold,
         }
     }
 
@@ -267,7 +296,17 @@ impl ReceivedFrame {
     #[cfg(feature = "testing")]
     #[must_use]
     pub const fn at(frame: ControlFrame, received_at: ContinuousInstant) -> Self {
-        Self { frame, received_at }
+        Self {
+            frame,
+            received_at,
+            hold: None,
+        }
+    }
+
+    /// What the host held for this frame when the reader read it ([`HostHandler::frame_read`]), if
+    /// it held anything. The host that takes it owns it from then on.
+    pub fn take_hold(&mut self) -> Option<FrameHold> {
+        self.hold.take()
     }
 
     /// The frame.
@@ -731,6 +770,8 @@ async fn serve_authorised<H: HostHandler>(
         connection.clone(),
         Arc::clone(&lost),
         Arc::clone(&state.clock),
+        Arc::clone(&state.handler) as Arc<dyn FrameWatch>,
+        authorised.peer_device_id,
     ));
     // While this flag is set the keepalive may issue a window. The guard clears it before it
     // retires the connection, and the keepalive retires any window it issued after the flag was
@@ -885,9 +926,12 @@ async fn control_read_loop(
     connection: Connection,
     lost: Arc<ControlLoss>,
     clock: Arc<dyn ContinuousClock>,
+    watch: Arc<dyn FrameWatch>,
+    device_id: DeviceId,
 ) {
     while let Ok(Some(frame)) = reader.read_message::<ControlFrame>().await {
-        match frames.try_send(ReceivedFrame::read(frame, &*clock)) {
+        let hold = watch.frame_read(&device_id, &frame);
+        match frames.try_send(ReceivedFrame::read(frame, &*clock, hold)) {
             Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 connection.close(CONTROL_LOST.into(), b"the control queue overflowed");
@@ -901,6 +945,17 @@ async fn control_read_loop(
 
 /// The QUIC application error code an unpaired connection is closed with when pairing is not open.
 pub const REFUSED_UNPAIRED: u32 = 2;
+
+/// The half of [`HostHandler`] the control stream's reader needs.
+trait FrameWatch: Send + Sync {
+    fn frame_read(&self, device_id: &DeviceId, frame: &ControlFrame) -> Option<FrameHold>;
+}
+
+impl<H: HostHandler> FrameWatch for H {
+    fn frame_read(&self, device_id: &DeviceId, frame: &ControlFrame) -> Option<FrameHold> {
+        HostHandler::frame_read(self, device_id, frame)
+    }
+}
 
 /// The half of [`HostHandler`] the stream registry needs.
 trait ControlLossListener: Send + Sync + std::fmt::Debug {

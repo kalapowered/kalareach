@@ -1858,6 +1858,11 @@ async fn the_screen_preview_is_read_from_a_real_worker_through_the_command() {
 /// host, and is told what an invitation to it carries before it accepts: the actions, that the
 /// live view is included, where its history begins, and none of the text on the screen its issuer
 /// was shown. The screen is a real worker's, and the issuer is shown its line.
+///
+/// KR-REQ-18.12, the live-screen option only: the issuer chooses it with the role, is shown the
+/// visible line of the session's screen before the invitation exists, and the offer the invitation
+/// issues says the live view is included. Not shown here: the role and the earlier-history choices,
+/// or sharing from `kr`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_offer_to_a_guest_tells_what_it_carries_and_none_of_the_screen_the_issuer_was_shown() {
     let adopted = Adopted::start(1).await;

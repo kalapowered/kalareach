@@ -90,7 +90,8 @@ with `device.push.register` over its paired connection. The call names no device
 the device the connection authenticated as.
 
 The host does not take the device's word for the credential. Before it keeps anything it checks
-that the credential names the KalaReach push gateway, lasts no longer than thirty days, has not
+that the credential names the KalaReach push gateway or one the host's configuration lists (see
+"Gateways the host delivers through"), lasts no longer than thirty days, has not
 expired, was not issued in the future, and is for the device's own installation: an installation is
 named by the hash of the key it authenticates with, and the host recorded that key when it paired
 the device. It refuses an authorisation or an installation that another destination names, in
@@ -353,6 +354,82 @@ was held, and it tries again an ending that failed: the expiry is on record by t
 else would. A device record that cannot be marked revoked ends the destination all the same, before
 the unpairing answers with its error. A destination that already received a notification stays in the
 journal, out of service and with no rule, as the name of what was sent to it.
+
+### Gateways the host delivers through
+
+A credential names the gateway that issued it, and the host sends every notification, status
+question and renewal under it to that origin. The host therefore allows two kinds of origin: the
+official gateway, which is always allowed, and the ones listed in the `push.gateways` setting of its
+configuration document (`docs/host/README.md`; `kr host push-gateways` writes it). Nothing else is
+allowed, and a device cannot change that by naming an origin in a credential.
+
+The host checks the set in three places.
+
+- A registration is checked before the gateway is asked about the credential, and again when the
+  registration is written, under the lock that the retirement below takes. A registration is
+  therefore written before the list moves and then retired with the rest, or refused after it.
+- The store of held credentials returns nothing for an origin outside the set. A notification, a
+  status question, a request to forget and a renewal for such a credential do not start, and a
+  notification settles as revoked, as it does for a destination with no credential.
+- Every exchange under a bearer (a post, a status question, a request to forget, a renewal, and the
+  confirmation of a registration) is made through the same set when it starts. One that begins after
+  a gateway was taken out never leaves the host. One that began before it is carried out. A request
+  still waiting for its connection when the gateway is taken out can leave the host up to about ten
+  seconds later, which can be after `kr host push-gateways` has said the list is in force: the
+  transport waits five seconds for a connection and tries once more. One already written ends
+  within twenty seconds, the longest the transport gives one exchange.
+
+A revocation is the one request that still goes to a gateway that was taken out. It carries no
+bearer and no notification, and it is how that gateway is told to end what it issued.
+
+An authorisation is named by its identifier alone, so the host refuses a credential whose
+identifier it holds for another gateway, and a credential for an authorisation it is revoking.
+
+#### Taking a gateway out of the list
+
+The host takes the document's list whenever it puts the document into force: when a command asks
+it (`kr host push-gateways` does, and so do `kr doctor` and any command that asks the host about
+itself), and at its start. For every credential it holds for a gateway that the list no longer
+allows, it then does what unpairing does, in the same order. It writes down that it owes the gateway
+a revocation, at the origin the credential names, and then forgets the credential from memory and
+from the secret store. It asks for the revocation at once. The destination stays, because its device
+is still paired and its preview keys stay. It holds no credential, so its notifications settle as
+revoked until the device registers again through a gateway the host allows. The authorisation it
+held before cannot be registered again while the revocation is owed.
+
+The debt is the one unpairing writes, in the same table of the delivery journal, and it is asked for
+the same way: at once, then again further apart each time, up to every six hours, and across
+restarts. It differs in when it ends. While the gateway is out of the list the debt ends only when
+the gateway has revoked the authorisation or has refused the opening of the revocation with
+`FORBIDDEN`, and it is never given up after thirty days. A gateway that never answers stays owed, at
+one ask every six hours, and no command drops the debt. If the owner lists the gateway again, it is
+an allowed gateway once more and a debt owed to it is given up after thirty days as any other is.
+The revocation is sent with the reason `Unpaired`, which is the one a revocation of this kind has;
+the device is still paired. A later unpairing, or a new authorisation that replaces the one a
+device holds, owes one more revocation at the official gateway once the debt has settled; that
+gateway holds no such authorisation and refuses it, which ends that debt.
+
+The list comes from the configuration document on disk, never from the copy of the accepted
+document that the registry records. A document the host cannot use, and an absent one, leave the
+list in force as it was, so a damaged file retires nothing. If the host cannot write a debt down,
+it leaves that credential held and unusable, reports that the document is not in force, and tries
+again the next time the document is put into force. A start over such a document stops. A start
+that finds the document unusable, after a release that does not read the section recorded the copy
+of the accepted document without it, starts with the official gateway only, and nothing is retired:
+notifications for a device that registered through a listed gateway settle as revoked until the
+document is usable and the host has put it into force. Such a host also makes no exchange with any
+gateway until it is restarted over a usable document (`docs/host/README.md`), so delivery needs
+both.
+
+A document edited by hand takes effect the next time the host puts the document into force, as
+every other value does; `kr host push-gateways` writes the setting and asks the host straight away.
+A release that reads configuration level 6 ignores the section, registers a credential from the
+official gateway only, and goes on using the credentials it holds. It reads the delivery journal,
+so a revocation that is owed when the host is rolled back to it is asked for there: it does not
+load a credential that an owed revocation names, it removes the item from the secret store, and it
+asks the gateway at the recorded origin to revoke. It gives a debt up after thirty days. A removal
+that no release that knows the section has put into force, because the document was edited and the
+host rolled back before any such release ran, is not carried to the earlier release.
 
 ## Who may be told
 

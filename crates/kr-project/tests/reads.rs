@@ -1,12 +1,13 @@
 //! What an invocation for a caller bounded by a grant can read.
 //!
 //! On Linux such an invocation runs inside one Landlock ruleset with no rule on the whole
-//! filesystem. It reads the directories the operation owns, the ones it is lent, Git's own program
-//! and helper directory, the four device nodes and the support set named for this host's Git, and
-//! nothing else the account can read. Each refusal here sits beside its control: the same
-//! operation on the same objects with exactly one restriction lifted, which reads what the refusal
-//! did not. Where the refusal is the kernel's, it is shown in the child's own words, as a refusal
-//! to open the object, rather than as an exit code.
+//! filesystem. On macOS it runs inside a sandbox profile that denies by default and names what it
+//! may read. On both it reads the directories the operation owns, the ones it is lent, Git's own
+//! program, the device nodes and the support set named for this host's Git, and on Linux its helper
+//! directory, and nothing else the account can read. Each refusal here sits beside its control: the
+//! same operation on the same objects with exactly one restriction lifted, which reads what the
+//! refusal did not. Where the refusal is the system's, it is shown in the child's own words, as a
+//! refusal to open the object, rather than as an exit code.
 //!
 //! Elsewhere no platform confines what Git reads, and such an invocation is refused with the
 //! reason.
@@ -21,7 +22,7 @@ fn bounded() -> Option<ReadAdmission> {
     Some(ReadAdmission::new(|| Ok(())).bounded())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn a_platform_that_does_not_confine_reads_refuses_a_bounded_caller_with_its_reason() {
     let fixture = Fixture::create();
@@ -46,20 +47,9 @@ fn a_platform_that_does_not_confine_reads_refuses_a_bounded_caller_with_its_reas
         refusal.to_string().contains(said),
         "the refusal says why: {refusal}"
     );
-    // The control: the owner's own invocation of the same command on the same repository runs
-    // where this platform runs Git at all.
-    #[cfg(target_os = "macos")]
-    assert!(
-        fixture
-            .service()
-            .profile()
-            .run(&kr_project::git::GitRequest::read(&path, &arguments))
-            .expect("the owner's status runs")
-            .success
-    );
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn a_platform_that_does_not_confine_reads_does_not_qualify_and_starts_no_git_to_say_so() {
     let fixture = Fixture::create();
@@ -76,8 +66,8 @@ fn a_platform_that_does_not_confine_reads_does_not_qualify_and_starts_no_git_to_
     );
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod confined {
     use std::ffi::{OsStr, OsString};
     use std::io::Read as _;
     use std::path::{Path, PathBuf};
@@ -88,11 +78,21 @@ mod linux {
 
     use super::{Fixture, bounded, support};
 
+    /// What the child's own error says when the system refuses it a file or a program: the
+    /// kernel's words on Linux, and the sandbox's on macOS.
+    const REFUSED: &str = if cfg!(target_os = "macos") {
+        "Operation not permitted"
+    } else {
+        "Permission denied"
+    };
+
     /// What one enclosed child did, in its own words, and the environment it was given.
     struct Outcome {
         status: Option<i32>,
         stdout: String,
         stderr: String,
+        /// Read by the case that compares what Git printed with what it was given.
+        #[cfg(target_os = "linux")]
         environment: Vec<(OsString, OsString)>,
     }
 
@@ -103,6 +103,8 @@ mod linux {
         helpers: Vec<PathBuf>,
         readable: Vec<PathBuf>,
         reads: Reads,
+        /// The directory the child may execute programs from, when it is not Git's own.
+        exec_path: Option<PathBuf>,
     }
 
     /// Starts one child inside the boundary as the profile starts Git, and keeps the child's own
@@ -118,7 +120,9 @@ mod linux {
         let temporary = tempfile::TempDir::new().expect("a temporary directory for the child");
         let confinement = Confinement {
             program: enclosed.program.to_owned(),
-            exec_path: git.exec_path().to_owned(),
+            exec_path: enclosed
+                .exec_path
+                .unwrap_or_else(|| git.exec_path().to_owned()),
             helpers: enclosed.helpers,
             working: OpenedDirectory::open(environment_id, working, None)
                 .expect("the working directory opens"),
@@ -174,6 +178,7 @@ mod linux {
             status: status.code(),
             stdout,
             stderr,
+            #[cfg(target_os = "linux")]
             environment,
         }
     }
@@ -230,6 +235,7 @@ mod linux {
                 helpers: Vec::new(),
                 readable,
                 reads,
+                exec_path: None,
             },
         )
     }
@@ -239,7 +245,7 @@ mod linux {
     fn assert_refused(outcome: &Outcome, secret: &str, what: &str) {
         assert_ne!(outcome.status, Some(0), "{what}: Git reports the failure");
         assert!(
-            outcome.stderr.contains("Permission denied"),
+            outcome.stderr.contains(REFUSED),
             "{what}: the kernel refused to open it, and Git said {}",
             outcome.stderr
         );
@@ -266,11 +272,14 @@ mod linux {
             proved.detail()
         );
         assert!(proved.detail().is_empty());
-        let reading = proved.narrowing();
-        assert!(
-            reading.user_namespaces.is_some() && reading.automounts.is_some(),
-            "the narrowing facts are read on Linux: {reading:?}"
-        );
+        #[cfg(target_os = "linux")]
+        {
+            let reading = proved.narrowing();
+            assert!(
+                reading.user_namespaces.is_some() && reading.automounts.is_some(),
+                "the narrowing facts are read on Linux: {reading:?}"
+            );
+        }
 
         let home = fixture.service().profile().home_directory().to_owned();
         let moved = home.with_file_name("home-moved-aside");
@@ -294,6 +303,7 @@ mod linux {
     /// A kernel without the interface the rules need does not qualify, and the doctor is told that
     /// cause and not that the host cannot name its Git's libraries. The kernel is not changed: the
     /// answer to the boundary's own probe is, on this thread only.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_kernel_without_the_interface_does_not_qualify_and_is_not_taken_for_a_missing_library() {
         use kr_project::service::Refusal;
@@ -315,6 +325,7 @@ mod linux {
     /// A platform that runs no Git does not qualify, and the doctor is told that cause and not
     /// that the host cannot name its Git's libraries. The machine is not changed: the answer to
     /// whether the platform runs Git is, on this thread only.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_platform_that_runs_no_git_does_not_qualify_and_is_not_taken_for_a_missing_library() {
         use kr_project::service::Refusal;
@@ -492,6 +503,7 @@ mod linux {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_secret_in_each_broad_system_directory_is_refused() {
         let fixture = Fixture::create();
@@ -613,10 +625,19 @@ mod linux {
         let location = fixture.work().join("location");
         std::fs::create_dir(&location).expect("a location");
         let planted = location.join("planted-program");
+        // On Apple platforms the system's `sh` is a stand-in that looks up the shell it stands for
+        // before it runs anything, so the case uses the shell itself.
+        let (shell, interpreter) = if cfg!(target_os = "macos") {
+            (Path::new("/bin/bash"), "#!/bin/bash")
+        } else {
+            (Path::new("/bin/sh"), "#!/bin/sh")
+        };
         // Placed rather than written here, so no child another test starts can hold it open for
         // writing and have the kernel refuse it as busy, which is not the refusal under test.
-        kr_ipc::testing::place_script(&planted, "#!/bin/sh\necho planted-program-ran\n");
-        let shell = Path::new("/bin/sh");
+        kr_ipc::testing::place_script(
+            &planted,
+            format!("{interpreter}\necho planted-program-ran\n"),
+        );
         let run = |helpers: Vec<PathBuf>| {
             run_enclosed(
                 &fixture,
@@ -627,6 +648,7 @@ mod linux {
                     helpers,
                     readable: Vec::new(),
                     reads: bounded_reads(&fixture),
+                    exec_path: None,
                 },
             )
         };
@@ -636,7 +658,7 @@ mod linux {
             "the planted program did not run"
         );
         assert!(
-            refused.stderr.contains("Permission denied"),
+            refused.stderr.contains(REFUSED),
             "the kernel refused to execute it: {}",
             refused.stderr
         );
@@ -767,6 +789,7 @@ mod linux {
     /// own mounts away: the comparison is tested with and without the one mount over the same
     /// directories in `boundary::linux`, and the test after this one runs the same operation over
     /// the same location with the mount and without it.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_granted_directory_with_a_filesystem_mounted_beneath_it_is_refused_with_the_reason() {
         let fixture = Fixture::create();
@@ -798,6 +821,7 @@ mod linux {
     }
 
     /// Tells the run of this test inside a mount namespace where the location is.
+    #[cfg(target_os = "linux")]
     const INSIDE: &str = "KR_PROJECT_READS_LOCATION_INSIDE_A_MOUNT_NAMESPACE";
 
     /// A filesystem mounted beneath the operation's own location refuses the invocation.
@@ -806,6 +830,7 @@ mod linux {
     /// inside a namespace that bubblewrap makes, with a filesystem mounted beneath the location,
     /// and the refusal is asserted there. A host whose bubblewrap cannot make a namespace does not
     /// exercise it and says so.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_filesystem_mounted_beneath_the_location_refuses_a_bounded_invocation() {
         if let Some(location) = std::env::var_os(INSIDE) {
@@ -852,7 +877,7 @@ mod linux {
             .arg(std::env::current_exe().expect("this test's own program"))
             .args([
                 "--exact",
-                "linux::a_filesystem_mounted_beneath_the_location_refuses_a_bounded_invocation",
+                "confined::a_filesystem_mounted_beneath_the_location_refuses_a_bounded_invocation",
                 "--nocapture",
                 "--test-threads=1",
             ])
@@ -870,6 +895,7 @@ mod linux {
     }
 
     /// The half of the test above that runs inside the namespace.
+    #[cfg(target_os = "linux")]
     fn inside_the_namespace(location: &Path) {
         let table = std::fs::read_to_string("/proc/self/mountinfo").expect("the mount table");
         let mounted = location.join("mounted");
@@ -900,5 +926,1550 @@ mod linux {
             .run(&repository.read(&status))
             .expect("the owner's status starts");
         assert!(owner.success, "the owner's status runs: {}", owner.stderr);
+    }
+
+    /// The cases only a macOS host runs: what the host reads outside the system's own paths, the
+    /// mount check against a disk image this account attaches, and the support set read from the
+    /// load commands of Mach-O files.
+    #[cfg(target_os = "macos")]
+    mod macos {
+        use std::ffi::{OsStr, OsString};
+        use std::path::{Path, PathBuf};
+        use std::process::Command;
+
+        use kr_project::identity::OpenedRepository;
+
+        use super::{
+            Enclosed, Fixture, REFUSED, Reads, assert_refused, bounded, bounded_reads,
+            read_as_configuration, run_enclosed, support,
+        };
+
+        /// A disk image this account attached at a directory, detached when it goes.
+        struct Attached {
+            mount: PathBuf,
+        }
+
+        impl Attached {
+            /// Makes a small image in `scratch` and attaches it at `directory`, or says so and
+            /// returns nothing on a host that will not.
+            fn at(directory: &Path, scratch: &Path) -> Option<Self> {
+                Self::spelled(directory, directory, scratch)
+            }
+
+            /// Attaches it at `spelled`, which is another name for `directory`, and detaches it
+            /// by `directory`.
+            fn spelled(directory: &Path, spelled: &Path, scratch: &Path) -> Option<Self> {
+                let image = scratch.join(format!("{}.dmg", uuid::Uuid::new_v4().simple()));
+                let made = Command::new("/usr/bin/hdiutil")
+                    .args([
+                        "create", "-size", "2m", "-fs", "APFS", "-volname", "krreads",
+                    ])
+                    .arg(&image)
+                    .output();
+                let Ok(made) = made else {
+                    println!("not exercised: this host cannot run the tool that makes an image");
+                    return None;
+                };
+                if !made.status.success() {
+                    println!(
+                        "not exercised: this host cannot make a disk image: {}",
+                        String::from_utf8_lossy(&made.stderr)
+                    );
+                    return None;
+                }
+                let attached = Command::new("/usr/bin/hdiutil")
+                    .args(["attach", "-nobrowse", "-noverify", "-mountpoint"])
+                    .arg(spelled)
+                    .arg(&image)
+                    .output();
+                let Ok(attached) = attached else {
+                    println!("not exercised: this host cannot run the tool that attaches an image");
+                    return None;
+                };
+                if !attached.status.success() {
+                    println!(
+                        "not exercised: this host cannot attach a disk image: {}",
+                        String::from_utf8_lossy(&attached.stderr)
+                    );
+                    return None;
+                }
+                Some(Self {
+                    mount: directory.to_owned(),
+                })
+            }
+        }
+
+        /// A directory moved from one place to another, moved back when it goes, so that a case
+        /// that fails between the two moves still leaves the image attached under it where it was
+        /// attached, and the detach finds it.
+        struct Carried {
+            now: PathBuf,
+            was: PathBuf,
+        }
+
+        impl Drop for Carried {
+            fn drop(&mut self) {
+                if self.now.exists() {
+                    let _ = std::fs::rename(&self.now, &self.was);
+                }
+            }
+        }
+
+        impl Drop for Attached {
+            fn drop(&mut self) {
+                let detached = Command::new("/usr/bin/hdiutil")
+                    .arg("detach")
+                    .arg(&self.mount)
+                    .arg("-force")
+                    .output();
+                if !detached.as_ref().is_ok_and(|done| done.status.success()) {
+                    eprintln!(
+                        "the disk image at {} was not detached: {detached:?}",
+                        self.mount.display()
+                    );
+                }
+            }
+        }
+
+        /// A secret in the machine's shared temporary directory, and the system's own hosts file,
+        /// are not read by a bounded invocation, and are read by the owner and, for the secret,
+        /// once the file itself is lent. Neither lies in a tree the profile names. The directory
+        /// is not lent: other cases attach disk images beneath their own directories in it, and a
+        /// bounded invocation over the whole of it would then be refused for them.
+        #[test]
+        fn a_secret_in_the_shared_temporary_directory_and_in_the_systems_configuration_is_refused()
+        {
+            let fixture = Fixture::create();
+            let location = fixture.work().join("location");
+            std::fs::create_dir(&location).expect("a location");
+
+            let shared = std::env::temp_dir();
+            let planted = shared.join(format!("kr-reads-{}.config", uuid::Uuid::new_v4().simple()));
+            std::fs::write(&planted, "[secret]\n\tvalue = in-the-shared-directory\n")
+                .expect("a file in the shared temporary directory");
+            let confined = read_as_configuration(
+                &fixture,
+                &location,
+                &planted,
+                Vec::new(),
+                bounded_reads(&fixture),
+            );
+            let granted = read_as_configuration(
+                &fixture,
+                &location,
+                &planted,
+                vec![planted.clone()],
+                bounded_reads(&fixture),
+            );
+            std::fs::remove_file(&planted).expect("the planted file goes");
+            assert_refused(&confined, "in-the-shared-directory", "the shared directory");
+            assert!(
+                granted
+                    .stdout
+                    .contains("secret.value=in-the-shared-directory"),
+                "with the file lent it is read: {} {}",
+                granted.stdout,
+                granted.stderr
+            );
+
+            // The hosts file is not configuration, so Git's own complaint about its content is
+            // what shows that it was opened and read.
+            let hosts = Path::new("/etc/hosts");
+            let confined = read_as_configuration(
+                &fixture,
+                &location,
+                hosts,
+                Vec::new(),
+                bounded_reads(&fixture),
+            );
+            assert_ne!(confined.status, Some(0));
+            assert!(
+                confined.stderr.contains(REFUSED) && !confined.stderr.contains("bad config line"),
+                "the sandbox refused to open it: {}",
+                confined.stderr
+            );
+            let owner =
+                read_as_configuration(&fixture, &location, hosts, Vec::new(), Reads::Everywhere);
+            assert!(
+                owner.stderr.contains("bad config line"),
+                "the owner's reads open it and Git objects to what it holds: {}",
+                owner.stderr
+            );
+            // The control: lent, it is opened by a bounded invocation too, so the refusal above is
+            // the file's own path and not the link `/etc` is.
+            let lent = read_as_configuration(
+                &fixture,
+                &location,
+                hosts,
+                vec![hosts.to_owned()],
+                bounded_reads(&fixture),
+            );
+            assert!(
+                lent.stderr.contains("bad config line") && !lent.stderr.contains(REFUSED),
+                "lent, a bounded invocation opens it: {}",
+                lent.stderr
+            );
+        }
+
+        /// The same file, reached by its name through the firmlink that presents the data volume
+        /// under the system volume, is refused as the file reached by its own name is.
+        #[test]
+        fn a_file_outside_every_grant_is_refused_by_the_name_the_data_volume_gives_it() {
+            let fixture = Fixture::create();
+            let location = fixture.work().join("location");
+            std::fs::create_dir(&location).expect("a location");
+            let outside = tempfile::TempDir::new().expect("a directory outside the location");
+            let secret = std::fs::canonicalize(outside.path())
+                .expect("the directory's own name")
+                .join("secret.config");
+            std::fs::write(&secret, "[secret]\n\tvalue = by-the-volume-name\n")
+                .expect("a file outside every grant");
+            let through_the_volume = Path::new("/System/Volumes/Data").join(
+                secret
+                    .strip_prefix("/")
+                    .expect("an absolute path has a root"),
+            );
+            if !through_the_volume.is_file() {
+                println!("not exercised: this host presents no data volume under /System");
+                return;
+            }
+            let confined = read_as_configuration(
+                &fixture,
+                &location,
+                &through_the_volume,
+                Vec::new(),
+                bounded_reads(&fixture),
+            );
+            assert_refused(&confined, "by-the-volume-name", "the data volume's name");
+            // The control: the same file lent by its own name is read by the volume's name too, so
+            // the refusal above is the profile holding the file's own path.
+            let lent = read_as_configuration(
+                &fixture,
+                &location,
+                &through_the_volume,
+                vec![secret],
+                bounded_reads(&fixture),
+            );
+            assert!(
+                lent.stdout.contains("secret.value=by-the-volume-name"),
+                "lent, it is read through the volume's name: {} {}",
+                lent.stdout,
+                lent.stderr
+            );
+        }
+
+        /// A disk image this account attaches beneath the operation's own location lets Git read
+        /// other storage by a name the profile grants, so the invocation is refused with the
+        /// reason while it is there, and runs when it is not. The owner's invocation is not
+        /// affected.
+        #[test]
+        fn a_disk_image_attached_beneath_the_location_refuses_a_bounded_invocation_until_it_is_gone()
+         {
+            let fixture = Fixture::create();
+            let profile = fixture.service().profile();
+            let scratch = tempfile::TempDir::new().expect("a directory for the image");
+            let location = support::ordinary_repository(fixture.work(), "location");
+            let mounted = location.join("mounted");
+            std::fs::create_dir(&mounted).expect("a directory to attach at");
+            let repository = OpenedRepository::open(profile, fixture.environment_id(), &location)
+                .expect("the repository opens");
+            let status: [&OsStr; 2] = [OsStr::new("status"), OsStr::new("--porcelain")];
+
+            // The control: the same bounded status of the same location with nothing attached.
+            let before = profile
+                .run(&repository.read(&status).admitted(bounded()))
+                .expect("a bounded status with nothing attached beneath the location runs");
+            assert!(before.success, "and succeeds: {}", before.stderr);
+
+            let Some(attached) = Attached::at(&mounted, scratch.path()) else {
+                return;
+            };
+            let refusal = profile
+                .run(&repository.read(&status).admitted(bounded()))
+                .expect_err("a bounded invocation over a location with a mount beneath it");
+            let said = refusal.to_string();
+            let mounted = std::fs::canonicalize(&mounted).expect("the mount point's own name");
+            let location = std::fs::canonicalize(&location).expect("the location's own name");
+            assert!(
+                said.contains(&format!("a filesystem is mounted at {}", mounted.display()))
+                    && said.contains(&format!("beneath {},", location.display())),
+                "the refusal names the mount point and the location: {said}"
+            );
+            // The check is made for a caller bounded by a grant; the owner's status is unchanged.
+            let owner = profile
+                .run(&repository.read(&status))
+                .expect("the owner's status starts");
+            assert!(owner.success, "the owner's status runs: {}", owner.stderr);
+
+            drop(attached);
+            let after = profile
+                .run(&repository.read(&status).admitted(bounded()))
+                .expect("a bounded status after the image is detached runs");
+            assert!(after.success, "and succeeds: {}", after.stderr);
+        }
+
+        /// A mount reached by another name for the same place is refused as one made at the
+        /// place's own name. A disk image attached beneath a directory outside the location and
+        /// carried into it by moving a directory above the mount point, and one attached through
+        /// the data volume's own name for a path, are both beneath the location when an invocation
+        /// starts, and the mount table gives each the name the profile holds.
+        #[test]
+        fn a_mount_reached_by_another_name_for_the_same_place_is_refused() {
+            let fixture = Fixture::create();
+            let profile = fixture.service().profile();
+            let scratch = tempfile::TempDir::new().expect("a directory for the images");
+            let location = support::ordinary_repository(fixture.work(), "location");
+            let repository = OpenedRepository::open(profile, fixture.environment_id(), &location)
+                .expect("the repository opens");
+            let status: [&OsStr; 2] = [OsStr::new("status"), OsStr::new("--porcelain")];
+            let location = std::fs::canonicalize(&location).expect("the location's own name");
+
+            // The control: a bounded status of the location with nothing attached runs.
+            let before = profile
+                .run(&repository.read(&status).admitted(bounded()))
+                .expect("a bounded status with nothing attached runs");
+            assert!(before.success, "and succeeds: {}", before.stderr);
+
+            // Attached beneath a directory outside the location, which does not affect it, and then
+            // carried inside it by moving the directory above the mount point.
+            let outside = fixture.work().join("outside");
+            let held = outside.join("held");
+            std::fs::create_dir_all(held.join("mounted")).expect("a directory to attach at");
+            let Some(attached) = Attached::at(&held.join("mounted"), scratch.path()) else {
+                return;
+            };
+            let unaffected = profile
+                .run(&repository.read(&status).admitted(bounded()))
+                .expect("a mount outside the location does not stop a bounded status");
+            assert!(unaffected.success, "and it succeeds: {}", unaffected.stderr);
+            std::fs::rename(&held, location.join("held")).expect("the directory moves");
+            let carried = Carried {
+                now: location.join("held"),
+                was: held.clone(),
+            };
+            let refusal = profile
+                .run(&repository.read(&status).admitted(bounded()))
+                .expect_err("a bounded status over a location with a mount carried into it");
+            let said = refusal.to_string();
+            assert!(
+                said.contains(&format!(
+                    "a filesystem is mounted at {}",
+                    location.join("held").join("mounted").display()
+                )),
+                "the refusal names the mount point by the name it has now: {said}"
+            );
+            // Detaching finds the image where it was attached.
+            drop(carried);
+            drop(attached);
+            let after = profile
+                .run(&repository.read(&status).admitted(bounded()))
+                .expect("a bounded status after the image is detached runs");
+            assert!(after.success, "and succeeds: {}", after.stderr);
+
+            // Attached through the data volume's name for a path beneath the location.
+            let mounted = location.join("mounted");
+            std::fs::create_dir(&mounted).expect("a directory to attach at");
+            let spelled = Path::new("/System/Volumes/Data").join(
+                mounted
+                    .strip_prefix("/")
+                    .expect("an absolute path has a root"),
+            );
+            if !spelled.is_dir() {
+                println!("not exercised: this host presents no data volume under /System");
+                return;
+            }
+            let Some(attached) = Attached::spelled(&mounted, &spelled, scratch.path()) else {
+                return;
+            };
+            let refusal = profile
+                .run(&repository.read(&status).admitted(bounded()))
+                .expect_err("a bounded status over a location with a mount made by that name");
+            let said = refusal.to_string();
+            assert!(
+                said.contains(&format!("a filesystem is mounted at {}", mounted.display())),
+                "the refusal names the mount point by the name the table gives it: {said}"
+            );
+            drop(attached);
+            let after = profile
+                .run(&repository.read(&status).admitted(bounded()))
+                .expect("a bounded status after the image is detached runs");
+            assert!(after.success, "and succeeds: {}", after.stderr);
+        }
+
+        /// A mount beneath a directory the proof itself runs in leaves the host unproved, with the
+        /// reason for the daemon's own log, and it qualifies again when the mount is gone.
+        #[test]
+        fn a_mount_beneath_the_proofs_own_directory_does_not_qualify_until_it_is_gone() {
+            use kr_project::service::Refusal;
+
+            let fixture = Fixture::create();
+            let scratch = tempfile::TempDir::new().expect("a directory for the image");
+            let mounted = fixture.service().profile().home_directory().join("mounted");
+            std::fs::create_dir(&mounted).expect("a directory to attach at");
+            let proved = fixture.service().qualify();
+            assert!(
+                proved.qualifies(),
+                "this host proves the boundary: {:?}: {}",
+                proved.refusal(),
+                proved.detail()
+            );
+            let Some(attached) = Attached::at(&mounted, scratch.path()) else {
+                return;
+            };
+            let refused = fixture.service().qualify();
+            assert!(!refused.qualifies());
+            assert_eq!(refused.refusal(), Some(Refusal::Invocation));
+            assert!(
+                refused.detail().contains("a filesystem is mounted at"),
+                "the daemon's own log is told what stopped it: {}",
+                refused.detail()
+            );
+            drop(attached);
+            assert!(
+                fixture.service().qualify().qualifies(),
+                "and the host qualifies again when the mount is gone"
+            );
+        }
+
+        /// A host with no launcher to apply a profile with does not qualify, and the daemon's own
+        /// log is told so. The machine is not changed: the answer to where the launcher is, is,
+        /// on this thread only.
+        #[test]
+        fn a_host_with_no_launcher_does_not_qualify_and_says_so() {
+            use kr_project::service::Refusal;
+
+            let fixture = Fixture::create();
+            let refused = kr_project::boundary::with_launcher_at(
+                Path::new("/nonexistent/sandbox-exec"),
+                || fixture.service().qualify(),
+            );
+            assert!(!refused.qualifies());
+            assert_eq!(refused.refusal(), Some(Refusal::Invocation));
+            assert!(
+                refused.detail().contains("no launcher"),
+                "the daemon's own log is told what stopped it: {}",
+                refused.detail()
+            );
+            assert!(
+                fixture.service().qualify().qualifies(),
+                "and the same host qualifies with the launcher it has"
+            );
+        }
+
+        /// A program in the helper directory an invocation may execute from is executed, and the
+        /// same program beside it is not. A Git whose helpers are programs of their own, as
+        /// Homebrew's are, asks this of the profile; Xcode's are links to Git itself.
+        #[test]
+        fn a_program_in_the_helper_directory_runs_and_the_same_program_beside_it_does_not() {
+            let fixture = Fixture::create();
+            let Some(built) = Built::under(Path::new(env!("CARGO_TARGET_TMPDIR"))) else {
+                return;
+            };
+            let helper = built.root.join("helpers").join("probe");
+            std::fs::copy(&built.program, &helper).expect("a copy in the helper directory");
+            let reads = Reads::Bounded(std::sync::Arc::new(
+                built.support().expect("the set of these programs is named"),
+            ));
+            let shell = Path::new("/bin/bash");
+            let location = fixture.work().join("location");
+            std::fs::create_dir_all(&location).expect("a location");
+            let run = |program: &Path, reads: Reads| {
+                run_enclosed(
+                    &fixture,
+                    &location,
+                    Enclosed {
+                        program: shell,
+                        arguments: vec![OsString::from("-c"), program.as_os_str().to_owned()],
+                        helpers: Vec::new(),
+                        readable: Vec::new(),
+                        reads,
+                        exec_path: Some(built.root.join("helpers")),
+                    },
+                )
+            };
+            let ran = run(&helper, reads.clone());
+            assert_eq!(ran.status, Some(0), "the helper runs: {}", ran.stderr);
+            let beside = run(&built.program, reads);
+            assert_ne!(
+                beside.status,
+                Some(0),
+                "the same program beside it does not"
+            );
+            assert!(
+                beside.stderr.contains(REFUSED),
+                "the sandbox refused it: {}",
+                beside.stderr
+            );
+        }
+
+        /// A helper that is a link to a program is the program the link leads to: its libraries
+        /// that are named relative to the program are read where the program is, which is where the
+        /// loader looks for them when the link is run. The link is deeper in the tree than the
+        /// program, so the two names for the program's own directory differ.
+        #[test]
+        fn a_helper_that_is_a_link_to_a_program_is_read_and_run_where_the_link_leads() {
+            let fixture = Fixture::create();
+            let Some(built) = Built::under(Path::new(env!("CARGO_TARGET_TMPDIR"))) else {
+                return;
+            };
+            let helpers = built.root.join("far").join("away");
+            std::fs::create_dir_all(&helpers).expect("a helper directory");
+            let link = helpers.join("probe");
+            std::os::unix::fs::symlink("../../bin/probe", &link).expect("a link to the program");
+            let named = kr_project::boundary::support_set(&[], &helpers)
+                .expect("the set of a helper that is a link is named");
+            assert_eq!(
+                named.libraries(),
+                built.library_directories,
+                "the libraries are those of the program the link leads to"
+            );
+
+            let location = fixture.work().join("location");
+            std::fs::create_dir_all(&location).expect("a location");
+            let run = |reads: Reads| {
+                run_enclosed(
+                    &fixture,
+                    &location,
+                    Enclosed {
+                        program: Path::new("/bin/bash"),
+                        arguments: vec![OsString::from("-c"), link.as_os_str().to_owned()],
+                        // The program the link leads to is on the execution list, as Git's own
+                        // helpers that are links to Git are.
+                        helpers: vec![built.program.clone()],
+                        readable: Vec::new(),
+                        reads,
+                        exec_path: Some(helpers.clone()),
+                    },
+                )
+            };
+            let ran = run(Reads::Bounded(std::sync::Arc::new(named)));
+            assert_eq!(
+                ran.status,
+                Some(0),
+                "the link runs under its set: {}",
+                ran.stderr
+            );
+            let without = run(bounded_reads(&fixture));
+            assert_ne!(
+                without.status,
+                Some(0),
+                "and does not run under a set that lacks its libraries"
+            );
+            assert!(
+                without.stderr.contains("Library not loaded"),
+                "the loader could not open the first of them: {}",
+                without.stderr
+            );
+        }
+
+        /// The compiler, when the developer tools are installed. The system's `clang` is a
+        /// stand-in that offers to install them when they are not, so it is asked for only after
+        /// `xcode-select` has said they are.
+        fn compiler() -> Option<PathBuf> {
+            let developer = Command::new("/usr/bin/xcode-select")
+                .arg("-p")
+                .output()
+                .ok()?;
+            let clang = PathBuf::from("/usr/bin/clang");
+            (developer.status.success() && clang.is_file()).then_some(clang)
+        }
+
+        /// A program and the libraries it loads, built in a directory of its own and taken away
+        /// again with it. The program names one library through an rpath that goes through a
+        /// link, a second by its absolute path and a third relative to itself. The first names a
+        /// fourth relative to itself, and the third names a fifth through the program's own rpath,
+        /// which a library it loads inherits, so that every way a name is written is read. A sixth
+        /// is linked weakly, which the loader may go without.
+        struct Built {
+            root: PathBuf,
+            program: PathBuf,
+            /// The directories the libraries are in, in the order of their paths.
+            library_directories: Vec<PathBuf>,
+        }
+
+        impl Built {
+            /// Builds them under `parent`, or says why not and returns nothing.
+            fn under(parent: &Path) -> Option<Self> {
+                let clang = compiler().or_else(|| {
+                    println!("not exercised: this host has no developer tools to build a library");
+                    None
+                })?;
+                let root = parent.join(format!("kr-reads-{}", uuid::Uuid::new_v4().simple()));
+                for name in [
+                    "real", "deep", "second", "third", "extra", "weak", "bin", "helpers",
+                ] {
+                    std::fs::create_dir_all(root.join(name)).expect("a directory to build in");
+                }
+                let root = std::fs::canonicalize(&root).expect("the directory's own name");
+                std::os::unix::fs::symlink("real", root.join("linked"))
+                    .expect("a link to the library's directory");
+                let source = |name: &str, text: &str| {
+                    std::fs::write(root.join(name), text).expect("a source file");
+                };
+                source("deep.c", "int krdeep_answer(void) { return 42; }\n");
+                source(
+                    "probe.c",
+                    "int krdeep_answer(void);\nint krprobe_answer(void) { return krdeep_answer(); }\n",
+                );
+                source("second.c", "int krsecond_answer(void) { return 42; }\n");
+                source(
+                    "third.c",
+                    "int krextra_answer(void);\nint krthird_answer(void) { return krextra_answer(); }\n",
+                );
+                source("extra.c", "int krextra_answer(void) { return 42; }\n");
+                source("weak.c", "int krweak_answer(void) { return 42; }\n");
+                source(
+                    "program.c",
+                    "int krprobe_answer(void);\nint krsecond_answer(void);\nint krthird_answer(void);\n\
+                     int main(void) {\n\
+                         return krprobe_answer() == 42 && krsecond_answer() == 42\n\
+                             && krthird_answer() == 42 ? 0 : 1;\n\
+                     }\n",
+                );
+                // Every file is built for both architectures, as the system's own programs are
+                // shipped, so the slice for this machine is the one that is read.
+                let compile = |arguments: &[&OsStr]| {
+                    let output = Command::new(&clang)
+                        .args(["-arch", "arm64", "-arch", "x86_64"])
+                        .args(arguments)
+                        .output()
+                        .expect("the compiler starts");
+                    assert!(
+                        output.status.success(),
+                        "the compiler builds it: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                };
+                let library =
+                    |directory: &str, name: &str, install_name: &str, extra: &[&OsStr]| {
+                        let file = root.join(directory).join(format!("lib{name}.dylib"));
+                        let source = root.join(format!(
+                            "{}.c",
+                            if name == "krprobe" {
+                                "probe"
+                            } else {
+                                &name[2..]
+                            }
+                        ));
+                        let mut arguments: Vec<&OsStr> = vec![
+                            OsStr::new("-dynamiclib"),
+                            OsStr::new("-install_name"),
+                            OsStr::new(install_name),
+                            OsStr::new("-o"),
+                            file.as_os_str(),
+                            source.as_os_str(),
+                        ];
+                        arguments.extend_from_slice(extra);
+                        compile(&arguments);
+                    };
+                library(
+                    "deep",
+                    "krdeep",
+                    "@loader_path/../deep/libkrdeep.dylib",
+                    &[],
+                );
+                library(
+                    "real",
+                    "krprobe",
+                    "@rpath/libkrprobe.dylib",
+                    &[
+                        OsStr::new(&format!("-L{}", root.join("deep").display())),
+                        OsStr::new("-lkrdeep"),
+                    ],
+                );
+                library(
+                    "second",
+                    "krsecond",
+                    &root
+                        .join("second")
+                        .join("libkrsecond.dylib")
+                        .display()
+                        .to_string(),
+                    &[],
+                );
+                library("extra", "krextra", "@rpath/libkrextra.dylib", &[]);
+                library("weak", "krweak", "@rpath/libkrweak.dylib", &[]);
+                library(
+                    "third",
+                    "krthird",
+                    "@executable_path/../third/libkrthird.dylib",
+                    &[
+                        OsStr::new(&format!("-L{}", root.join("extra").display())),
+                        OsStr::new("-lkrextra"),
+                    ],
+                );
+                let program = root.join("bin").join("probe");
+                compile(&[
+                    OsStr::new("-o"),
+                    program.as_os_str(),
+                    root.join("program.c").as_os_str(),
+                    OsStr::new(&format!("-L{}", root.join("real").display())),
+                    OsStr::new("-lkrprobe"),
+                    OsStr::new(&format!("-L{}", root.join("second").display())),
+                    OsStr::new("-lkrsecond"),
+                    OsStr::new(&format!("-L{}", root.join("third").display())),
+                    OsStr::new("-lkrthird"),
+                    OsStr::new(&format!("-L{}", root.join("weak").display())),
+                    OsStr::new("-weak-lkrweak"),
+                    OsStr::new("-Wl,-rpath,@loader_path/../linked"),
+                    OsStr::new("-Wl,-rpath,@loader_path/../extra"),
+                    OsStr::new("-Wl,-rpath,@loader_path/../weak"),
+                ]);
+                let library_directories = ["deep", "extra", "real", "second", "third", "weak"]
+                    .iter()
+                    .map(|name| root.join(name))
+                    .collect();
+                Some(Self {
+                    root,
+                    program,
+                    library_directories,
+                })
+            }
+
+            /// Returns the support set of the program alone, with no helper directory to read.
+            fn support(&self) -> kr_project::error::Result<kr_project::boundary::SupportSet> {
+                kr_project::boundary::support_set(
+                    &[self.program.as_path()],
+                    &self.root.join("helpers"),
+                )
+            }
+        }
+
+        impl Drop for Built {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+
+        /// Runs the built program inside the boundary with these reads, and reports how it ended.
+        fn run_probe(fixture: &Fixture, built: &Built, reads: Reads) -> (Option<i32>, String) {
+            let location = fixture.work().join("location");
+            std::fs::create_dir_all(&location).expect("a location");
+            let outcome = run_enclosed(
+                fixture,
+                &location,
+                Enclosed {
+                    program: &built.program,
+                    arguments: Vec::<OsString>::new(),
+                    helpers: Vec::new(),
+                    readable: Vec::new(),
+                    reads,
+                    exec_path: None,
+                },
+            );
+            (outcome.status, outcome.stderr)
+        }
+
+        /// A program's library is named by the directory it is in, resolved through the link its
+        /// rpath goes through, and the system's own libraries, which the shared cache supplies, are
+        /// named by nothing. The program runs under the set it was given, and does not run under
+        /// the set of a program that does not load the library; the owner's run is the control.
+        #[test]
+        fn a_programs_library_is_granted_by_its_directory_and_the_program_needs_the_grant() {
+            let fixture = Fixture::create();
+            let parent = Path::new(env!("CARGO_TARGET_TMPDIR"));
+            let Some(built) = Built::under(parent) else {
+                return;
+            };
+
+            let named = built.support().expect("the set of this program is named");
+            assert_eq!(
+                named.libraries(),
+                built.library_directories,
+                "the directory each library is in, with the link resolved, and no system directory"
+            );
+            assert!(named.loaders().is_empty(), "this platform names no loader");
+
+            let (status, stderr) =
+                run_probe(&fixture, &built, Reads::Bounded(std::sync::Arc::new(named)));
+            assert_eq!(
+                status,
+                Some(0),
+                "the program runs under its own set: {stderr}"
+            );
+
+            let (status, stderr) = run_probe(&fixture, &built, bounded_reads(&fixture));
+            assert_ne!(
+                status,
+                Some(0),
+                "the program does not run under the set of Git, which lacks its library"
+            );
+            assert!(
+                stderr.contains("Library not loaded") || status.is_none(),
+                "the loader could not open the library: {stderr}"
+            );
+
+            let (status, stderr) = run_probe(&fixture, &built, Reads::Everywhere);
+            assert_eq!(status, Some(0), "the owner's run is the control: {stderr}");
+
+            let git = fixture
+                .service()
+                .profile()
+                .support_set()
+                .expect("this host names the support set of its Git");
+            for directory in git.libraries() {
+                assert!(
+                    !directory.starts_with("/usr/lib") && !directory.starts_with("/System"),
+                    "the system's libraries come from the shared cache: {}",
+                    directory.display()
+                );
+            }
+        }
+
+        /// A library the program links weakly is one the loader goes without when it is not there,
+        /// so the set is named without it, and a library that is there is granted as any other.
+        #[test]
+        fn a_weak_library_that_is_not_there_does_not_refuse_the_set() {
+            let Some(built) = Built::under(Path::new(env!("CARGO_TARGET_TMPDIR"))) else {
+                return;
+            };
+            std::fs::remove_file(built.root.join("weak").join("libkrweak.dylib"))
+                .expect("the weakly linked library goes");
+            let named = built
+                .support()
+                .expect("a program is named without a library it links weakly");
+            let expected: Vec<PathBuf> = built
+                .library_directories
+                .iter()
+                .filter(|directory| !directory.ends_with("weak"))
+                .cloned()
+                .collect();
+            assert_eq!(named.libraries(), expected);
+        }
+
+        /// A library in the machine's shared temporary directory is one any program of the account
+        /// can replace, so a set that would grant its directory is refused, naming the library.
+        #[test]
+        fn a_library_in_the_shared_temporary_directory_is_not_granted() {
+            let Some(built) = Built::under(&std::env::temp_dir()) else {
+                return;
+            };
+            let refusal = built
+                .support()
+                .expect_err("a library there is not a support object");
+            let said = refusal.to_string();
+            assert!(
+                said.contains("libkrprobe.dylib")
+                    && said.contains("not a directory this host grants as a support directory"),
+                "the refusal names the library and the rule: {said}"
+            );
+        }
+
+        /// A library the program names and the system cannot find leaves the set unnamed, and the
+        /// refusal names it.
+        #[test]
+        fn a_library_that_cannot_be_found_refuses_the_set_by_its_name() {
+            let Some(built) = Built::under(Path::new(env!("CARGO_TARGET_TMPDIR"))) else {
+                return;
+            };
+            std::fs::remove_file(built.root.join("real").join("libkrprobe.dylib"))
+                .expect("the library goes");
+            let refusal = built
+                .support()
+                .expect_err("a library that is not there cannot be granted");
+            assert!(
+                refusal.to_string().contains("libkrprobe.dylib"),
+                "the refusal names it: {refusal}"
+            );
+        }
+
+        /// Mach-O files written by hand, to name libraries and kinds of command a compiler on this
+        /// host would not make. The support set is read from the load commands and not from what a
+        /// file would do, so a file with nothing to run in it is enough.
+        mod crafted {
+            /// The processor type of this machine, and of the other one a Mac is shipped with.
+            pub const THIS: u32 = if cfg!(target_arch = "aarch64") {
+                0x0100_000c
+            } else {
+                0x0100_0007
+            };
+            pub const OTHER: u32 = if cfg!(target_arch = "aarch64") {
+                0x0100_0007
+            } else {
+                0x0100_000c
+            };
+            /// The command that names a library, and the one that names it as one the loader may
+            /// go without.
+            pub const LOAD: u32 = 0x0c;
+            pub const LOAD_WEAK: u32 = 0x8000_0018;
+
+            fn little(words: &[u32]) -> Vec<u8> {
+                words.iter().flat_map(|word| word.to_le_bytes()).collect()
+            }
+
+            /// A command naming a library. With flags it is written in the newer form, which
+            /// carries what kind of link it is in a flag and not in the command.
+            pub fn library(command: u32, name: &str, flags: Option<u32>) -> Vec<u8> {
+                let offset: u32 = if flags.is_some() { 28 } else { 24 };
+                let mut path = name.as_bytes().to_vec();
+                path.push(0);
+                let size = (offset as usize + path.len()).next_multiple_of(8);
+                let marker = if flags.is_some() { 0x1a74_1800 } else { 2 };
+                let mut bytes = little(&[
+                    command,
+                    u32::try_from(size).expect("a small command"),
+                    offset,
+                    marker,
+                    0x0001_0000,
+                    0x0001_0000,
+                ]);
+                if let Some(flags) = flags {
+                    bytes.extend(little(&[flags]));
+                }
+                bytes.extend(path);
+                bytes.resize(size, 0);
+                bytes
+            }
+
+            /// A file of one processor type with these load commands.
+            pub fn thin(cputype: u32, commands: &[Vec<u8>]) -> Vec<u8> {
+                let size: usize = commands.iter().map(Vec::len).sum();
+                let mut bytes = little(&[
+                    0xfeed_facf,
+                    cputype,
+                    0,
+                    2,
+                    u32::try_from(commands.len()).expect("a few commands"),
+                    u32::try_from(size).expect("a small file"),
+                    0,
+                    0,
+                ]);
+                for command in commands {
+                    bytes.extend(command);
+                }
+                bytes
+            }
+
+            /// A universal file holding these slices, one for each processor type.
+            pub fn fat(slices: &[(u32, Vec<u8>)]) -> Vec<u8> {
+                let mut offsets = Vec::new();
+                let mut next = (8 + 20 * slices.len()).next_multiple_of(16);
+                for (_, slice) in slices {
+                    offsets.push(next);
+                    next = (next + slice.len()).next_multiple_of(16);
+                }
+                let big = |word: usize| u32::try_from(word).expect("a small file").to_be_bytes();
+                let mut bytes = Vec::new();
+                bytes.extend(0xcafe_babe_u32.to_be_bytes());
+                bytes.extend(big(slices.len()));
+                for ((cputype, slice), offset) in slices.iter().zip(&offsets) {
+                    bytes.extend(cputype.to_be_bytes());
+                    bytes.extend(big(0));
+                    bytes.extend(big(*offset));
+                    bytes.extend(big(slice.len()));
+                    bytes.extend(big(4));
+                }
+                for ((_, slice), offset) in slices.iter().zip(&offsets) {
+                    bytes.resize(*offset, 0);
+                    bytes.extend(slice);
+                }
+                bytes
+            }
+        }
+
+        /// A directory to write files in, whose own name is a directory that may be granted.
+        fn scratch() -> (tempfile::TempDir, PathBuf) {
+            let directory = tempfile::Builder::new()
+                .prefix("kr-reads-")
+                .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+                .expect("a directory to write in");
+            let root = std::fs::canonicalize(directory.path()).expect("the directory's own name");
+            (directory, root)
+        }
+
+        /// A library linked weakly is one the loader goes without, whichever way the command that
+        /// names it says so, and one that is not linked weakly and is not there refuses the set.
+        #[test]
+        fn a_library_linked_weakly_by_either_command_may_be_missing_and_another_may_not() {
+            let (_directory, root) = scratch();
+            let helpers = root.join("helpers");
+            std::fs::create_dir(&helpers).expect("an empty helper directory");
+            let gone = "/kr-reads-missing/libgone.dylib";
+            let named = |command: Vec<u8>| {
+                let program = root.join("program");
+                std::fs::write(&program, crafted::thin(crafted::THIS, &[command]))
+                    .expect("a program");
+                kr_project::boundary::support_set(&[program.as_path()], &helpers)
+            };
+            for (how, command) in [
+                (
+                    "by the weak command",
+                    crafted::library(crafted::LOAD_WEAK, gone, None),
+                ),
+                (
+                    "by the flag of the newer form",
+                    crafted::library(crafted::LOAD, gone, Some(1)),
+                ),
+            ] {
+                let set = named(command).unwrap_or_else(|error| {
+                    panic!("a library linked weakly {how} may be missing: {error}")
+                });
+                assert!(set.libraries().is_empty(), "{how}");
+            }
+            for (how, command) in [
+                (
+                    "in the older form",
+                    crafted::library(crafted::LOAD, gone, None),
+                ),
+                (
+                    "in the newer form with no flag",
+                    crafted::library(crafted::LOAD, gone, Some(0)),
+                ),
+            ] {
+                let refusal = named(command)
+                    .expect_err("a library that is required and is not there refuses the set");
+                assert!(
+                    refusal.to_string().contains("libgone.dylib"),
+                    "the refusal names it, {how}: {refusal}"
+                );
+            }
+        }
+
+        /// A program of another kind of machine than this one loads libraries of that kind, which
+        /// this host does not read, so it refuses the set rather than naming the wrong ones. A
+        /// universal file is read at the slice for this machine, whichever slice comes first.
+        #[test]
+        fn a_program_of_another_kind_of_machine_is_refused_and_a_universal_one_is_read_at_this_machines_slice()
+         {
+            let (_directory, root) = scratch();
+            let helpers = root.join("helpers");
+            std::fs::create_dir(&helpers).expect("an empty helper directory");
+            let named = |name: &str, bytes: Vec<u8>| {
+                let program = root.join(name);
+                std::fs::write(&program, bytes).expect("a program");
+                kr_project::boundary::support_set(&[program.as_path()], &helpers)
+            };
+            let refusal = named("foreign", crafted::thin(crafted::OTHER, &[]))
+                .expect_err("a program of another kind of machine is refused");
+            assert!(
+                refusal.to_string().contains("another kind of machine"),
+                "and the refusal says so: {refusal}"
+            );
+
+            let wants = |processor, library: &str| {
+                (
+                    processor,
+                    crafted::thin(processor, &[crafted::library(crafted::LOAD, library, None)]),
+                )
+            };
+            let refusal = named(
+                "universal",
+                crafted::fat(&[
+                    wants(crafted::OTHER, "/kr-reads-missing/libother.dylib"),
+                    wants(crafted::THIS, "/kr-reads-missing/libthis.dylib"),
+                ]),
+            )
+            .expect_err("the library of this machine's slice is not there");
+            let said = refusal.to_string();
+            assert!(
+                said.contains("libthis.dylib") && !said.contains("libother.dylib"),
+                "the refusal names this machine's slice's library and not the other's: {said}"
+            );
+            // The control: with nothing named in this machine's slice, the library the other
+            // slice names, which is not there, does not matter.
+            let set = named(
+                "quiet",
+                crafted::fat(&[
+                    wants(crafted::OTHER, "/kr-reads-missing/libother.dylib"),
+                    (crafted::THIS, crafted::thin(crafted::THIS, &[])),
+                ]),
+            )
+            .expect("the set is named from this machine's slice alone");
+            assert!(set.libraries().is_empty());
+        }
+
+        /// Each program is followed on its own: two that load one library are each given the
+        /// directory that library's `@executable_path` name leads to for them.
+        #[test]
+        fn two_programs_that_load_one_library_are_each_given_what_it_names_for_them() {
+            let (_directory, root) = scratch();
+            let helpers = root.join("helpers");
+            std::fs::create_dir(&helpers).expect("an empty helper directory");
+            let shared = root.join("shared");
+            std::fs::create_dir(&shared).expect("the shared library's directory");
+            let library = shared.join("libshared.dylib");
+            std::fs::write(
+                &library,
+                crafted::thin(
+                    crafted::THIS,
+                    &[crafted::library(
+                        crafted::LOAD,
+                        "@executable_path/../dep/libdep.dylib",
+                        None,
+                    )],
+                ),
+            )
+            .expect("a library that names another relative to the program");
+            let program = |name: &str| {
+                let directory = root.join(name);
+                std::fs::create_dir_all(directory.join("bin")).expect("a program directory");
+                std::fs::create_dir_all(directory.join("dep")).expect("a dependency directory");
+                std::fs::write(directory.join("dep").join("libdep.dylib"), "").expect("a library");
+                let path = directory.join("bin").join("program");
+                std::fs::write(
+                    &path,
+                    crafted::thin(
+                        crafted::THIS,
+                        &[crafted::library(
+                            crafted::LOAD,
+                            &library.display().to_string(),
+                            None,
+                        )],
+                    ),
+                )
+                .expect("a program");
+                path
+            };
+            let (one, two) = (program("one"), program("two"));
+            let named = |programs: &[&Path]| {
+                kr_project::boundary::support_set(programs, &helpers)
+                    .expect("the set is named")
+                    .libraries()
+                    .to_vec()
+            };
+            assert_eq!(
+                named(&[&one]),
+                [root.join("one").join("dep"), shared.clone()],
+                "one program alone is given its own dependency directory"
+            );
+            assert_eq!(
+                named(&[&one, &two]),
+                [
+                    root.join("one").join("dep"),
+                    shared,
+                    root.join("two").join("dep")
+                ],
+                "and two are each given theirs"
+            );
+        }
+
+        /// The loader goes into the libraries a program names in the order it names them, and a
+        /// library it loaded once is not loaded again, so what that library names through
+        /// `@rpath` is found through the search path of the library that named it first. Here the
+        /// program names two libraries that both name `libkrl`, each carrying an rpath to its own
+        /// directory of a `libkrm` that `libkrl` loads. The loader takes the one the first leads
+        /// to, so that is the one granted, and the program runs under it.
+        #[test]
+        fn the_library_a_program_names_first_decides_where_a_shared_librarys_names_lead() {
+            let fixture = Fixture::create();
+            let Some(clang) = compiler() else {
+                println!("not exercised: this host has no developer tools to build a library");
+                return;
+            };
+            let (_directory, root) = scratch();
+            for name in ["a", "b", "l", "ma", "mb", "bin", "helpers"] {
+                std::fs::create_dir(root.join(name)).expect("a directory to build in");
+            }
+            let source = |name: &str, text: &str| {
+                std::fs::write(root.join(name), text).expect("a source file");
+            };
+            source("m1.c", "int krm_answer(void) { return 1; }\n");
+            source("m2.c", "int krm_answer(void) { return 2; }\n");
+            source(
+                "l.c",
+                "int krm_answer(void);\nint krl_answer(void) { return krm_answer(); }\n",
+            );
+            source(
+                "ka.c",
+                "int krl_answer(void);\nint kra_answer(void) { return krl_answer(); }\n",
+            );
+            source(
+                "kb.c",
+                "int krl_answer(void);\nint krb_answer(void) { return krl_answer(); }\n",
+            );
+            source(
+                "program.c",
+                "int kra_answer(void);\nint krb_answer(void);\n\
+                 int main(void) { return kra_answer() + krb_answer(); }\n",
+            );
+            let directory = |name: &str| root.join(name);
+            let flag = |prefix: &str, name: &str| {
+                OsString::from(format!("{prefix}{}", directory(name).display()))
+            };
+            // Every file is built for both architectures, as the system's own programs are
+            // shipped, so the slice for this machine is the one that is read.
+            let compile = |arguments: Vec<OsString>| {
+                let output = Command::new(&clang)
+                    .args(["-arch", "arm64", "-arch", "x86_64"])
+                    .args(&arguments)
+                    .output()
+                    .expect("the compiler starts");
+                assert!(
+                    output.status.success(),
+                    "the compiler builds it: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            let library = |directory_name: &str, name: &str, source: &str, extra: Vec<OsString>| {
+                let mut arguments: Vec<OsString> = vec![
+                    "-dynamiclib".into(),
+                    "-install_name".into(),
+                    format!("@rpath/lib{name}.dylib").into(),
+                    "-o".into(),
+                    directory(directory_name)
+                        .join(format!("lib{name}.dylib"))
+                        .into(),
+                    directory(source).into(),
+                ];
+                arguments.extend(extra);
+                compile(arguments);
+            };
+            library("ma", "krm", "m1.c", Vec::new());
+            library("mb", "krm", "m2.c", Vec::new());
+            library("l", "krl", "l.c", vec![flag("-L", "ma"), "-lkrm".into()]);
+            library(
+                "a",
+                "kra",
+                "ka.c",
+                vec![
+                    flag("-L", "l"),
+                    "-lkrl".into(),
+                    flag("-Wl,-rpath,", "ma"),
+                    flag("-Wl,-rpath,", "l"),
+                ],
+            );
+            library(
+                "b",
+                "krb",
+                "kb.c",
+                vec![
+                    flag("-L", "l"),
+                    "-lkrl".into(),
+                    flag("-Wl,-rpath,", "mb"),
+                    flag("-Wl,-rpath,", "l"),
+                ],
+            );
+            let program = directory("bin").join("program");
+            compile(vec![
+                "-o".into(),
+                program.clone().into(),
+                directory("program.c").into(),
+                flag("-L", "a"),
+                "-lkra".into(),
+                flag("-L", "b"),
+                "-lkrb".into(),
+                flag("-Wl,-rpath,", "a"),
+                flag("-Wl,-rpath,", "b"),
+            ]);
+
+            let named =
+                kr_project::boundary::support_set(&[program.as_path()], &directory("helpers"))
+                    .expect("the set of the program is named");
+            assert_eq!(
+                named.libraries(),
+                [
+                    directory("a"),
+                    directory("b"),
+                    directory("l"),
+                    directory("ma")
+                ],
+                "the directory the first library leads to is granted, and the other is not"
+            );
+            let location = fixture.work().join("location");
+            std::fs::create_dir_all(&location).expect("a location");
+            let run = |reads: Reads| {
+                run_enclosed(
+                    &fixture,
+                    &location,
+                    Enclosed {
+                        program: &program,
+                        arguments: Vec::new(),
+                        helpers: Vec::new(),
+                        readable: Vec::new(),
+                        reads,
+                        exec_path: None,
+                    },
+                )
+            };
+            let ran = run(Reads::Bounded(std::sync::Arc::new(named)));
+            assert_eq!(
+                ran.status,
+                Some(2),
+                "both answers come from the `libkrm` the loader took: {}",
+                ran.stderr
+            );
+            let owner = run(Reads::Everywhere);
+            assert_eq!(
+                owner.status,
+                Some(2),
+                "the owner's run is the control: {}",
+                owner.stderr
+            );
+        }
+
+        /// A library takes the search path of the first image the loader goes into it from, not of
+        /// the first image that names it. The loader finds everything an image names, and then goes
+        /// into each of those in order, so a library that the program and an earlier library both
+        /// name is gone into from that earlier library, with its search path. Here the program
+        /// names `libkra` and then `libkrx`, `libkra` names `libkrx` too, and `libkrx` names
+        /// `libkrm`. The program's rpath leads to one directory of a `libkrm` and `libkra`'s to
+        /// another, and the loader takes the one `libkra`'s leads to, so that is the one granted.
+        #[test]
+        fn a_library_takes_the_search_path_of_the_image_the_loader_goes_into_it_from() {
+            let fixture = Fixture::create();
+            let Some(clang) = compiler() else {
+                println!("not exercised: this host has no developer tools to build a library");
+                return;
+            };
+            let (_directory, root) = scratch();
+            for name in ["a", "x", "ma", "mb", "bin", "helpers"] {
+                std::fs::create_dir(root.join(name)).expect("a directory to build in");
+            }
+            let source = |name: &str, text: &str| {
+                std::fs::write(root.join(name), text).expect("a source file");
+            };
+            source("m1.c", "int krm_answer(void) { return 1; }\n");
+            source("m2.c", "int krm_answer(void) { return 2; }\n");
+            source(
+                "x.c",
+                "int krm_answer(void);\nint krx_answer(void) { return krm_answer(); }\n",
+            );
+            source(
+                "a.c",
+                "int krx_answer(void);\nint kra_answer(void) { return krx_answer(); }\n",
+            );
+            source(
+                "program.c",
+                "int kra_answer(void);\nint krx_answer(void);\n\
+                 int main(void) { return kra_answer() + krx_answer(); }\n",
+            );
+            let directory = |name: &str| root.join(name);
+            let flag = |prefix: &str, name: &str| {
+                OsString::from(format!("{prefix}{}", directory(name).display()))
+            };
+            // Every file is built for both architectures, as the system's own programs are
+            // shipped, so the slice for this machine is the one that is read.
+            let compile = |arguments: Vec<OsString>| {
+                let output = Command::new(&clang)
+                    .args(["-arch", "arm64", "-arch", "x86_64"])
+                    .args(&arguments)
+                    .output()
+                    .expect("the compiler starts");
+                assert!(
+                    output.status.success(),
+                    "the compiler builds it: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            let library = |directory_name: &str, name: &str, source: &str, extra: Vec<OsString>| {
+                let mut arguments: Vec<OsString> = vec![
+                    "-dynamiclib".into(),
+                    "-install_name".into(),
+                    format!("@rpath/lib{name}.dylib").into(),
+                    "-o".into(),
+                    directory(directory_name)
+                        .join(format!("lib{name}.dylib"))
+                        .into(),
+                    directory(source).into(),
+                ];
+                arguments.extend(extra);
+                compile(arguments);
+            };
+            library("ma", "krm", "m1.c", Vec::new());
+            library("mb", "krm", "m2.c", Vec::new());
+            library("x", "krx", "x.c", vec![flag("-L", "ma"), "-lkrm".into()]);
+            library(
+                "a",
+                "kra",
+                "a.c",
+                vec![
+                    flag("-L", "x"),
+                    "-lkrx".into(),
+                    flag("-Wl,-rpath,", "mb"),
+                    flag("-Wl,-rpath,", "x"),
+                ],
+            );
+            let program = directory("bin").join("program");
+            compile(vec![
+                "-o".into(),
+                program.clone().into(),
+                directory("program.c").into(),
+                flag("-L", "a"),
+                "-lkra".into(),
+                flag("-L", "x"),
+                "-lkrx".into(),
+                flag("-Wl,-rpath,", "a"),
+                flag("-Wl,-rpath,", "x"),
+                flag("-Wl,-rpath,", "ma"),
+            ]);
+
+            let named =
+                kr_project::boundary::support_set(&[program.as_path()], &directory("helpers"))
+                    .expect("the set of the program is named");
+            assert_eq!(
+                named.libraries(),
+                [directory("a"), directory("mb"), directory("x")],
+                "the directory `libkra`'s search path leads to is granted, and the program's is not"
+            );
+            let location = fixture.work().join("location");
+            std::fs::create_dir_all(&location).expect("a location");
+            let run = |reads: Reads| {
+                run_enclosed(
+                    &fixture,
+                    &location,
+                    Enclosed {
+                        program: &program,
+                        arguments: Vec::new(),
+                        helpers: Vec::new(),
+                        readable: Vec::new(),
+                        reads,
+                        exec_path: None,
+                    },
+                )
+            };
+            let owner = run(Reads::Everywhere);
+            assert_eq!(
+                owner.status,
+                Some(4),
+                "the owner's run is the control, and the loader took `libkrm` from `mb`: {}",
+                owner.stderr
+            );
+            let ran = run(Reads::Bounded(std::sync::Arc::new(named)));
+            assert_eq!(
+                ran.status,
+                Some(4),
+                "the program runs under its set: {}",
+                ran.stderr
+            );
+        }
+
+        /// An `@rpath` name that an image already loaded answers is not searched for again. The
+        /// loader reuses the loaded image whose install name is that name, so a library that the
+        /// program names and that a later library names too is the one the first search found,
+        /// and what it names is found through the search path of the image the walk goes into it
+        /// from. Here the program names `libkra` and then `libkrx`, and finds the `libkrx` in
+        /// `ma`; `libkra` names `libkrx` too, with an rpath to a `mb` that holds another one, and
+        /// the loader reuses the one in `ma`. That one names `libkrm`, which the loader finds in
+        /// `mq` through `libkra`'s rpath, though the program's own leads to another in `mp`.
+        #[test]
+        fn a_library_an_image_already_loaded_answers_is_not_searched_for_again() {
+            let fixture = Fixture::create();
+            let Some(clang) = compiler() else {
+                println!("not exercised: this host has no developer tools to build a library");
+                return;
+            };
+            let (_directory, root) = scratch();
+            for name in ["a", "ma", "mb", "mp", "mq", "bin", "helpers"] {
+                std::fs::create_dir(root.join(name)).expect("a directory to build in");
+            }
+            let source = |name: &str, text: &str| {
+                std::fs::write(root.join(name), text).expect("a source file");
+            };
+            source("m1.c", "int krm_answer(void) { return 1; }\n");
+            source("m2.c", "int krm_answer(void) { return 2; }\n");
+            source(
+                "x1.c",
+                "int krm_answer(void);\nint krx_answer(void) { return krm_answer(); }\n",
+            );
+            source("x2.c", "int krx_answer(void) { return 100; }\n");
+            source(
+                "a.c",
+                "int krx_answer(void);\nint kra_answer(void) { return krx_answer(); }\n",
+            );
+            source(
+                "program.c",
+                "int kra_answer(void);\nint krx_answer(void);\n\
+                 int main(void) { return kra_answer() + krx_answer(); }\n",
+            );
+            let directory = |name: &str| root.join(name);
+            let flag = |prefix: &str, name: &str| {
+                OsString::from(format!("{prefix}{}", directory(name).display()))
+            };
+            // Every file is built for both architectures, as the system's own programs are
+            // shipped, so the slice for this machine is the one that is read.
+            let compile = |arguments: Vec<OsString>| {
+                let output = Command::new(&clang)
+                    .args(["-arch", "arm64", "-arch", "x86_64"])
+                    .args(&arguments)
+                    .output()
+                    .expect("the compiler starts");
+                assert!(
+                    output.status.success(),
+                    "the compiler builds it: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            let library = |directory_name: &str, name: &str, source: &str, extra: Vec<OsString>| {
+                let mut arguments: Vec<OsString> = vec![
+                    "-dynamiclib".into(),
+                    "-install_name".into(),
+                    format!("@rpath/lib{name}.dylib").into(),
+                    "-o".into(),
+                    directory(directory_name)
+                        .join(format!("lib{name}.dylib"))
+                        .into(),
+                    directory(source).into(),
+                ];
+                arguments.extend(extra);
+                compile(arguments);
+            };
+            library("mp", "krm", "m1.c", Vec::new());
+            library("mq", "krm", "m2.c", Vec::new());
+            library("ma", "krx", "x1.c", vec![flag("-L", "mp"), "-lkrm".into()]);
+            library("mb", "krx", "x2.c", Vec::new());
+            library(
+                "a",
+                "kra",
+                "a.c",
+                vec![
+                    flag("-L", "mb"),
+                    "-lkrx".into(),
+                    flag("-Wl,-rpath,", "mb"),
+                    flag("-Wl,-rpath,", "mq"),
+                ],
+            );
+            let program = directory("bin").join("program");
+            compile(vec![
+                "-o".into(),
+                program.clone().into(),
+                directory("program.c").into(),
+                flag("-L", "a"),
+                "-lkra".into(),
+                flag("-L", "ma"),
+                "-lkrx".into(),
+                flag("-Wl,-rpath,", "a"),
+                flag("-Wl,-rpath,", "ma"),
+                flag("-Wl,-rpath,", "mp"),
+            ]);
+
+            let named =
+                kr_project::boundary::support_set(&[program.as_path()], &directory("helpers"))
+                    .expect("the set of the program is named");
+            assert_eq!(
+                named.libraries(),
+                [directory("a"), directory("ma"), directory("mq")],
+                "the directories the loader uses: not `mb`, which it does not search, and not `mp`"
+            );
+            let location = fixture.work().join("location");
+            std::fs::create_dir_all(&location).expect("a location");
+            let run = |reads: Reads| {
+                run_enclosed(
+                    &fixture,
+                    &location,
+                    Enclosed {
+                        program: &program,
+                        arguments: Vec::new(),
+                        helpers: Vec::new(),
+                        readable: Vec::new(),
+                        reads,
+                        exec_path: None,
+                    },
+                )
+            };
+            let owner = run(Reads::Everywhere);
+            assert_eq!(
+                owner.status,
+                Some(4),
+                "the owner's run is the control, and the loader took `libkrm` from `mq`: {}",
+                owner.stderr
+            );
+            let ran = run(Reads::Bounded(std::sync::Arc::new(named)));
+            assert_eq!(
+                ran.status,
+                Some(4),
+                "the program runs under its set: {}",
+                ran.stderr
+            );
+        }
     }
 }

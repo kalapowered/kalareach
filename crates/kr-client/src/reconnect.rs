@@ -33,7 +33,12 @@ pub struct ClientState {
     /// sent as ([`Session::repeat`]): the host answers it from the record it kept, never by doing
     /// the action again, and the library makes none by itself. Those marked
     /// [`SubmittedAction::refused_for_now`](crate::session::SubmittedAction::refused_for_now) were
-    /// refused with a transient code, and their caller may send them again under their identifier.
+    /// refused with a transient code: the host did nothing of them. The window they carried ended
+    /// with the connection and the request is not carried, so the next connection has nothing to
+    /// ask the host about them with. A caller that still wants one sends it again under its
+    /// identifier ([`Session::mutate_continuing`]), which the next connection composes under its own
+    /// window and the host performs at most once, or as a new request ([`Session::mutate`]), which
+    /// is the way where the host kept its refusal and refuses the identifier under another window.
     pub submitted: Vec<crate::session::SubmittedAction>,
     /// What the ended connection left uncertain, when it had an input lane.
     pub interruption: Option<InputInterruption>,

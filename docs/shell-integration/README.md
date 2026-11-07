@@ -417,7 +417,12 @@ that only goes forward, so setting the time of day neither shortens nor lengthen
 session whose environment names a whole number of milliseconds from 1 to 4294967295 in
 `KR_SHELL_BRIDGE_HANDSHAKE_WAIT_MS` gets that wait instead; any other value leaves five seconds.
 Like the bootstrap values, the variable leaves the exported environment once the handshake is
-accepted. The other packages wait two seconds and read no such variable.
+accepted. The other packages wait two seconds and read no such variable. The worker writes a
+refusal and closes the connection, and the module reads the refusal first: it takes the bytes the
+worker sent before it acts on the close, whatever frames those are: a launch, a fence or a cancel
+that arrives with the close is acted on as well. It then writes the refusal's reason and the
+worker's message to standard error, as it does for an editor it cannot qualify, and the shell goes
+on without the integration.
 
 ## The reader-thread rules
 
@@ -825,12 +830,20 @@ it was given.
   completion question) do not go through `getkeybuf`, so they still take an answer. Bash drops it
   at those reads too. With `BAUD` set, Zsh redraws the line only when no input is waiting, so text
   typed in the same delivery as an answer is drawn with the next key, as it was before the answer
-  was dropped.
+  was dropped. A vi user's Escape can arrive in one delivery with only the first part of an
+  answer. The reader gives that part back to its buffer, so Readline takes the Escape for the start
+  of a key. If the rest of the answer arrives in the moment before Readline reads the next key, the
+  reader takes the answer out and the Escape waits for the next key before it leaves insert mode.
 - **Pastes.** Inside a bracketed paste the reader leaves the bytes alone, and so it does in a
-  quoted insertion. Readline reads text pasted in vi replace mode, and the target of a character
-  search, again key by key without that exemption, so an answer-shaped run in text pasted there is
-  dropped. A paste into a Readline search or a command name (`C-r`, `M-p`, `M-x`) is found whole:
-  the bytes of its opening that the reader read ahead are counted with the terminal's.
+  quoted insertion. Readline reads some pasted text again key by key: text pasted in vi replace
+  mode, and the rest of a paste whose first byte is the target of a character search, a
+  replacement, the motion after a vi operator or a key after a numeric argument. The patch marks
+  that text as pasted when Readline puts it back; the reader examines no Escape in marked text and
+  follows no run into it, and a byte of it is never the end-of-input gesture. A byte that Readline
+  gives back keeps the mark it had when Readline took it, also when it gives several back in a row
+  after a key sequence fails, with a key typed behind them. A paste into a Readline search or a
+  command name (`C-r`, `M-p`, `M-x`) is found whole: the bytes of its opening that the reader read
+  ahead are counted with the terminal's.
 - **Where it applies.** The root shell of a session, at the prompts the shell draws, primary and
   continuation. In `vared` and `select` (Zsh) and in `read -e` (Bash) the program that is reading
   may have asked, so the reader leaves the bytes alone. A Zsh `read -k` in a widget never goes
@@ -940,9 +953,13 @@ method, and that is exactly what it cannot do:
   `editor_left`, because a line installed before the read would never run. A launch quotes the
   fence of the read it was made for, and the worker publishes this read's fence only after the
   reader has acknowledged one, so what the module reads there is a launch for the read before.
-  Outside Windows, where the module queues its key, the entry does not report the reader idle.
-  The first idle report of a read comes from the handler of a key the module has queued for the
-  editor, which runs once the editor has started (see the cursor reply, below). A key the person
+  A launch that arrives while the module waits for the worker's answer to the entry (below) is
+  read at the first boundary after the editor has started, and is refused there by its fence or
+  the reader it names.
+  Outside Windows the entry does not report the reader idle. The first idle report of a read
+  comes from the handler of a key the module has queued for the editor, or, where it queues none,
+  from the first key that reaches one of its boundaries, which runs once the editor has started
+  (see the cursor reply, below). A key the person
   bound to a script of their own is theirs and carries no boundary, and an ordinary
   character goes straight to the editor's own insertion, so a request that arrives at a parked
   reader is answered after its next bound key that leaves the editor's queue empty rather than
@@ -996,22 +1013,36 @@ method, and that is exactly what it cannot do:
   report, at the reader's idle report, when the editor leaves, when the integration is lost and when
   the session closes. Nothing is held on Windows, or for Zsh and Bash, which ask no cursor question,
   or for Fish, which asks one in a write with two other questions and reads the three answers in
-  order. What the host does not reach: a reply already in the terminal's input when the editor
-  asks, such as the answer to a query of a program that ended before it read it, which the host
-  cannot take back; a reply that the writer has taken (one that waits at the end of the writer's
-  queue behind a fence frame it has not written is passed by the report); an answer the host writes
-  between the module reporting the start of the read and the worker applying that report (the
-  report and the editor's question are handled by two tasks in no fixed order, and when the
-  question is parsed first its report goes out before the hold begins, which then lasts only until
-  the start key's idle report); and the reads that keep the entry's own idle report, listed below,
-  where the hold ends at the entry. An answer written in one of these ways ahead of the report still
-  joins it. The module does not drop them: it meets an answer only as keys, after the editor has
-  read it from the terminal's input (the next item). What the module controls is when the reader
-  first reports its queues clear. A fence proved before the editor has asked its question comes
-  before the reply, and an answer the host writes behind that fence lands ahead of the reply and
-  joins it: the runtime takes the answer's `ESC [` and its first `;` for the start of the reply and
-  its digits for the position, and gives the other bytes back as keys. Some of the answer then
-  reaches the line, and the fence the reader proves next is over a line that is not empty. So outside Windows the read-line entry
+  order. What the host cannot hold is a reply that the writer has taken (one that waits at the end
+  of the writer's queue behind a fence frame it has not written is passed by the report) and a reply
+  already in the terminal's input when the editor asks, such as the answer to a query of a program
+  that ended before it read it. The module narrows both, in the Emacs edit mode. The read-line
+  entry waits for the worker's answer to the entry before it starts the editor, for the answer
+  budget at most: the entry and the terminal's output reach the worker on two paths in no fixed
+  order, and an editor that began at once could ask its question before the worker had applied the
+  entry, which would be answered before the hold began. A worker that does not answer inside the
+  budget costs it once, and the read starts without the hold being in place; no later entry waits
+  while that answer is owed. Then, before the editor starts, the module reads the keys the terminal
+  has already delivered with the console's own read, drops each host answer in them as the chords
+  drop one in the editor's keys (the next item), and puts every other key into the editor's queue,
+  in the order it came, behind its own key. A run that proves to be no answer gives its Escape and
+  introducer to the editor, and the module looks again from the key after them, because an Escape
+  among them may start an answer of its own. If a read fails part way, the editor still gets every
+  key the module had taken. Nothing is waited for there, and it takes what is in the
+  input when it reads: an answer that arrives later, or in two parts across the read, is not taken.
+  A reply the writer had taken when the entry was applied is normally written by the time the
+  worker's answer arrives, and is then in the input the module reads; one the writer has not yet
+  written by then, because its thread has not run or the terminal's input is full, is written ahead
+  of the editor's reply. In the Vi and Windows edit modes the module reads nothing, as the next item
+  says: an answer already in the input when the editor asks joins the editor's reply there, as it
+  did. Where the person has bound one of the chords, or the Escape key, since the module bound its
+  own, the module reads the keys and gives every one of them back to the editor, so the answers
+  reach it as keys there. What the module controls is when the reader first reports its queues clear. A
+  fence proved before the editor has asked its question comes before the reply, and an answer the
+  host writes behind that fence lands ahead of the reply and joins it: the runtime takes the
+  answer's `ESC [` and its first `;` for the start of the reply and its digits for the position,
+  and gives the other bytes back as keys. Some of the answer then reaches the line, and the fence
+  the reader proves next is over a line that is not empty. So outside Windows the read-line entry
   queues a key of the module's own in the editor's key queue (`Ctrl+Alt+F24`, which no terminal
   sends and which the module binds where nothing is bound), and the reader reports itself idle
   from that key's handler. The queue is not clear until the editor has run the key, which it does
@@ -1025,10 +1056,12 @@ method, and that is exactly what it cannot do:
   nothing bound on the key. It queues none for the read after a line accepted with
   accept-and-get-next: the editor loads the next history entry into that read and carries the
   person's history search over to it, and any key it runs ahead of the person's ends the search. In
-  those reads, and where the key cannot be bound or queued, the entry keeps its own idle report, as
-  before. A queue that holds keys is not clear either, and the editor asks where the cursor is
-  before it runs them, so a fence can be proved before the editor has asked only in the reads that
-  keep the entry's own idle report. The module takes its own key out of the queue when it goes.
+  those reads, and where the key cannot be bound or queued, the entry reports nothing: the reader
+  reports itself idle from the handler of the first key it runs, which is after the editor has
+  asked, so a launch into such a read waits for that key. A queue that holds keys is not clear
+  either, and the editor asks where the cursor is before it runs them. On Windows, where the console
+  has no cursor question in its input, the entry keeps its own idle report. The module takes its own
+  key out of the queue when it goes.
 - **A host's answer is dropped before the editor puts it in the line.** The host answers a question
   an application asked the terminal (its attributes, a colour, its version) in the terminal's input,
   and the answer can reach a prompt with nothing typed at it. The runtime has no key for the

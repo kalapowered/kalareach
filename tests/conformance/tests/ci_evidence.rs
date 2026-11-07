@@ -459,9 +459,8 @@ const CLASSES: [ClassOfTest; 10] = [
         runner: &["runs-on: macos-15"],
         runs_on: "macos-15",
         job_when: Some("github.event_name != 'workflow_dispatch' || inputs.macos"),
-        // The whole text of the step's command line, to its end: the step after it that runs the
-        // timed cases starts with the shorter words, and with the same condition, so a prefix
-        // would hold the class with the whole-workspace step deleted.
+        // The whole text of the step's command line, to its end, so that the whole-workspace step
+        // holds the class and not a step that starts with the same words.
         tool: "cargo test --locked --workspace --exclude kr-sync-integration --no-fail-fast --",
         when: Some("${{ !cancelled() && matrix.part == 'tests' }}"),
     },
@@ -851,4 +850,54 @@ fn the_linux_runs_of_the_workspace_tests_require_a_user_service_manager() {
         "the Linux job of the conformance workflow does not require a user service manager in its \
          own environment"
     );
+}
+
+/// The names of a workflow's jobs, in file order: the keys at two spaces in the `jobs:` block, which
+/// ends at the next line at the left margin. A key there that is not a name and a colon alone (an
+/// anchor or a mapping on the same line) is a layout this file's reading does not hold, and fails.
+fn jobs_of(workflow: &str) -> Vec<String> {
+    workflow
+        .lines()
+        .skip_while(|line| without_comment(line) != "jobs:")
+        .skip(1)
+        .take_while(|line| line.is_empty() || line.starts_with([' ', '#']))
+        .map(without_comment)
+        .filter(|line| {
+            line.starts_with("  ") && !line.starts_with("   ") && !line.trim().is_empty()
+        })
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .map(|line| {
+            line.strip_prefix("  ")
+                .and_then(|key| key.strip_suffix(':'))
+                .unwrap_or_else(|| panic!("a job header the case cannot read: {line:?}"))
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The report builds every suite's test programs in turn into one directory, with no build cache,
+/// and the debug information is the greater part of what that directory holds. A run of the
+/// Windows job that built with it filled the drive near the end, and the last two suites failed to
+/// build. Each job of the conformance workflow, like the landing workflow, builds without it.
+#[test]
+fn every_job_of_the_conformance_workflow_builds_without_debug_information() {
+    let report = fs::read_to_string(repository().join(".github/workflows/conformance.yml"))
+        .expect("the conformance workflow");
+    let names = jobs_of(&report);
+    assert!(!names.is_empty(), "the conformance workflow has no job");
+    for name in &names {
+        // Among the job's own keys, in its environment ahead of its steps, so that every step that
+        // builds has it.
+        let keys = header(&job(&report, name));
+        for variable in [
+            "CARGO_PROFILE_DEV_DEBUG: \"0\"",
+            "CARGO_PROFILE_TEST_DEBUG: \"0\"",
+        ] {
+            assert!(
+                keys.lines().any(|line| line.trim() == variable),
+                "the {name} job of the conformance workflow does not set {variable} in its own \
+                 environment"
+            );
+        }
+    }
 }

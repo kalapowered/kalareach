@@ -978,11 +978,15 @@ impl Controller {
                 Some(Refusal::SupportSet | Refusal::Invocation) => DoctorStatus::Warning,
             },
             match refusal {
-                None => Sentence::new().stated(
+                None => Sentence::new().stated(if cfg!(target_os = "macos") {
+                    "Git runs for a paired device inside a boundary that confines what it reads: \
+                     the libraries it needs that the system does not supply are named and one \
+                     invocation under the boundary ran here"
+                } else {
                     "Git runs for a paired device inside a boundary that confines what it reads: \
                      the loaders and libraries it needs are named and one invocation under the \
-                     boundary ran here",
-                ),
+                     boundary ran here"
+                }),
                 Some(refusal) => Sentence::new()
                     .stated(refusal.text())
                     .stated(", so a paired device is refused repository operations"),
@@ -992,15 +996,44 @@ impl Controller {
                     "This daemon's own log says what it could not do. A paired device is refused \
                      until a later check proves it.",
                 ),
-                Some(Refusal::Invocation) => Some(
+                Some(Refusal::Invocation) => Some(if cfg!(target_os = "macos") {
+                    "This daemon's own log says what it could not do, such as a missing sandbox \
+                     launcher, a Git that does not start inside the profile, or a filesystem \
+                     mounted beneath a directory the profile grants. A paired device is refused \
+                     until a later check proves it."
+                } else {
                     "This daemon's own log says what it could not do, such as the kernel's \
                      interface version or a machine it holds no system-call numbers for. A paired \
-                     device is refused until a later check proves it.",
-                ),
+                     device is refused until a later check proves it."
+                }),
                 Some(Refusal::Platform) | None => None,
             },
         )];
         if refusal == Some(Refusal::Platform) {
+            return checks;
+        }
+        if cfg!(target_os = "macos") {
+            // No setting of this host narrows the ways a filesystem can come to be mounted beneath
+            // a directory the owner authorised: any program of the account can attach a disk image
+            // or a share to a directory it owns. That is the state the other platforms' check
+            // reports as a warning, here with no remedy because there is nothing to restrict. What
+            // the host does is refuse an invocation that starts over one, and the sentence says
+            // what that leaves.
+            checks.push(DoctorCheck::new(
+                "device-repository-mounts",
+                "What a paired device's repository operations could reach through a mount",
+                DoctorStatus::Warning,
+                Sentence::new().stated(
+                    "A disk image, a network share or a user-space volume that a program running \
+                     as this account attaches beneath a directory the owner authorised is refused \
+                     when an invocation starts. One attached while Git runs is read as part of the \
+                     tree, and one attached at a directory the invocation was lent, at a support \
+                     directory or at Git's own helper directory is neither refused nor reported. \
+                     This narrows what a paired device's repository operations can reach and does \
+                     not close it, and nothing on this host narrows it further.",
+                ),
+                None,
+            ));
             return checks;
         }
         // What a host shows of how a filesystem could come to be mounted beneath a directory the

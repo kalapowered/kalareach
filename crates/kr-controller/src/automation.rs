@@ -2137,6 +2137,7 @@ fn command_outcome(closure: &kr_protocol::session::ClosureRecord) -> ActionOutco
 /// sweep to try again.
 async fn release_row(context: &NodeContext, action_id: kr_protocol::ids::ActionId) -> bool {
     release(
+        Arc::clone(&context.daemon),
         Arc::clone(&context.changesets),
         Arc::clone(&context.ledger),
         context.scratch_root.clone(),
@@ -2148,6 +2149,7 @@ async fn release_row(context: &NodeContext, action_id: kr_protocol::ids::ActionI
 }
 
 async fn release(
+    daemon: Arc<Daemon>,
     changesets: Arc<ChangeSetService>,
     ledger: Arc<ResourceLedger>,
     scratch_root: PathBuf,
@@ -2156,6 +2158,9 @@ async fn release(
     action_id: kr_protocol::ids::ActionId,
 ) -> bool {
     let released = blocking(move || -> kr_automation::Result<()> {
+        // The daemon is held while the resources are released and the row written, and a release
+        // that finds it gone leaves the row owed: the next daemon's sweep releases it.
+        let _held = daemon.get()?;
         let Some(row) = ledger.get(action_id)? else {
             return Ok(());
         };
@@ -2251,13 +2256,23 @@ impl HostActions {
     /// account for the worker waits for the kernel to say the worker's process ended, or for the
     /// boot it ran in to end. A row whose session was never made is released. Nothing here waits
     /// for the run to end, only for the session's closure.
+    ///
+    /// The sweep holds the daemon where it acts on it and while a job writes the ledger or
+    /// releases what a row owns, and not while it waits for a blocking thread to start that job or
+    /// to read the journal: a daemon let go meanwhile goes at once, and a job whose turn comes
+    /// after that does nothing and leaves its row owed, for the next daemon's sweep. No write
+    /// goes on under a daemon that has let go of its environment.
     pub(crate) async fn sweep(&self, service: &AutomationService) -> usize {
-        let Ok(controller) = self.daemon.get() else {
+        if self.daemon.get().is_err() {
             return 0;
-        };
+        }
         let ledger = Arc::clone(&self.ledger);
+        let daemon = Arc::clone(&self.daemon);
         let before_ms = self.daemon.now_ms().saturating_sub(RELEASED_ROWS_KEPT_MS);
         let rows = match blocking(move || {
+            let Ok(_held) = daemon.get() else {
+                return Ok(Vec::new());
+            };
             ledger.forget_released_before(before_ms)?;
             ledger.open_rows()
         })
@@ -2289,6 +2304,9 @@ impl HostActions {
                 continue;
             };
             let session = if row.owns_session {
+                let Ok(controller) = self.daemon.get() else {
+                    return stuck + 1;
+                };
                 controller
                     .workflow_session_of(&actor_id, row.action_id)
                     .await
@@ -2303,8 +2321,10 @@ impl HostActions {
                     // given it before anything is decided from it.
                     if row.worker.is_none() && found.worker.is_some() {
                         let ledger = Arc::clone(&self.ledger);
+                        let daemon = Arc::clone(&self.daemon);
                         let (action_id, worker) = (row.action_id, found.worker.clone());
                         let noted = blocking(move || {
+                            let _held = daemon.get()?;
                             ledger.note_session(action_id, session_id, worker.as_ref())
                         })
                         .await;
@@ -2316,6 +2336,9 @@ impl HostActions {
                             ),
                         }
                     }
+                    let Ok(controller) = self.daemon.get() else {
+                        return stuck + 1;
+                    };
                     match controller.recorded_or_established_closure(session_id).await {
                         Ok(Some(closure)) if !left_unaccounted(&closure) => {}
                         Ok(Some(_)) if worker_has_ended(&row, controller.boot()) => {}
@@ -2348,7 +2371,12 @@ impl HostActions {
                     continue;
                 }
             }
+            // A daemon that has gone releases nothing: the row stays owed for the next one.
+            if self.daemon.get().is_err() {
+                return stuck + 1;
+            }
             let released = release(
+                Arc::clone(&self.daemon),
                 Arc::clone(&self.changesets),
                 Arc::clone(&self.ledger),
                 self.scratch_root.clone(),
@@ -2955,6 +2983,35 @@ impl AutomationModule {
         self.actions.sweeps.get()
     }
 
+    /// Makes one look at what node dispatches left behind, as the sweep makes it on its own. For
+    /// this host's own tests.
+    #[cfg(test)]
+    pub(crate) async fn sweep_once(&self) -> usize {
+        self.actions.sweep(&self.service).await
+    }
+
+    /// The ledger of what node dispatches own. For this host's own tests.
+    #[cfg(test)]
+    pub(crate) fn ledger(&self) -> &Arc<ResourceLedger> {
+        &self.actions.ledger
+    }
+
+    /// Releases what the dispatch of `action_id` owns, as the sweep does. For this host's own
+    /// tests.
+    #[cfg(test)]
+    pub(crate) async fn release_once(&self, action_id: kr_protocol::ids::ActionId) -> bool {
+        release(
+            Arc::clone(&self.daemon),
+            Arc::clone(&self.actions.changesets),
+            Arc::clone(&self.actions.ledger),
+            self.actions.scratch_root.clone(),
+            Arc::clone(&self.actions.holds),
+            self.daemon.now_ms(),
+            action_id,
+        )
+        .await
+    }
+
     /// Arms the pause the next change-set capture of a workflow stops at once it has passed the
     /// check made before it reads the working tree, and before it asks the change-set store for
     /// anything. Returns the end that says the capture has arrived, and the end that lets it go.
@@ -3093,14 +3150,29 @@ impl AutomationModule {
             }
             Ok(None) => None,
             Ok(Some(answer)) => Some(frame(mutation.request_id, encode_answer(&answer))),
-            Err(error) => Some(frame(mutation.request_id, Err(error.into()))),
+            // A journal whose record of the action cannot be read is not one that holds none: an
+            // earlier copy may have performed it, and a transient word would have the caller send
+            // the action again. A reused identifier keeps its code.
+            Err(error) => Some(frame(
+                mutation.request_id,
+                Err(match error {
+                    kr_automation::AutomationError::DatabaseError(_)
+                    | kr_automation::AutomationError::JsonError(_)
+                    | kr_automation::AutomationError::AuthorityUnavailable(_) => {
+                        ControllerError::record_unreadable("workflow actions").to_protocol_error()
+                    }
+                    other => other.into(),
+                }),
+            )),
         }
     }
 
     /// The answer to a rearm that was performed, when `mutation` is its repeat.
     ///
     /// Anything else, a refusal included, is no answer here: the request goes on to be admitted
-    /// and decided as a new one, which refuses it for the reason it has.
+    /// and decided as a new one, which refuses it for the reason it has. A chain or a grant that
+    /// cannot be read is none of these: whether the rearm was performed is not known, and the
+    /// request is told so.
     async fn rearmed(
         &self,
         mutation: &MutationRequest,
@@ -3119,6 +3191,16 @@ impl AutomationModule {
         .await;
         match answer {
             Ok(Some(value)) => Some(frame(mutation.request_id, Ok(value))),
+            // A chain, or the grant it names, that cannot be read is not a chain that was not
+            // rearmed: the request is told it is not known whether an earlier one was, and is not
+            // decided as a new one.
+            Err(error) if error.code == ErrorCode::StorageUnavailable => Some(frame(
+                mutation.request_id,
+                Err(
+                    ControllerError::record_unreadable("workflow chains and the grants they name")
+                        .to_protocol_error(),
+                ),
+            )),
             Ok(None) | Err(_) => None,
         }
     }

@@ -660,6 +660,11 @@ pub struct Controller {
     /// every shipped build.
     #[cfg(test)]
     before_the_effect: ReadPause,
+    /// Where this host's own tests stop a voice change that found no record of its action, once the
+    /// early look is over and before it claims the action, so that a copy of it can claim and
+    /// record the action in between. Compiled away in every shipped build.
+    #[cfg(test)]
+    before_a_voice_change_claims: ReadPause,
     /// Where this host's own tests stop a close asked for by voice once it is held against its
     /// grant and before the revision and the authority are read, so that a withdrawal of the grant
     /// can land in between. Compiled away in every shipped build.
@@ -742,9 +747,11 @@ pub struct Controller {
     pub delivery: Arc<crate::push::DeliveryModule>,
     /// The loop that drives it: recovery at start, then a pass on every tick.
     delivery_runtime: Arc<crate::push::runtime::DeliveryRuntime>,
-    /// The only gateway a paired device may name in the credential it hands this host, and the
-    /// origin an owed revocation is asked at when no credential is held for it. Read once at start.
-    gateway_origin: String,
+    /// The gateways a paired device may name in the credential it hands this host: the official
+    /// one, whose origin is also where an owed revocation is asked when no credential is held for
+    /// it, and the ones the configuration document lists. The official origin is read once at
+    /// start, and the list whenever the document is put into force.
+    gateways: Arc<crate::push::gateways::AllowedGateways>,
     /// How a paired device's request waits for its effect before it is told the outcome is
     /// unknown, where a suite gave this host's daemon a wait of its own. Read once at start.
     /// Compiled away in every shipped build.
@@ -756,6 +763,10 @@ pub struct Controller {
     /// device records in, so the two see one set of devices whether or not this host is on a
     /// network.
     devices: Arc<net::devices::DeviceDirectory>,
+    /// The mutations paired devices have sent that are being served and have not yet claimed the
+    /// route of their action, which is what tells a refused repeat that its first copy has not
+    /// left a route yet. In memory only.
+    arrivals: Arc<net::arrivals::Arrivals>,
     /// Every grant's lifetime on this host, measured on this daemon's clocks.
     lifetimes: Arc<net::lifetimes::GrantLifetimes>,
     /// The owner confirmations this host asks for, has answered and has spent, whether or not it
@@ -898,8 +909,9 @@ pub struct Controller {
     /// its own schedule, so two removals can reach the same session together. Each takes the
     /// session's recovery lock without waiting, so the second would find the session held and
     /// leave it owed, and the change would answer that it was. The second waits for the first
-    /// and then asks what is still owed.
-    removing_closed: Mutex<()>,
+    /// and then asks what is still owed. A removal waits for its turn holding the lock and not the
+    /// daemon, so the lock is shared and taken by an owner of its own.
+    removing_closed: Arc<Mutex<()>>,
     /// The sessions whose crashed worker is being cleaned up, each under a lock of its own.
     ///
     /// A worker's death is noticed by a read, a list, the closure watcher, the barrier and the
@@ -952,6 +964,11 @@ impl Controller {
     #[must_use]
     pub fn devices(&self) -> &Arc<net::devices::DeviceDirectory> {
         &self.devices
+    }
+
+    /// The mutations paired devices have sent that have not yet claimed their action's route.
+    pub(crate) const fn arrivals(&self) -> &Arc<net::arrivals::Arrivals> {
+        &self.arrivals
     }
 
     /// The environment's grants and invitations.
@@ -1441,6 +1458,10 @@ mod a_transfer_whose_giver_keeps_control;
 #[cfg(test)]
 mod a_revocation_answered_to_a_device;
 
+/// What a repeat of an authority change is told when the record of its first attempt cannot be read.
+#[cfg(test)]
+mod a_repeat_whose_record_cannot_be_read;
+
 /// A transfer of control to a device that was revoked after the transfer was planned.
 #[cfg(test)]
 mod a_transfer_to_a_device_revoked_since;
@@ -1503,6 +1524,10 @@ mod an_owner_establishes_the_clock;
 #[cfg(test)]
 mod the_clock_effect_at_its_commit;
 
+/// A request for the owner's confirmation of a change of exclusive management, asked again.
+#[cfg(test)]
+mod a_repeat_of_an_exclusive_management_request;
+
 /// A closure whose recording is dropped while it waits for the locks after the record.
 #[cfg(test)]
 mod a_closure_that_is_cancelled;
@@ -1543,6 +1568,10 @@ mod a_closed_session_read_back;
 /// A descriptor write that the task waiting for it stops waiting for.
 #[cfg(test)]
 mod a_write_that_outlives_its_daemon;
+
+/// The passes the daemon runs on its own, which keep nothing of it while they wait.
+#[cfg(test)]
+mod a_pass_that_waits_for_its_turn;
 
 /// A daemon making way for an update: its gate to new sessions, the creates it waits for, and
 /// the stop, through its own door.

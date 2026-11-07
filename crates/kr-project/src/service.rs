@@ -4768,12 +4768,15 @@ pub(crate) fn new_uuid() -> Uuid {
 pub enum Refusal {
     /// This platform does not confine what Git reads.
     Platform,
-    /// This host cannot name the loaders and libraries Git needs.
+    /// This host cannot name what Git needs in order to run under the rules for such a caller: on
+    /// Linux the loaders and libraries, on macOS the libraries the system does not supply.
     SupportSet,
-    /// An invocation of Git under the rules for such a caller did not run here: the kernel has no
-    /// Landlock at the version the rules need, the machine is one this host holds no system-call
-    /// numbers for, a filesystem is mounted beneath a directory the invocation is granted, or the
-    /// rules could not be applied.
+    /// An invocation of Git under the rules for such a caller did not run here. On Linux: the
+    /// kernel has no Landlock at the version the rules need, the machine is one this host holds no
+    /// system-call numbers for, a filesystem is mounted beneath a directory the invocation is
+    /// granted, or the rules could not be applied. On macOS: the system's sandbox launcher is
+    /// missing or cannot apply the profile, Git does not start inside it, or a filesystem is
+    /// mounted beneath a directory the invocation is granted.
     Invocation,
 }
 
@@ -4784,14 +4787,26 @@ impl Refusal {
         match self {
             Self::Platform => "this platform does not confine what Git reads",
             Self::SupportSet => {
-                "this host cannot name the loaders and libraries its Git needs, so it cannot name \
-                 the files an invocation for such a caller may read"
+                if cfg!(target_os = "macos") {
+                    "this host cannot name the libraries its Git needs, so it cannot name the \
+                     files an invocation for such a caller may read"
+                } else {
+                    "this host cannot name the loaders and libraries its Git needs, so it cannot \
+                     name the files an invocation for such a caller may read"
+                }
             }
             Self::Invocation => {
-                "an invocation of Git under the rules for such a caller did not run on this \
-                 host: its kernel may lack the confinement they need, the machine may be one \
-                 this host holds no system-call numbers for, or a filesystem may be mounted \
-                 beneath a directory the invocation is granted"
+                if cfg!(target_os = "macos") {
+                    "an invocation of Git under the rules for such a caller did not run on this \
+                     host: the system's sandbox launcher may be missing or unable to apply the \
+                     profile, Git may not start inside it, or a filesystem may be mounted beneath \
+                     a directory the invocation is granted"
+                } else {
+                    "an invocation of Git under the rules for such a caller did not run on this \
+                     host: its kernel may lack the confinement they need, the machine may be one \
+                     this host holds no system-call numbers for, or a filesystem may be mounted \
+                     beneath a directory the invocation is granted"
+                }
             }
         }
     }
@@ -5074,9 +5089,9 @@ fn units_in(directory: &Path, kinds: &[&str]) -> std::io::Result<u64> {
 /// device.
 ///
 /// A host qualifies when Git runs, for such a caller, inside the boundary that confines what it
-/// reads: the kernel's confinement at the version it needs, the rules without the ambient read,
-/// the support set named for this host's Git, and the mount check each invocation makes. One
-/// invocation under exactly those rules proves all four. Nothing off Linux qualifies.
+/// reads: the system's confinement, the rules without the ambient read, the support set named for
+/// this host's Git, and the mount check each invocation makes. One invocation under exactly those
+/// rules proves all four. Linux and macOS can qualify; no other platform does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Qualification {
     refusal: Option<Refusal>,
@@ -5133,13 +5148,15 @@ impl ProjectService {
     /// Proves, now, whether this host runs Git for a caller bounded by a grant.
     ///
     /// It runs one bounded invocation: the profile's own empty directory under the rules such a
-    /// caller's invocation runs under, which needs the support set, the kernel's confinement, the
-    /// rules without the ambient read and the mount check to hold before Git starts. It starts a
-    /// process and takes a moment, so a caller on an async runtime runs it on a blocking thread.
+    /// caller's invocation runs under, which needs the support set, the system's confinement, the
+    /// rules without the ambient read and the mount check to hold before Git starts. On macOS the
+    /// launcher ends before Git starts when it cannot apply the profile, so Git running at all is
+    /// the launcher's proof that the profile applied. It starts a process and takes a moment, so
+    /// a caller on an async runtime runs it on a blocking thread.
     #[must_use]
     pub fn qualify(&self) -> Qualification {
         let narrowing = Narrowing::read();
-        if !cfg!(target_os = "linux") {
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
             return Qualification::refused(Refusal::Platform, Refusal::Platform.text())
                 .with_narrowing(narrowing);
         }

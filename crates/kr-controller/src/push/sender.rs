@@ -144,6 +144,9 @@ impl ServiceSigner for HostSigner {
 #[derive(Clone, Debug)]
 pub struct GatewaySenders {
     transports: Arc<dyn DeliveryTransports>,
+    /// What a revocation goes through. The transports above can refuse a gateway the host no
+    /// longer allows, and a revocation is how that gateway is told to end what it issued.
+    revoking: Arc<dyn DeliveryTransports>,
     signer: Arc<dyn ServiceSigner>,
     runtime: tokio::runtime::Handle,
 }
@@ -157,10 +160,18 @@ impl GatewaySenders {
         runtime: tokio::runtime::Handle,
     ) -> Self {
         Self {
+            revoking: Arc::clone(&transports),
             transports,
             signer,
             runtime,
         }
+    }
+
+    /// Makes revocations through `transports` instead of the ones renewals go through.
+    #[must_use]
+    pub fn revoking_through(mut self, transports: Arc<dyn DeliveryTransports>) -> Self {
+        self.revoking = transports;
+        self
     }
 
     /// Presents one signed request to one route and returns the gateway's answer as it came.
@@ -170,10 +181,21 @@ impl GatewaySenders {
         route: &str,
         body: &PushRequest,
     ) -> Result<ServiceHttpAnswer, String> {
+        self.post_through(&self.transports, origin, route, body)
+    }
+
+    /// Presents one signed request through `transports`.
+    fn post_through(
+        &self,
+        transports: &Arc<dyn DeliveryTransports>,
+        origin: &GatewayOrigin,
+        route: &str,
+        body: &PushRequest,
+    ) -> Result<ServiceHttpAnswer, String> {
         let request =
             kr_client::services::push::signed_push_request_now(origin, body, &*self.signer)
                 .map_err(|error| error.to_string())?;
-        let transport = self.transports.to(origin)?;
+        let transport = transports.to(origin)?;
         let url = format!("{}{route}", origin.as_str());
         self.runtime
             .block_on(async { transport.post_json(&url, &request, &[]).await })
@@ -259,7 +281,8 @@ impl SenderRevocation for GatewaySenders {
         origin: &GatewayOrigin,
         sender_record_id: PushSenderRecordId,
     ) -> RevocationAnswer {
-        let begin = match self.post(
+        let begin = match self.post_through(
+            &self.revoking,
             origin,
             REVOKE_ROUTE,
             &PushRequest::SenderRevoke {
@@ -309,7 +332,8 @@ impl SenderRevocation for GatewaySenders {
             Ok(signature) => signature,
             Err(error) => return RevocationAnswer::Later(error.to_string()),
         };
-        let complete = match self.post(
+        let complete = match self.post_through(
+            &self.revoking,
             origin,
             REVOKE_ROUTE,
             &PushRequest::SenderRevoke {

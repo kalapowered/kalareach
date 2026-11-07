@@ -666,6 +666,10 @@ jobs:
       #   - the plugin host's launcher: `kr-plugin-service`'s library filter `launcher::`, which
       #     holds the endpoint name a host of another release derives for its protocol, in its
       #     Windows form (a pipe's name);
+      #   - the plugin runtime itself: `kr-plugin-runtime`'s library, its `execution` suite, which
+      #     runs real components under the bounds the host holds them to, and its `service` suite,
+      #     which serves workers over this platform's pipe, with the compile budget's reading of a
+      #     thread's processor time, a case of the `execution` suite, as a step of its own;
       #   - the daemon's other Windows suites: the library filters `catalogue::integrations`,
       #     `catalogue::launch_probes`, `agent_tools`, `machine`, `registry` and `singleton`, and
       #     the `agent_tools`, `contact_skill`, `catalogue`, `voice_broker` (the sign-in cases),
@@ -1167,6 +1171,39 @@ jobs:
         if: ${{ !cancelled() && matrix.part == 'second' }}
         # Quoted: a plain YAML scalar cannot end in `:`.
         run: "cargo test --locked -p kr-plugin-service --lib launcher::"
+
+      # The compile budget counts the processor time of the thread that compiles, and on this
+      # platform that is the thread-times query. The case reads it on two real threads, one that
+      # spins and one that waits, and holds the waiting thread to a fraction of what the other used.
+      # No other case checks what it reads. This step carries its own limit, and the three below
+      # carry theirs, so that a case that hangs ends its step and not the leg.
+      - name: Test the compile budget's reading of a thread's processor time
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        timeout-minutes: 20
+        run: cargo test --locked -p kr-plugin-runtime --test execution kr_req_11_41_the_budget_counts_the_compiling_threads_own_processor_time
+
+      # The plugin runtime's own cases, which run the test components built above: the engine, the
+      # compile pool and the compiled-code cache, the host's read of a payload inside its packages
+      # directory, and the bindings' queues and faults.
+      - name: Test the plugin runtime's library
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        timeout-minutes: 10
+        run: cargo test --locked -p kr-plugin-runtime --lib
+
+      # Real components run under the bounds of section 11: memory, output, fuel and deadlines, the
+      # cache's refusals and the compile queue. The case above is run by its own step and left out
+      # here.
+      - name: Test the plugin runtime running real components
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        timeout-minutes: 10
+        run: cargo test --locked -p kr-plugin-runtime --test execution -- --skip kr_req_11_41_the_budget_counts_the_compiling_threads_own_processor_time
+
+      # The host and a worker over the pipe the host serves on this platform: the handshake and the
+      # challenge, registration, delivery, calls, unbinds and the refusals of each.
+      - name: Test the plugin runtime's service over a pipe
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        timeout-minutes: 10
+        run: cargo test --locked -p kr-plugin-runtime --test service
 
       # kr new through the environment's scheduled task, as the standalone start runs it here: three
       # first commands at once meet one daemon that serves every caller, the daemon is in none of
@@ -2602,14 +2639,12 @@ jobs:
       #   nothing without one. The rust job runs each leg against the deployment it names.
       # - The container cases, which need podman, and this runner has none. The rust job's runner
       #   has it, and its test step runs them.
-      # - The cases that need another filesystem, and the cases whose verdicts are timings, which
-      #   the two steps after this one run.
+      # - The cases that need another filesystem, which the step after this one runs.
       #
       # The step builds the workspace's tests and then runs them, and it grows with the tests. On a
       # hosted runner it has taken 108 to 141 minutes when it passed, and on a runner 15 to 30 per
       # cent slower in every suite it ran into a limit of 145 minutes with 38 suites not started.
-      # Its limit is 197 minutes, the most that this job's limit leaves once the other steps of
-      # this part have theirs: the limits of the part add up to 354 of the job's 355 minutes.
+      # Its limit is 197 minutes: the limits of the part add up to 344 of the job's 355 minutes.
       # That is under twice the longest it has taken.
       - name: Test
         if: ${{ !cancelled() && matrix.part == 'tests' }}
@@ -2643,8 +2678,6 @@ jobs:
           --skip a_materialisation_on_another_filesystem_is_not_read_or_emptied_whatever_its_numbers
           --skip a_staged_name_on_another_filesystem_is_left_where_it_is_whatever_its_numbers
           --skip a_volume_whose_disk_is_held_is_detached_once_it_is_let_go
-          --skip kr_req_11_38_every_export_is_stopped_by_its_own_deadline
-          --skip kr_req_11_38_a_worker_is_told_when_the_queue_overflowed
 
       # The lowest free space while the tests built and ran is the figure that says how much room
       # the step needs: the cases that stage a release refuse to start with less than their own
@@ -2776,32 +2809,6 @@ jobs:
         timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the cases that need another filesystem"
 
-      # The cases whose verdicts are timings: a queue that must overflow before a slow component
-      # drains it, and every export stopped at its own deadline. They run here one at a time, as the
-      # rust job runs its timed suites serially, so that no other case of their suites shares this
-      # runner's three processors with them. A case that did not pass here by name fails the step.
-      - name: The timed cases, one at a time
-        if: ${{ !cancelled() && matrix.part == 'tests' }}
-        timeout-minutes: 10
-        run: |
-          set -euo pipefail
-          cases=(
-            kr_req_11_38_a_worker_is_told_when_the_queue_overflowed
-            kr_req_11_38_every_export_is_stopped_by_its_own_deadline
-          )
-          log="$RUNNER_TEMP/timed-cases.log"
-          status=0
-          cargo test --locked --workspace --exclude kr-sync-integration --no-fail-fast \
-            --test service --test execution -- \
-            --exact --test-threads=1 "${cases[@]}" 2>&1 | tee "$log" || status=$?
-          for case in "${cases[@]}"; do
-            if ! grep -q "^test $case \.\.\. ok\$" "$log"; then
-              echo "$case did not pass here" >&2
-              status=1
-            fi
-          done
-          exit "$status"
-
       # Real processes, real sockets and real terminals, the suites the script names and nothing
       # else, each of which must demonstrate something, and no process of the run left behind. This
       # leg builds the suites' test programs itself, which the other leg's test step did before the
@@ -2902,7 +2909,7 @@ jobs:
   # The PowerShell package's cases on the macOS runner. The package's reader counts the input the
   # runtime has taken through .NET internals that differ by platform, and the shell-packages job
   # runs these cases on Linux only. They take far longer than the macos job has left to give: its
-  # limits add up to 354 of its 355 minutes. So they run here, in a job that has the Rust
+  # limits add up to 344 of its 355 minutes. So they run here, in a job that has the Rust
   # toolchain and PowerShell and nothing else of that one. PowerShell is the release the
   # shell-packages job pins, from the macOS archive and checked against the digest its release
   # publishes: the package refuses a release that a published advisory affects, and the .NET

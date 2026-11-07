@@ -8,7 +8,7 @@ use kr_protocol::envelope::{
     ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{RequestId, SessionId};
+use kr_protocol::ids::RequestId;
 use kr_protocol::method::Method;
 
 use super::super::proxy::Vouched;
@@ -213,11 +213,13 @@ impl RemoteConnection {
         received: kr_transport::listener::ReceivedFrame,
     ) -> Option<Answered> {
         let mut asked = None;
+        let mut received = received;
+        let hold = received.take_hold();
         let (frame, received_at) = received.into_parts();
         let frame = match frame {
             ControlFrame::Request(request) => self.read_decided(&request, &mut asked).await,
             ControlFrame::Mutation(mutation) => {
-                self.mutate_decided(&mutation, &mut asked, received_at)
+                self.mutate_decided(&mutation, &mut asked, received_at, hold)
                     .await
             }
             // A host does not call a client, and none of the daemon's own local frames belongs on
@@ -555,7 +557,8 @@ impl RemoteConnection {
     #[cfg(test)]
     pub(super) async fn mutate(&self, mutation: &MutationRequest) -> ControlFrame {
         let received_at = self.controller.clock.now();
-        self.mutate_decided(mutation, &mut None, received_at).await
+        self.mutate_decided(mutation, &mut None, received_at, None)
+            .await
     }
 
     /// Serves one mutation, and keeps the decision it was taken under in `asked`.
@@ -568,8 +571,14 @@ impl RemoteConnection {
         mutation: &MutationRequest,
         asked: &mut Option<Asked>,
         received_at: kr_transport::clock::ContinuousInstant,
+        hold: Option<kr_transport::listener::FrameHold>,
     ) -> ControlFrame {
-        let own_claim = OwnClaim::none();
+        // Entered among the calls that have not claimed the route of their action from the moment
+        // the transport read it, until it claims it or ends, so a refusal of a copy of it that
+        // arrives meanwhile is worded as a repeat's.
+        let own_claim = self
+            .arrival_of(mutation, hold)
+            .map_or_else(OwnClaim::none, OwnClaim::arrived);
         match self
             .serve_mutation(mutation, asked, received_at, &own_claim)
             .await
@@ -831,24 +840,17 @@ impl RemoteConnection {
                         .session_create(&actor_id, &mutation, carried)
                         .await
                 });
-                let answer = settled(
-                    request_id,
-                    tokio::time::timeout(crate::service::CREATE_WAIT, effect).await,
-                );
                 // A create the daemon answered from the reservation an earlier submission made is
-                // the same read of somebody's result as a retained answer anywhere else, and it
-                // says so: `deduplicated` is what distinguishes it from a session made now.
-                if deduplicated(&answer) {
-                    match self.may_read_receipts(
-                        answered_session(&answer),
-                        Method::SessionCreate,
-                        &decided.acting,
-                    ) {
-                        Ok(read) => *asked = Some(read),
-                        Err(_) => return Err(outcome_not_shown()),
-                    }
-                }
-                answer
+                // the same read of somebody's result as a retained answer anywhere else, whether
+                // that attempt launched a session or failed to, and it says so. It is told as any
+                // answer read from a record is.
+                noting(
+                    &mut copied,
+                    settled_by_a_service(
+                        request_id,
+                        tokio::time::timeout(crate::service::CREATE_WAIT, effect).await,
+                    ),
+                )
             }
             // A close is dispatched to the worker, so it goes over a bounded link of its own
             // rather than over the connection this host announces authority revisions on: a worker
@@ -888,10 +890,13 @@ impl RemoteConnection {
                 self.output().on_delivery(request_id, tell);
                 let observer = self.expiry_observer();
                 // The close runs on a task that outlives this connection, so it takes the standing
-                // the feed's refusal is asked of with it.
+                // the feed's refusal is asked of with it, and, when its route could not be recorded,
+                // the call's entry among those that have not claimed: a copy that arrives while the
+                // close runs finds the entry, as it would find the route.
                 let standing = self.feed_standing(&decided.acting.grant);
+                let entered = own_claim.shared_with_the_work();
                 tokio::spawn(async move {
-                    controller
+                    let reached_the_worker = controller
                         .close_remote_session(
                             &mutation,
                             Vouched {
@@ -910,6 +915,14 @@ impl RemoteConnection {
                             receive,
                         )
                         .await;
+                    // The close has no route and its entry goes with this task. A close that was
+                    // carried out, or may have been, is kept: a copy that arrives later finds the
+                    // request kept as one carried out without a route. A close that never reached
+                    // the worker did nothing, and keeps nothing: its copy is refused as any request
+                    // the host has not seen.
+                    if reached_the_worker && let Some(entered) = entered {
+                        entered.settle_without_a_route();
+                    }
                 });
                 match self.controller.within_effect_wait(answered).await {
                     Ok(Ok(Ok(closed))) => {
@@ -1257,13 +1270,11 @@ impl RemoteConnection {
                         })?;
                     let hold = match claimed {
                         crate::grants::ActionClaim::Claimed { hold } => hold,
+                        // An earlier attempt under this identifier claimed the action, and may
+                        // have renamed the session: what became of it is not known here, and a
+                        // transient word would say nothing took effect.
                         crate::grants::ActionClaim::Recorded(_) => {
-                            return Err(crate::error::ControllerError::Refused {
-                                code: ErrorCode::ResourceUnavailable,
-                                detail: "another attempt under this action identifier has not \
-                                         finished"
-                                    .to_owned(),
-                            });
+                            return Err(crate::error::ControllerError::attempt_still_running());
                         }
                     };
                     let outcome = match mutation.target.session_id.as_ref().copied() {
@@ -1279,9 +1290,17 @@ impl RemoteConnection {
                             "a rename names the session it renames".to_owned(),
                         )),
                     };
-                    let kept = controller.settle_claim(&hold, &outcome);
+                    // A receipt that cannot be kept does not change what the rename did, and the
+                    // device is told that, not that the registry failed: the claim stays
+                    // unfinished, and a retry is told the outcome is not known and does not rename
+                    // again.
+                    if let Err(unrecorded) = controller.settle_claim(&hold, &outcome) {
+                        eprintln!(
+                            "kr-controller: a rename's receipt could not be kept: {unrecorded}"
+                        );
+                    }
                     drop(hold);
-                    kept.and(outcome)
+                    outcome
                 });
                 settled(request_id, self.controller.within_effect_wait(effect).await)
             }
@@ -1727,36 +1746,4 @@ fn framed_protocol(
 fn noting(copied: &mut bool, given: Given<ControlFrame>) -> ControlFrame {
     *copied |= given.is_copied();
     given.into_answer()
-}
-
-/// Returns whether an answer is a create the daemon deduplicated rather than performed.
-fn deduplicated(answer: &ControlFrame) -> bool {
-    let ControlFrame::Response(Response {
-        outcome: Outcome::Ok(value),
-        ..
-    }) = answer
-    else {
-        return false;
-    };
-    value
-        .to_typed::<kr_protocol::session::SessionCreateResult>()
-        .is_ok_and(|created| created.deduplicated)
-}
-
-/// Returns the session a retained answer is about, when it names one.
-///
-/// A create's result names the session it made, which is the subject the answer is a read of. An
-/// answer that names none leaves the selector nothing to check, and the grant's own scope decides.
-pub(super) fn answered_session(answer: &ControlFrame) -> Option<SessionId> {
-    let ControlFrame::Response(Response {
-        outcome: Outcome::Ok(value),
-        ..
-    }) = answer
-    else {
-        return None;
-    };
-    value
-        .to_typed::<kr_protocol::session::SessionCreateResult>()
-        .ok()
-        .map(|created| created.session.session_id)
 }

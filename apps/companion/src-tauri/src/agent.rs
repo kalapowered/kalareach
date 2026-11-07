@@ -45,7 +45,7 @@ use kr_protocol::worker::WorkerDescriptor;
 use serde::Serialize;
 
 use crate::error::{CommandError, Result};
-use crate::standing::{Flight, Leased};
+use crate::standing::{Flight, Leased, PairedLinks};
 use crate::state::AppState;
 use crate::terminal::Locate;
 use crate::worker::Unreached;
@@ -485,6 +485,33 @@ impl WorkerLinks {
         Some(held.into_iter().map(|each| each.action_id).collect())
     }
 
+    /// Every link held for `session_id` now, none of them opened for the asking: the books of
+    /// these are where the sends made for the session are held.
+    ///
+    /// On this machine's own host that is the link over the worker's descriptor, if one is held. On
+    /// a host this device is paired with it is the link of the session's opening, which may act
+    /// under a share, and its ambient link, which acts under the pairing.
+    pub(crate) async fn held_for(&self, state: &AppState, session_id: SessionId) -> Vec<Arc<Link>> {
+        let paired = state
+            .paired_context()
+            .is_some()
+            .then(|| state.paired_links());
+        self.held_in(paired.map(|links| &**links), session_id).await
+    }
+
+    /// As [`Self::held_for`], for the places `paired` and this application's own slots hold.
+    async fn held_in(&self, paired: Option<&PairedLinks>, session_id: SessionId) -> Vec<Arc<Link>> {
+        if let Some(paired) = paired {
+            return paired.held_for(session_id);
+        }
+        let Some(slot) = self.lock().get(&session_id).cloned() else {
+            return Vec::new();
+        };
+        // The slot is locked while a link is opened, and for a moment when the link it holds is
+        // handed out, so a lock that is not free does not say there is no link: it is waited for.
+        slot.lock().await.clone().into_iter().collect()
+    }
+
     /// The link to `session_id`'s worker: the one held, or a new one.
     ///
     /// On this machine's own host that is the link over the worker's descriptor. On a host this
@@ -685,5 +712,62 @@ mod tests {
         let session = SessionId::new(kr_ipc::new_uuid());
         assert_eq!(links.serves(session), Ok(false));
         assert_eq!(links.held(), 0);
+    }
+
+    /// KR-REQ-11.63: the links held for a session are the paired host's links when this application
+    /// is on a paired host, and the slot's own when it is not. A slot that is locked, as it is when
+    /// the link it holds is being handed out, is waited for, and the link is found.
+    #[tokio::test]
+    async fn the_links_held_for_a_session_are_found_on_either_route() {
+        use crate::standing::tests::{link_holding_a_send, paired_links_holding};
+        use kr_protocol::ids::GrantId;
+        use kr_protocol::scalars::Uuid;
+
+        let host = kr_ipc::testing::TempHost::create();
+        let links = WorkerLinks::at(host.environment());
+        let environment_id = EnvironmentId::new(Uuid::from_bytes([1; 16]));
+        let session_id = SessionId::new(Uuid::from_bytes([2; 16]));
+        let (local, _) = link_holding_a_send(environment_id, session_id, None, 7).await;
+        let (shared, _) = link_holding_a_send(
+            environment_id,
+            session_id,
+            Some(GrantId::new(Uuid::from_bytes([4; 16]))),
+            5,
+        )
+        .await;
+        let (ambient, _) = link_holding_a_send(environment_id, session_id, None, 6).await;
+        let paired = paired_links_holding(session_id, &shared, &ambient);
+
+        // On a paired host, the paired host's links, and not the slot's.
+        links.lock().insert(
+            session_id,
+            Arc::new(tokio::sync::Mutex::new(Some(Arc::clone(&local)))),
+        );
+        let held = links.held_in(Some(&paired), session_id).await;
+        assert_eq!(held.len(), 2);
+        assert!(held.iter().all(|link| !Arc::ptr_eq(link, &local)));
+
+        // Off it, the slot's link, found though the slot is locked at first.
+        let slot = Arc::clone(links.lock().get(&session_id).expect("the slot"));
+        let locked = slot.lock().await;
+        let links = Arc::new(links);
+        let finding = {
+            let links = Arc::clone(&links);
+            tokio::spawn(async move { links.held_in(None, session_id).await })
+        };
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!finding.is_finished(), "a locked slot is waited for");
+        drop(locked);
+        let held = finding.await.expect("the lookup ends");
+        assert_eq!(held.len(), 1);
+        assert!(Arc::ptr_eq(&held[0], &local));
+        assert!(
+            links
+                .held_in(None, SessionId::new(Uuid::from_bytes([9; 16])))
+                .await
+                .is_empty()
+        );
     }
 }

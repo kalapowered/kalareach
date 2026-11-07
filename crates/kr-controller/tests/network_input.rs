@@ -521,6 +521,133 @@ async fn a_lone_escape_sent_after_a_mutation_on_its_own_connection_reaches_the_a
     rig.close().await;
 }
 
+/// Sends a second mutation behind the stalled one on the device's connection, and asks for a copy of
+/// it from another connection of the same device, in the window the first connection holds, until
+/// the host tells that copy the outcome is unknown. Returns what the copy was last told, the second
+/// mutation's request and the other connection.
+///
+/// The bound is the watchdog's, well under the 30 s the daemon waits for the worker's answer to the
+/// stopped mutation, so that the second mutation has not claimed its route during the poll. The
+/// poll covers the time the second mutation takes to reach the daemon, which no answer shows.
+async fn the_copy_of_a_second_mutation_behind(
+    rig: &Rig,
+) -> (kr_protocol::error::ProtocolError, RequestId, RawDevice) {
+    let report = rig.viewport_report();
+    // The window the second mutation carries, which no answer has renewed while the first is
+    // stopped.
+    let window = rig.device.action_window_id();
+    let behind = ActionId::new(kr_ipc::new_uuid());
+    let held = rig
+        .device
+        .submit(Method::AttachmentViewport, behind, rig.target(), &report)
+        .await;
+    let (device, record) = &rig.paired;
+    let other = RawDevice::connect(&rig.host, device, record).await;
+
+    let deadline = Instant::now() + WATCHDOG;
+    let told = loop {
+        let refused = other
+            .try_mutate_in(
+                window.clone(),
+                Method::AttachmentViewport,
+                behind,
+                rig.target(),
+                &report,
+            )
+            .await
+            .expect("the host answers on an open control stream")
+            .expect_err("a window that is not this connection's admits nothing");
+        if refused.code == ErrorCode::OutcomeUnknown || Instant::now() >= deadline {
+            break refused;
+        }
+    };
+    // The second mutation has claimed no route, so what told the copy is what the daemon holds of
+    // the call and not a route, which only the daemon's own wait for the stopped mutation would
+    // give it.
+    assert!(
+        rig.host
+            .controller()
+            .devices()
+            .action_route(&record.principal(), behind)
+            .expect("the routes are readable")
+            .is_none(),
+        "the second mutation had claimed its route when the copy was refused"
+    );
+    (told, held, other)
+}
+
+/// KR-REQ-23.49: a mutation the daemon has read ahead of the request it is answering, and holds
+/// behind it, is on this host and will be carried out when its turn comes. A copy of it that
+/// another connection of the same device sends meanwhile, in the window the first connection holds,
+/// is refused on the daemon's own account, and is told the outcome is unknown, as the copy of any
+/// call that has not yet claimed the route of its action is: the held mutation may still run.
+///
+/// The connection's first mutation is stopped in its commit at the worker and a second follows it,
+/// which the daemon reads ahead and holds, since keys go ahead of a viewport report. Both are then
+/// let through and answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_copy_of_a_mutation_held_behind_a_stalled_request_is_told_the_outcome_is_unknown() {
+    let rig = Rig::start().await;
+    let report = rig.viewport_report();
+    let (stall, viewport) = rig.stall_own(Method::AttachmentViewport, &report).await;
+    let (told, held, other) = the_copy_of_a_second_mutation_behind(&rig).await;
+    stall.let_go();
+    assert_eq!(
+        told.code,
+        ErrorCode::OutcomeUnknown,
+        "the copy was refused as {told:?}, although the held mutation will run"
+    );
+
+    let mut answers = Answers::default();
+    for request in [viewport, held] {
+        let answer = answers.until(&rig.device, request, LIVENESS_DEADLINE).await;
+        assert!(
+            matches!(answer, Some(Outcome::Ok(_))),
+            "the mutation was answered {answer:?}"
+        );
+    }
+    drop(other);
+    rig.close().await;
+}
+
+/// KR-REQ-23.49: a mutation that waits in the transport's queue for the request the connection is
+/// answering is on this host as much as one the connection has read ahead: the daemon has read it
+/// from the device's stream, and it will be carried out when its turn comes. A copy of it that
+/// another connection of the same device sends meanwhile is told the outcome is unknown.
+///
+/// The connection's first mutation is a detach, which keys wait for, so the daemon reads nothing
+/// more from the stream while it is stopped in its commit at the worker, and the second mutation
+/// stays in the queue. Both are then let through and answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_copy_of_a_mutation_in_the_transport_queue_is_told_the_outcome_is_unknown() {
+    let rig = Rig::start().await;
+    let detach = SessionDetachParams {
+        attachment_id: Nullable::some(rig.attachment),
+        line_token: Nullable::null(),
+    };
+    let (stall, detach_id) = rig.stall_own(Method::SessionDetach, &detach).await;
+    let (told, queued, other) = the_copy_of_a_second_mutation_behind(&rig).await;
+    stall.let_go();
+    assert_eq!(
+        told.code,
+        ErrorCode::OutcomeUnknown,
+        "the copy was refused as {told:?}, although the queued mutation will run"
+    );
+
+    // The detach is answered, and so is the mutation behind it, whatever the detach left it to
+    // meet.
+    let mut answers = Answers::default();
+    for request in [detach_id, queued] {
+        let answer = answers.until(&rig.device, request, LIVENESS_DEADLINE).await;
+        assert!(
+            answer.is_some(),
+            "the mutation {request:?} was not answered"
+        );
+    }
+    drop(other);
+    rig.close().await;
+}
+
 /// KR-PERF-002: a lone Escape that follows a read on the device's connection reaches the
 /// application while that read waits at the worker for a session another connection's mutation is
 /// holding.

@@ -82,7 +82,7 @@ use crate::shown::Shown;
 /* -------------------------------------------------------------------------- */
 
 /// The website's fixed origin, where the passkey ceremony runs.
-pub const ACCOUNT_ORIGIN: &str = "https://reach.kala.to";
+pub const ACCOUNT_ORIGIN: &str = kr_protocol::service::OFFICIAL_GATEWAY_ORIGIN;
 
 /// The passkey relying party: the origin's host, which is how the service derives it.
 pub const RELYING_PARTY_ID: &str = "reach.kala.to";

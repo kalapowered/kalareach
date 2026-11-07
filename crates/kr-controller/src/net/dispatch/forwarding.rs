@@ -15,6 +15,7 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_transport::window::AcceptedDeadline;
 
+use super::super::arrivals::{Arrival, Arrivals, Carried, request_of};
 use super::super::proxy::{Vouched, WorkerProxy};
 use crate::error::{ControllerError, Result};
 use crate::grants::policy::HeldBound;
@@ -63,20 +64,76 @@ impl RouteRefusal {
 /// ([`RemoteConnection::told_of_a_repeat`]). The route a call claims for itself does not make it a
 /// repeat, so a first request refused after its own claim is refused as ever; this records that the
 /// claim was the call's own. A route found otherwise was made by a copy of the request.
-pub(super) struct OwnClaim(AtomicBool);
+///
+/// It also holds the call's entry among the calls that have not yet claimed the route of their
+/// action ([`Arrivals`]), which it gives up when the route is claimed or found, and when the call
+/// ends. A close whose route cannot be recorded goes on without one, and its work outlives the
+/// call, so the entry is shared with that work ([`Self::shared_with_the_work`]) and leaves when both
+/// are done with it.
+pub(super) struct OwnClaim {
+    made: AtomicBool,
+    arrival: std::sync::Mutex<Option<Arc<Arrival>>>,
+}
 
 impl OwnClaim {
-    /// A call that has claimed nothing.
+    /// A call that has claimed nothing and is not among the calls that have not yet claimed.
     pub(super) const fn none() -> Self {
-        Self(AtomicBool::new(false))
+        Self {
+            made: AtomicBool::new(false),
+            arrival: std::sync::Mutex::new(None),
+        }
     }
 
+    /// A call that has claimed nothing, and is entered among those that have not yet claimed.
+    pub(super) fn arrived(arrival: Arrival) -> Self {
+        Self {
+            made: AtomicBool::new(false),
+            arrival: std::sync::Mutex::new(Some(Arc::new(arrival))),
+        }
+    }
+
+    /// Records that this call wrote the route of its action, and gives up its entry: the route is
+    /// what a refusal reads from here on.
     fn made(&self) {
-        self.0.store(true, Ordering::Release);
+        self.made.store(true, Ordering::Release);
+        self.leave();
     }
 
     fn is_made(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.made.load(Ordering::Acquire)
+    }
+
+    /// Gives up the entry among the calls that have not claimed, when the route has been found
+    /// rather than written.
+    fn leave(&self) {
+        self.arrival
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+
+    /// The call's entry, for the work that goes on after the call has ended, when the call has not
+    /// claimed the route of its action. The entry stays among the calls that have not claimed until
+    /// that work ends too, so a copy of the request that arrives while the work runs is a repeat of
+    /// an action that is being carried out, and is told so.
+    ///
+    /// The work holds the same entry, with the same call number, so the call still does not count
+    /// itself. [`Self::leave`] gives up the call's handle only: the entry leaves the set when the
+    /// work lets go of it as well.
+    pub(super) fn shared_with_the_work(&self) -> Option<Arc<Arrival>> {
+        self.arrival
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Whether another call that carries `request` has not yet claimed its route.
+    fn another_has_not_claimed(&self, arrivals: &Arrivals, request: &Carried) -> bool {
+        let own = self
+            .arrival
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        arrivals.another_carries(request, own.as_deref())
     }
 }
 
@@ -116,6 +173,22 @@ fn input_write_refusal(error: &CodecError) -> ProtocolError {
 }
 
 impl RemoteConnection {
+    /// The entry of `mutation` among the calls that have not claimed the route of their action: the
+    /// one the transport's reader made when it read the frame (`hold`), and otherwise a new one,
+    /// for a frame that did not come through the reader. The call is entered once, when it was read.
+    pub(super) fn arrival_of(
+        &self,
+        mutation: &MutationRequest,
+        hold: Option<kr_transport::listener::FrameHold>,
+    ) -> Option<Arrival> {
+        let request = request_of(&self.device.principal(), mutation)?;
+        let read = hold
+            .and_then(|hold| hold.downcast::<Arrival>().ok())
+            .map(|arrival| *arrival)
+            .filter(|arrival| arrival.carries(&request));
+        Some(read.unwrap_or_else(|| self.controller.arrivals().arrive(request)))
+    }
+
     /// The standing work decided under `acting` takes with it: this connection's pairing grant,
     /// `acting`, and the shares it has decided a request under.
     pub(super) fn feed_standing(&self, acting: &kr_protocol::grant::Grant) -> FeedStanding {
@@ -150,9 +223,12 @@ impl RemoteConnection {
     ///
     /// The route is read now, when the refusal is worded, because a copy of the request can claim it
     /// at any point while this one waits. A route this call made itself does not count, so a first
-    /// request refused after its own claim is refused as ever, and a route that holds another
-    /// request under the identifier does not either, so a reused identifier keeps its code. A code
-    /// that is already `OUTCOME_UNKNOWN` is told as it is.
+    /// request refused after its own claim is refused as ever. A route that holds another request
+    /// under the identifier does not either: the identifier is spent, this host dispatches nothing
+    /// under it for this request, and the refusal keeps its code however many copies of this request
+    /// are queued. Two kinds of mutation are the exception
+    /// ([`Self::identifier_is_spent_on_another_request`]). A code that is already `OUTCOME_UNKNOWN`
+    /// is told as it is.
     pub(super) fn told_of_a_repeat(
         &self,
         own_claim: &OwnClaim,
@@ -161,12 +237,58 @@ impl RemoteConnection {
     ) -> ProtocolError {
         if error.code == ErrorCode::OutcomeUnknown
             || own_claim.is_made()
-            || !self.holds_a_route_for(mutation)
+            || self.identifier_is_spent_on_another_request(mutation)
+            || !(self.another_copy_has_not_claimed(own_claim, mutation)
+                || self.holds_a_route_for(mutation))
         {
             error
         } else {
             outcome_not_shown()
         }
+    }
+
+    /// Whether the route of the action a mutation carries holds another request, which makes the
+    /// identifier a reused one that nothing is carried out under for this request.
+    ///
+    /// Two kinds of mutation are not always decided so. A close goes on without a route when
+    /// storage cannot record one, because a stop is let through, so another request that holds the
+    /// route by the time a copy is refused does not say the close was not carried out. A voice
+    /// delegation's challenge gives its route back, so the identifier is free again for the request
+    /// that is signed; only a route that names no session is given back, so a route that names one
+    /// is spent for a voice delegation as for any request. A copy of either is told as a repeat's,
+    /// as it is when it meets no conflict.
+    fn identifier_is_spent_on_another_request(&self, mutation: &MutationRequest) -> bool {
+        let method = mutation.method.method();
+        if method == Some(Method::SessionClose) {
+            return false;
+        }
+        let actor_id = self.device.principal();
+        match self.devices.action_route(&actor_id, mutation.action_id) {
+            Ok(Some(routed)) => {
+                if method == Some(Method::VoiceDelegate) && routed.session_id.is_none() {
+                    return false;
+                }
+                kr_protocol::digest::mutation_digest(mutation, &actor_id)
+                    .is_ok_and(|digest| routed.payload_digest != Some(digest))
+            }
+            Ok(None) | Err(_) => false,
+        }
+    }
+
+    /// Whether a copy of this request is being served that has not yet claimed the route of its
+    /// action, and so has left no route to be read.
+    ///
+    /// Read before the route is: a call writes its route before it leaves the set, so a reader that
+    /// finds the set without the copy finds the copy's route. A close whose route could not be
+    /// recorded has neither once its work has ended ([`Arrivals`]).
+    fn another_copy_has_not_claimed(
+        &self,
+        own_claim: &OwnClaim,
+        mutation: &MutationRequest,
+    ) -> bool {
+        request_of(&self.device.principal(), mutation).is_some_and(|request| {
+            own_claim.another_has_not_claimed(self.controller.arrivals(), &request)
+        })
     }
 
     /// Answers `action.read` for a catalogue action this device performed, where there is one.
@@ -567,8 +689,8 @@ impl RemoteConnection {
     /// Section 23 wants present view authority over the subject before either half of a retained
     /// result goes back, and the answer is written under that decision, so a lease that loses the
     /// right while it waits is refused where it is written. The subject is the session the request
-    /// names (a rename's, a review's, a visit's) or, for a create, the session its answer names,
-    /// which is in the answer rather than in the request.
+    /// names (a rename's, a review's, a visit's) or, for a create, `reserved`, the session of the
+    /// reservation the create left, which its answer does not name when the create failed.
     ///
     /// An owner confirmation's answer is a challenge. Its entry names only the owner's ceremony,
     /// which the confirmation service checks on a first request and cannot be asked again here, so
@@ -587,7 +709,7 @@ impl RemoteConnection {
         &self,
         method: Method,
         mutation: &MutationRequest,
-        retained: &ControlFrame,
+        reserved: Option<SessionId>,
         acting: &Acting,
     ) -> std::result::Result<Option<Asked>, ProtocolError> {
         if matches!(
@@ -598,12 +720,7 @@ impl RemoteConnection {
                 .ask(None, Method::OwnerConfirmationPending.entry(), false)
                 .map(|read| Some(read.answering(method).kept()));
         }
-        let subject = mutation
-            .target
-            .session_id
-            .as_ref()
-            .copied()
-            .or_else(|| super::routes::answered_session(retained));
+        let subject = mutation.target.session_id.as_ref().copied().or(reserved);
         if subject.is_some() {
             return self.may_read_receipts(subject, method, acting).map(Some);
         }
@@ -629,7 +746,23 @@ impl RemoteConnection {
         decided: &Asked,
         asked: &mut Option<Asked>,
     ) -> std::result::Result<ControlFrame, ProtocolError> {
-        *asked = Some(decided.clone().kept());
+        // A reused identifier is this host's word about the identifier and names no result, so it
+        // is no read of a record and is shown as it is, to whoever is still registered. It is
+        // written under the decision of the request, not as an answer kept from an earlier
+        // submission: a refusal to write a kept answer is told as an unknown outcome, and nothing
+        // was carried out here.
+        let reused = matches!(
+            &kept,
+            ControlFrame::Response(Response {
+                outcome: Outcome::Error(error),
+                ..
+            }) if error.code == ErrorCode::IdConflict
+        );
+        *asked = Some(if reused {
+            decided.clone()
+        } else {
+            decided.clone().kept()
+        });
         #[cfg(feature = "testing")]
         self.controller.after_the_retained_lookup.wait().await;
         // What this host holds is the outcome of an action. When it will not show the device
@@ -637,14 +770,48 @@ impl RemoteConnection {
         if self.admitted_to_answer(validated).is_err() {
             return Err(outcome_not_shown());
         }
+        if reused {
+            return Ok(kept);
+        }
         // The answer is a read of what an earlier submission produced, and is written under the
-        // decision that read is ([`Self::read_of_retained`]).
-        match self.read_of_retained(method, mutation, &kept, &decided.acting) {
+        // decision that read is ([`Self::read_of_retained`]). A create's answer is a read of the
+        // reservation its token holds, whichever way the first attempt ended, and the session that
+        // reservation holds is its subject.
+        let reserved = if method == Method::SessionCreate {
+            match self.reserved_session(mutation).await {
+                Ok(reserved) => reserved,
+                Err(()) => return Err(outcome_not_shown()),
+            }
+        } else {
+            None
+        };
+        match self.read_of_retained(method, mutation, reserved, &decided.acting) {
             Ok(Some(read)) => *asked = Some(read),
             Ok(None) => {}
             Err(_) => return Err(outcome_not_shown()),
         }
         Ok(kept)
+    }
+
+    /// The session of the reservation under a create's action, when that reservation holds this
+    /// request, which is what the create's answer is about when it is read from the reservation.
+    ///
+    /// `Ok(None)` is a token another request spent: the refusal that says so is this host's word
+    /// about the identifier and names no result, so it is told as it is. `Err` is a reservation that
+    /// cannot be read, which leaves open what the create came to.
+    async fn reserved_session(
+        &self,
+        mutation: &MutationRequest,
+    ) -> std::result::Result<Option<SessionId>, ()> {
+        let actor_id = self.device.principal();
+        let digest = kr_protocol::digest::mutation_digest(mutation, &actor_id).map_err(|_| ())?;
+        let registry = self.controller.registry.lock().await;
+        let reservation = registry
+            .reservation_for_token(&actor_id, mutation.action_id.get())
+            .ok()
+            .flatten()
+            .ok_or(())?;
+        Ok((reservation.payload_digest == digest).then_some(reservation.session_id))
     }
 
     /// Returns this connection's link to one worker, opening it on first use.
@@ -754,6 +921,7 @@ impl RemoteConnection {
             super::super::devices::ActionRoute::Existing(existing)
                 if existing.payload_digest == Some(digest) && existing.session_id == session_id =>
             {
+                own_claim.leave();
                 Ok(())
             }
             super::super::devices::ActionRoute::Existing(_) => {

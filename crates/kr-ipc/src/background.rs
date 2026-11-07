@@ -735,9 +735,12 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use super::{IoClass, io_class, lower_io_class, save};
 
-    /// A thread that lowers its I/O class finds the system holding it, and a thread that did not
-    /// is still at the class it started with: the class is the calling thread's on Linux, so the
-    /// check runs on threads of its own.
+    /// KR-REQ-22.11, the background I/O priority on Linux: a thread that lowers its I/O class finds
+    /// the system holding it at the idle class, and a thread that did not is still at the class it
+    /// started with. The class is the calling thread's on Linux, so the check runs on threads of its
+    /// own, and a thread that a lowered thread starts begins in the class. Not shown here: the
+    /// processor priority (this module sets none on Linux), that the disk's scheduler acts on the
+    /// class, or the cancellation and scheduling of the jobs, which the description cases show.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_io_class_of_a_thread_that_lowered_it_is_read_back_and_another_threads_is_not() {
@@ -775,8 +778,11 @@ mod tests {
     #[cfg(any(windows, target_os = "macos"))]
     static CLASS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// The process's own disk policy is set and read back, and put back as it was found, so the
-    /// tests that run beside this one in the same process are not throttled by it.
+    /// KR-REQ-22.11, the background I/O priority on macOS: the process's own disk policy is set to
+    /// the throttled one and read back from the system, and put back as it was found, so the tests
+    /// that run beside this one in the same process are not throttled by it. Not shown here: the
+    /// processor class (the case after this one), that a busy disk throttles the process's
+    /// requests, or the cancellation and scheduling of the jobs.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_disk_policy_of_this_process_is_set_read_back_and_put_back() {
@@ -881,10 +887,12 @@ mod tests {
         );
     }
 
-    /// The process enters the background class, and the system reports the idle priority class and
-    /// the very low I/O priority, both to the process itself and to a handle opened on it by its
-    /// identifier. The process is put back as it was found, so the tests that run beside this one
-    /// are not left in the class.
+    /// KR-REQ-22.11, the background class on Windows: the process enters the idle priority class
+    /// and the very low I/O priority, and the system reports both to the process itself and to a
+    /// handle opened on it by its identifier, so the class is read back and not assumed. The process
+    /// is put back as it was found, so the tests that run beside this one are not left in the class.
+    /// Not shown here: the thread that loads the model (the two cases after this one), or the
+    /// cancellation and scheduling of the jobs.
     #[cfg(windows)]
     #[test]
     fn the_background_class_of_this_process_is_set_read_back_and_left() {

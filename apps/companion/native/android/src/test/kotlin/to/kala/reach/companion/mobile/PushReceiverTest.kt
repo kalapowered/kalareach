@@ -70,6 +70,11 @@ class PushReceiverTest {
         assertFalse(record.mark(registration, PendingFile.ANSWERED, null, now))
     }
 
+    /**
+     * KR-REQ-16.06, the receiver's side of answering only its own pending registration: an answer
+     * that outlived its registration cannot move the record of the registration that replaced it,
+     * and the replacement is moved only by its own identifier.
+     */
     @Test
     fun aTryThatOutlivedItsRegistrationCannotMoveItsReplacement() {
         val record = PendingFile(file())
@@ -156,6 +161,12 @@ class PushReceiverTest {
         assertTrue(gateway.posted.isEmpty())
     }
 
+    /**
+     * KR-REQ-16.06, the receiver's side of answering only its own pending registration: a challenge
+     * the decision refuses is not answered. No key is read, nothing is signed or posted, and the
+     * registration stays pending. Not shown here: which challenges the decision refuses, which is
+     * the Rust half's cases.
+     */
     @Test
     fun aChallengeTheDecisionRefusesReadsNoKeyPostsNothingAndLeavesTheRecordPending() {
         val record = PendingFile(file()).also { it.write(pendingText()) }
@@ -175,6 +186,12 @@ class PushReceiverTest {
      * KR-REQ-13.24: a registration challenge is answered by the native receiver alone, with no page
      * running: it reads the device's key from the secure store by the name the decision gave, signs,
      * posts the answer and clears the key.
+     *
+     * KR-REQ-16.06, the receiver's side of returning a signed challenge: the answer the signer
+     * returns is posted to the gateway with the body the signer gave, and the pending registration
+     * it answers moves to answered. Not shown here: what the signature binds (token hash,
+     * registration, gateway origin and expiry), which is the Rust half's cases, or that the
+     * address posted to is the signer's and not the decision's (the fixture gives both the same).
      */
     @Test
     fun theKeyIsReadByTheNameTheDecisionGaveAndClearedOnceTheAnswerIsSigned() {

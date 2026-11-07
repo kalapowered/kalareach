@@ -65,6 +65,14 @@ const PATIENCE: Duration = Duration::from_secs(60);
 /// The gateway the product delivers through.
 const GATEWAY: &str = "https://reach.kala.to";
 
+/// The gateway an independently signed app registers with, which a host's document may list.
+#[cfg(unix)]
+const LISTED: &str = "https://push.builder.example";
+
+/// Another gateway, listed or not as a case needs.
+#[cfg(unix)]
+const OTHER: &str = "https://push.other.example";
+
 /// How long a credential the stand-in gateway issues lasts.
 const LIFETIME_MS: u64 = 30 * 24 * 60 * 60 * 1000 - 1_000;
 
@@ -99,6 +107,8 @@ async fn until(what: &str, mut holds: impl FnMut() -> bool) {
 /// What the gateway holds for one authorisation an installation issued.
 #[derive(Clone, Debug)]
 struct Authorisation {
+    /// The origin of the gateway that issued it, which every credential it mints names.
+    origin: String,
     installation_id: InstallationId,
     host_signing_key: AuthorisationKey,
     state: PushSenderState,
@@ -235,6 +245,17 @@ impl Gateway {
         installation_id: InstallationId,
         host_signing_key: AuthorisationKey,
     ) -> PushDeliveryCredential {
+        self.issue_at(GATEWAY, sender_record_id, installation_id, host_signing_key)
+    }
+
+    /// What an installation does with a gateway that runs at `origin`.
+    fn issue_at(
+        &self,
+        origin: &str,
+        sender_record_id: PushSenderRecordId,
+        installation_id: InstallationId,
+        host_signing_key: AuthorisationKey,
+    ) -> PushDeliveryCredential {
         let mut secret = [0_u8; 32];
         kr_crypto::random_bytes(&mut secret).expect("a secret");
         let issued = self.stamp();
@@ -246,6 +267,7 @@ impl Gateway {
             .get(&sender_record_id)
             .map(|held| held.revision);
         let authorisation = Authorisation {
+            origin: origin.to_owned(),
             installation_id,
             host_signing_key,
             state: PushSenderState::Active,
@@ -266,7 +288,8 @@ impl Gateway {
     ) -> PushDeliveryCredential {
         PushDeliveryCredential {
             expires_at_ms: TimestampMs::new(authorisation.expires_at_ms),
-            gateway_origin: kr_protocol::service::GatewayOrigin::new(GATEWAY).expect("an origin"),
+            gateway_origin: kr_protocol::service::GatewayOrigin::new(authorisation.origin.as_str())
+                .expect("an origin"),
             installation_id: authorisation.installation_id,
             issued_at_ms: TimestampMs::new(issued_at_ms),
             revision: PushSenderRevision::new(authorisation.revision),
@@ -1032,24 +1055,31 @@ impl Environment {
     /// Starts as [`Self::start`] does, with the daemon delivering through the gateway only when
     /// `attached` says so: a daemon with no transport asks no gateway anything.
     async fn start_attached(attached: bool) -> Self {
-        Self::start_on(attached, None, None, None).await
+        Self::start_on(attached, None, None, None, &[]).await
     }
 
     /// Starts as [`Self::start`] does, on clocks the test moves by hand.
     async fn start_on_clocks(clocks: kr_controller::service::Clocks) -> Self {
-        Self::start_on(true, Some(clocks), None, None).await
+        Self::start_on(true, Some(clocks), None, None, &[]).await
     }
 
     /// Starts as [`Self::start`] does, with a configuration document that selects the mailbox
     /// service at the gateway's own origin.
     async fn start_selecting_a_mailbox() -> Self {
-        Self::start_on(true, None, Some(GATEWAY), None).await
+        Self::start_on(true, None, Some(GATEWAY), None, &[]).await
     }
 
     /// Starts as [`Self::start`] does, with the managed service stood up at `origin`, which is
     /// where this daemon takes a credential from and sends every request under it.
     async fn start_with_the_service_at(origin: &str) -> Self {
-        Self::start_on(true, None, None, Some(origin)).await
+        Self::start_on(true, None, None, Some(origin), &[]).await
+    }
+
+    /// Starts as [`Self::start`] does, with a configuration document that lists `gateways` as
+    /// the ones besides the official gateway that a credential may name.
+    #[cfg(unix)]
+    async fn start_listing(gateways: &[&str]) -> Self {
+        Self::start_on(true, None, None, None, gateways).await
     }
 
     async fn start_on(
@@ -1057,6 +1087,7 @@ impl Environment {
         clocks: Option<kr_controller::service::Clocks>,
         mailbox: Option<&str>,
         service: Option<&str>,
+        gateways: &[&str],
     ) -> Self {
         let owner = DeviceKeys::generate().expect("owner keys");
         let host = match clocks {
@@ -1067,10 +1098,16 @@ impl Environment {
         if let Some(origin) = service {
             stopped.account_service_stays_at(origin);
         }
-        if let Some(origin) = mailbox {
+        if mailbox.is_some() || !gateways.is_empty() {
             let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
             document.revision = 1;
-            document.mailbox.origin = Nullable::some(origin.to_owned());
+            if let Some(origin) = mailbox {
+                document.mailbox.origin = Nullable::some(origin.to_owned());
+            }
+            if !gateways.is_empty() {
+                document.push.gateways =
+                    Nullable::some(gateways.iter().map(|&origin| origin.to_owned()).collect());
+            }
             net_support::write_document(stopped.tree(), &document);
         }
         let worker = Worker::start(stopped.tree(), 1).await;
@@ -1993,6 +2030,127 @@ async fn a_registration_whose_answer_was_lost_is_answered_again_over_a_new_conne
         .await
         .expect_err("an action identity reused in another window");
     assert_eq!(reused.code, kr_protocol::error::ErrorCode::IdConflict);
+}
+
+/// KR-REQ-09.09, the answer recorded for a device's push registration: an attempt of the
+/// registration's action that finds it already recorded (the first attempt finished before this one
+/// claimed the action) is given what the first produced only under the admission the attempt carries.
+/// While this host owes a fence it is refused, and the gateway is not asked; the control is the same
+/// attempt with nothing owed, which is answered with the first attempt's result, and again once the
+/// fence is gone. Not shown here: a registration withdrawn, or the repeat the paired door answers
+/// before the call is admitted, which the case above shows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_push_registration_recorded_before_an_attempt_claims_it_is_not_given_back_while_a_fence_is_owed()
+ {
+    use kr_protocol::envelope::{MutationRequest, ParamsValue};
+    use kr_protocol::error::ErrorCode;
+
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x72));
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    let params = DevicePushRegisterParams {
+        credential,
+        previews_enabled: true,
+    };
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let target = ActionTarget::environment(environment.environment_id());
+
+    // The first attempt registers the credential and records what it produced under the action.
+    let first: DevicePushRegisterResult = phone
+        .connection
+        .mutate(Method::DevicePushRegister, action, target.clone(), &params)
+        .await
+        .expect("the daemon registers a credential its gateway confirms")
+        .to_typed()
+        .expect("a registration result");
+    // What the daemon keeps the action under covers the window and the life the first attempt
+    // named, so the second names the same.
+    let window = phone.connection.action_window_id();
+    let asked = environment
+        .gateway
+        .answers_on("/api/push/deliver/status")
+        .len();
+    assert_eq!(
+        asked, 1,
+        "the gateway was asked once, for the first attempt"
+    );
+
+    // A second attempt of the action, arriving at the service itself: it claims the action and
+    // finds the record. It stands on a connection the daemon holds a registration for.
+    let controller = environment.controller();
+    let owner = environment.host.client().await;
+    let attempt = |carried: kr_controller::authority::AdmittedMutation| {
+        let mutation = MutationRequest {
+            request_id: kr_protocol::ids::RequestId::new(2),
+            method: Method::DevicePushRegister.into(),
+            method_version: Method::DevicePushRegister.entry().version,
+            action_id: action,
+            grant_id: Nullable::null(),
+            target: target.clone(),
+            expected: ParamsValue::empty(),
+            action_window_id: window.clone(),
+            requested_ttl_ms: kr_protocol::scalars::DurationMs::new(120_000),
+            params: ParamsValue::from_typed(&params).expect("encodes"),
+        };
+        let actor_id = kr_transport::listener::device_principal(&phone.device_id());
+        async move {
+            controller
+                .push_register_action(&actor_id, &mutation, carried)
+                .await
+        }
+    };
+    let carried = kr_controller::authority::AdmittedMutation {
+        connection_id: owner.acknowledgement().connection_id,
+        admitted_revision: controller.policy().authority_revision(),
+        deadline: controller
+            .continuous_now()
+            .checked_add(Duration::from_secs(60)),
+    };
+
+    // The control: with nothing owed the attempt is given the first attempt's result.
+    let given = attempt(carried).await;
+    assert!(given.is_copied(), "the attempt found the record");
+    let repeated: DevicePushRegisterResult = given
+        .into_answer()
+        .expect("the recorded result is given back")
+        .to_typed()
+        .expect("a registration result");
+    assert_eq!(repeated, first);
+
+    // A fence this host owes stops the recorded answer.
+    controller.hold_fence(true);
+    let refused = attempt(carried)
+        .await
+        .into_answer()
+        .expect_err("a fence this host owes stops the recorded answer");
+    controller.hold_fence(false);
+    assert_eq!(
+        refused.to_protocol_error().code,
+        ErrorCode::PermissionDenied,
+        "{refused}"
+    );
+
+    // Once the fence is gone the attempt is given the record again, and the gateway was asked no
+    // more than once.
+    let again: DevicePushRegisterResult = attempt(carried)
+        .await
+        .into_answer()
+        .expect("answered again once nothing is owed")
+        .to_typed()
+        .expect("a registration result");
+    assert_eq!(again, first);
+    assert_eq!(
+        environment
+            .gateway
+            .answers_on("/api/push/deliver/status")
+            .len(),
+        asked,
+        "the gateway was not asked again"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -5696,4 +5854,871 @@ async fn a_detail_that_does_not_fit_is_in_the_devices_mailbox_before_the_push_th
         kr_cbor::from_canonical_slice(opened.payload.as_slice(), &kr_cbor::Limits::DEFAULT)
             .expect("the whole body");
     assert_eq!(detail.summary, words, "nothing was trimmed");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The gateways the host's document lists, and what taking one out of the list does
+// ---------------------------------------------------------------------------------------------
+
+/// The URLs the gateway has been asked, in order.
+#[cfg(unix)]
+fn asked_urls(environment: &Environment) -> Vec<String> {
+    environment
+        .gateway
+        .state()
+        .asked
+        .iter()
+        .map(|(url, _)| url.clone())
+        .collect()
+}
+
+/// The requests the gateway has been asked that are not a revocation: a revocation owed to a
+/// gateway is asked for on the daemon's own schedule, and a test that counts requests counts the
+/// others.
+#[cfg(unix)]
+fn asked_but_revocations(environment: &Environment) -> Vec<String> {
+    asked_urls(environment)
+        .into_iter()
+        .filter(|url| !url.ends_with("/api/push/sender/revoke"))
+        .collect()
+}
+
+/// A worker relays an approval request through a channel of its own, and the daemon tells the
+/// paired device. The channel stays open for as long as the value is kept.
+#[cfg(unix)]
+async fn raise_an_approval(environment: &Environment, number: u8, request: &str) -> OpenChannel {
+    let mut bound = environment._worker.open_channel(number, true);
+    bound.channel.relay(request).await;
+    environment
+        ._worker
+        .until_relayed(&bound, request, true)
+        .await;
+    bound
+}
+
+/// Waits until the daemon has decided the newest notification written for a device: it is
+/// neither waiting nor on the wire.
+#[cfg(unix)]
+async fn until_the_newest_notification_is_decided(
+    environment: &Environment,
+    phone: &Phone,
+    notifications: usize,
+) -> kr_delivery::journal::DeliveryState {
+    let device = phone.device_id().to_string();
+    until("the notification being decided", || {
+        let records = environment.deliveries_to(&device);
+        records.len() == notifications
+            && records.last().is_some_and(|record| {
+                !matches!(
+                    record.state,
+                    kr_delivery::journal::DeliveryState::Admitted
+                        | kr_delivery::journal::DeliveryState::Retrying
+                        | kr_delivery::journal::DeliveryState::InFlight
+                )
+            })
+    })
+    .await;
+    environment
+        .deliveries_to(&device)
+        .last()
+        .expect("a notification")
+        .state
+}
+
+/// The owner changes the list of gateways through the daemon's own edit, which puts it in force.
+#[cfg(unix)]
+async fn list_gateways(
+    environment: &Environment,
+    gateways: Option<&[&str]>,
+) -> Result<kr_controller::config::Applied, kr_controller::error::ControllerError> {
+    environment
+        .controller()
+        .apply_configuration(&kr_protocol::hostinfo::configuration::Change::PushGateways(
+            gateways.map(|listed| listed.iter().map(|&origin| origin.to_owned()).collect()),
+        ))
+        .await
+}
+
+/// The push gateways the report says this host delivers through, which are the ones in force.
+/// The report is built from the same reading that puts the document into force.
+#[cfg(unix)]
+async fn reported_gateways(environment: &Environment) -> String {
+    environment
+        .controller()
+        .effective_configuration()
+        .await
+        .values
+        .iter()
+        .find(|row| row.key == "push.gateways")
+        .expect("a row for the list")
+        .value()
+        .to_owned()
+}
+
+/// Makes an owed revocation due at once, as the wait after a failed ask would have by itself.
+#[cfg(unix)]
+fn make_due(environment: &Environment, sender: PushSenderRecordId) {
+    environment
+        .controller()
+        .delivery()
+        .with(|producer| {
+            producer
+                .journal_mut()
+                .note_revocation_attempt(sender, 0)
+                .expect("a write");
+            Ok(())
+        })
+        .expect("a write");
+}
+
+/// Runs one sweep of the owed revocations, as the daemon's question tick does.
+#[cfg(unix)]
+async fn sweep_revocations(environment: &Environment) {
+    let runtime = Arc::clone(environment.controller().delivery_runtime());
+    tokio::task::spawn_blocking(move || runtime.sweep_revocations())
+        .await
+        .expect("the sweep ends");
+}
+
+/// KR-REQ-16.04: a credential that names a gateway the host's document lists is registered, is
+/// renewed at that gateway with the phone away, and is posted to, and the report says which
+/// gateways are listed.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_credential_naming_a_listed_gateway_registers_renews_and_posts() {
+    let environment = Environment::start_listing(&[LISTED]).await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0xa1));
+    // Two days left: inside the seven days in which section 16 renews ahead of expiry.
+    environment.gateway.issue_for(2 * 24 * 60 * 60 * 1000);
+    let credential = environment.gateway.issue_at(
+        LISTED,
+        sender,
+        phone.installation(),
+        environment.host_signing_key(),
+    );
+    environment.gateway.issue_for(0);
+    assert_eq!(credential.gateway_origin.as_str(), LISTED);
+    let registered = phone
+        .register(&environment, &credential)
+        .await
+        .expect("a credential naming a listed gateway is registered");
+    assert_eq!(registered.sender_record_id, sender);
+    assert!(environment.destination(phone.device_id()).is_some());
+    let issued = environment.gateway.revision_of(sender);
+
+    // The daemon starts again, with the phone away, and renews at the gateway the credential names.
+    let environment = environment.restart().await;
+    until("the daemon renewing a credential in its window", || {
+        environment.gateway.revision_of(sender) > issued
+    })
+    .await;
+    assert!(
+        asked_urls(&environment).contains(&format!("{LISTED}/api/push/sender/renew")),
+        "{:?}",
+        asked_urls(&environment)
+    );
+    let credentials = environment.controller().delivery_runtime().credentials();
+    until("the daemon holding the renewed credential", || {
+        credentials.held(sender).is_some_and(|held| {
+            held.gateway_origin.as_str() == LISTED && held.revision.get() > issued
+        })
+    })
+    .await;
+
+    // And an approval is posted to it.
+    let _approval = raise_an_approval(&environment, 2, "abcde").await;
+    until("the approval being delivered", || {
+        environment.gateway.delivered().len() == 1
+    })
+    .await;
+    assert!(asked_urls(&environment).contains(&format!("{LISTED}/api/push/deliver")));
+
+    // The report says what is listed, and that it applies at once.
+    let report = environment.controller().effective_configuration().await;
+    let row = report
+        .values
+        .iter()
+        .find(|row| row.key == "push.gateways")
+        .expect("a row for the list");
+    assert_eq!(row.value(), LISTED);
+    assert_eq!(
+        row.effect,
+        kr_protocol::hostinfo::configuration::ValueEffect::Immediately
+    );
+}
+
+/// KR-REQ-16.04: a credential naming an origin the document does not list is refused before the
+/// gateway is asked about it, and an authorisation the host holds for one gateway is not another
+/// gateway's to take over, because an authorisation is named by its identifier alone.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_credential_naming_an_origin_the_document_does_not_list_is_refused_before_the_gateway_is_asked()
+ {
+    let environment = Environment::start_listing(&[LISTED, OTHER]).await;
+    let phone = environment.phone().await;
+    let key = environment.host_signing_key();
+    let unlisted = "https://push.unlisted.example";
+    let refused = phone
+        .register(
+            &environment,
+            &environment.gateway.issue_at(
+                unlisted,
+                PushSenderRecordId::new(uuid(0xa2)),
+                phone.installation(),
+                key,
+            ),
+        )
+        .await
+        .expect_err("an origin the document does not list");
+    assert_eq!(refused.code, kr_protocol::error::ErrorCode::InvalidArgument);
+    assert!(environment.destination(phone.device_id()).is_none());
+    assert!(
+        asked_urls(&environment).is_empty(),
+        "the gateway was not asked about it"
+    );
+
+    // The control: a listed gateway's credential is taken.
+    let sender = PushSenderRecordId::new(uuid(0xa3));
+    let held = environment
+        .gateway
+        .issue_at(LISTED, sender, phone.installation(), key);
+    phone
+        .register(&environment, &held)
+        .await
+        .expect("a listed gateway's credential is registered");
+
+    // Another listed gateway issues an authorisation under the same identifier. The host holds
+    // that identifier for the first, and keeps it so: the registration is refused and writes
+    // nothing, neither a credential nor a debt.
+    let taken = environment
+        .gateway
+        .issue_at(OTHER, sender, phone.installation(), key);
+    let refused = phone
+        .register(&environment, &taken)
+        .await
+        .expect_err("an authorisation held for another gateway");
+    assert_eq!(refused.code, kr_protocol::error::ErrorCode::InvalidArgument);
+    let credentials = environment.controller().delivery_runtime().credentials();
+    assert_eq!(
+        credentials
+            .held(sender)
+            .map(|held| held.gateway_origin.as_str().to_owned()),
+        Some(LISTED.to_owned())
+    );
+    assert!(owed(&environment).is_empty());
+}
+
+/// KR-REQ-16.04: taking a gateway out of the list retires what the host holds for it, at once. The
+/// credential is no longer used or renewed and is gone from the host's memory and its secret
+/// store, the next notification is not posted, a credential naming the gateway is refused, and the
+/// host owes the gateway a revocation, which it makes. The device stays paired, with a destination
+/// that holds no credential.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn taking_a_gateway_out_of_the_list_retires_its_credentials_and_the_gateway_revokes_them() {
+    let environment = Environment::start_listing(&[LISTED]).await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0xa4));
+    let credential = environment.gateway.issue_at(
+        LISTED,
+        sender,
+        phone.installation(),
+        environment.host_signing_key(),
+    );
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+    let _first = raise_an_approval(&environment, 2, "abcde").await;
+    until("the first approval being delivered", || {
+        environment.gateway.delivered().len() == 1
+    })
+    .await;
+    let credentials = environment.controller().delivery_runtime().credentials();
+    assert!(credentials.held(sender).is_some());
+
+    // The gateway refuses revocations for now, so that what the host does before one is made can
+    // be seen.
+    environment.gateway.refuse_revocations(true);
+    list_gateways(&environment, None)
+        .await
+        .expect("the gateway is taken out of the list");
+    let asked = asked_urls(&environment).len();
+    let others = asked_but_revocations(&environment);
+    assert!(
+        credentials.held(sender).is_none(),
+        "the credential is no longer held"
+    );
+    assert!(
+        stored_credential(&environment, sender).is_none(),
+        "and is gone from the secret store"
+    );
+    assert!(
+        !secret_store_holds(&environment, bytes_of(&credential)),
+        "bearer included"
+    );
+    let debts = owed(&environment);
+    assert_eq!(debts.len(), 1, "one revocation is owed");
+    assert_eq!(debts[0].sender_record_id, sender);
+    assert_eq!(
+        debts[0].gateway_origin, LISTED,
+        "to the gateway that issued it"
+    );
+    let destination = environment
+        .destination(phone.device_id())
+        .expect("the device is still paired, with its destination");
+    assert!(destination.enabled && destination.rule.is_some());
+
+    // The next notification is not posted, and no request leaves for the gateway but the
+    // revocation.
+    let _second = raise_an_approval(&environment, 3, "fghij").await;
+    assert_eq!(
+        until_the_newest_notification_is_decided(&environment, &phone, 2).await,
+        kr_delivery::journal::DeliveryState::Revoked
+    );
+    assert_eq!(environment.gateway.delivered().len(), 1);
+    environment.gateway.refuse_revocations(false);
+    let after = asked_urls(&environment);
+    assert!(
+        after[asked..]
+            .iter()
+            .all(|url| url.ends_with("/api/push/sender/revoke")),
+        "{:?}",
+        &after[asked..]
+    );
+
+    // A credential naming the gateway is refused now, and the gateway is not asked.
+    let again = environment.gateway.issue_at(
+        LISTED,
+        PushSenderRecordId::new(uuid(0xa5)),
+        phone.installation(),
+        environment.host_signing_key(),
+    );
+    let refused = phone
+        .register(&environment, &again)
+        .await
+        .expect_err("a gateway that is no longer listed");
+    assert_eq!(refused.code, kr_protocol::error::ErrorCode::InvalidArgument);
+    assert_eq!(
+        asked_but_revocations(&environment),
+        others,
+        "the gateway was asked nothing but to revoke"
+    );
+
+    // The revocation is made at the gateway that issued the credential, and the debt is settled.
+    make_due(&environment, sender);
+    sweep_revocations(&environment).await;
+    until("the gateway revoking the authorisation", || {
+        environment
+            .gateway
+            .authorisation(sender)
+            .is_some_and(|held| held.state == PushSenderState::Revoked)
+    })
+    .await;
+    until("the debt being settled", || owed(&environment).is_empty()).await;
+    assert!(
+        asked_urls(&environment)
+            .iter()
+            .any(|url| url == &format!("{LISTED}/api/push/sender/revoke"))
+    );
+}
+
+/// KR-REQ-16.04: a revocation the removed gateway does not take is asked for again, further apart
+/// each time, and made when it answers. It is kept across a restart, and a restart does not load
+/// the credential again even when the gateway is listed again: a release that does not read the
+/// section does the same with the debt, and so a rollback cannot bring the credential back.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_revocation_the_removed_gateway_does_not_take_is_owed_across_restarts_and_never_brings_the_credential_back()
+ {
+    let environment = Environment::start_listing(&[LISTED]).await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0xa6));
+    let credential = environment.gateway.issue_at(
+        LISTED,
+        sender,
+        phone.installation(),
+        environment.host_signing_key(),
+    );
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+    environment.gateway.refuse_revocations(true);
+    list_gateways(&environment, None)
+        .await
+        .expect("the gateway is taken out of the list");
+
+    // The ask fails, is noted, and is not made again until its wait has gone by.
+    until("the revocation being asked for", || {
+        owed(&environment)
+            .iter()
+            .any(|debt| debt.sender_record_id == sender && debt.attempts >= 1)
+    })
+    .await;
+    // Asked at the moment the debt was written down, which is before the failed ask was noted: the
+    // wait that follows an ask has not gone by then, whatever time the test has taken.
+    let written_at_ms = owed(&environment)
+        .iter()
+        .find(|debt| debt.sender_record_id == sender)
+        .expect("the debt")
+        .queued_at_ms;
+    environment
+        .controller()
+        .delivery()
+        .with(|producer| {
+            assert!(
+                producer
+                    .journal()
+                    .revocations_due(written_at_ms, 64)
+                    .expect("a read")
+                    .is_empty(),
+                "the wait after a failed ask has not gone by"
+            );
+            Ok(())
+        })
+        .expect("a read");
+    assert_eq!(
+        environment
+            .gateway
+            .authorisation(sender)
+            .expect("held")
+            .state,
+        PushSenderState::Active
+    );
+
+    // A stop between the debt and the item leaves the item behind, and the gateway is listed again.
+    {
+        let store = open_store_in(&environment.host.tree().environment().secrets_dir())
+            .expect("the daemon's secret store");
+        kr_controller::push::secrets::DestinationSecrets::new(
+            Arc::from(store.store),
+            environment.environment_id(),
+        )
+        .put_push_credential(&credential)
+        .expect("the item is left behind");
+    }
+    list_gateways(&environment, Some(&[LISTED]))
+        .await
+        .expect("the gateway is listed again");
+
+    // The next daemon owes the same debt, does not load the credential, removes the item, and
+    // posts nothing under it.
+    let environment = environment.restart().await;
+    let debts = owed(&environment);
+    assert_eq!(debts.len(), 1);
+    assert_eq!(debts[0].sender_record_id, sender);
+    assert_eq!(debts[0].gateway_origin, LISTED);
+    assert!(
+        environment
+            .controller()
+            .delivery_runtime()
+            .credentials()
+            .held(sender)
+            .is_none()
+    );
+    assert!(!secret_store_holds(&environment, bytes_of(&credential)));
+    let _approval = raise_an_approval(&environment, 2, "abcde").await;
+    assert_eq!(
+        until_the_newest_notification_is_decided(&environment, &phone, 1).await,
+        kr_delivery::journal::DeliveryState::Revoked
+    );
+    assert!(environment.gateway.delivered().is_empty());
+
+    // The gateway answers, and the debt is paid.
+    environment.gateway.refuse_revocations(false);
+    make_due(&environment, sender);
+    sweep_revocations(&environment).await;
+    until("the gateway revoking the authorisation", || {
+        environment
+            .gateway
+            .authorisation(sender)
+            .is_some_and(|held| held.state == PushSenderState::Revoked)
+    })
+    .await;
+    until("the debt being settled", || owed(&environment).is_empty()).await;
+}
+
+/// KR-REQ-16.04: a registration the removed gateway confirmed while the gateway was being taken
+/// out of the list writes nothing: no destination, no credential and no debt.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_registration_confirmed_while_its_gateway_is_taken_out_of_the_list_writes_nothing() {
+    let environment = Environment::start_listing(&[LISTED]).await;
+    let key = environment.host_signing_key();
+    // The control: a registration at the listed gateway is taken.
+    let control = environment.phone().await;
+    control
+        .register(
+            &environment,
+            &environment.gateway.issue_at(
+                LISTED,
+                PushSenderRecordId::new(uuid(0xa7)),
+                control.installation(),
+                key,
+            ),
+        )
+        .await
+        .expect("the control registration is taken");
+
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0xa8));
+    let credential = environment
+        .gateway
+        .issue_at(LISTED, sender, phone.installation(), key);
+    // The gateway is slow to answer the host's question about the authorisation.
+    let held = environment.gateway.hold_before("/api/push/sender/renew", 0);
+    let registering = phone.register(&environment, &credential);
+    let removing = async {
+        held.reached().await;
+        list_gateways(&environment, None)
+            .await
+            .expect("the gateway is taken out of the list");
+        held.release();
+    };
+    let (registered, ()) = tokio::join!(registering, removing);
+    let refused = registered.expect_err("a gateway that is no longer listed");
+    assert_eq!(refused.code, kr_protocol::error::ErrorCode::InvalidArgument);
+    assert!(environment.destination(phone.device_id()).is_none());
+    assert!(
+        environment
+            .controller()
+            .delivery_runtime()
+            .credentials()
+            .held(sender)
+            .is_none()
+    );
+    assert!(
+        owed(&environment)
+            .iter()
+            .all(|debt| debt.sender_record_id != sender),
+        "the host never held the authorisation, so it owes nothing for it"
+    );
+}
+
+/// KR-REQ-16.04: a document this host cannot use decides nothing, and so retires nothing: not one
+/// that is damaged, not one whose list holds a malformed origin, not one that states a level below
+/// its section, and not an absent one. The list in force stays, and the credential goes on being
+/// used.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_document_the_host_cannot_use_retires_nothing() {
+    let environment = Environment::start_listing(&[LISTED]).await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0xa9));
+    let credential = environment.gateway.issue_at(
+        LISTED,
+        sender,
+        phone.installation(),
+        environment.host_signing_key(),
+    );
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+    let path = kr_worker::config::document_path(&environment.host.tree().environment());
+    let usable = std::fs::read(&path).expect("the document");
+    let requests = ["bcdef", "cdefg", "defgh"];
+    for (index, (why, text)) in [
+        (
+            "damaged",
+            b"{ this is not a configuration document".to_vec(),
+        ),
+        (
+            "a malformed origin",
+            br#"{"version": 3, "level": 7, "revision": 2, "push": {"gateways": ["push.builder.example"]}}"#.to_vec(),
+        ),
+        (
+            "a level below its section",
+            br#"{"version": 3, "level": 6, "revision": 3, "push": {"gateways": ["https://push.builder.example"]}}"#.to_vec(),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let posted = index + 1;
+        kr_ipc::paths::write_owner_only_file(&path, &text).expect("the document");
+        assert_eq!(
+            reported_gateways(&environment).await,
+            LISTED,
+            "{why}: the report says what is in force, not what the document would have said"
+        );
+        assert!(
+            environment
+                .controller()
+                .delivery_runtime()
+                .credentials()
+                .held(sender)
+                .is_some(),
+            "{why}: the credential is still held"
+        );
+        assert!(owed(&environment).is_empty(), "{why}");
+        let channel = u8::try_from(index).expect("a small index") + 2;
+        let _approval = raise_an_approval(&environment, channel, requests[index]).await;
+        until("the approval being delivered", || {
+            environment.gateway.delivered().len() == posted
+        })
+        .await;
+    }
+    // An absent document is the ordinary first run, and decides nothing either.
+    std::fs::remove_file(&path).expect("the document goes");
+    assert_eq!(reported_gateways(&environment).await, LISTED);
+    assert!(
+        environment
+            .controller()
+            .delivery_runtime()
+            .credentials()
+            .held(sender)
+            .is_some()
+    );
+    assert!(owed(&environment).is_empty());
+    // The control: the usable document again, with the list changed, retires it. The gateway
+    // refuses revocations for now, so that the debt is still there to be seen.
+    environment.gateway.refuse_revocations(true);
+    kr_ipc::paths::write_owner_only_file(&path, &usable).expect("the document");
+    list_gateways(&environment, Some(&[OTHER]))
+        .await
+        .expect("the list changes");
+    assert_eq!(owed(&environment).len(), 1);
+    assert_eq!(reported_gateways(&environment).await, OTHER);
+}
+
+/// KR-REQ-16.04: a registry that records the accepted document without the section, as a release
+/// that does not read it writes it, does not make this release let go of the credentials of the
+/// gateways the document on disk lists. The list comes from the document, never from that copy.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_registry_copy_without_the_section_does_not_retire_a_listed_gateway() {
+    let environment = Environment::start_listing(&[LISTED]).await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0xaa));
+    let credential = environment.gateway.issue_at(
+        LISTED,
+        sender,
+        phone.installation(),
+        environment.host_signing_key(),
+    );
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+
+    // The daemon stops, a release that does not read the section accepts the document without it,
+    // and this release starts again over the same document on disk.
+    let Environment {
+        host,
+        owner,
+        _worker,
+        worker_session,
+        gateway,
+    } = environment;
+    let stopped = host.shut_down().await;
+    {
+        let environment_paths = stopped.tree().environment();
+        let mut registry = kr_controller::registry::Registry::open(
+            environment_paths.registry_database(),
+            stopped.tree().environment_id(),
+        )
+        .expect("the registry");
+        let held = registry.accepted_configuration().expect("a record");
+        let mut earlier: serde_json::Value =
+            serde_json::from_str(&held.document.expect("an accepted copy")).expect("JSON");
+        earlier.as_object_mut().expect("an object").remove("push");
+        earlier["level"] = serde_json::json!(1);
+        registry
+            .record_accepted_configuration(&kr_controller::registry::AcceptedConfiguration {
+                revision: held.revision,
+                document: Some(earlier.to_string()),
+            })
+            .expect("the copy is recorded");
+    }
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    let environment = Environment {
+        host,
+        owner,
+        _worker,
+        worker_session,
+        gateway,
+    };
+    environment.until_adopted().await;
+    environment.attach_gateway();
+
+    assert!(
+        environment
+            .controller()
+            .delivery_runtime()
+            .credentials()
+            .held(sender)
+            .is_some(),
+        "the credential is still held"
+    );
+    assert!(owed(&environment).is_empty(), "and nothing is owed");
+    let _approval = raise_an_approval(&environment, 2, "abcde").await;
+    until("the approval being delivered", || {
+        environment.gateway.delivered().len() == 1
+    })
+    .await;
+}
+
+/// KR-REQ-16.04: a host that starts over a document it has already accepted, which no longer
+/// lists the gateway a credential was issued by, lets go of that credential before it delivers
+/// anything, though no acceptance runs at that start: the record of the accepted document and the
+/// document on disk are the same, and both lack the section. A release that does not read the
+/// section is one that leaves them so.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_start_over_an_accepted_document_that_does_not_list_a_gateway_lets_go_of_its_credentials()
+{
+    let environment = Environment::start_listing(&[LISTED]).await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0xac));
+    let credential = environment.gateway.issue_at(
+        LISTED,
+        sender,
+        phone.installation(),
+        environment.host_signing_key(),
+    );
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+    assert!(stored_credential(&environment, sender).is_some());
+
+    // The daemon stops, and the document on disk and the registry's record of the accepted one
+    // become the same document, which lists no gateway.
+    let Environment {
+        host,
+        owner,
+        _worker,
+        worker_session,
+        gateway,
+    } = environment;
+    let stopped = host.shut_down().await;
+    {
+        let environment_paths = stopped.tree().environment();
+        let mut registry = kr_controller::registry::Registry::open(
+            environment_paths.registry_database(),
+            stopped.tree().environment_id(),
+        )
+        .expect("the registry");
+        let held = registry.accepted_configuration().expect("a record");
+        let mut without: serde_json::Value =
+            serde_json::from_str(&held.document.expect("an accepted copy")).expect("JSON");
+        without.as_object_mut().expect("an object").remove("push");
+        without["level"] = serde_json::json!(1);
+        let text = without.to_string();
+        registry
+            .record_accepted_configuration(&kr_controller::registry::AcceptedConfiguration {
+                revision: held.revision,
+                document: Some(text.clone()),
+            })
+            .expect("the copy is recorded");
+        kr_ipc::paths::write_owner_only_file(
+            &kr_worker::config::document_path(&environment_paths),
+            text.as_bytes(),
+        )
+        .expect("the document");
+    }
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    let environment = Environment {
+        host,
+        owner,
+        _worker,
+        worker_session,
+        gateway,
+    };
+    environment.until_adopted().await;
+
+    // No transport is attached yet, so nothing has been asked of any gateway: what the start did
+    // it did by itself.
+    assert!(
+        environment
+            .controller()
+            .delivery_runtime()
+            .credentials()
+            .held_origin(sender)
+            .is_none(),
+        "the credential is let go of"
+    );
+    assert!(
+        stored_credential(&environment, sender).is_none(),
+        "and is gone from the secret store"
+    );
+    let debts = owed(&environment);
+    assert_eq!(debts.len(), 1, "one revocation is owed");
+    assert_eq!(debts[0].gateway_origin, LISTED);
+}
+
+/// KR-REQ-16.04: a debt the host cannot write down leaves the credential unusable, and the
+/// credential is let go of, with its debt, the next time the document is put into force.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_retirement_that_cannot_write_its_debt_leaves_the_credential_unusable_and_is_tried_again()
+{
+    let environment = Environment::start_listing(&[LISTED]).await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0xab));
+    let credential = environment.gateway.issue_at(
+        LISTED,
+        sender,
+        phone.installation(),
+        environment.host_signing_key(),
+    );
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+
+    // The journal refuses to take a debt.
+    let journal = environment
+        .host
+        .tree()
+        .environment()
+        .state_dir()
+        .join(kr_controller::push::DELIVERY_JOURNAL);
+    let connection = rusqlite::Connection::open(&journal).expect("the journal");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER refuse_a_debt BEFORE INSERT ON delivery_revocations
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )
+        .expect("the trigger");
+    let refused = list_gateways(&environment, None)
+        .await
+        .expect_err("a retirement that cannot write its debt is not in force");
+    assert!(refused.to_string().contains("not in force"), "{refused}");
+    assert!(
+        environment
+            .controller()
+            .delivery_runtime()
+            .credentials()
+            .held(sender)
+            .is_none(),
+        "the credential is unusable"
+    );
+    assert!(
+        stored_credential(&environment, sender).is_some(),
+        "and is still kept, because nothing is written down about it"
+    );
+    let _approval = raise_an_approval(&environment, 2, "abcde").await;
+    assert_eq!(
+        until_the_newest_notification_is_decided(&environment, &phone, 1).await,
+        kr_delivery::journal::DeliveryState::Revoked
+    );
+    assert!(environment.gateway.delivered().is_empty());
+
+    // The journal takes it again, and the next time the document is put into force the debt is
+    // written and the credential let go of.
+    connection
+        .execute_batch("DROP TRIGGER refuse_a_debt;")
+        .expect("the trigger goes");
+    drop(connection);
+    // The gateway refuses revocations for now, so that the debt is still there to be seen.
+    environment.gateway.refuse_revocations(true);
+    drop(environment.controller().effective_configuration().await);
+    assert_eq!(owed(&environment).len(), 1);
+    assert!(stored_credential(&environment, sender).is_none());
 }

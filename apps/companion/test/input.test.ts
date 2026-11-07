@@ -210,7 +210,7 @@ describe('the scripted host reads input as native code does (KR-REQ-10.01)', () 
       message:
         "those are not this operation's parameters: a wheel turns between 1 and 1024 times either way, not 0",
       user_action: 'nothing',
-      retry: 'no_retry'
+      retry: 'configuration_change'
     })
   })
 
@@ -474,7 +474,7 @@ describe("the scripted host reads a view's opening, size and moves as native cod
       code: 'INVALID_ARGUMENT',
       message: "that is not a terminal's size: cells 263168 must not exceed 262144",
       user_action: expect.any(String) as string,
-      retry: 'no_retry'
+      retry: 'configuration_change'
     })
   })
 })

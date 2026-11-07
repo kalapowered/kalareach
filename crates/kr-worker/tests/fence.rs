@@ -8492,9 +8492,9 @@ async fn a_hosts_answer_to_a_program_that_ended_stays_out_of_a_real_readers_line
     failures
 }
 
-/// KR-REQ-08.48: with a real qualified reader of Zsh or Bash at its prompt, the host's answers to
-/// the questions applications put to the terminal never reach the line the reader edits, and a
-/// line typed afterwards runs as typed.
+/// KR-REQ-08.48: with a real qualified reader of Zsh, Bash or Fish at its prompt, the host's
+/// answers to the questions applications put to the terminal never reach the line the reader edits,
+/// and a line typed afterwards runs as typed.
 ///
 /// See [`a_hosts_answers_stay_out_of_a_real_readers_line`] and
 /// [`a_hosts_answer_to_a_program_that_ended_stays_out_of_a_real_readers_line`]. The PowerShell
@@ -8504,7 +8504,7 @@ async fn a_hosts_answer_to_a_program_that_ended_stays_out_of_a_real_readers_line
 #[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
 async fn a_real_readers_line_stays_empty_when_the_host_answers_an_application() {
     let mut failures = Vec::new();
-    for kind in [ShellKind::Zsh, ShellKind::Bash] {
+    for kind in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
         failures.extend(
             a_hosts_answers_stay_out_of_a_real_readers_line(kind, APPLICATION_QUESTIONS).await,
         );

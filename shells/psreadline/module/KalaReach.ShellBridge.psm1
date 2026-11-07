@@ -1010,6 +1010,33 @@ function Restore-KrReplyHandlers {
     $script:Hooks.Replies = @()
 }
 
+# The introducers of the chords the module bound for a host's answer that are still its own now.
+#
+# A chord is the module's own while the editor still holds the module's handler on it and the Escape
+# key is still the first key of a chord: a person can bind either at the prompt after the module has
+# bound its own, and then the keys behind an Escape are theirs. The editor's tables are read each
+# time, because the list of chords the module bound is as it was when it bound them.
+function Get-KrOwnReplyIntroducers {
+    try {
+        $escape = $null
+        foreach ($entry in (Get-KrBindingTables).Keys.GetEnumerator()) {
+            if ("$($entry.Key)" -ceq 'Escape') { $escape = $entry.Value; break }
+        }
+        if ($null -eq $escape -or "$($escape.BriefDescription)" -cne 'ChordFirstKey') { return @() }
+        $own = [System.Collections.Generic.List[string]]::new()
+        foreach ($chord in @($script:Hooks.Replies)) {
+            $current = Get-KrBindingOn $chord
+            if ($null -ne $current -and "$($current.Description)" -ceq $script:ReplyDescription) {
+                $own.Add(($chord -creplace '^Escape,', ''))
+            }
+        }
+        return @($own)
+    } catch {
+        Write-KrTrace "the module's reply chords could not be read: $($_.Exception.Message)"
+        return @()
+    }
+}
+
 # The editor's tables of bindings in the place this module binds into: the keys, and the chords of
 # two keys.
 #
@@ -1258,18 +1285,36 @@ function Invoke-KalaReachReadLine {
     # that holds keys is not clear either, and the editor asks before it runs them.
     $started = Add-KrStartKey
     Send-KrEditorEnter
-    if (-not $started) {
-        # The reader is about to read and has nothing left, which is one of the three points a worker
-        # retries a withheld fence at. The entry's own event, above, has already read the mailbox, and
-        # a launch is refused there: the editor clears its buffer when its read starts, so a line
-        # installed before that is a line nobody would ever run. The next launch is decided at the
-        # reader's next boundary instead.
+    if ($IsWindows) {
+        # The console has no question about the cursor in its input, so there is nothing for a
+        # report of idleness to wait for. The reader is about to read and has nothing left, which is
+        # one of the three points a worker retries a withheld fence at. The entry's own event,
+        # above, has already read the mailbox, and a launch is refused there: the editor clears its
+        # buffer when its read starts, so a line installed before that is a line nobody would ever
+        # run. The next launch is decided at the reader's next boundary instead.
         Send-KrReaderIdle
         $script:State.IdleReported = $true
     }
+    # Outside Windows no report of idleness goes out here. The reader reports itself idle from the
+    # handler of its first key, which is after the editor has asked and been answered: a report before
+    # that would end the worker's hold at once. In a read that queues no key of its own (a read with
+    # keys ahead of it, one that starts in the Vi command table or after accept-and-get-next) that is
+    # the first key that reaches one of the module's boundaries; an ordinary character does not.
 
     $accepted = $false
     try {
+        if (-not $IsWindows) {
+            # The worker holds the answers it writes for the terminal back from the moment it has
+            # applied the entry until it has written the reply to the editor's question, so the
+            # read does not start before it has: a question asked first would be answered ahead of
+            # the hold. This is inside the `try` because an interrupt during the wait ends the
+            # pipeline, and the reader is then left as it is left by any other interrupt.
+            Wait-KrEntryAnswered
+            # An answer it had handed to its writer before then is already on its way, and no hold
+            # reaches it, so what is in the terminal's input now is taken out before the editor
+            # asks.
+            Clear-KrStaleReplies
+        }
         $line = [Microsoft.PowerShell.PSConsoleReadLine]::ReadLine(
             $Host.Runspace, $ExecutionContext, $script:State.LastStatus)
         # This editor ends an interrupted read the same way it ends an accepted empty one, so what
@@ -1882,7 +1927,7 @@ function Invoke-KalaReachReply {
     $previousKeys = $script:State.InvokingKeys
     $script:State.InvokingKeys = [byte[]]::new(0)
     try {
-        Skip-KrReply ([char]$Key.KeyChar)
+        $null = Skip-KrReply ([char]$Key.KeyChar)
     } finally {
         $script:State.InvokingKeys = $previousKeys
         $script:State.IdleReported = $false

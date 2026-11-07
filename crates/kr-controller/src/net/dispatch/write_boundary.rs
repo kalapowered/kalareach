@@ -1599,7 +1599,7 @@ async fn a_kept_owner_confirmation_answer_is_told_as_unknown_when_a_feed_refusal
         .read_of_retained(
             Method::OwnerConfirmationRequest,
             &request,
-            &kept,
+            None,
             &pending.acting,
         )
         .expect("the read is decided")
@@ -3497,4 +3497,144 @@ async fn an_answer_the_hosts_edits_make_too_large_for_the_device_is_not_written(
     assert!(roomy.send(&answer).await);
     assert_eq!(stream.frames(), vec![shown(&answer)]);
     drop(controller);
+}
+
+/// A hook a test hangs on a stream: something that happens in the world as a write is tried.
+struct Hook(Box<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for Hook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a hook")
+    }
+}
+
+/// A stream on which the decision a frame is written under is lost at each of its first `attempts`
+/// tries, and comes back before the frame is decided again: before such a try the bound the frame
+/// stands on passes (`lapse`), the boundary finds that and refuses the try, and a renewal is
+/// published (`renew`) before the frame is decided again.
+#[derive(Debug)]
+struct Losing {
+    recording: Arc<Recording>,
+    tried: std::sync::atomic::AtomicUsize,
+    attempts: usize,
+    lapse: Hook,
+    renew: Hook,
+}
+
+impl FrameSink for Arc<Losing> {
+    fn send_while<'a>(
+        &'a self,
+        frame: &'a ControlFrame,
+        admits: kr_transport::codec::Admission<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = kr_transport::Result<bool>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if self.tried.fetch_add(1, Ordering::SeqCst) < self.attempts {
+                (self.lapse.0)();
+                if !admits(&mut || {}) {
+                    (self.renew.0)();
+                    return Ok(false);
+                }
+            }
+            Ok(admits(&mut || {
+                self.recording
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(frame.clone());
+            }))
+        })
+    }
+
+    fn close(&self) {}
+}
+
+/// An answer whose decision held every time it was asked, and was lost before each of the writes
+/// the boundary makes (a lease that ran out and was renewed as the answer was about to go), is not
+/// written. What the device is told follows what the answer leaves open: an answer to an action
+/// that may have been carried out is told as an outcome that is unknown, and the word that asks it
+/// to try again is for the answer to a read, which carries out nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_whose_decision_is_lost_before_every_write_is_told_by_what_it_leaves_open() {
+    use kr_protocol::envelope::{Outcome, ParamsValue, Response};
+    use kr_protocol::error::ErrorCode;
+
+    for (action, told) in [
+        (true, ErrorCode::OutcomeUnknown),
+        (false, ErrorCode::ResourceUnavailable),
+    ] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (continuous, wall, clocks) = super::super::tests::manual_clocks();
+        let controller = super::super::tests::daemon_on(&temp, clocks).await;
+        let now = wall.load(Ordering::SeqCst);
+        let (organisation, grant, _connection, _asked) = member(&controller, 0x47, now);
+        let organisation = Arc::new(organisation);
+        let renewals = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let recording = Arc::new(Recording::default());
+        let stream = Arc::new(Losing {
+            recording: Arc::clone(&recording),
+            tried: std::sync::atomic::AtomicUsize::new(0),
+            attempts: super::RELAY_DECISIONS,
+            lapse: Hook(Box::new(move || {
+                // Past the end of the lease the frame was last decided under.
+                continuous.advance(Duration::from_secs(15 * 60 + 30));
+            })),
+            renew: Hook(Box::new({
+                let (controller, grant) = (Arc::clone(&controller), grant.clone());
+                move || {
+                    let renewed = renewals.fetch_add(1, Ordering::SeqCst) + 1;
+                    super::super::tests::renew_member(
+                        &controller,
+                        &organisation,
+                        &grant,
+                        now + renewed * 60_000,
+                        &[ActionRight::SessionView],
+                    )
+                    .expect("the renewal is written down")
+                    .expect("the renewal installs");
+                }
+            })),
+        });
+        let connection = super::RemoteConnection::for_test_writing_to(
+            &controller,
+            record_for(&grant),
+            Box::new(Arc::clone(&stream)),
+        );
+        let asked = connection
+            .ask(None, Method::SessionList.entry(), false)
+            .expect("the lease answers for the member's grant");
+        let asked = if action {
+            asked.answering(Method::SessionRename)
+        } else {
+            asked
+        };
+        let answered = super::decision::Answered {
+            frame: ControlFrame::Response(Response {
+                request_id: kr_protocol::ids::RequestId::new(1),
+                outcome: Outcome::Ok(ParamsValue::empty()),
+            }),
+            asked: Some(asked),
+        };
+        assert!(
+            connection.write_answer(answered).await,
+            "the connection stands"
+        );
+        assert_eq!(
+            stream.tried.load(Ordering::SeqCst),
+            super::RELAY_DECISIONS + 1,
+            "every try of the answer was lost, and the refusal was then written"
+        );
+        let frames = recording.frames();
+        let [
+            ControlFrame::Response(Response {
+                outcome: Outcome::Error(refusal),
+                ..
+            }),
+        ] = frames.as_slice()
+        else {
+            panic!("the answer, or nothing but a refusal, was written: {frames:?}");
+        };
+        assert_eq!(refusal.code, told, "{refusal:?}");
+        drop(controller);
+    }
 }

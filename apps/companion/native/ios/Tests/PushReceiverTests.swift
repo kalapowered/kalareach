@@ -52,6 +52,9 @@ final class PendingFileTests: XCTestCase {
         XCTAssertEqual(state(file(), at: now), "expired", "and it stays so for every later reader")
     }
 
+    /// KR-REQ-16.06, the receiver's side of answering only its own pending registration: an answer
+    /// that outlived its registration cannot move the record of the registration that replaced it,
+    /// and the replacement is moved only by its own identifier.
     func testATryThatOutlivedItsRegistrationCannotMoveItsReplacement() throws {
         let kept = file()
         try kept.write(record(deadline: now + 60_000))
@@ -175,6 +178,9 @@ final class ChallengeAnswererTests: XCTestCase {
         XCTAssertTrue(gateway.posted.isEmpty)
     }
 
+    /// KR-REQ-16.06, the receiver's side of answering only its own pending registration: a challenge
+    /// the decision refuses is not answered. Nothing is signed or posted, and the registration stays
+    /// pending. Not shown here: which challenges the decision refuses, which is the Rust half's cases.
     func testAChallengeTheDecisionRefusesSignsNothingPostsNothingAndLeavesTheRecordPending() throws {
         let record = try pending()
         let crypto = Crypto(verdict: #"{"verdict":"refused","reason":"registration"}"#)
@@ -185,6 +191,11 @@ final class ChallengeAnswererTests: XCTestCase {
         XCTAssertEqual(state(record), "pending")
     }
 
+    /// KR-REQ-16.06, the receiver's side of returning a signed challenge: the answer the signer
+    /// returns is posted to the gateway with the body the signer gave, and the pending registration
+    /// it answers moves to answered. Not shown here: what the signature binds (token hash,
+    /// registration, gateway origin and expiry), which is the Rust half's cases, or that the
+    /// address posted to is the signer's and not the decision's (the fixture gives both the same).
     func testTheAnswerIsPostedToTheAddressTheDecisionGaveAndTheRecordSaysItWasTaken() throws {
         let record = try pending()
         let gateway = Gateway(.status(200))

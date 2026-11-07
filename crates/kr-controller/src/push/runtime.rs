@@ -172,7 +172,9 @@ pub const QUESTION_BUDGET: Duration = Duration::from_secs(30);
 /// What the loops reach the network through, built once a transport is attached.
 #[derive(Debug)]
 struct Adapters {
-    /// The transport every exchange below goes through.
+    /// The transport as it was attached, which reaches any origin. Revocations, the mailbox placer
+    /// and the external senders go through it; every exchange under a bearer goes through the
+    /// gate over it ([`super::gateways::GatedTransports`]).
     transports: Arc<dyn DeliveryTransports>,
     sender: GatewayClient,
     /// Renewals and revocations, proven with this host's key.
@@ -329,7 +331,9 @@ impl DeliveryRuntime {
         self.adapters.get().is_some()
     }
 
-    /// The transport every delivery exchange goes through, once one is attached.
+    /// The transport as it was attached, once one is, before the gate that every exchange under a
+    /// bearer goes through. It is what revocations, the mailbox placer and the external senders
+    /// use.
     #[must_use]
     pub fn transports(&self) -> Option<&Arc<dyn DeliveryTransports>> {
         self.adapters.get().map(|adapters| &adapters.transports)
@@ -351,17 +355,34 @@ impl DeliveryRuntime {
         self.adapters.get().is_none() && self.mailbox.set(origin).is_ok()
     }
 
-    /// Attaches the transport every delivery exchange goes through.
+    /// Attaches the transport the delivery service reaches the network through, which every
+    /// exchange under a bearer goes through behind the gate of the gateways the host allows.
     ///
     /// Once: the transport is the composition root's decision, made at startup, and a second one
     /// would put two sets of rules on one host's exchanges. Returns false when one was already
     /// attached.
     pub fn attach_transport(&self, transports: Arc<dyn DeliveryTransports>) -> bool {
-        let senders = Arc::new(GatewaySenders::new(
-            Arc::clone(&transports),
-            Arc::clone(&self.signer),
-            self.runtime.clone(),
-        ));
+        // Every exchange under a bearer goes through the gateways the host allows: a post, a
+        // status question, a person's request to forget, a renewal and the confirmation of a
+        // registration. The gate asks the set again when each request is put, so one put after a
+        // gateway was taken out of the list never leaves the host. A revocation is the one
+        // exchange that does not: it carries no bearer, and it is how that gateway is told to end
+        // what it issued.
+        let gated: Arc<dyn DeliveryTransports> = match self.credentials.gateways() {
+            Some(gateways) => Arc::new(super::gateways::GatedTransports::new(
+                Arc::clone(&transports),
+                gateways,
+            )),
+            None => Arc::clone(&transports),
+        };
+        let senders = Arc::new(
+            GatewaySenders::new(
+                Arc::clone(&gated),
+                Arc::clone(&self.signer),
+                self.runtime.clone(),
+            )
+            .revoking_through(Arc::clone(&transports)),
+        );
         // The placer is attached before the adapters are published: a pass starts to present as
         // soon as they are, and a push that went out before the placer was there would go without
         // the detail it refers to and with no reason in its record.
@@ -380,19 +401,19 @@ impl DeliveryRuntime {
             .adapters
             .set(Adapters {
                 transports: Arc::clone(&transports),
-                sender: GatewayClient::new(Arc::clone(&transports), self.runtime.clone()),
+                sender: GatewayClient::new(Arc::clone(&gated), self.runtime.clone()),
                 senders: Arc::clone(&senders),
                 receipts: GatewayStatus::new(
-                    Arc::clone(&transports),
+                    Arc::clone(&gated),
                     self.runtime.clone(),
                     self.cadence.receipts,
                 ),
                 unknown: GatewayStatus::new(
-                    Arc::clone(&transports),
+                    Arc::clone(&gated),
                     self.runtime.clone(),
                     self.cadence.unknown,
                 ),
-                forgetter: GatewayForget::new(Arc::clone(&transports), self.runtime.clone()),
+                forgetter: GatewayForget::new(Arc::clone(&gated), self.runtime.clone()),
                 external: ExternalSenders::new(
                     Arc::clone(&transports),
                     self.runtime.clone(),
@@ -932,9 +953,28 @@ fn storage(error: kr_delivery::DeliveryError) -> crate::error::ControllerError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use super::{QuestionStep, next_question_step};
+    use kr_client::services::{ServiceFuture, ServiceHttp, ServiceHttpAnswer};
+    use kr_delivery::destination::DestinationRecord;
+    use kr_delivery::producer::RecipientScope;
+    use kr_delivery::push::{DeliveryStatus, PushSender};
+    use kr_protocol::ids::{
+        CollapseId, EnvironmentId, InstallationId, NotificationId, PushSenderRecordId,
+        PushSenderRevision,
+    };
+    use kr_protocol::push::{
+        PushAlert, PushDeliveryCredential, PushDeliveryRequest, PushPlatformHints, PushUrgency,
+    };
+    use kr_protocol::scalars::{Nullable, SecretBytes32, TimestampMs, Uuid};
+    use kr_protocol::service::GatewayOrigin;
+
+    use super::super::credentials::CredentialRenewal as _;
+    use super::super::gateways::AllowedGateways;
+    use super::super::sender::{HostSigner, SenderRevocation as _};
+    use super::super::transport::DeliveryTransports;
+    use super::{Cadence, DeliveryRuntime, QuestionStep, next_question_step};
 
     /// KR-PERF-003: an idle daemon's question loop is woken for the moment a sweep is due and for
     /// nothing in between, where it used to look at every pass. This shows the loop's decision
@@ -971,5 +1011,220 @@ mod tests {
             QuestionStep::Ask,
             "and sweeps when the period is over"
         );
+    }
+
+    /// What the wiring is proved against: it counts the requests put to it and answers each one
+    /// with a refusal, since only whether a request arrived matters here.
+    #[derive(Debug, Default)]
+    struct Counting {
+        put: Mutex<usize>,
+    }
+
+    impl Counting {
+        fn put(&self) -> usize {
+            *self.put.lock().expect("not poisoned")
+        }
+    }
+
+    impl ServiceHttp for Counting {
+        fn post_json<'a>(
+            &'a self,
+            _url: &'a str,
+            _body: &'a [u8],
+            _headers: &'a [(&'a str, &'a str)],
+        ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+            *self.put.lock().expect("not poisoned") += 1;
+            Box::pin(async {
+                Ok(ServiceHttpAnswer {
+                    status: 503,
+                    body: Vec::new(),
+                })
+            })
+        }
+    }
+
+    /// Every origin reaches the one counting transport.
+    #[derive(Debug)]
+    struct Reaching(Arc<Counting>);
+
+    impl DeliveryTransports for Reaching {
+        fn to(&self, _origin: &GatewayOrigin) -> Result<Arc<dyn ServiceHttp>, String> {
+            Ok(Arc::clone(&self.0) as Arc<dyn ServiceHttp>)
+        }
+
+        fn outbound(&self) -> crate::config::Outbound {
+            crate::config::Outbound::Direct
+        }
+    }
+
+    /// Nobody is a recipient: the wiring has no use for one.
+    #[derive(Debug)]
+    struct NoRecipients;
+
+    impl kr_delivery::producer::RecipientAuthority for NoRecipients {
+        fn scope_for(
+            &self,
+            _rule: &kr_delivery::destination::DeliveryRule,
+        ) -> Option<RecipientScope> {
+            None
+        }
+
+        fn device_scope(&self, _destination: &DestinationRecord) -> Option<RecipientScope> {
+            None
+        }
+    }
+
+    /// KR-REQ-16.04: every exchange the runtime makes under a bearer (a notification, a status
+    /// question of either loop, a request to delete, a renewal) is put only to a gateway the host
+    /// allows, however it came by its transport: the check is made when the request is put. A
+    /// revocation is the one that still reaches a gateway that was taken out. A request prepared
+    /// while the gateway was allowed and sent after it was taken out sends nothing.
+    ///
+    /// The adapters are the runtime's own, built by `attach_transport` over a transport that
+    /// counts what it is given, so an adapter built over the raw transport fails here.
+    #[test]
+    fn every_exchange_under_a_bearer_is_put_only_to_a_gateway_the_host_allows() {
+        const LISTED: &str = "https://push.listed.invalid";
+        let reactor = tokio::runtime::Runtime::new().expect("a runtime");
+        let directory = tempfile::tempdir().expect("a directory");
+        let module = Arc::new(
+            crate::push::DeliveryModule::open_at(
+                &directory.path().join("delivery.sqlite3"),
+                kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
+                kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+                crate::push::secrets::DestinationSecrets::new(
+                    Arc::new(kr_crypto::store::MemoryStore::new()),
+                    EnvironmentId::new(Uuid::from_bytes([0xee; 16])),
+                ),
+            )
+            .expect("a delivery module"),
+        );
+        let credentials = Arc::new(super::HeldCredentials::new());
+        let gateways = Arc::new(AllowedGateways::new(
+            "https://reach.invalid",
+            &[LISTED.to_owned()],
+        ));
+        assert!(credentials.attach_gateways(Arc::clone(&gateways)));
+        let runtime = DeliveryRuntime::new(
+            module,
+            credentials,
+            Arc::new(NoRecipients),
+            Arc::new(HostSigner::new(
+                kr_crypto::keys::AuthorisationKeyPair::generate().expect("a key"),
+            )),
+            Cadence::DEFAULT,
+            reactor.handle().clone(),
+        );
+        let counting = Arc::new(Counting::default());
+        assert!(runtime.attach_transport(Arc::new(Reaching(Arc::clone(&counting)))));
+        let adapters = runtime.adapters.get().expect("the adapters are built");
+
+        let origin = GatewayOrigin::new(LISTED).expect("an origin");
+        let sender = PushSenderRecordId::new(Uuid::from_bytes([0x31; 16]));
+        let notification = NotificationId::new(Uuid::from_bytes([0x41; 16]));
+        let credential = PushDeliveryCredential {
+            expires_at_ms: TimestampMs::new(1_700_000_000_000 + 30 * 24 * 60 * 60 * 1000),
+            gateway_origin: origin.clone(),
+            installation_id: InstallationId::new(Uuid::from_bytes([0x51; 16])),
+            issued_at_ms: TimestampMs::new(1_700_000_000_000),
+            revision: PushSenderRevision::new(1),
+            secret: SecretBytes32::from_bytes([9; 32]),
+            sender_record_id: sender,
+        };
+        let request = PushDeliveryRequest {
+            collapse_id: CollapseId::new(Uuid::from_bytes([0x61; 16])),
+            expires_at_ms: TimestampMs::new(1_700_000_000_000 + 60 * 60 * 1000),
+            hints: PushPlatformHints {
+                alert: PushAlert::ApprovalWaiting,
+                urgency: PushUrgency::Attention,
+            },
+            notification_id: notification,
+            preview: Nullable::null(),
+            sender_record_id: sender,
+        };
+
+        type Exchange<'a> = Box<dyn Fn() + 'a>;
+        let exchanges: Vec<(&str, Exchange<'_>)> = vec![
+            (
+                "a notification",
+                Box::new(|| {
+                    let _ = adapters.sender.send(&credential, &request);
+                }),
+            ),
+            (
+                "a status question of the pass",
+                Box::new(|| {
+                    let _ = adapters.receipts.status(&credential, notification);
+                }),
+            ),
+            (
+                "a status question of the sweep",
+                Box::new(|| {
+                    let _ = adapters.unknown.status(&credential, notification);
+                }),
+            ),
+            (
+                "a request to delete",
+                Box::new(|| {
+                    if let Ok(prepared) =
+                        adapters.forgetter.prepare(credential.clone(), notification)
+                    {
+                        let _ = prepared.send();
+                    }
+                }),
+            ),
+            (
+                "the confirmation of a registration",
+                Box::new(|| {
+                    let _ = adapters.senders.begin_renewal(&origin, sender);
+                }),
+            ),
+            (
+                "a renewal",
+                Box::new(|| {
+                    let _ = adapters.senders.renew(&credential);
+                }),
+            ),
+        ];
+
+        // The control: while the gateway is listed each one is put.
+        for (what, exchange) in &exchanges {
+            let before = counting.put();
+            exchange();
+            assert!(
+                counting.put() > before,
+                "{what} was put to a listed gateway"
+            );
+        }
+
+        // A request prepared while the gateway was listed, and sent after it was taken out.
+        let prepared = adapters
+            .forgetter
+            .prepare(credential.clone(), notification)
+            .expect("a request is prepared for a listed gateway");
+        gateways.replace(&[]);
+        let before = counting.put();
+        let _ = prepared.send();
+        assert_eq!(
+            counting.put(),
+            before,
+            "a prepared request was put after the removal"
+        );
+
+        // Taken out, none is put.
+        for (what, exchange) in &exchanges {
+            let before = counting.put();
+            exchange();
+            assert_eq!(
+                counting.put(),
+                before,
+                "{what} was put to a gateway taken out"
+            );
+        }
+
+        // And the revocation still is: it is how that gateway is told to end what it issued.
+        let before = counting.put();
+        let _ = adapters.senders.revoke(&origin, sender);
+        assert!(counting.put() > before, "the revocation was not put");
     }
 }

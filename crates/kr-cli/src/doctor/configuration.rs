@@ -135,6 +135,107 @@ pub fn apply_over(
     Ok(edited.revision)
 }
 
+/// The push gateways, besides the official one, that the host reports it delivers through right
+/// now, from the effective configuration it answered with.
+///
+/// A host that does not report the setting does not know it: it would ignore the section a command
+/// wrote, and go on delivering through the official gateway alone. That is said before anything is
+/// written.
+///
+/// # Errors
+///
+/// Returns the refusal that says the host cannot be asked to deliver through another gateway.
+pub fn push_gateways_reported(
+    effective: &kr_protocol::hostinfo::EffectiveConfiguration,
+) -> Result<Vec<String>> {
+    let Some(row) = effective
+        .values
+        .iter()
+        .find(|row| row.key == configuration::PUSH_GATEWAYS_KEY)
+    else {
+        return Err(CliError::Refused(kr_client::error::refusal(
+            kr_protocol::error::ErrorCode::UnsupportedCapability,
+            Shown::said(
+                "this host's control daemon does not know the push gateways setting, and would \
+                 ignore it: bring it to this release first",
+            ),
+        )));
+    };
+    Ok(match row.value() {
+        "none" => Vec::new(),
+        listed => listed.split(", ").map(str::to_owned).collect(),
+    })
+}
+
+/// The push gateways the host reports it delivers through, when it says it acts on its document.
+///
+/// A host reports the list it holds. When it also says that it did not put the document into force
+/// (a revocation it owes could not be written down, say), or that it cannot use the document (a
+/// host that started over one closes its routes and delivers through no gateway), the list alone
+/// would mislead. That is said instead, with the host's reason.
+///
+/// # Errors
+///
+/// Returns why the host does not act on the document, or the refusal of
+/// [`push_gateways_reported`].
+pub fn push_gateways_acted_on(
+    effective: &kr_protocol::hostinfo::EffectiveConfiguration,
+) -> Result<Vec<String>> {
+    let reported = push_gateways_reported(effective)?;
+    if let Some(problem) = effective.not_in_force.as_ref() {
+        return Err(CliError::Unfinished {
+            code: kr_protocol::error::ErrorCode::ResourceUnavailable,
+            message: shown!(
+                "the host did not put its configuration into force: {}",
+                crate::shown::host_text(problem)
+            ),
+        });
+    }
+    if effective.status.state.is_a_problem() {
+        return Err(CliError::Unfinished {
+            code: kr_protocol::error::ErrorCode::ResourceUnavailable,
+            message: shown!(
+                "the host cannot use its configuration document ({}): {}",
+                effective.status.state.as_str(),
+                crate::shown::host_text(&effective.status.detail)
+            ),
+        });
+    }
+    Ok(reported)
+}
+
+/// The push gateways the host delivers through after a change, when it put the change into force.
+///
+/// The host answers a question about its configuration only after it has put the document into
+/// force, so what it reports is what it acts on. A change it could not put into force is not
+/// said to have been made, and neither is one it reports differently from what was written.
+///
+/// # Errors
+///
+/// Returns why the host does not deliver through what was written.
+pub fn push_gateways_in_force(
+    effective: &kr_protocol::hostinfo::EffectiveConfiguration,
+    written: &[String],
+) -> Result<Vec<String>> {
+    let reported = push_gateways_acted_on(effective)?;
+    // The same gateways, whatever order the host says them in.
+    let sorted = |origins: &[String]| {
+        let mut origins = origins.to_vec();
+        origins.sort();
+        origins
+    };
+    if sorted(&reported) != sorted(written) {
+        return Err(CliError::Unfinished {
+            code: kr_protocol::error::ErrorCode::OutcomeUnknown,
+            message: Shown::said(
+                "the host reports other push gateways than the ones written, so the change is \
+                 not in force",
+            ),
+        });
+    }
+    Ok(reported)
+}
+
 /// What a refused edit says: the configuration's own sentences, as its export rule says them.
 #[must_use]
 pub fn refusal(refused: &configuration::EditRefused) -> CliError {
@@ -155,6 +256,98 @@ mod tests {
 
     use super::*;
     use crate::shown::marker::{MARKER, assert_unmarked, failure_renderings};
+
+    fn reporting(
+        gateways: Option<&[&str]>,
+        not_in_force: Option<&'static str>,
+    ) -> kr_protocol::hostinfo::EffectiveConfiguration {
+        let mut effective = kr_protocol::hostinfo::EffectiveConfiguration::unread();
+        if let Some(gateways) = gateways {
+            effective.values = vec![configuration::push_row(
+                &gateways
+                    .iter()
+                    .map(|&origin| origin.to_owned())
+                    .collect::<Vec<_>>(),
+                None,
+                "/tmp/kalareach/config.json",
+            )];
+        }
+        effective.not_in_force =
+            kr_protocol::scalars::Nullable(not_in_force.map(|why| Sentence::new().stated(why)));
+        effective
+    }
+
+    /// KR-REQ-16.04: the command writes a list of gateways only to a host that knows the setting,
+    /// and says it made the change only when that host reports it in force.
+    #[test]
+    fn a_change_is_made_only_to_a_host_that_knows_the_setting_and_said_only_when_it_is_in_force() {
+        const LISTED: &str = "https://push.builder.example";
+        let written = vec![LISTED.to_owned()];
+
+        // A host of an earlier release reports no such row: nothing is written for it.
+        let older = reporting(None, None);
+        let refused = push_gateways_reported(&older).expect_err("a host that does not know it");
+        assert!(matches!(
+            refused,
+            CliError::Refused(ref error)
+                if error.code == kr_protocol::error::ErrorCode::UnsupportedCapability
+        ));
+
+        // The control: a host that reports it, with the list in force.
+        let reported = reporting(Some(&[LISTED]), None);
+        assert_eq!(push_gateways_reported(&reported).expect("a row"), written);
+        assert_eq!(
+            push_gateways_in_force(&reported, &written).expect("in force"),
+            written
+        );
+        assert!(
+            push_gateways_reported(&reporting(Some(&[]), None))
+                .expect("a row")
+                .is_empty()
+        );
+
+        // A host that could not put the change into force says why, and the command does not say
+        // the change was made.
+        let stopped = reporting(
+            Some(&[LISTED]),
+            Some("a revocation could not be written down"),
+        );
+        assert!(matches!(
+            push_gateways_in_force(&stopped, &written),
+            Err(CliError::Unfinished { .. })
+        ));
+
+        // The same gateways in another order are the same list.
+        let two = vec![LISTED.to_owned(), "http://127.0.0.1:8788".to_owned()];
+        let reversed = reporting(Some(&["http://127.0.0.1:8788", LISTED]), None);
+        assert!(push_gateways_in_force(&reversed, &two).is_ok());
+
+        // A host that reports other gateways than the ones written has not taken the change.
+        let other = reporting(Some(&["https://push.other.example"]), None);
+        assert!(matches!(
+            push_gateways_in_force(&other, &written),
+            Err(CliError::Unfinished { .. })
+        ));
+
+        // With nothing to change, the list is shown for a document the host can use, or none, and
+        // not for one it cannot use.
+        for (state, shown) in [
+            (configuration::DocumentState::Absent, true),
+            (configuration::DocumentState::Loaded, true),
+            (configuration::DocumentState::UnknownVersion, false),
+            (configuration::DocumentState::Unreadable, false),
+            (configuration::DocumentState::Invalid, false),
+        ] {
+            let mut effective = reporting(Some(&[LISTED]), None);
+            effective.status.state = state;
+            assert_eq!(
+                push_gateways_acted_on(&effective).is_ok(),
+                shown,
+                "{}",
+                state.as_str()
+            );
+        }
+    }
 
     /// A refused edit says the configuration's own sentences, and a sentence that arrived from a
     /// document rather than being composed here is said by its class and length.

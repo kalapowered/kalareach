@@ -1832,6 +1832,94 @@ async fn a_fence_that_lands_while_a_refresh_starts_the_environment_is_an_unknown
     assert_eq!(rig.recorded_status(1), EnvironmentPresence::Stale);
 }
 
+/// KR-REQ-09.09, the outcome of a refresh whose look fails after its start: the environment was
+/// started and the platform then could not be asked about it, so the refresh is an outcome this host
+/// does not know and not a refusal it keeps, and nothing is recorded. The control is a platform that
+/// cannot be asked at all: nothing was started, and the failure is not told as an unknown outcome.
+/// Not shown here: a fence, an expiry or a withdrawn registration at the same place, which the
+/// cases beside this one show.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refresh_whose_look_fails_after_its_start_is_an_unknown_outcome() {
+    use kr_protocol::identity::EnvironmentPresence;
+    let rig = Refreshing::start().await;
+
+    let platform = LosesTheLook::after_the_start();
+    rig.controller.ask_instead(platform.clone());
+    let unknown = rig
+        .refresh(1, true)
+        .await
+        .expect_err("the look after the start failed");
+    assert!(platform.was_started());
+    assert_eq!(unknown.code(), ErrorCode::OutcomeUnknown, "{unknown}");
+    assert!(
+        !matches!(
+            unknown.code().retry_category(),
+            kr_protocol::error::RetryCategory::NoRetry
+                | kr_protocol::error::RetryCategory::ConfigurationChange
+        ),
+        "no claim keeps it as a refusal"
+    );
+    assert_eq!(rig.recorded_status(1), EnvironmentPresence::Stale);
+
+    // The control: the platform that cannot be asked before anything is started.
+    let platform = LosesTheLook::from_the_first_look();
+    rig.controller.ask_instead(platform.clone());
+    let failed = rig
+        .refresh(2, true)
+        .await
+        .expect_err("the first look failed");
+    assert!(!platform.was_started());
+    assert_ne!(failed.code(), ErrorCode::OutcomeUnknown, "{failed}");
+    assert_eq!(rig.recorded_status(2), EnvironmentPresence::Stale);
+}
+
+/// A platform that cannot be asked about the environment: from its first look, or once it has been
+/// told to start it.
+struct LosesTheLook {
+    from_the_first_look: bool,
+    started: std::sync::atomic::AtomicBool,
+}
+
+impl LosesTheLook {
+    fn after_the_start() -> Arc<Self> {
+        Arc::new(Self {
+            from_the_first_look: false,
+            started: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn from_the_first_look() -> Arc<Self> {
+        Arc::new(Self {
+            from_the_first_look: true,
+            started: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn was_started(&self) -> bool {
+        self.started.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl crate::bridge::store::Observer for LosesTheLook {
+    fn observe(
+        &self,
+        _: &kr_protocol::identity::EnvironmentEnrolment,
+    ) -> crate::error::Result<kr_protocol::identity::EnvironmentPresence> {
+        if self.from_the_first_look || self.was_started() {
+            return Err(crate::error::ControllerError::supervision(
+                "the platform did not answer",
+            ));
+        }
+        Ok(kr_protocol::identity::EnvironmentPresence::EnvironmentStopped)
+    }
+
+    fn start(&self, _: &kr_protocol::identity::EnvironmentEnrolment) -> crate::error::Result<()> {
+        self.started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 /// KR-REQ-09.09: a fence that lands after a refresh has recorded what the platform said leaves the
 /// refresh answered, with the observation recorded, and says that no bridge was opened.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1959,6 +2047,122 @@ async fn a_machine_group_step_recorded_before_a_late_attempts_claim_is_not_given
             .unwrap_or_else(|| panic!("a registration that is gone stops it: {refused:?}"))
             .code,
         ErrorCode::PermissionDenied
+    );
+}
+
+/// KR-REQ-26.16, the part about a change affecting authority fencing dispatch: a fence that lands
+/// while a late attempt holds the machine group's step lock stops the answer it found there. The
+/// attempt has waited for the lock and found its action recorded; the fence is raised with the
+/// lock held and the answer in hand, so only a check made after the record is found, and not one
+/// made before the lock was taken, sees it. It is raised twice: as a fence this host owes, and by
+/// a revocation of this host's authority that is acknowledged while the lock is held. The control:
+/// the same late attempt, with nothing raised while it is stopped there, is answered from the
+/// receipt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_that_lands_while_a_late_attempt_holds_the_step_lock_stops_the_answer_it_found() {
+    use kr_protocol::machine::{MachineExpected, MachineSplitParams};
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let group = controller
+        .machine_report()
+        .expect("this daemon serves a machine group record");
+    let mutation = mutation_of(
+        &temp,
+        Method::MachineSplit,
+        ParamsValue::from_typed(&MachineSplitParams {
+            expected: MachineExpected {
+                machine_id: group.machine_id,
+                revision: group.revision,
+            },
+        })
+        .expect("encodes"),
+    );
+    let attempt = |controller: Arc<Controller>| {
+        let actor_id = actor_id.clone();
+        let mutation = mutation.clone();
+        async move {
+            controller
+                .write_method(
+                    &actor_id,
+                    &mutation,
+                    Method::MachineSplit,
+                    connection_id,
+                    None,
+                    Some(accepted(&controller)),
+                    controller.admitted_revision(connection_id).ok(),
+                )
+                .await
+        }
+    };
+    let first = attempt(Arc::clone(&controller)).await;
+    assert!(refusal(&first).is_none(), "the first attempt: {first:?}");
+
+    // A late attempt stopped where it holds the step lock with the recorded answer in hand.
+    let stopped_with_the_lock = || async {
+        let (arrived, release) = controller.pause_retained_lookup();
+        let waiting = tokio::spawn(attempt(Arc::clone(&controller)));
+        tokio::time::timeout(Duration::from_secs(30), arrived)
+            .await
+            .expect("the late attempt reaches the place it is stopped at")
+            .expect("the pause is armed");
+        assert!(
+            controller.a_machine_step_holds_the_step_lock(),
+            "the late attempt holds the step lock where it is stopped"
+        );
+        (waiting, release)
+    };
+
+    let (waiting, release) = stopped_with_the_lock().await;
+    release.send(()).expect("the late attempt goes on");
+    let answered = waiting.await.expect("the late attempt finishes");
+    assert!(
+        refusal(&answered).is_none(),
+        "with nothing raised the late attempt is answered from the receipt: {answered:?}"
+    );
+
+    let (waiting, release) = stopped_with_the_lock().await;
+    controller.hold_fence(true);
+    release.send(()).expect("the late attempt goes on");
+    let refused = waiting.await.expect("the late attempt finishes");
+    refused_for_a_fence(refusal(&refused).unwrap_or_else(|| {
+        panic!("a fence raised while the step lock was held stops the answer: {refused:?}")
+    }));
+    controller.hold_fence(false);
+    assert!(
+        !controller.a_machine_step_holds_the_step_lock(),
+        "the refused attempt let the lock go"
+    );
+
+    // A revocation of this host's authority, acknowledged while the lock is held, withdraws the
+    // registration the late attempt was admitted under.
+    let (waiting, release) = stopped_with_the_lock().await;
+    let acknowledged = controller
+        .revoke_authority()
+        .await
+        .expect("the revocation is acknowledged");
+    assert!(
+        acknowledged
+            .workers
+            .iter()
+            .all(|worker| worker.state != kr_protocol::action::BarrierState::Pending),
+        "no barrier is pending when the revocation is acknowledged"
+    );
+    release.send(()).expect("the late attempt goes on");
+    let refused = waiting.await.expect("the late attempt finishes");
+    let withheld = refusal(&refused).unwrap_or_else(|| {
+        panic!(
+            "a revocation acknowledged while the step lock was held stops the answer: {refused:?}"
+        )
+    });
+    assert_eq!(withheld.code, ErrorCode::PermissionDenied, "{withheld:?}");
+    assert_eq!(
+        withheld.message,
+        crate::authority::AdmissionLapse::Deregistered.to_string(),
+        "the refusal is the withdrawn registration's, and not a fence this host owes"
+    );
+    assert!(
+        !controller.a_machine_step_holds_the_step_lock(),
+        "the refused attempt let the lock go"
     );
 }
 

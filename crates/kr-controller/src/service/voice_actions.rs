@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ProtocolError;
 use kr_protocol::ids::{ActorId, AuthorityRevision, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::session::{SessionReadParams, SessionReadResult};
@@ -409,6 +409,8 @@ impl Controller {
         if method != Method::VoiceStop {
             admission.check()?;
         }
+        #[cfg(test)]
+        self.before_a_voice_change_claims.wait().await;
         let hold = match self.claim_voice_action(&actor_id, mutation)? {
             crate::grants::ActionClaim::Claimed { hold } => hold,
             crate::grants::ActionClaim::Recorded(record) => {
@@ -647,10 +649,7 @@ impl Controller {
             crate::grants::ActionRecord::Refused { code, detail } => {
                 Err(ControllerError::Refused { code, detail })
             }
-            crate::grants::ActionRecord::InFlight => Err(ControllerError::Refused {
-                code: ErrorCode::ResourceUnavailable,
-                detail: "that action is already running on this host".to_owned(),
-            }),
+            crate::grants::ActionRecord::InFlight => Err(ControllerError::attempt_still_running()),
             crate::grants::ActionRecord::Unfinished => Err(ControllerError::Uncertain {
                 detail: "an earlier attempt at this voice change ended without recording what it \
                          did, so what it changed may exist; it is not performed again"

@@ -37,12 +37,11 @@
 //! as, exactly as it was before.
 //!
 //! An operation performed for a caller bounded by a grant is different, because it may reach only
-//! what the owner named. On Linux its reads are confined to what the invocation is granted and to a
-//! support set named for this host's own Git ([`Reads::Bounded`]), and it is refused when a
-//! filesystem is mounted beneath a directory it would be granted. On a platform that does not
-//! confine reads it is refused outright: no macOS profile tried confined reads and still let the
-//! system's loader start Git. Windows confines reading with everything else, and what an invocation
-//! reads outside the directories the operation owns is granted by name.
+//! what the owner named. On Linux and on macOS its reads are confined to what the invocation is
+//! granted and to a support set named for this host's own Git ([`Reads::Bounded`]), and it is
+//! refused when a filesystem is mounted beneath a directory it would be granted. On a platform that
+//! does not confine reads it is refused outright. Windows confines reading with everything else,
+//! and what an invocation reads outside the directories the operation owns is granted by name.
 //!
 //! ## Directories, not names
 //!
@@ -91,7 +90,7 @@
 //!
 //! | Platform | Execution | Network | Writes | Reads for a caller bounded by a grant |
 //! | --- | --- | --- | --- | --- |
-//! | macOS | A per-invocation sandbox profile, applied by the system's own launcher before it runs Git | The same profile | The same profile | Not confined, so such an invocation is refused |
+//! | macOS | A per-invocation sandbox profile, applied by the system's own launcher before it runs Git | The same profile | The same profile | The same profile: the granted paths, resolved, and the named support set, and beyond them only the names and attributes of the root directory, of symbolic links and of the directories above a granted path |
 //! | Linux | Landlock, with the execute right only on Git's own program and helper directory | Landlock's TCP rules for a remote operation, and a system-call filter that makes a socket only of what the boundary can account for | Landlock, from the opened directory handles | Landlock, with no rule on the whole filesystem: the granted objects and the named support set only |
 //! | Windows: **refused, and never run** | An application container whose grants on the repository carry no execute right | The container's capabilities: none at all for a local operation | The container's grants, inside a job object that ends every descendant | Refused, as every invocation is |
 //!
@@ -115,6 +114,8 @@ use crate::error::{ProjectError, Result};
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
+mod macho;
+#[cfg(target_os = "macos")]
 mod macos;
 #[cfg(unix)]
 mod unix;
@@ -135,7 +136,7 @@ use self::windows as platform;
 #[cfg(all(target_os = "linux", feature = "git-fixtures"))]
 pub use self::linux::{with_kernel_interface, with_no_git};
 #[cfg(all(target_os = "macos", any(test, feature = "git-fixtures")))]
-pub use self::macos::profile_text;
+pub use self::macos::{profile_text, with_launcher_at};
 #[cfg(unix)]
 pub use self::unix::{Spawned, start};
 #[cfg(windows)]
@@ -505,8 +506,11 @@ pub enum Reads {
     Everywhere,
     /// Only what the invocation is granted, for an operation performed for a caller bounded by a
     /// grant: the directories the operation owns, the ones it is lent to read, Git's own program
-    /// and helper directory, the device nodes every process needs, and the support set named for
-    /// this host's Git. Nothing else the account can read is readable.
+    /// and, on Linux, its helper directory (on macOS that directory is executed from and not
+    /// read), the device nodes every process needs, and the support set named for this host's Git.
+    /// Nothing else the account can read is readable. On macOS the profile also lets through the
+    /// names and attributes of the root directory, of symbolic links and of the directories above
+    /// a granted path, which tell no content; its module lists them.
     ///
     /// A support set is named only where the platform confines what a process reads, so an
     /// invocation bounded this way exists only there.
@@ -515,11 +519,14 @@ pub enum Reads {
 
 /// The system objects this host's Git needs in order to run, named by object.
 ///
-/// Found on the host rather than written down: the loader each of Git's programs names for
-/// itself, which the kernel opens for execution when it starts the program, and the directories
-/// the libraries that loader resolves for it are in, which are read and never executed. A library
-/// directory rather than each library, because Git and the libraries it links open further
-/// modules by name while running, and those resolve within the same directories.
+/// Found on the host rather than written down. On Linux: the loader each of Git's programs names
+/// for itself, which the kernel opens for execution when it starts the program, and the
+/// directories the libraries that loader resolves for it are in, which are read and never executed.
+/// On macOS: the directories of the libraries Git loads that the system does not supply from its
+/// shared cache, found from the load commands of Git and of each program in its helper directory;
+/// there is no loader to name, and a Git that links only the system's libraries has an empty set.
+/// A library directory rather than each library, because Git and the libraries it links open
+/// further modules by name while running, and those resolve within the same directories.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SupportSet {
     loaders: Vec<PathBuf>,
@@ -554,7 +561,17 @@ pub fn support_set(programs: &[&Path], helper_directory: &Path) -> Result<Suppor
         let (loaders, libraries) = linux::support_set(programs, helper_directory)?;
         Ok(SupportSet { loaders, libraries })
     }
-    #[cfg(not(target_os = "linux"))]
+    // The loader is the system's own on this platform, and no object a profile could name, so
+    // only the libraries the system does not supply are named.
+    #[cfg(target_os = "macos")]
+    {
+        let libraries = macho::support_set(programs, helper_directory)?;
+        Ok(SupportSet {
+            loaders: Vec::new(),
+            libraries,
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (programs, helper_directory);
         Err(reads_not_confined())
@@ -564,16 +581,51 @@ pub fn support_set(programs: &[&Path], helper_directory: &Path) -> Result<Suppor
 /// The refusal a platform that does not confine what a process reads gives a caller bounded by a
 /// grant.
 ///
-/// On macOS the sandbox profile reads everywhere, because no profile tried there confined reads and
-/// still let the system's loader start Git; on Windows no Git runs at all. So neither can bound
-/// what Git reads for such a caller, and the invocation is refused rather than run with the
-/// owner's reach.
-#[cfg(not(target_os = "linux"))]
+/// On Windows no Git runs at all, and no other platform has a boundary. So none can bound what Git
+/// reads for such a caller, and the invocation is refused rather than run with the owner's reach.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn reads_not_confined() -> ProjectError {
     ProjectError::GitFailed {
         detail: "this platform does not confine what Git reads, so an invocation for a caller \
                  bounded by a grant is not run here"
             .into(),
+    }
+}
+
+/// Returns the first of these mount points that lies beneath one of these directories, and that
+/// directory. A directory that is itself a mount point has nothing mounted beneath it by that.
+///
+/// Both platforms that confine what a caller bounded by a grant reads compare the same way, each
+/// against its own mount table.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn first_mount_beneath(
+    points: impl IntoIterator<Item = PathBuf>,
+    directories: &[PathBuf],
+) -> Option<(PathBuf, &Path)> {
+    points.into_iter().find_map(|point| {
+        directories
+            .iter()
+            .find(|directory| point != **directory && point.starts_with(directory))
+            .map(|directory| (point.clone(), directory.as_path()))
+    })
+}
+
+/// The refusal for a filesystem mounted beneath a directory an invocation bounded by a grant would
+/// be granted.
+///
+/// A rule on a directory reaches everything beneath it as the system presents it at each open, and
+/// that includes another filesystem mounted there, so such an invocation is not run over it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn mounted_beneath(point: &Path, directory: &Path) -> ProjectError {
+    ProjectError::GitFailed {
+        detail: format!(
+            "a filesystem is mounted at {}, beneath {}, which this invocation would be granted; \
+             an invocation for a caller bounded by a grant is not run over a directory with \
+             another filesystem inside it",
+            crate::git::redact(&point.display().to_string()),
+            crate::git::redact(&directory.display().to_string())
+        )
+        .into(),
     }
 }
 
@@ -985,7 +1037,28 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_mount_point_is_beneath_a_granted_directory_only_when_it_is_inside_it() {
+        let directories = vec![PathBuf::from("/work/tree"), PathBuf::from("/work/lib")];
+        let beneath = |points: &[&str]| {
+            first_mount_beneath(points.iter().map(PathBuf::from), &directories)
+                .map(|(point, directory)| (point, directory.to_owned()))
+        };
+        assert_eq!(
+            beneath(&["/", "/work/tree/mounted"]),
+            Some((
+                PathBuf::from("/work/tree/mounted"),
+                PathBuf::from("/work/tree")
+            ))
+        );
+        // A directory that is itself a mount point has nothing mounted beneath it by that, and a
+        // neighbour whose name only starts the same way is not inside it.
+        assert_eq!(beneath(&["/work/tree", "/work/lib"]), None);
+        assert_eq!(beneath(&["/work/tree2", "/work/library/inner"]), None);
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn a_platform_that_does_not_confine_reads_names_no_support_set_and_says_why() {
         let refusal = support_set(&[Path::new("/bin/sh")], Path::new("/usr/libexec/git-core"))

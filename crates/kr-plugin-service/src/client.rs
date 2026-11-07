@@ -292,6 +292,8 @@ pub struct PluginClient {
     offer_hold: Arc<Hold>,
     /// How long a registration is waited for.
     register_deadline: core::time::Duration,
+    /// How long an unbind is waited for.
+    unbind_deadline: core::time::Duration,
     next_request: AtomicU64,
     descriptor: HostDescriptor,
     reader_task: tokio::task::JoinHandle<()>,
@@ -387,6 +389,7 @@ impl PluginClient {
             #[cfg(feature = "testing")]
             offer_hold,
             register_deadline: REGISTER_DEADLINE,
+            unbind_deadline: DEFAULT_DEADLINE,
             next_request: AtomicU64::new(1),
             descriptor,
             reader_task,
@@ -560,6 +563,17 @@ impl PluginClient {
         self
     }
 
+    /// Waits `deadline` for the answer to an unbind instead of [`DEFAULT_DEADLINE`], for the
+    /// tests of a host whose unbind is held up for a time the test decides: a test that decides
+    /// by what the host answers does not decide by how long a machine takes to get to the step that
+    /// lets the host go.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn unbinding_within(mut self, deadline: core::time::Duration) -> Self {
+        self.unbind_deadline = deadline;
+        self
+    }
+
     /// Offers one source event and waits for the queue's answer.
     ///
     /// Nothing runs a component here either: the host answers an observation on the task that read
@@ -668,22 +682,32 @@ impl PluginClient {
 
     /// Removes a binding.
     ///
+    /// Any answer from the host means the binding is gone: it has been removed, or the host took it
+    /// out of its runtime without waiting for the removal to finish and said so in a refusal. A
+    /// worker reads either as gone, and so does this client, which forgets what its queue was
+    /// holding for the binding on both.
+    ///
     /// # Errors
     ///
-    /// Returns [`ServiceError::Unavailable`] when the host is gone.
+    /// Returns [`ServiceError::Protocol`] for the host's refusal, which is an answer and not a
+    /// failure to get one, and [`ServiceError::Unavailable`] when the host is gone.
     pub async fn unbind(&self, binding_id: BindingId) -> ServiceResult<bool> {
         let body = self
-            .request(RequestBody::Unbind {
-                binding_id: binding_id.get(),
-            })
+            .request_within(
+                RequestBody::Unbind {
+                    binding_id: binding_id.get(),
+                },
+                self.unbind_deadline,
+            )
             .await?;
+        // The host answered, so the binding has gone from it, and what this client's queue was
+        // holding for it has nothing left to catch: the identifier's next incarnation starts clean.
+        self.sink.forget(binding_id.get());
         match body {
-            ResponseBody::Unbound { existed } => {
-                // The binding has gone, so what this client's queue was holding for it has nothing
-                // left to catch, and the identifier's next incarnation starts clean.
-                self.sink.forget(binding_id.get());
-                Ok(existed)
-            }
+            ResponseBody::Unbound { existed } => Ok(existed),
+            ResponseBody::Refused {
+                detail, disabled, ..
+            } => Err(refused(detail, disabled)),
             other => Err(protocol_error(&other)),
         }
     }

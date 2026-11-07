@@ -34,8 +34,8 @@ use kr_protocol::ids::{
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_protocol::sharing::{
-    AuthorityNotice, GrantCreateResult, GrantListResult, InvitationPreview, LiveScreenPreview,
-    NamedApprovalPreview, NamedQuestionPreview, RoleSelection,
+    AuthorityNotice, GrantCreateResult, GrantListResult, GrantState, InvitationPreview,
+    LiveScreenPreview, NamedApprovalPreview, NamedQuestionPreview, RoleSelection,
 };
 
 use crate::error::{ControllerError, Result};
@@ -639,9 +639,18 @@ impl SharingService {
     /// delegation authority reaches. Holding a right that a grant happens to contain is not
     /// authority over the grant, so it does not widen this list.
     ///
+    /// Whether a grant has run out is decided on its anchor on the continuous clock and on its
+    /// expiry in UTC under the host's floor, with the end on record ([`GrantDirectory::lapsed`]).
+    /// A list that read the wall clock alone could call a grant active that the host has already
+    /// found ended, and a grant that ended never revives.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the store cannot be read.
+    /// Returns an error when the store cannot be read, `CLOCK_UNTRUSTED` when an expiring grant
+    /// with no end on record has no anchor in this boot and the clock cannot give it one, or while
+    /// this boot's clock continuity is lost, and a `STORAGE_UNAVAILABLE` refusal while the clock
+    /// floor a grant's expiry is decided on is owed its record, and while an end found cannot be
+    /// written down.
     pub fn list_for_issuer(
         &self,
         issuer_device_id: DeviceId,
@@ -654,42 +663,81 @@ impl SharingService {
         // descend from, and a transfer that moved a grant's issuer to another device must not take
         // it out of the owner's sight. Anybody else sees what it issued and what was delegated
         // from that.
-        if issuer_device_id == self.host_device_id {
-            let grants = all
-                .into_iter()
-                .filter(|record| session_id.is_none_or(|named| record.session_id == Some(named)))
-                .filter(|record| include_resolved || !is_resolved(record, now_ms))
-                .map(|record| record.summary(now_ms))
+        let visible: Vec<GrantRecord> = if issuer_device_id == self.host_device_id {
+            all
+        } else {
+            let mut reached: Vec<GrantId> = all
+                .iter()
+                .filter(|record| record.grant.issuer_device_id == issuer_device_id)
+                .map(|record| record.grant.grant_id)
                 .collect();
-            return Ok(GrantListResult { grants });
-        }
-        let mut visible: Vec<GrantId> = all
-            .iter()
-            .filter(|record| record.grant.issuer_device_id == issuer_device_id)
-            .map(|record| record.grant.grant_id)
-            .collect();
-        // Descendants of what this issuer issued, however deep.
-        let mut grew = true;
-        while grew {
-            grew = false;
-            for record in &all {
-                if let Some(parent) = record.grant.parent_grant_id.as_ref()
-                    && visible.contains(parent)
-                    && !visible.contains(&record.grant.grant_id)
-                {
-                    visible.push(record.grant.grant_id);
-                    grew = true;
+            // Descendants of what this issuer issued, however deep.
+            let mut grew = true;
+            while grew {
+                grew = false;
+                for record in &all {
+                    if let Some(parent) = record.grant.parent_grant_id.as_ref()
+                        && reached.contains(parent)
+                        && !reached.contains(&record.grant.grant_id)
+                    {
+                        reached.push(record.grant.grant_id);
+                        grew = true;
+                    }
                 }
             }
-        }
-        let grants = all
+            all.into_iter()
+                .filter(|record| reached.contains(&record.grant.grant_id))
+                .collect()
+        };
+        let mut grants = Vec::new();
+        for record in visible
             .into_iter()
-            .filter(|record| visible.contains(&record.grant.grant_id))
             .filter(|record| session_id.is_none_or(|named| record.session_id == Some(named)))
-            .filter(|record| include_resolved || !is_resolved(record, now_ms))
-            .map(|record| record.summary(now_ms))
-            .collect();
+        {
+            let state = record.state(self.has_run_out(&record, now_ms)?);
+            // A grant is resolved when it is expired or revoked. A proposal nobody has redeemed
+            // is neither: it is the thing an issuer most wants to see in a list, because it is
+            // the one still waiting for somebody.
+            if include_resolved || !matches!(state, GrantState::Expired | GrantState::Revoked) {
+                grants.push(record.summary(state));
+            }
+        }
         Ok(GrantListResult { grants })
+    }
+
+    /// Whether a grant that is not revoked has run out: its end is on record, or one of its two
+    /// deadlines has passed. A grant that does not expire reads no clock, and a revoked one is
+    /// revoked whatever its time says. An end on record is read first and stands whatever the
+    /// clocks say, as it does where a share is opened: an object that ended never revives. The
+    /// floor on disk at or after the expiry proves it ended next, and a refusal for a clock that
+    /// cannot be trusted names the grant it could not decide.
+    fn has_run_out(&self, record: &GrantRecord, now_ms: u64) -> Result<bool> {
+        if record.revoked_at_ms.is_some() || record.grant.expiry == GrantExpiry::Never {
+            return Ok(false);
+        }
+        if self
+            .grants
+            .grant_expired_at(record.grant.grant_id)?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        // The floor on disk at or after the expiry proves the grant ended, and holds while this
+        // boot's clock continuity is lost and nothing anchors the grant.
+        if self.grants.floor_on_disk_covers(record.grant.expiry) {
+            return Ok(true);
+        }
+        self.grants
+            .lapsed(record, now_ms)
+            .map_err(|error| match error {
+                ControllerError::ClockUntrusted { detail } => ControllerError::ClockUntrusted {
+                    detail: format!(
+                        "{detail}; the grant it could not decide is {}",
+                        record.grant.grant_id
+                    ),
+                },
+                other => other,
+            })
     }
 
     /// Every live grant one device currently holds.
@@ -712,17 +760,6 @@ impl SharingService {
             .map(|record| record.grant)
             .collect())
     }
-}
-
-/// Whether a grant is finished: expired or revoked.
-///
-/// A proposal nobody has redeemed is neither. It is the thing an issuer most wants to see in a
-/// list, because it is the one still waiting for somebody.
-fn is_resolved(record: &GrantRecord, now_ms: u64) -> bool {
-    matches!(
-        record.state(now_ms),
-        kr_protocol::sharing::GrantState::Expired | kr_protocol::sharing::GrantState::Revoked
-    )
 }
 
 /// Whether this grant is a persistent enlargement, and so needs the owner's confirmation.

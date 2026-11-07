@@ -2126,10 +2126,23 @@ impl AttentionModule {
         method: Method,
     ) -> Option<ControlFrame> {
         let key = action_key(actor, mutation, method).ok()?;
-        let record = match self.store().ok()?.answered(actor, &key.action_id) {
+        // A store that cannot be asked is not one that holds nothing: an earlier copy of this action
+        // may have been performed in it. Nor is one whose record cannot be read, or that is no
+        // longer this daemon's.
+        let unreadable = || {
+            Some(frame(
+                mutation.request_id,
+                Err(ControllerError::record_unreadable("attention actions").to_protocol_error()),
+            ))
+        };
+        let held = match self.store() {
+            Ok(store) => store.answered(actor, &key.action_id),
+            Err(_) => return unreadable(),
+        };
+        let record = match held {
             Ok(Some(record)) => record,
             Ok(None) => return None,
-            Err(error) => return Some(frame(mutation.request_id, Err(refusal(error)))),
+            Err(_) => return unreadable(),
         };
         if record.method != key.method || record.digest != key.digest {
             return Some(frame(
@@ -4360,10 +4373,12 @@ fn encode_answer(answer: &Answered, reading: HostReading) -> Vec<u8> {
         .unwrap_or_default()
 }
 
+/// Reads the answer an action's record keeps. The action was performed, and an answer that cannot
+/// be read leaves open what it came to, which a transient word would have the caller send again.
 fn decode_answer(bytes: &[u8]) -> Answer<ParamsValue> {
     kr_cbor::decode(bytes, &kr_cbor::Limits::DEFAULT)
         .map(ParamsValue::new)
-        .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))
+        .map_err(|_| ControllerError::record_unreadable("attention actions").to_protocol_error())
 }
 
 fn frame(request_id: RequestId, answer: Answer<ParamsValue>) -> ControlFrame {
@@ -5821,6 +5836,40 @@ pub(crate) mod tests {
                 world.changed_for(&newcomer, caller).await.from_cursor.get(),
             );
         }
+    }
+
+    /// KR-REQ-09.09: a repeat asked of a store that cannot be asked is told that what became of the
+    /// action is not known, and is not taken for a first request: the store holds the record of
+    /// every action it performed, and a request that is admitted as a new one is refused for its
+    /// window in place of the answer its first attempt left.
+    #[test]
+    fn a_repeat_asked_of_a_store_that_cannot_be_asked_is_told_the_outcome_is_unknown() {
+        let world = Summarised::start();
+        let module = Arc::clone(&world.module);
+        let poisoned = std::thread::spawn(move || {
+            let _held = module.store().expect("the store");
+            panic!("a panic while the store is held, which poisons its lock");
+        })
+        .join();
+        assert!(poisoned.is_err(), "the store's lock is poisoned");
+        let actor = ActorId::new("test:device").expect("an actor");
+        let told = world
+            .module
+            .retained(
+                &Caller::Owner,
+                &actor,
+                &visit_acknowledgement(&world, 11, U64::new(0)),
+                Method::VisitAcknowledge,
+            )
+            .expect("a repeat the store cannot be asked about is answered");
+        let ControlFrame::Response(Response {
+            outcome: Outcome::Error(error),
+            ..
+        }) = told
+        else {
+            panic!("the repeat is refused: {told:?}");
+        };
+        assert_eq!(error.code, ErrorCode::OutcomeUnknown, "{error:?}");
     }
 
     /// KR-REQ-18.02: the callers whose history reaches every moment are the owner and a device

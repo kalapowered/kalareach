@@ -470,11 +470,13 @@ fn session() -> SessionId {
     SessionId::new(uuid(1))
 }
 
+/// The gateway the daemon delivers through: the official one, which every host allows.
+const GATEWAY: &str = kr_controller::push::OFFICIAL_GATEWAY_ORIGIN;
+
 fn credential(expires_at_ms: u64) -> PushDeliveryCredential {
     PushDeliveryCredential {
         expires_at_ms: TimestampMs::new(expires_at_ms),
-        gateway_origin: kr_protocol::service::GatewayOrigin::new("https://reach.invalid")
-            .expect("an origin"),
+        gateway_origin: kr_protocol::service::GatewayOrigin::new(GATEWAY).expect("an origin"),
         installation_id: InstallationId::new(uuid(2)),
         issued_at_ms: TimestampMs::new(NOW - 1_000),
         revision: kr_protocol::ids::PushSenderRevision::new(1),
@@ -4437,7 +4439,7 @@ async fn the_daemon_delivers_a_notification_without_anything_calling_a_pass() {
         .into_iter()
         .find(|asked| asked.url.ends_with("/api/push/deliver"))
         .expect("the delivery request");
-    assert_eq!(delivery.url, "https://reach.invalid/api/push/deliver");
+    assert_eq!(delivery.url, format!("{GATEWAY}/api/push/deliver"));
     assert!(
         delivery
             .headers
@@ -5133,7 +5135,7 @@ fn a_status_answer_about_another_notification_resolves_nothing() {
     let asked = transport.asked();
     assert_eq!(asked.len(), 2);
     for Asked { url, body, headers } in asked {
-        assert_eq!(url, "https://reach.invalid/api/push/deliver/status");
+        assert_eq!(url, format!("{GATEWAY}/api/push/deliver/status"));
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).expect("a JSON question"),
             serde_json::json!({ "notification_id": notification_id }),
@@ -10436,4 +10438,218 @@ fn a_recipient_whose_grant_ended_is_left_no_object() {
     assert!(gateway.held_at_the_push().is_empty());
     assert_eq!(the_notification_is(&environment).0, DeliveryState::Revoked);
     assert!(!the_object_is_owed(&environment, object));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The gateways a credential may name
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-16.04: every exchange under a bearer is made through the gateways the host allows, and
+/// is checked when it starts. A question a registration asks and a renewal never leave the host for
+/// a gateway taken out of the list, whatever looked at the credential before; a revocation is the
+/// one request that does, because it is how that gateway is told to end what it issued.
+#[test]
+fn an_exchange_under_a_bearer_never_leaves_for_a_gateway_taken_out_of_the_list_but_a_revocation_does()
+ {
+    use kr_client::services::ServiceHttp;
+    use kr_controller::push::credentials::CredentialRenewal;
+    use kr_controller::push::gateways::{AllowedGateways, GatedTransports};
+    use kr_controller::push::sender::{GatewaySenders, HostSigner, SenderRevocation};
+    use kr_controller::push::transport::DeliveryTransports;
+
+    const LISTED: &str = "https://push.listed.invalid";
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let recorder = Arc::new(RecordingHttp::answering(Vec::new()));
+    let raw: Arc<dyn DeliveryTransports> =
+        Arc::new(OneTransport(Arc::clone(&recorder) as Arc<dyn ServiceHttp>));
+    let gateways = Arc::new(AllowedGateways::new(
+        "https://reach.invalid",
+        &[LISTED.to_owned()],
+    ));
+    let gated: Arc<dyn DeliveryTransports> = Arc::new(GatedTransports::new(
+        Arc::clone(&raw),
+        Arc::clone(&gateways),
+    ));
+    let senders = GatewaySenders::new(
+        gated,
+        Arc::new(HostSigner::new(
+            kr_crypto::keys::AuthorisationKeyPair::generate().expect("a key"),
+        )),
+        runtime.handle().clone(),
+    )
+    .revoking_through(raw);
+    let origin = kr_protocol::service::GatewayOrigin::new(LISTED).expect("an origin");
+    let id = PushSenderRecordId::new(uuid(0x31));
+    let mut held = credential(NOW + 2 * DAY);
+    held.gateway_origin = origin.clone();
+    held.sender_record_id = id;
+
+    // The control: while the gateway is listed the question and the renewal are asked.
+    let _ = senders.begin_renewal(&origin, id);
+    let _ = senders.renew(&held);
+    assert_eq!(recorder.asked().len(), 2);
+
+    gateways.replace(&[]);
+    let before = recorder.asked().len();
+    assert!(matches!(
+        senders.begin_renewal(&origin, id),
+        Err(kr_controller::push::Confirmation::NotAsked(_))
+    ));
+    assert!(senders.renew(&held).is_err());
+    assert_eq!(
+        recorder.asked().len(),
+        before,
+        "nothing left for a gateway that is not listed"
+    );
+
+    // The revocation does.
+    let _ = senders.revoke(&origin, id);
+    let asked = recorder.asked();
+    assert!(asked.len() > before);
+    assert!(
+        asked[before..]
+            .iter()
+            .all(|request| request.url == format!("{LISTED}/api/push/sender/revoke"))
+    );
+}
+
+/// KR-REQ-16.10, KR-REQ-16.04: a revocation owed to a gateway that was taken out of the list is
+/// never given up, however long it goes unanswered, and ends when the gateway has made it. One
+/// owed to an allowed gateway is given up after thirty days and some asks, as it always was.
+#[test]
+fn a_revocation_owed_to_a_gateway_taken_out_of_the_list_is_never_given_up() {
+    use kr_controller::push::gateways::AllowedGateways;
+    use kr_controller::push::sender::RevocationAnswer::{Later, Revoked};
+
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+    let directory = tempfile::tempdir().expect("a directory");
+    let module = DeliveryModule::open_at(
+        &directory.path().join("delivery.sqlite3"),
+        kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
+        kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+        secrets(),
+    )
+    .expect("a delivery module");
+    assert!(module.attach_gateways(Arc::new(AllowedGateways::new("https://reach.invalid", &[]))));
+    let removed = PushSenderRecordId::new(uuid(1));
+    let allowed = PushSenderRecordId::new(uuid(2));
+    let t0 = 1_700_000_000_000_u64;
+    module
+        .with(|producer| {
+            let journal = producer.journal_mut();
+            journal
+                .owe_revocation(removed, "https://push.removed.invalid", t0)
+                .expect("a debt");
+            journal
+                .owe_revocation(allowed, "https://reach.invalid", t0)
+                .expect("a debt");
+            Ok(())
+        })
+        .expect("the debts are written");
+    let owed = || {
+        module
+            .with(|producer| Ok(producer.journal().owed_revocations().expect("a read")))
+            .expect("a read")
+    };
+
+    // Asked at 31, 80, 200 and 400 days, never answered: only the allowed gateway's is given up.
+    for (ask, at) in [31, 80, 200, 400].into_iter().enumerate() {
+        let revoking = Revoking::default();
+        *revoking.answers.lock().expect("not poisoned") =
+            [Later("no answer".to_owned()), Later("no answer".to_owned())].into();
+        let at = t0 + at * DAY;
+        module
+            .settle_revocations(&revoking, &|_| true, &move || at)
+            .expect("a sweep");
+        assert!(owed().contains(&removed), "after ask {ask}");
+        assert_eq!(owed().contains(&allowed), ask < 3, "after ask {ask}");
+    }
+
+    // It ends when the gateway has made it.
+    let revoking = Revoking::default();
+    *revoking.answers.lock().expect("not poisoned") = [Revoked].into();
+    module
+        .settle_revocations(&revoking, &|_| true, &move || t0 + 401 * DAY)
+        .expect("a sweep");
+    assert!(owed().is_empty());
+}
+
+/// KR-REQ-16.04, KR-REQ-16.10: a gateway taken out of the list while the sweep is settling a debt
+/// owed to it keeps the debt. The sweep reads the list when it settles, not before it takes the
+/// journal: a debt owed to a gateway that left the list ends only when the gateway has made it.
+///
+/// The host moves the list with `replace_gateways`, as it does in production. That the sweep reads
+/// the list inside the journal's lock, and the move takes the same lock, is not shown by a case: it
+/// would take a wait for a thread to block, and a case decides by a condition and not by a delay.
+#[test]
+fn a_gateway_taken_out_of_the_list_as_the_sweep_settles_its_debt_keeps_the_debt() {
+    use kr_controller::push::gateways::AllowedGateways;
+    use kr_controller::push::sender::RevocationAnswer::Later;
+
+    const LISTED: &str = "https://push.listed.invalid";
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+    let t0 = 1_700_000_000_000_u64;
+    // Three asks the gateway never answers, then a fourth after more than thirty days, which gives
+    // a debt owed to an allowed gateway up. The fourth is stopped once the sweep has its answer,
+    // and the gateway is taken out of the list there when `remove` says so.
+    let still_owed_after_the_fourth_ask = |remove: bool| {
+        let directory = tempfile::tempdir().expect("a directory");
+        let module = DeliveryModule::open_at(
+            &directory.path().join("delivery.sqlite3"),
+            kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
+            kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+            secrets(),
+        )
+        .expect("a delivery module");
+        let gateways = Arc::new(AllowedGateways::new(
+            "https://reach.invalid",
+            &[LISTED.to_owned()],
+        ));
+        assert!(module.attach_gateways(Arc::clone(&gateways)));
+        let debt = PushSenderRecordId::new(uuid(1));
+        module
+            .with(|producer| {
+                producer
+                    .journal_mut()
+                    .owe_revocation(debt, LISTED, t0)
+                    .expect("a debt");
+                Ok(())
+            })
+            .expect("the debt is written");
+        let sweep = |at: u64| {
+            let revoking = Revoking::default();
+            *revoking.answers.lock().expect("not poisoned") =
+                [Later("no answer".to_owned())].into();
+            module
+                .settle_revocations(&revoking, &|_| true, &move || at)
+                .expect("a sweep");
+        };
+        for at in [31, 80, 200] {
+            sweep(t0 + at * DAY);
+        }
+        let (arrived, release) = module.pause_before_a_debt_is_settled();
+        std::thread::scope(|scope| {
+            let sweeping = scope.spawn(|| sweep(t0 + 400 * DAY));
+            arrived.recv().expect("the sweep has its answer");
+            if remove {
+                module.replace_gateways(&[]);
+            }
+            release.send(()).expect("the sweep goes on");
+            sweeping.join().expect("the sweep ends");
+        });
+        module
+            .with(|producer| Ok(producer.journal().owed_revocations().expect("a read")))
+            .expect("a read")
+            .contains(&debt)
+    };
+
+    assert!(
+        !still_owed_after_the_fourth_ask(false),
+        "the control: a debt owed to a gateway still in the list is given up"
+    );
+    assert!(
+        still_owed_after_the_fourth_ask(true),
+        "a debt owed to a gateway taken out of the list as it is settled is kept"
+    );
 }

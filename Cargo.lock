@@ -5114,6 +5114,7 @@ dependencies = [
  "kr-transfer",
  "landlock",
  "libc",
+ "object",
  "rusqlite",
  "rustix",
  "serde",

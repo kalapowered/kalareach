@@ -44,8 +44,8 @@ use kr_plugin_service::vocabulary::{
 };
 
 use crate::runtime::binding::{
-    BindingEvent, BindingHandle, BindingOwner, BindingRequest, DEFAULT_EVENT_QUEUE, Runtime,
-    RuntimeConfig, Unbound, remaining_of,
+    BindingEvent, BindingHandle, BindingOwner, BindingRequest, DEFAULT_EVENT_QUEUE, Incarnation,
+    Runtime, RuntimeConfig, Unbound, remaining_of,
 };
 use crate::runtime::budget::CallKind;
 use crate::runtime::compile::{CompileOrigin, Payload};
@@ -73,12 +73,14 @@ pub const REGISTER_DEADLINE: core::time::Duration =
 const UNBIND_DEADLINE: core::time::Duration = kr_plugin_service::client::DEFAULT_DEADLINE
     .saturating_sub(kr_plugin_service::client::ROUND_TRIP_ALLOWANCE);
 
-/// How many unbinds one connection may have queued or running on the blocking pool.
+/// How many unbinds the host may have queued or running on the blocking pool, whichever connections
+/// asked for them.
 ///
 /// A request that stops waiting at its deadline does not take its removal back, so a removal is
-/// counted from the request that queued it until it has run: a connection that has this many
-/// behind it is refused the next rather than queued behind itself, and the removals one connection
-/// leaves behind are bounded as the calls it has running are.
+/// counted from the request that queued it until it has run, and it is counted for the host: a
+/// worker that closes its connection and opens another leaves its removals behind and finds them
+/// still counted. An unbind that finds this many waiting does not queue another task behind them, so
+/// the removals a host leaves on the pool are bounded however many connections asked for them.
 pub const MAX_PENDING_UNBINDS: usize = 16;
 
 /// The file, in the state directory beside the compiled-code cache, that holds every registration
@@ -163,6 +165,12 @@ pub struct PluginHost {
     config: HostConfig,
     /// How many payloads may be in hand at once, across every connection.
     payloads: Arc<tokio::sync::Semaphore>,
+    /// How many unbinds may be queued or running on the blocking pool at once, across every
+    /// connection.
+    unbinds: Arc<tokio::sync::Semaphore>,
+    /// How many unbinds found every place taken, for the tests of what one does then.
+    #[cfg(feature = "testing")]
+    unbinds_found_full: std::sync::atomic::AtomicUsize,
     /// The packages directory, opened once. Every payload is opened relative to this handle, which
     /// is what keeps a component's location inside it a property of the open rather than of a
     /// comparison made before it.
@@ -176,6 +184,11 @@ pub struct PluginHost {
     /// holds to stand where a document has left the queue and not yet been written.
     #[cfg(feature = "testing")]
     notice_hold: Arc<kr_plugin_service::hold::Hold>,
+    /// The pause a registration takes after the connection has recorded it and before the runtime
+    /// reserves its identifier, which a test holds to stand where an unbind can come between the
+    /// two.
+    #[cfg(feature = "testing")]
+    reserving_hold: Arc<kr_plugin_service::hold::Hold>,
 }
 
 impl core::fmt::Debug for PluginHost {
@@ -262,12 +275,17 @@ impl PluginHost {
             runtime: Arc::new(runtime),
             config,
             payloads: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PAYLOADS)),
+            unbinds: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_UNBINDS)),
+            #[cfg(feature = "testing")]
+            unbinds_found_full: std::sync::atomic::AtomicUsize::new(0),
             packages: Arc::new(packages),
             started: std::time::Instant::now(),
             register_deadline: REGISTER_DEADLINE,
             unbind_deadline: UNBIND_DEADLINE,
             #[cfg(feature = "testing")]
             notice_hold: Arc::new(kr_plugin_service::hold::Hold::default()),
+            #[cfg(feature = "testing")]
+            reserving_hold: Arc::new(kr_plugin_service::hold::Hold::default()),
         })
     }
 
@@ -293,6 +311,22 @@ impl PluginHost {
         self
     }
 
+    /// Returns how many of the places for unbinds the host has taken, for the tests of what an
+    /// unbind does when it finds them all taken.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn unbinds_waiting(&self) -> usize {
+        MAX_PENDING_UNBINDS.saturating_sub(self.unbinds.available_permits())
+    }
+
+    /// Returns how many unbinds have found every place taken, which they find before they wait for
+    /// one.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn unbinds_found_full(&self) -> usize {
+        self.unbinds_found_full.load(Ordering::Acquire)
+    }
+
     /// Holds the notice writers, for the tests of what a connection writes: until the returned hold
     /// is released a writer that took a notice stops with it in hand, before it takes the
     /// connection's writer, and writes nothing.
@@ -300,6 +334,15 @@ impl PluginHost {
     #[must_use]
     pub fn hold_notice_writes(&self) -> kr_plugin_service::hold::HoldHandle {
         self.notice_hold.set()
+    }
+
+    /// Holds registrations after the connection has recorded them and before the runtime reserves
+    /// their identifiers, for the tests of what an unbind does when it comes between the two: until
+    /// the returned hold is released a registration that reached that step stops there.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn hold_registrations_before_the_runtime(&self) -> kr_plugin_service::hold::HoldHandle {
+        self.reserving_hold.set()
     }
 
     /// Returns the host's own identity.
@@ -382,7 +425,6 @@ impl PluginHost {
             notices: sink.clone(),
             writer: Arc::clone(&writer),
             work: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CALLS)),
-            unbinds: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_UNBINDS)),
             bindings: Arc::default(),
             conversation: Arc::clone(&conversation),
             registered: Registered::default(),
@@ -426,14 +468,15 @@ impl PluginHost {
             held.live.clear();
             held.preparing.clear();
             held.owed.clear();
+            held.standing.clear();
+            held.ends.clear();
         }
 
         // The worker is gone. Its bindings go with it: a binding exists to serve one worker's
-        // connection, and nothing durable was in it. Stopping one joins its thread, so it happens
-        // off the executor.
-        let runtime = Arc::clone(&self.runtime);
-        let owner = served.owner;
-        let _stopped = tokio::task::spawn_blocking(move || runtime.release_owner(owner)).await;
+        // connection, and nothing durable was in it. Each thread is told to stop and is not waited
+        // for, so the end of a connection queues nothing on the blocking pool, whatever else keeps
+        // the pool busy: a thread ends on its own after at most one bounded call.
+        self.runtime.release_owner(served.owner);
     }
 
     async fn read_requests(self: Arc<Self>, mut reader: FrameReader, served: &Arc<Served>) {
@@ -476,12 +519,19 @@ impl PluginHost {
             // request never waits for it. That is what keeps an observation from queueing behind a
             // snapshot, and a registration from delaying either.
             let Ok(permit) = Arc::clone(&served.work).try_acquire_owned() else {
-                let body = ResponseBody::Refused {
-                    request: name.to_owned(),
-                    detail: format!(
-                        "this connection already has the {MAX_CONCURRENT_CALLS} calls it may have running"
-                    ),
-                    disabled: false,
+                let body = match request.body {
+                    // An unbind is answered with the binding out of the runtime like any other,
+                    // and taking it out waits for nothing.
+                    RequestBody::Unbind { binding_id } => {
+                        self.unbind_without_a_call(binding_id, served)
+                    }
+                    _ => ResponseBody::Refused {
+                        request: name.to_owned(),
+                        detail: format!(
+                            "this connection already has the {MAX_CONCURRENT_CALLS} calls it may have running"
+                        ),
+                        disabled: false,
+                    },
                 };
                 if !respond(served, reply_to, name, body).await {
                     return;
@@ -515,35 +565,73 @@ impl PluginHost {
             })
     }
 
-    /// Starts a task that stamps one binding's events with its identifier.
+    /// Starts a task that stamps one registration's events with its identifier, and returns the
+    /// channel the registration's thread sends them on and what says when the task has ended.
     ///
-    /// Each binding gets its own channel, so a connection with several bindings never attributes
-    /// one binding's fault to another.
+    /// Each registration gets its own channel, so a connection with several bindings never
+    /// attributes one binding's fault to another, and its own task, which passes a notice on only
+    /// while the connection stands behind the registration. The identifier alone cannot say that:
+    /// the registration may have been removed and the identifier registered again while its thread
+    /// finishes a call, and what that thread produces is not the new registration's. The check and
+    /// the sending of everything one event became are one step under the connection's record, so a
+    /// removal that takes the registration out and forgets what the queue holds for the identifier
+    /// is not overtaken by a notice that passed the check before it, and a document is not left
+    /// in the queue without its end.
+    ///
+    /// The task goes on receiving, and dropping, what a registration the connection no longer
+    /// stands behind sends, so that its thread never waits on a full channel. It ends when the
+    /// thread has, which closes the channel, and the place it holds goes then, before it is said
+    /// to have ended.
     fn forward_notices(
         binding_id: BindingId,
+        incarnation: Incarnation,
         notices: NoticeSink,
+        registered: Registered,
         conversation: Arc<Conversation>,
-    ) -> tokio::sync::mpsc::Sender<BindingEvent> {
+        place: Place,
+    ) -> (tokio::sync::mpsc::Sender<BindingEvent>, Ended) {
         let (events, mut pending) = tokio::sync::mpsc::channel::<BindingEvent>(DEFAULT_EVENT_QUEUE);
+        let (ending, ended) = Ended::new();
         tokio::spawn(async move {
+            // Dropped in the reverse order, so the place is back when the task is said to be over.
+            let _ending = ending;
+            let _place = place;
             while let Some(event) = pending.recv().await {
-                for notice in notices_of(binding_id, event) {
-                    match notices.send(notice) {
-                        // A dropped document is answered where the loss is reported, because the
-                        // binding that lost one is not always the binding that made room.
-                        Offered::Kept | Offered::Dropped | Offered::Withheld => {}
-                        // What had to arrive would not fit. Nothing further this connection said
-                        // could be answered honestly, so it is over.
-                        Offered::Overflowed => {
-                            conversation.end();
-                            return;
-                        }
-                        Offered::Closed => return,
+                let pieces = notices_of(binding_id, event);
+                let outcome = {
+                    let Ok(held) = registered.lock() else {
+                        continue;
+                    };
+                    if !held.stands(incarnation) {
+                        continue;
                     }
+                    let mut outcome = Offered::Kept;
+                    for notice in pieces {
+                        match notices.send(notice) {
+                            // A dropped document is answered where the loss is reported, because
+                            // the binding that lost one is not always the binding that made room.
+                            Offered::Kept | Offered::Dropped | Offered::Withheld => {}
+                            end @ (Offered::Overflowed | Offered::Closed) => {
+                                outcome = end;
+                                break;
+                            }
+                        }
+                    }
+                    outcome
+                };
+                match outcome {
+                    // What had to arrive would not fit. Nothing further this connection said
+                    // could be answered honestly, so it is over.
+                    Offered::Overflowed => {
+                        conversation.end();
+                        return;
+                    }
+                    Offered::Closed => return,
+                    Offered::Kept | Offered::Dropped | Offered::Withheld => {}
                 }
             }
         });
-        events
+        (events, ended)
     }
 
     async fn handle(
@@ -849,7 +937,10 @@ impl PluginHost {
             component,
         } = registration;
         check_facts(&facts).map_err(refused)?;
-        let admitted = served.bindings.admit()?;
+        // The connection's place for this binding. It is handed to the binding's forwarder once
+        // there is one, and given back when the binding's thread has ended; a registration that
+        // fails before that gives it back at once.
+        let binding_place = served.bindings.admit()?;
 
         // Reading a file is blocking work, and so is the digest of what was read, and a payload is
         // up to sixteen mebibytes. Neither belongs on the executor that is reading this
@@ -903,36 +994,70 @@ impl PluginHost {
             facts: facts_of(&facts),
             executable,
         };
-        // Recorded before the forwarder starts, because what `bind` draws reaches the notice queue
+        // This registration's own number, which everything that concerns it is kept and removed
+        // by: the notices its thread produces, the place it holds and its entry in the runtime.
+        // The identifier names whichever registration holds it now, and that is not always this
+        // one.
+        let incarnation = Incarnation::next();
+        let (events, ended) = Self::forward_notices(
+            binding,
+            incarnation,
+            served.notices.clone(),
+            Arc::clone(&served.registered),
+            Arc::clone(&served.conversation),
+            binding_place,
+        );
+        // Recorded before the instance exists, because what `bind` draws reaches the notice queue
         // before this registration returns: a document lost in that moment has to be an obligation
-        // this connection can still discharge.
-        let attempt = served
-            .registered
-            .lock()
-            .ok()
-            .and_then(|mut held| held.preparing(binding_id));
-        let started_registering = Registering {
+        // this connection can still discharge. An identifier has one registration in flight at a
+        // time. Standing behind the registration is what lets its forwarder pass its notices on,
+        // and it is recorded in the same step, so an unbind cannot come between the two.
+        let recorded = served.registered.lock().is_ok_and(|mut held| {
+            let recorded = held.preparing(binding_id, incarnation);
+            if recorded {
+                held.stand(incarnation, ended);
+            }
+            recorded
+        });
+        if !recorded {
+            return Err(refused(format!("binding {binding} is already live")));
+        }
+        let registering = Registering {
             registered: &served.registered,
             binding_id,
-            attempt,
+            incarnation,
             kept: false,
         };
-        let events = Self::forward_notices(
-            binding,
-            served.notices.clone(),
-            Arc::clone(&served.conversation),
-        );
+        #[cfg(feature = "testing")]
+        self.reserving_hold.pause().await;
         let remaining = remaining_of(started, deadline).map_err(refusal)?;
         let bound = self
             .runtime
-            .instantiate(served.owner, request, &compiled, events, remaining)
+            .instantiate(
+                served.owner,
+                incarnation,
+                request,
+                &compiled,
+                events,
+                remaining,
+            )
             .await
             .map_err(refusal)?;
-        if let Ok(mut held) = served.registered.lock() {
-            held.joined(binding_id, attempt, bound);
+        let kept = served
+            .registered
+            .lock()
+            .is_ok_and(|mut held| held.joined(binding_id, incarnation, bound));
+        if !kept {
+            // An unbind retired this registration between the connection's record of it and now.
+            // Its removal found nothing, or the binding that has just gone live, or removed it
+            // already; what it was about is this binding, so it goes if it is still there, and
+            // the worker is told that it did.
+            self.runtime.detach(served.owner, binding, incarnation);
+            return Err(refused(format!(
+                "binding {binding} was unbound while it was being registered"
+            )));
         }
-        started_registering.keep();
-        admitted.keep();
+        registering.keep();
         Ok(ResponseBody::Registered {
             origin: match compiled.origin {
                 CompileOrigin::Compiled => "compiled".to_owned(),
@@ -944,72 +1069,169 @@ impl PluginHost {
 
     /// Removes one binding, and answers inside the time a worker waits for the answer.
     ///
-    /// Removing a binding waits for its thread, so it happens off the executor, and the removal and
-    /// what is recorded once it is done are one task of the blocking pool's. A blocking pool that
-    /// other work keeps busy can leave that task waiting for a thread for longer than the worker
-    /// waits, and a request that waited for it would hold its place among the calls the connection
-    /// may have running, and with it the connection's cleanup, for as long. So the wait is held to
-    /// the time a worker gives it. A caller that stops waiting does not take the task back: it runs
-    /// when it gets a thread, removes the binding, gives the connection its place back and clears
-    /// the records, as it would for a caller that waited. The tasks a connection leaves behind are
-    /// counted, [`MAX_PENDING_UNBINDS`] at most, and an unbind beyond that is refused at once.
+    /// The request is about the registration this connection holds under the identifier when it
+    /// arrives, and it removes that registration and no other: an identifier registered again by
+    /// the time a removal runs is another registration's. A connection that holds none has nothing
+    /// to remove. From the start of the request, nothing the registration's thread produces
+    /// reaches the notice queue.
+    ///
+    /// Removing a binding waits for its thread, so it happens off the executor, and the removal is
+    /// one task of the blocking pool's. A blocking pool that other work keeps busy can leave that
+    /// task waiting for a thread for longer than the worker waits, and a request that waited for it
+    /// would hold its place among the calls the connection may have running, and with it the
+    /// connection's cleanup, for as long. So the wait is held to the time a worker gives it. A
+    /// caller that stops waiting does not take the task back: it runs when it gets a thread, and
+    /// finds nothing to remove by then, as the request has taken the binding out already.
+    ///
+    /// The tasks the host has waiting are counted across its connections, [`MAX_PENDING_UNBINDS`]
+    /// at most. A request that finds them all taken waits for a place, in the time it has, as
+    /// removals that many connections ask for at once do.
+    ///
+    /// A request that finds no place, or whose removal has not finished when its time is up, takes
+    /// the binding out of the runtime and tells its thread to stop, without waiting for the thread,
+    /// and says why it did not wait. That includes a place that was found near the end of the time,
+    /// which leaves the removal almost none. A worker takes any answer to an unbind as the binding
+    /// gone, so every answer is given with the binding out of the runtime: one left in it would be
+    /// one its worker could not register again. That holds for a request that finds none of the
+    /// connection's places for calls too, which [`Self::unbind_without_a_call`] answers. The
+    /// connection keeps the binding's place until its thread has ended, and a removal that was
+    /// queued and runs later finds nothing to remove.
+    ///
+    /// An unbind that was carried out is answered after the binding's thread has ended and after
+    /// everything it produced was passed on or dropped, so no notice the registration produced
+    /// after the request began follows the answer. A second request about a registration whose
+    /// removal is under way, that arrives while the connection still records the registration, is
+    /// answered at the same point; one that arrives after it is recorded no more finds nothing
+    /// to remove.
     async fn unbind(
         &self,
         binding_id: Uuid,
         served: &Arc<Served>,
     ) -> Result<ResponseBody, (String, bool)> {
-        // The handle is taken first so the record can be cleared by identity afterwards: the
-        // identifier may have been registered again by then, and that binding's place is not this
-        // removal's to take.
-        let removing = served
-            .registered
-            .lock()
-            .ok()
-            .and_then(|held| held.live.get(&binding_id).cloned());
-        // A place among the removals this connection may have waiting, held by the task until it
-        // has run and not by this request, which stops waiting at its deadline.
-        let Ok(waiting) = Arc::clone(&served.unbinds).try_acquire_owned() else {
-            return Err(refused(format!(
-                "this connection already has the {MAX_PENDING_UNBINDS} unbinds it may have waiting"
-            )));
+        let started = std::time::Instant::now();
+        let Some(leaving) = leave(served, binding_id) else {
+            return Ok(ResponseBody::Unbound { existed: false });
+        };
+        let incarnation = leaving.incarnation;
+        let owner = served.owner;
+        let binding = BindingId::new(binding_id);
+        #[cfg(feature = "testing")]
+        if self.unbinds.available_permits() == 0 {
+            self.unbinds_found_full.fetch_add(1, Ordering::Release);
+        }
+        // A place among the removals this host may have waiting, held by the task until it has run
+        // and not by this request, which stops waiting at its deadline, nor by the connection,
+        // which may be over by then.
+        let Ok(Ok(waiting)) = tokio::time::timeout(
+            self.unbind_deadline,
+            Arc::clone(&self.unbinds).acquire_owned(),
+        )
+        .await
+        else {
+            return Err(self.detached(
+                served,
+                binding_id,
+                incarnation,
+                &format!(
+                    "this host already has the {MAX_PENDING_UNBINDS} unbinds it may have waiting"
+                ),
+            ));
         };
         let runtime = Arc::clone(&self.runtime);
         // Only what the task needs: it is not given the connection's writer, so a connection that is
         // over does not stay open for the task.
-        let owner = served.owner;
-        let places = Arc::clone(&served.bindings);
         let registered = Arc::clone(&served.registered);
-        let notices = served.notices.clone();
-        let binding = BindingId::new(binding_id);
         let removal = tokio::task::spawn_blocking(move || {
             let _waiting = waiting;
-            let removed = runtime.unbind(owner, binding);
-            // Only a binding that existed had a place of its own. A preparation that was still
-            // running holds its place until it finishes and gives it back itself, so counting it
-            // here as well would let this connection hold more bindings than it may.
-            if matches!(removed, Unbound::Stopped) {
-                places.give_back();
+            let removed = runtime.unbind(owner, binding, incarnation);
+            if let Ok(mut held) = registered.lock() {
+                held.withdraw(binding_id, incarnation);
             }
-            if let Ok(mut held) = registered.lock()
-                && let Some(removing) = removing
-            {
-                // By identity, and nothing else: a registration that started while this unbind was
-                // joining the old thread owns the identifier now, and its state is not this
-                // removal's to clear.
-                held.parted(binding_id, &removing);
-            }
-            // The binding has gone, so what the notice queue was holding for it has nothing left
-            // to catch, and the identifier's next incarnation starts clean.
-            notices.forget(binding_id);
             removed
         });
-        let removed = tokio::time::timeout(self.unbind_deadline, removal)
-            .await
-            .map_err(|_elapsed| caller_deadline(self.unbind_deadline))?
-            .map_err(|error| (format!("the binding could not be removed: {error}"), false))?;
-        Ok(ResponseBody::Unbound {
-            existed: removed.existed(),
+        let remaining = self.unbind_deadline.saturating_sub(started.elapsed());
+        let carried_out = tokio::time::timeout(remaining, async {
+            let removed = removal.await?;
+            // The binding's thread has ended, or is ending: its removal has been waited for, here
+            // or by the request that took it out, and the answer is given after its forwarder
+            // has ended too. A registration that was withdrawn while it was being prepared has no
+            // thread to wait for yet, and a registration that was not in the runtime yet has none.
+            let waited_for = match removed {
+                Unbound::Stopped => true,
+                Unbound::Absent => leaving.was_live,
+                Unbound::Preparing => false,
+            };
+            if waited_for && let Some(ended) = leaving.ended {
+                ended.wait().await;
+            }
+            Ok::<_, tokio::task::JoinError>(removed)
         })
+        .await;
+        match carried_out {
+            Ok(Ok(removed)) => Ok(ResponseBody::Unbound {
+                existed: removed.existed(),
+            }),
+            Ok(Err(error)) => Err(self.detached(
+                served,
+                binding_id,
+                incarnation,
+                &format!("the binding could not be removed: {error}"),
+            )),
+            Err(_elapsed) => Err(self.detached(
+                served,
+                binding_id,
+                incarnation,
+                &format!(
+                    "the unbind did not finish within {} ms",
+                    self.unbind_deadline.as_millis()
+                ),
+            )),
+        }
+    }
+
+    /// Answers an unbind that found none of the connection's places for calls to run in. Nothing
+    /// is queued and nothing waits: the binding is taken out of the runtime, and the refusal says
+    /// so.
+    fn unbind_without_a_call(&self, binding_id: Uuid, served: &Arc<Served>) -> ResponseBody {
+        let Some(leaving) = leave(served, binding_id) else {
+            return ResponseBody::Unbound { existed: false };
+        };
+        let (detail, disabled) = self.detached(
+            served,
+            binding_id,
+            leaving.incarnation,
+            &format!(
+                "this connection already has the {MAX_CONCURRENT_CALLS} calls it may have running"
+            ),
+        );
+        ResponseBody::Refused {
+            request: "unbind".to_owned(),
+            detail: clipped(detail),
+            disabled,
+        }
+    }
+
+    /// Takes one registration out of the runtime without waiting for its thread, and returns the
+    /// refusal that says why the removal was not waited for and what was found.
+    fn detached(
+        &self,
+        served: &Served,
+        binding_id: Uuid,
+        incarnation: Incarnation,
+        why: &str,
+    ) -> (String, bool) {
+        let removed = self
+            .runtime
+            .detach(served.owner, BindingId::new(binding_id), incarnation);
+        if let Ok(mut held) = served.registered.lock() {
+            held.withdraw(binding_id, incarnation);
+        }
+        let outcome = match removed {
+            Unbound::Stopped => "the binding was stopped without waiting for its thread",
+            Unbound::Preparing => "the registration of the binding was withdrawn",
+            Unbound::Absent => "the host no longer holds the binding",
+        };
+        refused(format!("{why}, and {outcome}"))
     }
 
     fn descriptor(&self) -> kr_plugin_service::protocol::HostDescriptor {
@@ -1078,12 +1300,10 @@ struct Served {
     writer: Arc<tokio::sync::Mutex<FrameWriter>>,
     /// How much work that enters a component this connection may have running.
     work: Arc<tokio::sync::Semaphore>,
-    /// How many unbinds this connection may have queued or running on the blocking pool.
-    unbinds: Arc<tokio::sync::Semaphore>,
     /// How many bindings it holds.
     ///
-    /// Shared, so that an unbind the connection's end does not wait for can still give its place
-    /// back without holding the rest of what the connection held.
+    /// Shared, so that the forwarder of a binding whose thread outlives the connection can still
+    /// give its place back without holding the rest of what the connection held.
     bindings: Arc<BindingPlaces>,
     /// Whether it is still worth talking on.
     conversation: Arc<Conversation>,
@@ -1098,61 +1318,106 @@ struct Served {
 /// The bindings one connection holds, and what they owe.
 type Registered = Arc<std::sync::Mutex<Held>>;
 
+/// What a registration's forwarder holds, and says when it is dropped that the forwarder is over.
+#[derive(Debug)]
+struct Ending(tokio::sync::watch::Sender<bool>);
+
+impl Drop for Ending {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
+}
+
+/// Says when a registration's forwarder has ended, which is when its thread has ended and
+/// everything the thread produced has been passed on or dropped, and the connection's place for
+/// the registration is back. Any number of removals of one registration can wait for it.
+#[derive(Clone, Debug)]
+struct Ended(tokio::sync::watch::Receiver<bool>);
+
+impl Ended {
+    fn new() -> (Ending, Self) {
+        let (ending, ended) = tokio::sync::watch::channel(false);
+        (Ending(ending), Self(ended))
+    }
+
+    /// Waits until the forwarder has ended.
+    async fn wait(mut self) {
+        let _ended = self.0.wait_for(|over| *over).await;
+    }
+}
+
 /// One connection's bindings, and the redraws they owe.
 #[derive(Debug, Default)]
 struct Held {
     live: std::collections::HashMap<Uuid, Arc<BindingHandle>>,
-    /// Bindings this connection is registering, by the attempt that is registering each.
+    /// Bindings this connection is registering, by the incarnation that is registering each.
     ///
     /// What `bind` draws reaches the notice queue before the registration that started it has
-    /// returned, so a document lost in that moment has no handle to ask. The attempt is what keeps
-    /// one registration's cleanup from clearing another's: an identifier can be registered twice,
-    /// and the one that fails must not take the other's state with it.
-    preparing: std::collections::HashMap<Uuid, u64>,
+    /// returned, so a document lost in that moment has no handle to ask. The incarnation is what
+    /// keeps one registration's cleanup from clearing another's: an identifier can be registered
+    /// twice, and the one that fails must not take the other's state with it.
+    preparing: std::collections::HashMap<Uuid, Incarnation>,
     /// Redraws owed to bindings that were still being registered when the loss was reported.
     ///
     /// Only for identifiers in `preparing`: a loss reported for a binding that has already gone is
     /// a loss with nobody to tell, and remembering those would be a record that grew for as long as
     /// the connection lasted.
     owed: std::collections::HashSet<Uuid>,
+    /// The registrations this connection stands behind.
+    ///
+    /// A registration is here from the moment its forwarder starts until the connection stops
+    /// standing behind it: a removal began, or it failed to finish registering. A forwarder passes
+    /// nothing on for a registration that is not here, whatever its thread still produces.
+    standing: std::collections::HashSet<Incarnation>,
+    /// When each registration's forwarder has ended, for as long as the connection records the
+    /// registration, which is after it stops standing behind it and until it is out of the runtime.
+    ends: std::collections::HashMap<Incarnation, Ended>,
 }
 
-/// The source of registration attempt numbers, which are never reused inside a process.
-static NEXT_REGISTRATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
 impl Held {
-    /// Records that this connection has started registering a binding, and returns the attempt.
+    /// Records that this connection has started registering a binding, and says whether it did.
     ///
-    /// Nothing, when an attempt on that identifier is already under way: the runtime refuses the
-    /// second registration of one identifier, and letting it overwrite the first one's record would
-    /// leave the first with nothing to clean up by.
-    fn preparing(&mut self, binding_id: Uuid) -> Option<u64> {
+    /// Not when a registration of that identifier is already under way: the host refuses a second
+    /// registration of one identifier, and letting it overwrite the first one's record would leave
+    /// the first with nothing to clean up by.
+    fn preparing(&mut self, binding_id: Uuid, incarnation: Incarnation) -> bool {
         if self.preparing.contains_key(&binding_id) {
-            return None;
+            return false;
         }
-        let attempt = NEXT_REGISTRATION.fetch_add(1, Ordering::Relaxed);
-        self.preparing.insert(binding_id, attempt);
-        Some(attempt)
+        self.preparing.insert(binding_id, incarnation);
+        true
     }
 
-    /// Records a binding, and discharges any redraw it owed from before it existed.
-    fn joined(&mut self, binding_id: Uuid, attempt: Option<u64>, handle: Arc<BindingHandle>) {
+    /// Records a binding, and discharges any redraw it owed from before it existed. Says whether
+    /// the connection still stands behind the registration: when it does not, an unbind retired it
+    /// after the connection recorded it, the binding is not recorded, and the caller takes it out
+    /// of the runtime.
+    fn joined(
+        &mut self,
+        binding_id: Uuid,
+        incarnation: Incarnation,
+        handle: Arc<BindingHandle>,
+    ) -> bool {
         // The redraw first: it is taken before the cleanup that would otherwise remove it, because
         // a document lost while this binding was being registered is a document the binding still
-        // has to draw again.
-        let owed = self.owed.remove(&binding_id);
-        if let Some(attempt) = attempt {
-            self.gave_up(binding_id, attempt);
-        }
+        // has to draw again. It is owed to the registration that is being made now, which is this
+        // one only while the identifier is recorded as its.
+        let owed =
+            self.preparing.get(&binding_id) == Some(&incarnation) && self.owed.remove(&binding_id);
+        self.gave_up(binding_id, incarnation);
         if owed {
             handle.require_snapshot();
         }
-        self.live.insert(binding_id, handle);
+        let stands = self.stands(incarnation);
+        if stands {
+            self.live.insert(binding_id, handle);
+        }
+        stands
     }
 
-    /// Forgets one registration attempt, if it is still the attempt this identifier is on.
-    fn gave_up(&mut self, binding_id: Uuid, attempt: u64) {
-        if self.preparing.get(&binding_id) == Some(&attempt) {
+    /// Forgets one registration, if it is still the one this identifier is being registered by.
+    fn gave_up(&mut self, binding_id: Uuid, incarnation: Incarnation) {
+        if self.preparing.get(&binding_id) == Some(&incarnation) {
             self.preparing.remove(&binding_id);
             self.owed.remove(&binding_id);
         }
@@ -1163,7 +1428,13 @@ impl Held {
     /// A loss for an identifier this connection neither holds nor is registering is a loss with
     /// nobody to tell: the binding has gone, and its next incarnation will draw from scratch.
     fn redraw(&mut self, binding_id: Uuid) {
-        match self.live.get(&binding_id) {
+        // A binding the connection has stopped standing behind is on its way out, and the loss
+        // is a registration of the identifier that is being made now, if there is one.
+        match self
+            .live
+            .get(&binding_id)
+            .filter(|handle| self.standing.contains(&handle.incarnation()))
+        {
             Some(handle) => handle.require_snapshot(),
             None => {
                 if self.preparing.contains_key(&binding_id) {
@@ -1173,18 +1444,60 @@ impl Held {
         }
     }
 
-    /// Removes one binding, if the one held is the one being removed.
+    /// Starts standing behind a registration, whose forwarder ends as `ended` says.
+    fn stand(&mut self, incarnation: Incarnation, ended: Ended) {
+        self.standing.insert(incarnation);
+        self.ends.insert(incarnation, ended);
+    }
+
+    /// Returns true while this connection stands behind the registration.
+    fn stands(&self, incarnation: Incarnation) -> bool {
+        self.standing.contains(&incarnation)
+    }
+
+    /// Returns when the registration's forwarder has ended, while this connection records it.
+    fn ended_of(&self, incarnation: Incarnation) -> Option<Ended> {
+        self.ends.get(&incarnation).cloned()
+    }
+
+    /// Returns the registration this connection holds under an identifier now: the binding that is
+    /// live and stood behind, or else the one being registered, or else one that was stood behind
+    /// and is on its way out, for a second request about it. A registration on its way out is
+    /// never preferred to the one that replaces it.
+    fn registration_of(&self, binding_id: Uuid) -> Option<Incarnation> {
+        let live = self
+            .live
+            .get(&binding_id)
+            .map(|handle| handle.incarnation());
+        live.filter(|incarnation| self.standing.contains(incarnation))
+            .or_else(|| self.preparing.get(&binding_id).copied())
+            .or(live)
+    }
+
+    /// Stops standing behind a registration, and says whether it did: it does not for a
+    /// registration this connection had stopped standing behind already.
     ///
-    /// By identity rather than by name: an identifier can be unbound and registered again, and the
-    /// removal of the old binding must not take the new one's place in this record with it.
-    fn parted(&mut self, binding_id: Uuid, handle: &Arc<BindingHandle>) {
+    /// From here nothing that registration's thread produces reaches the notice queue: the
+    /// forwarder checks and sends under this record.
+    fn retire(&mut self, incarnation: Incarnation) -> bool {
+        self.standing.remove(&incarnation)
+    }
+
+    /// Removes one registration's entries once it is out of the runtime: its binding, if it is the
+    /// one held, and its place among those being registered.
+    ///
+    /// By incarnation rather than by name: an identifier can be unbound and registered again, and
+    /// the removal of the old binding must not take the new one's place in this record with it.
+    fn withdraw(&mut self, binding_id: Uuid, incarnation: Incarnation) {
         if self
             .live
             .get(&binding_id)
-            .is_some_and(|held| Arc::ptr_eq(held, handle))
+            .is_some_and(|held| held.incarnation() == incarnation)
         {
             self.live.remove(&binding_id);
         }
+        self.gave_up(binding_id, incarnation);
+        self.ends.remove(&incarnation);
     }
 }
 
@@ -1238,11 +1551,13 @@ struct BindingPlaces {
 /// One registration in progress, forgotten if it does not finish.
 ///
 /// A registration that failed leaves an identifier nothing is preparing any more, and a redraw owed
-/// to it is owed to nobody. Forgetting it here is what keeps that record from growing.
+/// to it is owed to nobody. Forgetting it here is what keeps that record from growing, and the
+/// connection stops standing behind it, so that nothing its thread still produces reaches the
+/// queue.
 struct Registering<'a> {
     registered: &'a Registered,
     binding_id: Uuid,
-    attempt: Option<u64>,
+    incarnation: Incarnation,
     kept: bool,
 }
 
@@ -1255,45 +1570,39 @@ impl Registering<'_> {
 impl Drop for Registering<'_> {
     fn drop(&mut self) {
         if !self.kept
-            && let Some(attempt) = self.attempt
             && let Ok(mut held) = self.registered.lock()
         {
-            held.gave_up(self.binding_id, attempt);
+            held.retire(self.incarnation);
+            held.gave_up(self.binding_id, self.incarnation);
+            held.ends.remove(&self.incarnation);
         }
     }
 }
 
-/// One taken place, given back if its registration does not finish.
-struct Place<'a> {
-    places: &'a BindingPlaces,
-    kept: bool,
+/// One of a connection's places for bindings, given back when it is dropped.
+///
+/// A binding's forwarder holds the place, and the forwarder ends when the binding's thread has
+/// ended, so the places a connection has taken are the instances it still has, those that were told
+/// to stop and have not yet ended among them.
+struct Place {
+    places: Arc<BindingPlaces>,
 }
 
-impl Place<'_> {
-    /// Keeps the place: the binding exists now.
-    fn keep(mut self) {
-        self.kept = true;
-    }
-}
-
-impl Drop for Place<'_> {
+impl Drop for Place {
     fn drop(&mut self) {
-        if !self.kept {
-            self.places.give_back();
-        }
+        self.places.give_back();
     }
 }
 
 impl BindingPlaces {
     /// Takes one place, or says they are all taken.
-    fn admit(&self) -> Result<Place<'_>, (String, bool)> {
+    fn admit(self: &Arc<Self>) -> Result<Place, (String, bool)> {
         self.held
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                 (held < MAX_BINDINGS_PER_CONNECTION).then_some(held + 1)
             })
             .map(|_held| Place {
-                places: self,
-                kept: false,
+                places: Arc::clone(self),
             })
             .map_err(|held| {
                 (
@@ -1491,6 +1800,42 @@ fn native_request_of(event: &WireSourceEvent) -> Result<ScopedSourceEvent, (Stri
 /// The refusal of a request this host will not run: nothing is disabled by it.
 fn refused(detail: String) -> (String, bool) {
     (detail, false)
+}
+
+/// What an unbind is about: the registration the connection holds under the identifier.
+struct Leaving {
+    incarnation: Incarnation,
+    /// Whether the registration was live and not still being registered.
+    was_live: bool,
+    /// When the registration's forwarder has ended.
+    ended: Option<Ended>,
+}
+
+/// Finds the registration an unbind is about, and stops standing behind it.
+///
+/// From here nothing the registration's thread produces reaches the notice queue, and what the
+/// queue held for the identifier is forgotten, so that the next registration of the identifier
+/// starts with a queue that knows nothing about this one. That happens under the record the
+/// forwarder sends under, so no notice follows it, and before the runtime lets the identifier go,
+/// so no later registration has any. Nothing is forgotten when another request stopped standing
+/// behind the registration already: the identifier may be another registration's by now.
+///
+/// Nothing, when the connection holds none under the identifier.
+fn leave(served: &Served, binding_id: Uuid) -> Option<Leaving> {
+    let mut held = served.registered.lock().ok()?;
+    let incarnation = held.registration_of(binding_id)?;
+    let was_live = held
+        .live
+        .get(&binding_id)
+        .is_some_and(|handle| handle.incarnation() == incarnation);
+    if held.retire(incarnation) {
+        served.notices.forget(binding_id);
+    }
+    Some(Leaving {
+        incarnation,
+        was_live,
+        ended: held.ended_of(incarnation),
+    })
 }
 
 /// The refusal for a request that has run out of the time it was given.
@@ -2151,27 +2496,22 @@ mod tests {
 
     #[test]
     fn a_connection_holds_the_bindings_it_may_hold_and_no_more() {
-        let places = BindingPlaces::default();
-        let mut kept = Vec::new();
+        let places = Arc::new(BindingPlaces::default());
+        let mut held = Vec::new();
         for _ in 0..MAX_BINDINGS_PER_CONNECTION {
-            kept.push(places.admit().expect("a place"));
+            held.push(places.admit().expect("a place"));
         }
         assert_eq!(places.taken(), MAX_BINDINGS_PER_CONNECTION);
         let (detail, _disabled) = places.admit().err().expect("the places are all taken");
         assert!(detail.contains("may hold"));
 
-        // A registration that did not finish gives its place back.
-        kept.pop();
+        // A place comes back when whatever holds it ends, and not before.
+        held.pop();
         assert_eq!(places.taken(), MAX_BINDINGS_PER_CONNECTION - 1);
-        let taken = places.admit().expect("the place came back");
-        // And one that did keeps it.
-        taken.keep();
+        let again = places.admit().expect("the place came back");
         assert_eq!(places.taken(), MAX_BINDINGS_PER_CONNECTION);
-        for place in kept {
-            place.keep();
-        }
-        // Unbinding is what gives a kept place back.
-        places.give_back();
-        assert_eq!(places.taken(), MAX_BINDINGS_PER_CONNECTION - 1);
+        drop(again);
+        drop(held);
+        assert_eq!(places.taken(), 0);
     }
 }

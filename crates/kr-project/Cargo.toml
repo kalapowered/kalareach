@@ -34,6 +34,11 @@ rustix = { workspace = true, features = ["fs", "process"] }
 # The boundary every Git invocation runs inside on this platform.
 landlock.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# The libraries Git loads that the system does not supply are named from its load commands, for the
+# profile every invocation for a caller bounded by a grant runs inside.
+object.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 # The boundary every Git invocation runs inside on this platform: an application container with its
 # own grants, inside a job object that ends every descendant.

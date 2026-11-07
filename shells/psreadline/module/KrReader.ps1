@@ -229,8 +229,9 @@ function Read-KrNextHistoryIndex {
 # cursor is, from the same input as every other byte, and then reads its first key. Until the module's
 # handler for the key runs, the queue is not empty, so no fence is proved over a reader whose editor
 # has not asked yet, and the reader reports itself idle from the handler, which is where the worker
-# asks for a fence again. Where the key cannot be queued the caller reports idle at once, as it always
-# did.
+# asks for a fence again. Where the key cannot be queued the reader reports nothing at the entry, and
+# reports itself idle from the first key that reaches one of the module's boundaries instead, which
+# is after the editor has asked.
 #
 # The key is queued only where it cannot change what the person's keys do or fail to run.
 # - The queue is empty. A key the person typed ahead is in it first, and a key of the module's behind
@@ -303,7 +304,7 @@ $script:ReplyKeysMax = 8192
 function Test-KrBell {
     param($Key)
     if ([int]$Key.KeyChar -eq 0x07) { return $true }
-    $info = $Key.AsConsoleKeyInfo()
+    $info = if ($Key -is [System.ConsoleKeyInfo]) { $Key } else { $Key.AsConsoleKeyInfo() }
     ($info.Key -eq [System.ConsoleKey]::G) -and (($info.Modifiers -band [System.ConsoleModifiers]::Control) -ne 0)
 }
 
@@ -325,34 +326,176 @@ function Test-KrBell {
 # goes back to the front of the editor's queue. A run longer than the most keys a reply is read as
 # is let go.
 function Skip-KrReply {
-    param([char]$Introducer)
+    param(
+        [char]$Introducer,
+        # Where the keys come from: whether one has been delivered, the next one, and where a key
+        # that is no part of the reply goes back to. The editor's own, unless a caller reads the
+        # terminal before the editor has started.
+        [scriptblock]$Waiting = { Test-KrKeyWaiting },
+        [scriptblock]$Read = { Read-KrKey },
+        [scriptblock]$Restore = { param($Keys) Restore-KrKeys $Keys }
+    )
     $shape = $script:ReplyShapes["$Introducer"]
-    if ($null -eq $shape) { return }
+    if ($null -eq $shape) { return $false }
     $escape = $null
     for ($taken = 0; $taken -lt $script:ReplyKeysMax; $taken++) {
-        if (-not (Test-KrKeyWaiting)) {
-            if ($null -ne $escape) { Restore-KrKeys @($escape) }
-            return
+        if (-not (& $Waiting)) {
+            if ($null -ne $escape) { & $Restore @($escape) }
+            return $false
         }
-        $key = Read-KrKey
+        $key = & $Read
         $code = [int]$key.KeyChar
         if ($shape -eq 'control') {
             if ($code -ge 0x20 -and $code -le 0x3F) { continue }
-            if ($code -ge 0x40 -and $code -le 0x7E) { return }
-            Restore-KrKeys @($key)
-            return
+            if ($code -ge 0x40 -and $code -le 0x7E) { return $true }
+            & $Restore @($key)
+            return $false
         }
         if ($null -ne $escape) {
-            if ($code -ne 0x5C) { Restore-KrKeys @($escape, $key) }
-            return
+            if ($code -ne 0x5C) {
+                & $Restore @($escape, $key)
+                return $false
+            }
+            return $true
         }
-        if ($code -eq 0x5C) { return }
+        if ($code -eq 0x5C) { return $true }
         if ($code -eq 0x1B) { $escape = $key; continue }
-        if ($shape -eq 'system' -and (Test-KrBell $key)) { return }
+        if ($shape -eq 'system' -and (Test-KrBell $key)) { return $true }
         if ($code -lt 0x20 -or $code -eq 0x7F) {
-            Restore-KrKeys @($key)
-            return
+            & $Restore @($key)
+            return $false
         }
+    }
+    $false
+}
+
+# Takes the host's answers that are already in the terminal's input out of it before the editor
+# starts to read.
+#
+# The editor asks the terminal where the cursor is as it starts, and the runtime reads the reply
+# from the same input as every other byte, joining into it every digit that comes ahead of it. The
+# worker holds back every answer it writes for the terminal from the moment it has applied the read's
+# entry until it has written that reply, but an answer it had already handed to its writer before then
+# is on its way to the terminal, or in it, and no hold reaches it. It is read here, with the console's
+# own reads, which are the ones the editor makes once it has started: the editor's own read of the
+# next key cannot be called before its read has begun.
+#
+# What is taken is what the chords take in the editor, and only where those chords are the module's:
+# in the Emacs edit mode, for an introducer whose chord (`Escape,[`, `Escape,]` or `Escape,P`) the
+# module bound and the editor still holds, read from the editor's tables at each read. In the Vi and
+# Windows edit modes, and where the person has bound the chord or the Escape key since, an Escape and
+# the key behind it are theirs, so nothing is read there. The introducer is compared as typed:
+# `Escape,p` is another chord. An Escape that is followed at once by an introducer is the start of an
+# answer, taken to the end of the sequence, and one that is followed by another Escape starts again
+# at the later one, so an Escape the person pressed does not hide an answer behind it. Nothing is
+# waited for: only keys the terminal has delivered are read, and every other key, the Escape of a key
+# that is no answer included, is put into the editor's queue in the order it came in, behind the
+# module's own key. A run that turns out to be no answer gives its Escape and its introducer to the
+# editor and its other keys back to the reading, which starts again at the first of them: an Escape
+# among them may begin an answer of its own. When the read fails part way, every key it had taken is
+# put into the queue, in order, the ones of the answer it was reading included. A key typed ahead is
+# therefore met by the editor as it would have been in the terminal.
+function Clear-KrStaleReplies {
+    if ($IsWindows -or -not $script:Kr.Registered -or $script:State.EditMode -cne 'Emacs') { return }
+    $introducers = @(Get-KrOwnReplyIntroducers)
+    if ($introducers.Count -eq 0) { return }
+    try {
+        $queue = Get-KrKeyQueue
+        if ($null -eq $queue) { return }
+        $convert = $script:Rl.Assembly.GetType('Microsoft.PowerShell.PSKeyInfo').GetMethod(
+            'FromConsoleKeyInfo', [type[]]@([System.ConsoleKeyInfo]))
+        if ($null -eq $convert) { return }
+        $tables = Get-KrBindingTables
+        # Whether a key is the first key of a chord: the key behind it is the second key of that
+        # chord, whatever it is, and the editor's.
+        $startsChord = {
+            param($each)
+            try {
+                $handler = $null
+                $tables.Keys.TryGetValue($convert.Invoke($null, @($each)), [ref]$handler) -and
+                    "$($handler.BriefDescription)" -ceq 'ChordFirstKey'
+            } catch { $false }
+        }.GetNewClosure()
+        # The keys the editor is to have, in the order they came in.
+        $kept = [System.Collections.Generic.List[object]]::new()
+        # Keys taken from the terminal or from `$ahead` that are neither the editor's nor dropped yet.
+        $undecided = [System.Collections.Generic.List[object]]::new()
+        # Keys taken and to be looked at again, the next first.
+        $ahead = [System.Collections.Generic.LinkedList[object]]::new()
+        $waiting = { $ahead.Count -gt 0 -or [Console]::KeyAvailable }.GetNewClosure()
+        $take = {
+            $each = if ($ahead.Count -gt 0) {
+                $first = $ahead.First.Value
+                $ahead.RemoveFirst()
+                $first
+            } else {
+                [Console]::ReadKey($true)
+            }
+            $undecided.Add($each)
+            $each
+        }.GetNewClosure()
+        $dropped = 0
+        $behindChordKey = $false
+        try {
+            for ($taken = 0; $taken -lt $script:ReplyKeysMax; $taken++) {
+                if (-not (& $waiting)) { break }
+                $key = & $take
+                if ($behindChordKey) {
+                    $behindChordKey = $false
+                    $kept.AddRange($undecided)
+                    $undecided.Clear()
+                    continue
+                }
+                if ([int]$key.KeyChar -ne 0x1B -or -not (& $waiting)) {
+                    $kept.AddRange($undecided)
+                    $undecided.Clear()
+                    $behindChordKey = & $startsChord $key
+                    continue
+                }
+                $next = & $take
+                if ([int]$next.KeyChar -eq 0x1B) {
+                    # The first Escape is the person's, and an answer starts at the later one.
+                    $undecided.RemoveAt($undecided.Count - 1)
+                    $kept.AddRange($undecided)
+                    $undecided.Clear()
+                    $null = $ahead.AddFirst($next)
+                    continue
+                }
+                if ($introducers -cnotcontains "$($next.KeyChar)") {
+                    $kept.AddRange($undecided)
+                    $undecided.Clear()
+                    continue
+                }
+                $whole = Skip-KrReply ([char]$next.KeyChar) -Waiting $waiting -Read $take -Restore { param($Keys) }
+                if ($whole) {
+                    $dropped++
+                } else {
+                    # Not a whole answer: an Escape and a bracket that something else follows, or the
+                    # start of one that has not been delivered whole. The Escape and the introducer
+                    # are the editor's, and the keys the attempt read after them are looked at again
+                    # from the first: one of them may be the Escape of an answer.
+                    $kept.Add($undecided[0])
+                    $kept.Add($undecided[1])
+                    for ($index = $undecided.Count - 1; $index -ge 2; $index--) {
+                        $null = $ahead.AddFirst($undecided[$index])
+                    }
+                }
+                $undecided.Clear()
+            }
+        } finally {
+            # However the loop ends, no key taken is lost: the ones not decided on, then the ones to
+            # be looked at again, go behind the ones already kept.
+            $kept.AddRange($undecided)
+            foreach ($key in $ahead) { $kept.Add($key) }
+            foreach ($key in $kept) {
+                try { $queue.Enqueue($convert.Invoke($null, @($key))) } catch {
+                    Write-KrTrace "a key typed ahead was not given back to the editor: $($_.Exception.Message)"
+                }
+            }
+        }
+        if ($dropped -gt 0) { Write-KrTrace "$dropped host answers were in the terminal's input when the read began" }
+    } catch {
+        Write-KrTrace "the terminal's input was not cleared of host answers: $($_.Exception.Message)"
     }
 }
 
@@ -644,25 +787,66 @@ function Write-KrHint {
     } catch { }
 }
 
+# What `stty -a` says of the terminal, or nothing when it says nothing.
+#
+# The runtime puts the terminal in its line mode, where the terminal shows every key itself and
+# gives the editor a line feed where the return was, for as long as a program runs that has the
+# terminal for any of its three standard streams. A key the person types in that time is shown
+# twice and a return among the keys is not the editor's Enter. So the program is started with all
+# three streams redirected, which leaves the terminal as the editor has it, and the terminal is
+# given to `stty` by the system shell, which opens it by path as `stty`'s input: that works for the
+# BSD `stty` and for the GNU one, which name a terminal by different options.
+#
+# `stty` is found by PowerShell's own lookup of a program on the path, as a command line would
+# find it, and not as a function or an alias of the person's. That lookup skips an empty entry of
+# the path, which the system shell reads as the current directory, so the shell is given the
+# program's absolute path to run and never searches the path itself, and it is started by its own
+# absolute path. A relative entry of the path is made absolute where PowerShell found it.
+#
+# The terminal it reads is the controlling one, which is the terminal the editor reads in a terminal
+# emulator, a multiplexer or a login with a terminal. A shell whose input is another terminal than
+# its controlling one gets the controlling terminal's character, and one with no controlling
+# terminal gets none, and the gesture is then not enabled.
+function Read-KrTerminalSettings {
+    $program = Get-Command -CommandType Application -Name stty -TotalCount 1 -ErrorAction Ignore
+    if ($null -eq $program) { return $null }
+    $start = [System.Diagnostics.ProcessStartInfo]::new('/bin/sh')
+    # The shell reads the program as `$0`, after its command text.
+    foreach ($argument in '-c', 'exec "$0" -a </dev/tty', [System.IO.Path]::GetFullPath($program.Source)) {
+        $start.ArgumentList.Add($argument)
+    }
+    $start.UseShellExecute = $false
+    $start.RedirectStandardInput = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    try {
+        $process = [System.Diagnostics.Process]::Start($start)
+    } catch {
+        return $null
+    }
+    try {
+        $process.StandardInput.Close()
+        $output = $process.StandardOutput.ReadToEndAsync()
+        $null = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $output.GetAwaiter().GetResult()
+    } catch {
+        $null
+    } finally {
+        $process.Dispose()
+    }
+}
+
 # The terminal's own end-of-file character, or -1 when it has none.
 #
 # The host reads keys rather than the line discipline's own characters, so the gesture is read from
 # the terminal and matched against the key the reader was given. `stty` is what a shell has here;
-# it is asked once per prompt rather than once per key.
+# it is asked once per prompt rather than once per key, and `Read-KrTerminalSettings` says how.
 function Get-KrTerminalEof {
     if ($IsWindows) { return -1 }
-    # `stty` leaves its own exit code in `$LASTEXITCODE`, which is the code of the last program the
-    # person ran and stays theirs: it is put back as it was, or taken out if there was none.
-    $before = $ExecutionContext.SessionState.PSVariable.GetValue('LASTEXITCODE')
-    $settings = try { & stty -a 2>$null } catch { $null }
-    if ($null -ne $before) {
-        $global:LASTEXITCODE = $before
-    } else {
-        Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore
-    }
+    $settings = Read-KrTerminalSettings
     if (-not $settings) { return -1 }
-    $text = ($settings -join ' ')
-    if ($text -notmatch 'eof\s*=\s*([^;]+);') { return -1 }
+    if ($settings -notmatch 'eof\s*=\s*([^;]+);') { return -1 }
     $value = $Matches[1].Trim()
     if ($value -eq '<undef>' -or $value -eq 'undef' -or $value -eq '^-') { return -1 }
     if ($value -match '^\^(.)$') {

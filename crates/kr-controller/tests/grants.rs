@@ -4293,7 +4293,7 @@ async fn a_device_revocation_is_performed_once_however_long_its_first_attempt_wa
     let refusal = retried.expect_err("the retry is answered rather than performed");
     assert_eq!(
         refusal.code,
-        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        kr_protocol::error::ErrorCode::OutcomeUnknown,
         "{refusal:?}"
     );
     assert!(performed.revoked_grants.contains(&held.grant_id));
@@ -4336,7 +4336,7 @@ async fn a_retry_while_a_device_revocation_runs_is_told_it_has_not_finished() {
         .expect_err("the retry is answered rather than performed");
     assert_eq!(
         refusal.code,
-        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        kr_protocol::error::ErrorCode::OutcomeUnknown,
         "{refusal:?}"
     );
     let stored = controller

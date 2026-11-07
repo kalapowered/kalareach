@@ -1303,15 +1303,20 @@ fn a_sweep_waiting_to_run_does_not_keep_its_daemon() {
         let swept = controller.transfer().sweep(&daemon);
 
         drop(controller);
+        // The daemon's own passes hold it for a moment each time they run, and it goes when the
+        // last of them lets go. A pass that waits for the thread this test holds keeps nothing of
+        // the daemon, so it goes while that thread is still taken. The bound ends a wait that
+        // never ends; it is not a time the daemon is held to.
         let dropped = std::time::Instant::now();
-        while daemon.strong_count() > 0 && dropped.elapsed() < std::time::Duration::from_secs(5) {
+        while daemon.strong_count() > 0 {
+            assert!(
+                dropped.elapsed() < std::time::Duration::from_secs(120),
+                "a sweep waiting for its thread keeps nothing of the daemon, and neither does \
+                 any other task of it: it is still held {} time(s)",
+                daemon.strong_count()
+            );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert_eq!(
-            daemon.strong_count(),
-            0,
-            "a sweep waiting for its thread keeps nothing of the daemon"
-        );
 
         // Its turn comes after the daemon has gone: it does nothing, and says why.
         let _ = release.send(());

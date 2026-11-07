@@ -273,6 +273,6 @@ async fn kr_acc_016_an_external_fixture_is_bound_under_this_hosts_own_bounds() {
         .await
         .expect("the snapshot answers inside its deadline");
 
-    runtime.unbind(owner, binding_id);
+    runtime.unbind(owner, binding_id, binding.incarnation());
     runtime.release_owner(owner);
 }

@@ -58,8 +58,8 @@ use kr_protocol::organisation::{
     OrganisationListResult,
 };
 use kr_protocol::pairing::{
-    ConfirmationChannel, DevicePlatform, OwnerConfirmationRequest, PairStatus,
-    PairingConsumedReason, ProposedGrant, RendezvousOrigin,
+    ConfirmationChannel, DevicePlatform, PairStatus, PairingConsumedReason, ProposedGrant,
+    RendezvousOrigin,
 };
 use kr_protocol::preauth::{PairStatusParams, PairStatusResult};
 use kr_protocol::scalars::Nullable;
@@ -516,20 +516,34 @@ async fn confirmed(
     effect: &Effect,
     build_id: &BuildId,
 ) -> Result<ParamsValue> {
-    let challenge: OwnerConfirmationRequestResult = bind::mutate(
+    // What the host says the challenge asks to confirm is what an owner device is shown. The
+    // terminal needs it to say what it confirms; the wait for an owner device only reports it.
+    let Issued {
+        challenge,
+        deadline,
+        display,
+    } = issued(
         client,
-        Method::OwnerConfirmationRequest,
-        target.clone(),
-        &OwnerConfirmationRequestParams { subject },
+        matches!(ceremony, Ceremony::EndExclusive),
+        async |client| {
+            bind::mutate(
+                client,
+                Method::OwnerConfirmationRequest,
+                target.clone(),
+                &OwnerConfirmationRequestParams { subject },
+            )
+            .await
+        },
+        async |client| {
+            bind::read(
+                client,
+                Method::OwnerConfirmationPending,
+                &OwnerConfirmationPendingParams {},
+            )
+            .await
+        },
     )
     .await?;
-    // What the host says the challenge asks to confirm, which is what an owner device is shown.
-    // The terminal needs it to say what it confirms; the wait for an owner device only reports it.
-    let display = if matches!(ceremony, Ceremony::EndExclusive) {
-        displayed(client, &challenge.request).await
-    } else {
-        Ok(None)
-    };
     if challenge.initial_bootstrap {
         ceremony.bootstrap_permits()?;
         guard(build_id, ceremony.confirmed_at_a_terminal()).await?;
@@ -549,19 +563,23 @@ async fn confirmed(
                 Shown::pairing(&error)
             ))
         })?;
-        let _: OwnerConfirmationCompleteResult = bind::mutate(
+        return completed_and_performed(
             client,
-            Method::OwnerConfirmationComplete,
-            target.clone(),
-            &OwnerConfirmationCompleteParams {
-                proof,
-                bootstrap_signer: Nullable::some(*key.public()),
+            async |client| {
+                bind::mutate(
+                    client,
+                    Method::OwnerConfirmationComplete,
+                    target.clone(),
+                    &OwnerConfirmationCompleteParams {
+                        proof,
+                        bootstrap_signer: Nullable::some(*key.public()),
+                    },
+                )
+                .await
             },
+            async |client| perform(client, target.clone(), effect).await,
         )
-        .await?;
-        return perform(client, target, effect)
-            .await?
-            .map_err(CliError::Refused);
+        .await;
     }
     let expires_at_ms = challenge.request.expires_at_ms.get();
     if let Some(note) = ceremony.owner_device_note() {
@@ -574,36 +592,102 @@ async fn confirmed(
         "Confirm this on an owner device. Waiting {}.",
         remaining(expires_at_ms, kr_ipc::now_ms().get())
     ));
-    loop {
-        match perform(client, target.clone(), effect).await? {
-            Ok(answer) => return Ok(answer),
-            Err(error)
-                if error.code == ErrorCode::OwnerConfirmationRequired
-                    && kr_ipc::now_ms().get() < expires_at_ms =>
-            {
-                tokio::time::sleep(OWNER_DEVICE_POLL).await;
-            }
-            Err(error) => return Err(CliError::Refused(error)),
-        }
-    }
+    // The wait is the one every owner-device ceremony shares, so a refusal for now, a refusal in
+    // the host's definite word, and an answer the host did not give each end it the same way. Its
+    // deadline is the host's own expiry, measured once on this process's monotonic clock.
+    let client = tokio::sync::Mutex::new(client);
+    crate::plugin::wait_for_an_owner_device(
+        deadline,
+        crate::plugin::PERFORM_WITHIN,
+        OWNER_DEVICE_POLL,
+        async || match perform(&mut **client.lock().await, target.clone(), effect).await? {
+            Ok(answer) => Ok(answer),
+            Err(refused) => Err(CliError::Refused(refused)),
+        },
+        async || {
+            crate::plugin::challenge_listed(
+                bind::read(
+                    &mut **client.lock().await,
+                    Method::OwnerConfirmationPending,
+                    &OwnerConfirmationPendingParams {},
+                ),
+                &challenge.request,
+            )
+            .await
+        },
+    )
+    .await
 }
 
-/// What the host lists as the description of `request`, which the owner device is shown for it.
-async fn displayed(
-    client: &mut LocalClient,
-    request: &OwnerConfirmationRequest,
-) -> Result<Option<ConfirmationDisplay>> {
-    let pending: OwnerConfirmationPendingResult = bind::read(
-        client,
-        Method::OwnerConfirmationPending,
-        &OwnerConfirmationPendingParams {},
-    )
-    .await?;
-    Ok(pending
-        .pending
-        .into_iter()
-        .find(|listed| listed.request == *request)
-        .map(|listed| listed.display))
+/// Answers the challenge the person confirmed at the terminal, and performs the effect it
+/// confirms.
+///
+/// Each request is given the time a request the host began to perform is given, as the wait for an
+/// owner device gives it. A host that holds the connection open and answers neither does not hold
+/// the command; what it did not answer may have been done, so the command says the outcome is not
+/// known and not that nothing was changed. So it does when the connection ends after a request
+/// was sent.
+async fn completed_and_performed<C>(
+    client: &mut C,
+    complete: impl AsyncFnOnce(&mut C) -> Result<OwnerConfirmationCompleteResult>,
+    perform: impl AsyncFnOnce(&mut C) -> Result<std::result::Result<ParamsValue, ProtocolError>>,
+) -> Result<ParamsValue> {
+    let within = crate::plugin::PERFORM_WITHIN;
+    crate::plugin::performed_within(within, complete(client)).await?;
+    crate::plugin::performed_within(within, perform(client))
+        .await?
+        .map_err(CliError::Refused)
+}
+
+/// What the host issued for a request to confirm.
+struct Issued {
+    /// The challenge an owner device or the terminal answers.
+    challenge: OwnerConfirmationRequestResult,
+    /// Where the challenge ends, on this process's monotonic clock, fixed when it arrived.
+    deadline: tokio::time::Instant,
+    /// What the host lists as the description of the challenge, which the owner device is shown for
+    /// it, when the ceremony asked for it.
+    display: Result<Option<ConfirmationDisplay>>,
+}
+
+/// Asks the host for the challenge and, when `wants_display`, for what it lists as shown for it.
+///
+/// A host that holds the connection open and answers neither does not hold the command: the
+/// request for the challenge is given the time any request that changes nothing is given, and the
+/// read of what is shown that time at most, and not past the challenge's own end. The second read
+/// ends the command when it is not answered, since an answer that came late would be taken on this
+/// connection for the answer to the request after it.
+async fn issued<C>(
+    client: &mut C,
+    wants_display: bool,
+    request: impl AsyncFnOnce(&mut C) -> Result<OwnerConfirmationRequestResult>,
+    pending: impl AsyncFnOnce(&mut C) -> Result<OwnerConfirmationPendingResult>,
+) -> Result<Issued> {
+    let challenge = crate::plugin::ask_within(request(client)).await?;
+    let deadline = tokio::time::Instant::now()
+        + crate::plugin::time_left(
+            challenge.request.expires_at_ms.get(),
+            kr_ipc::now_ms().get(),
+        );
+    let display = if wants_display {
+        match crate::plugin::ask_before(deadline, pending(client)).await {
+            Err(unanswered @ CliError::HostUnavailable(_)) => return Err(unanswered),
+            read => read.map(|pending| {
+                pending
+                    .pending
+                    .into_iter()
+                    .find(|listed| listed.request == challenge.request)
+                    .map(|listed| listed.display)
+            }),
+        }
+    } else {
+        Ok(None)
+    };
+    Ok(Issued {
+        challenge,
+        deadline,
+        display,
+    })
 }
 
 /// Asks for the effect once, under an action identity of its own.
@@ -1236,7 +1320,7 @@ fn not_confirmed(message: &'static str) -> CliError {
 mod tests {
     use super::*;
     use kr_protocol::invitation::QrText;
-    use kr_protocol::pairing::{CodeQrPayload, QrPayload, ShortCode};
+    use kr_protocol::pairing::{CodeQrPayload, OwnerConfirmationRequest, QrPayload, ShortCode};
     use kr_protocol::scalars::{TimestampMs, Uuid};
 
     fn arguments(owner: bool, guest: Option<u64>) -> PairInviteArguments {
@@ -1542,6 +1626,226 @@ mod tests {
             "the owner device note",
             &[marked.as_str().to_owned()],
         );
+    }
+
+    /// A challenge as the host issues it, ending `ms_left` from now.
+    fn a_challenge(ms_left: u64) -> OwnerConfirmationRequestResult {
+        use kr_protocol::ids::{ConfirmationId, DeviceId};
+        use kr_protocol::pairing::SensitiveAction;
+        use kr_protocol::scalars::{CanonicalSet, Digest256, EndpointKey, Nonce256};
+        OwnerConfirmationRequestResult {
+            request: OwnerConfirmationRequest {
+                confirmation_id: ConfirmationId::new(Uuid::from_bytes([1; 16])),
+                action: SensitiveAction::ChangeHostAuthority,
+                action_digest: Digest256::from_bytes([2; 32]),
+                destination_keys: Nullable::null(),
+                destination_rights: CanonicalSet::new(),
+                host_device_id: DeviceId::new(Uuid::from_bytes([3; 16])),
+                host_endpoint_id: EndpointKey::from_bytes([5; 32]),
+                nonce: Nonce256::from_bytes([4; 32]),
+                expires_at_ms: TimestampMs::new(kr_ipc::now_ms().get() + ms_left),
+            },
+            initial_bootstrap: false,
+        }
+    }
+
+    /// What the host lists for `challenge`: the description an owner device is shown for it.
+    fn listing(challenge: &OwnerConfirmationRequestResult) -> OwnerConfirmationPendingResult {
+        OwnerConfirmationPendingResult {
+            pending: vec![kr_protocol::confirmation::PendingConfirmation {
+                request: challenge.request.clone(),
+                display: ConfirmationDisplay::EstablishClock,
+                answered: false,
+            }],
+        }
+    }
+
+    /// KR-REQ-07.47: a host that holds the connection open and does not answer the request for the
+    /// challenge, or the read of what an owner device is shown for it, does not hold the command.
+    /// The first is given the time any request that changes nothing is given. The second is given
+    /// that time too, and not past the challenge's own end, and ends the command, since nothing
+    /// more is asked on a connection that may answer it late. The controls are a host that answers,
+    /// which is read as before, one that refuses the read, which the command goes on without, and a
+    /// ceremony that does not need what is shown, which does not ask.
+    #[tokio::test(start_paused = true)]
+    async fn a_host_that_does_not_answer_the_challenge_or_what_is_shown_for_it_does_not_hold_the_command()
+     {
+        // The outer bound is the test's own: a request that is never given up never ends.
+        let outer = tokio::time::Duration::from_secs(3600);
+        let is_unanswered = |issued: std::result::Result<
+            Result<Issued>,
+            tokio::time::error::Elapsed,
+        >| { matches!(issued, Ok(Err(CliError::HostUnavailable(_)))) };
+
+        let silent_challenge = tokio::time::timeout(
+            outer,
+            issued(
+                &mut (),
+                true,
+                async |_| std::future::pending::<Result<OwnerConfirmationRequestResult>>().await,
+                async |_| unreachable!("nothing is asked for what is shown without a challenge"),
+            ),
+        )
+        .await;
+        assert!(
+            is_unanswered(silent_challenge),
+            "the request for the challenge"
+        );
+
+        let challenge = a_challenge(600_000);
+        let silent_read = tokio::time::timeout(
+            outer,
+            issued(
+                &mut (),
+                true,
+                async |_| Ok(challenge.clone()),
+                async |_| std::future::pending::<Result<OwnerConfirmationPendingResult>>().await,
+            ),
+        )
+        .await;
+        assert!(is_unanswered(silent_read), "the read of what is shown");
+
+        // A challenge that ends in five seconds ends the wait for the read there, not at the time
+        // any request is given.
+        let short = a_challenge(5_000);
+        let started = tokio::time::Instant::now();
+        let silent_read = tokio::time::timeout(
+            outer,
+            issued(
+                &mut (),
+                true,
+                async |_| Ok(short.clone()),
+                async |_| std::future::pending::<Result<OwnerConfirmationPendingResult>>().await,
+            ),
+        )
+        .await;
+        assert!(
+            is_unanswered(silent_read),
+            "the read, past a short challenge"
+        );
+        assert!(
+            started.elapsed() <= tokio::time::Duration::from_secs(5),
+            "the read was not waited for past the challenge's end"
+        );
+
+        let answered = issued(
+            &mut (),
+            true,
+            async |_| Ok(challenge.clone()),
+            async |_| Ok(listing(&challenge)),
+        )
+        .await
+        .expect("a host that answers");
+        assert!(
+            matches!(
+                answered.display,
+                Ok(Some(ConfirmationDisplay::EstablishClock))
+            ),
+            "what is shown for the challenge is read"
+        );
+        assert_eq!(answered.challenge, challenge);
+
+        let refused = issued(
+            &mut (),
+            true,
+            async |_| Ok(challenge.clone()),
+            async |_| {
+                Err(CliError::Refused(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "no",
+                )))
+            },
+        )
+        .await
+        .expect("a refused read does not end the command");
+        assert!(matches!(refused.display, Err(CliError::Refused(_))));
+
+        let not_asked = issued(
+            &mut (),
+            false,
+            async |_| Ok(challenge.clone()),
+            async |_| unreachable!("a ceremony that does not need what is shown does not ask"),
+        )
+        .await
+        .expect("the challenge");
+        assert!(matches!(not_asked.display, Ok(None)));
+    }
+
+    /// KR-REQ-07.47: a host that holds the connection open and does not answer the terminal's
+    /// answer to the challenge, or the effect it confirms, does not hold the command, and nor does a
+    /// connection that ends after one was sent. What it did not answer may have been done, so the
+    /// command ends as an unfinished request whose outcome is not known. The controls are a host
+    /// that answers, and one that refuses the effect.
+    #[tokio::test(start_paused = true)]
+    async fn a_host_that_does_not_answer_the_terminals_confirmation_leaves_the_outcome_unknown() {
+        let outer = tokio::time::Duration::from_secs(3600);
+        let not_known = |ended: std::result::Result<Result<ParamsValue>, _>| {
+            matches!(
+                ended,
+                Ok(Err(CliError::Unfinished {
+                    code: ErrorCode::OutcomeUnknown,
+                    ..
+                }))
+            )
+        };
+        let completed = || OwnerConfirmationCompleteResult {
+            confirmation_id: kr_protocol::ids::ConfirmationId::new(Uuid::from_bytes([1; 16])),
+            channel: ConfirmationChannel::LocalBootstrapTerminal,
+            answered_at_ms: TimestampMs::new(1),
+        };
+
+        let silent_completion = tokio::time::timeout(
+            outer,
+            completed_and_performed(
+                &mut (),
+                async |_| std::future::pending::<Result<OwnerConfirmationCompleteResult>>().await,
+                async |_| unreachable!("nothing is performed before the answer is taken"),
+            ),
+        )
+        .await;
+        assert!(not_known(silent_completion), "the answer to the challenge");
+
+        let silent_effect = tokio::time::timeout(
+            outer,
+            completed_and_performed(
+                &mut (),
+                async |_| Ok(completed()),
+                async |_| {
+                    std::future::pending::<Result<std::result::Result<ParamsValue, ProtocolError>>>(
+                    )
+                    .await
+                },
+            ),
+        )
+        .await;
+        assert!(not_known(silent_effect), "the effect");
+
+        // A connection that ends after a request was sent is no answer either, and is not "nothing
+        // was changed".
+        let ended = completed_and_performed(
+            &mut (),
+            async |_| Ok(completed()),
+            async |_| Err(CliError::Other(Shown::said("the connection ended"))),
+        )
+        .await;
+        assert!(not_known(Ok(ended)), "a connection that ends");
+
+        let answered = completed_and_performed(
+            &mut (),
+            async |_| Ok(completed()),
+            async |_| Ok(Ok(ParamsValue::empty())),
+        )
+        .await
+        .expect("a host that answers");
+        assert_eq!(answered, ParamsValue::empty());
+
+        let refused = completed_and_performed(
+            &mut (),
+            async |_| Ok(completed()),
+            async |_| Ok(Err(ProtocolError::new(ErrorCode::PermissionDenied, "no"))),
+        )
+        .await;
+        assert!(matches!(refused, Err(CliError::Refused(_))));
     }
 
     /// The value a person types is compared with the host's without regard to case, spaces or

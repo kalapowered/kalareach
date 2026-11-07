@@ -36,6 +36,72 @@ fn the_reader_counts_what_the_host_put_into_its_terminal_as_input_it_has_not_tak
     shellpkg::bytes_the_host_put_into_the_terminal_are_input_the_reader_has_not_taken(FISH);
 }
 
+/// KR-REQ-08.48: the host's answers to a program's questions, written into the terminal in the
+/// middle of what a person types, leave the keys whole and in order.
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_keys_a_person_types_around_a_hosts_answers_arrive_whole_and_in_order() {
+    shellpkg::the_keys_a_person_types_around_a_hosts_answers_arrive_whole_and_in_order(FISH);
+}
+
+/// KR-REQ-08.48: the byte behind the start of a device control string that is not one the reader
+/// skips stays the person's.
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_byte_behind_a_device_control_header_the_reader_does_not_skip_stays_the_persons() {
+    shellpkg::the_byte_behind_a_device_control_header_the_reader_does_not_skip_stays_the_persons(
+        FISH,
+    );
+}
+
+/// KR-REQ-08.48: a cursor key behind the start of a device control string that is not one the
+/// reader skips is still the cursor key.
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_cursor_key_behind_a_device_control_header_the_reader_does_not_skip_still_moves_the_cursor() {
+    shellpkg::a_cursor_key_behind_a_device_control_header_the_reader_does_not_skip_still_moves_the_cursor(
+        FISH,
+    );
+}
+
+/// KR-REQ-08.48: a long run of Escape pairs, each ahead of the start of a device control string that
+/// is not one the reader skips, leaves the shell running.
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_long_run_of_escape_pairs_before_a_device_control_header_leaves_the_shell_running() {
+    shellpkg::a_long_run_of_escape_pairs_before_a_device_control_header_leaves_the_shell_running(
+        FISH,
+    );
+}
+
+/// KR-REQ-08.48: the Escape before a device control string that is not one the reader skips stays
+/// ahead of the key behind the string while the reader waits for the terminal's answer.
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_keys_around_a_device_control_header_keep_their_order_while_the_terminal_is_asked() {
+    shellpkg::the_keys_around_a_device_control_header_keep_their_order_while_the_terminal_is_asked(
+        FISH,
+    );
+}
+
+/// KR-REQ-08.48: a bracketed paste with an unfinished device control string in its text still
+/// ends, and the key typed behind it reaches the line.
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_paste_with_an_unfinished_device_control_string_in_it_still_ends() {
+    shellpkg::a_paste_with_an_unfinished_device_control_string_in_it_still_ends(FISH);
+}
+
+/// KR-REQ-08.48: a bracketed paste with the start of a device control string that is not one the
+/// reader skips in its text still ends, and the text behind the start is pasted.
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_paste_with_a_device_control_header_the_reader_does_not_skip_in_its_text_is_pasted_whole() {
+    shellpkg::a_paste_with_a_device_control_header_the_reader_does_not_skip_in_its_text_is_pasted_whole(
+        FISH,
+    );
+}
+
 /// KR-REQ-08.48: the host's answer between the cursor keys a person presses leaves them working.
 #[test]
 #[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]

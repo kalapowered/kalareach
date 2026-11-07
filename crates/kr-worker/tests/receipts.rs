@@ -6065,6 +6065,87 @@ async fn a_reconnect_discards_unsent_keystrokes_rather_than_replaying_them() {
     assert_eq!(error.code, ErrorCode::LeaseLost);
 }
 
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-09.20: the connection identity of the input stream
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-09.20, the connection identity of the input stream: the lease record names the
+/// connection that holds it, and a client that comes back as a connection of its own takes the
+/// lease with another identity, a later epoch and a sequence that starts again at zero. It takes
+/// the lease while the first connection still holds it, as a host that has not yet counted the
+/// first connection gone sees it, and the record is read in the answer to the acquisition and from
+/// the worker's own lease. When the first connection then goes, the lease still names the second.
+/// Not shown here: that the old stream's unsent keystrokes are discarded, which the case above
+/// shows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_lease_names_the_connection_that_holds_it_and_a_reconnect_is_another() {
+    let host = host().await;
+    let lease_connection = |host: &Host| {
+        host.service
+            .runtime()
+            .session()
+            .lease()
+            .connection_id
+            .as_ref()
+            .copied()
+    };
+    let mut first = cli(&host).await;
+    let first_connection = first.acknowledgement().connection_id;
+    let attachment = attach(&mut first, &host).await;
+    let held = acquire_lease(&mut first, &host, attachment).await;
+    assert_eq!(
+        held.connection_id.as_ref(),
+        Some(&first_connection),
+        "the lease records the connection that took it"
+    );
+    for sequence in 0..2_u64 {
+        write_input(&mut first, &host, attachment, held.epoch, sequence, b"a")
+            .await
+            .expect("an in-order write is accepted");
+    }
+    assert_eq!(
+        lease_connection(&host),
+        Some(first_connection),
+        "and the worker's own lease says so too"
+    );
+
+    // The client comes back as a connection of its own while the first still holds the lease.
+    let mut second = cli(&host).await;
+    let second_connection = second.acknowledgement().connection_id;
+    assert_ne!(
+        second_connection, first_connection,
+        "a reconnect is a connection identity of its own"
+    );
+    let reattached = attach(&mut second, &host).await;
+    let next = acquire_lease(&mut second, &host, reattached).await;
+    assert_eq!(
+        next.connection_id.as_ref(),
+        Some(&second_connection),
+        "the new stream is under the new connection's identity"
+    );
+    assert!(
+        next.epoch.get() > held.epoch.get(),
+        "and under a later epoch"
+    );
+    assert_eq!(
+        next.next_sequence.get(),
+        0,
+        "and starts again at sequence zero"
+    );
+    assert_eq!(lease_connection(&host), Some(second_connection));
+
+    // The first connection goes, and the lease it no longer holds still names the second.
+    drop(first);
+    write_input(&mut second, &host, reattached, next.epoch, 0, b"b")
+        .await
+        .expect("the new stream's first position is accepted");
+    assert_eq!(
+        lease_connection(&host),
+        Some(second_connection),
+        "the first connection going leaves the lease with the second"
+    );
+}
+
 async fn attach(client: &mut Client<impl Codec>, host: &Host) -> kr_protocol::ids::AttachmentId {
     let mut requested = kr_protocol::scalars::CanonicalSet::new();
     requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
@@ -6095,6 +6176,15 @@ async fn acquire(
     host: &Host,
     attachment_id: kr_protocol::ids::AttachmentId,
 ) -> kr_protocol::ids::InputLeaseEpoch {
+    acquire_lease(client, host, attachment_id).await.epoch
+}
+
+/// Takes the input lease and returns the lease record the worker answers with.
+async fn acquire_lease(
+    client: &mut Client<impl Codec>,
+    host: &Host,
+    attachment_id: kr_protocol::ids::AttachmentId,
+) -> kr_protocol::input::InputLeaseState {
     let outcome = client
         .mutate(
             Method::InputAcquire,
@@ -6110,7 +6200,7 @@ async fn acquire(
         .expect("reaches the worker")
         .expect("the lease is acquired");
     let result: kr_protocol::input::InputAcquireResult = outcome.to_typed().expect("decodes");
-    result.lease.epoch
+    result.lease
 }
 
 async fn write_input(
@@ -6138,6 +6228,10 @@ async fn write_input(
         .expect("reaches the worker")
         .map(|value| value.to_typed().expect("decodes"))
 }
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-09.23: the bound on an input batch
+// ---------------------------------------------------------------------------------------------
 
 /// KR-REQ-09.23: an input batch beyond the frame bound is refused rather than truncated, so the
 /// parser is never told about bytes the host decided not to carry.

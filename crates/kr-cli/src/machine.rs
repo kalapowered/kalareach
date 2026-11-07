@@ -26,22 +26,32 @@
 //! - `finish` sends each step that has no result: a step never sent is composed and sent under its
 //!   identity, and a step already sent is sent again as it was composed, so an environment that
 //!   took it answers from its receipt. A step the environment refuses without a receipt is read
-//!   against what the environment reports: at the precondition nothing was applied, and a step sent
-//!   again is composed again under a new action identity (unless its first action is still running,
-//!   in which case it waits for that), while a step composed now is refused for what the
-//!   environment refused it for, unless the environment could not write, answer or finish it, which
-//!   stay sent; one step on, the plan takes the record as showing the step was taken once the
-//!   environment has confirmed that the record survives a crash, which it does before it claims any
-//!   step, so a step it refuses after it claimed it, for the record it now holds, is taken, while
-//!   an answer it kept for an action sent again was made earlier and confirms nothing, and one
-//!   refused any other way may have come before that confirmation: it is composed again under a new
-//!   action to ask if it was sent before, and stays sent if it was composed now; an environment
-//!   that could not say whether its change survives a crash, or whose action is still running,
-//!   leaves the step sent; and anywhere else it can never apply and is given its refusal. A step
-//!   whose outcome the environment does not know, or could not confirm, or could not write, is not
-//!   given a result it was not given: it stays sent. An environment that reports no record takes no
-//!   step, and what it refuses a step for says nothing of an earlier action of that step, which it
-//!   may have taken: the first action sent for a step that the environment refuses is refused with
+//!   against what the environment reports, except after an `INVALID_ARGUMENT` refusal, which the
+//!   environment decides against the request itself: that is final, whatever the environment reports
+//!   or can read, and the step is refused with it. At the record the step was approved against
+//!   nothing was applied. A step sent again is then composed again under a new action identity,
+//!   against the same record (an environment tells a repeat that meets a first action still running
+//!   the word it tells one whose first attempt ended without recording what it did, so the two are
+//!   not told apart, and at most one action of a step applies), except that a refusal with
+//!   `RESOURCE_UNAVAILABLE`, which says the environment dispatched nothing, leaves the step sent
+//!   for the next `finish` to send the same action again. A step composed now is refused for what
+//!   the environment refused it for, unless the environment could not write, answer or finish it,
+//!   or refused it for now with another transient code, which stay sent.
+//!   One step on, the plan takes the record as showing the step was taken once the environment has
+//!   confirmed that the record survives a crash, which it does before it claims any step, so a step
+//!   it refuses with `DRAFT_CONFLICT` after it claimed it, for the record it now holds, is taken,
+//!   while an answer it kept for an action sent again was made earlier and confirms nothing, and
+//!   one refused any other way may have come before that confirmation: it is composed again under a
+//!   new action to ask if it was sent before, and stays sent if it was composed now. At that record,
+//!   whichever action the step was sent under, an answer of `OUTCOME_UNKNOWN` (the environment could
+//!   not say whether its change survives a crash, or its action is still running) or of
+//!   `RESOURCE_UNAVAILABLE` leaves it sent. At a record that is neither the one the step was
+//!   approved against nor the one that shows it taken, such as another group or a later revision,
+//!   the step can never apply and is refused with `DRAFT_CONFLICT`, whatever the environment
+//!   refused it for.
+//!   An environment that reports no record takes no step, and what it refuses a step for says
+//!   nothing of an earlier action of that step, which it may have taken: the first action sent for
+//!   a step that the environment refuses in its definite word is refused with
 //!   `STORAGE_UNAVAILABLE`, and a step sent before stays sent, under any action, until the
 //!   environment can read its record. A step saved before it was sent counts as sent. An
 //!   environment that cannot be reached stays pending.
@@ -1318,10 +1328,14 @@ fn judge(
     if group.machine_id == step.expected.machine_id && group.revision == step.expected.revision {
         // Nothing was applied.
         return match (fresh, code) {
-            // The first action is still running in the environment, and may yet apply.
+            // The environment refused the repeat before it dispatched anything, which is what a
+            // transient word says: the same action is asked again by the next `finish`.
             (false, ErrorCode::ResourceUnavailable) => Verdict::Pending,
             // A mutation sent again was refused for its window, or an action the environment kept
-            // a refusal for, or one it cannot finish: it is composed again under a new action.
+            // a refusal for, or one it cannot finish, or one whose first attempt is still running:
+            // the environment tells that last as it tells an attempt that ended without recording
+            // what it did (`OUTCOME_UNKNOWN`), and the two are not told apart. It is composed again
+            // under a new action against the same record, so at most one of its actions applies.
             (false, _) => Verdict::AskAgain,
             // A step composed here and refused as the owner's authority is not the owner's.
             (true, ErrorCode::PermissionDenied) => {
@@ -1815,10 +1829,11 @@ mod tests {
     }
 
     /// KR-REQ-03.07: at the record the step was approved against, nothing was applied. A mutation
-    /// sent again that is refused is composed again under a new action, unless its first action is
-    /// still running; one composed on the connection that sent it, as a first action or a new one,
-    /// is not given up for an answer that says it may yet be taken, and a refusal of the owner's
-    /// authority is final.
+    /// sent again that is refused is composed again under a new action, against the same record,
+    /// also when its first action is still running, which the environment tells as it tells an
+    /// attempt that ended without recording what it did; one composed on the connection that sent
+    /// it, as a first action or a new one, is not given up for an answer that says it may yet be
+    /// taken, and a refusal of the owner's authority is final.
     #[test]
     fn at_the_precondition_a_step_is_asked_again_once_and_never_while_it_may_still_be_taken() {
         let step = step();
@@ -1827,7 +1842,6 @@ mod tests {
             ErrorCode::PermissionDenied,
             ErrorCode::DraftConflict,
             ErrorCode::StorageUnavailable,
-            ErrorCode::OutcomeUnknown,
             ErrorCode::IdConflict,
         ] {
             assert_eq!(
@@ -1837,6 +1851,13 @@ mod tests {
             );
         }
         assert_eq!(
+            judge(&step, Some(&at), ErrorCode::OutcomeUnknown, Sent::Again),
+            Verdict::AskAgain,
+            "a first action still running is told as an unknown outcome, as one that ended \
+             without recording what it did is, and the step is composed again against the same \
+             record"
+        );
+        assert_eq!(
             judge(
                 &step,
                 Some(&at),
@@ -1844,7 +1865,8 @@ mod tests {
                 Sent::Again
             ),
             Verdict::Pending,
-            "the first action is still running, and a second identity would race it"
+            "a transient word says the repeat was refused before it was dispatched, so the same \
+             action is asked again"
         );
         for sent in [Sent::First, Sent::Anew] {
             // Every transient code is the environment saying it cannot take the step now, and not

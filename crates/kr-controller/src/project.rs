@@ -676,26 +676,74 @@ impl ProjectModule {
             // A row that is there already is another attempt's unless this attempt wrote the claim
             // for its action, which only one attempt can: the methods that claim settle their own
             // row, and an answer read back from it is this attempt's own.
-            let existing = service.record_action(&actor, action_id, name, digest, &record)?;
+            //
+            // A row that cannot be written leaves the claim as it was. An action that was carried
+            // out is then not told as a failure of the store, which says nothing took effect.
+            //
+            // A refusal that cannot be written down is not told as a definite one: it can be a
+            // word about what another copy of the action did, such as the destination it made,
+            // and a client takes a definite refusal for the host's word that nothing was done. The
+            // record is read instead. It is the answer where the action has one, this attempt's own
+            // refusal included when it wrote the claim and settled it; where there is none to be
+            // read, the outcome is not known.
+            let existing = match service.record_action(&actor, action_id, name, digest, &record) {
+                Ok(existing) => existing,
+                Err(error) if outcome.is_ok() => {
+                    return Err(ProtocolError::new(
+                        ErrorCode::OutcomeUnknown,
+                        format!(
+                            "this action was performed and this host could not record what it \
+                             came to: {error}"
+                        ),
+                    ));
+                }
+                Err(_) => {
+                    return match service.retained_action(&actor, action_id, name, digest) {
+                        Ok(Some(retained)) => {
+                            if !claimed.load(Ordering::Acquire) {
+                                copied.store(true, Ordering::Release);
+                            }
+                            recorded(retained)
+                        }
+                        Ok(None) => Err(refusal_not_recorded()),
+                        Err(error @ kr_project::ProjectError::IdConflict { .. }) => {
+                            Err(error.into())
+                        }
+                        Err(_) => Err(refusal_not_recorded()),
+                    };
+                }
+            };
             if existing.is_some() && !claimed.load(Ordering::Acquire) {
                 copied.store(true, Ordering::Release);
             }
             match existing {
                 None => outcome,
-                Some(RetainedOutcome::Ok(result)) => {
-                    kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
-                        .map(ParamsValue::new)
-                        .map_err(|error| {
-                            ProtocolError::new(ErrorCode::OutcomeUnknown, error.to_string())
-                        })
-                }
-                Some(RetainedOutcome::Error { code, detail }) => {
-                    Err(ProtocolError::new(code, detail))
-                }
+                Some(retained) => recorded(retained),
             }
         })
         .await
     }
+}
+
+/// The answer a record of an action is: the result it kept, or the refusal it kept. A result that
+/// cannot be decoded leaves open what the action came to.
+fn recorded(retained: RetainedOutcome) -> Answer<ParamsValue> {
+    match retained {
+        RetainedOutcome::Ok(result) => kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
+            .map(ParamsValue::new)
+            .map_err(|error| ProtocolError::new(ErrorCode::OutcomeUnknown, error.to_string())),
+        RetainedOutcome::Error { code, detail } => Err(ProtocolError::new(code, detail)),
+    }
+}
+
+/// What a refusal is told as when this host could not record it, no record of the action can be
+/// read, and another copy of the action may have been performed.
+fn refusal_not_recorded() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::OutcomeUnknown,
+        "this request was refused and this host could not record the refusal; whether another \
+         attempt at this action was carried out is not known",
+    )
 }
 
 /// Performs one of the owner's two confirmed location decisions.

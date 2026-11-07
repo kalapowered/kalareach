@@ -9,14 +9,20 @@
 //! answers as the deployed Worker does and is held to a recording of it. The archive and the bundle
 //! are sealed here with the production primitives, in the convention a host's producer follows, and
 //! put into the stand-in as the owner's device and the writer would.
-
-#![cfg(unix)]
+//!
+//! The cases run on Windows as well as on Unix, by the way the command is used there: the kit is
+//! named with `--kit-file` or piped, and a plan is confirmed with `--confirm-plan`. A case that
+//! needs what only Unix has (a terminal that is asked, a signal, a file's mode, a link made with
+//! Unix's call, a pipe on the file system, the rename of a folder a run holds open) is Unix's
+//! alone, and the file says so at each.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use kr_client::recovery::fresh_locator;
 use kr_client::services::account::{
@@ -401,6 +407,11 @@ impl Rig {
         for directory in [&work, &home] {
             std::fs::create_dir(directory).expect("a directory on the internal disk");
         }
+        #[cfg(windows)]
+        for directory in ["Local", "Roaming"] {
+            std::fs::create_dir_all(home.join("AppData").join(directory))
+                .expect("a folder for the host's program data");
+        }
         write_document(&temp, served.origin());
         if sign_in == SignIn::Usable {
             keep_sign_in(&temp, served.origin()).await;
@@ -432,7 +443,7 @@ impl Rig {
                         secret_store: StoreSelection::File,
                         boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
                         supervisor: Box::new(NoWorkers),
-                        worker_program: PathBuf::from("/nonexistent/kr-worker"),
+                        worker_program: temp.root().join("none").join("kr-worker"),
                         build_id: build(),
                         release: "0".to_owned(),
                         shell_packages: None,
@@ -462,8 +473,58 @@ impl Rig {
         self.served.origin()
     }
 
+    /// The environment every `kr` this test runs is given on Windows: what a program needs to start
+    /// there, and this host's directories.
+    #[cfg(windows)]
+    fn variables(&self) -> Vec<(&'static str, String)> {
+        let mut variables = Vec::new();
+        for name in [
+            "SystemRoot",
+            "SystemDrive",
+            "windir",
+            "TEMP",
+            "TMP",
+            "ComSpec",
+            "PATHEXT",
+        ] {
+            if let Ok(value) = std::env::var(name) {
+                variables.push((name, value));
+            }
+        }
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
+        variables.push(("PATH", format!(r"{root}\System32")));
+        // The folders a program keeps its data in are the host's own below its home.
+        variables.push(("USERPROFILE", self.home.display().to_string()));
+        variables.push((
+            "LOCALAPPDATA",
+            self.home
+                .join("AppData")
+                .join("Local")
+                .display()
+                .to_string(),
+        ));
+        variables.push((
+            "APPDATA",
+            self.home
+                .join("AppData")
+                .join("Roaming")
+                .display()
+                .to_string(),
+        ));
+        variables.push((
+            "KR_RUNTIME_DIR",
+            self.temp.paths().runtime_root().display().to_string(),
+        ));
+        variables.push((
+            "KR_STATE_DIR",
+            self.temp.paths().state_root().display().to_string(),
+        ));
+        variables
+    }
+
     /// The environment every `kr` this test runs is given: this host's directories, a home of its
     /// own, and nothing of the person running the test.
+    #[cfg(unix)]
     fn variables(&self) -> Vec<(&'static str, String)> {
         vec![
             ("PATH", "/usr/bin:/bin".to_owned()),
@@ -579,6 +640,7 @@ enum Input<'a> {
     /// These bytes, then the end of the input.
     Bytes(&'a [u8]),
     /// These bytes, and the pipe left open for the test to hold.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Held(&'a [u8]),
 }
 
@@ -679,9 +741,7 @@ impl Running {
         match tokio::time::timeout(LIVENESS_DEADLINE, self.ended()).await {
             Ok(output) => output,
             Err(_) => {
-                let pid = rustix::process::Pid::from_raw(i32::try_from(pid).expect("a process id"))
-                    .expect("a process id");
-                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                end_at_once(pid);
                 panic!("the command did not end");
             }
         }
@@ -712,15 +772,33 @@ impl Running {
     }
 
     /// Sends the command an interrupt, as Ctrl-C does to a process outside a terminal.
+    #[cfg(unix)]
     fn interrupt(&self) {
         self.signal(rustix::process::Signal::INT);
     }
 
     /// Sends the command a signal.
+    #[cfg(unix)]
     fn signal(&self, signal: rustix::process::Signal) {
         let pid = rustix::process::Pid::from_raw(i32::try_from(self.pid).expect("a process id"))
             .expect("a process id");
         rustix::process::kill_process(pid, signal).expect("the signal is sent");
+    }
+}
+
+/// Ends the command with process id `pid` at once, for a command that did not end by itself.
+fn end_at_once(pid: u32) {
+    #[cfg(unix)]
+    {
+        let pid = rustix::process::Pid::from_raw(i32::try_from(pid).expect("a process id"))
+            .expect("a process id");
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .output();
     }
 }
 
@@ -966,13 +1044,17 @@ async fn a_fresh_host_restores_a_backup_from_the_kit_alone_and_changes_nothing_o
             .expect("the record is JSON");
     assert_eq!(record["plan_digest"], digest);
     assert_eq!(record["backup_generation"], 1);
-    use std::os::unix::fs::PermissionsExt as _;
-    for name in names(&into) {
-        let mode = std::fs::metadata(into.join(&name))
-            .expect("metadata")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600, "{name}");
+    // A file's mode is Unix's alone.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for name in names(&into) {
+            let mode = std::fs::metadata(into.join(&name))
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "{name}");
+        }
     }
     assert_eq!(
         host_state(&rig).await,
@@ -2034,6 +2116,12 @@ fn sha(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Whether reading a file failed because another process holds it open without sharing it, which
+/// is a Windows error (a sharing violation or a lock violation).
+fn held_open(error: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33))
+}
+
 /// Every file below `root`, by relative path.
 fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
     fn walk(root: &Path, at: &Path, into: &mut BTreeMap<String, Vec<u8>>) {
@@ -2044,12 +2132,35 @@ fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
             let path = entry.path();
             if path.is_dir() {
                 walk(root, &path, into);
-            } else if let Ok(bytes) = std::fs::read(&path) {
+            } else if path.is_file() {
+                // A regular file that exists and cannot be read would leave a scan of the tree
+                // vacuous, so it fails the case. Three kinds are not read: one removed since the
+                // folder was listed; a socket or a pipe, which is not a file; and, on Windows, a
+                // lock file another process holds open without sharing it, as the daemon holds its
+                // own (it records the daemon's process id, which holds no secret). A lock file
+                // nothing holds is read, and so is every lock file on Unix.
+                let bytes = match std::fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error)
+                        if held_open(&error)
+                            && path
+                                .extension()
+                                .is_some_and(|extension| extension == "lock") =>
+                    {
+                        continue;
+                    }
+                    Err(error) => panic!("{} cannot be read: {error}", path.display()),
+                };
+                // Named with `/` between its parts on every platform, so a case compares a name
+                // with the same text wherever it runs.
                 into.insert(
                     path.strip_prefix(root)
                         .expect("below the root")
-                        .display()
-                        .to_string(),
+                        .components()
+                        .map(|part| part.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/"),
                     bytes,
                 );
             }
@@ -2066,6 +2177,7 @@ fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
 
 /// A terminal window `kr` runs in, with the person's side of it: what the window has shown, and a
 /// way to type.
+#[cfg(unix)]
 struct Window {
     terminal: portable_pty::PtyPair,
     shell: Box<dyn portable_pty::Child + Send + Sync>,
@@ -2073,6 +2185,7 @@ struct Window {
     seen: Arc<Mutex<Vec<u8>>>,
 }
 
+#[cfg(unix)]
 impl Drop for Window {
     fn drop(&mut self) {
         let _ = self.shell.kill();
@@ -2080,6 +2193,7 @@ impl Drop for Window {
     }
 }
 
+#[cfg(unix)]
 impl Window {
     /// Opens a window whose shell runs `kr` with `arguments`, prints the status it ended with, and
     /// then reads one line of its own, so a test can tell whether anything was left waiting in the
@@ -2913,11 +3027,12 @@ async fn a_service_that_keeps_asking_for_quiet_stops_the_run_after_five_waits_an
 /* The folder                                                                  */
 /* -------------------------------------------------------------------------- */
 
-/// A folder other accounts may write in, a link to a folder, a folder with something in it and one
-/// that is not there are each refused before a kit is read or the service is asked; a folder a
-/// group may write in is the person's own choice, and goes ahead.
+/// A folder other accounts may write in and a link to a folder are each refused before a kit is
+/// read or the service is asked; a folder a group may write in is the person's own choice, and goes
+/// ahead. A file's mode is Unix's, and the link is made here with Unix's call.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_folder_that_is_not_the_persons_to_fill_is_refused_before_anything_is_read() {
+async fn a_folder_that_other_accounts_write_in_or_a_link_is_refused_before_anything_is_read() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let fixture = Fixture::new().await;
@@ -2949,10 +3064,33 @@ async fn a_folder_that_is_not_the_persons_to_fill_is_refused_before_anything_is_
     assert_eq!(refused.status.code(), Some(2));
     assert!(text(&refused.stderr).contains("symbolic link"));
 
+    assert_eq!(
+        fixture.bundle_reads(),
+        1,
+        "only the control asked the service"
+    );
+}
+
+/// A folder with something in it, one that is not there and a file are each refused before a kit
+/// is read or the service is asked, and what a file manager adds to a folder is named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folder_with_something_in_it_one_that_is_not_there_and_a_file_are_refused_before_anything_is_read()
+ {
+    let fixture = Fixture::new().await;
+    let preview = |into: String| {
+        let fixture = &fixture;
+        async move {
+            fixture
+                .rig
+                .run(&fixture.line(&into, &["--preview"]), Some(b""))
+                .await
+        }
+    };
+
     // A folder with something in it, and what a file manager adds is named.
     std::fs::write(fixture.into.join(".DS_Store"), b"x").expect("a file");
     let refused = preview(fixture.folder_arg()).await;
-    assert_eq!(refused.status.code(), Some(2));
+    assert_eq!(refused.status.code(), Some(2), "{}", text(&refused.stderr));
     let said = text(&refused.stderr);
     assert!(
         said.contains("not empty") && said.contains(".DS_Store"),
@@ -2962,25 +3100,22 @@ async fn a_folder_that_is_not_the_persons_to_fill_is_refused_before_anything_is_
     // A folder that is not there, and a file.
     let missing = fixture.rig.temp.root().join("missing");
     let refused = preview(missing.display().to_string()).await;
-    assert_eq!(refused.status.code(), Some(2));
+    assert_eq!(refused.status.code(), Some(2), "{}", text(&refused.stderr));
     assert!(text(&refused.stderr).contains("does not exist"));
     let file = fixture.rig.temp.root().join("file");
     std::fs::write(&file, b"x").expect("a file");
     let refused = preview(file.display().to_string()).await;
-    assert_eq!(refused.status.code(), Some(2));
+    assert_eq!(refused.status.code(), Some(2), "{}", text(&refused.stderr));
     assert!(text(&refused.stderr).contains("not a folder"));
 
-    assert_eq!(
-        fixture.bundle_reads(),
-        1,
-        "only the control asked the service"
-    );
+    assert_eq!(fixture.bundle_reads(), 0, "no refusal asked the service");
 }
 
 /// While a member is being read the folder is renamed away and another is put at its path, which
 /// holds files with the restore's own names. The run goes on through the handle it holds: what it
 /// wrote is in the folder it opened, and what it removes is removed there. Nothing in the
 /// replacement is touched, and no folder is removed.
+#[cfg(unix)]
 async fn the_folder_swapped_during_a_read(replacement_holds_decoys: bool) {
     let fixture = Fixture::new().await;
     let into = fixture.folder_arg();
@@ -3051,11 +3186,13 @@ async fn the_folder_swapped_during_a_read(replacement_holds_decoys: bool) {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_folder_swapped_for_one_holding_the_same_names_is_not_written_into_or_cleaned() {
     the_folder_swapped_during_a_read(true).await;
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_folder_swapped_for_an_empty_one_is_not_written_into_or_removed() {
     the_folder_swapped_during_a_read(false).await;
@@ -3152,6 +3289,7 @@ fn kit_limit() -> usize {
 }
 
 /// A kit file that is a named pipe nobody writes to is refused, and does not hold the command.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_kit_file_that_is_a_pipe_with_no_writer_is_refused_and_does_not_hang() {
     let fixture = Fixture::new().await;
@@ -3187,6 +3325,7 @@ async fn a_kit_file_that_is_a_pipe_with_no_writer_is_refused_and_does_not_hang()
 /// An interrupt, a termination, a hang-up or Ctrl-\ while a kit is being piped in and the writer
 /// holds the pipe open ends the command promptly, with nothing asked of the service. The last would
 /// otherwise end it with a core dump.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_signal_that_ends_a_command_waiting_for_a_kit_on_a_pipe_that_stays_open() {
     use rustix::process::Signal;
@@ -3215,6 +3354,7 @@ async fn a_signal_that_ends_a_command_waiting_for_a_kit_on_a_pipe_that_stays_ope
 }
 
 /// Ctrl-C while the files are being written stops the run and removes what it wrote.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_interrupt_while_the_members_are_read_stops_the_run_and_removes_its_files() {
     let fixture = Fixture::new().await;
@@ -3240,6 +3380,7 @@ async fn an_interrupt_while_the_members_are_read_stops_the_run_and_removes_its_f
 /// The kit typed at a terminal: nothing is shown as it is typed, the document ends at a blank line,
 /// what is shown back names the locator by its first eight characters, and what was pasted after
 /// the document never reaches the shell the command was run from.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_kit_typed_at_a_terminal_is_not_shown_and_what_follows_it_never_reaches_the_shell() {
     let fixture = Fixture::new().await;
@@ -3287,6 +3428,7 @@ async fn a_kit_typed_at_a_terminal_is_not_shown_and_what_follows_it_never_reache
 
 /// A paste that is not a kit ends the command with no question after it, so what was pasted past
 /// the end of the document is left for the shell unless the command throws it away.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn text_pasted_after_a_document_that_is_not_a_kit_never_reaches_the_shell() {
     let fixture = Fixture::new().await;
@@ -3314,6 +3456,7 @@ async fn text_pasted_after_a_document_that_is_not_a_kit_never_reaches_the_shell(
 
 /// A kit typed at a terminal is not used until the person says it is the kit they meant: a wrong
 /// answer ends the command before the service is asked anything.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_kit_typed_at_a_terminal_is_not_used_unless_the_person_says_it_is_the_one_meant() {
     let fixture = Fixture::new().await;
@@ -3333,6 +3476,7 @@ async fn a_kit_typed_at_a_terminal_is_not_used_unless_the_person_says_it_is_the_
 }
 
 /// Ctrl-C while a kit is half typed ends the command and leaves the terminal as it was found.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_interrupt_while_a_kit_is_half_typed_ends_the_command_and_puts_the_terminal_back() {
     let fixture = Fixture::new().await;
@@ -3354,6 +3498,7 @@ async fn an_interrupt_while_a_kit_is_half_typed_ends_the_command_and_puts_the_te
 }
 
 /// At a terminal the command asks, and only yes writes. Ctrl-C at the question stops the run.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn at_a_terminal_only_yes_writes_and_an_interrupt_at_the_question_writes_nothing() {
     let fixture = Fixture::new().await;
@@ -3386,6 +3531,7 @@ async fn at_a_terminal_only_yes_writes_and_an_interrupt_at_the_question_writes_n
 
 /// Ctrl-C at the question ends the command also when its standard input is the terminal device
 /// itself, which some systems cannot wait on with a timeout.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_interrupt_at_the_question_ends_the_command_when_its_input_is_the_terminal_device() {
     let fixture = Fixture::new().await;
@@ -3400,6 +3546,7 @@ async fn an_interrupt_at_the_question_ends_the_command_when_its_input_is_the_ter
 
 /// A line typed before the question is shown is not the answer to it: the person answers what is on
 /// the screen.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_line_typed_before_the_question_is_shown_does_not_answer_it() {
     let fixture = Fixture::new().await;
@@ -3416,6 +3563,7 @@ async fn a_line_typed_before_the_question_is_shown_does_not_answer_it() {
 }
 
 /// What was typed before the kit prompt appeared is not part of the kit.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lines_typed_before_the_kit_prompt_appears_are_not_part_of_the_kit() {
     let fixture = Fixture::new().await;
@@ -3483,12 +3631,25 @@ async fn the_folder_is_checked_again_when_opened_and_the_probe_removes_only_what
 
     let fixture = Fixture::new().await;
     let destination = Destination::check(&fixture.into).expect("the folder passes");
+    // The path as the operating system names it, in bytes: what the plan's digest holds.
+    #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt as _;
         assert_eq!(
             destination.native_bytes(),
             fixture.into.as_os_str().as_bytes()
         );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        let wide: Vec<u8> = fixture
+            .into
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(destination.native_bytes(), wide);
     }
     std::fs::write(fixture.into.join("late"), b"x").expect("an entry");
     assert!(

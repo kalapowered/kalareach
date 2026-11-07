@@ -828,6 +828,11 @@ pub struct Commands {
     pub stuck: bool,
     /// Whether an acceptance goes unanswered while every other event is still answered.
     pub silent_acceptance: bool,
+    /// Whether the entry of a reader goes unanswered until a case answers it, while every other
+    /// event is still answered.
+    pub hold_entries: bool,
+    /// The entries held, by the identifier the bridge gave each.
+    pub held_entries: Vec<RequestId>,
     /// Frames written ahead of the next answer to a resolve, as a worker's other traffic can be.
     pub before_resolve_answer: Vec<BridgeFrame>,
     /// Frames written ahead of the next answer to an acceptance.
@@ -1012,6 +1017,9 @@ enum HandshakeAnswer {
     Accept,
     /// A frame whose body is not a value of the contract at all, which the bridge cannot decode.
     NotDecodable,
+    /// The worker's own refusal of a shell whose start time it reads one unit away from the one
+    /// the shell named, followed at once by the end of the connection, as the worker ends it.
+    Refuse,
 }
 
 impl Session {
@@ -1126,6 +1134,28 @@ impl Session {
             Profile::ORDINARY,
             true,
             HandshakeAnswer::NotDecodable,
+        )
+    }
+
+    /// Starts the packaged shell and refuses its opening frame the way the worker refuses a shell
+    /// whose process it cannot match: with the refusal, and then the end of the connection.
+    ///
+    /// The shell is the person's own shell afterwards, with no worker behind it: what a case reads
+    /// from this session is what the bridge made of the refusal.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the shell does not connect, opens with anything but a hello, or the worker's
+    /// own decision does not refuse it.
+    #[must_use]
+    pub fn start_refused(package: &Package) -> Self {
+        Self::start_as(
+            package,
+            &[],
+            kr_shell_integration::contract::events::EofGesture::default(),
+            Profile::ORDINARY,
+            true,
+            HandshakeAnswer::Refuse,
         )
     }
 
@@ -1414,13 +1444,39 @@ impl Session {
             already_registered: false,
             gesture,
         };
+        let observed = if answer == HandshakeAnswer::Refuse {
+            // The kernel's start value is a unit away from the one the shell named: the least a
+            // start time can differ by, and the worker refuses the shell as another process.
+            let mut seen = hello.shell_process.clone();
+            seen.start_value = U64::new(seen.start_value.get() + 1);
+            seen
+        } else {
+            hello.shell_process.clone()
+        };
         let peer = ObservedPeer {
             uid: endpoint_owner(&endpoint_path),
-            process: Some(hello.shell_process.clone()),
+            process: Some(observed),
         };
         let outcome =
             handshake::admit_observed(&secret_key, &expectation, &endpoint, &peer, &hello)
                 .expect("the transcript encodes");
+        if answer == HandshakeAnswer::Refuse {
+            assert!(
+                matches!(
+                    &outcome,
+                    HandshakeOutcome::Refused(refused)
+                        if refused.reason
+                            == kr_shell_integration::contract::qualification::QualificationReason::ProcessMismatch
+                ),
+                "the worker's decision did not refuse the shell as another process: {outcome:?}"
+            );
+            // The refusal and the end of the connection go out together, as the worker's do: it
+            // writes the answer and drops the connection.
+            session.write_frame(&BridgeFrame::Handshake(outcome));
+            session.close_endpoint();
+            session.hello = hello;
+            return session;
+        }
         let accepted = match outcome {
             HandshakeOutcome::Accepted(accepted) => accepted,
             HandshakeOutcome::Refused(refused) => {
@@ -1797,6 +1853,9 @@ impl Session {
                     if outcome.is_none() && matches!(event, BridgeEvent::CommandResolve(_)) {
                         self.commands.unanswered.push(id);
                     }
+                    if outcome.is_none() && matches!(event, BridgeEvent::EditorEnter(_)) {
+                        self.commands.held_entries.push(id);
+                    }
                     if let Some(result) = outcome {
                         // What a case put ahead of this answer goes first, in the same write, so
                         // the shell reads it while it waits.
@@ -1871,6 +1930,34 @@ impl Session {
         })
     }
 
+    /// The worker's answer to the entry of a reader.
+    fn entry_answer() -> EventOutcome {
+        EventOutcome::EditorEntered(RootEditorEnterResult {
+            state: FenceState::Unfenced,
+            fence_exchange: Nullable::null(),
+        })
+    }
+
+    /// Answers the entries a case held, in the order they came, and stops holding the ones that
+    /// come after.
+    pub fn answer_held_entries(&mut self) {
+        self.commands.hold_entries = false;
+        let held = std::mem::take(&mut self.commands.held_entries);
+        let frames: Vec<BridgeFrame> = held
+            .into_iter()
+            .map(|id| BridgeFrame::EventResult {
+                id,
+                result: Self::entry_answer(),
+            })
+            .collect();
+        if !frames.is_empty() {
+            // The answer is no reason to type a key at the reader: it is not reading yet.
+            let steps = std::mem::replace(&mut self.stepping, false);
+            let _ = self.write_frames(&frames);
+            self.stepping = steps;
+        }
+    }
+
     /// What the worker answers an event that needs no decision of its own.
     fn routine_answer(&mut self, event: &BridgeEvent) -> Option<EventOutcome> {
         if self.commands.stuck {
@@ -1891,10 +1978,10 @@ impl Session {
         match event {
             BridgeEvent::EditorEnter(params) => {
                 self.commands.entries.push(params.clone());
-                Some(EventOutcome::EditorEntered(RootEditorEnterResult {
-                    state: FenceState::Unfenced,
-                    fence_exchange: Nullable::null(),
-                }))
+                if self.commands.hold_entries {
+                    return None;
+                }
+                Some(Self::entry_answer())
             }
             BridgeEvent::EditorLeave(_) => Some(EventOutcome::EditorLeft(RootEditorLeaveResult {
                 state: FenceState::Outside,
@@ -2459,17 +2546,7 @@ impl Session {
     fn wait_for_editor_reading(&mut self) -> bool {
         let deadline = self.deadline_for(REPLY);
         loop {
-            let prompt_ended = {
-                let output = self.output.lock().expect("the output lock");
-                let mark = self.mark.min(output.len());
-                output[mark..]
-                    .windows(self.prompt.len())
-                    .position(|window| window == self.prompt.as_bytes())
-                    .map(|at| mark + at + self.prompt.len())
-            };
-            if prompt_ended
-                .is_some_and(|ended| self.cursor_answered.load(Ordering::Acquire) > ended)
-            {
+            if self.editor_has_asked_where_the_cursor_is() {
                 return true;
             }
             if deadline.passed() {
@@ -2477,6 +2554,20 @@ impl Session {
             }
             self.pump(Duration::from_millis(10));
         }
+    }
+
+    /// Says whether the editor has asked where the cursor is after the prompt `mark` points at, and
+    /// been answered or told to wait for its answer, without waiting for it to.
+    fn editor_has_asked_where_the_cursor_is(&self) -> bool {
+        let prompt_ended = {
+            let output = self.output.lock().expect("the output lock");
+            let mark = self.mark.min(output.len());
+            output[mark..]
+                .windows(self.prompt.len())
+                .position(|window| window == self.prompt.as_bytes())
+                .map(|at| mark + at + self.prompt.len())
+        };
+        prompt_ended.is_some_and(|ended| self.cursor_answered.load(Ordering::Acquire) > ended)
     }
 
     /// Waits for the editor's own drawing to reach the terminal after `start`.
@@ -2782,6 +2873,13 @@ impl Session {
         self.terminal.hold_answers();
     }
 
+    /// Has the terminal say nothing to the editor's questions from the second one about the cursor
+    /// on, as a terminal that is slow to answer does. The first is the shell's own, asked before
+    /// it draws a prompt, and a shell that waits for it never gets as far as a prompt.
+    pub fn hold_terminal_answers_after_the_shells_own_cursor_question(&self) {
+        self.terminal.hold_answers_after_cursor_questions(1);
+    }
+
     /// Gives the editor the answers the terminal kept, and has it answer at once again.
     pub fn release_terminal_answers(&self) {
         self.terminal.release_answers();
@@ -2906,6 +3004,10 @@ struct TerminalInput {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Where the terminal's answers wait while it is told to say nothing: `None` answers at once.
     held: Mutex<Option<Vec<u8>>>,
+    /// How many questions about the cursor the shell has asked.
+    cursor_questions: AtomicUsize,
+    /// After how many of them the terminal keeps its answers, or `usize::MAX` for never.
+    hold_after_cursor_questions: AtomicUsize,
 }
 
 /// Bytes to type, and where to say that they went in.
@@ -2936,6 +3038,8 @@ impl TerminalInput {
             typing,
             writer,
             held: Mutex::new(None),
+            cursor_questions: AtomicUsize::new(0),
+            hold_after_cursor_questions: AtomicUsize::new(usize::MAX),
         }
     }
 
@@ -2984,9 +3088,28 @@ impl TerminalInput {
         }
     }
 
+    /// Keeps every answer from the one to the cursor question after the first `asked` of them
+    /// onward, until [`TerminalInput::release_answers`]. The shell asks one of its own before it
+    /// draws a prompt, and the editor asks the next after it.
+    fn hold_answers_after_cursor_questions(&self, asked: usize) {
+        self.hold_after_cursor_questions
+            .store(asked, Ordering::Release);
+    }
+
+    /// Takes note of `count` more questions about the cursor, and keeps the answers from the one
+    /// that passes the number the terminal was told to hold after.
+    fn note_cursor_questions(&self, count: usize) {
+        let total = self.cursor_questions.fetch_add(count, Ordering::AcqRel) + count;
+        if total > self.hold_after_cursor_questions.load(Ordering::Acquire) {
+            self.hold_answers();
+        }
+    }
+
     /// Gives the editor the answers kept since [`TerminalInput::hold_answers`], and answers at
     /// once from here on.
     fn release_answers(&self) {
+        self.hold_after_cursor_questions
+            .store(usize::MAX, Ordering::Release);
         let kept = self.held.lock().ok().and_then(|mut held| held.take());
         if let Some(kept) = kept.filter(|kept| !kept.is_empty())
             && let Ok(mut writer) = self.writer.lock()
@@ -3118,6 +3241,7 @@ impl TerminalQueries {
         self.read += bytes.len();
         let mut reply: Vec<u8> = Vec::new();
         let mut cursor_answered_to = None;
+        let mut cursor_questions = 0;
         let mut at = 0;
         while at < stream.len() {
             let matched = TERMINAL_QUERIES
@@ -3135,6 +3259,7 @@ impl TerminalQueries {
             reply.extend_from_slice(answer);
             if *query == b"\x1b[6n" {
                 cursor_answered_to = Some(origin + at);
+                cursor_questions += 1;
             }
         }
         let longest = TERMINAL_QUERIES
@@ -3146,6 +3271,7 @@ impl TerminalQueries {
         if reply.is_empty() {
             return;
         }
+        terminal.note_cursor_questions(cursor_questions);
         terminal.answer_now(&reply);
         if let Some(ended) = cursor_answered_to {
             self.cursor_answered_to.store(ended, Ordering::Release);

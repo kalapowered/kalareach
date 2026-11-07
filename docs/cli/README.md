@@ -22,6 +22,7 @@ worker directly for what a session owns.
 | `kr doctor` | — | Read-only diagnostics, this host's effective configuration, and support bundles |
 | `kr host power` | — | Show or change whether this host stays awake for work it has admitted |
 | `kr host shell-mode` | — | Show or choose the shell mode a new session is created in when none is named |
+| `kr host push-gateways` | — | Show or choose the push gateways, besides the official one, that a paired device's notification credential may name |
 | `kr host terminal` | — | Show the terminal applications this host has, and which one a new window opens in |
 | `kr host terminal-profile` | — | Show, add or take out the optional `KalaReach` profile in one terminal application, so each window or tab opened through it is a session of its own |
 | `kr host startup` | — | Show or choose how `kr new` starts this environment's control daemon when none is running |
@@ -324,6 +325,23 @@ less the line that joins the two pages, and a read of several of the key is that
 wheel does the same while the window is above the live page, where this terminal's own scrollback
 holds nothing and the reports would otherwise address rows the application's grid does not have.
 
+A size counts as sent only once the session has answered it, by accepting it or by a definite
+refusal. When the session refuses it for now, or cannot say what became of it, the newest size is
+said again, even if the terminal is still at the size that was sent. It goes at once if the terminal
+changed size or a key moved the window while the report was on its way. Otherwise it goes with the
+session's next word, up to three times in a row, and after that with the terminal's next resize or
+key. A move, or the return to the live screen that typing asks for, which the session refuses for
+now or cannot say what became of, is settled as not taken and is not made again: press the key
+again. If the terminal owes a size after such a return, or the question a refused resize leaves
+owed, it sends it at the live screen, where the typing wanted the window, until a screen says where
+the window is. That includes the size the return itself carried: the return takes the newest size
+with it, and when the session does not take the return the size is owed again, with the session's
+next word. A resize that the terminal makes as the owner of the session's size, and that the
+session refuses for now or cannot say what became of, is asked about with the session's next word:
+the answer says what size the session has, and the terminal resizes again if the session is at
+another. It does this for at most three such resizes in a row, and after that the session stays at
+the size it has until the terminal is resized again.
+
 A read is one of those keys or it is the session's, whole and unchanged. That is the rule rather
 than a reader that looks inside a batch, because looking inside is how a command starts altering
 what somebody typed: it would have to hold back the beginning of a sequence a read boundary cut in
@@ -408,9 +426,13 @@ own. A refusal settles a report at once and changes nothing. So does an answer t
 terminal the session's own bytes, and so does a new subscription that begins with them, because the
 session hands its bytes only to a window at the live screen's first line and column. Nothing is
 reported while a new subscription is being asked for, so the first thing it delivers can only answer
-what was sent before. What the person presses meanwhile waits too, and goes from where that screen
-puts the window. Presses in one direction add up, and a reversal waits its turn, so a press the
-window cannot make is spent without taking the next one with it. A report of this terminal's *size*
+what was sent before. A session that refuses a new subscription for now has changed nothing: the
+stream goes on, and the subscription is asked for again after the pause the retry policy gives,
+whether or not the session says anything meanwhile, up to three times, after which the attachment
+ends as it does when the session refuses in its definite word. What the person presses meanwhile
+waits too, and goes from where that screen puts the window. Presses in one direction add up, and a
+reversal waits its turn, so a press the window cannot make is spent without taking the next one
+with it. A report of this terminal's *size*
 waits the same way. Only the newest size waits, carrying where the window is, so a report refused
 meanwhile never takes a newer size with it. A resize this terminal makes as the size's owner is not
 such a report and goes at once.
@@ -1155,7 +1177,7 @@ Because a restore puts content on disk outside what this host retains, it follow
 
 When the storage service asks to be left alone, the daemon sends it nothing until the time has passed. The command waits for that time, prints a message to the error stream to say how long, and then asks again, at most five times for each read. If, after five waits, the service still asks for quiet, the command stops, removes the files it made, and says when to try again.
 
-A recovery bundle gives one flat set of writers, so any writer the bundle trusts can verify any of the owner's archives at any generation. When a writer is replaced, the old one continues to be trusted for as long as the bundle contains it. An older authentic revision of the bundle still opens and supplies an older checkpoint. The plan shows which revision of the bundle is being used and the generation it last verified, so that you can see both. After the files and `restore.json` are written, the command records the generation it verified in the bundle at the service. It reads the bundle again, opens it with the kit, changes only that archive's checkpoint, and writes it back so that it replaces the bundle only if no one has changed it since. A writer, a producer or a checkpoint that another device added in the meantime is kept, and the command reads and merges again if it finds the bundle moved. A checkpoint never goes down: a restore of a generation older than the one recorded, which you accepted, leaves the bundle as it was. The same generation recorded with another manifest is refused and reported. If the checkpoint cannot be recorded, the restore stays done and the output says why and that restoring again records it. The next restore then refuses a service that offers an older generation. This has limits. The first restore after a loss has nothing to compare with, and a service can hold the bundle back as well as an archive. A checkpoint you can trust independently of the service comes from pairing.
+A recovery bundle gives one flat set of writers, so any writer the bundle trusts can verify any of the owner's archives at any generation. When a writer is replaced, the old one continues to be trusted for as long as the bundle contains it. An older authentic revision of the bundle still opens and supplies an older checkpoint. The plan shows which revision of the bundle is being used and the generation it last verified, so that you can see both. After the files and `restore.json` are written, the command records the generation it verified in the bundle at the service. It reads the bundle again, opens it with the kit, changes only that archive's checkpoint, and writes it back so that it replaces the bundle only if no one has changed it since. A writer, a producer or a checkpoint that another device added in the meantime is kept, and the command reads and merges again if it finds the bundle moved. A service that refuses the write for now is asked again after a pause, at most three times, and the output then says why the checkpoint is not recorded. A checkpoint never goes down: a restore of a generation older than the one recorded, which you accepted, leaves the bundle as it was. The same generation recorded with another manifest is refused and reported. If the checkpoint cannot be recorded, the restore stays done and the output says why and that restoring again records it. The next restore then refuses a service that offers an older generation. This has limits. The first restore after a loss has nothing to compare with, and a service can hold the bundle back as well as an archive. A checkpoint you can trust independently of the service comes from pairing.
 
 `--accept-older <generation>` is for a service that was put back to an earlier state on purpose. Without it, a service that holds an older generation than the bundle recorded is refused, and the refusal names the generation the service holds, the generation the bundle recorded and this flag. With it, exactly the generation you name is restored, and only if the service holds that generation and nothing newer. A name given when the service holds the recorded generation or a newer one is refused by name, because that generation needs no such word and would otherwise be restored under one you gave for another. The plan shows that you named it, and its digest covers it, so a confirmation made without the flag does not write. The flag does not lower the bundle's checkpoint, the plan says the bundle keeps the newer one, and it never accepts the recorded generation's number with another manifest.
 
@@ -1405,6 +1427,7 @@ configuration /home/someone/.config/kalareach/environments/ab12cd34/config.json 
   relay.origin = none from default, applies at the next start
   automation.test_suites = none from default, applies immediately
   automation.test_outputs = none from default, applies immediately
+  push.gateways = none from default, applies immediately
   session_limit ceiling 128
   enrolment ceiling 67108864 metadata bytes, 100000 entries, 5 generations retained, …;
     configured here: retained_generations
@@ -1771,7 +1794,17 @@ pairing.
 Issuing an invitation and approving a device each need a fresh owner confirmation naming exactly
 that action, and `kr` asks the host for one first. On a host that has an owner, an owner device
 confirms it in its own ceremony: `kr` says so on standard error and waits, asking the host again
-every second, until the confirmation arrives or the challenge runs out after two minutes.
+every second, until the confirmation arrives or the challenge runs out after two minutes. The wait
+is the one the plugin commands use. A host that says it cannot take the request now, with a
+transient code, is asked again, and a request refused for now after the host spent the owner
+device's answer ends the wait with that refusal. A host that does not answer, or a connection that
+ends after the request was sent, leaves the outcome unknown: the command says so, with
+`OUTCOME_UNKNOWN`, and exits 1. A host that does not answer the request for the challenge, or the
+read of what the owner device is shown, within thirty seconds, or before the challenge ends if that
+comes first, has changed nothing: the command says so and exits 3. At a terminal that confirms for
+a host with no owner, the answer to the challenge and the effect it confirms are each waited for
+as long as the wait gives a request the host began to perform, and a host that answers neither
+leaves the outcome unknown, as above.
 
 ### A host's first owner
 
@@ -2113,12 +2146,17 @@ nothing was changed. A host that does not answer the repeated request, or a conn
 after it was sent, leaves the outcome unknown: the command says so, with `OUTCOME_UNKNOWN`, and
 exits 1, because the host refused nothing. A host that says it cannot take the request now, with a
 transient code, has not refused it either: the command asks again at the next second, and if the
-challenge ends first, exits with that code. A host that answers `OUTCOME_UNKNOWN` ends the wait with
-that answer, and the request is not made again, because it may have been performed. A host that
-does not answer one of the requests before it, for the budgets, for the challenge and for what the
-owner device is shown, within thirty seconds changed nothing, and the command exits 3. If the host has no owner device
-yet, it says so at once and names `kr pair invite --owner`. A host that is not on the network has no
-owner device to ask and returns `HOST_NOT_CONFIGURED`: select a network and restart it.
+challenge ends first, exits with that code. The host spends the owner device's answer before it
+performs the request, so a request can be refused for now after the spend; the next request is then
+told that the owner has to confirm, and when the host no longer lists the challenge, or does not say
+what it lists, the command ends at once with the earlier refusal instead of waiting for the end of
+the challenge. A host that
+answers `OUTCOME_UNKNOWN` ends the wait with that answer, and the request is not made again, because
+it may have been performed. A host that does not answer one of the requests before it, for the
+budgets, for the challenge and for what the owner device is shown, within thirty seconds changed
+nothing, and the command exits 3. If the host has no owner device yet, it says so at once and
+names `kr pair invite --owner`. A host that is not on the network has no owner device to ask and
+returns `HOST_NOT_CONFIGURED`: select a network and restart it.
 
 The second decision is an installation that may do more than the one it replaces or, with none to
 replace, more than its repository permits by itself, and every release that installs a native bridge
@@ -2368,6 +2406,45 @@ keeps the mode it was created in. A request outranks it
 fallback; `docs/host/README.md` has the document's schema and the order a request, the document and
 the default are taken in.
 
+## `kr host push-gateways`
+
+A host delivers notifications through the official gateway and through the gateways listed here,
+and through no other. An independently signed app registers with its own gateway, and a host reaches
+it only once its owner lists it:
+
+```sh
+kr host push-gateways                                   # the gateways in force
+kr host push-gateways --set https://push.builder.example  # allow this gateway
+kr host push-gateways --set https://push.a.example http://127.0.0.1:8788
+kr host push-gateways --clear                           # the official gateway only
+```
+
+`--set` replaces the list with the origins it names; each is an `https` origin, or an `http` origin
+on a loopback address, with no path and no trailing slash. The official gateway is always allowed and
+cannot be listed. The command applies one validated revision of the host's configuration document, which
+states level 7 while the list is not empty. It refuses an origin that is not one, by the name
+`push.gateways`, and writes nothing. It asks the running control daemon before it writes: with none
+running it says so and changes nothing, and a daemon that does not report the setting, as one of an
+earlier release does not, is refused with nothing written, because it would ignore the list. It asks
+the daemon again after it writes, and says the list is in force only when the daemon reports it so.
+A gateway taken out of the list is then retired: the host stops using and renewing the credentials it
+holds for that gateway, forgets them, and asks the gateway to revoke each authorisation, again until
+it has (`docs/delivery/README.md`). A request that was already waiting for its connection to that
+gateway when the list changed can still leave the host for up to about ten seconds, which can be
+after the command has returned; no request that starts later does. When the daemon cannot put the
+change into force, because it cannot write down the revocation it owes, for one, the command fails
+and says why, and the daemon's own report (`kr doctor`) says which gateways are in force. With
+neither `--set` nor `--clear` the command shows the gateways the daemon reports in force. It fails
+in the same way, with the daemon's reason and a non-zero exit status, when the daemon reports that
+it has not put its configuration document into force or that it cannot use the document. A list
+shown without that reason would suggest that the host delivers through exactly what the document
+says. A host that started over a document it could not use keeps its routes closed until it starts
+again, though it reports the document as usable once it is put right; `kr doctor` says so in its
+network check. Devices paired through a gateway taken out stay paired and are not sent
+notifications until their app registers with a gateway the host allows. With `--json` the answer is
+`{ "ok": true, "environment_id": "...", "push_gateways": ["..."] }`, listing the gateways besides the
+official one that the daemon reports in force.
+
 ## `kr host machine`
 
 A machine group is a random grouping of environments that the owner approves. It grants nothing, and each environment records its own group and changes it only by its own step. `kr host machine` shows the group an environment records and takes those steps at the owner's own command line:
@@ -2395,7 +2472,7 @@ The plan is written to a file `machine-merge-plan`, readable only by the owner, 
 
 The `kr host machine merge --from`, `kr host machine finish` and `kr host machine undo` commands all take an exclusive lock on the file `machine-merge-plan.lock`, adjacent to the plan file, for the duration of the command. If a second command tries to take this lock while the first is running, it will report that another command is working on the plan and will exit with status 1. `kr host machine plan` does not take this lock, since the file it reads will always be complete. Neither `kr host machine plan`, `kr host machine finish` nor `kr host machine undo` takes an `--environment` option.
 
-`kr host machine plan` prints the plan and shows what each step has come to. `kr host machine finish` takes each step that has no result. It composes a step that was never sent and sends it under its own identity. A step that was sent is sent again exactly as it was composed, so an environment that took it answers from its receipt, and one that did not refuses it, because its window belongs to the connection that first sent it. Where an environment answers no receipt, the command reads its group. If it is still the record the step was approved against, nothing was applied. A step that was sent before is composed again under a new action, unless its first action is still running in the environment, when it waits for that. A step composed now is refused for what the environment refused it for, unless the environment could not write, answer or finish it, or refused it for now with another transient code, which stays sent. If it shows the step taken, the step is taken once the environment has confirmed that the record survives a crash. An environment confirms that before it claims any step, so a step it refuses after claiming it, because the record has moved on, is taken. An answer it kept for an action sent again was made earlier and confirms nothing. A step refused any other way may have been refused before that confirmation: if it was sent before, it is composed again under a new action to ask, and if it was composed now, it stays sent. Anywhere else the step can never apply, and it is refused. A step whose outcome the environment does not know, or could not confirm to survive a crash, or could not write, or whose action is still running, is not given a result it was not given: it stays sent, and so does the plan. An environment that cannot read its own record takes no step, and what it refuses a step for says nothing of an earlier action of that step, which it may have taken. The first action sent for a step that the environment refuses in its definite word is refused with `STORAGE_UNAVAILABLE`; one it refuses for now, with a transient code, stays sent. A step that was sent before stays sent, under any action, until the environment can read its record, as does one it could not answer or whose action is still running. A step the plan saved before sending it counts as sent. To abandon a plan, move `machine-merge-plan` aside, in this user's state directory: each environment keeps the group it reports, and `kr host machine join` moves one back. An environment that cannot be reached stays pending, and the command exits with 1 and `ENVIRONMENT_UNAVAILABLE`.
+`kr host machine plan` prints the plan and shows what each step has come to. `kr host machine finish` takes each step that has no result. It composes a step that was never sent and sends it under its own identity. A step that was sent is sent again exactly as it was composed, so an environment that took it answers from its receipt, and one that did not refuses it, because its window belongs to the connection that first sent it. Where an environment answers no receipt, the command reads its group, except after an `INVALID_ARGUMENT` refusal, which the environment decides against the request itself: that is final, whatever the environment reports or can read, and the step is refused with it. If the group is still the record the step was approved against, nothing was applied. A step that was sent before is composed again under a new action, against the same record, so at most one of its actions applies; an environment tells a repeat that meets a first action still running the way it tells one whose first attempt ended without recording what it did (`OUTCOME_UNKNOWN`), so the command does not tell the two apart and does not wait for the first; the environment takes one step at a time, so the new action waits behind the first there. A step refused with `RESOURCE_UNAVAILABLE` is the exception: the environment refused it before it dispatched anything, so it stays sent, and the next `finish` sends the same action again. A step composed now is refused for what the environment refused it for, unless the environment could not write, answer or finish it, or refused it for now with another transient code, which stays sent. If it shows the step taken (the group the step enters, one revision on from the record it was approved against), the step is taken once the environment has confirmed that the record survives a crash. An environment confirms that before it claims any step, so a step it refuses with `DRAFT_CONFLICT` after claiming it, for the record it now holds, is taken. An answer it kept for an action sent again was made earlier and confirms nothing. A step refused any other way may have been refused before that confirmation: if it was sent before, it is composed again under a new action to ask, and if it was composed now, it stays sent. Where the record shows the step taken, a step the environment answers with `OUTCOME_UNKNOWN` (it could not say whether its change survives a crash, or its action is still running) or with `RESOURCE_UNAVAILABLE` is not called taken on the record alone: it stays sent, whichever action it was sent under, and so does the plan. Where the record is neither the one the step was approved against nor the one that shows it taken, for example because the group is another one or the revision is a later one, the step can never apply, and it is refused with `DRAFT_CONFLICT` whatever the environment refused it for. An environment that cannot read its own record takes no step, and what it refuses a step for says nothing of an earlier action of that step, which it may have taken. The first action sent for a step that the environment refuses in its definite word is refused with `STORAGE_UNAVAILABLE`; one it refuses for now, with a transient code, stays sent. A step that was sent before stays sent, under any action, until the environment can read its record, as does one it could not answer or whose action is still running. A step the plan saved before sending it counts as sent. To abandon a plan, move `machine-merge-plan` aside, in this user's state directory: each environment keeps the group it reports, and `kr host machine join` moves one back. An environment that cannot be reached stays pending, and the command exits with 1 and `ENVIRONMENT_UNAVAILABLE`.
 
 `kr host machine undo` puts each environment the plan moved back into the group it left, by a step of its own against the record the first step left, each composed by the connection that sends it. A step that was never sent is given up. Where one was sent and what the environment did is not known, `undo` refuses and asks for `finish` first, because moving the others back while that one could still move would leave the merge half undone the other way round. Where a step was refused and the plan is gone because every step has a result, the output says how to put each environment the merge moved back, as a `kr host machine join` command to type, and the command exits with 1 and `DRAFT_CONFLICT`.
 

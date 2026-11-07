@@ -14,6 +14,7 @@ import userEvent from '@testing-library/user-event'
 
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, LOST_CONTROL, terminalScreen, type HeldReads } from '../../src/host/fake'
+import { DraftBook } from '../../src/model/draft-book'
 import { describeMode } from '../../src/mobile/model/gestures'
 import { MobileSession } from '../../src/mobile/views/MobileSession'
 import { useLifecycle } from '../../src/mobile/useLifecycle'
@@ -1654,6 +1655,31 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     await person.type(field, 'ls')
     await person.click(screen.getByRole('button', { name: 'Send' }))
     expect(await screen.findByText('Not taken for now')).toBeInTheDocument()
+    expect(field).toHaveValue('ls')
+  })
+
+  it('ends a send as unknown when the host says so by the category of its code, and not only by the code', async () => {
+    const { port } = fakeHost()
+    const ends = vi.spyOn(DraftBook.prototype, 'endSend')
+    // A code this page has no word for, in the category the protocol gives only to a host that
+    // cannot say what became of a send. The category is what native code hands over with the code.
+    const uncertain = {
+      ...port,
+      composerSubmit: () =>
+        Promise.reject({
+          code: 'A_CODE_FROM_A_NEWER_HOST',
+          message: 'The host did not say what became of it.',
+          user_action: 'ask',
+          retry: 'outcome_unknown'
+        })
+    }
+    const person = await onTerminal(uncertain)
+    const field = screen.getByLabelText('Message this session')
+    await person.type(field, 'ls')
+    await person.click(screen.getByRole('button', { name: 'Send' }))
+    expect(await screen.findByText(/no confirmed outcome yet/)).toBeInTheDocument()
+    // The draft keeps its uncertain-send state: the book is told the send ended as unknown.
+    expect(ends.mock.calls.map((call) => call[1])).toEqual(['unknown'])
     expect(field).toHaveValue('ls')
   })
 

@@ -865,6 +865,223 @@ pub fn the_keys_a_person_types_around_a_hosts_answers_arrive_whole_and_in_order(
     );
 }
 
+/// KR-REQ-08.48: the byte behind the start of a device control string that is not one the reader
+/// skips stays the person's.
+///
+/// A reader that reads a device control string to its end decides from its first bytes which string
+/// it is. The tertiary device attributes begin with `!` and the report of a setting with `1$`, and
+/// the byte behind such a header says whether the string is one: a person who presses Alt+Shift+p
+/// and then types `!` or `1$` and a command has typed no string, and the first letter of the
+/// command is theirs. The case types each header and a command that prints a word, with no
+/// terminal answer anywhere in the line: a reader that took the letter for the string's next byte
+/// runs a command with a letter missing, and the word is not printed.
+///
+/// # Panics
+///
+/// Panics when a line does not print its word.
+#[cfg(unix)]
+pub fn the_byte_behind_a_device_control_header_the_reader_does_not_skip_stays_the_persons(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    for (header, marker) in DEVICE_CONTROL_HEADERS_NOT_SKIPPED {
+        let line = format!("{header}{}", print_assembled(kind, marker));
+        assert!(
+            session.run(&line, marker),
+            "the line typed behind {header:?} did not print {marker:?}:\n{}",
+            session.terminal_output()
+        );
+    }
+}
+
+/// The starts of the device control strings a reader skips to their end, each with the word a line
+/// typed behind it prints. The strings are the tertiary device attributes (`ESC P !`) and the
+/// reports of a setting (`ESC P 1 $` and `ESC P 0 $`); the header is all the reader has to go on
+/// until the byte behind it says whether it is one.
+#[cfg(unix)]
+const DEVICE_CONTROL_HEADERS_NOT_SKIPPED: [(&str, &str); 3] = [
+    ("\x1bP!", "kr-dcs-a"),
+    ("\x1bP1$", "kr-dcs-b"),
+    ("\x1bP0$", "kr-dcs-c"),
+];
+
+/// KR-REQ-08.48: a cursor key behind the start of a device control string that is not one the
+/// reader skips is still the cursor key.
+///
+/// The reader tells the string from text by the byte behind its header, and an Escape there begins
+/// a sequence of its own. A person who presses Alt+Shift+p, types `!` (or `1$` or `0$`) and moves
+/// the cursor with an arrow key inside the wait for the next byte of a sequence has typed no
+/// string, and the arrow key is theirs whole. The case types a line that prints a word from two
+/// arguments, each header, the left arrow and one letter: the word is printed only if the arrow
+/// moved the cursor before the last letter of the second argument. A reader that takes the Escape
+/// for a key of its own and the rest for text puts `[D` into the line.
+///
+/// # Panics
+///
+/// Panics when a line does not print its word.
+#[cfg(unix)]
+pub fn a_cursor_key_behind_a_device_control_header_the_reader_does_not_skip_still_moves_the_cursor(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    for (header, _) in DEVICE_CONTROL_HEADERS_NOT_SKIPPED {
+        let word = "kr-curexd";
+        let line = format!("printf '%s%s\\n' kr-cur ed{header}\x1b[Dx");
+        assert!(
+            session.run(&line, word),
+            "the arrow key typed behind {header:?} did not move the cursor:\n{}",
+            session.terminal_output()
+        );
+    }
+}
+
+/// KR-REQ-08.48: a long run of Escape pairs, each ahead of the start of a device control string that
+/// is not one the reader skips, is read to its end and leaves the shell running.
+///
+/// The Escape that comes before an `ESC P !` header is a key of the person's own, and the reader
+/// owes one for each pair it reads again after dropping the header. A reader that counts them in a
+/// byte stops at the 256th, and a shell built with overflow checks ends on it: the host's shell
+/// session goes with it. The case types three hundred pairs, each with the header, and a
+/// control character that clears the line, then runs a command that prints a word: the word is
+/// printed only if the shell took them all and went on.
+///
+/// # Panics
+///
+/// Panics when the shell does not print the word.
+#[cfg(unix)]
+pub fn a_long_run_of_escape_pairs_before_a_device_control_header_leaves_the_shell_running(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    let mut keys = "\x1b\x1bP!".repeat(300);
+    keys.push('\x15');
+    session.type_bytes(keys.as_bytes());
+    assert!(
+        session.answered("kr-esc-run"),
+        "the shell did not go on after three hundred pairs of Escapes and headers:\n{}",
+        session.terminal_output()
+    );
+}
+
+/// KR-REQ-08.48: the Escape that comes before a device control string that is not one the reader
+/// skips stays ahead of the key behind the string while the reader waits for the terminal's answer.
+///
+/// While a query of the terminal is unanswered the reader sets the keys typed aside at the back of
+/// its queue, and otherwise it puts a key it has decoded at the front. The Escape of an
+/// `ESC ESC P !` is owed to the person ahead of the key that is read again, in both. The case sets
+/// the editor to its vi keys, takes the terminal's answers away so that the next prompt's query
+/// stays open, types a line with a word that ends in a letter, the Escapes with the header and an
+/// `x`, and a return, then gives the answers back. The Escape comes out ahead of the `x`, and an
+/// Escape followed at once by a key is read by the editor as the two of them together, which leave
+/// the word as it was, so the line prints the whole word and a dash. With the two the other way
+/// round the `x` is typed into the word and the Escape ends up beside the return, so the line
+/// does not print that word. The dash is what the case waits for with the word, so that a word with
+/// anything after its last letter is not taken for the one that was asked for.
+///
+/// # Panics
+///
+/// Panics when the line does not print its word.
+#[cfg(unix)]
+pub fn the_keys_around_a_device_control_header_keep_their_order_while_the_terminal_is_asked(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    let (vi_mode, _) = vi_keymap_commands(kind).expect("this editor has vi keys");
+    assert!(session.run(vi_mode, "kr-vi-on"));
+    let _ = session.next_prompt();
+    session.hold_terminal_answers();
+    assert!(session.answered("kr-held"));
+    let _ = session.next_prompt();
+    let start = session.written();
+    session.type_bytes(b"printf '%s%s-\\n' kr-ord ered\x1b\x1bP!x\r");
+    session.release_terminal_answers();
+    let deadline = session.deadline_for(REPLY);
+    assert!(
+        session.wait_for_output_after_by(start, "kr-ordered-", deadline),
+        "the Escape did not stay ahead of the key behind the header:\n{}",
+        shown_since(&session, start)
+    );
+}
+
+/// KR-REQ-08.48: a bracketed paste with an unfinished device control string in its text still
+/// ends, and the key typed behind it reaches the line.
+///
+/// The reader reads a tertiary device attributes string or a report of a setting to its terminator,
+/// and a terminal sends one only as an answer, never inside a paste. A reader that reads one inside
+/// a paste takes the end of the paste for part of the string when the text has the string's start
+/// and no terminator, and stays in the paste: every key typed afterwards is held with it. The case
+/// pastes a command with each of the strings' starts (`ESC P ! |`, `ESC P 1 $ r`, `ESC P 0 $ r`)
+/// and no terminator in the middle of a quoted word, types the rest of the word and a last word
+/// behind the paste, and returns: the word is printed only if the paste ended and the typed keys
+/// reached the line, with the byte behind the start among the pasted text.
+///
+/// # Panics
+///
+/// Panics when a line does not print its word.
+#[cfg(unix)]
+pub fn a_paste_with_an_unfinished_device_control_string_in_it_still_ends(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    for (start, kept) in [("\x1bP!|", '|'), ("\x1bP1$r", 'r'), ("\x1bP0$r", 'r')] {
+        let line = format!("\x1b[200~printf '%s%s\\n' 'kr-pa{start}\x1b[201~' ted");
+        let word = format!("kr-pa{kept}ted");
+        assert!(
+            session.run(&line, &word),
+            "the keys typed behind the paste with {start:?} in it did not reach the line:\n{}",
+            session.terminal_output()
+        );
+    }
+}
+
+/// KR-REQ-08.48: a bracketed paste with the start of a device control string that is not one the
+/// reader skips in its text still ends, and the text behind the start is pasted.
+///
+/// The paste ends with a sequence of the terminal's own, and the Escape that begins it comes
+/// right behind the text. When the text ends in the header of a string the reader skips (`ESC P !`,
+/// `ESC P 1 $`, `ESC P 0 $`) that Escape is the byte the reader reads to tell the string from
+/// text, and a reader that does not read it again as the start of the paste's end takes the rest
+/// of the end for pasted text: the paste never ends and every key typed after it is held with the
+/// paste. A letter behind the header inside the paste is the byte read to tell, too, and belongs
+/// to the paste, not to the keys typed. The case pastes a command with each header at its end,
+/// types the last word of the command behind the paste and returns, and pastes a command with
+/// each header before its last word: the word is printed only if the paste ended, the typed word
+/// came after it and the pasted word reached the line in its place.
+///
+/// # Panics
+///
+/// Panics when a line does not print its word.
+#[cfg(unix)]
+pub fn a_paste_with_a_device_control_header_the_reader_does_not_skip_in_its_text_is_pasted_whole(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    for (header, _) in DEVICE_CONTROL_HEADERS_NOT_SKIPPED {
+        let line = format!("\x1b[200~printf '%s%s\\n' kr-pas{header}\x1b[201~ ed");
+        assert!(
+            session.run(&line, "kr-pased"),
+            "the keys typed behind the paste ending in {header:?} did not reach the line:\n{}",
+            session.terminal_output()
+        );
+        let line = format!("\x1b[200~printf '%s%s\\n' kr-pa{header}sted\x1b[201~");
+        assert!(
+            session.run(&line, "kr-pasted"),
+            "the text pasted behind {header:?} did not reach the line:\n{}",
+            session.terminal_output()
+        );
+    }
+}
+
 /// KR-REQ-08.48: the host's answer between the cursor keys a person presses leaves the cursor keys
 /// working.
 ///
@@ -1017,6 +1234,233 @@ pub fn an_escape_and_a_hosts_answer_in_one_delivery_leave_vi_insert_mode(kind: S
         session.finish_line(&keys, "A ab", "kr-ab"),
         "the line appended in command mode did not run:\n{}",
         session.terminal_output()
+    );
+}
+
+/// KR-REQ-08.48: text pasted in vi replace mode, which Readline reads again key by key, reaches
+/// the line whole, a run shaped like the host's answer inside it included.
+///
+/// A bracketed paste is data, and the reader leaves its bytes alone while Readline collects it.
+/// In vi replace mode Readline puts the collected text back among its keys and reads it again, so
+/// the bytes are read a second time as keys, and the reader must not take an answer-shaped run of
+/// them for an answer then either. The case switches to vi bindings, presses Escape and `R`, and
+/// pastes a line that prints a string with an answer in the middle of it, through `od` and `tr`
+/// (some `od` pad their columns), so the bytes the shell was given show as hex that no echo of the
+/// typed line can draw.
+///
+/// # Panics
+///
+/// Panics when the line does not print the string with the answer in it.
+#[cfg(unix)]
+pub fn a_paste_read_again_in_vi_replace_mode_reaches_the_line_whole(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    assert!(
+        session.run(
+            "set -o vi; printf '%s%s\\n' kr-vi- replace",
+            "kr-vi-replace"
+        ),
+        "the editor did not switch to vi bindings:\n{}",
+        session.terminal_output()
+    );
+    let _ = session.next_prompt();
+    let line = format!(
+        "\x1bR\x1b[200~printf '%s' 'x{}y' | od -An -tx1 | tr -s ' '\x1b[201~",
+        HOST_ANSWERS[0]
+    );
+    assert!(
+        session.run(&line, "78 1b 5b 3f 36 32 3b 32 32 63 79"),
+        "the answer inside the text pasted in replace mode did not reach the line:\n{}",
+        session.terminal_output()
+    );
+}
+
+/// KR-REQ-08.48: the rest of a paste whose first byte Readline takes as a search target reaches the
+/// editor's keys whole, a run shaped like the host's answer inside it included.
+///
+/// A character search reads the target from the keys, and when the target is the start of a
+/// bracketed paste Readline takes the paste's first byte for it and puts the rest back among its
+/// keys. Those bytes are the person's paste and not the host's, so the reader must not take a run
+/// of them for an answer. The case binds, to a command that prints a word, the key sequence that is
+/// the shape of an answer, presses the editor's character-search key, and pastes a letter followed
+/// by that sequence: the bytes behind the letter are keys, and the word is printed only if the
+/// sequence reached the editor whole.
+///
+/// # Panics
+///
+/// Panics when the bound command does not run.
+#[cfg(unix)]
+pub fn the_rest_of_a_paste_read_as_a_search_target_reaches_the_keys_whole(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    let binding = format!(
+        "bind -x '\"\\e[?62;22c\": printf \"%s%s\\n\" kr-ke ys'; {}",
+        print_assembled(kind, "kr-bound")
+    );
+    assert!(
+        session.run(&binding, "kr-bound"),
+        "the line that binds the key sequence did not run:\n{}",
+        session.terminal_output()
+    );
+    let _ = session.next_prompt();
+    let start = session.written();
+    // The search key, then a paste of a letter and the sequence.
+    session.type_bytes(b"\x1d\x1b[200~x\x1b[?62;22c\x1b[201~");
+    let deadline = session.deadline_for(REPLY);
+    assert!(
+        session.wait_for_output_after_by(start, "kr-keys", deadline),
+        "the bytes of the paste behind its first byte did not reach the editor's keys whole:\n{}",
+        shown_since(&session, start)
+    );
+}
+
+/// KR-REQ-08.48: pasted bytes that Readline gives back after a key sequence fails are still pasted.
+///
+/// A key sequence that is a prefix of a longer binding is read on until a key fails it, and
+/// Readline then gives every key it read back, the last first. When the first key is a letter that
+/// a character search took the rest of a paste for, the bytes behind it are pasted text, and so are
+/// the bytes it gives back; the keys that failed the sequence are not, and a reader that gave the
+/// bytes the marks of those keys, or lost the marks of the oldest of a long sequence, would take an
+/// answer-shaped run among them for the host's. The case binds the answer-shaped run to a command
+/// that prints a word, and a longer sequence that begins with a letter, holds the run and ends in
+/// a hundred and forty keys and a last one. It presses the editor's character-search key and
+/// pastes a letter, the letter that begins the longer sequence, the run and a hundred and thirty of
+/// the keys, then types the other ten and a key that is not the sequence's last. The sequence fails
+/// at the last key: the word is printed only if the run reached the editor's keys whole after the
+/// hundred and fifty keys were given back.
+///
+/// # Panics
+///
+/// Panics when the bound command does not run.
+#[cfg(unix)]
+pub fn a_key_sequence_that_fails_behind_pasted_bytes_gives_them_back_as_pasted(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    let sequence_end = "z".repeat(140);
+    let binding = format!(
+        "bind -x '\"\\e[?62;22c\": printf \"%s%s\\n\" kr-ke ys'; \
+         bind -x '\"x\\e[?62;22c{sequence_end}q\": printf \"%s%s\\n\" kr-ot her'; {}",
+        print_assembled(kind, "kr-bound")
+    );
+    assert!(
+        session.run(&binding, "kr-bound"),
+        "the line that binds the key sequences did not run:\n{}",
+        session.terminal_output()
+    );
+    let _ = session.next_prompt();
+    let start = session.written();
+    // The search key, then a paste of the search target, the sequence and most of its end, then
+    // the rest of its end and a key that is not the sequence's last, typed behind the paste.
+    let mut keys = b"\x1d\x1b[200~ax\x1b[?62;22c".to_vec();
+    keys.extend(std::iter::repeat_n(b'z', 130));
+    keys.extend_from_slice(b"\x1b[201~");
+    keys.extend(std::iter::repeat_n(b'z', 10));
+    keys.push(b'y');
+    session.type_bytes(&keys);
+    let deadline = session.deadline_for(REPLY);
+    assert!(
+        session.wait_for_output_after_by(start, "kr-keys", deadline),
+        "the pasted bytes a failed key sequence gave back did not reach the editor's keys whole:\n{}",
+        shown_since(&session, start)
+    );
+}
+
+/// KR-REQ-08.48: a byte of a paste that Readline reads again as a key is not the end-of-input
+/// gesture.
+///
+/// A character search takes the first byte of a paste for its target and reads the rest again as
+/// keys. They are pasted text, whatever they are: a person who pastes a letter and an end-of-input
+/// character has not pressed the gesture, as they have not when the paste reaches the line the usual
+/// way. The case sets the shell to keep the end-of-input character from ending it, presses the
+/// character-search key at an empty prompt under a fence and pastes a letter with the character
+/// behind it: the reader sends no decision about it, and the shell goes on.
+///
+/// # Panics
+///
+/// Panics when a decision is sent for the character, or the shell stops answering.
+#[cfg(unix)]
+pub fn a_byte_of_a_paste_read_again_as_a_key_is_not_the_gesture(kind: ShellKind) {
+    let package = Package::built(kind);
+    let speech = dialect(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    session.forget_events();
+    // The editor's own answer to the character at an empty prompt can be to end the shell, so the
+    // person's setting that keeps it is on, as it is in the drives of the detach condition.
+    let ready = speech
+        .ignore_eof_on
+        .map_or_else(|| print_assembled(kind, "kr-ready"), ToOwned::to_owned);
+    assert!(session.run(&ready, "kr-ready"));
+    let (_enter, _fence) = session.fenced_prompt(5);
+    session.ensure_reading();
+    session.forget_events();
+    session.type_bytes(b"\x1d\x1b[200~x\x04\x1b[201~");
+    session
+        .serving_after_teardown(&[], "kr-paste-gesture-served")
+        .unwrap_or_else(|why| {
+            panic!(
+                "after the paste with the character: {why}:\n{}",
+                session.terminal_output()
+            )
+        });
+    session
+        .ended_whole_with_no_decision()
+        .unwrap_or_else(|why| {
+            panic!(
+                "at the end of the paste with the character: {why}:\n{}",
+                session.terminal_output()
+            )
+        });
+}
+
+/// KR-REQ-08.48: the end-of-input gesture a person types behind pasted bytes that a failed key
+/// sequence gave back is still the gesture.
+///
+/// Readline gives the keys of a sequence that fails back to its typeahead, the last first, and the
+/// key that failed it is one the person typed. A reader that took the marks of the bytes from the
+/// wrong places would call that key pasted, and the gesture would be taken for a letter of the
+/// paste. The case binds the shape of an answer to a command that does nothing, and a longer
+/// sequence that begins with a control character and holds it, sets the shell to keep the
+/// end-of-input character from ending it, and at an empty prompt under a fence presses the
+/// character-search key, pastes a letter, the control character and the answer's shape, and
+/// types the end-of-input character behind the paste: it fails the longer sequence, the keys it
+/// gave back run, and the character is read again as typed and is the gesture.
+///
+/// # Panics
+///
+/// Panics when no detach is asked for, or the shell stops.
+#[cfg(unix)]
+pub fn a_gesture_typed_behind_bytes_a_failed_key_sequence_gave_back_is_still_the_gesture(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    session.forget_events();
+    let setup = format!(
+        "set -o ignoreeof; bind -x '\"\\C-a\\e[?62;22cq\": :'; bind -x '\"\\e[?62;22c\": :'; {}",
+        print_assembled(kind, "kr-ready")
+    );
+    assert!(
+        session.run(&setup, "kr-ready"),
+        "the line that sets the shell up did not run:\n{}",
+        session.terminal_output()
+    );
+    let (_enter, _fence) = session.fenced_prompt(5);
+    session.ensure_reading();
+    session.forget_events();
+    session.type_bytes(b"\x1d\x1b[200~a\x01\x1b[?62;22c\x1b[201~\x04");
+    let (id, event) = session.expect_event("eof_detach", |event| {
+        matches!(event, BridgeEvent::EofDetach(_))
+    });
+    assert!(matches!(event, BridgeEvent::EofDetach(_)));
+    session.answer_event(id, detached(attachment_id(1)));
+    assert!(
+        session.alive(),
+        "the gesture typed behind the pasted bytes ended the shell"
     );
 }
 
@@ -1179,6 +1623,872 @@ pub fn a_reader_reports_itself_idle_only_once_its_editor_has_the_cursors_reply(k
                     if idle.prompt_generation == enter.prompt_generation
                         && idle.reader_revision == enter.reader_revision
                         && idle.editor.buffer_empty
+            )
+        },
+    );
+}
+
+/// What the module's trace says so far, or nothing when it has written none.
+#[cfg(unix)]
+fn the_trace(trace: &Path) -> String {
+    std::fs::read_to_string(trace).unwrap_or_default()
+}
+
+/// KR-REQ-08.48, KR-REQ-08.49: the editor does not start its read until the worker has answered the
+/// entry of the read.
+///
+/// The worker holds every answer it writes for the terminal back from the moment it has applied the
+/// entry until it has written the reply to the editor's question about the cursor. It applies the
+/// entry on one path and reads the terminal's output on another, in no fixed order, so a read that
+/// began before the entry was answered could ask its question first and have it let go by. The case
+/// leaves the entry unanswered. The module says in its trace that it is waiting for the answer, and
+/// the editor has not asked where the cursor is when it has: a module that started its read at once
+/// says nothing of waiting, and its editor asks within moments. The case then answers the entry and
+/// expects the editor to ask and the reader to report itself idle over an empty line.
+///
+/// # Panics
+///
+/// Panics when the editor asks where the cursor is before the entry is answered, when the module
+/// does not say it waits, or when the read does not go on once the entry is answered.
+#[cfg(unix)]
+pub fn the_editor_does_not_start_its_read_until_the_worker_has_answered_its_entry(kind: ShellKind) {
+    let package = Package::built(kind);
+    let directory = tempfile::Builder::new()
+        .prefix("kr-entry-trace-")
+        .tempdir()
+        .expect("a directory for the module's trace");
+    let trace = directory.path().join("trace");
+    let mut session = Session::start_with(
+        &package,
+        &[("KR_SHELL_BRIDGE_TRACE".to_owned(), told(&trace))],
+    );
+    session.commands.hold_entries = true;
+    session.stepping = false;
+    let entry = session.first_prompt();
+    assert!(
+        session.wait_for_prompt(),
+        "the shell drew no prompt:\n{}",
+        session.terminal_output()
+    );
+    // The module has sent the entry. Either it says it waits for the answer, or its editor has
+    // begun and asks where the cursor is.
+    let deadline = session.deadline_for(REPLY);
+    while !the_trace(&trace).contains("waiting for the worker's answer")
+        && !session.editor_has_asked_where_the_cursor_is()
+        && !deadline.passed()
+    {
+        session.pump(Duration::from_millis(10));
+    }
+    assert!(
+        !session.editor_has_asked_where_the_cursor_is(),
+        "the editor began its read and asked where the cursor is before the worker had answered \
+         the entry of the read:\n{}",
+        session.terminal_output()
+    );
+    assert!(
+        the_trace(&trace).contains("waiting for the worker's answer"),
+        "the module did not say it was waiting for the worker's answer to the entry:\n{}",
+        the_trace(&trace)
+    );
+
+    session.answer_held_entries();
+    assert!(
+        session.wait_for_editor_reading(),
+        "the editor never began its read once the worker had answered the entry:\n{}",
+        session.terminal_output()
+    );
+    assert!(
+        the_trace(&trace).contains(": answered"),
+        "the module did not say the worker's answer came:\n{}",
+        the_trace(&trace)
+    );
+    session.stepping = true;
+    session.expect_event(
+        "an idle report over an empty line from the read that began once its entry was answered",
+        |event| {
+            matches!(
+                event,
+                BridgeEvent::ReaderIdle(idle)
+                    if idle.prompt_generation == entry.prompt_generation
+                        && idle.reader_revision == entry.reader_revision
+                        && idle.editor.buffer_empty
+            )
+        },
+    );
+}
+
+/// KR-REQ-08.48, KR-REQ-08.49: the host's answers that are already in the terminal's input when a
+/// read begins are taken out of it before the editor asks where the cursor is.
+///
+/// The editor reads the reply to that question from the same input as every other byte, and joins
+/// into it every digit that comes ahead of it, so an answer the host wrote before the question is
+/// read as part of the reply and leaves the editor with a cursor that is not where it is. The worker
+/// holds back every answer it writes after it has applied the entry, but one it had already handed
+/// to its writer is on its way to the terminal, and no hold reaches it. The case leaves the entry
+/// unanswered, as the case above does, and types two answers into the terminal in the meantime, so
+/// they are in the terminal's input before the editor has begun. It then answers the entry and
+/// expects the editor to begin, ask and be answered, the reader to report itself idle over a line
+/// that is empty, and a line typed afterwards to run as typed. A module that does not wait for the
+/// entry's answer begins its editor with the answers still in the input, and the answers are read
+/// as part of the reply or typed into the line.
+///
+/// # Panics
+///
+/// Panics when the reader does not report itself idle over an empty line, or when a line typed
+/// afterwards does not run.
+#[cfg(unix)]
+pub fn host_answers_in_the_terminal_when_a_read_begins_are_taken_out_before_the_editor_asks(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let directory = tempfile::Builder::new()
+        .prefix("kr-stale-trace-")
+        .tempdir()
+        .expect("a directory for the module's trace");
+    let trace = directory.path().join("trace");
+    let mut session = Session::start_with(
+        &package,
+        &[("KR_SHELL_BRIDGE_TRACE".to_owned(), told(&trace))],
+    );
+    session.commands.hold_entries = true;
+    session.stepping = false;
+    // The terminal keeps the reply to the editor's question until the case lets it go, so the reply
+    // is written after the two answers whenever the editor asks, and a module that starts its
+    // editor at once cannot ask before they are in the input and be answered ahead of them.
+    session.hold_terminal_answers_after_the_shells_own_cursor_question();
+    let entry = session.first_prompt();
+    assert!(
+        session.wait_for_prompt(),
+        "the shell drew no prompt:\n{}",
+        session.terminal_output()
+    );
+    session.type_bytes(b"\x1b[?62;22c\x1b]11;rgb:0000/0000/0000\x07");
+    session.answer_held_entries();
+    assert!(
+        session.wait_for_editor_reading(),
+        "the editor never asked where the cursor was once the entry was answered:\n{}",
+        session.terminal_output()
+    );
+    session.release_terminal_answers();
+    session.stepping = true;
+    session.expect_event(
+        "an idle report over an empty line from the read the answers were in the terminal for",
+        |event| {
+            matches!(
+                event,
+                BridgeEvent::ReaderIdle(idle)
+                    if idle.prompt_generation == entry.prompt_generation
+                        && idle.reader_revision == entry.reader_revision
+                        && idle.editor.buffer_empty
+            )
+        },
+    );
+    let marker = "kr-stale-ok";
+    assert!(
+        session.run(&print_assembled(kind, marker), marker),
+        "a line typed after the answers did not run:\n{}",
+        session.terminal_output()
+    );
+    assert!(
+        the_trace(&trace).contains("2 host answers were in the terminal's input"),
+        "the module did not take the two answers out of the terminal's input:\n{}",
+        the_trace(&trace)
+    );
+}
+
+/// KR-REQ-08.48: the keys a person typed ahead of a read reach the editor whole and in order, with the
+/// host's answers among them taken out.
+///
+/// Before the editor starts, the module reads what the terminal has delivered, drops the host's
+/// answers and gives every other key to the editor's queue, so a read must not lose, reorder or change
+/// a key that was typed ahead. The case leaves the entry unanswered and types a line in one write with
+/// answers among its keys: one first, one behind the Escape of Alt+b (which starts again at the later
+/// Escape), and one behind the End key. The line puts a letter after a word with Alt+b and the End key
+/// and runs; it prints the word only if every key reached the editor, in its place.
+///
+/// # Panics
+///
+/// Panics when the line does not print the word the keys spell.
+#[cfg(unix)]
+pub fn keys_typed_ahead_of_a_read_reach_the_editor_whole_and_in_order_among_the_hosts_answers(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.commands.hold_entries = true;
+    session.stepping = false;
+    session.first_prompt();
+    assert!(
+        session.wait_for_prompt(),
+        "the shell drew no prompt:\n{}",
+        session.terminal_output()
+    );
+    let typed = [
+        "\x1b[?62;22c",
+        "Write-Output ('kr-ahead-' + '",
+        "z",
+        "\x1b",
+        "\x1b[?62;22c",
+        "b",
+        "y",
+        "\x1b[F",
+        "\x1b]11;rgb:0000/0000/0000\x07",
+        "')",
+        "\r",
+    ]
+    .concat();
+    let start = session.written();
+    session.type_bytes(typed.as_bytes());
+    session.answer_held_entries();
+    let deadline = session.deadline_for(REPLY);
+    assert!(
+        session.wait_for_output_after_by(start, "kr-ahead-yz", deadline),
+        "the keys typed ahead of the read did not spell \"kr-ahead-yz\":\n{}",
+        shown_since(&session, start)
+    );
+}
+
+/// KR-REQ-08.48: the keys of an answer the module was reading when its read failed reach the
+/// editor, and the answer is still taken out.
+///
+/// Before the editor starts, the module reads the keys the terminal has delivered, and it takes an
+/// Escape and the introducer behind it before it reads the rest of the answer. A read that fails
+/// part way must not lose the keys it has already taken: they are the person's, as far as the
+/// module can tell. The case replaces the module's reader of the rest of an answer with one that
+/// fails on its first call and then does what it did, leaves the entry unanswered, and types a line
+/// with an answer in the middle of it. The first read fails, so the answer reaches the editor with
+/// its Escape and its bracket, and the module's chord for the bracket takes it out as the editor
+/// meets it; the line prints its word only if that happened and no key was lost. A module that
+/// loses the two keys leaves the rest of the answer in the line.
+///
+/// # Panics
+///
+/// Panics when the line does not print the word the keys spell.
+#[cfg(unix)]
+pub fn the_keys_of_an_answer_the_drain_was_reading_when_it_failed_reach_the_editor(
+    kind: ShellKind,
+) {
+    // Runs after the package's entry: the first call of the module's reader of an answer fails,
+    // the others are the module's own.
+    const FAILING_ONCE: &str = r#"& (Get-Module KalaReach.ShellBridge) {
+    $script:RealSkipReply = (Get-Command Skip-KrReply -CommandType Function).ScriptBlock
+    $script:SkipReplyFailures = 1
+    Set-Item function:script:Skip-KrReply -Value {
+        param([char]$Introducer, [scriptblock]$Waiting, [scriptblock]$Read, [scriptblock]$Restore)
+        if ($script:SkipReplyFailures -gt 0) {
+            $script:SkipReplyFailures--
+            throw 'the read of the answer failed'
+        }
+        & $script:RealSkipReply @PSBoundParameters
+    }
+}
+"#;
+    let package = Package::built(kind);
+    let mut session = Session::start_with_profile(
+        &package,
+        Profile {
+            after_entry: FAILING_ONCE,
+            ..Profile::ORDINARY
+        },
+    );
+    session.commands.hold_entries = true;
+    session.stepping = false;
+    session.first_prompt();
+    assert!(
+        session.wait_for_prompt(),
+        "the shell drew no prompt:\n{}",
+        session.terminal_output()
+    );
+    let typed = ["Write-Output ('kr-lost-' + 'a", "\x1b[?62;22c", "b')", "\r"].concat();
+    let start = session.written();
+    session.type_bytes(typed.as_bytes());
+    session.answer_held_entries();
+    let deadline = session.deadline_for(REPLY);
+    assert!(
+        session.wait_for_output_after_by(start, "kr-lost-ab", deadline),
+        "the keys typed ahead of the read did not spell \"kr-lost-ab\":\n{}",
+        shown_since(&session, start)
+    );
+}
+
+/// KR-REQ-08.48: an answer behind one that was cut short is taken out before the editor starts.
+///
+/// The module reads the keys the terminal has delivered, and a run that turns out to be no answer
+/// gives its Escape and its bracket to the editor. The keys it read after them are looked at again
+/// from the first, because one of them may be the Escape of an answer of its own: a control
+/// sequence cut short by the Escape of the next one is the case. The case types a line in which a
+/// control sequence is cut short by an answer, and expects the module to say in its trace that it
+/// took one answer out of the input, and the line to print the word the other keys spell.
+///
+/// # Panics
+///
+/// Panics when the module does not take the second answer out or the line does not print its word.
+#[cfg(unix)]
+pub fn an_answer_behind_one_that_was_cut_short_is_taken_out_before_the_editor_starts(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let directory = tempfile::Builder::new()
+        .prefix("kr-cut-trace-")
+        .tempdir()
+        .expect("a directory for the module's trace");
+    let trace = directory.path().join("trace");
+    let mut session = Session::start_with(
+        &package,
+        &[("KR_SHELL_BRIDGE_TRACE".to_owned(), told(&trace))],
+    );
+    session.commands.hold_entries = true;
+    session.stepping = false;
+    session.first_prompt();
+    assert!(
+        session.wait_for_prompt(),
+        "the shell drew no prompt:\n{}",
+        session.terminal_output()
+    );
+    let typed = [
+        "Write-Output ('kr-cut-' + 'a",
+        "\x1b[?",
+        "\x1b[?62;22c",
+        "~b')",
+        "\r",
+    ]
+    .concat();
+    let start = session.written();
+    session.type_bytes(typed.as_bytes());
+    session.answer_held_entries();
+    let deadline = session.deadline_for(REPLY);
+    assert!(
+        session.wait_for_output_after_by(start, "kr-cut-ab", deadline),
+        "the keys typed ahead of the read did not spell \"kr-cut-ab\":\n{}",
+        shown_since(&session, start)
+    );
+    assert!(
+        the_trace(&trace).contains("1 host answers were in the terminal's input"),
+        "the module did not take the answer behind the one that was cut short out of the terminal's \
+         input:\n{}",
+        the_trace(&trace)
+    );
+}
+
+/// KR-REQ-08.48: a chord the person bound on an Escape runs when its keys were typed ahead of a read.
+///
+/// The module takes an Escape and the key behind it for a host's answer only where the chord is its
+/// own: it binds `Escape,[`, `Escape,]` and `Escape,P` where nothing is bound, and a person's binding
+/// of one of them is theirs. The case binds `Escape,P` to a handler that inserts a line ending in a
+/// comment, leaves the entry unanswered, types the chord, a backslash (which ends a device control
+/// string, so the three keys are a whole answer by their shape) and a return, and expects the line to
+/// run: a module that took the Escape and the P for the start of an answer would drop the chord and
+/// run an empty line.
+///
+/// # Panics
+///
+/// Panics when the person's handler does not run.
+#[cfg(unix)]
+pub fn a_chord_the_person_bound_on_an_escape_runs_when_it_was_typed_ahead_of_a_read(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start_with_profile(
+        &package,
+        Profile {
+            after_configuration: "Set-PSReadLineKeyHandler -Chord 'Escape,P' -ScriptBlock { \
+                [Microsoft.PowerShell.PSConsoleReadLine]::Insert(\
+                'Write-Output (''kr-cho'' + ''rd'') # ') }\n",
+            ..Profile::ORDINARY
+        },
+    );
+    session.commands.hold_entries = true;
+    session.stepping = false;
+    session.first_prompt();
+    assert!(
+        session.wait_for_prompt(),
+        "the shell drew no prompt:\n{}",
+        session.terminal_output()
+    );
+    let start = session.written();
+    session.type_bytes(b"\x1bP\\\r");
+    session.answer_held_entries();
+    let deadline = session.deadline_for(REPLY);
+    assert!(
+        session.wait_for_output_after_by(start, "kr-chord", deadline),
+        "the person's handler on Escape,P did not run when its keys were typed ahead:\n{}",
+        shown_since(&session, start)
+    );
+}
+
+/// KR-REQ-08.48: a chord the person bound behind another key runs when its keys were typed ahead of
+/// a read.
+///
+/// The key behind the first key of a chord is the chord's second key, whatever it is, and the
+/// editor's: an Escape there is not the start of a host's answer. The case binds `Ctrl+x,Escape` to
+/// a handler that inserts a line ending in a comment, leaves the entry unanswered, types `Ctrl+x`,
+/// an Escape, a `P`, a backslash (which ends a device control string, so the three keys behind the
+/// first are a whole answer by their shape) and a return, and expects the line to run: a module that
+/// took the Escape for the start of an answer would drop it, and the chord with it.
+///
+/// # Panics
+///
+/// Panics when the person's handler does not run.
+#[cfg(unix)]
+pub fn a_chord_the_person_bound_behind_another_key_runs_when_it_was_typed_ahead_of_a_read(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start_with_profile(
+        &package,
+        Profile {
+            after_configuration: "Set-PSReadLineKeyHandler -Chord 'Ctrl+x,Escape' -ScriptBlock { \
+                [Microsoft.PowerShell.PSConsoleReadLine]::Insert(\
+                'Write-Output (''kr-cho'' + ''rd'') # ') }\n",
+            ..Profile::ORDINARY
+        },
+    );
+    session.commands.hold_entries = true;
+    session.stepping = false;
+    session.first_prompt();
+    assert!(
+        session.wait_for_prompt(),
+        "the shell drew no prompt:\n{}",
+        session.terminal_output()
+    );
+    let start = session.written();
+    session.type_bytes(b"\x18\x1bP\\\r");
+    session.answer_held_entries();
+    let deadline = session.deadline_for(REPLY);
+    assert!(
+        session.wait_for_output_after_by(start, "kr-chord", deadline),
+        "the person's handler on Ctrl+x,Escape did not run when its keys were typed ahead:\n{}",
+        shown_since(&session, start)
+    );
+}
+
+/// KR-REQ-08.48: a chord the person binds after the module has bound its own runs when its keys were
+/// typed ahead of a read.
+///
+/// The module binds `Escape,[`, `Escape,]` and `Escape,P` where nothing is bound when it starts, and
+/// takes a host's answer out of the keys typed ahead only where those chords are still its own. A
+/// person can bind a chord later, at the prompt, and the module reads the editor's tables at each
+/// read for that reason. The case runs a line that binds `Escape,P` to a handler of the person's
+/// own, leaves the entry of the next read unanswered, types the chord, a backslash (which ends a
+/// device control string, so the three keys are a whole answer by their shape) and a return, and
+/// expects the handler to have run: a module that went by the chords it bound at the start would
+/// drop the three keys and run an empty line.
+///
+/// # Panics
+///
+/// Panics when the person's handler does not run.
+#[cfg(unix)]
+pub fn a_chord_the_person_binds_after_the_first_prompt_runs_when_it_was_typed_ahead_of_a_read(
+    kind: ShellKind,
+) {
+    let handler = "Set-PSReadLineKeyHandler -Chord 'Escape,P' -ScriptBlock { \
+        [Microsoft.PowerShell.PSConsoleReadLine]::Insert('Write-Output (''kr-lat'' + ''e'') # ') }";
+    keys_typed_ahead_of_a_read_after_a_binding_made_at_the_prompt(
+        kind,
+        handler,
+        "kr-late",
+        "the person's handler on Escape,P, bound after the first prompt, did not run when its keys \
+         were typed ahead",
+    );
+}
+
+/// KR-REQ-08.48: an Escape the person binds alone after the module has bound its chords is theirs,
+/// and the keys typed ahead of a read after it are the line they spell.
+///
+/// The chords the module binds stand behind the Escape key, which the editor keeps as the first key
+/// of a chord. A person who binds the Escape key to an operation of their own at the prompt makes
+/// the keys behind it a new line, as the Windows edit mode does, and the module reads the editor's
+/// tables at each read for that reason. The case binds the Escape key to reverting the line, leaves
+/// the entry of the next read unanswered and types an Escape, a `P`, a backslash and a return; the
+/// editor has to meet the `P` and the backslash as the line it runs, which the shell says it does
+/// not know as a command, where a module that went by the chords it bound at the start would take
+/// the three keys for an answer and run an empty line.
+///
+/// # Panics
+///
+/// Panics when the shell does not run the line the keys spell.
+#[cfg(unix)]
+pub fn an_escape_the_person_binds_after_the_first_prompt_leaves_the_keys_behind_it_theirs(
+    kind: ShellKind,
+) {
+    keys_typed_ahead_of_a_read_after_a_binding_made_at_the_prompt(
+        kind,
+        "Set-PSReadLineKeyHandler -Chord 'Escape' -Function RevertLine",
+        "The term 'P\\' is not recognized",
+        "the keys typed behind an Escape the person bound after the first prompt did not run as the \
+         line they spell",
+    );
+}
+
+/// Binds with `binding` in a line the person runs at the prompt, then types an Escape, a `P`, a
+/// backslash and a return into the read that follows the next one, whose entry is left unanswered,
+/// and waits for `expected` to be shown.
+#[cfg(unix)]
+fn keys_typed_ahead_of_a_read_after_a_binding_made_at_the_prompt(
+    kind: ShellKind,
+    binding: &str,
+    expected: &str,
+    complaint: &str,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    session.stepping = false;
+    let bound = format!("{binding}; {}", print_assembled(kind, "kr-bound"));
+    assert!(
+        session.run(&bound, "kr-bound"),
+        "the line that binds did not run:\n{}",
+        session.terminal_output()
+    );
+    // The read that follows the binding has started and been answered before the next entry is
+    // left unanswered, so that it is the entry of the read after it that is.
+    assert!(
+        session.wait_for_prompt() && session.wait_for_editor_reading(),
+        "the editor did not start the read after the binding:\n{}",
+        session.terminal_output()
+    );
+    session.commands.hold_entries = true;
+    let entries = session.commands.entries.len();
+    assert!(
+        session.answered("kr-after"),
+        "a line did not run after the binding:\n{}",
+        session.terminal_output()
+    );
+    assert!(
+        session.wait_for_prompt(),
+        "the shell drew no prompt after the line:\n{}",
+        session.terminal_output()
+    );
+    // The prompt is drawn before the module sends the read's entry, and the module does some work
+    // of its own in between. The keys are typed ahead of a read the module holds at its entry,
+    // so they are typed once that entry has arrived.
+    session.until("the entry of the read after the line", |commands| {
+        commands.entries.len() > entries
+    });
+    let start = session.written();
+    session.type_bytes(b"\x1bP\\\r");
+    session.answer_held_entries();
+    let deadline = session.deadline_for(REPLY);
+    assert!(
+        session.wait_for_output_after_by(start, expected, deadline),
+        "{complaint}:\n{}",
+        shown_since(&session, start)
+    );
+}
+
+/// A `stty` that, once, says what mode the terminal is in while it runs, waits until the case lets
+/// it go, then does what `stty` does. The case puts the directory it lives in first on the shell's path
+/// and arms it with a file; the pipe is what it waits on, so no time is measured.
+#[cfg(unix)]
+const HELD_STTY: &str = "#!/bin/sh\n\
+    if [ -e \"$KR_STTY_HOLD/armed\" ] && mv \"$KR_STTY_HOLD/armed\" \"$KR_STTY_HOLD/used\" 2>/dev/null; then\n\
+    settings=$(stty -a </dev/tty 2>/dev/null | tr '\\n' ' ')\n\
+    case \" $settings \" in *\" -icanon \"*) mode=raw ;; *) mode=line ;; esac\n\
+    printf 'kr-stty-held-%s\\n' \"$mode\" > /dev/tty\n\
+    read -r _ < \"$KR_STTY_HOLD/release\"\n\
+    fi\n\
+    PATH=${PATH#*:}\n\
+    exec stty \"$@\"\n";
+
+/// KR-REQ-08.48: the keys a person types while the module asks the terminal for its settings are
+/// theirs, whole, and a return among them is accepted.
+///
+/// Between drawing the prompt and sending the read's entry the module runs `stty` once, to learn
+/// the terminal's end-of-file character. The runtime puts the terminal in line mode for as long as
+/// a program runs that has the terminal for any of its three standard streams, and a terminal in
+/// line mode shows every key itself and hands the editor a line feed where the return was, which
+/// the editor does not take for Enter. The case puts a `stty` first on the shell's path that
+/// says what mode the terminal is in while it runs and waits, runs a line so that the next read is
+/// the one it waits in, expects the terminal to be raw, types a line and a return while it waits,
+/// lets it go, and expects the line to run.
+///
+/// # Panics
+///
+/// Panics when the line the keys spell does not run.
+#[cfg(unix)]
+pub fn keys_typed_while_the_module_asks_the_terminal_for_its_settings_are_the_persons_own(
+    kind: ShellKind,
+) {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = tempfile::Builder::new()
+        .prefix("kr-stty-")
+        .tempdir()
+        .expect("a directory for the held program");
+    let programs = fixture.path().join("bin");
+    let hold = fixture.path().join("hold");
+    std::fs::create_dir(&programs).expect("a directory for the held program's path");
+    std::fs::create_dir(&hold).expect("a directory for the held program's state");
+    let release = hold.join("release");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&release)
+            .status()
+            .expect("mkfifo starts")
+            .success(),
+        "no pipe to let the held program go on"
+    );
+    // Opened for reading and writing here, before the program is started, so that neither side
+    // waits for the other to open it: the program opens it to read, and a byte written here waits
+    // in it until the program reads.
+    let mut pipe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&release)
+        .expect("the pipe opens");
+    let program = programs.join("stty");
+    std::fs::write(&program, HELD_STTY).expect("the held program");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("an executable held program");
+
+    let package = Package::built(kind);
+    let path = format!(
+        "{}:{}",
+        programs.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut session = Session::start_with(
+        &package,
+        &[
+            ("PATH".to_owned(), path),
+            ("KR_STTY_HOLD".to_owned(), hold.display().to_string()),
+        ],
+    );
+    session.first_prompt();
+    session.stepping = false;
+    // The program waits in the read that follows the next line.
+    std::fs::write(hold.join("armed"), b"").expect("the file that arms the held program");
+    // Counted from before the line runs: the program can say it is running before the line's own
+    // check has returned.
+    let waiting = session.written();
+    assert!(
+        session.answered("kr-armed"),
+        "a line did not run:\n{}",
+        session.terminal_output()
+    );
+    let deadline = session.deadline_for(REPLY);
+    assert!(
+        session.wait_for_output_after_by(waiting, "kr-stty-held-", deadline),
+        "the module never asked the terminal for its settings:\n{}",
+        shown_since(&session, waiting)
+    );
+    assert!(
+        shown_since(&session, waiting).contains("kr-stty-held-raw"),
+        "the terminal was in line mode while the module asked it for its settings:\n{}",
+        shown_since(&session, waiting)
+    );
+
+    let start = session.written();
+    session.type_bytes(format!("{}\r", print_assembled(kind, "kr-held")).as_bytes());
+    pipe.write_all(b"\n").expect("the held program is let go");
+    let deadline = session.deadline_for(REPLY);
+    assert!(
+        session.wait_for_output_after_by(start, "kr-held", deadline),
+        "the line typed while the module asked the terminal for its settings did not run:\n{}",
+        shown_since(&session, start)
+    );
+}
+
+/// A `stty` for a case that must never run it: it leaves a file where the case looks, then does
+/// what `stty` does.
+#[cfg(unix)]
+const MARKING_STTY: &str = "#!/bin/sh\n\
+    : > \"$KR_STTY_RAN\"\n\
+    if [ -x /bin/stty ]; then exec /bin/stty \"$@\"; fi\n\
+    exec /usr/bin/stty \"$@\"\n";
+
+/// KR-REQ-07.73: the module never runs a program of the shell's current directory to read the
+/// terminal's settings, whatever the path holds.
+///
+/// An empty entry of the path (a leading or a trailing colon, or two together) is the current
+/// directory to a POSIX shell, and a lookup that skips it is the one a command line here makes.
+/// The case puts a `stty` that leaves a file where the case looks in the directory the shell is
+/// in, gives the shell a path with an empty entry at each end, lets the module read the terminal's
+/// settings for the read that follows, and expects the file not to be there.
+///
+/// # Panics
+///
+/// Panics when the program of the current directory ran.
+#[cfg(unix)]
+pub fn a_program_of_the_current_directory_is_not_run_for_an_empty_entry_of_the_path(
+    kind: ShellKind,
+) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = tempfile::Builder::new()
+        .prefix("kr-stty-")
+        .tempdir()
+        .expect("a directory for the program");
+    let here = fixture.path().join("here");
+    std::fs::create_dir(&here).expect("a directory for the shell to stand in");
+    let ran = fixture.path().join("ran");
+    let program = here.join("stty");
+    std::fs::write(&program, MARKING_STTY).expect("the program of the current directory");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("an executable program");
+
+    let package = Package::built(kind);
+    let path = format!(":{}:", std::env::var("PATH").unwrap_or_default());
+    let mut session = Session::start_with(
+        &package,
+        &[
+            ("PATH".to_owned(), path),
+            ("KR_STTY_RAN".to_owned(), ran.display().to_string()),
+        ],
+    );
+    session.first_prompt();
+    session.stepping = false;
+    let entries = session.commands.entries.len();
+    let moving = format!(
+        "Set-Location '{}'; {}",
+        here.display(),
+        print_assembled(kind, "kr-moved")
+    );
+    assert!(
+        session.run(&moving, "kr-moved"),
+        "the line that moves the shell did not run:\n{}",
+        session.terminal_output()
+    );
+    // The entry of the read that follows is sent after the module has read the settings.
+    session.until("the entry of the read after the line", |commands| {
+        commands.entries.len() > entries
+    });
+    assert!(
+        !ran.exists(),
+        "the module ran the program of the shell's current directory for an empty entry of the path"
+    );
+}
+
+/// KR-REQ-08.48: in the Windows edit mode the keys typed ahead of a read are the person's, whatever
+/// follows an Escape in them.
+///
+/// The module binds the chords that drop a host's answer only in the Emacs edit mode, where an Escape
+/// begins a chord. In the Windows edit mode an Escape reverts the line, and the keys behind it are a
+/// new line. The case sets that mode, leaves the entry unanswered and types an Escape, a `P`, a
+/// backslash (`ESC P \` is a whole device control string by its shape) and a return. The editor has
+/// to meet the `P` and the backslash as the line it runs, which the shell says it does not know as a
+/// command; a module that took the three keys for an answer would run an empty line and say nothing.
+/// (A control sequence cannot stand in for the answer here: the runtime reads one that has no
+/// parameters as a function key of the terminal before any editor or module meets it.)
+///
+/// # Panics
+///
+/// Panics when the shell does not run the line the keys spell.
+#[cfg(unix)]
+pub fn keys_typed_ahead_of_a_read_in_the_windows_edit_mode_are_the_persons_own(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start_with_profile(
+        &package,
+        Profile {
+            after_configuration: "Set-PSReadLineOption -EditMode Windows\n",
+            ..Profile::ORDINARY
+        },
+    );
+    session.commands.hold_entries = true;
+    session.stepping = false;
+    session.first_prompt();
+    assert!(
+        session.wait_for_prompt(),
+        "the shell drew no prompt:\n{}",
+        session.terminal_output()
+    );
+    let start = session.written();
+    session.type_bytes(b"\x1bP\\\r");
+    session.answer_held_entries();
+    let deadline = session.deadline_for(REPLY);
+    assert!(
+        session.wait_for_output_after_by(start, "The term 'P\\' is not recognized", deadline),
+        "the keys typed behind an Escape in the Windows edit mode did not run as the line they spell:\n{}",
+        shown_since(&session, start)
+    );
+}
+
+/// KR-REQ-08.49: a read that the module queues no key for reports itself idle only once its editor
+/// has the cursor's reply.
+///
+/// The module queues a key of its own at the start of a read, and the reader reports itself idle
+/// from that key's handler, which runs after the editor has asked where the cursor is and been
+/// answered. It queues none where that would change what the person's keys do: one is the read
+/// after a line accepted with accept-and-get-next, where the editor loads the next history entry and
+/// carries the person's search over, and any key it runs ahead of the person's ends the search. A
+/// report from such a read before the editor has the reply ends the worker's hold on the answers it
+/// writes for the terminal early, and lets a fence be proved before the editor has asked. The case
+/// accepts a recalled line with accept-and-get-next, waits for the editor of the next prompt to have
+/// asked and been answered, and expects the reader to have reported nothing: its entry's report
+/// would have been on the endpoint before the editor asked. It then types a key, as a person does,
+/// and expects the report from that key.
+///
+/// # Panics
+///
+/// Panics when the reader has reported itself idle before any key has run in such a read, or when it
+/// never reports once a key has run.
+#[cfg(unix)]
+pub fn a_read_with_no_key_of_the_modules_own_reports_idle_only_once_its_editor_has_the_cursors_reply(
+    kind: ShellKind,
+) {
+    // Control characters, which no runtime splits or reads as the start of a sequence.
+    const PREVIOUS_HISTORY: &[u8] = b"\x10";
+    const ACCEPT_AND_GET_NEXT: &[u8] = b"\x0f";
+    const FORWARD_CHARACTER: &[u8] = b"\x06";
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    session.stepping = false;
+    for entry in ["aaa1", "bbb2"] {
+        let marker = format!("kr-idle-{entry}");
+        assert!(
+            session.run(&print_assembled(kind, &marker), &marker),
+            "a line of the history did not run:\n{}",
+            session.terminal_output()
+        );
+    }
+    assert!(
+        session.wait_for_prompt() && session.wait_for_editor_reading(),
+        "the shell drew no prompt to recall a line at:\n{}",
+        session.terminal_output()
+    );
+    // Two steps back in the history recall the first line, and accepting it with accept-and-get-next
+    // loads the second at the next prompt.
+    let recalled = session.written();
+    session.type_bytes(PREVIOUS_HISTORY);
+    session.type_bytes(PREVIOUS_HISTORY);
+    // The editor draws a line in colours, so the recalled line is not one run of text: the end of
+    // its first entry is.
+    assert!(
+        session.drew_after(recalled, "aa1'", REPLY).was_drawn(),
+        "the history did not recall the first line:\n{}",
+        shown_since(&session, recalled)
+    );
+    session.forget_events();
+    session.mark = session.written();
+    session.type_bytes(ACCEPT_AND_GET_NEXT);
+    let enter = session.next_prompt();
+    assert!(
+        session.wait_for_prompt() && session.wait_for_editor_reading(),
+        "the editor asked the terminal nothing at the prompt after the recalled line:\n{}",
+        session.terminal_output()
+    );
+    // A report from the read's entry comes before the editor asks, so it is on the endpoint by now.
+    session.take_in_what_has_arrived();
+    assert!(
+        !session.events.waiting().contains(&"reader_idle"),
+        "the reader reported itself idle before any key had run in a read the module queued no key \
+         for, which is before its editor had the reply to its question about the cursor: \
+         {:?}\n{}",
+        session.events.waiting(),
+        session.terminal_output()
+    );
+
+    session.type_bytes(FORWARD_CHARACTER);
+    session.expect_event(
+        "an idle report from the key the person pressed once the editor has the reply",
+        |event| {
+            matches!(
+                event,
+                BridgeEvent::ReaderIdle(idle)
+                    if idle.prompt_generation == enter.prompt_generation
+                        && idle.reader_revision == enter.reader_revision
             )
         },
     );
@@ -5189,6 +6499,35 @@ pub fn an_error_in_the_powershell_handshake_leaves_the_bridge_unregistered() {
         session.run(probe, "kr-bridge=False/False/True/0"),
         "the module is registered or managed, keeps its connection or holds secret bytes after an \
          answer it could not decode:\n{}",
+        session.terminal_output()
+    );
+}
+
+/// KR-REQ-07.37: a hello the worker refuses is reported to the person, with the reason the worker
+/// gave, and the shell goes on without the integration.
+///
+/// A worker that refuses a shell's hello writes the refusal and ends the connection. A module that
+/// takes the end for the whole answer starts the person's shell with no integration and says
+/// nothing of why, which the person cannot tell from an installation that was never set up. The
+/// case answers the opening frame of a PowerShell with the worker's own refusal of a shell whose
+/// start time it reads a unit away from the one the shell named, which is a process mismatch, and
+/// ends the connection behind it as the worker does. The shell then runs a command of the person's,
+/// and the terminal has to show the reason by its name.
+///
+/// # Panics
+///
+/// Panics when the reason is not shown, or the shell does not answer.
+pub fn a_hello_the_worker_refuses_is_reported_to_the_person() {
+    let package = Package::built(ShellKind::PowerShell);
+    let mut session = Session::start_refused(&package);
+    assert!(
+        session.answered("kr-after-refusal"),
+        "the shell did not answer after the worker refused its hello:\n{}",
+        session.terminal_output()
+    );
+    assert!(
+        session.terminal_output().contains("process_mismatch"),
+        "the person was not told why the worker refused the shell's hello:\n{}",
         session.terminal_output()
     );
 }

@@ -745,7 +745,10 @@ impl Controller {
             // window that admitted it is gone, and the reservation above is where such a retry is
             // answered from. What it may not do is start a session.
             Method::SessionCreate => match accepted {
-                Some(_) => self.session_create(actor_id, mutation, carried).await,
+                Some(_) => self
+                    .session_create(actor_id, mutation, carried)
+                    .await
+                    .into_answer(),
                 None => Err(ControllerError::WindowExpired {
                     detail: "this action carries no freshness, so it may be answered from what \
                              this host holds and may not start a session"

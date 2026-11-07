@@ -250,6 +250,17 @@ away: removing it at once failed a reader that had resolved `current` just befor
 failed none of about 1.2 million reads. The kept link names a release's directory and holds
 nothing, so the release it names is removed as any other.
 
+On macOS a read of `current` can still outlast the exchange. One that looked the link up before an
+exchange, and is held up (by a machine with more runnable threads than processors) until the next
+switch has taken that link away, answers that `current` is no link or is not there, though it was a
+link at every moment. With twelve readers in the background scheduling class and a loop that
+switched with no pause, that was 47 to 72 of about 3.2 million reads; in use the next switch is that
+of the next update, rollback or install, so a read meets it only if it stays in one call for that
+long. A read that starts again finds the link unless it too is held up as long, and the store's own
+read of `current` starts again, up to three times in all, before it gives its answer. A program that
+reads or walks `current` some other way (a shell, a service manager) can meet that answer, rarely,
+and nothing starts it again.
+
 An update that is held waits. It starts again every daemon it stopped, from the release still
 current, keeps the new release staged for the next attempt, which replaces it by the copy it checks
 then, and exits with 9. When a daemon it stopped does not start again, it exits with 1 instead,
@@ -535,6 +546,8 @@ Note that the version number may not be present in records written to other stor
 ### Configuration levels
 
 The configuration document is the only store that can have a new section added without the version being raised. To do this, the section must be considered optional: if the section is absent, then the setting is not used. The section must have a level; the configuration document records the highest level of any section present in `level`. A release that supports levels will read the document strictly if its level is equal or less than the release; if the level is higher, then it will read the document ignoring sections it does not know about (and counting them, as the host guide describes for the configuration document). It will not, however, edit the configuration document, since it would not be able to rewrite it without losing the sections it does not know about.
+
+A section can change what a release does about something it already holds, and then rolling back needs more than reading what the older release knows. The `push` section lists the push gateways a paired device's credential may name besides the official one. Taking a gateway out of the list writes a debt to ask that gateway to revoke each authorisation the host held for it, in the delivery journal's table of owed revocations, and forgets the credentials. A release that a rollback can go to reads that table: it does not load a credential that an owed revocation names, removes the item from the secret store, and asks the gateway at the recorded origin to revoke, so a rollback does not bring the credential back. That release ignores the section, registers a credential from the official gateway only, and gives a debt up after thirty days, which this release does not for a gateway taken out of the list. A removal that no release knowing the section has put into force is not carried to the older release.
 
 Raising the level raises neither the version of the configuration document nor the registry's. A rollback to a release that supports levels is not stopped: that release reads what it knows and ignores the rest. A release from before levels behaves differently. If it holds the fail-closed rule, it takes a document at version 3 for a version it does not know, and the host fails closed until the document is rewritten or the host moves to a release that reads it. A release from before that rule takes such a document for no document at all, uses the product defaults, keeps the ceilings the registry accepted and refuses every edit. Raising the version of the configuration document does raise the version of the registry, since the copy of the configuration document stored in the registry will have the version of the release that wrote it. A rollback across that raise is refused, as it is for any store the earlier release cannot read, unless that release reads both raised versions through. Such a release then refuses whole a document or a copy that holds a ceiling it lacks: the host fails closed, and the control daemon does not start over the copy.
 

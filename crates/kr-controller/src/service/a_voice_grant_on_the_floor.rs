@@ -21,7 +21,7 @@ use kr_voice::seams::VoiceAuthority as _;
 use crate::grants::GrantRecord;
 use crate::service::Controller;
 use crate::service::net::devices::DeviceRecord;
-use crate::service::net::tests::{daemon_on, manual_clocks};
+use crate::service::net::tests::{daemon_on, daemon_on_clocks_to_move, manual_clocks};
 use crate::voice::GrantAuthority;
 
 /// A grant to `device_id` carrying `actions`, which stands until `expires_at_ms` in UTC.
@@ -518,6 +518,242 @@ async fn a_voice_grant_that_ran_out_does_not_come_back_when_the_wall_clock_is_wo
             .grant(voice.grant_id)
             .expect("the store answers")
             .is_none()
+    );
+}
+
+/// The state the host's grant list gives `grant_id`, listing as the person at this machine.
+fn listed_state(
+    controller: &Controller,
+    grant_id: GrantId,
+) -> Option<kr_protocol::sharing::GrantState> {
+    use kr_protocol::sharing::{GrantListParams, GrantListResult};
+
+    let listing: GrantListResult = controller
+        .grant_list(
+            controller.sharing().host_device_id(),
+            &kr_protocol::envelope::ParamsValue::from_typed(&GrantListParams {
+                session_id: Nullable::null(),
+                include_resolved: true,
+            })
+            .expect("encodes"),
+        )
+        .expect("the host lists its grants")
+        .to_typed()
+        .expect("a list");
+    listing
+        .grants
+        .into_iter()
+        .find(|summary| summary.grant.grant_id == grant_id)
+        .map(|summary| summary.state)
+}
+
+/// KR-REQ-09.17, the part about an expiry-dependent read deciding on the continuous deadline and
+/// not on UTC alone: the grant list says a voice grant has ended when the continuous clock has
+/// passed its deadline, although the wall clock stands before its expiry, and the voice read agrees
+/// with it. The control: before the clock runs, the list says it is active.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_grant_list_says_a_voice_grant_ended_that_the_continuous_clock_ended() {
+    use kr_protocol::sharing::GrantState;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let (continuous, wall, clocks) = manual_clocks();
+    // No pass of the daemon reads the clocks after the first step, so none raises the floor from
+    // the continuous clock's reading and hides what the list reads.
+    let controller = daemon_on_clocks_to_move(&temp, clocks).await;
+    let now = wall.load(Ordering::SeqCst);
+    let device = paired(&controller, 44, None);
+    let voice = voice_grant(&controller, &device, now + 60_000);
+    let authority = authority(&controller);
+    let listed = || listed_state(&controller, voice.grant_id);
+
+    // The voice read takes the grant's anchor on the continuous clock, as a call does.
+    assert!(
+        authority
+            .standing_voice_grant(device.device_id)
+            .expect("the store answers")
+            .is_some()
+    );
+    assert_eq!(listed(), Some(GrantState::Active));
+
+    // The continuous clock runs past the grant's end and the wall clock stands still, as it does
+    // when it is wound back by what has passed. Nothing has asked about the grant since, so the
+    // list is the first to find it ended.
+    continuous.advance(std::time::Duration::from_secs(61));
+    assert_eq!(wall.load(Ordering::SeqCst), now);
+    assert!(
+        controller.settled_utc_now() < now + 60_000,
+        "the host's reading of UTC is still before the grant's expiry, so only the continuous \
+         deadline says it ended"
+    );
+    assert_eq!(
+        listed(),
+        Some(GrantState::Expired),
+        "the list says what the continuous deadline says, and not what the wall clock alone would"
+    );
+    assert!(
+        controller.settled_utc_now() < now + 60_000,
+        "and the floor did not rise while the list read, so the list did not read UTC past the \
+         expiry"
+    );
+    assert!(
+        authority
+            .standing_voice_grant(device.device_id)
+            .expect("the store answers")
+            .is_none(),
+        "the voice read agrees with the list"
+    );
+
+    // It stays ended when the wall clock reads past the expiry and is wound back again.
+    wall.store(now + 120_000, Ordering::SeqCst);
+    assert_eq!(listed(), Some(GrantState::Expired));
+    wall.store(now + 10_000, Ordering::SeqCst);
+    assert_eq!(
+        listed(),
+        Some(GrantState::Expired),
+        "a grant that ended never revives"
+    );
+}
+
+/// KR-REQ-09.17, the part about a previously expired object never reviving: a grant whose end is
+/// on record is listed as ended while both of its clocks still hold, as the record is read before
+/// the clocks where a share is opened. The control: the same grant, before its end is written
+/// down, is listed as active.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_grant_list_says_a_grant_ended_whose_end_is_on_record_whatever_the_clocks_say() {
+    use kr_protocol::sharing::GrantState;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, wall, clocks) = manual_clocks();
+    let controller = daemon_on_clocks_to_move(&temp, clocks).await;
+    let now = wall.load(Ordering::SeqCst);
+    let device = paired(&controller, 45, None);
+    let voice = voice_grant(&controller, &device, now + 60_000);
+
+    // The voice read takes the grant's anchor in this boot, and both of its clocks hold.
+    assert!(
+        authority(&controller)
+            .standing_voice_grant(device.device_id)
+            .expect("the store answers")
+            .is_some()
+    );
+    assert_eq!(
+        listed_state(&controller, voice.grant_id),
+        Some(GrantState::Active)
+    );
+
+    controller
+        .sharing()
+        .grants()
+        .record_grant_expiry(voice.grant_id, now)
+        .expect("the end is written down");
+    assert_eq!(
+        listed_state(&controller, voice.grant_id),
+        Some(GrantState::Expired),
+        "an end on record stands over the clocks"
+    );
+}
+
+/// A grant `device` holds in the grant store, which carries viewing and never expires.
+fn lasting_grant(controller: &Controller, device: &DeviceRecord) -> Grant {
+    let lasting = Grant {
+        issuer_device_id: controller.sharing().host_device_id(),
+        ..grant(
+            device.device_id,
+            &[ActionRight::SessionView],
+            None,
+            controller.policy().authority_revision(),
+        )
+    };
+    controller
+        .sharing()
+        .grants()
+        .issue(
+            &GrantRecord {
+                grant: lasting.clone(),
+                session_id: None,
+                issued_at_ms: 1,
+                activated_at_ms: Some(1),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
+        .expect("a grant that never expires");
+    lasting
+}
+
+/// KR-REQ-09.17, the part about a previously expired object never reviving: while this boot's clock
+/// continuity is lost, a grant the written floor covers is still listed as ended, as the floor only
+/// rises and a floor at or after a grant's expiry proves it passed; the grant that never expires
+/// is listed beside it. The list is not stopped by a grant the host can prove ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_grant_list_says_a_grant_ended_that_the_written_floor_covers_while_continuity_is_lost()
+{
+    use kr_protocol::sharing::GrantState;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, wall, clocks) = manual_clocks();
+    let controller = daemon_on_clocks_to_move(&temp, clocks).await;
+    let now = wall.load(Ordering::SeqCst);
+    let device = paired(&controller, 46, None);
+    let ending = voice_grant(&controller, &device, now + 60_000);
+    let lasting = lasting_grant(&controller, &device);
+
+    // The wall clock reads past the grant's expiry, and the floor is written down at that reading.
+    wall.store(now + 120_000, Ordering::SeqCst);
+    controller.settled_now_ms();
+    assert!(
+        controller.utc_floor().written() >= now + 60_000,
+        "the floor on disk covers the grant's expiry"
+    );
+    controller.utc_floor().lose_continuity();
+
+    assert_eq!(
+        listed_state(&controller, ending.grant_id),
+        Some(GrantState::Expired),
+        "a grant the floor on disk covers ended, whatever else is not proven"
+    );
+    assert_eq!(
+        listed_state(&controller, lasting.grant_id),
+        Some(GrantState::Active)
+    );
+}
+
+/// KR-REQ-09.18, the part about rejecting an object whose expiry cannot otherwise be proved: while
+/// this boot's clock continuity is lost, a grant that expires above the floor is not decided, and
+/// the list is refused as `CLOCK_UNTRUSTED` in words that name that grant, so the owner can tell
+/// which grant stops it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_grant_list_names_the_grant_it_cannot_decide() {
+    use kr_protocol::sharing::GrantListParams;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, wall, clocks) = manual_clocks();
+    let controller = daemon_on_clocks_to_move(&temp, clocks).await;
+    let now = wall.load(Ordering::SeqCst);
+    let device = paired(&controller, 47, None);
+    let unproven = voice_grant(&controller, &device, now + 3_600_000);
+    lasting_grant(&controller, &device);
+    controller.utc_floor().lose_continuity();
+
+    let refused = controller
+        .grant_list(
+            controller.sharing().host_device_id(),
+            &kr_protocol::envelope::ParamsValue::from_typed(&GrantListParams {
+                session_id: Nullable::null(),
+                include_resolved: true,
+            })
+            .expect("encodes"),
+        )
+        .expect_err("a grant the host cannot decide stops the list");
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::ClockUntrusted,
+        "{refused}"
+    );
+    assert!(
+        refused.to_string().contains(&unproven.grant_id.to_string()),
+        "the refusal names the grant it cannot decide: {refused}"
     );
 }
 
