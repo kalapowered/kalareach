@@ -2106,13 +2106,15 @@ fn run_again_with_an_answering_bridge() {
     );
 }
 
-/// KR-REQ-09.09: a fence that lands after a bridge has answered, and before this host records what
-/// answered, leaves the refresh answered and not refused, and says that the bridge answered and was
-/// not recorded: the answer establishes nothing, and the same bridge records once nothing is owed.
+/// KR-REQ-09.09, one recheck of five only: the recheck of authority by an owed fence. A fence that
+/// lands after a bridge has answered, and before this host records what answered, leaves the
+/// refresh answered and not refused, and says that the bridge answered and was not recorded: the
+/// answer establishes nothing, and the same bridge records once nothing is owed.
 ///
 /// The destination answers through a stand-in for the launcher, so the bridge really opens and
-/// really answers. Not shown here: a fence at the other places a refresh waits, which the cases
-/// beside this one show, or a registration withdrawn at this one.
+/// really answers. Not shown here: the rechecks of expiry, identity, binding and preconditions, a
+/// fence at the other places a refresh waits, which the cases beside this one show, or a
+/// registration withdrawn at this one.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fence_that_lands_after_a_bridge_has_answered_says_the_answer_was_not_recorded() {
