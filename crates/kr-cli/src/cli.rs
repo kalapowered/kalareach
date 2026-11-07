@@ -1799,7 +1799,7 @@ pub enum QuestionCommand {
     /// Answer one question.
     Answer(QuestionAnswerArguments),
     /// Withdraw one question without answering it.
-    Cancel(QuestionShowArguments),
+    Cancel(QuestionCancelArguments),
     /// Show the answers kept on this device, and say of each whether it can still be sent. Nothing
     /// is sent.
     Drafts,
@@ -1818,11 +1818,24 @@ pub struct QuestionListArguments {
     pub include_resolved: bool,
 }
 
-/// `kr question show` and `kr question cancel`.
+/// `kr question show` and `kr question send`.
 #[derive(Args)]
 pub struct QuestionShowArguments {
     /// The question identifier.
     pub question: String,
+}
+
+/// `kr question cancel`.
+#[derive(Args)]
+pub struct QuestionCancelArguments {
+    /// The question identifier.
+    pub question: String,
+    /// Make a later cancellation after an earlier one whose outcome the host could not establish.
+    ///
+    /// The command shows that earlier action's receipt and sends a new action that names it and the
+    /// revision shown. Without this, the cancellation is sent once, and is never sent again.
+    #[arg(long, value_name = "ACTION")]
+    pub after_unknown: Option<String>,
 }
 
 /// How one question is answered. Exactly one of these is required.

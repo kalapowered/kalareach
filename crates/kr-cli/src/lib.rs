@@ -39,6 +39,7 @@
 //! | [`terminal`] | Raw mode, terminal size and the saved state the guard holds |
 //! | [`platform`] | The one place this crate calls the operating system directly |
 //! | [`shell`] | `kr shell`: the guarded startup entries and what the integration resolved to |
+//! | [`unknown`] | A mutation whose outcome the host did not establish: the command names the action and sends it no more |
 //! | [`update`] | `kr host install`, `kr host update` and `kr host versions`: the releases this host keeps side by side |
 //! | [`barrier`] | The lock a command takes before it writes a stored record, which an update holds across its check of the stores and its switch |
 //! | [`output`] | Everything written on standard output, and the only writer there |
@@ -91,6 +92,7 @@ pub mod skill;
 pub mod startup;
 pub mod terminal;
 pub mod terminal_profile;
+pub mod unknown;
 pub mod update;
 pub mod windows;
 pub mod workflow;

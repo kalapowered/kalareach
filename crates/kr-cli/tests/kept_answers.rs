@@ -73,6 +73,11 @@ enum Behaviour {
     IsOfAnEarlierBuild,
     /// Refuses every answer with `DRAFT_CONFLICT`, taking nothing and keeping no receipt.
     RefusesAnswers,
+    /// Reads a close or a cancellation and ends the connection without replying.
+    EndsAfterReadingARequestToStop,
+    /// Cannot say what became of a close or a cancellation: refuses it with `OUTCOME_UNKNOWN` and
+    /// keeps a receipt in the `unknown` state.
+    CannotSayWhatBecameOfRequestsToStop,
 }
 
 /// Which environment the scripted session runs in.
@@ -119,6 +124,8 @@ struct State {
     /// An earlier send that lands just before the next answer is looked at, and answers the
     /// question.
     late: Option<ActionId>,
+    /// Every close and cancellation that reached it, by method and action.
+    stops: Vec<(String, ActionId)>,
 }
 
 /// One answer as it reached the worker.
@@ -127,6 +134,8 @@ struct Arrival {
     action_id: ActionId,
     /// The uncertain send the answer named, when it named one.
     quoted: Option<ActionId>,
+    /// The revision of that send's receipt that the answer says it was shown.
+    quoted_revision: Option<u64>,
 }
 
 /// A host tree with one scripted session in it, holding one question.
@@ -214,6 +223,7 @@ impl Host {
             shown: Vec::new(),
             recorded_first: Vec::new(),
             late: None,
+            stops: Vec::new(),
         }));
         let serving = tokio::spawn(serve(
             listener,
@@ -630,6 +640,52 @@ async fn serve_one(
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .behaviour;
+                if matches!(
+                    mutation.method.as_str(),
+                    "session.close" | "question.cancel"
+                ) {
+                    state
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .stops
+                        .push((mutation.method.as_str().to_owned(), mutation.action_id));
+                    match behaviour {
+                        Behaviour::EndsAfterReadingARequestToStop => return,
+                        Behaviour::CannotSayWhatBecameOfRequestsToStop => {
+                            state
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .receipts
+                                .push((mutation.action_id, ReceiptState::Unknown));
+                            let _ = writer
+                                .write_message(&ControlFrame::Response(Response {
+                                    request_id: mutation.request_id,
+                                    outcome: Outcome::Error(ProtocolError::new(
+                                        ErrorCode::OutcomeUnknown,
+                                        "this worker cannot say what became of the request",
+                                    )),
+                                }))
+                                .await;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    if mutation.method.as_str() == "question.cancel" {
+                        let arrival = arrive(&state, &mutation);
+                        let outcome = admit(&state, &arrival)
+                            .and_then(|()| cancel(&state, &mutation.params, mutation.action_id));
+                        let _ = writer
+                            .write_message(&ControlFrame::Response(Response {
+                                request_id: mutation.request_id,
+                                outcome: match outcome {
+                                    Ok(value) => Outcome::Ok(value),
+                                    Err(error) => Outcome::Error(error),
+                                },
+                            }))
+                            .await;
+                        continue;
+                    }
+                }
                 if mutation.method.as_str() == "question.answer" {
                     spoil(&state);
                     land_late(&state);
@@ -802,9 +858,16 @@ fn arrive(state: &Mutex<State>, mutation: &kr_protocol::envelope::MutationReques
             .and_then(|value| kr_cbor::from_canonical_value::<ActionId>(value).ok()),
         _ => None,
     };
+    let quoted_revision = match mutation.expected.clone().into_value() {
+        kr_cbor::CanonicalValue::Map(map) => map
+            .get(kr_protocol::action::SUPERSEDES_REVISION_KEY)
+            .and_then(|value| kr_cbor::from_canonical_value::<u64>(value).ok()),
+        _ => None,
+    };
     let arrival = Arrival {
         action_id: mutation.action_id,
         quoted,
+        quoted_revision,
     };
     let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
     let recorded = std::fs::read_dir(&state.store)
@@ -831,7 +894,9 @@ fn admit(state: &Mutex<State>, arrival: &Arrival) -> Result<(), ProtocolError> {
     match (uncertain, arrival.quoted) {
         (None, _) => Ok(()),
         (Some(uncertain), Some(named))
-            if named == uncertain && state.shown.contains(&uncertain) =>
+            if named == uncertain
+                && state.shown.contains(&uncertain)
+                && arrival.quoted_revision == Some(served_revision(&state, uncertain)) =>
         {
             Ok(())
         }
@@ -839,6 +904,20 @@ fn admit(state: &Mutex<State>, arrival: &Arrival) -> Result<(), ProtocolError> {
             ErrorCode::DraftConflict,
             "an earlier action has an uncertain outcome that this one does not name",
         )),
+    }
+}
+
+/// The revision of an action's receipt that the worker serves: a cancellation's receipt stands at a
+/// different revision from an answer's, so a request that quotes the wrong one is told apart.
+fn served_revision(state: &State, action_id: ActionId) -> u64 {
+    if state
+        .stops
+        .iter()
+        .any(|(method, id)| method == "question.cancel" && *id == action_id)
+    {
+        5
+    } else {
+        3
     }
 }
 
@@ -865,9 +944,17 @@ fn read_receipt(state: &Mutex<State>, params: &ParamsValue) -> Result<ParamsValu
         receipt: Receipt {
             action_id: params.action_id,
             actor_id: ActorId::new("local:test").expect("an actor"),
-            method: kr_protocol::method::Method::QuestionAnswer.into(),
+            method: if state
+                .stops
+                .iter()
+                .any(|(method, id)| method == "question.cancel" && *id == params.action_id)
+            {
+                kr_protocol::method::Method::QuestionCancel.into()
+            } else {
+                kr_protocol::method::Method::QuestionAnswer.into()
+            },
             method_version: kr_protocol::method::MethodVersion::V1,
-            revision: U64::new(3),
+            revision: U64::new(served_revision(&state, params.action_id)),
             state: held,
             reason: Nullable::null(),
             payload_digest: Digest256::from_bytes([0; 32]),
@@ -914,6 +1001,38 @@ fn take(
         answered_at_ms: now,
     });
     question.state = QuestionState::Answered;
+    question.revision = QuestionRevision::new(question.revision.get() + 1);
+    question.resolved_at_ms = Nullable::some(now);
+    let whole = QuestionResolveResult::whole(question.clone());
+    state.receipts.push((action_id, ReceiptState::Applied));
+    ParamsValue::from_typed(&whole).map_err(|error| refusal(&error.to_string()))
+}
+
+/// Answers `question.cancel`: cancels the pending question at the revision it names.
+fn cancel(
+    state: &Mutex<State>,
+    params: &ParamsValue,
+    action_id: ActionId,
+) -> Result<ParamsValue, ProtocolError> {
+    let params: kr_protocol::question::QuestionCancelParams = params
+        .to_typed()
+        .map_err(|error| refusal(&error.to_string()))?;
+    let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+    let question = &mut state.question;
+    if question.state.is_resolved() {
+        return Err(ProtocolError::new(
+            ErrorCode::QuestionResolved,
+            "the question is already resolved",
+        ));
+    }
+    if params.question_id != question.question_id || params.expected_revision != question.revision {
+        return Err(ProtocolError::new(
+            ErrorCode::StaleSession,
+            "the question is at another revision",
+        ));
+    }
+    let now = TimestampMs::new(kr_ipc::now_ms().get());
+    question.state = QuestionState::Cancelled;
     question.revision = QuestionRevision::new(question.revision.get() + 1);
     question.resolved_at_ms = Nullable::some(now);
     let whole = QuestionResolveResult::whole(question.clone());
@@ -1154,9 +1273,10 @@ async fn a_worker_of_another_release_retires_no_kept_answer() {
     assert_eq!(host.answers_received(), 0);
 }
 
-/// KR-REQ-11.63: an answer the worker took and whose reply was lost is kept as an answer whose
-/// outcome is not known, and is never called unsent. The next `kr question drafts` finds the
-/// question answered and retires it, so it is never sent twice.
+/// KR-REQ-11.63, KR-REQ-23.24: an answer the worker took and whose reply was lost is kept as an
+/// answer whose outcome is not known, and is never called unsent. The next `kr question drafts`
+/// finds the question answered and retires it, so it is never sent twice, and nothing makes a
+/// replacement for it by itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_answer_whose_reply_was_lost_is_kept_as_unknown_and_never_sent_twice() {
     let host = Host::start(Behaviour::TakesAnswersAndDropsTheReply).await;
@@ -1997,6 +2117,11 @@ impl Host {
         self.state().arrivals.clone()
     }
 
+    /// The closes and cancellations that reached the worker, by method and action.
+    fn stops(&self) -> Vec<(String, ActionId)> {
+        self.state().stops.clone()
+    }
+
     /// Records the answer `yes` under the send `id` and nothing more, as an attempt does before it
     /// sends: what a crash right after leaves.
     fn record_pair(&self, id: ActionId) {
@@ -2135,9 +2260,10 @@ async fn an_answer_whose_reply_was_lost_after_the_worker_took_it_is_found_taken(
     assert!(!host.record().exists());
 }
 
-/// KR-ACC-009, KR-REQ-11.63: an uncertain outcome is shown before a new send names it. `drafts`
-/// offers the answer with the uncertain send, and `send` names it in the one command: the output and
-/// the document name the earlier outcome, and the worker saw the quote.
+/// KR-ACC-009, KR-REQ-11.63, KR-REQ-23.24: an uncertain outcome is shown before a new send names
+/// it. `drafts` offers the answer with the uncertain send, and `send` names it in the one command:
+/// the output and the document name the earlier outcome, and the worker saw the quote, with the
+/// revision of the receipt it had shown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_uncertain_send_is_named_by_the_next_send_and_shown_first() {
     let host = Host::start(Behaviour::CannotSayWhatBecameOfAnswers).await;
@@ -2171,10 +2297,15 @@ async fn an_uncertain_send_is_named_by_the_next_send_and_shown_first() {
         Some(uncertain),
         "the send names the uncertain one"
     );
+    assert_eq!(
+        arrivals[1].quoted_revision,
+        Some(3),
+        "and the revision of its receipt that the worker had shown"
+    );
     assert!(!host.kept().exists());
 }
 
-/// KR-REQ-11.63: the same, with `--json`: the document names the earlier outcome before the new
+/// KR-REQ-11.63, KR-REQ-23.24: the same, with `--json`: the document names the earlier outcome before the new
 /// result, and a failed send carries it too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_earlier_outcome_is_named_in_the_document_of_a_send_and_of_a_failed_one() {
@@ -2302,4 +2433,130 @@ async fn a_record_that_describes_no_answer_is_swept_and_one_that_cannot_be_read_
     let (status, document) = host.json(&["question", "send", &question]);
     assert_ne!(status, Some(0), "{document}");
     assert_eq!(host.arrivals().len(), 0, "nothing was sent");
+}
+
+/// KR-REQ-23.24, the client's half, for a cancellation: a cancellation whose outcome the worker could
+/// not establish ends with `OUTCOME_UNKNOWN`, names its action and the command that reads it back,
+/// and is sent once. A plain run again is refused by the worker, which holds the earlier outcome
+/// against it, so nothing replaces it by itself. Only `--after-unknown` with that action reads the
+/// receipt, shows it, and sends a new action that names the action and the revision shown; a
+/// receipt that is not an unknown outcome is not named, and sends nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancellation_of_unknown_outcome_is_sent_again_only_by_the_persons_later_request() {
+    let host = Host::start(Behaviour::CannotSayWhatBecameOfRequestsToStop).await;
+    let question = host.question();
+    let session = host.state().question.session_id;
+
+    let (status, stopped) = host.json(&["question", "cancel", &question]);
+    assert_eq!(status, Some(1), "{stopped}");
+    assert_eq!(stopped["code"], "OUTCOME_UNKNOWN", "{stopped}");
+    let first = host.stops()[0].1;
+    let said = stopped["message"].as_str().expect("a message");
+    assert!(
+        said.contains(&first.to_string()),
+        "names the action: {said}"
+    );
+    assert!(
+        said.contains(&format!("kr action read {first} --session {session}")),
+        "and the command that reads it back: {said}"
+    );
+    assert!(
+        said.contains(&format!("--after-unknown {first}")),
+        "and the later request: {said}"
+    );
+    assert_eq!(host.stops().len(), 1, "it was sent once");
+
+    // The worker serves again. A plain run is not the person's later request: it quotes nothing,
+    // and the worker refuses it while the earlier outcome stands.
+    host.behave(Behaviour::Serves);
+    let (status, plain) = host.json(&["question", "cancel", &question]);
+    assert_ne!(status, Some(0), "{plain}");
+    assert_eq!(host.stops().len(), 2, "this run sent one request");
+    assert_eq!(host.arrivals()[0].quoted, None, "and it quoted nothing");
+    assert_eq!(
+        host.state().question.state,
+        QuestionState::Pending,
+        "the worker held the earlier outcome against it"
+    );
+
+    // The person's later request.
+    let output = host.kr(&[
+        "question",
+        "cancel",
+        &question,
+        "--after-unknown",
+        &first.to_string(),
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let shown = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        shown.contains(&first.to_string()) && shown.contains("revision 5"),
+        "the earlier outcome is shown first: {shown}"
+    );
+    assert!(host.state().shown.contains(&first), "the receipt was read");
+    let last = host.stops().last().expect("a request").1;
+    assert_ne!(last, first, "a new action");
+    assert_eq!(host.state().question.state, QuestionState::Cancelled);
+    let arrivals = host.arrivals();
+    assert_eq!(arrivals.len(), 2);
+    assert_eq!(
+        arrivals[1].quoted,
+        Some(first),
+        "it names the earlier action"
+    );
+    assert_eq!(
+        arrivals[1].quoted_revision,
+        Some(5),
+        "and the revision of the receipt that was shown"
+    );
+
+    // An action that is not an outcome nobody knows is not one a later cancellation names.
+    let sent = host.stops().len();
+    let (status, refused) = host.json(&[
+        "question",
+        "cancel",
+        &question,
+        "--after-unknown",
+        &last.to_string(),
+    ]);
+    assert_eq!(status, Some(2), "{refused}");
+    assert_eq!(refused["code"], "INVALID_ARGUMENT", "{refused}");
+    assert_eq!(host.stops().len(), sent, "and nothing was sent");
+}
+
+/// KR-REQ-23.24, the client's half, for a close: a connection that ends after the close was read, and
+/// a worker that cannot say what became of it, each end `kr close` with `OUTCOME_UNKNOWN`, naming
+/// the action it was sent as and the command that reads it back. It is sent once, under that action,
+/// and nothing is sent again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_whose_outcome_is_not_known_names_its_action_and_is_sent_once() {
+    for behaviour in [
+        Behaviour::EndsAfterReadingARequestToStop,
+        Behaviour::CannotSayWhatBecameOfRequestsToStop,
+    ] {
+        let host = Host::start(behaviour).await;
+        let session = host.state().question.session_id;
+        let (status, stopped) = host.json(&["close", "1"]);
+        assert_eq!(status, Some(1), "{behaviour:?}: {stopped}");
+        assert_eq!(
+            stopped["code"], "OUTCOME_UNKNOWN",
+            "{behaviour:?}: {stopped}"
+        );
+        let stops = host.stops();
+        assert_eq!(stops.len(), 1, "{behaviour:?}: it was sent once");
+        assert_eq!(stops[0].0, "session.close");
+        let said = stopped["message"].as_str().expect("a message");
+        assert!(
+            said.contains(&format!(
+                "kr action read {} --session {session}",
+                stops[0].1
+            )),
+            "{behaviour:?}: {said}"
+        );
+    }
 }

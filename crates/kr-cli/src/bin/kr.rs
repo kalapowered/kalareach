@@ -490,17 +490,17 @@ async fn run(cli: Cli) -> Result<Completion> {
                 Some((known, descriptor)) => {
                     match open_controller(&known.paths, build_id()).await {
                         Ok(mut client) => {
-                            let outcome = client
-                                .mutate(
-                                    Method::SessionClose,
-                                    ActionId::new(kr_ipc::new_uuid()),
-                                    session_target(known.environment_id, descriptor.session_id),
-                                    &SessionCloseParams {
-                                        session_id: descriptor.session_id,
-                                    },
-                                )
-                                .await?;
-                            typed::<SessionCloseResult>(outcome)?
+                            kr_cli::unknown::mutate_naming::<_, SessionCloseResult>(
+                                &mut client,
+                                Method::SessionClose,
+                                session_target(known.environment_id, descriptor.session_id),
+                                &SessionCloseParams {
+                                    session_id: descriptor.session_id,
+                                },
+                                None,
+                                &close_unknown(shown!("{}", descriptor.session_id), wanted),
+                            )
+                            .await?
                         }
                         Err(_) => {
                             let mut client = open_worker(&descriptor, build_id()).await?;
@@ -509,20 +509,17 @@ async fn run(cli: Cli) -> Result<Completion> {
                                 descriptor.display_number.get(),
                                 "close",
                             )?;
-                            let outcome = client
-                                .mutate(
-                                    Method::SessionClose,
-                                    ActionId::new(kr_ipc::new_uuid()),
-                                    session_target(
-                                        descriptor.environment_id,
-                                        descriptor.session_id,
-                                    ),
-                                    &SessionCloseParams {
-                                        session_id: descriptor.session_id,
-                                    },
-                                )
-                                .await?;
-                            typed::<SessionCloseResult>(outcome)?
+                            kr_cli::unknown::mutate_naming::<_, SessionCloseResult>(
+                                &mut client,
+                                Method::SessionClose,
+                                session_target(descriptor.environment_id, descriptor.session_id),
+                                &SessionCloseParams {
+                                    session_id: descriptor.session_id,
+                                },
+                                None,
+                                &close_unknown(shown!("{}", descriptor.session_id), wanted),
+                            )
+                            .await?
                         }
                     }
                 }
@@ -532,15 +529,15 @@ async fn run(cli: Cli) -> Result<Completion> {
                     let mut client = open_controller(&environment.paths, build_id()).await?;
                     let session_id =
                         kr_cli::resolve::retained_session(&mut client, &selector).await?;
-                    let outcome = client
-                        .mutate(
-                            Method::SessionClose,
-                            ActionId::new(kr_ipc::new_uuid()),
-                            session_target(environment.environment_id, session_id),
-                            &SessionCloseParams { session_id },
-                        )
-                        .await?;
-                    typed::<SessionCloseResult>(outcome)?
+                    kr_cli::unknown::mutate_naming::<_, SessionCloseResult>(
+                        &mut client,
+                        Method::SessionClose,
+                        session_target(environment.environment_id, session_id),
+                        &SessionCloseParams { session_id },
+                        None,
+                        &close_unknown(shown!("{}", session_id), wanted),
+                    )
+                    .await?
                 }
             };
             if cli.json {
@@ -2284,6 +2281,19 @@ fn parse_environment(named: Option<&str>) -> Result<Option<EnvironmentId>> {
         .transpose()
 }
 
+/// What `kr close` says when its close ended with an outcome nobody established: the session whose
+/// worker keeps the receipt, and the environment when the command was given one.
+fn close_unknown(session: Shown, environment: Option<EnvironmentId>) -> kr_cli::unknown::Unknown {
+    kr_cli::unknown::Unknown {
+        what: "the close",
+        read_back: kr_cli::unknown::ReadBack::of(
+            session,
+            environment.map(|environment_id| shown!("{}", environment_id)),
+        ),
+        later: None,
+    }
+}
+
 fn session_target(environment_id: EnvironmentId, session_id: SessionId) -> ActionTarget {
     ActionTarget {
         environment_id,
@@ -2391,7 +2401,14 @@ async fn question(
         }
         QuestionCommand::Cancel(arguments) => {
             let question_id = parse_question(&arguments.question)?;
-            let item = question::cancel(paths, question_id, build_id()).await?;
+            let after_unknown = arguments
+                .after_unknown
+                .as_deref()
+                .map(|text| {
+                    kr_cli::daemon::identifier::<kr_protocol::ids::ActionId>(text, "an action")
+                })
+                .transpose()?;
+            let item = question::cancel(paths, question_id, after_unknown, build_id()).await?;
             if json {
                 output::document(
                     &Document::new()
