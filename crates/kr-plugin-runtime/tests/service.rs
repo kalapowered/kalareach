@@ -3264,7 +3264,10 @@ async fn kr_req_11_39_an_observation_and_a_call_on_one_connection_are_both_answe
 
     // And the handoff that never waits at all does not even write a frame: another task holds the
     // connection's writer, and the events are handed over all the same, and written once it lets
-    // go. Everything handed over so far is written first, so that the queue has room.
+    // go. Everything handed over so far is written first, so that the queue has room. The task that
+    // writes them is held too, before it asks for the writer: a write that has asked for it is given
+    // ten seconds to get it, which a machine that stops this case for that long would run out, and
+    // the case decides by the steps it takes and not by that.
     tokio::time::timeout(HANG_GUARD, async {
         while client.offered_bytes() != 0 {
             tokio::task::yield_now().await;
@@ -3273,6 +3276,7 @@ async fn kr_req_11_39_an_observation_and_a_call_on_one_connection_are_both_answe
     .await
     .expect("the events handed over so far were never written");
     let writer = client.hold_writer().await;
+    let writes = client.hold_offered_writes();
     for index in 2..4 {
         let handoff = client.offer(
             request.binding_id,
@@ -3290,6 +3294,7 @@ async fn kr_req_11_39_an_observation_and_a_call_on_one_connection_are_both_answe
         "an event handed over while the writer was held was written"
     );
     drop(writer);
+    writes.release();
     tokio::time::timeout(HANG_GUARD, async {
         while client.offered_bytes() != 0 {
             tokio::task::yield_now().await;

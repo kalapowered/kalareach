@@ -739,7 +739,10 @@ pub enum ResponseBody {
     },
     /// The binding is gone.
     Unbound {
-        /// Whether there was one to remove.
+        /// Whether this request is the one that ended the connection's registration of the
+        /// binding. A second request about a registration whose removal is already under way is
+        /// answered at the same point and says false, though a registration was there when it was
+        /// read.
         existed: bool,
     },
     /// A revision of a binding's facts or attachments was accepted.
