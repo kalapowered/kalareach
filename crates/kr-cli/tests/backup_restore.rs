@@ -1045,7 +1045,8 @@ fn borrowed(members: &[(String, Vec<u8>)]) -> Vec<(&str, Vec<u8>)> {
 /// and the plan lists those five as not restored, with a reason each; none of their bytes is in
 /// the restored folder, and the host's own secrets, configuration and devices are as they were.
 /// Not shown here: that a backup is made without those keys, which the daemon's production case
-/// shows, or the kind the table gives each name, which the library's case shows.
+/// reads in part (its doc says which), or the kind the table gives each name, which the library's
+/// case shows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fresh_host_restores_a_backup_from_the_kit_alone_and_changes_nothing_of_its_own() {
     let world = World::new();
@@ -1578,8 +1579,10 @@ async fn a_restore_from_a_file_is_confirmed_apart_from_one_that_records_a_genera
 /// the plan lists those five as not restored, with the reason of each kind, the folder holds
 /// exactly the three files the restore writes and its record, none of the five's bytes is in it,
 /// and the host's own secrets, configuration and devices are as they were. Not shown here: that an
-/// export holds none of those keys, which the companion's case shows for what it writes; or the
-/// kind the table gives each name, which the library's case shows.
+/// export holds none of those keys, which the companion's case reads for the export of the bundle
+/// alone and the library's case for the equality of an archive export with the service's bytes (a
+/// successful export of an archive by the companion is read by neither); or the kind the table
+/// gives each name, which the library's case shows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restore_from_an_export_file_needs_no_service_and_no_sign_in() {
     let world = World::new();

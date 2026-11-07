@@ -4029,28 +4029,32 @@ fn x25519_secret_of(seed: &[u8]) -> Vec<u8> {
     aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA512, seed).as_ref()[..32].to_vec()
 }
 
-/// KR-REQ-20.17, the host's own backup production only: a generation the daemon makes holds the
-/// members the convention names, each of a kind the material table lets a backup carry, and no
-/// object of it holds a private key this host keeps. The host keeps two sets of four keys
-/// (transport, which is the reusable endpoint key; authorisation, which is the control-signing key;
-/// stored envelope; and notification preview): the controller identity that signs its workers'
-/// tokens, and the device keys it pairs with. It also keeps a backup writer's key. The case reads
-/// all nine seeds from the secret store the daemon wrote them to, and for the four X25519 keys
-/// (whose private key is made from the seed by a hash, so that the seed is not the key) the
-/// private key too, checked against the public key the pair has. It reads each object of the
-/// generation on its own, as the recovery recipient opens it: the descriptor, which is not
-/// encrypted, the decrypted manifest, and each member's plaintext, so a member that shares a name
-/// with another is read as well; and it asserts the service holds no object beyond the manifest
-/// and the members. Each key is looked for as bytes, in hexadecimal of either case, in either
-/// base64 alphabet wherever it lies in a longer value, and as a list of numbers. The controls are
-/// the scan finding each form of a seed where one is put, in a member of the same name as another,
-/// and the session's own output in the session's member, so the scan reads what the members hold.
-/// Not shown here: a key in a binary list of integers, split, reversed or otherwise transformed;
-/// the ciphertext of the objects, which holds no readable key; the member key wraps in the manifest
-/// object, whose sealed keys are ciphertext and whose clear context fields (object, generation and
-/// recipient identifiers) the reader does not hand out, so they are not scanned; that a restore
-/// refuses a member under a reserved name or a revoked grant, which the restore cases show; or the
-/// other data paths of backup and recovery material.
+/// KR-REQ-20.17, the host's own backup production only, and only what this case reads: a generation
+/// the daemon makes holds the members the convention names, each of a kind the material table lets
+/// a backup carry, and the objects the case opens hold no private key this host keeps. The host
+/// keeps two sets of four keys (transport, which is the reusable endpoint key; authorisation, which
+/// is the control-signing key; stored envelope; and notification preview): the controller identity
+/// that signs its workers' tokens, and the device keys it pairs with. It also keeps a backup
+/// writer's key. The case reads all nine seeds from the secret store the daemon wrote them to, and
+/// for the four X25519 keys (whose private key is made from the seed by a hash, so that the seed is
+/// not the key) the private key too, checked against the public key the pair has. It reads, each on
+/// its own, the descriptor as the host recorded it when it sealed the generation (it is not
+/// encrypted), the signed manifest decrypted and verified, and each member's plaintext, so a member
+/// that shares a name with another is read as well; and it asserts the service holds no object
+/// beyond the manifest and the members. Each key is looked for as bytes, in hexadecimal of either
+/// case, in either base64 alphabet wherever it lies in a longer value, and as a list of numbers.
+/// The controls are the scan finding each form of a seed where one is put, in a member of the same
+/// name as another, and the session's own output in the session's member, so the scan reads what
+/// the members hold. Not shown here: the member key wraps in the decrypted manifest object, which
+/// the reader does not hand out, so an unused wrap (its sealed keys and its clear context fields)
+/// could hold a key and pass; the publication the service holds, whose fields beyond the
+/// descriptor (the writer's key identifier, the time and the signature) are not read, and the
+/// descriptor as the service holds it, which is not read apart from the host's record; the stored
+/// bytes of the objects and the requests the daemon sent the service, which are ciphertext and are
+/// not read (the plaintexts are read through the opened archive); a key in a binary list of
+/// integers, split, reversed or otherwise transformed; that a restore refuses a member under a
+/// reserved name or a revoked grant, which the restore cases show; or the other data paths of backup
+/// and recovery material.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_generation_the_host_makes_holds_none_of_the_private_keys_the_host_keeps() {
     use kr_crypto::backup::{Material, may_back_up, member_material};
