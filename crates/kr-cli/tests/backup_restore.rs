@@ -2215,39 +2215,45 @@ fn held_open(error: &std::io::Error) -> bool {
     cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33))
 }
 
-/// Whether a failure to look at `path` leaves nothing there to scan: it was removed since its
-/// folder was listed or was never made, or, on Windows, it is a lock file another process holds
-/// open without sharing it, as the daemon holds its own (it records the daemon's process id, which
-/// holds no secret). A lock file nothing holds is read, and so is every lock file on Unix.
-fn nothing_to_scan(path: &Path, error: &std::io::Error) -> bool {
+/// The name of the lock file the daemon holds for its environment (the file `EnvironmentPaths::singleton_lock` names).
+const HOST_LOCK_FILE: &str = "controller.lock";
+
+/// Whether a file that cannot be read is the daemon's own lock file, which the daemon holds open on
+/// Windows without sharing it (it records the daemon's process id, which holds no secret). A lock
+/// file nothing holds is read, and so is every lock file on Unix. A directory or an entry that is
+/// named like one is not this, whatever the error.
+fn is_the_daemons_held_lock_file(path: &Path, error: &std::io::Error) -> bool {
+    held_open(error) && path.file_name().is_some_and(|name| name == HOST_LOCK_FILE)
+}
+
+/// Whether a failure to look at something leaves nothing there to scan: it was removed since its
+/// folder was listed, or was never made.
+fn is_gone(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound
-        || (held_open(error)
-            && path
-                .extension()
-                .is_some_and(|extension| extension == "lock"))
 }
 
 /// Every file below `root`, by relative path.
 ///
 /// A folder, an entry or a file the scan cannot look at would leave a scan of the tree vacuous, so
-/// it fails the case, unless it leaves nothing there to scan ([`nothing_to_scan`]). A socket or a
-/// pipe is not a file and is not read.
+/// it fails the case, unless it is gone ([`is_gone`]) or is the daemon's lock file held open
+/// ([`is_the_daemons_held_lock_file`], a file that is read, nothing else). A socket or a pipe is not
+/// a file and is not read.
 fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
     fn walk(root: &Path, at: &Path, into: &mut BTreeMap<String, Vec<u8>>) {
         let entries = match std::fs::read_dir(at) {
             Ok(entries) => entries,
-            Err(error) if nothing_to_scan(at, &error) => return,
+            Err(error) if is_gone(&error) => return,
             Err(error) => panic!("{} cannot be listed: {error}", at.display()),
         };
         for entry in entries {
             let path = match entry {
                 Ok(entry) => entry.path(),
-                Err(error) if nothing_to_scan(at, &error) => continue,
+                Err(error) if is_gone(&error) => continue,
                 Err(error) => panic!("an entry of {} cannot be read: {error}", at.display()),
             };
             let kind = match std::fs::metadata(&path) {
                 Ok(kind) => kind,
-                Err(error) if nothing_to_scan(&path, &error) => continue,
+                Err(error) if is_gone(&error) => continue,
                 Err(error) => panic!("{} cannot be examined: {error}", path.display()),
             };
             if kind.is_dir() {
@@ -2255,7 +2261,11 @@ fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
             } else if kind.is_file() {
                 let bytes = match std::fs::read(&path) {
                     Ok(bytes) => bytes,
-                    Err(error) if nothing_to_scan(&path, &error) => continue,
+                    Err(error)
+                        if is_gone(&error) || is_the_daemons_held_lock_file(&path, &error) =>
+                    {
+                        continue;
+                    }
                     Err(error) => panic!("{} cannot be read: {error}", path.display()),
                 };
                 // Named with `/` between its parts on every platform, so a case compares a name
@@ -3837,4 +3847,92 @@ fn a_tree_whose_removal_is_refused_is_removed_when_the_file_is_let_go_of() {
         "the first removal was refused, which is what the case is about"
     );
     assert!(!root.exists(), "{} is left", root.display());
+}
+
+/// The scan's exception for a held lock file covers the daemon's lock file by its name and nothing
+/// else: not a directory or a file named like a lock file.
+#[cfg(windows)]
+#[test]
+fn the_scans_exception_for_a_held_file_is_the_daemons_lock_file_alone() {
+    let sharing_violation = std::io::Error::from_raw_os_error(32);
+    assert!(is_the_daemons_held_lock_file(
+        Path::new(r"C:\host\s\controller.lock"),
+        &sharing_violation
+    ));
+    for other in [
+        r"C:\host\s\other.lock",
+        r"C:\host\s\controller.lock.d\inner",
+        r"C:\host\s\directory.lock",
+    ] {
+        assert!(
+            !is_the_daemons_held_lock_file(Path::new(other), &sharing_violation),
+            "{other} is not the daemon's lock file"
+        );
+    }
+    assert!(
+        !is_the_daemons_held_lock_file(
+            Path::new(r"C:\host\s\controller.lock"),
+            &std::io::Error::from_raw_os_error(5)
+        ),
+        "an access that is refused is not a file held open"
+    );
+}
+
+/// A folder the account cannot list fails the scan of the tree it is in, and so does nothing less:
+/// a scan that passed over it would pass on what it holds unread.
+#[test]
+fn a_folder_the_account_cannot_list_fails_the_scan() {
+    let place = kr_ipc::testing::PrivateTempDir::create();
+    let hidden = place.path().join("hidden");
+    std::fs::create_dir(&hidden).expect("a folder");
+    std::fs::write(hidden.join("secret"), b"x").expect("a file in it");
+    let restore = denying_a_listing(&hidden);
+    let listed = std::fs::read_dir(&hidden).map(|_| ());
+    let scanned = std::panic::catch_unwind(|| tree(place.path()));
+    restore();
+    // An account that cannot be denied a listing (the superuser on Unix) shows nothing here.
+    if cfg!(unix) && listed.is_ok() {
+        eprintln!("this account can list a folder whatever its mode: nothing is shown");
+        return;
+    }
+    assert!(
+        listed.is_err(),
+        "the folder could still be listed: this account cannot be denied a listing here, and the case shows nothing"
+    );
+    assert!(
+        scanned.is_err(),
+        "the scan went past a folder it could not list"
+    );
+}
+
+/// Makes `folder` one this account cannot list, and returns what undoes it.
+#[cfg(windows)]
+fn denying_a_listing(folder: &Path) -> impl FnOnce() + '_ {
+    let icacls = Path::new(&std::env::var_os("SystemRoot").expect("a system directory"))
+        .join("System32")
+        .join("icacls.exe");
+    let denied = std::process::Command::new(&icacls)
+        .arg(folder)
+        .args(["/deny", "*S-1-1-0:(RD)"])
+        .output()
+        .expect("icacls runs");
+    assert!(denied.status.success(), "icacls: {denied:?}");
+    move || {
+        let _ = std::process::Command::new(&icacls)
+            .arg(folder)
+            .args(["/remove:d", "*S-1-1-0"])
+            .output();
+    }
+}
+
+/// Makes `folder` one this account cannot list, and returns what undoes it.
+#[cfg(unix)]
+fn denying_a_listing(folder: &Path) -> impl FnOnce() + '_ {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o000))
+        .expect("a folder nobody may list");
+    move || {
+        let _ = std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o700));
+    }
 }
