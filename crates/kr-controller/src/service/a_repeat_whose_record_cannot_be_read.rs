@@ -271,3 +271,75 @@ async fn a_voice_change_whose_claim_cannot_be_read_where_it_is_made_is_told_the_
         .expect_err("a claim that cannot be read is not one this change may be made under");
     assert_eq!(unread.code(), ErrorCode::OutcomeUnknown, "{unread}");
 }
+
+/// KR-REQ-09.09: a voice change whose claim cannot even be begun, because another writer holds the
+/// store where the claim's transaction opens, is told the outcome is unknown. The claim's
+/// transaction is where a copy that found no record at the early look meets one it cannot read, and
+/// that is as true of a transaction that never opened as of a read that failed in it. A claim that
+/// cannot be written is another matter, and keeps the storage word.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_voice_change_whose_claim_cannot_be_begun_is_told_the_outcome_is_unknown() {
+    let (temp, controller) = daemon().await;
+    let actor_id = ActorId::new("local:test").expect("a principal");
+    let mutation = voice_stop_request(&temp);
+    let registry = rusqlite::Connection::open(temp.environment().registry_database())
+        .expect("the registry opens beside the daemon's own handle");
+    registry
+        .busy_timeout(std::time::Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    let accepted = kr_transport::window::AcceptedDeadline {
+        deadline: controller
+            .clock
+            .now()
+            .checked_add(std::time::Duration::from_secs(30))
+            .expect("a deadline half a minute out"),
+        bound: kr_transport::window::DeadlineBound::RequestedTtl,
+    };
+    let carried = super::a_close_a_worker_never_answers::admission(&controller, accepted).await;
+    let revision = controller.policy().authority_revision();
+
+    let (arrived, go) = controller.before_a_voice_change_claims.arm();
+    let making = tokio::spawn({
+        let controller = std::sync::Arc::clone(&controller);
+        let mutation = mutation.clone();
+        async move {
+            controller
+                .voice_mutation(
+                    super::voice_actions::VoiceIngress {
+                        actor_id,
+                        actor: crate::voice::VoiceActor::Owner,
+                        route: None,
+                    },
+                    &mutation,
+                    Method::VoiceStop,
+                    revision,
+                    carried,
+                )
+                .await
+        }
+    });
+    arrived.await.expect("the change has looked for a record");
+    // Another writer holds the store, and the claim's transaction does not wait for it.
+    controller
+        .sharing()
+        .grants()
+        .wait_for_storage_up_to(std::time::Duration::ZERO)
+        .expect("the store waits no time for another writer");
+    registry
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("another writer holds the store");
+    let _ = go.send(());
+    let given = making.await.expect("the change ran");
+    registry
+        .execute_batch("ROLLBACK")
+        .expect("the other writer lets the store go");
+    controller
+        .sharing()
+        .grants()
+        .wait_for_storage_up_to(std::time::Duration::from_secs(5))
+        .expect("the store waits as it does");
+    let unbegun = given
+        .into_answer()
+        .expect_err("a claim that cannot be begun is not one this change may be made under");
+    assert_eq!(unbegun.code(), ErrorCode::OutcomeUnknown, "{unbegun}");
+}
