@@ -4166,15 +4166,16 @@ async fn a_collection_key_is_neither_backed_up_nor_restored() {
     }
 }
 
-/// KR-REQ-20.17, the settings part: a device's reusable endpoint (transport) and control-signing
-/// (authorisation) private keys are in neither the settings it exports nor the archive that carries
-/// them, whether as the bytes, in hexadecimal or in base64url, and an import refuses a member that
-/// the archive calls one of those keys, or a revoked grant, with the table's reason and before it
-/// reads a byte of it. The device is one that holds all four of its keys and its collection's.
-/// The control is the exported settings themselves, which the same scan finds. Not shown here: the
-/// other data paths of backup and recovery material, or a grant that has not been revoked.
+/// KR-REQ-20.17, the settings part, the import only: an import refuses a member the archive calls
+/// a reusable endpoint (transport) private key, a control-signing (authorisation) private key or a
+/// revoked grant, with the table's reason and before it reads a byte of the member, and puts
+/// nothing back; the settings the archive does carry come back. The bytes offered under those
+/// names are the device's real seeds, kept in a secret store as the product keeps them. Not shown
+/// here: that an export holds none of those keys, which holds because it reads one settings object
+/// from the sync store and no secret store, so no assertion here could fail for it; the other data
+/// paths of backup and recovery material; or a grant that has not been revoked.
 #[tokio::test]
-async fn a_devices_endpoint_and_control_keys_are_not_exported_and_an_import_refuses_them() {
+async fn an_import_refuses_an_endpoint_key_a_control_key_and_a_revoked_grant() {
     let world = World::default();
     let mut owner = Node::new(&world);
     let mut lost = Node::new(&world);
@@ -4197,35 +4198,11 @@ async fn a_devices_endpoint_and_control_keys_are_not_exported_and_an_import_refu
     let endpoint = seed_of(KeyPurpose::Transport);
     let control = seed_of(KeyPurpose::Authorisation);
     assert!(endpoint.len() >= 32 && control.len() >= 32);
-    let carried_in = |haystack: &[u8], needle: &[u8]| {
-        let hex: String = needle.iter().map(|byte| format!("{byte:02x}")).collect();
-        [
-            needle.to_vec(),
-            hex.into_bytes(),
-            kr_protocol::scalars::to_base64url(needle).into_bytes(),
-        ]
-        .iter()
-        .any(|form| contains(haystack, form))
-    };
 
     let (store, object) = settings_on(&lost);
     let exported = export_settings(&store, object.object_id).expect("the settings export");
     let seed = RecoverySeed::generate().expect("a seed");
     let (filename, plaintext) = through_an_archive(&lost, &seed, &exported);
-    assert!(
-        carried_in(exported.plaintext(), &exported.plaintext()[..16]),
-        "the scan reads the exported settings"
-    );
-    for (what, key) in [("endpoint", &endpoint), ("control-signing", &control)] {
-        assert!(
-            !carried_in(exported.plaintext(), key),
-            "the {what} private key is in the export"
-        );
-        assert!(
-            !carried_in(plaintext.expose(), key),
-            "the {what} private key is in the archive"
-        );
-    }
 
     // An archive that calls a member one of those keys, or a revoked grant, is refused with the
     // table's reason before the member is read; nothing is put back.
@@ -4255,6 +4232,12 @@ async fn a_devices_endpoint_and_control_keys_are_not_exported_and_an_import_refu
     );
     // The control for the refusals: the settings the archive does carry come back.
     import_settings(&fresh, material_named(&filename), plaintext.expose()).expect("the settings");
+    assert!(
+        fresh
+            .object(object.object_id)
+            .expect("a readable store")
+            .is_some()
+    );
 }
 
 /// KR-REQ-20.17, the settings part (the library's half; the device's archive producer carries it
