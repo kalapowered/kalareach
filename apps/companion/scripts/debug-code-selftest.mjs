@@ -7,11 +7,12 @@
 // its extension for the names that code is made of. Compiling the release is not needed to test it:
 // the bundle is built here, with executables that hold those names or do not.
 import { Buffer } from 'node:buffer'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-import { debugCodeIn, DEBUG_CODE_NAMES } from './debug-code.mjs'
+import { debugCodeIn, DEBUG_CODE_NAMES, RUST_PROBE_NAMES } from './debug-code.mjs'
 
 const work = mkdtempSync(join(tmpdir(), 'kr-debug-code-'))
 let failures = 0
@@ -54,6 +55,38 @@ for (const name of DEBUG_CODE_NAMES) {
   held(`the application holding ${name} is found`, [`KalaReach holds ${name}`], debugCodeIn(bundle(`app-${name}`, { app: `x${name}y` })))
   held(`the extension holding ${name} is found`, [`PlugIns/KalaReachNotificationService.appex/KalaReachNotificationService holds ${name}`], debugCodeIn(bundle(`ext-${name}`, { extension: `x${name}y` })))
 }
+
+// The Rust device probe is compiled into any build that has debug assertions on, so a release built
+// with them forced on keeps it. Its words are what the scan finds it by.
+held(
+  "an application that holds the Rust device probe's request file name and a check name is found",
+  ['KalaReach holds device-request.json', 'KalaReach holds locked start: the records are not open'],
+  debugCodeIn(bundle('rust-probe', { app: 'x device-request.json y locked start: the records are not open z' }))
+)
+const crateSources = join(dirname(fileURLToPath(import.meta.url)), '..', 'src-tauri', 'src')
+const sourcesOf = (directory) =>
+  readdirSync(directory, { withFileTypes: true }).flatMap((entry) =>
+    entry.isDirectory() ? sourcesOf(join(directory, entry.name)) : entry.name.endsWith('.rs') ? [join(directory, entry.name)] : []
+  )
+const probeSource = join(crateSources, 'device_probe.rs')
+held('the Rust probe has names to be found by', true, RUST_PROBE_NAMES.length > 0)
+held(
+  'every name of the Rust probe is longer than fifteen bytes, the least this scan asks of a name it finds by its bytes',
+  [],
+  RUST_PROBE_NAMES.filter((name) => Buffer.byteLength(name) <= 15)
+)
+held(
+  "every name of the Rust probe is a string literal of the probe's own source, not only a word in a comment",
+  [],
+  RUST_PROBE_NAMES.filter((name) => !readFileSync(probeSource, 'utf8').includes(`"${name}"`))
+)
+held(
+  'no other source of the crate holds a name of the Rust probe, so a release without the probe holds none',
+  [],
+  sourcesOf(crateSources)
+    .filter((file) => file !== probeSource)
+    .flatMap((file) => RUST_PROBE_NAMES.filter((name) => readFileSync(file, 'utf8').includes(name)).map((name) => `${file} holds ${name}`))
+)
 
 held('a name in both is reported for both', 2, debugCodeIn(bundle('both', { app: 'KRDeviceProbe', extension: 'KRDeviceProbe' })).length)
 held('a name split across two reads is still found', ['KalaReach holds DeviceProbe'], debugCodeIn(bundle('long', { app: `${'a'.repeat(3_000_000)}KRDeviceProbe${'b'.repeat(10)}` })))

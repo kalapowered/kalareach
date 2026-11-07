@@ -12,6 +12,21 @@ import { join, relative } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 /**
+ * The words of the Rust device probe, which is compiled into any build that has debug assertions on,
+ * a release built with them forced on included. Each is a string literal of the probe's own source
+ * and of no other, and is longer than fifteen bytes, the least this scan asks of a name it finds by
+ * its bytes (a shorter literal may be made into instructions): the name of the probe's request file
+ * and the names of its checks. A debug build of the application holds every one as bytes.
+ */
+export const RUST_PROBE_NAMES = [
+  'device-request.json',
+  'locked start: the records are not open',
+  'unlock: the records open without a relaunch',
+  'the system says protected data is available',
+  'the paired hosts are out of the backup'
+]
+
+/**
  * The names the debug-only code is made of, and what no release may link.
  *
  * A string literal of fifteen bytes or fewer can be compiled into instructions rather than kept as
@@ -34,6 +49,7 @@ export const DEBUG_CODE_NAMES = [
   'ProbeFixture',
   'NotificationRecorder',
   'KeychainSweepPlan',
+  ...RUST_PROBE_NAMES,
   // Firebase's analytics library writes an installation of its own, whatever else is switched off.
   // These are names only that library holds: the core and messaging libraries, which are linked,
   // look up and refer to `FIRAnalytics` and its interop by name, so that name proves nothing.
