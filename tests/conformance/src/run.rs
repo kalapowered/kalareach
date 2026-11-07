@@ -1593,6 +1593,40 @@ mod tests {
         assert!(ends.contains("only Cargo's account"), "{ends}");
     }
 
+    #[test]
+    fn cargos_account_of_a_program_that_could_not_run_is_in_the_end() {
+        // The runner never started, or was killed: the program wrote nothing, and the only cause
+        // is in Cargo's account, after its line about the program.
+        for (cause, shown) in [
+            (
+                "could not execute process `/x/lister list-one a-0123 --list` (never executed)\n\
+                 \nCaused by:\n  No such file or directory (os error 2)",
+                ["never executed", "No such file or directory"],
+            ),
+            (
+                "process didn't exit successfully: `/x/lister list-one a-0123 --list` (signal: 9, SIGKILL: kill)",
+                ["signal: 9", "SIGKILL"],
+            ),
+        ] {
+            let text = format!(
+                "    Finished `test` profile [unoptimized] target(s) in 0.1s\n\
+                 \x20    Running unittests src/lib.rs (target/debug/deps/a-0123)\n\
+                 error: test failed, to rerun pass `-p a --lib`\n\
+                 \nCaused by:\n  {cause}\n\
+                 note: test exited abnormally; to see the full output pass --no-capture to the harness.\n\
+                 \x20    Running unittests src/lib.rs (target/debug/deps/b-0123)\n   Doc-tests a\n"
+            );
+            let ends = ends_of(&text, Path::new("/nowhere"));
+            for word in shown {
+                assert!(ends.contains(word), "{word}: {ends}");
+            }
+            assert!(
+                !ends.contains("b-0123") && !ends.contains("Doc-tests"),
+                "{ends}"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_root_with_a_dotdot_or_a_link_in_it_is_left_out_by_its_physical_path() {
