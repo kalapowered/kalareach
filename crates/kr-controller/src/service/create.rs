@@ -1213,7 +1213,7 @@ impl Controller {
     /// repeat would read as an attempt still under way, or one that may have started a worker, until
     /// the next start settles the row. The host knows better: this attempt has ended and started
     /// nothing. So the failure is held in memory until the row can be written, and a repeat of the
-    /// create is told it ([`Self::the_launch_that_failed_unwritten`]).
+    /// create is told it ([`Self::reservation_as_it_stands`]).
     fn record_failed(
         &self,
         registry: &mut crate::registry::Registry,
@@ -1230,40 +1230,47 @@ impl Controller {
         }
     }
 
-    /// The reservation as it stands once a failure this daemon could not write has been, if it holds
-    /// one for it.
+    /// The reservation as it stands now, for a repeat that read it earlier.
     ///
-    /// The write is tried again here, so the row says `failed` as soon as the registry takes it. The
-    /// repeat is told the failure whether or not it does: nothing was launched, and a worker's claim
-    /// is admitted only against a reservation that is `spawned` with a launcher recorded.
-    async fn the_launch_that_failed_unwritten(
+    /// A reservation that was `reserved` or `spawned` when it was read may have been settled since
+    /// by the attempt that made it, and the repeat is owed what is so when it is answered. The
+    /// registry's row and what this daemon holds for a failure the registry refused to write are
+    /// read in one look under the registry's lock, which is the lock a failure is recorded under,
+    /// so a failure is either in the row or in what the daemon holds and never in neither. A
+    /// failure the daemon holds is written again here, and the repeat is told it whether or not
+    /// the registry takes it: nothing was launched, and a worker's claim is admitted only against a
+    /// reservation that is `spawned` with a launcher recorded. A row that cannot be read leaves the
+    /// reservation as it was read.
+    async fn reservation_as_it_stands(
         &self,
-        reservation: &crate::registry::Reservation,
-    ) -> Option<crate::registry::Reservation> {
+        read: &crate::registry::Reservation,
+    ) -> crate::registry::Reservation {
+        if !matches!(read.phase, LaunchPhase::Reserved | LaunchPhase::Spawned) {
+            return read.clone();
+        }
+        let mut registry = self.registry.lock().await;
+        let mut now = match registry.reservation(read.reservation_id) {
+            Ok(Some(row)) => row,
+            _ => read.clone(),
+        };
         let held = self
             .unwritten_failures
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&reservation.reservation_id);
-        if !held {
-            return None;
+            .contains(&read.reservation_id);
+        if held {
+            if registry
+                .set_phase(read.reservation_id, LaunchPhase::Failed)
+                .is_ok()
+            {
+                self.unwritten_failures
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&read.reservation_id);
+            }
+            now.phase = LaunchPhase::Failed;
         }
-        let written = self
-            .registry
-            .lock()
-            .await
-            .set_phase(reservation.reservation_id, LaunchPhase::Failed)
-            .is_ok();
-        if written {
-            self.unwritten_failures
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&reservation.reservation_id);
-        }
-        Some(crate::registry::Reservation {
-            phase: LaunchPhase::Failed,
-            ..reservation.clone()
-        })
+        now
     }
 
     /// Gives back the directory a worker was to run in.
@@ -1294,37 +1301,10 @@ impl Controller {
         self: &Arc<Self>,
         reservation: &crate::registry::Reservation,
     ) -> Result<ParamsValue> {
-        // What the caller read may be older than this repeat: a reservation that was `reserved` or
-        // `spawned` then may have been settled since by the attempt that made it, and the answer is
-        // owed for what the registry shows now. A row that cannot be read leaves the one in hand.
-        let current;
-        let reservation = if matches!(
-            reservation.phase,
-            LaunchPhase::Reserved | LaunchPhase::Spawned
-        ) {
-            match self
-                .registry
-                .lock()
-                .await
-                .reservation(reservation.reservation_id)
-            {
-                Ok(Some(row)) => {
-                    current = row;
-                    &current
-                }
-                _ => reservation,
-            }
-        } else {
-            reservation
-        };
-        let failed;
-        let reservation = match self.the_launch_that_failed_unwritten(reservation).await {
-            Some(unwritten) => {
-                failed = unwritten;
-                &failed
-            }
-            None => reservation,
-        };
+        // What the caller read may be older than this repeat, and the answer is owed for the
+        // reservation as it stands when it is given.
+        let current = self.reservation_as_it_stands(reservation).await;
+        let reservation = &current;
         // A launch recorded as failed, or fenced, that no worker ever claimed made no session, and
         // the reservation the caller read says so: a worker is given its launch specification only
         // by claiming, and a claim is admitted only against a reservation still waiting for it. It
