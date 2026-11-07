@@ -246,6 +246,11 @@
  * widest tab needs and the rest of the bar is shared out, so a long label gets the room a short one
  * leaves, and what a tab holds is centred in its column, which keeps neighbours apart. Where a face
  * is wide enough that two columns still cut a label, each tab has a row of its own.
+ *
+ * The first tab holds a count beside its glyph, so two columns have little to spare on a narrow
+ * screen: a label sits one gap from its glyph, the smaller of the two, and the glyph has no margin
+ * of its own. A bold wide enough to cut a label in two columns on the narrowest phone, at the largest
+ * text, is what takes a tab to a row of its own, and not the room a count and a gap would have taken.
  */
 .m-tabbar[data-form] {
   grid-auto-flow: row;
@@ -264,7 +269,7 @@
   grid-template-columns: auto minmax(0, max-content);
   justify-content: center;
   align-items: center;
-  gap: var(--gap-2);
+  gap: var(--gap-1);
   padding: var(--gap-1) 0;
 }
 
@@ -350,7 +355,7 @@
 
 .m-tabbar[data-form] .m-tab-glyph > svg {
   flex: none;
-  margin: 2px;
+  margin: 0;
 }
 
 .m-tabbar[data-form] .m-tab-badge {
