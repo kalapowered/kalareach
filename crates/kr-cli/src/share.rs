@@ -1744,7 +1744,8 @@ async fn transfer(
 /// passes, or when the list cannot be read: each read is given the time any request that changes
 /// nothing is given and never past `deadline`, as the other owner-device commands give it, and
 /// each ends the command with nothing changed and the reason it ended. A read that `deadline` cut
-/// short is the challenge running out.
+/// short is the challenge running out, and so is the pause between two reads, which ends at
+/// `deadline` when it would run past it.
 ///
 /// `deadline` is a point on this process's own monotonic clock, fixed when the challenge arrived,
 /// so nothing that happens to the wall clock afterwards moves it.
@@ -1777,7 +1778,10 @@ async fn answered_by_an_owner_device(
             .find(|waiting| waiting.request == *request)
         {
             Some(waiting) if waiting.answered => return Ok(()),
-            Some(_) => tokio::time::sleep(every).await,
+            // The wait ends where the challenge does, so the last sleep is cut short at its end.
+            Some(_) => {
+                tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + every)).await;
+            }
             None => return Err(ran_out()),
         }
     }
@@ -2296,9 +2300,9 @@ mod tests {
     /// process's own clock, and not after the time any read is given: a host that does not answer,
     /// or a connection that fails, ends the command with nothing changed and the reason, with the
     /// status of a host that is not there; a challenge the host stops listing, or lists to its
-    /// end unanswered, is one that ran out, and so is a read the challenge's end cuts short. The
-    /// controls are a challenge an owner device has answered and a refusal of the host's, which is
-    /// its own.
+    /// end unanswered, is one that ran out, and so is a read the challenge's end cuts short; the
+    /// wait ends at the challenge's end and not a pause later. The controls are a challenge an
+    /// owner device has answered and a refusal of the host's, which is its own.
     #[tokio::test(start_paused = true)]
     async fn the_wait_for_an_owner_device_to_confirm_a_transfer_ends_with_the_challenge_and_says_why()
      {
@@ -2396,6 +2400,25 @@ mod tests {
             reads.load(Ordering::SeqCst) > 1,
             "the host's list is read again until the challenge ends"
         );
+        // The wait ends where the challenge does, and not up to one poll later: a deadline that is
+        // not a whole number of polls cuts the last sleep short.
+        let started = tokio::time::Instant::now();
+        let part_way = tokio::time::timeout(
+            outer,
+            answered_by_an_owner_device(
+                started + POLL_EVERY * 5 + POLL_EVERY / 4,
+                POLL_EVERY,
+                &request,
+                async || Ok(listing(false)),
+            ),
+        )
+        .await
+        .expect("the wait ended with the challenge");
+        let Err(part_way @ CliError::ServiceRefused { .. }) = part_way else {
+            panic!("the challenge ran out");
+        };
+        assert_eq!(part_way.code(), ErrorCode::OwnerConfirmationRequired);
+        assert_eq!(started.elapsed(), POLL_EVERY * 5 + POLL_EVERY / 4);
         let reads = AtomicUsize::new(0);
         let unlisted = answered_by_an_owner_device(
             tokio::time::Instant::now() + Duration::from_secs(60),
