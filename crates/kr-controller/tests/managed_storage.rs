@@ -3909,8 +3909,8 @@ async fn the_host_makes_a_backup_of_a_closed_session_and_its_configuration_once_
 }
 
 /// Whether `needle` is in `haystack` as it is, in lower-case hexadecimal, or as base64url on its
-/// own: the ways a document of the host's could carry a key. A key encoded inside a longer base64
-/// field, at an offset that is not a multiple of three bytes, is not found.
+/// own: the ways a document of the host's could carry a key. A key that is part of a longer base64
+/// value is not found, because its last encoded characters depend on the bytes that follow it.
 fn is_carried_in(haystack: &[u8], needle: &[u8]) -> bool {
     let hex: String = needle.iter().map(|byte| format!("{byte:02x}")).collect();
     [
@@ -3931,9 +3931,9 @@ fn is_carried_in(haystack: &[u8], needle: &[u8]) -> bool {
 /// secret store the daemon wrote them to and scans every member for each as the bytes, in
 /// hexadecimal or as base64url. The controls are the scan finding each of those forms of a seed
 /// where one is put, and the session's own output in the session's member, so the scan reads what
-/// the members hold. Not shown here: a key inside a longer base64 field at an offset that is not a
-/// multiple of three bytes, that a restore refuses a member under a reserved name or a revoked
-/// grant, which the restore cases show, or the other data paths of backup and recovery material.
+/// the members hold. Not shown here: a key that is part of a longer base64 value, that a restore
+/// refuses a member under a reserved name or a revoked grant, which the restore cases show, or the
+/// other data paths of backup and recovery material.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_generation_the_host_makes_holds_none_of_the_private_keys_the_host_keeps() {
     use kr_crypto::backup::{Material, may_back_up, member_material};
