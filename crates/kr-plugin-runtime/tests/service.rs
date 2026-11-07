@@ -1898,7 +1898,8 @@ async fn a_client_empties_its_queue_for_an_unbind_whose_caller_stopped_waiting_w
         }
     })
     .await;
-    let client = Arc::new(client);
+    // The unbind is stopped by the case, and not by a deadline of its own.
+    let client = Arc::new(client.unbinding_within(HANG_GUARD));
 
     let unbinding = tokio::spawn({
         let client = Arc::clone(&client);
@@ -2140,6 +2141,328 @@ async fn a_client_keeps_what_a_live_registration_wrote_when_a_second_registratio
     serving.await.expect("the host program ended");
 }
 
+// A removal that a registration overlapped says nothing of the registrations the client counts as
+// live. The host answers `existed` for the registration the removal was about, which can be one that
+// was still being made and was refused: a registration the client never counted as live. If the
+// client took that answer for the removal of the live registration that replaced it, a later
+// registration of the identifier that the host refuses would empty the queue of what the live
+// registration wrote.
+//
+// The host here is a program of the case's own, because what the case needs is the order of the
+// frames: a registration is read, an unbind of the identifier is read while it is under way, and the
+// registration is refused. A second registration is answered as registered and writes a notice.
+// Then the unbind is answered as having removed one, and a third registration is refused. The privacy
+// request that follows is answered with a notice that is always read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_keeps_what_a_live_registration_wrote_when_the_unbind_of_a_refused_one_is_answered_late()
+ {
+    let request = components::request("well-behaved", 1);
+    let component = ComponentSource {
+        path: "unused".to_owned(),
+        digest: PayloadDigest::of(b"unused"),
+        bytes: 0,
+    };
+    let live = Notice::Disabled {
+        binding_id: request.binding_id.get(),
+        reason: "the live registration's".to_owned(),
+    };
+    let after_it = Notice::Disabled {
+        binding_id: new_binding_id().get(),
+        reason: "the notice that is always read".to_owned(),
+    };
+    let (first_sender, first) = tokio::sync::oneshot::channel::<()>();
+    let (unbind_sender, unbind_read) = tokio::sync::oneshot::channel::<()>();
+    let (client, serving) = scripted_host({
+        let live = live.clone();
+        let after_it = after_it.clone();
+        move |mut reader, mut writer| async move {
+            let refused_first: kr_plugin_service::protocol::Request = reader
+                .read_message_without_schema()
+                .await
+                .expect("the first registration");
+            first_sender
+                .send(())
+                .expect("the case waits for the first registration");
+            let unbind: kr_plugin_service::protocol::Request = reader
+                .read_message_without_schema()
+                .await
+                .expect("the unbind");
+            assert!(
+                matches!(unbind.body, RequestBody::Unbind { .. }),
+                "the client asked for {:?}",
+                unbind.body
+            );
+            unbind_sender
+                .send(())
+                .expect("the case waits for the unbind");
+            writer
+                .write_message(&Frame::Response {
+                    reply_to: refused_first.request_id,
+                    body: ResponseBody::Refused {
+                        request: "register_binding".to_owned(),
+                        detail: "binding was unbound while it was being registered".to_owned(),
+                        disabled: false,
+                    },
+                })
+                .await
+                .expect("the refusal is written");
+            let second: kr_plugin_service::protocol::Request = reader
+                .read_message_without_schema()
+                .await
+                .expect("the second registration");
+            writer
+                .write_message(&Frame::Response {
+                    reply_to: second.request_id,
+                    body: ResponseBody::Registered {
+                        origin: "compiled".to_owned(),
+                        elapsed_ms: 0,
+                    },
+                })
+                .await
+                .expect("the answer is written");
+            writer
+                .write_message(&Frame::Notice(live))
+                .await
+                .expect("a notice is written");
+            writer
+                .write_message(&Frame::Response {
+                    reply_to: unbind.request_id,
+                    body: ResponseBody::Unbound { existed: true },
+                })
+                .await
+                .expect("the answer is written");
+            let third: kr_plugin_service::protocol::Request = reader
+                .read_message_without_schema()
+                .await
+                .expect("the third registration");
+            writer
+                .write_message(&Frame::Response {
+                    reply_to: third.request_id,
+                    body: ResponseBody::Refused {
+                        request: "register_binding".to_owned(),
+                        detail: "binding is already live".to_owned(),
+                        disabled: false,
+                    },
+                })
+                .await
+                .expect("the refusal is written");
+            let privacy: kr_plugin_service::protocol::Request = reader
+                .read_message_without_schema()
+                .await
+                .expect("the privacy request");
+            let RequestBody::Privacy { private } = privacy.body else {
+                panic!("the client asked for {:?}", privacy.body);
+            };
+            writer
+                .write_message(&Frame::Notice(after_it))
+                .await
+                .expect("a notice is written");
+            writer
+                .write_message(&Frame::Response {
+                    reply_to: privacy.request_id,
+                    body: ResponseBody::PrivacySet { private },
+                })
+                .await
+                .expect("the answer is written");
+        }
+    })
+    .await;
+    let client = Arc::new(client.unbinding_within(HANG_GUARD));
+
+    let registering = tokio::spawn({
+        let client = Arc::clone(&client);
+        let request = request.clone();
+        let component = component.clone();
+        async move {
+            client
+                .register(
+                    request.binding_id,
+                    &request.identity,
+                    &request.facts,
+                    &request.executable,
+                    &component,
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(HANG_GUARD, first)
+        .await
+        .expect("the host never read the first registration")
+        .expect("the host program ended");
+    let unbinding = tokio::spawn({
+        let client = Arc::clone(&client);
+        let binding_id = request.binding_id;
+        async move { client.unbind(binding_id).await }
+    });
+    tokio::time::timeout(HANG_GUARD, unbind_read)
+        .await
+        .expect("the host never read the unbind")
+        .expect("the host program ended");
+    let refused = registering.await.expect("the first registration ended");
+    assert!(
+        matches!(&refused, Err(ServiceError::Protocol { .. })),
+        "the first registration was read as {refused:?}"
+    );
+    register_on(&client, &request, &component).await;
+    let removed = unbinding
+        .await
+        .expect("the unbind task ended")
+        .expect("the unbind was answered");
+    assert!(
+        removed,
+        "the host's answer was not read as a binding removed"
+    );
+    let third = client
+        .register(
+            request.binding_id,
+            &request.identity,
+            &request.facts,
+            &request.executable,
+            &component,
+        )
+        .await;
+    assert!(
+        matches!(&third, Err(ServiceError::Protocol { .. })),
+        "the third registration was read as {third:?}"
+    );
+    client.privacy(false).await.expect("privacy is set");
+
+    let notices = notices_until(&client, &after_it).await;
+    assert_eq!(
+        notices,
+        [live, after_it],
+        "the refusal of a registration emptied the queue of what the live registration wrote"
+    );
+    serving.await.expect("the host program ended");
+}
+
+// The removal of the live registration takes it off the client's account of what is live: a
+// registration of the identifier that the host refuses afterwards is one nothing else could own the
+// notices of, and the client empties its queue of them.
+//
+// The host here is a program of the case's own: the first registration is answered, an unbind is
+// answered as having removed one, and a second registration writes a notice and is refused. The
+// privacy request that follows is answered with a notice that is always read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_empties_its_queue_when_a_registration_is_refused_after_the_live_one_was_removed()
+{
+    let request = components::request("well-behaved", 1);
+    let component = ComponentSource {
+        path: "unused".to_owned(),
+        digest: PayloadDigest::of(b"unused"),
+        bytes: 0,
+    };
+    let written = Notice::Disabled {
+        binding_id: request.binding_id.get(),
+        reason: "the refused registration's".to_owned(),
+    };
+    let after_it = Notice::Disabled {
+        binding_id: new_binding_id().get(),
+        reason: "the notice that is always read".to_owned(),
+    };
+    let (client, serving) = scripted_host({
+        let written = written.clone();
+        let after_it = after_it.clone();
+        move |mut reader, mut writer| async move {
+            let first: kr_plugin_service::protocol::Request = reader
+                .read_message_without_schema()
+                .await
+                .expect("the first registration");
+            writer
+                .write_message(&Frame::Response {
+                    reply_to: first.request_id,
+                    body: ResponseBody::Registered {
+                        origin: "compiled".to_owned(),
+                        elapsed_ms: 0,
+                    },
+                })
+                .await
+                .expect("the answer is written");
+            let unbind: kr_plugin_service::protocol::Request = reader
+                .read_message_without_schema()
+                .await
+                .expect("the unbind");
+            writer
+                .write_message(&Frame::Response {
+                    reply_to: unbind.request_id,
+                    body: ResponseBody::Unbound { existed: true },
+                })
+                .await
+                .expect("the answer is written");
+            let second: kr_plugin_service::protocol::Request = reader
+                .read_message_without_schema()
+                .await
+                .expect("the second registration");
+            writer
+                .write_message(&Frame::Notice(written))
+                .await
+                .expect("a notice is written");
+            writer
+                .write_message(&Frame::Response {
+                    reply_to: second.request_id,
+                    body: ResponseBody::Refused {
+                        request: "register_binding".to_owned(),
+                        detail: "the binding could not be bound".to_owned(),
+                        disabled: false,
+                    },
+                })
+                .await
+                .expect("the refusal is written");
+            let privacy: kr_plugin_service::protocol::Request = reader
+                .read_message_without_schema()
+                .await
+                .expect("the privacy request");
+            let RequestBody::Privacy { private } = privacy.body else {
+                panic!("the client asked for {:?}", privacy.body);
+            };
+            writer
+                .write_message(&Frame::Notice(after_it))
+                .await
+                .expect("a notice is written");
+            writer
+                .write_message(&Frame::Response {
+                    reply_to: privacy.request_id,
+                    body: ResponseBody::PrivacySet { private },
+                })
+                .await
+                .expect("the answer is written");
+        }
+    })
+    .await;
+    let client = client.unbinding_within(HANG_GUARD);
+
+    register_on(&client, &request, &component).await;
+    assert!(
+        client
+            .unbind(request.binding_id)
+            .await
+            .expect("the unbind is answered"),
+        "the host's answer was not read as the binding removed"
+    );
+    let second = client
+        .register(
+            request.binding_id,
+            &request.identity,
+            &request.facts,
+            &request.executable,
+            &component,
+        )
+        .await;
+    assert!(
+        matches!(&second, Err(ServiceError::Protocol { .. })),
+        "the refusal was read as {second:?}"
+    );
+    client.privacy(false).await.expect("privacy is set");
+
+    let notices = notices_until(&client, &after_it).await;
+    assert_eq!(
+        notices,
+        [after_it],
+        "the client still counted a registration as live after the host removed it"
+    );
+    serving.await.expect("the host program ended");
+}
+
 // The refusal of a registration says nothing of another registration of the identifier that is
 // still waiting for its answer: the host refuses a second registration of an identifier it is
 // registering by name, and the first goes on to write its notices. Those are the queue's, and the
@@ -2336,6 +2659,7 @@ async fn a_registration_whose_request_was_never_written_leaves_nothing_under_way
         }
     })
     .await;
+    let client = client.unbinding_within(HANG_GUARD);
 
     let writer = client.hold_writer().await;
     {
@@ -3288,10 +3612,13 @@ async fn kr_req_11_39_an_observation_and_a_call_on_one_connection_are_both_answe
             "an event was not handed over while another task held the connection's writer"
         );
     }
+    // Held at the writer's task as well, so this shows the handed-over events are counted until they
+    // are written; that the handoff itself never waits for the writer is what the `Accepted`
+    // answers above show, while the writer is held.
     assert_ne!(
         client.offered_bytes(),
         0,
-        "an event handed over while the writer was held was written"
+        "an event handed over was counted as written while the offered writes were held"
     );
     drop(writer);
     writes.release();
