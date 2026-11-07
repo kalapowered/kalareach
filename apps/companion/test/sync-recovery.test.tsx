@@ -44,6 +44,9 @@ describe('the sync service setting', () => {
   it('is the managed service until another is chosen, and a refused choice leaves it', async () => {
     const { person, sheet } = await openSheet()
     expect(await within(sheet).findByTestId('sync-service')).toHaveTextContent('reach.kala.to')
+    // A screen reader says the address as words, and does not read the written form.
+    expect(within(sheet).getByText('reach dot kala dot to')).not.toHaveAttribute('aria-hidden')
+    expect(within(sheet).getByTestId('sync-service')).toHaveAttribute('aria-hidden', 'true')
 
     await person.click(within(sheet).getByTestId('change-sync-service'))
     const input = within(sheet).getByLabelText('Sync service')

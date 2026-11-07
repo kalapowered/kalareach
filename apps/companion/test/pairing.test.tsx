@@ -631,6 +631,9 @@ describe('pairing with a host', () => {
     await waitFor(() => {
       expect(screen.getByTestId('pairing-service').textContent).toBe('pair.example.org')
     })
+    // A screen reader says the address as words, and does not read the written form.
+    expect(screen.getByText('pair dot example dot org')).not.toHaveAttribute('aria-hidden')
+    expect(screen.getByTestId('pairing-service')).toHaveAttribute('aria-hidden', 'true')
   })
 })
 
