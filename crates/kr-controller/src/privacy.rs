@@ -990,6 +990,13 @@ impl EnvironmentPrivacy {
         self.report_now(now_ms).to_wire()
     }
 
+    /// When privacy mode last changed, on this host's wall clock: nought for a host that has never
+    /// changed it.
+    #[must_use]
+    pub fn changed_at_ms(&self) -> TimestampMs {
+        self.inner().changed_at_ms
+    }
+
     /// Says where privacy mode stands, without retrying anything.
     #[must_use]
     pub fn report_now(&self, now_ms: TimestampMs) -> Report {

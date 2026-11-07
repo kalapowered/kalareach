@@ -23,6 +23,7 @@ mod authority;
 mod context;
 mod host;
 mod submit;
+mod worker_half;
 
 use std::sync::Arc;
 
@@ -41,6 +42,10 @@ pub use context::{
 };
 pub use host::{ControllerDispatch, ControllerFacts};
 pub use submit::{HostDispatch, ProposalSubmitter, method_for};
+pub use worker_half::{
+    BEFORE_PRIVACY_CHANGE, MAX_HISTORY_PARTS, PRIVACY_ON, WorkerHalf, approval, decisions, message,
+    messages, question,
+};
 
 use crate::error::{ControllerError, Result};
 
