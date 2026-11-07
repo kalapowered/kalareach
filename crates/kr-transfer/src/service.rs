@@ -3879,7 +3879,7 @@ fn handle_of(row: &UploadRow) -> Result<AttachmentHandle> {
 
 fn check_media_type(media_type: &str) -> Result<()> {
     if media_type.is_empty() || media_type.len() > MAX_MEDIA_TYPE_LEN {
-        return Err(TransferError::invalid(format!(
+        return Err(TransferError::malformed(format!(
             "a declared media type is between one and {MAX_MEDIA_TYPE_LEN} bytes"
         )));
     }
@@ -3887,12 +3887,12 @@ fn check_media_type(media_type: &str) -> Result<()> {
         .bytes()
         .any(|byte| byte.is_ascii_control() || !byte.is_ascii())
     {
-        return Err(TransferError::invalid(
+        return Err(TransferError::malformed(
             "a declared media type is printable ASCII",
         ));
     }
     if !media_type.contains('/') {
-        return Err(TransferError::invalid(
+        return Err(TransferError::malformed(
             "a declared media type names a type and a subtype",
         ));
     }
@@ -3901,14 +3901,14 @@ fn check_media_type(media_type: &str) -> Result<()> {
 
 fn check_original_name(name: &str) -> Result<()> {
     if name.len() > MAX_ORIGINAL_FILE_NAME_LEN {
-        return Err(TransferError::invalid(format!(
+        return Err(TransferError::malformed(format!(
             "an original filename is at most {MAX_ORIGINAL_FILE_NAME_LEN} bytes"
         )));
     }
     // The name is metadata and never a path, so separators are not refused; a control byte is,
     // because it would corrupt whatever is asked to display it.
     if name.bytes().any(|byte| byte == 0) || name.chars().any(char::is_control) {
-        return Err(TransferError::invalid(
+        return Err(TransferError::malformed(
             "an original filename carries no control characters",
         ));
     }
