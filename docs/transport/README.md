@@ -545,9 +545,9 @@ through.
   then refuse a segmented send. A connection that was open when that first happened would go on
   sending batches, and whenever it had more than one datagram to send at a time its stream data
   could then stall for tens of seconds or for good, while single datagrams could still keep it
-  inside the inactivity threshold. The one exception is the address-discovery probes that iroh
-  itself makes to up to five relays on an endpoint with an IP transport. They use a configuration
-  iroh builds from the QUIC library's defaults, with offload on, which this crate cannot
+  inside the inactivity threshold. Offload stays on in one other place: the address-discovery
+  probes that iroh itself makes to up to five relays on an endpoint with an IP transport. They use
+  a configuration iroh builds from the QUIC library's defaults, which this crate cannot
   configure. They carry little traffic, and a stall in one would hurt address discovery and the
   choice of home relay, not a peer connection's streams. Against iroh's default the setting has
   two costs. On Linux, Android and Windows a bulk transfer makes up to ten times as many send
