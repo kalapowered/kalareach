@@ -561,9 +561,24 @@ impl Worker {
 
     /// As [`Self::register_agent`], with any upstream a test gives.
     pub fn register_agent_on(&self, upstream: Arc<dyn UpstreamDispatch>) -> ApplicationInstanceId {
-        let instance = ApplicationInstanceId::new(Uuid::from_bytes([2; 16]));
+        self.register_agent_numbered(2, upstream)
+    }
+
+    /// As [`Self::register_agent_on`], for the instance numbered `number`: a second agent on one
+    /// session is registered under another number. Number 2 is the one the other helpers act on.
+    pub fn register_agent_numbered(
+        &self,
+        number: u8,
+        upstream: Arc<dyn UpstreamDispatch>,
+    ) -> ApplicationInstanceId {
+        let instance = ApplicationInstanceId::new(Uuid::from_bytes([number; 16]));
+        let binding = number.wrapping_add(7);
         let broker = self.service.broker();
-        let process = ProcessStartIdentity::new(41, ProcessStartSource::MacosProcBsdInfo, 900);
+        let process = ProcessStartIdentity::new(
+            41 + u64::from(number - 2),
+            ProcessStartSource::MacosProcBsdInfo,
+            900,
+        );
         broker
             .register_instance(
                 instance,
@@ -578,14 +593,14 @@ impl Worker {
                         executable_digest: Digest256::from_bytes([3; 32]),
                         process,
                     },
-                    Credential::from_bytes([9; 32]),
+                    Credential::from_bytes([binding; 32]),
                     TimestampMs::new(1),
                 )),
             )
             .expect("the instance is registered");
         broker
             .bind_descriptor(
-                BrokerBindingId::new(Uuid::from_bytes([9; 16])),
+                BrokerBindingId::new(Uuid::from_bytes([binding; 16])),
                 instance,
                 PluginId::new("kalareach.codex").expect("valid"),
                 PublisherId::new("kalareach").expect("valid"),
@@ -641,6 +656,18 @@ impl Worker {
         instance: ApplicationInstanceId,
         upstream: Arc<dyn UpstreamDispatch>,
         deadline: Option<TimestampMs>,
+    ) -> kr_protocol::ids::PendingResourceId {
+        self.offer_approval_at(instance, upstream, deadline, TimestampMs::new(2))
+    }
+
+    /// As [`Self::offer_approval`], for a request the broker records at `recorded_at`, which is
+    /// the moment a grant's history bound is checked a pending approval against.
+    pub fn offer_approval_at(
+        &self,
+        instance: ApplicationInstanceId,
+        upstream: Arc<dyn UpstreamDispatch>,
+        deadline: Option<TimestampMs>,
+        recorded_at: TimestampMs,
     ) -> kr_protocol::ids::PendingResourceId {
         use kr_protocol::gateway::{
             DeclarativeEntry, DeclarativeTable, NativeFraming, NativeMethodClass, RichMethodEntry,
@@ -749,7 +776,7 @@ impl Worker {
             .forward_native(
                 GatewayConnectionId::new(1),
                 br#"{"id":11,"method":"session/request_permission"}"#,
-                TimestampMs::new(2),
+                recorded_at,
             )
             .expect("forwarded")
             .1
@@ -767,7 +794,7 @@ impl Worker {
                     }],
                 },
                 deadline,
-                TimestampMs::new(3),
+                TimestampMs::new(recorded_at.get() + 1),
             )
             .expect("interpreted")
             .resource_id
@@ -793,7 +820,12 @@ impl Adopted {
     /// workers on the tree, each reserved and open in the registry as every session a daemon
     /// creates is, and starts the daemon again, which adopts them.
     pub async fn start(sessions: u64) -> Self {
-        Self::start_on(sessions, None, Clocks::system()).await
+        Self::start_on(sessions, None, Clocks::system(), None).await
+    }
+
+    /// As [`Self::start`], for one session whose application is `script`, a POSIX shell script.
+    pub async fn start_running(script: &str) -> Self {
+        Self::start_on(1, None, Clocks::system(), Some(script)).await
     }
 
     /// As [`Self::start`], for a host whose configuration is `document`.
@@ -801,18 +833,19 @@ impl Adopted {
         sessions: u64,
         document: &kr_protocol::hostinfo::configuration::ConfigurationDocument,
     ) -> Self {
-        Self::start_on(sessions, Some(document), Clocks::system()).await
+        Self::start_on(sessions, Some(document), Clocks::system(), None).await
     }
 
     /// As [`Self::start`], on the clocks a suite moves by hand.
     pub async fn start_on_clocks(sessions: u64, clocks: Clocks) -> Self {
-        Self::start_on(sessions, None, clocks).await
+        Self::start_on(sessions, None, clocks, None).await
     }
 
     async fn start_on(
         sessions: u64,
         document: Option<&kr_protocol::hostinfo::configuration::ConfigurationDocument>,
         clocks: Clocks,
+        script: Option<&str>,
     ) -> Self {
         let owner = DeviceKeys::generate().expect("owner keys");
         let host = match document {
@@ -822,7 +855,10 @@ impl Adopted {
         let stopped = host.shut_down().await;
         let mut workers = Vec::new();
         for display in 1..=sessions {
-            workers.push(Worker::start_reserved(stopped.tree(), display).await);
+            workers.push(match script {
+                Some(script) => Worker::start_running(stopped.tree(), display, script).await,
+                None => Worker::start_reserved(stopped.tree(), display).await,
+            });
         }
         let settings = stopped.settings().clone();
         let host = stopped.start(settings).await;
@@ -862,6 +898,50 @@ impl Adopted {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "the daemon never reached the worker: {read:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Turns privacy mode on or off at the daemon's local socket, and waits until the change has
+    /// finished taking effect in the daemon and in every worker it reaches.
+    pub async fn set_privacy(&self, enabled: bool) {
+        let mut client = self.host.client().await;
+        client
+            .mutate(
+                Method::PrivacySet,
+                kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(self.environment_id()),
+                &kr_protocol::privacy::PrivacySetParams { enabled },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("privacy mode is set");
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            let report: kr_protocol::privacy::PrivacyReport = self
+                .host
+                .client()
+                .await
+                .request(
+                    Method::PrivacyStatus,
+                    &kr_protocol::privacy::PrivacyStatusParams {},
+                )
+                .await
+                .expect("the call reaches the daemon")
+                .expect("privacy mode's report")
+                .to_typed()
+                .expect("decodes");
+            if matches!(
+                report.completion,
+                kr_protocol::privacy::PrivacyCompletion::Complete
+            ) && report.enabled == enabled
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "privacy mode's change did not finish: {report:?}"
             );
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
