@@ -233,7 +233,13 @@ impl Rig {
     /// Pairs a device that may view sessions, whose history reaches back to `bound` when it names
     /// one and to the pairing when it names none.
     async fn pair_viewing(&self, bound: Option<u64>) -> Connected {
-        let mut grant = proposal(&[ActionRight::SessionView]);
+        self.pair_holding(bound, &[ActionRight::SessionView]).await
+    }
+
+    /// Pairs a device that holds `rights`, whose history reaches back as [`Self::pair_viewing`]'s
+    /// does.
+    async fn pair_holding(&self, bound: Option<u64>, rights: &[ActionRight]) -> Connected {
+        let mut grant = proposal(rights);
         grant.history.lower_bound_ms = Nullable(bound.map(TimestampMs::new));
         let (device, record) = self.pair(grant).await;
         let session = connect(&self.host, &device, &record).await;
@@ -759,4 +765,200 @@ async fn a_paired_device_is_refused_a_closed_sessions_retained_output_and_told_w
     );
     session.close();
     host.stop().await;
+}
+
+/// Whether `bytes` holds `marker`.
+fn holds(bytes: &[u8], marker: &str) -> bool {
+    bytes
+        .windows(marker.len())
+        .any(|window| window == marker.as_bytes())
+}
+
+/// One page of `limit` bytes at most from `from`, as a device is given it.
+async fn device_page_of(
+    session: &Session,
+    session_id: SessionId,
+    from: u64,
+    limit: u64,
+) -> HistoryPageResult {
+    session
+        .history_page(&HistoryPageParams {
+            session_id,
+            from_cursor: U64::new(from),
+            max_bytes: U64::new(limit),
+        })
+        .await
+        .expect("the device is served the page")
+}
+
+/// What a device is paged from `from` to the end of the output, a page of `limit` bytes at most at
+/// a time. A page stops where the worker's resident window begins, so one page does not reach the
+/// end of output as long as the window is.
+async fn device_paged(session: &Session, session_id: SessionId, from: u64, limit: u64) -> Vec<u8> {
+    let mut cursor = from;
+    let mut together = Vec::new();
+    loop {
+        let page = device_page_of(session, session_id, cursor, limit).await;
+        if page.next_cursor.get() <= cursor {
+            return together;
+        }
+        together.extend_from_slice(page.bytes.as_slice());
+        cursor = page.next_cursor.get();
+    }
+}
+
+/// What the owner is paged from `from` to the end of the output.
+async fn owner_paged(rig: &Rig, from: u64) -> Vec<u8> {
+    let mut cursor = from;
+    let mut together = Vec::new();
+    loop {
+        let page = rig.owner_page(cursor).await;
+        if page.next_cursor.get() <= cursor {
+            return together;
+        }
+        together.extend_from_slice(page.bytes.as_slice());
+        cursor = page.next_cursor.get();
+    }
+}
+
+/// Adds `bytes`, which hold no line end, to what the application prints, waits until the owner is
+/// paged all of them, and returns the cursor they begin at.
+async fn print(rig: &Rig, bytes: &[u8]) -> u64 {
+    use std::io::Write as _;
+    let start = owner_paged(rig, 0).await.len() as u64;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&rig.output)
+        .and_then(|mut file| file.write_all(bytes))
+        .expect("the output is added to");
+    let end = start + bytes.len() as u64;
+    until("the output being retained", || async {
+        let page = rig.owner_page(end - 1).await;
+        page.next_cursor.get() >= end
+    })
+    .await;
+    start
+}
+
+/// One word inside each payload `printed` writes.
+const PAYLOADS: [&str; 5] = [
+    "INLINEFILEPAYLOAD",
+    "SIXELPICTUREPAYLOAD",
+    "KITTYPICTUREPAYLOAD",
+    "ENVELOPEDFILEPAYLOAD",
+    "LARGEFILEPAYLOAD",
+];
+
+/// What an application prints that a terminal takes for a file or a picture, with plain words
+/// between: an inline file of the iTerm2 protocol, a sixel picture, a Kitty graphics command, an
+/// inline file inside a tmux passthrough envelope, and an inline file longer than the engine holds
+/// of a control string.
+///
+/// The second is the same output with each of those sequences replaced, byte for byte, by NUL.
+fn printed() -> (Vec<u8>, Vec<u8>) {
+    let mut large = b"\x1b]1337;File=name=bGFyZ2U=;inline=1:".to_vec();
+    large.extend(std::iter::repeat_n(b'Z', 70_000));
+    large.extend_from_slice(PAYLOADS[4].as_bytes());
+    large.push(0x07);
+    let sequences: [Vec<u8>; 5] = [
+        format!("\x1b]1337;File=name=bm90ZQ==;inline=1:{}\x07", PAYLOADS[0]).into_bytes(),
+        format!("\x1bP0;0;0q#0;2;0;0;0{}~~@@\x1b\\", PAYLOADS[1]).into_bytes(),
+        format!("\x1b_Gf=24,s=1,v=1,a=T;{}\x1b\\", PAYLOADS[2]).into_bytes(),
+        format!(
+            "\x1bPtmux;\x1b\x1b]1337;File=name=YQ==:{}\x1b\x1b\\\x1b\\",
+            PAYLOADS[3]
+        )
+        .into_bytes(),
+        large,
+    ];
+    let mut written = Vec::new();
+    let mut shown = Vec::new();
+    for (number, sequence) in sequences.into_iter().enumerate() {
+        let words = format!("words {number} ").into_bytes();
+        written.extend_from_slice(&words);
+        shown.extend_from_slice(&words);
+        written.extend_from_slice(&sequence);
+        shown.extend(std::iter::repeat_n(0_u8, sequence.len()));
+    }
+    written.extend_from_slice(b"last words");
+    shown.extend_from_slice(b"last words");
+    (written, shown)
+}
+
+/// KR-REQ-10.50, the part about file and attachment bytes needing a file grant of their own: a
+/// device that holds `session.view`, the live screen and a history that reaches every moment, and
+/// not `files.read`, is not given what an application printed as a file or a picture when it pages
+/// the retained output. The local owner is.
+///
+/// Each such sequence comes back as NUL, byte for byte, so every cursor in a page and every word
+/// around a payload is where it was, whatever size a page is cut to: a page that begins or ends
+/// inside a payload withholds that part of it. Not shown here: a device that holds `files.read`,
+/// which the worker cannot tell from one that does not, since the scope a read carries states no
+/// rights, and the terminal's live stream, which the engine withholds the same sequences from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_50_a_device_without_files_read_is_not_paged_the_files_and_pictures_an_application_printed()
+ {
+    let rig = Rig::start().await;
+    let device = rig.pair_holding(Some(0), &[ActionRight::SessionView]).await;
+    let (written, shown) = printed();
+    let start = print(&rig, &written).await;
+
+    let owner = owner_paged(&rig, start).await;
+    assert_eq!(owner, written, "the owner is paged what was written");
+
+    // Whole pages, and pages cut small, so the cuts fall inside payloads and inside the sequences
+    // around them.
+    for limit in [WHOLE, 4_099] {
+        let paged = device_paged(&device, rig.session_id(), start, limit).await;
+        for marker in PAYLOADS {
+            assert!(
+                !holds(&paged, marker),
+                "pages of {limit} bytes hold {marker}"
+            );
+        }
+        assert_eq!(
+            paged, shown,
+            "pages of {limit} bytes are the words, and NUL where each payload lay"
+        );
+    }
+
+    device.close();
+    rig.stop().await;
+}
+
+/// KR-REQ-10.50, the part about file and attachment bytes needing a file grant of their own: a
+/// control string the application has begun and not ended is not paged to a device without
+/// `files.read`, since nothing yet says what it is. The page stops where it begins, and once it
+/// ends the string is withheld if it was a file, and the words after it are paged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_string_the_application_has_not_ended_is_paged_to_a_device_without_files_read_only_when_it_ends()
+ {
+    let rig = Rig::start().await;
+    let device = rig.pair_holding(Some(0), &[ActionRight::SessionView]).await;
+    let start = rig.end().await;
+    rig.write(b"words before ").await;
+    let opens_at = rig.end().await;
+    let opening = format!("\x1b]1337;File=name=eA==:{}", PAYLOADS[0]);
+    rig.write(opening.as_bytes()).await;
+
+    let page = device_page_of(&device, rig.session_id(), start, WHOLE).await;
+    assert_eq!(
+        page.bytes.as_slice(),
+        b"words before ",
+        "the page stops where the string begins"
+    );
+    assert_eq!(page.next_cursor.get(), opens_at);
+
+    rig.write(b"\x07 words after").await;
+    let page = device_page_of(&device, rig.session_id(), opens_at, WHOLE).await;
+    let mut wanted = vec![0_u8; opening.len() + 1];
+    wanted.extend_from_slice(b" words after");
+    assert_eq!(
+        page.bytes.as_slice(),
+        wanted.as_slice(),
+        "once it ends the string is withheld, and the words after it are paged"
+    );
+
+    device.close();
+    rig.stop().await;
 }
