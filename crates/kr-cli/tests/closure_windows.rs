@@ -244,6 +244,28 @@ async fn nothing_started_the_closed_session_again(
     );
 }
 
+/// A host that ran a session to its closure takes its whole tree away when it goes, the daemon's
+/// lock file in it. Windows refuses the removal of a folder below a file the daemon still holds
+/// open, so a host that went with its daemon still up left its tree in the temporary folder for
+/// good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_ran_a_session_to_its_closure_leaves_no_tree_behind() {
+    let host = WorkerHost::start().await;
+    let tree = host.tree.root().to_path_buf();
+    let (session, mut typist, worker, _root) = opened(&host, &system32("cmd.exe")).await;
+    typist.type_line("exit 0").await;
+    closed_session(&host, &session.to_string()).await;
+    drop(typist);
+    ended(&worker, "the worker").await;
+
+    drop(host);
+    assert!(
+        !tree.exists(),
+        "{} is left in the temporary folder",
+        tree.display()
+    );
+}
+
 /// KR-REQ-07.52: an explicit `exit` typed at the root shell closes the session with the status the
 /// shell ended with, and the shell is not started again.
 ///
