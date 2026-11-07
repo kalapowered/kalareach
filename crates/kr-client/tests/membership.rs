@@ -4176,8 +4176,10 @@ async fn a_collection_key_is_neither_backed_up_nor_restored() {
 /// carries, which an import that read the member would put back. Not shown here: that an export
 /// holds none of those keys, which holds because it reads one settings object from the sync store
 /// and no secret store, so no assertion here could fail for it; what the archive producer
-/// (`SettingsArchive`) puts in its bundle, descriptor and manifest, which no case scans for keys;
-/// the other data paths of backup and recovery material; or a grant that has not been revoked.
+/// (`SettingsArchive`) puts in its bundle, descriptor and manifest, which
+/// `the_settings_archive_holds_none_of_the_private_keys_the_device_keeps` in `settings_archive.rs`
+/// scans for keys; the other data paths of backup and recovery material; or a grant that has not
+/// been revoked.
 #[tokio::test]
 async fn an_import_refuses_an_endpoint_key_a_control_key_and_a_revoked_grant() {
     let world = World::default();
