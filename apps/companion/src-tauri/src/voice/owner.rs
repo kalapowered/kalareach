@@ -1300,7 +1300,7 @@ impl Owner {
                     .send_call_start_context(&read.selection)
                     .await
                     .map(|_| ())
-                    .map_err(|_| "the voice service did not take it"),
+                    .map_err(|_| "the voice service did not take all of it"),
                 _ => Err("the host did not give it"),
             };
             let _ = internal.send(Internal::Opened(opened));
@@ -1356,9 +1356,19 @@ impl Owner {
                 None
             }
             Internal::Opened(opened) => {
-                // The call goes on without it.
+                // The call goes on without it, and the warning a person reads once the call has
+                // ended says that it was not given all of it. A warning already standing is not
+                // replaced.
                 if let Err(words) = opened {
                     tracing::warn!("the call was not given its opening context: {words}");
+                    self.view(|state| {
+                        state.warning.get_or_insert_with(|| {
+                            format!(
+                                "This call was not given all of the host's context for its \
+                                 session: {words}."
+                            )
+                        });
+                    });
                 }
                 None
             }
