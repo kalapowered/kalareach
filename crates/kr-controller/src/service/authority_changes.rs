@@ -303,12 +303,17 @@ impl Controller {
                 Some(Method::GrantCreate) => {
                     let (grant_id, invitation_id) =
                         kr_protocol::sharing::share_identities(actor_id, mutation.action_id.get());
-                    Some(self.sharing.shared(grant_id, invitation_id).and_then(
-                        |shared| match shared {
-                            Some(shared) => encode(&shared),
-                            None => Err(unfinished_and_unknown()),
-                        },
-                    ))
+                    // The claim shows the first attempt began, so a registry that cannot be read
+                    // here has not said that the share was never made.
+                    Some(
+                        self.sharing
+                            .shared(grant_id, invitation_id)
+                            .map_err(|error| error.found_unreadable("authority changes"))
+                            .and_then(|shared| match shared {
+                                Some(shared) => encode(&shared),
+                                None => Err(unfinished_and_unknown()),
+                            }),
+                    )
                 }
                 _ => Some(Err(unfinished_and_unknown())),
             },
