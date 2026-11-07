@@ -4,15 +4,15 @@
 //!
 //! Some kernels refuse a segmented send on some devices and routes, for example Linux before 6.11
 //! on a device with no transmit checksum offload (the Android emulator's Wi-Fi interface is one),
-//! Linux on an IPsec policy route, and Windows, whose own refusal the socket layer treats the same
-//! way. The socket layer then stops batching on that socket, but a connection that was already
-//! open keeps asking for batches, every one of them is refused, and whenever it has more than one
-//! datagram to send at a time its stream data can stall while single datagrams still pass. A
-//! device that refuses a batch cannot be made in a process, and the endpoint does not hand out its
-//! socket, so this watches the other end of the same fact: when a sender hands the kernel a batch,
-//! the Linux loopback delivers it to a receiving socket that asked for coalesced reads as one
-//! coalesced read, which the receiving endpoint counts. A transfer with no coalesced read was sent
-//! as single datagrams.
+//! Linux on an IPsec policy route, and some older Windows versions, which report segmentation
+//! support and then refuse a segmented send. The socket layer then stops batching on that socket,
+//! but a connection that was already open keeps asking for batches, every one of them is refused,
+//! and whenever it has more than one datagram to send at a time its stream data can stall while
+//! single datagrams still pass. A device that refuses a batch cannot be made in a process, and the
+//! endpoint does not hand out its socket, so this watches the other end of the same fact: when a
+//! sender hands the kernel a batch, the Linux loopback delivers it to a receiving socket that
+//! asked for coalesced reads as one coalesced read, which the receiving endpoint counts. A
+//! transfer with no coalesced read was sent as single datagrams.
 //!
 //! A count of zero says nothing where the host cannot show a batch at all: a kernel without UDP
 //! segmentation offload, a loopback that splits a batch itself, a receiving socket on which
@@ -22,7 +22,9 @@
 //! control's batches arrive coalesced, the product connection's zero is a difference the setting
 //! makes. Where they do not, the host cannot show the property: the case says so and passes, and a
 //! run that sets `KR_REQUIRE_SEGMENTATION` fails instead, as the Linux job of the landing workflow
-//! does.
+//! does. A host that refuses a segmented send is the one place where the control connection can
+//! stall itself, since it keeps offload on: the case then fails at the deadline of a transfer, or
+//! says it cannot show a batch if the stall clears first.
 
 mod support;
 
@@ -38,15 +40,15 @@ use support::{Side, direct_addr, paired_pair};
 /// more than the few the handshake and its acknowledgements need.
 const TRANSFER: usize = 1 << 20;
 
-/// What a transfer may take before the case fails instead of waiting for ever: a transfer over
-/// loopback is a few milliseconds, so this only turns a connection that stalls into a failure.
+/// What a transfer may take before the case fails instead of waiting for ever: the whole case takes
+/// well under a second over loopback, so this only turns a connection that stalls into a failure.
 const DEADLINE: Duration = Duration::from_secs(60);
 
 /// Set by a run that has to show the property, as the Linux job of the landing workflow does, so a
 /// host that cannot show it fails the case instead of passing without having looked.
 const REQUIRE: &str = "KR_REQUIRE_SEGMENTATION";
 
-/// The reads a receiving endpoint counted: datagrams, and reads that arrived coalesced.
+/// What a receiving endpoint counted: datagrams, and the reads that arrived coalesced.
 fn counted(side: &Side) -> (u64, u64) {
     let socket = &side.endpoint.metrics().socket;
     (socket.recv_datagrams.get(), socket.recv_gro_datagrams.get())
