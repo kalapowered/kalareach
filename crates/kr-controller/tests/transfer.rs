@@ -3160,12 +3160,13 @@ async fn a_transfer_refusal_that_cannot_be_recorded_is_told_the_outcome_is_unkno
     host.stop().await;
 }
 
-/// KR-REQ-09.09: a refusal that cannot be recorded, and that finds the record another copy of the
-/// action left, gives that record back only under the check any retained answer is owed. A host
-/// that comes to owe a fence after the copy passed its own check does not disclose a result under
-/// authority that has gone: the copy is refused for it, as a lookup that finds the same record is.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_record_found_when_a_refusal_cannot_be_recorded_is_not_given_while_a_fence_is_owed() {
+/// A copy of a refused upload whose first copy's record is put aside, stopped where it has passed
+/// the daemon's own check. Another copy's record is back by the time the copy's own refusal is to
+/// be written, `unwritable` says whether a record can be written then, and the host owes a fence.
+/// Returns what the copy is told.
+async fn a_copy_that_finds_a_record_where_it_records_its_refusal(
+    unwritable: bool,
+) -> ProtocolError {
     let host = host().await;
     let mut control = client(&host).await;
     host.controller
@@ -3188,7 +3189,7 @@ async fn a_record_found_when_a_refusal_cannot_be_recorded_is_not_given_while_a_f
 
     // The first copy is refused for the size of its file, and the refusal is recorded. Its record
     // is then put aside, so that the copy under test finds none at the door and meets it only
-    // when its own refusal cannot be recorded.
+    // when its own refusal is recorded.
     let recorded = failure(
         control
             .repeat(&mutation)
@@ -3201,8 +3202,6 @@ async fn a_record_found_when_a_refusal_cannot_be_recorded_is_not_given_while_a_f
         .execute_batch("CREATE TABLE actions_aside AS SELECT * FROM actions; DELETE FROM actions;")
         .expect("the record is put aside");
 
-    // The copy has passed the daemon's own check. Another copy's record is back by the time its
-    // refusal is to be written, the record cannot be written, and the host owes a fence.
     let (arrived, release) = host.controller.transfer().pause_after_the_outer_check();
     let (answer, registry) = tokio::join!(control.repeat(&mutation), async {
         tokio::task::spawn_blocking(move || {
@@ -3212,12 +3211,16 @@ async fn a_record_found_when_a_refusal_cannot_be_recorded_is_not_given_while_a_f
         .expect("the waiting thread finishes")
         .expect("the copy reaches the place it is stopped at");
         store
-            .execute_batch(
-                "INSERT INTO actions SELECT * FROM actions_aside;
-                 CREATE TRIGGER no_record_can_be_written BEFORE INSERT ON actions
-                 BEGIN SELECT RAISE(ABORT, 'the record cannot be written'); END;",
-            )
-            .expect("the other copy's record is back, and none can be written");
+            .execute_batch("INSERT INTO actions SELECT * FROM actions_aside;")
+            .expect("the other copy's record is back");
+        if unwritable {
+            store
+                .execute_batch(
+                    "CREATE TRIGGER no_record_can_be_written BEFORE INSERT ON actions
+                     BEGIN SELECT RAISE(ABORT, 'the record cannot be written'); END;",
+                )
+                .expect("no record can be written");
+        }
         let registry = Lapse::AFence.happens(&host).await;
         release.send(()).expect("the copy goes on");
         registry
@@ -3226,10 +3229,33 @@ async fn a_record_found_when_a_refusal_cannot_be_recorded_is_not_given_while_a_f
         fence_support::clear_the_fault(&registry);
     }
     let told = failure(answer.expect("the call reaches the daemon"));
+    host.stop().await;
+    told
+}
+
+/// KR-REQ-09.09: a refusal that cannot be recorded, and that finds the record another copy of the
+/// action left, gives that record back only under the check any retained answer is owed. A host
+/// that comes to owe a fence after the copy passed its own check does not disclose a result under
+/// authority that has gone: the copy is refused for it, as a lookup that finds the same record is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_found_when_a_refusal_cannot_be_recorded_is_not_given_while_a_fence_is_owed() {
+    let told = a_copy_that_finds_a_record_where_it_records_its_refusal(true).await;
     assert_eq!(
         told.code,
         ErrorCode::PermissionDenied,
         "the record is not given while a fence is owed: {told:?}"
     );
-    host.stop().await;
+}
+
+/// KR-REQ-09.09: the same for the record another copy left when the copy's own refusal is recorded
+/// without a fault. The write meets the other copy's row, and the answer is that row, given under
+/// the same check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_another_copy_left_is_not_given_while_a_fence_is_owed() {
+    let told = a_copy_that_finds_a_record_where_it_records_its_refusal(false).await;
+    assert_eq!(
+        told.code,
+        ErrorCode::PermissionDenied,
+        "the record is not given while a fence is owed: {told:?}"
+    );
 }
