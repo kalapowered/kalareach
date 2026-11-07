@@ -706,6 +706,7 @@ impl Companion {
                 companion_tauri::commands::device_list,
                 companion_tauri::commands::grant_held,
                 companion_tauri::commands::voice_prepare,
+                companion_tauri::commands::voice_context,
                 companion_tauri::commands::voice_allow,
                 companion_tauri::commands::voice_scope,
                 companion_tauri::commands::voice_start,

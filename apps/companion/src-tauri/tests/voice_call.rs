@@ -81,7 +81,7 @@ use kr_protocol::scalars::Nullable;
 use net_support::Host;
 use serde_json::json;
 use support::call::{OFFER, ScriptedCalls};
-use support::{Companion, NoOwner, Phone, StubIntake, WATCHDOG, pair, parts};
+use support::{Companion, NoOwner, Phone, StubIntake, WATCHDOG, pair, pair_under, parts};
 use tauri::Manager as _;
 use tokio::sync::watch;
 use voice_support::StandIn;
@@ -479,13 +479,11 @@ async fn scene_replacing(
         room,
         data,
     };
-    pair(
-        &phone,
-        &host,
-        &owner,
-        &[ActionRight::SessionView, ActionRight::AgentPrompt],
-    )
-    .await;
+    // Paired with the history of the session from its start: what a call is told of a session is
+    // decided against the history the pairing reaches, and none reaches nothing.
+    let mut proposed = net_support::proposal(&[ActionRight::SessionView, ActionRight::AgentPrompt]);
+    proposed.history.lower_bound_ms = Nullable::some(kr_protocol::scalars::TimestampMs::new(0));
+    pair_under(&phone, &host, &owner, proposed).await;
     let session = workers.first().map_or_else(
         || kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()).to_string(),
         |worker| worker.session_id.to_string(),
@@ -649,6 +647,105 @@ async fn a_call_runs_from_the_pages_start_to_its_hang_up() {
     assert_eq!(ended["ended"]["cause"], "requested");
     assert_eq!(ended["ended"]["host"]["kind"], "revoked");
     assert!(commands_sent(&scene).contains(&"close".to_owned()));
+    scene.stop_host().await;
+}
+
+/// KR-REQ-15.20: the call is given the host's default context as its opening context, exactly the
+/// selection the host makes of the session and nothing more of it. What the session's agents said
+/// and the decisions waiting on a person are in it, a secret in either is replaced, and the voice
+/// service's control receives no other `thinking` request. The service here is the local stand-in,
+/// which reads each request as the managed service does; no provider is reached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_call_is_given_the_hosts_default_context_as_its_opening_context_and_nothing_more() {
+    const SECRET: &str = "ghp_Zr8Qm3Kd9Lw2Xv7Nb5Tc1Hs";
+    let mut scene = scene_built(
+        quick(),
+        Some(phone_grant(PHONE_TOKEN, 3600)),
+        None,
+        HttpDeadlines::default(),
+        1,
+    )
+    .await;
+    let worker = &scene.workers[0];
+    let agent = worker.register_agent(Arc::new(net_support::worker::Upstream::default()));
+    let at = kr_ipc::now_ms().get();
+    for (i, text) in [
+        "the release notes are drafted".to_owned(),
+        format!("deploy with {SECRET}"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        worker
+            .service
+            .broker()
+            .observe(
+                agent,
+                "message",
+                text,
+                kr_protocol::scalars::TimestampMs::new(at + i as u64),
+            )
+            .expect("the agent has said something");
+    }
+    worker.ask("r1");
+
+    let started = scene.start().await;
+    let voice_session_id = started["value"]["outcome"]["started"]["session"]["voice_session_id"]
+        .as_str()
+        .expect("a voice session")
+        .to_owned();
+    scene
+        .state_where("a running call", |state| {
+            state["running"] == true && state["control"] == "connected"
+        })
+        .await;
+
+    // What the host selects for the call, read the way the page reads it.
+    let read: kr_protocol::voice::VoiceContextResult = serde_json::from_value(
+        scene
+            .call(
+                "voice_context",
+                json!({ "params": {
+                    "voice_session_id": voice_session_id,
+                    "session_id": scene.session,
+                    "selected": [],
+                    "delegation_id": null,
+                } }),
+            )
+            .expect("the host selects the context"),
+    )
+    .expect("the selection decodes");
+    let expected = kr_client::services::voice_control::call_start_appends(&read.selection);
+    assert!(!expected.is_empty());
+
+    let thinking = |report: &voice_support::control_route::Report| -> Vec<String> {
+        report
+            .sent
+            .iter()
+            .filter(|sent| sent.command == "thinking")
+            .filter_map(|sent| sent.content.clone())
+            .collect()
+    };
+    scene
+        .stand_in
+        .control()
+        .until("the opening context was sent", |report| {
+            thinking(report).len() >= expected.len()
+        })
+        .await;
+    let given = thinking(&scene.stand_in.control().report());
+    assert_eq!(given, expected, "exactly the host's selection, and no more");
+    let all = given.join("\n");
+    assert!(all.contains("the release notes are drafted"), "{all}");
+    assert!(all.contains("Publish the release (r1)?"), "{all}");
+    assert!(
+        !all.contains(SECRET) && all.contains("[redacted]"),
+        "a secret is replaced before it leaves the host: {all}"
+    );
+
+    scene
+        .call("voice_stop", json!({ "voiceSessionId": voice_session_id }))
+        .expect("the call ends");
     scene.stop_host().await;
 }
 

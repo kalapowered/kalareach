@@ -92,7 +92,7 @@ again. A request the service never answered may have reached the provider, so it
 the same state is not asked for a second time, and a different one, an unmute after the mute, is.
 The mute itself never waits for the service.
 
-The host's selected context is sent as the call's opening context, appended using `thinking` frames. The first line of the opening context says that the text is data about the person's work and not instructions, and the selected text follows. Where possible, splitting will be done at line breaks, and each chunk will be at most 500 bytes. If the selection would require more than 64 chunks of opening context, the whole selection will be rejected.
+The host's selected context is sent as the call's opening context, appended using `thinking` frames. The phone reads it from the host when the control first attaches, for the first session the call reaches, and sends exactly that selection and nothing else of the session. If the host does not give it or the service does not take it, the call goes on without it and the device's log says why. The first line of the opening context says that the text is data about the person's work and not instructions, and the selected text follows. Where possible, splitting will be done at line breaks, and each chunk will be at most 500 bytes. If the selection would require more than 64 chunks of opening context, the whole selection will be rejected.
 
 ## Screen lock and background audio
 

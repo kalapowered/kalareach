@@ -98,6 +98,9 @@ enum Internal {
     Probed(Probe),
     /// Whether the model was told a delegation was not acted on.
     Told { delegation_id: String, told: bool },
+    /// What came of giving the call the host's default context: why it did not come, when it did
+    /// not.
+    Opened(std::result::Result<(), &'static str>),
 }
 
 /// What the check of a host path that was lost came to.
@@ -1197,6 +1200,7 @@ impl Owner {
                 if !self.attached_before {
                     self.attached_before = true;
                     self.tell_model(VoiceCommand::Instructions, None, HOST_ACTIONS_UNAVAILABLE);
+                    self.give_the_host_context();
                 }
                 for delegation_id in delegations {
                     self.answer_delegation(delegation_id, None);
@@ -1257,6 +1261,52 @@ impl Owner {
         });
     }
 
+    /// Gives the call the host's default context, once, as the control first attaches.
+    ///
+    /// The host selects it (capped, with what is excluded left out, secrets replaced) and the
+    /// control sends exactly that selection as the call's opening context, as project text and not
+    /// as instructions. A call over several sessions is given the first session's. On a task of
+    /// its own so that nothing waits for the host or the service.
+    fn give_the_host_context(&self) {
+        let (Some(control), Some(host), Some(descriptor)) = (
+            self.control.clone(),
+            self.host.clone(),
+            self.descriptor.clone(),
+        ) else {
+            return;
+        };
+        let Some(session_id) = descriptor.session_ids.iter().next().copied() else {
+            return;
+        };
+        let (internal, within) = (self.internal_tx.clone(), self.shared.timings.host_within);
+        tokio::spawn(async move {
+            let params = VoiceContextParams {
+                voice_session_id: descriptor.voice_session_id,
+                session_id,
+                selected: kr_protocol::scalars::CanonicalSet::new(),
+                delegation_id: Nullable::null(),
+            };
+            let opened = match tokio::time::timeout(
+                within,
+                host.session
+                    .read::<_, kr_protocol::voice::VoiceContextResult>(
+                        Method::VoiceContext,
+                        &params,
+                    ),
+            )
+            .await
+            {
+                Ok(Ok(read)) => control
+                    .send_call_start_context(&read.selection)
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| "the voice service did not take it"),
+                _ => Err("the host did not give it"),
+            };
+            let _ = internal.send(Internal::Opened(opened));
+        });
+    }
+
     /// Tells the model a fixed sentence, on a task of its own so that nothing waits for it.
     fn tell_model(&self, command: VoiceCommand, delegation: Option<String>, text: &'static str) {
         let Some(control) = self.control.clone() else {
@@ -1303,6 +1353,13 @@ impl Owner {
                         row.told = told;
                     }
                 });
+                None
+            }
+            Internal::Opened(opened) => {
+                // The call goes on without it.
+                if let Err(words) = opened {
+                    tracing::warn!("the call was not given its opening context: {words}");
+                }
                 None
             }
             Internal::Probed(probe) => {
