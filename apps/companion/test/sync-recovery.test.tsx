@@ -9,7 +9,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { act, render, screen, waitFor, within } from '@testing-library/react'
+import { act, isInaccessible, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import { App } from '../src/App'
@@ -45,8 +45,8 @@ describe('the sync service setting', () => {
     const { person, sheet } = await openSheet()
     expect(await within(sheet).findByTestId('sync-service')).toHaveTextContent('reach.kala.to')
     // A screen reader says the address as words, and does not read the written form.
-    expect(within(sheet).getByText('reach dot kala dot to')).not.toHaveAttribute('aria-hidden')
-    expect(within(sheet).getByTestId('sync-service')).toHaveAttribute('aria-hidden', 'true')
+    expect(isInaccessible(within(sheet).getByText('reach dot kala dot to'))).toBe(false)
+    expect(isInaccessible(within(sheet).getByTestId('sync-service'))).toBe(true)
 
     await person.click(within(sheet).getByTestId('change-sync-service'))
     const input = within(sheet).getByLabelText('Sync service')

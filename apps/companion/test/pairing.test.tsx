@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, isInaccessible, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import { App } from '../src/App'
@@ -632,8 +632,8 @@ describe('pairing with a host', () => {
       expect(screen.getByTestId('pairing-service').textContent).toBe('pair.example.org')
     })
     // A screen reader says the address as words, and does not read the written form.
-    expect(screen.getByText('pair dot example dot org')).not.toHaveAttribute('aria-hidden')
-    expect(screen.getByTestId('pairing-service')).toHaveAttribute('aria-hidden', 'true')
+    expect(isInaccessible(screen.getByText('pair dot example dot org'))).toBe(false)
+    expect(isInaccessible(screen.getByTestId('pairing-service'))).toBe(true)
   })
 })
 
