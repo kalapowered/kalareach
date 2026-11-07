@@ -1444,18 +1444,32 @@ fn a_listing_whose_first_program_fails_names_what_it_said_and_not_what_cargo_wro
         directory.path(),
         "cannot write in $CARGO_MANIFEST_DIR: the volume is full",
     );
-    let (document, _evidence) = run_step_through(
+    let (document, evidence) = run_step_through(
         "several",
         &["test", "--locked", "--workspace", "--no-fail-fast"],
         lister,
     )
     .unwrap_or_else(|stopped| panic!("{stopped:?}"));
-    let error = document.steps[0].error.as_deref().unwrap_or_default();
+    let step = &document.steps[0];
+    let error = step.error.as_deref().unwrap_or_default();
     assert!(error.contains("did not list the step's tests"), "{error}");
     assert!(
         error.contains("the volume is full"),
         "the error does not name what the first program said: {error}"
     );
+    // The target directory is outside the checkout, and Cargo's status lines name the programs in
+    // it: they belong in the log, and not in the result.
+    for status in [
+        "Finished",
+        "Running unittests",
+        "kr-conformance-fixture-target",
+    ] {
+        assert!(!error.contains(status), "{status} is in the error: {error}");
+    }
+    let log = std::fs::read_to_string(evidence.path().join(&step.log)).expect("the step's log");
+    for status in ["Running unittests", "kr-conformance-fixture-target"] {
+        assert!(log.contains(status), "{status} is not in the log:\n{log}");
+    }
     for cargo in [
         "Doc-tests",
         "Caused by",
