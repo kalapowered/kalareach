@@ -31,7 +31,9 @@ function layOut(bar: HTMLElement, form: Form): void {
  * whole word. A label that is a fraction of a pixel short ends in an ellipsis as one that is far
  * short does, so the word as typeset is held to its box to the fraction. The labels are measured in
  * the bold weight of the tab the person is on, the widest a label is ever set in, whichever tab
- * that is now: what the bar can hold never depends on where the person is.
+ * that is now: what the bar can hold never depends on where the person is. Each form keeps its own
+ * gap between a word and the edge of the screen as padding, so a form in which a label would come
+ * nearer the edge than that is one whose labels do not fit.
  */
 function showsEveryLabel(bar: HTMLElement): boolean {
   if (bar.scrollWidth > bar.clientWidth) return false
