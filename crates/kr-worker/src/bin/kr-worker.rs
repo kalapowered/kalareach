@@ -361,10 +361,19 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     ) {
         Ok(runtime) => runtime,
         Err(failure) => {
-            let error = ProtocolError::new(failure.error.code(), failure.error.to_string());
-            writer
-                .write_message(&ControlFrame::WorkerFailed(error))
-                .await?;
+            // A shell that is not seen to have ended is not reported on, so the daemon finds the
+            // worker's connection gone and tells the create that what became of it is not known.
+            if failure.shell_may_run {
+                tell(format_args!(
+                    "the root shell is not seen to have ended after the session failed to start, \
+                     so the launch failure is not reported"
+                ));
+            } else {
+                let error = ProtocolError::new(failure.error.code(), failure.error.to_string());
+                writer
+                    .write_message(&ControlFrame::WorkerFailed(error))
+                    .await?;
+            }
             return Err(Box::new(failure.error));
         }
     };
