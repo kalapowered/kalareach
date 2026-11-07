@@ -1405,9 +1405,8 @@ fn a_job_runs_with_the_limits_sent_and_the_loaded_profiles_sampler() {
 /// the thread) and the I/O class it lowers to (Linux: idle; macOS: the
 /// throttled disk policy of the process). The server does not hand out the model thread's
 /// identifier, so the case reads it on that thread. It shows the model thread and no thread that
-/// thread starts: on macOS the threads a model starts are read from outside in the next case, and
-/// on Linux they inherit the thread's class, which no case reads. Windows reads the process's class
-/// from outside, in `tests/supervise.rs`.
+/// thread starts: the threads a model starts are read in the Linux case and in the macOS case that
+/// follow this one. Windows reads the process's class from outside, in `tests/supervise.rs`.
 #[cfg(unix)]
 #[test]
 fn the_thread_that_runs_a_job_is_in_the_background_class_the_system_reports() {
@@ -1439,6 +1438,109 @@ fn the_thread_that_runs_a_job_is_in_the_background_class_the_system_reports() {
             "the thread holds no lowered I/O class at its {when}: {held:?}"
         );
     }
+}
+
+/// A model that starts a thread of its own, with the default attributes, in a load and in a job, as
+/// a runtime that reads its weights or computes on a pool does, and records what each of those
+/// threads reports of its own background class.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Default)]
+struct Starting {
+    at_load: Arc<Mutex<Vec<support::Held>>>,
+    at_job: Arc<Mutex<Vec<support::Held>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl Starting {
+    /// What a thread started from the calling thread reports of its class.
+    fn held_by_a_thread_started_here() -> support::Held {
+        std::thread::Builder::new()
+            .name("model-thread".to_owned())
+            .spawn(support::held_by_this_thread)
+            .expect("a thread starts")
+            .join()
+            .expect("the thread read its class")
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Model for Starting {
+    fn load(&mut self, _work: &LoadWork<'_>, _token: &Cancellation, _deadline: Instant) -> Loading {
+        let held = Self::held_by_a_thread_started_here();
+        self.at_load.lock().expect("the record").push(held);
+        Loading::Loaded
+    }
+
+    fn generate(
+        &mut self,
+        _job: &Job<'_>,
+        _token: &Cancellation,
+        _deadline: Instant,
+    ) -> Generating {
+        let held = Self::held_by_a_thread_started_here();
+        self.at_job.lock().expect("the record").push(held);
+        Generating::Ended {
+            why: JobEnd::Failed,
+            detail: None,
+        }
+    }
+
+    fn verify(
+        &mut self,
+        _asset: &kr_describe::profile::Asset,
+        _path: &Path,
+        _token: &Cancellation,
+        _deadline: Instant,
+    ) -> Verifying {
+        Verifying::Verified
+    }
+}
+
+/// KR-REQ-22.11, the threads a model starts on Linux only: a thread the model starts of its own,
+/// in the load and in the job it is given, runs at the background class the process sets for the
+/// thread that runs the model, which is the batch policy at niceness 19 and the idle I/O class.
+/// The server applies the class on that thread before it hands the model a load or a job, and
+/// the new threads inherit it. The case reads the class on the thread the model started, and not
+/// on the model thread. The control is a thread started from the test's own thread, outside the
+/// server: it reads neither class, so a process that was already in the class as a whole would not
+/// pass for the product having put the model's threads there. Not shown here: that a job is
+/// cancellable, that the disk's scheduler acts on the idle class, and the other platforms, which
+/// the cases beside this one read from outside.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_thread_the_model_starts_is_in_the_background_class_the_system_reports() {
+    let model = Starting::default();
+    let profile = default_profile();
+    serve_in_process(
+        model.clone(),
+        &[load(1, &profile, 300_000), generate(2, 1, 30_000)],
+        || !model.at_job.lock().expect("the record").is_empty(),
+    );
+    let at_load = model.at_load.lock().expect("the record").clone();
+    let [at_load] = at_load[..] else {
+        panic!("one load reached the model: {at_load:?}");
+    };
+    let at_job = model.at_job.lock().expect("the record").clone();
+    let [at_job] = at_job[..] else {
+        panic!("one job reached the model: {at_job:?}");
+    };
+    for (when, held) in [("load", at_load), ("job", at_job)] {
+        assert!(
+            held.cpu_is_lowered(),
+            "a thread the model started in its {when} holds no lowered processor class: {held:?}"
+        );
+        assert!(
+            held.io_is_lowered(),
+            "a thread the model started in its {when} holds no lowered I/O class: {held:?}"
+        );
+    }
+
+    let outside = Starting::held_by_a_thread_started_here();
+    assert!(
+        !outside.cpu_is_lowered() && !outside.io_is_lowered(),
+        "a thread this test starts outside the server is already in the class, so the case could \
+         not tell the product's work from the process's: {outside:?}"
+    );
 }
 
 /// KR-REQ-22.11: on macOS every thread of the description process is in the background class the
