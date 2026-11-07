@@ -613,16 +613,36 @@ fn text(bytes: &[u8]) -> String {
 }
 
 /// Every file below `root`, by relative path.
+///
+/// A folder, an entry or a file the scan cannot look at would leave a scan of the tree vacuous, so
+/// it fails the case, unless it was removed since its folder was listed. A socket or a pipe is not
+/// a file and is not read.
 fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
     fn walk(root: &Path, at: &Path, into: &mut BTreeMap<String, Vec<u8>>) {
-        let Ok(entries) = std::fs::read_dir(at) else {
-            return;
+        let entries = match std::fs::read_dir(at) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("{} cannot be listed: {error}", at.display()),
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
+        for entry in entries {
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("an entry of {} cannot be read: {error}", at.display()),
+            };
+            let kind = match std::fs::metadata(&path) {
+                Ok(kind) => kind,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("{} cannot be examined: {error}", path.display()),
+            };
+            if kind.is_dir() {
                 walk(root, &path, into);
-            } else if let Ok(bytes) = std::fs::read(&path) {
+            } else if kind.is_file() {
+                let bytes = match std::fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => panic!("{} cannot be read: {error}", path.display()),
+                };
                 into.insert(
                     path.strip_prefix(root)
                         .expect("below the root")
