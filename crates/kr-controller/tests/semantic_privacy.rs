@@ -74,7 +74,12 @@ async fn privacy_mode_removes_an_agents_semantic_history_and_records_none_while_
     let (control, _) = read_history(&adopted, &device, &record, instance).await;
     assert_eq!(control, vec!["before".to_owned()]);
 
+    // Enabling removes what was kept, before anything else is recorded or read.
     adopted.set_privacy(true).await;
+    let (removed, _) = read_history(&adopted, &device, &record, instance).await;
+    assert!(removed.is_empty(), "{removed:?}");
+
+    // And nothing is recorded while it is on.
     broker
         .observe(instance, "message", "during", TimestampMs::new(11))
         .expect("the agent said something while privacy mode was on");
