@@ -347,9 +347,9 @@ async fn a_create_whose_first_attempt_reserved_its_token() -> (
 }
 
 /// KR-REQ-09.09: a create asked again whose session's closure cannot be read is told that what
-/// became of the session is not known. The token is held, so a first attempt was made, and a
-/// transient word would say that nothing took effect and have the create sent again as though
-/// nothing had.
+/// became of the session is not known. The token is held and a worker was asked for, so a first
+/// attempt may have made the session, and a transient word would say that nothing took effect and
+/// have the create sent again as though nothing had.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_create_asked_again_whose_closure_cannot_be_read_is_told_the_outcome_is_unknown() {
     let (temp, controller, request, carried, actor_id) =
@@ -359,6 +359,9 @@ async fn a_create_asked_again_whose_closure_cannot_be_read_is_told_the_outcome_i
     registry
         .busy_timeout(Duration::from_secs(10))
         .expect("waits for the daemon's own writes");
+    registry
+        .execute("UPDATE reservations SET phase = 'spawned'", [])
+        .expect("the reservation shows that a worker was asked for");
     registry
         .execute_batch("ALTER TABLE tombstones RENAME TO tombstones_aside;")
         .expect("the closures cannot be read");
@@ -371,6 +374,91 @@ async fn a_create_asked_again_whose_closure_cannot_be_read_is_told_the_outcome_i
         .execute_batch("ALTER TABLE tombstones_aside RENAME TO tombstones;")
         .expect("the closures can be read again");
     assert_eq!(told.code(), ErrorCode::OutcomeUnknown, "{told}");
+}
+
+/// KR-REQ-09.09: a create asked again whose reservation reads as a launch that failed, and that no
+/// worker ever claimed, is told so whatever else the host cannot read: no session was started, so
+/// neither the session's closure nor a second read of the reservation can say otherwise, and the
+/// create is refused as it is when the registry can be read. The first attempt here is exactly that,
+/// for the supervisor starts nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_asked_again_whose_launch_failed_is_told_so_though_the_host_cannot_read_more() {
+    let (temp, controller, request, carried, actor_id) =
+        a_create_whose_first_attempt_reserved_its_token().await;
+    let reservation = controller
+        .registry
+        .lock()
+        .await
+        .reservation_for_token(&actor_id, request.action_id.get())
+        .expect("reads the token")
+        .expect("the token is reserved");
+    assert_eq!(reservation.phase, LaunchPhase::Failed);
+    assert!(reservation.claimed_key.is_none(), "no worker claimed it");
+    let registry = rusqlite::Connection::open(temp.environment().registry_database())
+        .expect("the registry opens beside the daemon's own handle");
+    registry
+        .busy_timeout(Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+
+    // The closures cannot be read.
+    registry
+        .execute_batch("ALTER TABLE tombstones RENAME TO tombstones_aside;")
+        .expect("the closures cannot be read");
+    let told = controller
+        .session_create(&actor_id, &request, carried)
+        .await
+        .into_answer()
+        .expect_err("a launch that failed leaves no session to answer with");
+    registry
+        .execute_batch("ALTER TABLE tombstones_aside RENAME TO tombstones;")
+        .expect("the closures can be read again");
+    assert_eq!(
+        told.code(),
+        ErrorCode::ResourceUnavailable,
+        "the closures cannot be read: {told}"
+    );
+
+    // The control: a worker that claimed is not shown to have made no session. With the closures
+    // unreadable, the host does not know what became of it.
+    registry
+        .execute("UPDATE reservations SET claimed_key = zeroblob(32)", [])
+        .expect("a worker claimed the reservation");
+    registry
+        .execute_batch("ALTER TABLE tombstones RENAME TO tombstones_aside;")
+        .expect("the closures cannot be read");
+    let told = controller
+        .session_create(&actor_id, &request, carried)
+        .await
+        .into_answer()
+        .expect_err("a claimed launch that failed is not shown to have made no session");
+    registry
+        .execute_batch("ALTER TABLE tombstones_aside RENAME TO tombstones;")
+        .expect("the closures can be read again");
+    registry
+        .execute("UPDATE reservations SET claimed_key = NULL", [])
+        .expect("the claim is taken back");
+    assert_eq!(
+        told.code(),
+        ErrorCode::OutcomeUnknown,
+        "a worker claimed: {told}"
+    );
+
+    // The reservation was read by the caller, and cannot be read a second time.
+    registry
+        .execute(
+            "UPDATE reservations SET phase = 'a phase this build does not know'",
+            [],
+        )
+        .expect("the reservation cannot be read again");
+    let told = controller
+        .replay_create(&reservation)
+        .await
+        .expect_err("a launch that failed leaves no session to answer with");
+    assert_eq!(
+        told.code(),
+        ErrorCode::ResourceUnavailable,
+        "the reservation cannot be read again: {told}"
+    );
 }
 
 /// KR-REQ-09.09: a create asked again whose worker is not in the directory and whose session has

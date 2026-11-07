@@ -1200,6 +1200,12 @@ impl Controller {
         self: &Arc<Self>,
         reservation: &crate::registry::Reservation,
     ) -> Result<ParamsValue> {
+        // A launch recorded as failed that no worker ever claimed made no session, and the
+        // reservation the caller read says so. It is decided before the records that may fail to
+        // be read, a closure or a second read of the reservation: none of them can say otherwise.
+        if reservation.phase == LaunchPhase::Failed && reservation.claimed_key.is_none() {
+            return Err(launch_failed(reservation));
+        }
         // A retry can arrive before this daemon has adopted the worker its first attempt started,
         // which is what happens when a restart landed while the session was still qualifying.
         if self
@@ -1249,12 +1255,9 @@ impl Controller {
         self.closed_create(reservation, true).await?.ok_or_else(|| {
             let phase = reservation.phase.as_str();
             match reservation.phase {
-                // The launch is confirmed to have produced no worker: the host knows the session
-                // does not exist.
-                LaunchPhase::Failed => ControllerError::supervision(format!(
-                    "this create token is already recorded as {phase} and its worker is not \
-                     available"
-                )),
+                // The worker claimed and then reported that it could not start, and no closure
+                // is recorded for it: the host says what the reservation shows.
+                LaunchPhase::Failed => launch_failed(reservation),
                 // The first attempt has reserved the session and not yet asked for a worker: it may
                 // still make the session. A row its attempt left behind when a write failed reads the
                 // same until the next start moves it to failed, and nothing ran for it.
@@ -1303,6 +1306,15 @@ impl Controller {
         })
         .map(Some)
     }
+}
+
+/// What a create asked again is told when its reservation shows that its launch failed: the
+/// refusal the create was given when the launch failed.
+fn launch_failed(reservation: &crate::registry::Reservation) -> ControllerError {
+    ControllerError::supervision(format!(
+        "this create token is already recorded as {} and its worker is not available",
+        reservation.phase.as_str()
+    ))
 }
 
 /// What a repeat of a create is told when the worker its first attempt started, or the claim that
