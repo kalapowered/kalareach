@@ -66,22 +66,37 @@ impl ReadBack {
     }
 }
 
+/// Why the command does not know what became of its request.
+pub enum Cause<'a> {
+    /// The connection failed after the request was composed, and the request may have been written
+    /// before it did.
+    Connection,
+    /// The host answered, and the answer could not be read.
+    Unreadable,
+    /// The host said that it cannot establish what became of the action.
+    Host(&'a ProtocolError),
+}
+
 impl Unknown {
     /// What the command ends as: `OUTCOME_UNKNOWN`, naming the action, the command that reads it
-    /// back and what a later request is. `host_said` is the host's own refusal when it gave one;
-    /// without it the connection ended.
+    /// back and what a later request is.
     #[must_use]
-    pub fn ended(&self, action: ActionId, host_said: Option<&ProtocolError>) -> CliError {
-        let cause = match host_said {
-            Some(refusal) => shown!(
+    pub fn ended(&self, action: ActionId, cause: Cause<'_>) -> CliError {
+        let cause = match cause {
+            Cause::Connection => shown!(
+                "the connection failed after the request for {} was composed, and the request may \
+                 have reached the host, so whether it performed it is not known",
+                self.what
+            ),
+            Cause::Unreadable => shown!(
+                "the host answered the request for {} and its answer could not be read, so whether \
+                 it performed it is not known",
+                self.what
+            ),
+            Cause::Host(refusal) => shown!(
                 "the host could not say whether it performed {} ({})",
                 self.what,
                 Shown::protocol(refusal)
-            ),
-            None => shown!(
-                "the connection ended after the request for {} was sent, so whether the host \
-                 performed it is not known",
-                self.what
             ),
         };
         let next = match &self.later {
@@ -90,13 +105,16 @@ impl Unknown {
                 command.clone(),
                 action
             ),
-            None => Shown::said("a later request has to be made in sight of that result"),
+            None => Shown::said(
+                "this command makes no later request: what the host holds of it shows whether it \
+                 happened",
+            ),
         };
         CliError::Unfinished {
             code: ErrorCode::OutcomeUnknown,
             message: shown!(
-                "{}. It was sent as action {} and is not sent again; `{}` shows what the host holds \
-                 of it, and {}",
+                "{}. The request was made as action {} and is not sent again; `{}` shows what the \
+                 host holds of it, and {}",
                 cause,
                 action,
                 self.read_back.command(action),
@@ -141,12 +159,14 @@ where
     match client.repeat(&mutation).await {
         // A reply that cannot be read came after the request went out, so the action may have been
         // performed.
-        Ok(Ok(value)) => value.to_typed().map_err(|_| unknown.ended(action_id, None)),
+        Ok(Ok(value)) => value
+            .to_typed()
+            .map_err(|_| unknown.ended(action_id, Cause::Unreadable)),
         Ok(Err(refusal)) if refusal.code == ErrorCode::OutcomeUnknown => {
-            Err(unknown.ended(action_id, Some(&refusal)))
+            Err(unknown.ended(action_id, Cause::Host(&refusal)))
         }
         Ok(Err(refusal)) => Err(CliError::Refused(refusal)),
         Err(error @ IpcError::NotInLevel(_)) => Err(CliError::Ipc(error)),
-        Err(_) => Err(unknown.ended(action_id, None)),
+        Err(_) => Err(unknown.ended(action_id, Cause::Connection)),
     }
 }

@@ -1897,8 +1897,9 @@ fn finish_transfer(
         Some(waiting) => Some(CliError::Unfinished {
             code: ErrorCode::ResourceUnavailable,
             message: shown!(
-                "the transfer is recorded and the giving device's grant is revoked, and {} \
-                 session worker{} {} not fenced it yet; `{}` again reports how far it has got",
+                "the transfer is recorded and the revocation of the giving device's grant is \
+                 pending: {} session worker{} {} not fenced it yet; `{}` again reports how far it \
+                 has got",
                 waiting,
                 if waiting == 1 { "" } else { "s" },
                 if waiting == 1 { "has" } else { "have" },

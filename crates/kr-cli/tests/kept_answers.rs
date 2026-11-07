@@ -2553,8 +2553,9 @@ async fn a_close_whose_outcome_is_not_known_names_its_action_and_is_sent_once() 
         let said = stopped["message"].as_str().expect("a message");
         assert!(
             said.contains(&format!(
-                "kr action read {} --session {session}",
-                stops[0].1
+                "kr action read {} --session {session} --environment {}",
+                stops[0].1,
+                host.environment.environment_id()
             )),
             "{behaviour:?}: {said}"
         );

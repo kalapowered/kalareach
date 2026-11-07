@@ -207,7 +207,7 @@ machine the session is on; `list` and `show` read with `question.read`.
 | `kr question list [--session <id>] [--include-resolved]` | Lists what is waiting, with the verified identity that asked |
 | `kr question show <question_id>` | One question in full, including the context and the choices |
 | `kr question answer <question_id> (--text \| --choice <id> \| --yes \| --no \| --other <text>)` | Answers it |
-| `kr question cancel <question_id>` | Withdraws it without answering |
+| `kr question cancel <question_id> [--after-unknown <action>]` | Withdraws it without answering; `--after-unknown` is the later cancellation after an earlier one whose outcome the worker could not establish |
 
 Questions belong to the session, so these reach the session's worker directly, the way attaching
 does. They keep working while the control daemon is restarting, and the authority behind them is

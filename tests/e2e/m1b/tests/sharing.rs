@@ -863,6 +863,13 @@ fn hand_over(leg: &str, lose: Option<Method>, stopped: bool) {
         );
         assert_eq!(done.document["ok"], false, "{}", done.document);
         assert!(
+            !done.document["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("is revoked")),
+            "a revocation a worker has not fenced is not said to be done: {}",
+            done.document
+        );
+        assert!(
             counter(&done.document["authority_revision"]) > 0,
             "the document states the revision the host issued: {}",
             done.document

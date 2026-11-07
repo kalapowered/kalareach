@@ -1037,9 +1037,11 @@ command it is about to run.
 session's worker when none is. It sends one request, under an action it makes for it. When the
 outcome of that request is not known (see the exit codes), the command ends with exit status 1 and
 `OUTCOME_UNKNOWN`, names the action and the `kr action read <action> --session <session>` that shows
-what the host holds of it, and sends nothing again. A plain `kr close` after that is refused by the
-session's worker while the earlier outcome stands, and the command has no later request of its own:
-read the receipt, and look at `kr list`, to see whether the session closed.
+what the host holds of it, and sends nothing again. If the session's worker holds that close as an
+outcome it could not establish, a plain `kr close` is refused while it does, and the command has no
+later request of its own: read the receipt, and look at `kr list`, to see whether the session
+closed. A failure of the control daemon's own connection to the worker reaches `kr` as the
+daemon's refusal, and is reported as that refusal, without the action named.
 
 ## `kr export`
 
