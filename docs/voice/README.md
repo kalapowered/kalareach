@@ -260,9 +260,15 @@ is turned on whilst the context is being read the context will be read again, an
 carries none of it. The context will be read
 at most three times; if the privacy mode keeps changing the request will be refused as transient and
 the device will request it again. The answer is checked once, when the read ends, so the privacy
-mode may still be turned on between that check and the write to the device. The receipt for a voice
-read of a session carries the pinned name and the facts the daemon holds itself, but no model text
-or description host information, and it passes the same secret patterns as a selection does.
+mode may still be turned on between that check and the write to the device.
+
+A voice read of a session is answered with a receipt, and the receipt is not a selection. It holds
+the two items a selection leads with, built by the same functions and passed through the same
+history bound: the session's description (its number, its pinned name and its shell) and its
+directory. It adds the session's state while the session runs. It holds no model text, description
+host information, message, decision, output, environment variable, file or attachment, so none of
+the four classes a selection leaves out can enter it. The coordinator strips it with the same
+secret patterns and cuts it to the 500 bytes an append may carry, far below the selection's cap.
 
 ## A voice session is not a terminal session
 

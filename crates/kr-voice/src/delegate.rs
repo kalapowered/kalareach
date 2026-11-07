@@ -1871,8 +1871,11 @@ impl Coordinator {
             if receipt.performed {
                 VoiceDelegationOutcome::Performed {
                     action_id: receipt.action_id,
-                    // What the host says it did leaves with the same patterns a context selection
-                    // is stripped with, and is cut to what a result may carry.
+                    // What the host says it did leaves stripped with the patterns a context
+                    // selection is stripped with, and cut to what a result may carry. A receipt
+                    // is a short statement and not a selection: the host's read of a session
+                    // names its description, directory and state and none of the text a
+                    // selection leaves out, so the stripping and the cut are what apply to it.
                     summary: bounded(&self.patterns.strip(&receipt.summary).0),
                 }
             } else {

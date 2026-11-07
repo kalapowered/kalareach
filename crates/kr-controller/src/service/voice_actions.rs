@@ -499,6 +499,14 @@ impl Controller {
             // so it travels with a description the bound admitted.
             let live = read.session.state != kr_protocol::session::SessionState::Closed;
             let state = read.session.state.as_str().to_owned();
+            // This receipt does not go through `select_context`, because it holds nothing that
+            // function would take out. It is made of the two items a selection leads with, the
+            // description and the directory, built by the functions the selection uses and passed
+            // through the same bound just above, and of the session's state. The worker's half
+            // (messages and decisions) is not read here and nothing of the session's output,
+            // environment, files or attachments is, so no item of a class a selection leaves out
+            // can enter it. The coordinator strips it with its secret patterns and cuts it to the
+            // bytes an append may carry, which is far below the selection's cap.
             let filtered = crate::voice::filtered(snapshot, &narrowed);
             let summary = match (filtered.session_description, filtered.working_directory) {
                 (None, _) => "this grant's history does not reach that session".to_owned(),

@@ -580,6 +580,12 @@ async fn what_the_default_leaves_out_never_reaches_the_context_selected_or_not()
     let agent = world.agent();
     world.said(agent, "control-marker-entry", world.started_ms + 1);
 
+    let markers = [
+        "env-marker-5c1e",
+        "file-marker-9d2a",
+        "scrollback-marker-3b7f",
+    ];
+
     for selected in [
         Vec::new(),
         vec![
@@ -593,16 +599,24 @@ async fn what_the_default_leaves_out_never_reaches_the_context_selected_or_not()
             carried.contains("control-marker-entry"),
             "{selected:?}: {carried}"
         );
-        for marker in [
-            "env-marker-5c1e",
-            "file-marker-9d2a",
-            "scrollback-marker-3b7f",
-        ] {
+        for marker in markers {
             assert!(
                 !carried.contains(marker),
                 "{selected:?}: {marker} reached the model: {carried}"
             );
         }
+    }
+
+    // The receipt of a voice read of the same session is made of its description, directory and
+    // state, so it holds none of them either. Like the legs above it guards against a route being
+    // added, and no mutation adds one.
+    let receipt = world.status_receipt().await;
+    assert!(receipt.contains("session 1"), "{receipt}");
+    for marker in markers {
+        assert!(
+            !receipt.contains(marker),
+            "{marker} reached the model in the receipt: {receipt}"
+        );
     }
     world.stop().await;
 }
