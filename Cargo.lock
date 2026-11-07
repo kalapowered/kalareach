@@ -1296,6 +1296,7 @@ dependencies = [
 name = "companion-tauri"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "block2",
  "companion-platform",
  "companion-tauri",
@@ -4567,6 +4568,7 @@ dependencies = [
 name = "kr-client"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "base64 0.23.1",
  "futures-util",
  "iroh",

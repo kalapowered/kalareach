@@ -112,6 +112,9 @@ testing = ["kr-client/testing"]
 exacl.workspace = true
 
 [dev-dependencies]
+# A test that scans for a private key made from a seed checks the key it looks for against the
+# public key of the pair, which takes an X25519 scalar multiplication.
+aws-lc-rs.workspace = true
 # Reads the QR code the kit is saved as, which a test holds to the kit's own text: the whole SVG is
 # rendered as a viewer renders it (`resvg`) and its pixels decoded by `rqrr`, so an encoder or a
 # wrapper that misrendered, or drew white on white, would fail where its own reading of its own

@@ -71,6 +71,9 @@ terminal = ["dep:kr-term"]
 testing = []
 
 [dev-dependencies]
+# A test that scans for a private key made from a seed checks the key it looks for against the
+# public key of the pair, which takes an X25519 scalar multiplication.
+aws-lc-rs.workspace = true
 # This crate's own tests, with the seams above compiled in.
 kr-client = { path = ".", default-features = false, features = ["testing"] }
 iroh = { workspace = true, features = ["test-utils"] }
