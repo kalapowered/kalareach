@@ -262,8 +262,8 @@ async fn host() -> Host {
         session_epoch: SessionEpoch::V1,
         environment_id,
         display_number: DisplayNumber::new(1),
-        // A shell that ends only when its terminal reaches end of input or the session closes it,
-        // so no case here decides by how long the shell lasts.
+        // A shell that ends only on end of input, on a signal or when the session closes it, so no
+        // case here decides by how long the shell lasts.
         shell: kr_worker::testing::posix_script("while read -r _; do :; done"),
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
@@ -4578,8 +4578,8 @@ async fn an_answer_is_not_inserted_into_the_thread_the_agent_selected_after_aski
         "the person's prompt is the one request the new thread was sent"
     );
 
-    // The fixture's shell ends only when its terminal reaches end of input or the session closes
-    // it, and nothing here sends end of input: the session is closed, and the case returns once the
+    // The fixture's shell ends only on end of input, on a signal or when the session closes it, and
+    // nothing in this case sends the first two: the session is closed, and the case returns once the
     // session has finished closing. The record says the case closed it.
     let runtime = host.service.runtime();
     runtime.close(ClosureReason::CloseRequested).1.release();

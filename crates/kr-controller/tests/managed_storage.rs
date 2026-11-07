@@ -3778,7 +3778,7 @@ fn opened_members_as(
 
 /// A generation opened as a reader opens it, object by object.
 struct OpenedGeneration {
-    /// The descriptor, as the service publishes it and as it is not encrypted.
+    /// The descriptor, as the host recorded it when it sealed the generation: it is not encrypted.
     descriptor: Vec<u8>,
     /// The manifest, decrypted and verified, as canonical bytes.
     manifest: Vec<u8>,
@@ -4046,9 +4046,11 @@ fn x25519_secret_of(seed: &[u8]) -> Vec<u8> {
 /// the scan finding each form of a seed where one is put, in a member of the same name as another,
 /// and the session's own output in the session's member, so the scan reads what the members hold.
 /// Not shown here: a key in a binary list of integers, split, reversed or otherwise transformed;
-/// the ciphertext of the objects and the key wraps sealed in the manifest, which hold no readable
-/// key; that a restore refuses a member under a reserved name or a revoked grant, which the
-/// restore cases show; or the other data paths of backup and recovery material.
+/// the ciphertext of the objects, which holds no readable key; the member key wraps in the manifest
+/// object, whose sealed keys are ciphertext and whose clear context fields (object, generation and
+/// recipient identifiers) the reader does not hand out, so they are not scanned; that a restore
+/// refuses a member under a reserved name or a revoked grant, which the restore cases show; or the
+/// other data paths of backup and recovery material.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_generation_the_host_makes_holds_none_of_the_private_keys_the_host_keeps() {
     use kr_crypto::backup::{Material, may_back_up, member_material};

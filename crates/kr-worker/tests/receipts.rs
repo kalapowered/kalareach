@@ -190,8 +190,8 @@ fn session_config(
         session_epoch: SessionEpoch::V1,
         environment_id: environment.environment_id(),
         display_number: DisplayNumber::new(1),
-        // A shell that ends only when its terminal reaches end of input or the session closes it,
-        // so no case here decides by how long the shell lasts.
+        // A shell that ends only on end of input, on a signal or when the session closes it, so no
+        // case here decides by how long the shell lasts.
         shell: kr_worker::testing::posix_script("while read -r _; do :; done"),
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
