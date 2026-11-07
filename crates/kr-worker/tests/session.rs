@@ -2599,3 +2599,33 @@ async fn a_new_shell_owns_its_terminal_before_it_starts_a_child() {
     gate.release();
     closure_record(&runtime, "the closure finishes").await;
 }
+
+/// KR-REQ-09.09: a session that launched its shell and cannot start its runtime ends the shell
+/// before it returns the failure. The worker reports a launch that failed to the daemon, which
+/// records it and tells a repeat of the create that the launch failed; a shell left running would
+/// make that false.
+///
+/// The terminal's writer is taken once, so a runtime started after something else took it cannot
+/// take it, which is how a session ends up launched and unable to start.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_that_launched_its_shell_and_cannot_start_ends_the_shell() {
+    let host = kr_ipc::testing::TempHost::create();
+    let mut session = Session::open(configuration(&host, "exec sleep 60")).expect("opens");
+    session.launch().expect("launches the shell");
+    let shell = session.root_identity().expect("a shell is running");
+    let _taken = session.input_writer().expect("takes the writer once");
+
+    let started = SessionRuntime::start(
+        session,
+        std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+    );
+    assert!(started.is_err(), "a runtime cannot take a writer twice");
+    assert!(
+        matches!(
+            kr_ipc::identity::process_state(&shell),
+            kr_ipc::identity::ProcessState::Ended
+        ),
+        "the shell the session launched is still running"
+    );
+}

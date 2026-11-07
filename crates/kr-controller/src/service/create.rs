@@ -932,11 +932,11 @@ impl Controller {
             // A worker that failed its rendezvous, or never reported, has no session to close, so
             // no closure removes its job. It goes once the worker has ended.
             Ok(Ok(Err(error))) => {
-                // The worker was refused its claim or reported that it could not start, and a
-                // worker that fails its qualification reports that while its shell is still
-                // alive, so the session stops being a writer when the kernel says the worker's
-                // process has ended and its own journal shows it left nothing running, and not
-                // before.
+                // The worker was refused its claim or reported that it could not start. A worker
+                // that reports a failure has ended the shell it started, but its own process may
+                // still be ending, so the session stops being a writer when the kernel says the
+                // worker's process has ended and its own journal shows it left nothing running,
+                // and not before.
                 // A claim the host refused sent the worker no launch specification, so it started
                 // no session; one that was admitted recorded its key, and then the worker did. A
                 // reservation that cannot be read counts as claimed, and the failure reported
