@@ -1032,38 +1032,57 @@ impl TransferModule {
                 payload_digest: digest,
                 admission: kr_transfer::service::Admission::new(admission.clone()),
             };
+            // Whether the service's refusal was decided by the request alone, which no copy of the
+            // request can have changed ([`kr_transfer::TransferError::is_decided_by_the_request`]).
+            let by_the_request = std::cell::Cell::new(false);
+            let told = |error: kr_transfer::TransferError| {
+                by_the_request.set(error.is_decided_by_the_request());
+                ProtocolError::from(error)
+            };
             // Every arm runs inside a closure, so a refusal the service decided reaches the
             // retention below instead of returning from the task. An action whose failure was not
             // retained could be performed again under the same identifier and succeed.
             let outcome = (|| -> Answer<ParamsValue> {
                 match method {
-                    Method::UploadBegin => {
-                        encode(&service.upload_begin(&actor, &typed(&params)?, Some(&performed))?)
-                    }
-                    Method::UploadChunk => {
-                        encode(&service.upload_chunk(&actor, &typed(&params)?, Some(&performed))?)
-                    }
-                    Method::UploadFinish => encode(&service.upload_finish(
-                        &actor,
-                        &typed(&params)?,
-                        Some(&performed),
-                    )?),
-                    Method::UploadCancel => encode(&service.upload_cancel(
-                        &actor,
-                        &typed(&params)?,
-                        Some(&performed),
-                    )?),
-                    Method::DraftCreate => {
-                        encode(&service.draft_create(&actor, &typed(&params)?, Some(&performed))?)
-                    }
-                    Method::DraftUpdate => {
-                        encode(&service.draft_update(&actor, &typed(&params)?, Some(&performed))?)
-                    }
+                    Method::UploadBegin => encode(
+                        &service
+                            .upload_begin(&actor, &typed(&params)?, Some(&performed))
+                            .map_err(&told)?,
+                    ),
+                    Method::UploadChunk => encode(
+                        &service
+                            .upload_chunk(&actor, &typed(&params)?, Some(&performed))
+                            .map_err(&told)?,
+                    ),
+                    Method::UploadFinish => encode(
+                        &service
+                            .upload_finish(&actor, &typed(&params)?, Some(&performed))
+                            .map_err(&told)?,
+                    ),
+                    Method::UploadCancel => encode(
+                        &service
+                            .upload_cancel(&actor, &typed(&params)?, Some(&performed))
+                            .map_err(&told)?,
+                    ),
+                    Method::DraftCreate => encode(
+                        &service
+                            .draft_create(&actor, &typed(&params)?, Some(&performed))
+                            .map_err(&told)?,
+                    ),
+                    Method::DraftUpdate => encode(
+                        &service
+                            .draft_update(&actor, &typed(&params)?, Some(&performed))
+                            .map_err(&told)?,
+                    ),
                     Method::AgentDraftAddAttachment => {
                         let params: kr_protocol::transfer::AgentDraftAddAttachmentParams =
                             typed(&params)?;
                         require_declared_path(params.contribution.insertion_method)?;
-                        encode(&service.draft_add_attachment(&actor, &params, Some(&performed))?)
+                        encode(
+                            &service
+                                .draft_add_attachment(&actor, &params, Some(&performed))
+                                .map_err(&told)?,
+                        )
                     }
                     _ => Err(ProtocolError::new(
                         ErrorCode::InvalidArgument,
@@ -1109,11 +1128,15 @@ impl TransferModule {
                         RECORDS,
                     ));
                 }
-                // A refusal that cannot be written down is not told as a definite one, nor as the
-                // store's transient word: it can be a word about what another copy of the action
-                // did. The record is read instead. It is the answer where the action has one, under
-                // the check any retained answer is owed, and where there is none to be read the
-                // outcome is not known.
+                // A refusal that a check of the request alone decided, before anything was done,
+                // is the same for every exact copy of the request whatever another copy did: the
+                // host knows nothing ran, and says what it said.
+                Err(_) if by_the_request.get() => return outcome,
+                // Any other refusal that cannot be written down is not told as a definite one, nor
+                // as the store's transient word: it can be a word about what another copy of the
+                // action did. The record is read instead. It is the answer where the action has
+                // one, under the check any retained answer is owed, and where there is none to be
+                // read the outcome is not known.
                 Err(_) => {
                     return match service.retained_action(&actor, action_id, name, digest) {
                         Ok(Some(retained)) => {

@@ -145,6 +145,12 @@ pub enum TransferError {
     /// The request is not valid.
     #[error("{0}")]
     InvalidArgument(String),
+    /// A field of the request is not valid on its own account.
+    ///
+    /// The check that refused it looks at the request and at nothing the service holds, so every
+    /// exact copy of the request fails it the same way, whatever another copy did.
+    #[error("{0}")]
+    Malformed(String),
     /// The admission the mutation arrived under no longer stands, and nothing it began became durable
     /// or visible.
     ///
@@ -190,6 +196,24 @@ impl TransferError {
         Self::InvalidArgument(detail.to_string())
     }
 
+    /// Builds the failure of a field that is not valid on its own account
+    /// ([`Self::Malformed`]).
+    pub fn malformed(detail: impl std::fmt::Display) -> Self {
+        Self::Malformed(detail.to_string())
+    }
+
+    /// Whether the request alone decided this refusal, before the service looked at anything it
+    /// holds or did anything.
+    ///
+    /// A field that is not valid on its own account is refused so for every exact copy of the
+    /// request, and nothing another copy did can change it. A refusal that depends on what the
+    /// service holds, such as a transfer that is not there, a limit that is reached, an
+    /// environment a stored row names or a draft that moved, is not decided so.
+    #[must_use]
+    pub const fn is_decided_by_the_request(&self) -> bool {
+        matches!(self, Self::Malformed(_))
+    }
+
     /// Returns the stable protocol code this failure is reported under.
     #[must_use]
     pub fn code(&self) -> ErrorCode {
@@ -227,7 +251,7 @@ impl TransferError {
             Self::Retained { code, .. } => *code,
             Self::Ipc(error) => error.code(),
             Self::SessionEnded => ErrorCode::SessionClosed,
-            Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
+            Self::InvalidArgument(_) | Self::Malformed(_) => ErrorCode::InvalidArgument,
             Self::NotAdmitted(refusal) => refusal.code,
         }
     }

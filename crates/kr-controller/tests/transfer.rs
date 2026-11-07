@@ -3259,3 +3259,53 @@ async fn a_record_another_copy_left_is_not_given_while_a_fence_is_owed() {
         "the record is not given while a fence is owed: {told:?}"
     );
 }
+
+/// KR-REQ-09.09: a refusal that a check of the request alone decided, before anything was done, is
+/// told as itself when the host cannot record it. Every exact copy of the request fails the same
+/// check whatever another copy did, so the host knows nothing ran, and the caller is not told the
+/// outcome is unknown. Asked again once a record can be written, the request is refused the same
+/// way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_the_request_alone_decided_is_told_as_itself_though_it_cannot_be_recorded() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let mut params = begin_params(&host, &pattern(64), "kept.bin");
+    params.declared_media_type = String::new();
+    let store = beside_the_store(&host);
+    store
+        .execute_batch(
+            "CREATE TRIGGER no_record_can_be_written BEFORE INSERT ON actions
+             BEGIN SELECT RAISE(ABORT, 'the record cannot be written'); END;",
+        )
+        .expect("no record of an action can be written");
+    let told = failure(
+        control
+            .mutate(
+                Method::UploadBegin,
+                action,
+                ActionTarget::environment(host.environment_id),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    store
+        .execute_batch("DROP TRIGGER no_record_can_be_written;")
+        .expect("records can be written again");
+    assert_eq!(told.code, ErrorCode::InvalidArgument, "{told:?}");
+
+    let again = failure(
+        control
+            .mutate(
+                Method::UploadBegin,
+                action,
+                ActionTarget::environment(host.environment_id),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(again.code, ErrorCode::InvalidArgument, "{again:?}");
+    host.stop().await;
+}
