@@ -3976,7 +3976,8 @@ async fn the_serial_path_rechecks_authority_expiry_identity_binding_and_precondi
 }
 
 // ---------------------------------------------------------------------------------------------
-// Retention, lifetimes, windows and the protocol defaults: each case below names its own rows
+// Retention, lifetimes and windows, and what an earlier build's journal keeps: each case below
+// names its own rows
 // ---------------------------------------------------------------------------------------------
 
 /// KR-REQ-09.14: 30-day retention, a two-minute default lifetime, a five-minute cap, and no
@@ -4769,8 +4770,8 @@ async fn an_uncertain_close_a_migration_left_without_a_subject_holds_back_every_
 }
 
 // ---------------------------------------------------------------------------------------------
-// Recovery, the outstanding limit, retained records and forwarded retries: each case below names
-// its own rows
+// Recovery, the outstanding limit, retained records, forwarded retries and the protocol defaults:
+// each case below names its own rows
 // ---------------------------------------------------------------------------------------------
 
 /// KR-REQ-09.08, KR-REQ-09.09: recovery rejects an intent whose freshness cannot be proved again,
