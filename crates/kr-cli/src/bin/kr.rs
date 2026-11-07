@@ -1091,12 +1091,13 @@ async fn run(cli: Cli) -> Result<Completion> {
                 let mut answer: HostDoctorResult =
                     host_read(&mut client, &environment.paths, Method::HostDoctor, &()).await?;
                 // A host whose routes were read at its start, and differ from its document now,
-                // sends over the routes it started with, whatever else this command finds. Said
-                // on standard error, and after the answer when there is one, so the answer stays
-                // what it was; and said before a failure of a list check, because that failure
-                // says nothing of the routes. A failure to take the lock, to write the document
-                // or to read the host again says nothing of them either, and an unusable
-                // document gets none.
+                // sends over the routes it started with, whatever else this command finds. The
+                // note goes to standard error, after the answer when the command succeeds so the
+                // answer stays what it was. It goes before the error when a check of the list
+                // fails (the host is not all in force, does not know the setting, or reports
+                // other gateways than were written), because those errors say nothing of the
+                // routes. A failure to take the lock, to write the document or to read the host
+                // again gets no note, and neither does a document the host cannot use.
                 let mut restart =
                     kr_cli::doctor::configuration::routes_waiting_for_a_restart(&answer);
                 // The list the host reports is shown only when the host acts on its document, as a
@@ -1154,14 +1155,10 @@ async fn run(cli: Cli) -> Result<Completion> {
                                     .collect::<Vec<_>>(),
                             ),
                     );
-                } else if listed.is_empty() {
-                    output::say(&Shown::said(
-                        "this host delivers notifications through the official gateway only",
-                    ));
                 } else {
-                    output::say(&shown!(
-                        "this host delivers notifications through the official gateway and {}",
-                        Shown::joined(listed.iter().map(|origin| Shown::address(origin)), ", ")
+                    output::say(&kr_cli::doctor::configuration::gateways_said(
+                        &listed,
+                        restart.is_some(),
                     ));
                 }
                 say_restart(restart.as_ref());

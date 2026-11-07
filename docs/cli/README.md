@@ -2433,9 +2433,9 @@ it has or the gateway says it holds no such authorisation (`docs/delivery/README
 was already waiting for its connection to that gateway when the list changed can still leave the
 host for up to about ten seconds, which can be after the command has returned; no request that
 starts later does. When the daemon cannot put the change into force, because it cannot write down
-the revocation it owes, for one, the command fails and says why, and the daemon's own report
-(`kr doctor`) says which gateways are in force. With neither `--set` nor `--clear` the command shows
-the gateways the daemon reports in force. It fails in the same way, with a non-zero exit status,
+the revocation it owes, for one, the command fails and says why, and names the gateways in force
+(below); `kr doctor` says the same. With neither `--set` nor `--clear` the command shows the
+gateways the daemon reports in force. It fails in the same way, with a non-zero exit status,
 when the daemon reports that it cannot use the document, and says why. It also fails when the
 daemon reports that it has not finished putting the document into force. The message names the
 gateways in force. For a document the host loaded that is the document's list, because the host
@@ -2451,10 +2451,15 @@ once it is put right, and a network selection edited after the start likewise ap
 start. When the `configuration-network` check in the daemon's doctor answer (`kr doctor --json`)
 warns that the routes differ from the document, the command writes a line on standard error, with
 or without `--json`, saying that a restart is needed and naming that check. When the command
-succeeds it writes the line after its answer. When it fails because the document is not all in
-force it writes the line before the error; it writes none for a document the daemon cannot use,
-which the command says on its own. The answer on standard output and the exit status are the same
-as for a host with open routes.
+succeeds it writes the line after its answer. It writes the line before the error when the
+daemon has not put the document all into force, when it does not know the setting, or when it
+reports other gateways than the ones written. It writes none when the command fails to take the
+lock, to write the document or to read the daemon again, and none for a document the daemon cannot
+use, which the command says on its own. In text, the last line of the answer then says which
+gateways are in force and not that the host delivers through them. The answer on standard output
+in `--json`, and the exit status, are the same as for a host with open routes. The check compares
+what the document selects with what the daemon started with, not how the document spells it: a
+document that says `network.enabled` is `false` where it said nothing selects nothing new.
 
 Devices paired through a gateway taken out stay paired and are not sent notifications until their
 app registers with a gateway the host allows. With `--json` the answer is
