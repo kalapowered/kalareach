@@ -684,12 +684,15 @@ fn a_distribution_the_case_started_is_ended_when_the_case_fails_after_that() {
     let ran = marker.is_dir();
     let removed = std::fs::remove_dir(&marker);
 
-    // Asked for, it runs once, and the drop after that does not run it again.
+    // Asked for, it runs once, and the drop after that does not run it again: what the command
+    // made is taken away before the drop, so a second run would make it again.
     let mut asked = make(&marker);
     let first = asked.end();
     let second = asked.end();
-    drop(asked);
     let ran_once = marker.is_dir();
+    let taken_away = std::fs::remove_dir(&marker);
+    drop(asked);
+    let ran_again = marker.exists();
     let _ = std::fs::remove_dir(&marker);
 
     // A command that does not succeed is the case's failure.
@@ -704,6 +707,8 @@ fn a_distribution_the_case_started_is_ended_when_the_case_fails_after_that() {
     removed.expect("the directory the command made is removed");
     assert!(first.is_ok() && second.is_ok(), "{first:?} {second:?}");
     assert!(ran_once, "and a command that was asked for ran");
+    taken_away.expect("the directory the asked-for command made is removed");
+    assert!(!ran_again, "the drop ran a command that had been run");
     assert!(
         refused.is_err_and(|why| why.contains("did not succeed")),
         "a command that does not succeed fails the case"
@@ -720,17 +725,15 @@ fn the_distribution_lists_are_read_when_the_environment_asks_wsl_for_utf8() {
         std::env::var("WSL_UTF8").is_ok_and(|value| value == "1"),
         "this case is about an environment that asks wsl.exe for UTF-8; set WSL_UTF8=1"
     );
+    let distribution =
+        std::env::var("KR_WSL_DISTRIBUTION").unwrap_or_else(|_| "Ubuntu-24.04".into());
     let registered = wsl_text(&["--list", "--quiet"]);
     let names = listed_names(&registered);
     assert!(
-        !names.is_empty(),
-        "wsl.exe lists a distribution: {registered:?}"
-    );
-    assert!(
         names
             .iter()
-            .all(|name| name.chars().all(|letter| letter.is_ascii_graphic())),
-        "every name reads as the plain text it is: {names:?}"
+            .any(|name| name.eq_ignore_ascii_case(&distribution)),
+        "the list names {distribution}, as the recording case reads it: {registered:?}"
     );
 }
 

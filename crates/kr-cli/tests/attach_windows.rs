@@ -480,13 +480,15 @@ impl Probe {
         keyboard.flush().expect("flushes the console input");
     }
 
-    /// Waits until the console shows `what`. It fails when the console has shown all it will and
-    /// `what` is not in it, and when the liveness deadline passes.
+    /// Waits until the console shows `what`. It fails when the console's output has ended without
+    /// it, and when the liveness deadline passes.
     ///
     /// A probe that has ended can still have its last lines on their way to this side of the
     /// console, and how long that takes is not this test's to know. So its end does not end the
     /// wait: the console's thread having read to the end of the output does, and until it has, the
-    /// wait goes on to the deadline.
+    /// wait goes on to the deadline. The output of a pseudo-console usually ends only when the
+    /// pseudo-console closes, which this probe holds open for as long as it lives, so a marker that
+    /// never comes is mostly reported by the deadline, which says whether the probe had ended.
     fn waits_for(&mut self, what: &str) {
         loop {
             // Read before the text is, so that a thread that was done has also added the last bytes.
