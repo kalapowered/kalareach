@@ -1020,7 +1020,7 @@ async fn finish(paths: &HostPaths, json: bool, after: Option<ActionId>) -> Resul
     {
         return Err(CliError::Usage(shown!(
             "no step of the plan was sent under action {} and is waiting for an answer: \
-             `kr host machine plan` names each step's action",
+             `kr host machine finish` names the action of each step it stops at",
             named
         )));
     }
@@ -1507,7 +1507,7 @@ async fn settle(
             return Ok(());
         };
         let step = step_mut(plan, which, index).clone();
-        let quote = match judge(&step, info.machine.as_ref(), error.code, sent) {
+        let flagged = match judge(&step, info.machine.as_ref(), error.code, sent) {
             Verdict::Done(group) => {
                 return conclude(paths, plan, which, index, StepState::Done(group));
             }
@@ -1534,35 +1534,46 @@ async fn settle(
                     });
                     return Ok(());
                 }
-                // The person's later request: the earlier result and the record are shown before
-                // the new action goes. The quote names the environment's record revision, since a
-                // daemon's action has no receipt `action.read` could show; the daemon reads no
-                // supersession key from a step, so the quote is what this command records of what
-                // the person saw.
-                crate::report::say(&shown!(
-                    "Environment {} answered action {} with an outcome it could not establish, and \
-                     its record shows group {} at revision {}. The step is sent again as a new \
-                     action that names that action and that revision.",
-                    step.environment_id,
-                    named,
-                    record.machine_id.get(),
-                    record.revision
-                ));
-                Some(answers::Quote {
-                    action_id: named,
-                    revision: record.revision.get(),
-                })
+                // The person's later request. The quote names the environment's record revision,
+                // since a daemon's action has no receipt `action.read` could show; the daemon
+                // reads no supersession key from a step, so the quote is what this command
+                // records of what the person saw.
+                Some((
+                    answers::Quote {
+                        action_id: named,
+                        revision: record.revision.get(),
+                    },
+                    record.clone(),
+                ))
             }
         };
         let action_id = ActionId::new(kr_ipc::new_uuid());
         let Ok(mut mutation) = compose_step(reached, which, &step, action_id).await else {
             return Ok(());
         };
-        if let Some(quote) = quote {
+        if let Some((quote, record)) = flagged {
             let Ok(expected) = answers::supersession(Some(quote)) else {
                 return Ok(());
             };
             mutation.expected = expected;
+            // The earlier result and the record are shown before the new action goes, and the new
+            // action goes only when the person could be shown them.
+            if !crate::report::shown_before_going_on(&shown!(
+                "Environment {} answered action {} with an outcome it could not establish, and \
+                 its record shows group {} at revision {}. The step is sent again as a new \
+                 action that names that action and that revision.",
+                step.environment_id,
+                quote.action_id,
+                record.machine_id.get(),
+                record.revision
+            )) {
+                stopped.push(Stopped {
+                    environment_id: step.environment_id,
+                    action_id: quote.action_id,
+                    record,
+                });
+                return Ok(());
+            }
         }
         {
             let step = step_mut(plan, which, index);

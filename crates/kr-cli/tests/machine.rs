@@ -149,6 +149,16 @@ impl Host {
 
 /// Runs `kr` on plain pipes with `temp`'s directories, from the root directory.
 fn run_kr(temp: &kr_ipc::testing::TempHost, bridges: Option<&Path>, line: &[&str]) -> Output {
+    run_kr_with_stderr(temp, bridges, line, Stdio::piped())
+}
+
+/// Runs `kr` as [`run_kr`] does, with standard error as `stderr`.
+fn run_kr_with_stderr(
+    temp: &kr_ipc::testing::TempHost,
+    bridges: Option<&Path>,
+    line: &[&str],
+    stderr: Stdio,
+) -> Output {
     let path = bridges.map_or_else(
         || "/usr/bin:/bin".to_owned(),
         |directory| format!("{}:/usr/bin:/bin", directory.display()),
@@ -162,6 +172,7 @@ fn run_kr(temp: &kr_ipc::testing::TempHost, bridges: Option<&Path>, line: &[&str
         .env("KR_STATE_DIR", temp.paths().state_root())
         .current_dir("/")
         .stdin(Stdio::null())
+        .stderr(stderr)
         .output()
         .expect("kr runs")
 }
@@ -1406,6 +1417,36 @@ async fn a_step_whose_outcome_the_environment_cannot_establish_is_sent_again_onl
     ]);
     assert_eq!(elsewhere["code"], "INVALID_ARGUMENT", "{elsewhere}");
 
+    // The earlier result is shown before a new action goes. Where standard error takes nothing, it
+    // cannot be shown, so the step is not sent again.
+    #[cfg(target_os = "linux")]
+    {
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("/dev/full");
+        let output = run_kr_with_stderr(
+            &pair.a.temp,
+            Some(pair.bridges.path()),
+            &[
+                "host",
+                "machine",
+                "finish",
+                "--after-unknown",
+                &first,
+                "--json",
+            ],
+            Stdio::from(full),
+        );
+        let unsent: Value = serde_json::from_slice(&output.stdout).expect("a document");
+        assert_eq!(output.status.code(), Some(1), "{unsent}");
+        assert_eq!(
+            text(&unsent["steps"][1]["action_id"]),
+            first,
+            "nothing was sent while the earlier result could not be shown: {unsent}"
+        );
+    }
+
     // The person asks for it. The earlier result and the record are shown first, and the step is sent
     // again as a new action that names the earlier action and the revision of the record shown.
     let output = run_kr(
@@ -1469,11 +1510,6 @@ fn quote_in_the_plan(plan: &Path) -> Option<(Vec<u8>, i128)> {
                 map.entries().iter().find_map(|(_, inner)| find(inner))
             }
             CanonicalValue::Array(items) => items.iter().find_map(find),
-            // A request kept as bytes holds its own encoding.
-            CanonicalValue::Bytes(bytes) => kr_cbor::decode(bytes, &kr_cbor::Limits::DEFAULT)
-                .ok()
-                .as_ref()
-                .and_then(find),
             _ => None,
         }
     }

@@ -1036,8 +1036,8 @@ command it is about to run.
 `kr close [id]` closes a session through the control daemon where one is running, and through the
 session's worker when none is. It sends one request, under an action it makes for it. When the
 outcome of that request is not known (see the exit codes), the command ends with exit status 1 and
-`OUTCOME_UNKNOWN`, names the action and the `kr action read <action> --session <session>` that shows
-what the host holds of it, and sends nothing again. If the session's worker holds that close as an
+`OUTCOME_UNKNOWN`, names the action and the `kr action read <action> --session <session>
+--environment <environment>` that shows what the host holds of it, and sends nothing again. If the session's worker holds that close as an
 outcome it could not establish, a plain `kr close` is refused while it does, and the command has no
 later request of its own: read the receipt, and look at `kr list`, to see whether the session
 closed. A failure of the control daemon's own connection to the worker reaches `kr` as the
@@ -1403,11 +1403,12 @@ Before it reads a request, `kr agent-tools --stdio` will search for a session to
 | 9 | An update of this host waits: a live session runs at a level the new release does not retain, something does not answer, another install or update is running, a control daemon of the store has been starting for more than thirty seconds, a control daemon answers that it does not stop, a control daemon on Windows is not one the environment's scheduled task would start again as it is (it was started by hand, with another key store, in another directory or with another home, or the task is missing or is not this installation's), a release an earlier install or update left in the store is held by a running program, or a command that writes a stored record holds the writers' lock for more than thirty seconds. Nothing was replaced, and whatever the update stopped runs again. A command that waits that long for an update's switch or for the install lock it holds exits with 9 as well, and does not make the write it waited for |
 
 A command that sent nothing before its connection ended exits with 3. `kr close` and `kr question
-cancel` each send one request that changes a session, and when the connection ends after the request
-may have been written, or the host answers that it cannot say what became of it, they exit with 1
-and `OUTCOME_UNKNOWN`, whichever way the host reached them. They name the action the request was sent as
-and the `kr action read <action> --session <session>` that shows what the host holds of it, and send
-nothing again, under that action or a new one. A request the connection could not carry was not
+cancel` each send one request that changes a session, and when the exchange with the host fails
+after the request may have been written, the host's answer cannot be read, or the host answers that
+it cannot say what became of it, they exit with 1 and `OUTCOME_UNKNOWN`. They name the action the
+request was made as and the `kr action read <action> --session <session>` (with `--environment`
+for a session of another environment) that shows what the host holds of it, and send nothing
+again, under that action or a new one. A request the connection could not carry was not
 written, and is not an unknown outcome.
 
 `kr attach`, and `kr new` when it attaches, exit 0 when the session closed cleanly, 1 when it closed

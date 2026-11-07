@@ -80,6 +80,17 @@ pub fn say(line: &Shown) {
     }
 }
 
+/// Writes one line on standard error that a command must have shown before it goes on, and says
+/// whether it was written: `false` when standard error refused it, now or an earlier line.
+///
+/// A command whose next step depends on the person having read the line (a request that quotes a
+/// result the person was shown) does not take that step when this says `false`.
+#[must_use]
+pub fn shown_before_going_on(line: &Shown) -> bool {
+    say(line);
+    ERROR_UNWRITTEN.get().is_none()
+}
+
 /// The first failure to write standard error, kept until the command ends.
 static ERROR_UNWRITTEN: std::sync::OnceLock<Shown> = std::sync::OnceLock::new();
 

@@ -2479,6 +2479,37 @@ async fn a_cancellation_of_unknown_outcome_is_sent_again_only_by_the_persons_lat
         "the worker held the earlier outcome against it"
     );
 
+    // The earlier outcome is shown before a new action goes. Where standard error takes nothing it
+    // cannot be shown, so nothing is sent.
+    #[cfg(target_os = "linux")]
+    {
+        let sent = host.stops().len();
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("/dev/full");
+        let output = std::process::Command::new(support::kr())
+            .args([
+                "question",
+                "cancel",
+                &question,
+                "--after-unknown",
+                &first.to_string(),
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &host.home)
+            .env("KR_RUNTIME_DIR", host.temp.paths().runtime_root())
+            .env("KR_STATE_DIR", host.temp.paths().state_root())
+            .current_dir(host.temp.root())
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(full))
+            .output()
+            .expect("kr runs");
+        assert_ne!(output.status.code(), Some(0));
+        assert_eq!(host.stops().len(), sent, "nothing was sent");
+    }
+
     // The person's later request.
     let output = host.kr(&[
         "question",

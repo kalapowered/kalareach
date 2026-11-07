@@ -2288,7 +2288,7 @@ fn parse_environment(named: Option<&str>) -> Result<Option<EnvironmentId>> {
 }
 
 /// What `kr close` says when its close ended with an outcome nobody established: the session whose
-/// worker keeps the receipt, and the environment when the command was given one.
+/// worker keeps the receipt, and the environment it was found in, or the one the command was given.
 fn close_unknown(session: Shown, environment: Option<EnvironmentId>) -> kr_cli::unknown::Unknown {
     kr_cli::unknown::Unknown {
         what: "the close",
