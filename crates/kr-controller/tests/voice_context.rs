@@ -25,7 +25,8 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::U64;
 use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs};
 use kr_protocol::voice::{
-    VoiceContextClass, VoiceContextParams, VoiceContextResult, VoiceGrantParams,
+    FragmentText, TranscriptFragment, VoiceContextClass, VoiceContextParams, VoiceContextResult,
+    VoiceDelegateParams, VoiceDelegationId, VoiceDelegationOutcome, VoiceGrantParams,
     VoicePrepareParams, VoiceStartOutcome, VoiceStartParams,
 };
 use net_support::worker::{Adopted, Upstream};
@@ -230,6 +231,37 @@ impl World {
             .await
             .expect("the call reaches the daemon")
             .expect("the session is renamed");
+    }
+
+    /// What the host says to a device that asks for the session's status: the summary of the
+    /// receipt of the read it performs.
+    async fn status_receipt(&self) -> String {
+        let answered = self
+            .voice
+            .coordinator()
+            .delegate(
+                self.device_id,
+                kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+                &VoiceDelegateParams {
+                    voice_session_id: self.voice_session_id,
+                    delegation_id: VoiceDelegationId::new("item_status").expect("an identifier"),
+                    offset_ms: U64::new(0),
+                    fragments: vec![TranscriptFragment {
+                        start_ms: U64::new(0),
+                        end_ms: U64::new(0),
+                        text: FragmentText::new("What's the status?").expect("a fragment"),
+                    }],
+                    confirmation: Nullable::null(),
+                },
+                kr_ipc::now_ms().get(),
+                &(Arc::new(kr_voice::Unbounded) as Arc<dyn kr_voice::Admission>),
+            )
+            .await
+            .expect("the words are read as the status of the session");
+        let VoiceDelegationOutcome::Performed { summary, .. } = answered.outcome else {
+            panic!("the host performs the read: {:?}", answered.outcome);
+        };
+        summary
     }
 
     /// Waits until the session's retained terminal output holds `marker`, read at the worker.
@@ -502,6 +534,20 @@ async fn a_secret_in_either_half_is_replaced_and_counted() {
         result.selection.stripping_note.contains("does not prove"),
         "{result:?}"
     );
+    world.stop().await;
+}
+
+/// KR-REQ-15.20: the receipt of a voice read of a session is stated through the same selection:
+/// a secret in the name a person pinned is replaced there too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_receipt_of_a_voice_read_passes_the_same_stripping() {
+    let world = World::start().await;
+    world.pin("AKIAZR8QM3KD9LW2XV7N").await;
+
+    let summary = world.status_receipt().await;
+    assert!(!summary.contains("AKIAZR8QM3KD9LW2XV7N"), "{summary}");
+    assert!(summary.contains("[redacted]"), "{summary}");
+    assert!(summary.contains("session 1"), "{summary}");
     world.stop().await;
 }
 

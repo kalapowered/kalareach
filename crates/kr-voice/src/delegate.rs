@@ -1871,7 +1871,9 @@ impl Coordinator {
             if receipt.performed {
                 VoiceDelegationOutcome::Performed {
                     action_id: receipt.action_id,
-                    summary: bounded(&receipt.summary),
+                    // What the host says it did leaves with the same patterns a context selection
+                    // is stripped with, and is cut to what a result may carry.
+                    summary: bounded(&self.patterns.strip(&receipt.summary).0),
                 }
             } else {
                 // Admitted and not performed. Never reported as done: the receipt is the
