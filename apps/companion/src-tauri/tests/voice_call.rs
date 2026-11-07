@@ -746,6 +746,11 @@ async fn the_call_is_given_the_hosts_default_context_as_its_opening_context_and_
     scene
         .call("voice_stop", json!({ "voiceSessionId": voice_session_id }))
         .expect("the call ends");
+    assert_eq!(
+        thinking(&scene.stand_in.control().report()),
+        expected,
+        "nothing else was given to the call as it ended"
+    );
     scene.stop_host().await;
 }
 

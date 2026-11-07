@@ -169,7 +169,8 @@ impl Controller {
         self: &Arc<Self>,
         session_id: SessionId,
     ) -> Result<crate::voice::SessionSnapshot> {
-        // One time for the session read and for what the worker holds beside it.
+        // The worker's half is read within the time this read of a session is given, from its
+        // start: a half that has run out of it is left, with its reason, not waited for.
         let deadline = tokio::time::Instant::now() + self.voice_budgets().read;
         let params = ParamsValue::from_typed(&SessionReadParams { session_id })
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
@@ -214,7 +215,7 @@ impl Controller {
         let Some(published) = published.filter(|published| !published.private) else {
             return WorkerHalf::not_read(PRIVACY_ON);
         };
-        let boundary = (published.generation.get() > 0).then(|| self.privacy.changed_at_ms().get());
+        let boundary = (published.generation.get() > 0).then_some(published.since_ms);
         let Some(worker) = self.directory.lock().await.get(session_id).cloned() else {
             return WorkerHalf::not_read("this session has no worker to read");
         };
@@ -380,6 +381,9 @@ impl Controller {
         P: serde::Serialize + ?Sized,
         R: kr_protocol::wire::WireMessage,
     {
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
         let mut link = tokio::time::timeout_at(deadline, self.worker_client(worker))
             .await
             .ok()?

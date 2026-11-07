@@ -28,9 +28,11 @@ use kr_protocol::gateway::{PendingKind, PendingResource};
 use kr_protocol::question::Question;
 use kr_voice::seams::{ContextItem, WithheldRun};
 
-/// The most parts of one agent's history a read follows. A history is at most 4,096 entries, and a
-/// part carries as many as a control frame holds, so this is far more than a history needs; a read
-/// that passes it is given up rather than followed on.
+/// The most parts of one agent's history, or of the approvals waiting in a session, a read
+/// follows. It is an operational limit and not a bound a history cannot pass: a history of the
+/// largest entries a producer may offer is larger than this many parts hold, and bridge reports,
+/// which are cut well short of that, fit in far fewer. A read that passes it is given up, and says
+/// so, rather than followed on.
 pub const MAX_HISTORY_PARTS: usize = 64;
 
 /// The reason given when privacy mode is on.
