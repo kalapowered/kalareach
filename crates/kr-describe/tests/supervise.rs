@@ -285,8 +285,8 @@ fn the_process_ended(reports: &[Report]) -> bool {
 /// holds of it. Asked from outside, the system agrees where the platform lets a parent ask: on
 /// Windows the process's priority class and I/O priority, on macOS the kernel's priority of every
 /// thread of the process, and on Linux the scheduling policy of the process's threads (some thread
-/// of the process is in the batch class; no case reads that a thread the model starts is). The I/O
-/// class on Linux has no read from outside here, and is read on the model thread itself, in
+/// of the process is in the batch class). The I/O class on Linux has no read from outside here,
+/// and is read on the model thread itself, and on a thread the model starts, in
 /// `tests/process.rs`, which also reads the threads a model starts on macOS during a job.
 #[test]
 fn the_process_runs_its_model_in_the_background_class_the_system_reports() {
