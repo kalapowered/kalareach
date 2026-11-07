@@ -116,8 +116,8 @@ impl core::fmt::Debug for WriterHold {
     }
 }
 
-/// What this client is doing about the registrations and removals of one identifier, for as long as
-/// it is doing any.
+/// What this client is doing about the registrations and removals of one identifier, and what it
+/// knows of its live registrations, for as long as there is anything to know.
 #[derive(Debug, Default)]
 struct Churn {
     /// How many registrations of the identifier this client has started.
@@ -126,58 +126,137 @@ struct Churn {
     registering: usize,
     /// How many removals of it wait for their answers now.
     removing: usize,
+    /// How many registrations of it the host has answered as registered, less the removals it has
+    /// answered as having removed one. It is the client's account, from the answers it has read, of
+    /// the registrations the host stands behind: answers that arrive out of their order leave it
+    /// above what the host holds, and never below, so a count of nothing is the client's word that
+    /// no registration of the identifier is live.
+    live: usize,
+}
+
+impl Churn {
+    /// Returns true when there is nothing about the identifier to remember.
+    const fn idle(&self) -> bool {
+        self.registering == 0 && self.removing == 0 && self.live == 0
+    }
 }
 
 /// What the client is doing about each identifier it is registering or removing.
 type Churning = Mutex<HashMap<Uuid, Churn>>;
 
-/// One request to register a binding, counted from before it is sent until its answer has been read
-/// or it is dropped.
-struct Registering<'a> {
-    churning: &'a Churning,
-    binding_id: Uuid,
+/// What the client does about the answer to a request, whether or not the caller that made the
+/// request is still waiting for it.
+///
+/// A request the host has read is about the registration the host holds, and the host answers it
+/// whatever its caller does after. So the record of what the client is doing about the identifier
+/// ends when the client reads the answer, in the task that reads the connection, and not when the
+/// caller's future ends: a caller that stops waiting leaves the registration or the removal under
+/// way at the host, and the client's queue is emptied, or kept, as the answer says.
+#[derive(Debug)]
+enum Settle {
+    Registration(Registering),
+    Removal(Removing),
 }
 
-impl<'a> Registering<'a> {
-    fn begin(churning: &'a Churning, binding_id: Uuid) -> Self {
+impl Settle {
+    fn answered(self, body: &ResponseBody) {
+        match self {
+            Self::Registration(registering) => registering.answered(body),
+            Self::Removal(removing) => removing.answered(body),
+        }
+    }
+}
+
+/// One request to register a binding, counted from before it is sent until its answer has been read,
+/// or until the client has no answer to read because the request was never sent or the connection
+/// ended.
+#[derive(Debug)]
+struct Registering {
+    churning: Arc<Churning>,
+    sink: NoticeSink,
+    binding_id: Uuid,
+    released: bool,
+}
+
+impl Registering {
+    fn begin(churning: &Arc<Churning>, sink: &NoticeSink, binding_id: Uuid) -> Self {
         if let Ok(mut churning) = churning.lock() {
             let churn = churning.entry(binding_id).or_default();
             churn.started += 1;
             churn.registering += 1;
         }
         Self {
-            churning,
+            churning: Arc::clone(churning),
+            sink: sink.clone(),
             binding_id,
+            released: false,
         }
     }
-}
 
-impl Drop for Registering<'_> {
-    fn drop(&mut self) {
-        if let Ok(mut churning) = self.churning.lock()
-            && let Some(churn) = churning.get_mut(&self.binding_id)
-        {
-            churn.registering = churn.registering.saturating_sub(1);
-            if churn.registering == 0 && churn.removing == 0 {
-                churning.remove(&self.binding_id);
+    fn answered(mut self, body: &ResponseBody) {
+        self.release(Some(body));
+    }
+
+    /// Ends the request's place in the record, and acts on the host's answer if there is one.
+    ///
+    /// A registration the host answered as registered is live until a removal says otherwise. One
+    /// it refused may have written notices before it failed, which the host retracts from its queue
+    /// but cannot take back from the connection, and the refusal is the only word the client has that
+    /// the registration they came from is gone. They are taken out of the client's queue when
+    /// nothing else could own them: no registration of the identifier is live, and no other
+    /// registration of it waits for its answer. The host wrote everything the refused registration
+    /// wrote before it answered the refusal, so what the queue holds then belongs to it or to a
+    /// registration that is gone. The decision and the cleanup are one step under the record of
+    /// what the client is doing, so a registration that is started afterwards sends its request
+    /// after the cleanup.
+    fn release(&mut self, answer: Option<&ResponseBody>) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        let Ok(mut churning) = self.churning.lock() else {
+            return;
+        };
+        let Some(churn) = churning.get_mut(&self.binding_id) else {
+            return;
+        };
+        match answer {
+            Some(ResponseBody::Registered { .. }) => churn.live += 1,
+            Some(ResponseBody::Refused { .. }) if churn.registering == 1 && churn.live == 0 => {
+                self.sink.forget(self.binding_id);
             }
+            _ => {}
+        }
+        churn.registering = churn.registering.saturating_sub(1);
+        if churn.idle() {
+            churning.remove(&self.binding_id);
         }
     }
 }
 
-/// One request to remove a binding, counted from before it is sent until its answer has been read or
-/// it is dropped.
-struct Removing<'a> {
-    churning: &'a Churning,
+impl Drop for Registering {
+    fn drop(&mut self) {
+        self.release(None);
+    }
+}
+
+/// One request to remove a binding, counted from before it is sent until its answer has been read,
+/// or until the client has no answer to read because the request was never sent or the connection
+/// ended.
+#[derive(Debug)]
+struct Removing {
+    churning: Arc<Churning>,
+    sink: NoticeSink,
     binding_id: Uuid,
     /// How many registrations of the identifier had been started when the request began.
     started_before: u64,
     /// Whether a registration of the identifier was waiting for its answer when the request began.
     registering_before: bool,
+    released: bool,
 }
 
-impl<'a> Removing<'a> {
-    fn begin(churning: &'a Churning, binding_id: Uuid) -> Self {
+impl Removing {
+    fn begin(churning: &Arc<Churning>, sink: &NoticeSink, binding_id: Uuid) -> Self {
         let mut started_before = 0;
         let mut registering_before = false;
         if let Ok(mut churning) = churning.lock() {
@@ -187,45 +266,65 @@ impl<'a> Removing<'a> {
             registering_before = churn.registering > 0;
         }
         Self {
-            churning,
+            churning: Arc::clone(churning),
+            sink: sink.clone(),
             binding_id,
             started_before,
             registering_before,
+            released: false,
         }
     }
 
-    /// Takes out of `sink` everything it holds for the identifier, unless a registration of the
-    /// identifier was under way when this removal began or has been started since.
+    fn answered(mut self, body: &ResponseBody) {
+        self.release(Some(body));
+    }
+
+    /// Ends the request's place in the record, and acts on the host's answer if there is one.
     ///
-    /// The host can write such a registration's first notices before it answers this removal, and
-    /// nothing in a notice says which registration it is from, so what the queue holds may be that
-    /// registration's. The decision and the cleanup are one step under the record of what the
-    /// client is registering: a registration that is started afterwards sends its request after
-    /// the cleanup, and the host writes nothing for it before it reads that request.
-    fn forget(&self, sink: &NoticeSink) {
-        let Ok(churning) = self.churning.lock() else {
+    /// When the host removed a registration, either way it says so, the client takes out of its
+    /// queue everything it holds for the identifier, unless a registration of the identifier was
+    /// under way when this removal began or has been started since. The host can write such a
+    /// registration's first notices before it answers this removal, and nothing in a notice says
+    /// which registration it is from, so what the queue holds may be that registration's. The
+    /// decision and the cleanup are one step under the record of what the client is doing: a
+    /// registration that is started afterwards sends its request after the cleanup, and the host
+    /// writes nothing for it before it reads that request.
+    ///
+    /// An answer that found nothing removed nothing: the host held no registration of the
+    /// identifier when it read the request.
+    fn release(&mut self, answer: Option<&ResponseBody>) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        let Ok(mut churning) = self.churning.lock() else {
             return;
         };
-        let overlapped = self.registering_before
-            || churning
-                .get(&self.binding_id)
-                .is_some_and(|churn| churn.started != self.started_before);
-        if !overlapped {
-            sink.forget(self.binding_id);
+        let Some(churn) = churning.get_mut(&self.binding_id) else {
+            return;
+        };
+        let removed = match answer {
+            Some(ResponseBody::Unbound { existed }) => *existed,
+            Some(ResponseBody::Refused { .. }) => true,
+            _ => false,
+        };
+        if removed {
+            churn.live = churn.live.saturating_sub(1);
+            let overlapped = self.registering_before || churn.started != self.started_before;
+            if !overlapped {
+                self.sink.forget(self.binding_id);
+            }
+        }
+        churn.removing = churn.removing.saturating_sub(1);
+        if churn.idle() {
+            churning.remove(&self.binding_id);
         }
     }
 }
 
-impl Drop for Removing<'_> {
+impl Drop for Removing {
     fn drop(&mut self) {
-        if let Ok(mut churning) = self.churning.lock()
-            && let Some(churn) = churning.get_mut(&self.binding_id)
-        {
-            churn.removing = churn.removing.saturating_sub(1);
-            if churn.registering == 0 && churn.removing == 0 {
-                churning.remove(&self.binding_id);
-            }
-        }
+        self.release(None);
     }
 }
 
@@ -276,10 +375,33 @@ struct Transport {
 /// The one writer this connection has, until it is closed.
 type Writer = Arc<tokio::sync::Mutex<Option<FrameWriter>>>;
 
+/// One request waiting for its answer.
+#[derive(Debug)]
+struct Waiter {
+    /// Where the answer goes while the caller still waits for it.
+    caller: Option<Answer>,
+    /// What is done with the answer whether or not anybody still waits for it.
+    settle: Option<Settle>,
+    /// Whether the request's frame has been written in full, which is when the host can answer it.
+    written: bool,
+}
+
+impl Waiter {
+    /// Acts on the answer, and hands it to the caller if the caller still waits.
+    fn answered(self, body: ResponseBody) {
+        if let Some(settle) = self.settle {
+            settle.answered(&body);
+        }
+        if let Some(caller) = self.caller {
+            let _delivered = caller.send(body);
+        }
+    }
+}
+
 /// The requests this client is waiting on, and whether its connection still exists.
 #[derive(Debug, Default)]
 struct Pending {
-    waiting: Mutex<HashMap<u64, Answer>>,
+    waiting: Mutex<HashMap<u64, Waiter>>,
     closed: AtomicBool,
     transport: Mutex<Option<Transport>>,
 }
@@ -290,23 +412,65 @@ impl Pending {
     /// The check and the insertion are one step under the lock. Two steps would let a request be
     /// admitted between a reader deciding the connection was over and its clearing the waiting
     /// set, and that request would then wait for an answer nobody could send.
-    fn wait_for(&self, request_id: u64, answer: Answer) -> bool {
+    fn wait_for(&self, request_id: u64, answer: Answer, settle: Option<Settle>) -> bool {
         let Ok(mut waiting) = self.waiting.lock() else {
             return false;
         };
         if self.closed.load(Ordering::Acquire) {
             return false;
         }
-        waiting.insert(request_id, answer);
+        waiting.insert(
+            request_id,
+            Waiter {
+                caller: Some(answer),
+                settle,
+                written: false,
+            },
+        );
         true
     }
 
-    /// Takes one request's sender, if it is still waiting.
-    fn take(&self, request_id: u64) -> Option<Answer> {
+    /// Records that a request's frame has been written in full.
+    fn written(&self, request_id: u64) {
+        if let Ok(mut waiting) = self.waiting.lock()
+            && let Some(waiter) = waiting.get_mut(&request_id)
+        {
+            waiter.written = true;
+        }
+    }
+
+    /// Takes one request's place, if it is still waiting.
+    fn take(&self, request_id: u64) -> Option<Waiter> {
         self.waiting
             .lock()
             .ok()
             .and_then(|mut waiting| waiting.remove(&request_id))
+    }
+
+    /// Ends a caller's wait for one request's answer.
+    ///
+    /// A request that something is to be done about when its answer comes, and whose frame has been
+    /// written in full, stays among those waiting without a caller, so that the answer is acted on
+    /// when it is read. Every other request goes: an answer nobody is waiting for is dropped.
+    fn stop_waiting(&self, request_id: u64) {
+        let gone = {
+            let Ok(mut waiting) = self.waiting.lock() else {
+                return;
+            };
+            let outlives_its_caller = waiting
+                .get(&request_id)
+                .is_some_and(|waiter| waiter.written && waiter.settle.is_some());
+            if outlives_its_caller {
+                if let Some(waiter) = waiting.get_mut(&request_id) {
+                    waiter.caller = None;
+                }
+                None
+            } else {
+                waiting.remove(&request_id)
+            }
+        };
+        // Outside the lock: what a waiter holds takes locks of its own when it goes.
+        drop(gone);
     }
 
     /// Drops every waiting sender and records that the connection is gone.
@@ -316,12 +480,15 @@ impl Pending {
     fn close(&self) {
         // The flag is set under the lock an admission takes, so an admission either happens before
         // the connection ended or is refused by it; there is no order in which it happens after.
-        if let Ok(mut waiting) = self.waiting.lock() {
+        let drained = if let Ok(mut waiting) = self.waiting.lock() {
             self.closed.store(true, Ordering::Release);
-            waiting.clear();
+            core::mem::take(&mut *waiting)
         } else {
             self.closed.store(true, Ordering::Release);
-        }
+            HashMap::new()
+        };
+        // Outside the lock: what a waiter holds takes locks of its own when it goes.
+        drop(drained);
         // And the transport goes with them: a reader still waiting on the socket, a writer still
         // sending events, or a socket still half open would be this client carrying on with a
         // connection it has declared over.
@@ -386,11 +553,12 @@ impl Drop for Framing<'_> {
     }
 }
 
-/// One request's place in the waiting set, removed however the caller leaves.
+/// One request's place in the waiting set, ended however the caller leaves.
 ///
-/// A timeout, a write failure and a cancelled future all end the same way: the entry goes. Without
-/// this, a caller that gave up would leave its sender behind and the set would grow with every call
-/// that did not arrive.
+/// A timeout, a write failure and a cancelled future all end the same way: the caller's sender goes,
+/// and so does the entry, unless the request is one whose answer is acted on whoever is waiting for
+/// it. Without this, a caller that gave up would leave its sender behind and the set would grow
+/// with every call that did not arrive.
 struct Waiting<'a> {
     pending: &'a Pending,
     request_id: u64,
@@ -398,7 +566,7 @@ struct Waiting<'a> {
 
 impl Drop for Waiting<'_> {
     fn drop(&mut self) {
-        let _taken = self.pending.take(self.request_id);
+        self.pending.stop_waiting(self.request_id);
     }
 }
 
@@ -421,7 +589,7 @@ pub struct PluginClient {
     /// How long an unbind is waited for.
     unbind_deadline: core::time::Duration,
     /// What this client is doing about the identifiers it is registering or removing.
-    churning: Churning,
+    churning: Arc<Churning>,
     next_request: AtomicU64,
     descriptor: HostDescriptor,
     reader_task: tokio::task::JoinHandle<()>,
@@ -518,7 +686,7 @@ impl PluginClient {
             offer_hold,
             register_deadline: REGISTER_DEADLINE,
             unbind_deadline: DEFAULT_DEADLINE,
-            churning: Mutex::new(HashMap::new()),
+            churning: Arc::new(Mutex::new(HashMap::new())),
             next_request: AtomicU64::new(1),
             descriptor,
             reader_task,
@@ -573,9 +741,9 @@ impl PluginClient {
         executable: &str,
         component: &ComponentSource,
     ) -> ServiceResult<Registration> {
-        let _registering = Registering::begin(&self.churning, binding_id.get());
+        let registering = Registering::begin(&self.churning, &self.sink, binding_id.get());
         let body = self
-            .request_within(
+            .request_settling(
                 RequestBody::RegisterBinding(Box::new(BindingRegistration {
                     binding_id: binding_id.get(),
                     identity: identity.clone(),
@@ -584,6 +752,7 @@ impl PluginClient {
                     component: component.clone(),
                 })),
                 self.register_deadline,
+                Some(Settle::Registration(registering)),
             )
             .await?;
         match body {
@@ -838,46 +1007,39 @@ impl PluginClient {
     /// after it, so what the queue holds when the answer comes is the removed registration's, and
     /// none of it is shown to the identifier's next one.
     ///
+    /// That is done when the answer is read, whatever the caller of this has done by then: a
+    /// caller that stops waiting for the answer, by a deadline of its own or by dropping this
+    /// future, leaves the removal with the host, which carries it out, and the queue is emptied as
+    /// the answer comes, where a retry would find nothing to remove.
+    ///
     /// That holds for a caller that registers the identifier again only after this returns, which
     /// is what a worker does. A caller that has a registration of the identifier under way when
     /// this begins, or starts one while this waits, has the host's word for nothing more than that
     /// the old registration's notices came before the answer, and the new registration's first
-    /// notices can have come before it too, with nothing to tell the two apart. Such a caller
-    /// keeps everything its queue holds.
+    /// notices can have come before it too, with nothing to tell the two apart. A registration is
+    /// under way until the host has answered it, also when its caller has stopped waiting. Such a
+    /// caller keeps everything its queue holds.
     ///
     /// # Errors
     ///
     /// Returns [`ServiceError::Protocol`] for the host's refusal, which is an answer and not a
     /// failure to get one, and [`ServiceError::Unavailable`] when the host is gone.
     pub async fn unbind(&self, binding_id: BindingId) -> ServiceResult<bool> {
-        let removing = Removing::begin(&self.churning, binding_id.get());
+        let removing = Removing::begin(&self.churning, &self.sink, binding_id.get());
         let body = self
-            .request_within(
+            .request_settling(
                 RequestBody::Unbind {
                     binding_id: binding_id.get(),
                 },
                 self.unbind_deadline,
+                Some(Settle::Removal(removing)),
             )
             .await?;
-        // What the queue holds for the identifier is the removed registration's, and goes with it,
-        // when the host says it removed one and no registration of the identifier overlapped the
-        // removal: the host can write such a registration's first notices before it answers the
-        // removal of the old one, and nothing in a notice says which registration it is from.
         match body {
-            ResponseBody::Unbound { existed } => {
-                // An answer that found nothing removed nothing: the host held no registration of
-                // the identifier when it read the request.
-                if existed {
-                    removing.forget(&self.sink);
-                }
-                Ok(existed)
-            }
+            ResponseBody::Unbound { existed } => Ok(existed),
             ResponseBody::Refused {
                 detail, disabled, ..
-            } => {
-                removing.forget(&self.sink);
-                Err(refused(detail, disabled))
-            }
+            } => Err(refused(detail, disabled)),
             other => Err(protocol_error(&other)),
         }
     }
@@ -1122,6 +1284,21 @@ impl PluginClient {
         body: RequestBody,
         deadline: core::time::Duration,
     ) -> ServiceResult<ResponseBody> {
+        self.request_settling(body, deadline, None).await
+    }
+
+    /// Sends one request as [`Self::request_within`] does, and has `settle` acted on its answer
+    /// when the client reads it, whether or not this call is still waiting for it by then.
+    ///
+    /// The answer to a request that was written in full is read and acted on even when the caller
+    /// has stopped waiting, by a deadline or by dropping this future; one that was never written
+    /// in full has no answer to wait for, and `settle` goes with the caller.
+    async fn request_settling(
+        &self,
+        body: RequestBody,
+        deadline: core::time::Duration,
+        settle: Option<Settle>,
+    ) -> ServiceResult<ResponseBody> {
         if self.pending.is_closed() {
             return Err(ServiceError::Unavailable {
                 detail: "the plugin host closed the connection".to_owned(),
@@ -1129,7 +1306,7 @@ impl PluginClient {
         }
         let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
         let (answer, reply) = oneshot::channel();
-        if !self.pending.wait_for(request_id, answer) {
+        if !self.pending.wait_for(request_id, answer, settle) {
             return Err(ServiceError::Unavailable {
                 detail: "the plugin host closed the connection".to_owned(),
             });
@@ -1173,6 +1350,9 @@ impl PluginClient {
                 };
                 let written = writer.write_message(&Request { request_id, body }).await;
                 frame.finished(written.is_ok());
+                if written.is_ok() {
+                    self.pending.written(request_id);
+                }
                 if written.is_ok() && !self.pending.is_closed() {
                     *held = Some(writer);
                 } else {
@@ -1270,8 +1450,8 @@ async fn read_frames(mut reader: FrameReader, pending: Arc<Pending>, notices: No
         };
         match frame {
             Frame::Response { reply_to, body } => {
-                if let Some(answer) = pending.take(reply_to) {
-                    let _delivered = answer.send(body);
+                if let Some(waiter) = pending.take(reply_to) {
+                    waiter.answered(body);
                 }
             }
             Frame::Notice(notice) => {

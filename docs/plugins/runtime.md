@@ -225,12 +225,24 @@ not. That covers a notice the writer had already taken off the queue. The report
 is checked a step earlier, before the writer is taken, because it also asks a component to draw
 again, and it asks only the registration that suffered the loss. The host writes everything a
 registration produced before it answers that registration's unbind, and nothing after, so the
-worker's client empties its own queue of the binding's notices when the answer says a binding was
-removed. That is exact for a worker, which registers the identifier again only after the answer. A
-caller with a registration of the identifier under way when the unbind begins, or one that starts
-one while it waits, could have the new registration's first notices written before the answer, with
-nothing in a notice to tell them from the old ones, so its client keeps what its queue holds. A
-worker's next registration of the identifier is shown none of the old one's.
+worker's client empties its own queue of the binding's notices when it reads an answer that says a
+binding was removed. It does so when it reads the answer, whether or not the caller that asked is
+still waiting: a caller that gives up on an unbind leaves the host to carry it out, and a retry
+finds nothing to remove. That is exact for a worker, which registers the identifier again only
+after the answer. A caller with a registration of the identifier under way when the unbind begins,
+or one that starts one while it waits, could have the new registration's first notices written
+before the answer, with nothing in a notice to tell them from the old ones, so its client keeps
+what its queue holds. A registration is under way until the host has answered it, also when its
+caller has stopped waiting. The wire does not say which registration wrote a notice, so at such an
+overlap the client keeps the whole queue, the old registration's notices and loss records included,
+until a later removal that nothing overlapped empties it. A worker's next registration of the
+identifier is shown none of the old one's.
+
+A registration the host refuses may have written notices before it failed. The host takes what it
+left in its own queue out, but the writer may have written a notice already, and the refusal is the
+only word the client has that the registration it came from is gone. So the client empties its
+queue of the identifier when it reads the refusal, unless it counts a registration of the
+identifier as live or another registration of it is still waiting for its answer.
 
 A binding also holds a bounded number of unanswered calls. A caller whose deadline ran out has
 stopped waiting, but its request is still on the binding's thread until that thread reaches it, and

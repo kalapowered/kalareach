@@ -1413,6 +1413,102 @@ async fn appears(path: &std::path::Path) {
     .expect("the file the case waits for never appeared");
 }
 
+/// Returns once the client has written the request it last sent in full, which is when the request
+/// is on the wire for the host to read whatever the caller does next. The request in the middle of
+/// its write holds the writer, so taking the writer is waiting for the write to end. A caller that
+/// is stopped before that would end the connection, and not stop waiting for one request.
+async fn on_the_wire(client: &PluginClient) {
+    drop(client.hold_writer().await);
+}
+
+/// A host that is a program of the case's own, for the cases about the order of the frames a client
+/// reads. It answers the handshake and the challenge, then hands the connection's two halves to
+/// `script`, which is the rest of what the host does. The client the case drives is connected to it.
+async fn scripted_host<Script, Running>(
+    script: Script,
+) -> (PluginClient, tokio::task::JoinHandle<()>)
+where
+    Script: FnOnce(kr_ipc::framed::FrameReader, kr_ipc::framed::FrameWriter) -> Running
+        + Send
+        + 'static,
+    Running: core::future::Future<Output = ()> + Send + 'static,
+{
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let identity = HostIdentity::generate(temp.environment_id()).expect("an identity");
+    let endpoint = host_endpoint(&environment, &HostProtocol::THIS).expect("an endpoint");
+    let descriptor = HostDescriptor {
+        protocol: HostProtocol::THIS.name.to_owned(),
+        environment_id: temp.environment_id(),
+        reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
+        endpoint: endpoint.as_text(),
+        boot_identity: identity.boot_identity().clone(),
+        process_start_identity: identity.process_start_identity().clone(),
+        host_public_key: *identity.public_key(),
+    };
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("a listener");
+    let serving = tokio::spawn({
+        let descriptor = descriptor.clone();
+        async move {
+            let _temp = temp;
+            let (connection, _peer) = listener.accept().await.expect("a connection");
+            let (mut reader, mut writer) =
+                kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+            for _ in 0..2 {
+                let request: kr_plugin_service::protocol::Request = reader
+                    .read_message_without_schema()
+                    .await
+                    .expect("the handshake request");
+                let body = match request.body {
+                    RequestBody::Hello { .. } => ResponseBody::Hello {
+                        protocol: HostProtocol::THIS.name.to_owned(),
+                        descriptor: Box::new(descriptor.clone()),
+                    },
+                    RequestBody::Verify { nonce } => ResponseBody::Verified(Box::new(
+                        identity
+                            .answer(&nonce, &descriptor.endpoint)
+                            .expect("an answer"),
+                    )),
+                    other => panic!("the client asked for {other:?} in the handshake"),
+                };
+                writer
+                    .write_message(&Frame::Response {
+                        reply_to: request.request_id,
+                        body,
+                    })
+                    .await
+                    .expect("the handshake answer is written");
+            }
+            script(reader, writer).await;
+        }
+    });
+    let connection = kr_ipc::endpoint::Connection::connect(&endpoint)
+        .await
+        .expect("connects");
+    let client = PluginClient::over(connection, descriptor)
+        .await
+        .expect("the handshake and the challenge");
+    (client, serving)
+}
+
+/// Reads the client's notices through `last`, the notice the host program writes after everything
+/// the case is about, and returns them with it.
+async fn notices_until(client: &PluginClient, last: &Notice) -> Vec<Notice> {
+    tokio::time::timeout(HANG_GUARD, async {
+        let mut read = Vec::new();
+        loop {
+            let notice = client.notice().await.expect("the connection stood");
+            let ends = notice == *last;
+            read.push(notice);
+            if ends {
+                return read;
+            }
+        }
+    })
+    .await
+    .expect("the notice that is always read never came")
+}
+
 // What the host's notice queue holds for a binding when it is removed is the removed registration's,
 // and no later registration of the identifier is shown it. Notices carry the binding's identifier
 // and nothing else, so a worker cannot tell them from the new registration's own.
@@ -1730,6 +1826,557 @@ async fn a_client_shows_a_later_registration_nothing_its_queue_held_for_the_bind
     serving.await.expect("the host program ended");
 }
 
+// What the client's queue holds for a binding goes when the host answers the removal, whether or not
+// the caller of the unbind is still waiting for the answer. A caller that gives up on an unbind
+// after the host has read it has no answer to act on, but the host has removed the registration all
+// the same and a retry finds none to remove, so nothing but the client's own reading of the answer
+// can empty the queue of what the removed registration left in it, and the identifier's next
+// registration would be shown it.
+//
+// The host here is a program of the case's, because what the case needs is the order of the frames
+// and when the answer comes: the unbind is read, its caller stops waiting for it, and only then does
+// the host write a notice of the removed registration and the answer. The privacy request that
+// follows is answered after the unbind's answer, with a notice that is always read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_empties_its_queue_for_an_unbind_whose_caller_stopped_waiting_when_the_host_answers_it()
+ {
+    let binding_id = new_binding_id();
+    let left_behind = Notice::Disabled {
+        binding_id: binding_id.get(),
+        reason: "the removed registration's".to_owned(),
+    };
+    let after_it = Notice::Disabled {
+        binding_id: new_binding_id().get(),
+        reason: "the notice that is always read".to_owned(),
+    };
+    let (read_sender, read) = tokio::sync::oneshot::channel::<()>();
+    let (go_sender, go) = tokio::sync::oneshot::channel::<()>();
+    let (client, serving) = scripted_host({
+        let left_behind = left_behind.clone();
+        let after_it = after_it.clone();
+        move |mut reader, mut writer| async move {
+            let unbind: kr_plugin_service::protocol::Request = reader
+                .read_message_without_schema()
+                .await
+                .expect("the unbind");
+            assert!(
+                matches!(unbind.body, RequestBody::Unbind { .. }),
+                "the client asked for {:?}",
+                unbind.body
+            );
+            read_sender.send(()).expect("the case waits for the unbind");
+            go.await.expect("the case lets the answer go");
+            writer
+                .write_message(&Frame::Notice(left_behind))
+                .await
+                .expect("a notice is written");
+            writer
+                .write_message(&Frame::Response {
+                    reply_to: unbind.request_id,
+                    body: ResponseBody::Unbound { existed: true },
+                })
+                .await
+                .expect("the answer is written");
+            let privacy: kr_plugin_service::protocol::Request = reader
+                .read_message_without_schema()
+                .await
+                .expect("the privacy request");
+            let RequestBody::Privacy { private } = privacy.body else {
+                panic!("the client asked for {:?}", privacy.body);
+            };
+            writer
+                .write_message(&Frame::Notice(after_it))
+                .await
+                .expect("a notice is written");
+            writer
+                .write_message(&Frame::Response {
+                    reply_to: privacy.request_id,
+                    body: ResponseBody::PrivacySet { private },
+                })
+                .await
+                .expect("the answer is written");
+        }
+    })
+    .await;
+    let client = Arc::new(client);
+
+    let unbinding = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { client.unbind(binding_id).await }
+    });
+    tokio::time::timeout(HANG_GUARD, read)
+        .await
+        .expect("the host never read the unbind")
+        .expect("the host program ended");
+    on_the_wire(&client).await;
+    unbinding.abort();
+    assert!(
+        unbinding
+            .await
+            .expect_err("the caller was stopped")
+            .is_cancelled(),
+        "the unbind's caller ended some other way"
+    );
+    go_sender.send(()).expect("the host program waits");
+    client.privacy(false).await.expect("privacy is set");
+
+    let notices = notices_until(&client, &after_it).await;
+    assert_eq!(
+        notices,
+        [after_it],
+        "the client kept what its queue held for the binding whose removal was answered after the \
+         caller stopped waiting"
+    );
+    serving.await.expect("the host program ended");
+}
+
+// What a registration the host refused wrote is not shown to a later registration of the
+// identifier. The host retracts what a refused registration left in its queue, but a notice the
+// writer had already written is in the client's queue before the refusal comes, and the refusal is
+// the only word the client has that the registration it was from is gone. A registration that is
+// refused after nothing of the identifier was live leaves nothing of it in the queue.
+//
+// The host here is a program of the case's, because what the case needs is a notice from a
+// registration that then fails. The privacy request that follows is answered with a notice that is
+// always read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_shows_a_later_registration_nothing_a_registration_the_host_refused_wrote() {
+    let request = components::request("well-behaved", 1);
+    let component = ComponentSource {
+        path: "unused".to_owned(),
+        digest: PayloadDigest::of(b"unused"),
+        bytes: 0,
+    };
+    let written = Notice::Disabled {
+        binding_id: request.binding_id.get(),
+        reason: "the refused registration's".to_owned(),
+    };
+    let after_it = Notice::Disabled {
+        binding_id: new_binding_id().get(),
+        reason: "the notice that is always read".to_owned(),
+    };
+    let (client, serving) = scripted_host({
+        let written = written.clone();
+        let after_it = after_it.clone();
+        move |mut reader, mut writer| async move {
+            let registration: kr_plugin_service::protocol::Request = reader
+                .read_message_without_schema()
+                .await
+                .expect("the registration");
+            assert!(
+                matches!(registration.body, RequestBody::RegisterBinding(_)),
+                "the client asked for {:?}",
+                registration.body
+            );
+            writer
+                .write_message(&Frame::Notice(written))
+                .await
+                .expect("a notice is written");
+            writer
+                .write_message(&Frame::Response {
+                    reply_to: registration.request_id,
+                    body: ResponseBody::Refused {
+                        request: "register_binding".to_owned(),
+                        detail: "the binding could not be bound".to_owned(),
+                        disabled: false,
+                    },
+                })
+                .await
+                .expect("the refusal is written");
+            let privacy: kr_plugin_service::protocol::Request = reader
+                .read_message_without_schema()
+                .await
+                .expect("the privacy request");
+            let RequestBody::Privacy { private } = privacy.body else {
+                panic!("the client asked for {:?}", privacy.body);
+            };
+            writer
+                .write_message(&Frame::Notice(after_it))
+                .await
+                .expect("a notice is written");
+            writer
+                .write_message(&Frame::Response {
+                    reply_to: privacy.request_id,
+                    body: ResponseBody::PrivacySet { private },
+                })
+                .await
+                .expect("the answer is written");
+        }
+    })
+    .await;
+
+    let registered = client
+        .register(
+            request.binding_id,
+            &request.identity,
+            &request.facts,
+            &request.executable,
+            &component,
+        )
+        .await;
+    assert!(
+        matches!(&registered, Err(ServiceError::Protocol { .. })),
+        "the refusal was read as {registered:?}"
+    );
+    client.privacy(false).await.expect("privacy is set");
+
+    let notices = notices_until(&client, &after_it).await;
+    assert_eq!(
+        notices,
+        [after_it],
+        "the client kept what a registration the host refused wrote"
+    );
+    serving.await.expect("the host program ended");
+}
+
+// A registration the host refuses empties the client's queue only when no registration of the
+// identifier is live: the refusal of a second registration of an identifier that is live (the host
+// refuses it by name) says nothing of the live one, whose notices are the queue's and are shown.
+//
+// The host here is a program of the case's: the first registration is answered, a notice follows
+// it, and a second registration of the identifier is refused. The privacy request that follows is
+// answered with a notice that is always read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_keeps_what_a_live_registration_wrote_when_a_second_registration_of_the_identifier_is_refused()
+ {
+    let request = components::request("well-behaved", 1);
+    let component = ComponentSource {
+        path: "unused".to_owned(),
+        digest: PayloadDigest::of(b"unused"),
+        bytes: 0,
+    };
+    let live = Notice::Disabled {
+        binding_id: request.binding_id.get(),
+        reason: "the live registration's".to_owned(),
+    };
+    let after_it = Notice::Disabled {
+        binding_id: new_binding_id().get(),
+        reason: "the notice that is always read".to_owned(),
+    };
+    let (client, serving) = scripted_host({
+        let live = live.clone();
+        let after_it = after_it.clone();
+        move |mut reader, mut writer| async move {
+            let first: kr_plugin_service::protocol::Request = reader
+                .read_message_without_schema()
+                .await
+                .expect("the first registration");
+            writer
+                .write_message(&Frame::Response {
+                    reply_to: first.request_id,
+                    body: ResponseBody::Registered {
+                        origin: "compiled".to_owned(),
+                        elapsed_ms: 0,
+                    },
+                })
+                .await
+                .expect("the answer is written");
+            writer
+                .write_message(&Frame::Notice(live))
+                .await
+                .expect("a notice is written");
+            let second: kr_plugin_service::protocol::Request = reader
+                .read_message_without_schema()
+                .await
+                .expect("the second registration");
+            writer
+                .write_message(&Frame::Response {
+                    reply_to: second.request_id,
+                    body: ResponseBody::Refused {
+                        request: "register_binding".to_owned(),
+                        detail: "binding is already live".to_owned(),
+                        disabled: false,
+                    },
+                })
+                .await
+                .expect("the refusal is written");
+            let privacy: kr_plugin_service::protocol::Request = reader
+                .read_message_without_schema()
+                .await
+                .expect("the privacy request");
+            let RequestBody::Privacy { private } = privacy.body else {
+                panic!("the client asked for {:?}", privacy.body);
+            };
+            writer
+                .write_message(&Frame::Notice(after_it))
+                .await
+                .expect("a notice is written");
+            writer
+                .write_message(&Frame::Response {
+                    reply_to: privacy.request_id,
+                    body: ResponseBody::PrivacySet { private },
+                })
+                .await
+                .expect("the answer is written");
+        }
+    })
+    .await;
+
+    let register = || {
+        client.register(
+            request.binding_id,
+            &request.identity,
+            &request.facts,
+            &request.executable,
+            &component,
+        )
+    };
+    register()
+        .await
+        .expect("the first registration is answered");
+    let second = register().await;
+    assert!(
+        matches!(&second, Err(ServiceError::Protocol { .. })),
+        "the refusal was read as {second:?}"
+    );
+    client.privacy(false).await.expect("privacy is set");
+
+    let notices = notices_until(&client, &after_it).await;
+    assert_eq!(
+        notices,
+        [live, after_it],
+        "the client emptied its queue of what the live registration wrote"
+    );
+    serving.await.expect("the host program ended");
+}
+
+// The refusal of a registration says nothing of another registration of the identifier that is
+// still waiting for its answer: the host refuses a second registration of an identifier it is
+// registering by name, and the first goes on to write its notices. Those are the queue's, and the
+// refusal leaves them.
+//
+// The host here is a program of the case's: it reads two registrations of one identifier, writes a
+// notice, refuses the second, and only then answers the first. The privacy request that follows is
+// answered with a notice that is always read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_keeps_what_a_registration_under_way_wrote_when_a_second_registration_of_the_identifier_is_refused()
+ {
+    let request = components::request("well-behaved", 1);
+    let component = ComponentSource {
+        path: "unused".to_owned(),
+        digest: PayloadDigest::of(b"unused"),
+        bytes: 0,
+    };
+    let under_way = Notice::Disabled {
+        binding_id: request.binding_id.get(),
+        reason: "the registration under way's".to_owned(),
+    };
+    let after_it = Notice::Disabled {
+        binding_id: new_binding_id().get(),
+        reason: "the notice that is always read".to_owned(),
+    };
+    let (first_sender, first) = tokio::sync::oneshot::channel::<()>();
+    let (client, serving) = scripted_host({
+        let under_way = under_way.clone();
+        let after_it = after_it.clone();
+        move |mut reader, mut writer| async move {
+            let first_request: kr_plugin_service::protocol::Request = reader
+                .read_message_without_schema()
+                .await
+                .expect("the first registration");
+            first_sender
+                .send(())
+                .expect("the case waits for the first registration");
+            let second: kr_plugin_service::protocol::Request = reader
+                .read_message_without_schema()
+                .await
+                .expect("the second registration");
+            writer
+                .write_message(&Frame::Notice(under_way))
+                .await
+                .expect("a notice is written");
+            writer
+                .write_message(&Frame::Response {
+                    reply_to: second.request_id,
+                    body: ResponseBody::Refused {
+                        request: "register_binding".to_owned(),
+                        detail: "binding is already live".to_owned(),
+                        disabled: false,
+                    },
+                })
+                .await
+                .expect("the refusal is written");
+            writer
+                .write_message(&Frame::Response {
+                    reply_to: first_request.request_id,
+                    body: ResponseBody::Registered {
+                        origin: "compiled".to_owned(),
+                        elapsed_ms: 0,
+                    },
+                })
+                .await
+                .expect("the answer is written");
+            let privacy: kr_plugin_service::protocol::Request = reader
+                .read_message_without_schema()
+                .await
+                .expect("the privacy request");
+            let RequestBody::Privacy { private } = privacy.body else {
+                panic!("the client asked for {:?}", privacy.body);
+            };
+            writer
+                .write_message(&Frame::Notice(after_it))
+                .await
+                .expect("a notice is written");
+            writer
+                .write_message(&Frame::Response {
+                    reply_to: privacy.request_id,
+                    body: ResponseBody::PrivacySet { private },
+                })
+                .await
+                .expect("the answer is written");
+        }
+    })
+    .await;
+    let client = Arc::new(client);
+
+    let registering = tokio::spawn({
+        let client = Arc::clone(&client);
+        let request = request.clone();
+        let component = component.clone();
+        async move { register_on(&client, &request, &component).await }
+    });
+    tokio::time::timeout(HANG_GUARD, first)
+        .await
+        .expect("the host never read the first registration")
+        .expect("the host program ended");
+    let second = client
+        .register(
+            request.binding_id,
+            &request.identity,
+            &request.facts,
+            &request.executable,
+            &component,
+        )
+        .await;
+    assert!(
+        matches!(&second, Err(ServiceError::Protocol { .. })),
+        "the refusal was read as {second:?}"
+    );
+    registering
+        .await
+        .expect("the first registration was answered");
+    client.privacy(false).await.expect("privacy is set");
+
+    let notices = notices_until(&client, &after_it).await;
+    assert_eq!(
+        notices,
+        [under_way, after_it],
+        "the client emptied its queue of what the registration under way wrote"
+    );
+    serving.await.expect("the host program ended");
+}
+
+// A registration whose request was never written is not under way: its caller stopped before the
+// client could write it, so the host knows nothing of it and will answer nothing, and the client
+// does not wait for an answer to it. A removal of the identifier that comes after it is not
+// overlapped by it.
+//
+// The connection's writer is held, so that the registration waits for it and is dropped there, after
+// the client has recorded it and before it can have written anything. A removal then runs, and the
+// host here, a program of the case's, answers it with a notice of the removed registration before
+// the answer; the client empties its queue of that notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_registration_whose_request_was_never_written_leaves_nothing_under_way() {
+    let request = components::request("well-behaved", 1);
+    let component = ComponentSource {
+        path: "unused".to_owned(),
+        digest: PayloadDigest::of(b"unused"),
+        bytes: 0,
+    };
+    let left_behind = Notice::Disabled {
+        binding_id: request.binding_id.get(),
+        reason: "the removed registration's".to_owned(),
+    };
+    let after_it = Notice::Disabled {
+        binding_id: new_binding_id().get(),
+        reason: "the notice that is always read".to_owned(),
+    };
+    let (client, serving) = scripted_host({
+        let left_behind = left_behind.clone();
+        let after_it = after_it.clone();
+        move |mut reader, mut writer| async move {
+            let unbind: kr_plugin_service::protocol::Request = reader
+                .read_message_without_schema()
+                .await
+                .expect("the unbind");
+            assert!(
+                matches!(unbind.body, RequestBody::Unbind { .. }),
+                "the client wrote {:?}, and the registration was dropped before it could write",
+                unbind.body
+            );
+            writer
+                .write_message(&Frame::Notice(left_behind))
+                .await
+                .expect("a notice is written");
+            writer
+                .write_message(&Frame::Response {
+                    reply_to: unbind.request_id,
+                    body: ResponseBody::Unbound { existed: true },
+                })
+                .await
+                .expect("the answer is written");
+            let privacy: kr_plugin_service::protocol::Request = reader
+                .read_message_without_schema()
+                .await
+                .expect("the privacy request");
+            let RequestBody::Privacy { private } = privacy.body else {
+                panic!("the client asked for {:?}", privacy.body);
+            };
+            writer
+                .write_message(&Frame::Notice(after_it))
+                .await
+                .expect("a notice is written");
+            writer
+                .write_message(&Frame::Response {
+                    reply_to: privacy.request_id,
+                    body: ResponseBody::PrivacySet { private },
+                })
+                .await
+                .expect("the answer is written");
+        }
+    })
+    .await;
+
+    let writer = client.hold_writer().await;
+    {
+        let mut registering = core::pin::pin!(client.register(
+            request.binding_id,
+            &request.identity,
+            &request.facts,
+            &request.executable,
+            &component,
+        ));
+        // One poll takes the registration as far as the writer, which is held, and no further.
+        core::future::poll_fn(|context| {
+            assert!(
+                registering.as_mut().poll(context).is_pending(),
+                "the registration went on without the connection's writer"
+            );
+            core::task::Poll::Ready(())
+        })
+        .await;
+    }
+    drop(writer);
+
+    assert!(
+        client
+            .unbind(request.binding_id)
+            .await
+            .expect("the unbind is answered"),
+        "the host's answer was not read as the binding removed"
+    );
+    client.privacy(false).await.expect("privacy is set");
+
+    let notices = notices_until(&client, &after_it).await;
+    assert_eq!(
+        notices,
+        [after_it],
+        "the client kept what its queue held for a removal that a registration never written \
+         was said to overlap"
+    );
+    serving.await.expect("the host program ended");
+}
+
 // A caller that registers an identifier again before the host has answered the removal of its
 // previous registration cannot be given an exact account of the client's queue: the host removes the
 // binding from its runtime first and waits for its thread after, so the new registration can bind and
@@ -1781,6 +2428,13 @@ async fn a_client_keeps_what_the_new_registration_wrote_before_the_removal_of_th
         .expect("the unbind task ended")
         .expect("the unbind ran");
     assert!(existed, "the removed binding was not there to remove");
+    // Looked at as soon as the removal is answered: a queue emptied in error shows here, and not
+    // when the case gives up on a document that is never coming.
+    assert_ne!(
+        client.held_notice_bytes(),
+        0,
+        "the unbind emptied the queue of what the new registration wrote"
+    );
     let bound = notices_through(&client, request.binding_id, "bind", 1).await;
     assert_eq!(
         bound.len(),
@@ -1853,6 +2507,97 @@ async fn a_client_keeps_what_a_registration_already_under_way_wrote_before_the_r
         .expect("the unbind task ended")
         .expect("the unbind ran");
     assert!(existed, "the removed binding was not there to remove");
+    // Looked at as soon as the removal is answered, as in the case above.
+    assert_ne!(
+        client.held_notice_bytes(),
+        0,
+        "the unbind emptied the queue of what the registration under way wrote"
+    );
+    let bound = notices_through(&client, request.binding_id, "bind", 1).await;
+    assert_eq!(
+        bound.len(),
+        1,
+        "the new registration's first document was not kept: {bound:?}"
+    );
+}
+
+// A registration is under way until the host has answered it, and not until its caller stops waiting.
+// A caller that gives up on a registration after its request is on the wire leaves the host making
+// it, and the registration writes its first notices as any other would, so a removal of the
+// identifier that begins afterwards still overlaps it and the client keeps what its queue holds.
+//
+// The new registration is held where the host has read its request and nothing else, by the gate file
+// the host honours in the state directory it files its cache in, and its caller stops waiting for it
+// there. The removal begins: the host removes the live registration, whose thread stands at a stopped
+// pass. The gate is opened, the registration finishes without its caller, its first document is in
+// the client's queue unread, and the pass is let go. The queue is looked at as soon as the removal is
+// answered, so a queue emptied in error shows then and not when the case gives up on the document.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_keeps_what_a_registration_wrote_whose_caller_stopped_waiting_for_it_before_the_removal_of_the_old_one_was_answered()
+ {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let served = Served::start_unbinding_within(HANG_GUARD).await;
+    let client = Arc::new(served.client().await.unbinding_within(HANG_GUARD));
+    let (path, digest, bytes) = served.install("well-behaved", &wasm);
+    let component = ComponentSource {
+        path,
+        digest,
+        bytes,
+    };
+    let request = components::request("well-behaved", 1);
+    register_on(&client, &request, &component).await;
+    notices_through(&client, request.binding_id, "bind", 1).await;
+    let stop = overflow_behind_a_stopped_pass(&served, &client, &request).await;
+
+    let state = served._temp.environment().state_dir().to_path_buf();
+    let gate = state.join("hold-registrations");
+    std::fs::write(&gate, b"").expect("the gate is closed");
+    let registering = tokio::spawn({
+        let client = Arc::clone(&client);
+        let request = request.clone();
+        let component = component.clone();
+        async move { register_on(&client, &request, &component).await }
+    });
+    appears(&state.join("hold-registrations.reached")).await;
+    on_the_wire(&client).await;
+    registering.abort();
+    assert!(
+        registering
+            .await
+            .expect_err("the caller was stopped")
+            .is_cancelled(),
+        "the registration's caller ended some other way"
+    );
+
+    let removing = tokio::spawn({
+        let client = Arc::clone(&client);
+        let binding_id = request.binding_id;
+        async move { client.unbind(binding_id).await }
+    });
+    health_until(&client, |health| health.live_bindings == 0).await;
+    std::fs::remove_file(&gate).expect("the gate is opened");
+    tokio::time::timeout(HANG_GUARD, async {
+        while client.held_notice_bytes() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the new registration's first document never reached the client's queue");
+
+    stop.release();
+    let existed = tokio::time::timeout(HANG_GUARD, removing)
+        .await
+        .expect("the unbind was answered")
+        .expect("the unbind task ended")
+        .expect("the unbind ran");
+    assert!(existed, "the removed binding was not there to remove");
+    assert_ne!(
+        client.held_notice_bytes(),
+        0,
+        "the unbind emptied the queue of what the registration whose caller stopped waiting wrote"
+    );
     let bound = notices_through(&client, request.binding_id, "bind", 1).await;
     assert_eq!(
         bound.len(),
