@@ -36,9 +36,10 @@ env:
   # so incremental artefacts would only take disk.
   CARGO_INCREMENTAL: "0"
   # The release's macOS floor. Rust's own default is older (11.0 on Apple Silicon), and the C that
-  # the build compiles reads the same variable, so every object in an executable targets 14.0:
-  # the Intel leg's cache key holds the variable, so no object restored from the cache was built
-  # for another floor. Nothing reads it on the other platforms.
+  # the build compiles reads the same variable, so the executables are linked for 14.0 and the C
+  # objects in them target 14.0 (the Rust standard library's own objects keep Rust's default). The
+  # Intel leg's cache key holds the variable, so no C object restored from the cache was built for
+  # another floor. Nothing reads it on the other platforms.
   MACOSX_DEPLOYMENT_TARGET: "14.0"
 
 defaults:
@@ -184,9 +185,10 @@ jobs:
       # built of them is always this commit's. The key holds the toolchain, `.cargo/config.toml`,
       # the profiles, Rust's flags in the environment (`RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`,
       # `CARGO_PROFILE_*`), what the C and C++ compilers read (`MACOSX_DEPLOYMENT_TARGET`, `SDKROOT`,
-      # `CC`, `CXX`, `CFLAGS`, `CXXFLAGS` and the like: Cargo does not see a change to them, and a
-      # native build keeps the objects it has), the runner image and the week, so a cache is
-      # restored only for the same settings, and Cargo decides which of its crates are current.
+      # `CC`, `CXX`, `CFLAGS`, `CXXFLAGS` and the like: Cargo does not see a change to them in a
+      # Rust crate, or in a build script that does not name them, and a native build keeps the
+      # objects it has), the runner image and the week, so a cache is restored only for the same
+      # settings, and Cargo decides which of its crates are current.
       - name: Restore the third-party crates' build output
         id: cargo-cache
         if: ${{ matrix.cache }}
