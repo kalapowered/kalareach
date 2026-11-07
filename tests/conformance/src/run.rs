@@ -627,9 +627,10 @@ const ERROR_BYTES: usize = 800;
 
 /// The end of a failed listing's standard error as the step's error names it: its last
 /// [`ERROR_LINES`] lines that say anything, on one line, the last [`ERROR_BYTES`] bytes of them at
-/// most, with the checkout's path left out of them (a result names none). Cargo's own account of
-/// which targets failed ([`what_the_targets_said`]) is left out: it says which program failed and
-/// not why, and it would take the place of the lines that say.
+/// most, with the checkout's path left out of them (a result names none). Only what comes before
+/// Cargo's first line about a failed program counts ([`what_the_program_said`]): Cargo writes its
+/// account of a failure, and its lines for the programs it goes on to, after the program's own
+/// words, and they would take the place of the lines that say why.
 fn ends_of(standard_error: &str, root: &Path) -> String {
     #[cfg(unix)]
     let resolved = std::fs::canonicalize(root).ok();
@@ -640,12 +641,12 @@ fn ends_of(standard_error: &str, root: &Path) -> String {
 
 /// [`ends_of`] with the checkout's physical path, `resolved`, given.
 fn ends_of_root_resolved(standard_error: &str, root: &Path, resolved: Option<&Path>) -> String {
-    let lines = what_the_targets_said(standard_error);
+    let lines = what_the_program_said(standard_error);
     if lines.is_empty() {
         return if standard_error.trim().is_empty() {
             "it wrote nothing to its standard error".to_owned()
         } else {
-            "it wrote only Cargo's account of the failed targets to its standard error".to_owned()
+            "it wrote only Cargo's account of the failure to its standard error".to_owned()
         };
     }
     let mut ends = lines[lines.len().saturating_sub(ERROR_LINES)..].join(" | ");
@@ -682,12 +683,15 @@ fn ends_of_root_resolved(standard_error: &str, root: &Path, resolved: Option<&Pa
     format!("its standard error ends: {ends}")
 }
 
-/// The lines of `text`, trimmed, that are not Cargo's account of which targets failed: the line
-/// "error: test failed, to rerun pass ..." (or "error: doctest failed ...") after each failed
-/// program, and, when Cargo was told to go on after a failure, the header "error: N targets
+/// The lines of `text`, trimmed, that come before Cargo's first line about a failed program,
+/// "error: test failed, to rerun pass ..." (or "error: doctest failed ..."). Cargo lets a program
+/// write to its standard error as it runs, so what the program said stands before that line; after
+/// it come Cargo's account of the failure ("Caused by:", the program's exit status) and the status
+/// lines of every program it goes on to when it was told to, and none of them says why the program
+/// failed. When no program failed, all the lines count but Cargo's header "error: N targets
 /// failed:" with the indented, backquoted command lines that follow it. A similar line anywhere
 /// else is kept.
-fn what_the_targets_said(text: &str) -> Vec<&str> {
+fn what_the_program_said(text: &str) -> Vec<&str> {
     let mut said = Vec::new();
     let mut in_the_account = false;
     for line in text.lines() {
@@ -698,8 +702,7 @@ fn what_the_targets_said(text: &str) -> Vec<&str> {
         if trimmed.starts_with("error: test failed, to rerun pass")
             || trimmed.starts_with("error: doctest failed, to rerun pass")
         {
-            in_the_account = false;
-            continue;
+            break;
         }
         if names_the_targets_that_failed(trimmed) {
             in_the_account = true;
