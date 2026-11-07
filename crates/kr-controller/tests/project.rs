@@ -4054,3 +4054,166 @@ async fn a_copy_of_an_action_with_an_open_claim_is_told_the_outcome_is_unknown_w
     assert_eq!(answered, made);
     let _ = host.stop().await;
 }
+
+/// KR-REQ-09.09: a repeat of a project action whose first attempt is still carrying it out, sent
+/// again on another connection exactly as it was first sent, is told that what became of the action
+/// is not known yet. The window it carries is one that connection never issued, which refuses a first
+/// action, but the action is not a first one: its claim is open. A definite refusal would be taken
+/// for the host's word that nothing was done, while the clone is still running. A first action under
+/// the same window is refused as ever, and once the first attempt has ended the repeat is given what
+/// it recorded.
+///
+/// The remote is a listener on this machine's loopback address that accepts the clone's connection
+/// and holds it until the case lets it go, so the clone is running for exactly as long as the case
+/// needs.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_of_a_clone_still_running_is_told_the_outcome_is_unknown_on_a_new_connection() {
+    let host = host().await;
+    let mut first = client(&host).await;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+    let port = listener.local_addr().expect("its address").port();
+    let (arrived, has_arrived) = tokio::sync::oneshot::channel::<()>();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let remote = std::thread::spawn(move || {
+        let held = listener.accept();
+        let _ = arrived.send(());
+        let _ = released.recv();
+        drop(held);
+    });
+
+    let params = ProjectCloneParams {
+        destination: host.destination("running"),
+        label: "running".to_owned(),
+        source: CloneSource::Remote {
+            remote: RemoteSpecification {
+                remote_name: "origin".to_owned(),
+                transport: RemoteTransport::Https,
+                url: format!("https://127.0.0.1:{port}/repository.git"),
+                provider: String::new(),
+                credential_broker: kr_project::credential::OS_SECRET_STORE.to_owned(),
+            },
+        },
+    };
+    let original = composed(
+        &mut first,
+        host.environment_id,
+        Method::ProjectClone,
+        ActionId::new(kr_ipc::new_uuid()),
+        &params,
+    )
+    .await;
+    let running = {
+        let original = original.clone();
+        tokio::spawn(async move {
+            let told = first.repeat(&original).await;
+            (first, told)
+        })
+    };
+    // The clone reaches its remote only after its claim is written, so the claim is open now.
+    has_arrived
+        .await
+        .expect("the clone reached the remote it is held at");
+
+    let mut second = client(&host).await;
+    let told = failure(
+        second
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+
+    // A first action under a window this connection never issued has no claim to answer for and is
+    // refused for its window, as it always was.
+    let mut third = client(&host).await;
+    let fresh = composed(
+        &mut third,
+        host.environment_id,
+        Method::ProjectInit,
+        ActionId::new(kr_ipc::new_uuid()),
+        &ProjectInitParams {
+            destination: host.destination("fresh"),
+            label: "fresh".to_owned(),
+            initial_branch: Nullable::null(),
+        },
+    )
+    .await;
+    let refused = failure(
+        second
+            .repeat(&fresh)
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        !host.work().join("fresh").exists(),
+        "the refused first action made nothing"
+    );
+
+    // The remote lets go. The clone ends, its connection is told what came of it, and the repeat
+    // is then given the record the first attempt left.
+    release.send(()).expect("the remote is waiting");
+    let (_first, ended) = running.await.expect("the clone ran");
+    let ended = failure(ended.expect("the call reaches the daemon"));
+    let settled = failure(
+        second
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(settled.code, ended.code, "{settled:?} against {ended:?}");
+    assert_eq!(settled.message, ended.message);
+    remote.join().expect("the remote ends");
+    let _ = host.stop().await;
+}
+
+/// KR-REQ-09.09: a repeat that carries no window this connection issued, whose claim the journal
+/// cannot be read for where the door asks after it, is told that what became of the action is not
+/// known. The door cannot tell a first action from a repeat of one that ran, so it tells both the
+/// same, and nothing is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
+async fn a_repeat_with_no_usable_window_whose_claim_cannot_be_read_is_told_the_outcome_is_unknown()
+{
+    let host = host().await;
+    let mut first = client(&host).await;
+    let original = composed(
+        &mut first,
+        host.environment_id,
+        Method::ProjectInit,
+        ActionId::new(kr_ipc::new_uuid()),
+        &ProjectInitParams {
+            destination: host.destination("made"),
+            label: "made".to_owned(),
+            initial_branch: Nullable::null(),
+        },
+    )
+    .await;
+    let mut second = client(&host).await;
+    let journal = beside_the_journal(&host);
+
+    // The door has looked for a record and found none; the journal then cannot be read where the
+    // window refuses the repeat and the door asks after its claim.
+    let (arrived, go) = host.controller.pause_retained_lookup();
+    let sending = tokio::spawn(async move {
+        let told = second.repeat(&original).await;
+        (second, told)
+    });
+    arrived.await.expect("the repeat has looked for a record");
+    the_records_cannot_be_read(&journal);
+    let _ = go.send(());
+    let (_second, told) = sending.await.expect("the repeat ran");
+    the_records_can_be_read_again(&journal);
+    let told = failure(told.expect("the call reaches the daemon"));
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    assert!(
+        !host.work().join("made").exists(),
+        "nothing was made for a repeat with no usable window"
+    );
+    let _ = host.stop().await;
+}

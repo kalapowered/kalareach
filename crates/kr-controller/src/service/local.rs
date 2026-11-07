@@ -1015,6 +1015,29 @@ impl Controller {
                     }
                 }
             }
+            // And for an exact repeat of a project action whose claim is open: its first attempt
+            // may still be carrying the action out, and a refusal about a window says nothing was
+            // done. The repeat is told what the service holds for its action, which for an open
+            // claim is that the outcome is not known yet. An action with no claim is a first
+            // admission, and is refused for its window.
+            Err(error @ ControllerError::WindowExpired { .. })
+                if crate::project::ProjectModule::serves(method) =>
+            {
+                let Some(held) = self.project.held_answer(actor_id, &mutation, method).await else {
+                    return DoorReply::Refused(ControlFrame::Response(Response {
+                        request_id: mutation.request_id,
+                        outcome: Outcome::Error(error.to_protocol_error()),
+                    }));
+                };
+                if let Err(error) = self.check_retained_answer(connection_id, admitted) {
+                    return DoorReply::Refused(error_reply(
+                        mutation.request_id,
+                        error.code(),
+                        error.to_string(),
+                    ));
+                }
+                return DoorReply::Answered(held);
+            }
             Err(error) => {
                 return DoorReply::Refused(ControlFrame::Response(Response {
                     request_id: mutation.request_id,
