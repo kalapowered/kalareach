@@ -3572,8 +3572,10 @@ window is told the same when the daemon cannot read whether its claim is open. A
 project action repeated with no usable window, because the window is one this connection never
 issued or one that has expired on it, is told what its journal holds for the action:
 `OUTCOME_UNKNOWN` while its claim is open, because the attempt that wrote the claim may still be
-carrying the action out, as a long `project.clone` does; and the recorded answer once that attempt
-has settled the claim. Where the journal holds no claim, the door refuses the window only if no other
+carrying the action out, as a long `project.clone` does, or may have ended without recording what it
+did, and the host cannot tell which. The answer says that, and does not promise a later one: asking
+again gives the record once a running attempt has settled the claim, and an attempt that ended
+unrecorded leaves none. A repeat that finds the claim settled is given the recorded answer. Where the journal holds no claim, the door refuses the window only if no other
 arrival holds the action. A copy that arrives while the first attempt has been admitted and has not
 yet written its claim is told `OUTCOME_UNKNOWN`, because that attempt goes on to carry the action
 out; a transfer action repeated with no usable window is told the same in that case. At the network

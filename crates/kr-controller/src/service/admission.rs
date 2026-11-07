@@ -1339,6 +1339,9 @@ impl Controller {
                 mutation.requested_ttl_ms,
                 authority,
             )
+            // A window that no longer admits anything on the connection that issued it is refused
+            // as one that another connection issued is, so a repeat on the same connection can
+            // meet this too.
             .map_err(|refusal| ControllerError::WindowExpired {
                 detail: window_refusal_detail(refusal).to_owned(),
             })
