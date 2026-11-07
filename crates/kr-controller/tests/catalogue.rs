@@ -1534,19 +1534,22 @@ fn a_catalogue_mutation_names_an_environment_and_never_a_session() {
 /// wherever the entry classes the method as a write; a new trust root is always confirmed by the
 /// owner, and a catalogue sync only where it would enlarge trust.
 ///
-/// For 23.28 the part shown is the `host.manage` requirement of the catalogue's writes and the
-/// owner's confirmation of a new root: the case holds `catalogue.add`, `catalogue.sync`,
-/// `catalogue.pin` and `catalogue.remove` to be writes. For 23.29 it is the `host.manage`
-/// requirement of the changing plugin methods: the case holds `plugin.install`, `plugin.remove`,
-/// `plugin.pin`, `plugin.enable`, `plugin.disable` and `plugin.grant` to be writes. Not shown here:
-/// `host.manage` on a read such as `catalogue.list`, the repository's root, generation and
+/// For 23.28 the part shown is the `host.manage` requirement of the catalogue's writes, always
+/// required and not conditional, and the owner's confirmation: always for a new root, and for
+/// `catalogue.sync` only where it would enlarge authority (`WhenEnlargingAuthority`). The case
+/// holds `catalogue.add`, `catalogue.sync`, `catalogue.pin` and `catalogue.remove` to be writes.
+/// For 23.29 it is the `host.manage` requirement of the changing plugin methods, always required:
+/// the case holds `plugin.install`, `plugin.remove`, `plugin.pin`, `plugin.enable`,
+/// `plugin.disable` and `plugin.grant` to be writes. Not shown here: `host.manage` on a read such
+/// as `catalogue.list`, what makes a sync enlarge authority, the repository's root, generation and
 /// budget, the package hash, repository ceiling, environment and binding checks, or scoped read
 /// authority for capability queries.
 #[test]
 fn kr_req_23_28_and_23_29_every_method_has_one_exhaustive_authority_entry() {
     use kr_protocol::actor::ActorIngress;
     use kr_protocol::authority::{
-        AuthorityDecision, ConfirmationRequirement, EffectClass, RequiredAuthority,
+        AuthorityDecision, ConfirmationRequirement, EffectClass, RequiredAuthority, RequiredRight,
+        RightCondition,
     };
     use kr_protocol::method::{MethodGroup, decide};
     use kr_protocol::rights::ActionRight;
@@ -1579,12 +1582,15 @@ fn kr_req_23_28_and_23_29_every_method_has_one_exhaustive_authority_entry() {
         if listed.effect == EffectClass::Write {
             assert!(
                 listed.required_rights.iter().any(|required| matches!(
-                    required.authority,
-                    RequiredAuthority::Right {
-                        right: ActionRight::HostManage
+                    required,
+                    RequiredRight {
+                        authority: RequiredAuthority::Right {
+                            right: ActionRight::HostManage
+                        },
+                        when: RightCondition::Always,
                     }
                 )),
-                "{} changes something without host.manage",
+                "{} changes something without always requiring host.manage",
                 entry.name
             );
         }
