@@ -1632,12 +1632,18 @@ async fn earlier_cancellation(
             crate::output::closed_word(&receipt.state)
         )));
     }
-    crate::report::say(&shown!(
+    if !crate::report::shown_before_going_on(&shown!(
         "The earlier cancellation, action {}, stands at revision {} with an outcome the worker \
          could not establish. This sends a new action that names it.",
         earlier,
         receipt.revision
-    ));
+    )) {
+        return Err(CliError::Other(shown!(
+            "the earlier cancellation, action {}, could not be shown on standard error, so \
+             nothing is sent: a later cancellation names a result the person was shown",
+            earlier
+        )));
+    }
     Ok(answers::Quote {
         action_id: earlier,
         revision: receipt.revision.get(),

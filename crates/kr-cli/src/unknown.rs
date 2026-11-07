@@ -1,8 +1,9 @@
 //! A mutation whose outcome the host did not establish, as the command that sent it says so.
 //!
 //! A command sends each mutation once, under an identifier it makes for that intent. When the
-//! connection ends after the request may have been written, or the host answers that it cannot say
-//! what became of the action, the command does not know whether the action was performed and does
+//! connection ends after the request may have been written, the host's answer cannot be read, or the
+//! host answers that it cannot say what became of the action, the command does not know whether the
+//! action was performed and does
 //! not send it again, under that identifier or a new one: a later request is the person's, and has
 //! to be made in sight of the earlier result. So the command ends with `OUTCOME_UNKNOWN`, names the
 //! action and says where the person reads what the host holds of it.
@@ -68,8 +69,8 @@ impl ReadBack {
 
 /// Why the command does not know what became of its request.
 pub enum Cause<'a> {
-    /// The connection failed after the request was composed, and the request may have been written
-    /// before it did.
+    /// The exchange with the host failed after the request was composed, and the request may have
+    /// been written before it did.
     Connection,
     /// The host answered, and the answer could not be read.
     Unreadable,
@@ -84,8 +85,8 @@ impl Unknown {
     pub fn ended(&self, action: ActionId, cause: Cause<'_>) -> CliError {
         let cause = match cause {
             Cause::Connection => shown!(
-                "the connection failed after the request for {} was composed, and the request may \
-                 have reached the host, so whether it performed it is not known",
+                "the exchange with the host failed after the request for {} was composed, and the \
+                 request may have reached the host, so whether it performed it is not known",
                 self.what
             ),
             Cause::Unreadable => shown!(
@@ -105,10 +106,7 @@ impl Unknown {
                 command.clone(),
                 action
             ),
-            None => Shown::said(
-                "this command makes no later request: what the host holds of it shows whether it \
-                 happened",
-            ),
+            None => Shown::said("this command makes no later request"),
         };
         CliError::Unfinished {
             code: ErrorCode::OutcomeUnknown,
