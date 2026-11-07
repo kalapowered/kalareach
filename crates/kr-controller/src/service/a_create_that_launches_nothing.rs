@@ -463,11 +463,13 @@ async fn a_create_asked_again_whose_launch_failed_is_told_so_though_the_host_can
 
 /// KR-REQ-09.09: a create asked again whose worker is not in the directory and whose session has
 /// no closure is told what the host knows. Where the reservation shows that the launch produced no
-/// worker, the session does not exist and the create is refused as ever. Where the first attempt
-/// has not yet asked for a worker, it may still make the session, and where a worker was asked
-/// for, or ran, whether the session was made and what it came to is not known: both are told that.
-/// A `claimed` reservation is not among the phases here: a daemon looks for its worker again before
-/// it answers, which is a different path.
+/// worker, the session does not exist and the create is refused as ever: a reservation that failed
+/// or was fenced before any worker claimed it handed nobody a launch specification. Where the first
+/// attempt has not yet asked for a worker, it may still make the session, and where a worker was
+/// asked for, or ran, whether the session was made and what it came to is not known: both are told
+/// that. A `claimed` reservation is not among the phases here: a daemon looks for its worker again
+/// before it answers, which is a different path. A fenced reservation that a worker did claim is
+/// told as unknown too, for that worker was given its specification and may have started a shell.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_create_asked_again_whose_worker_is_gone_is_told_what_the_reservation_shows() {
     let (temp, controller, request, carried, actor_id) =
@@ -482,7 +484,7 @@ async fn a_create_asked_again_whose_worker_is_gone_is_told_what_the_reservation_
         ("reserved", ErrorCode::OutcomeUnknown),
         ("spawned", ErrorCode::OutcomeUnknown),
         ("live", ErrorCode::OutcomeUnknown),
-        ("fenced", ErrorCode::OutcomeUnknown),
+        ("fenced", ErrorCode::ResourceUnavailable),
         ("closed", ErrorCode::OutcomeUnknown),
     ] {
         registry
@@ -495,6 +497,25 @@ async fn a_create_asked_again_whose_worker_is_gone_is_told_what_the_reservation_
             .expect_err("a worker that is gone leaves no session to answer with");
         assert_eq!(told.code(), owed, "a reservation {phase}: {told}");
     }
+
+    // The control: a worker that claimed the reservation was given its launch specification, so a
+    // fenced reservation it claimed is not shown to have made no session.
+    registry
+        .execute(
+            "UPDATE reservations SET phase = 'fenced', claimed_key = zeroblob(32)",
+            [],
+        )
+        .expect("a worker claimed the reservation before it was fenced");
+    let told = controller
+        .session_create(&actor_id, &request, carried)
+        .await
+        .into_answer()
+        .expect_err("a worker that is gone leaves no session to answer with");
+    assert_eq!(
+        told.code(),
+        ErrorCode::OutcomeUnknown,
+        "a fenced reservation a worker claimed: {told}"
+    );
 }
 
 /// Creates a session on a daemon whose reading of its host has been made short by `shorten`, and
