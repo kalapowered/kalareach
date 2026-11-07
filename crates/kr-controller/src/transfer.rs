@@ -105,6 +105,11 @@ pub struct TransferModule {
     /// is what refuses it. Compiled only with the `testing` feature.
     #[cfg(feature = "testing")]
     after_the_outer_check: Arc<crate::attention::Pause>,
+    /// The point a repeat that arrived with no usable window stops at once the claim of its action
+    /// has been asked about, before it looks for the record. Compiled only with the `testing`
+    /// feature.
+    #[cfg(feature = "testing")]
+    after_the_claim_is_asked_about: Arc<crate::attention::Pause>,
     /// The point a worker's read of a draft stops at once the transfer service has answered it,
     /// before the answer is written. Compiled only with the `testing` feature.
     #[cfg(feature = "testing")]
@@ -376,6 +381,8 @@ impl TransferModule {
             #[cfg(feature = "testing")]
             after_the_outer_check: Arc::new(crate::attention::Pause::default()),
             #[cfg(feature = "testing")]
+            after_the_claim_is_asked_about: Arc::new(crate::attention::Pause::default()),
+            #[cfg(feature = "testing")]
             after_a_read: Arc::new(crate::attention::Pause::default()),
             #[cfg(feature = "testing")]
             before_a_claim: Arc::new(crate::attention::Pause::default()),
@@ -397,6 +404,19 @@ impl TransferModule {
         std::sync::mpsc::SyncSender<()>,
     ) {
         self.after_the_outer_check.arm()
+    }
+
+    /// Arms the pause a repeat that arrived with no usable window stops at once the claim of its
+    /// action has been asked about, before it looks for the record. Returns the end that says it
+    /// has arrived, and the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_the_claim_is_asked_about(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.after_the_claim_is_asked_about.arm()
     }
 
     /// Arms the pause a worker's read of a draft stops at once the transfer service has answered
@@ -647,10 +667,24 @@ impl TransferModule {
         let actor = actor_id.clone();
         let action_id = mutation.action_id.get();
         let name = method.as_str();
-        let open =
-            blocking(move || Ok(service.claim_is_open(&actor, action_id, name, digest)?)).await;
-        if open == Ok(true) {
-            return Settling::Open;
+        #[cfg(feature = "testing")]
+        let after_the_claim_is_asked_about = Arc::clone(&self.after_the_claim_is_asked_about);
+        let open = blocking(move || {
+            let open = service.claim_is_open(&actor, action_id, name, digest);
+            #[cfg(feature = "testing")]
+            after_the_claim_is_asked_about.wait();
+            open.map_err(|error| {
+                ControllerError::found_unreadable_on_the_wire(error.into(), RECORDS)
+            })
+        })
+        .await;
+        match open {
+            Ok(true) => return Settling::Open,
+            Ok(false) => {}
+            // A claim that cannot be read is not one that is not open: the second look for the
+            // record gives nothing for an open claim, and the repeat would be refused for its
+            // window, which says nothing was done.
+            Err(error) => return Settling::Answered(frame(mutation.request_id, Err(error))),
         }
         match self.retained(actor_id, mutation, method).await {
             Some(answer) => Settling::Answered(answer),
