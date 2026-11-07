@@ -1633,17 +1633,19 @@ fn x25519_secret_of(seed: &[u8]) -> Vec<u8> {
 }
 
 /// KR-REQ-20.17, the companion's own outputs only: the kit saved as text, the kit saved as a QR
-/// code, the offline export of the bundle and the bundle itself, opened with the kit alone, hold none
-/// of the private keys this computer keeps in the secure store beside the recovery seed: the
-/// reusable endpoint (transport) key, the control-signing (authorisation) key, and the stored
-/// envelope and notification preview keys with the private keys made from their seeds. Every text the
-/// page was sent is read as well. Each key is looked for as bytes, in hexadecimal of either case, in
-/// either base64 alphabet wherever it lies in a longer value, and as a list of numbers. The controls
-/// are the scan finding a seed in each of those forms, and the kit's own seed in the kit file and in
-/// what the QR code scans back to, so that the scan reads what the outputs hold. Not shown here: an
-/// export of an archive, which adds no byte to the ciphertext the service holds (the library's
-/// export cases); a key in a binary list of integers, split, reversed or otherwise transformed; or
-/// the other data paths of backup and recovery material.
+/// code (the file and what a scanner reads from it), the offline export of the bundle, the setup
+/// the computer sends a host it covers and the bundle itself, opened with the kit alone once it
+/// names the host, hold none of the private keys this computer keeps in the secure store beside the
+/// recovery seed: the reusable endpoint (transport) key, the control-signing (authorisation) key,
+/// and the stored envelope and notification preview keys with the private keys made from their
+/// seeds. Every text the page was sent is read as well. Each key is looked for as bytes, in
+/// hexadecimal of either case, in either base64 alphabet wherever it lies in a longer value, and as
+/// a list of numbers. The controls are the scan finding a seed in each of those forms, the kit's own
+/// seed in the kit file and in what the QR code scans back to, the kit's fingerprint in the setup
+/// and the host's public keys in the bundle, so that the scan reads what the outputs hold. Not shown
+/// here: an export of an archive, which adds no byte to the ciphertext the service holds (the
+/// library's export cases); a key in a binary list of integers, split, reversed or otherwise
+/// transformed; or the other data paths of backup and recovery material.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_computer_keeps() {
     use kr_crypto::store::{SecretName, SecretStore as _};
@@ -1695,6 +1697,19 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
     // export of the bundle, the bundle opened with the kit alone, and what the page was told.
     let (kit_path, kit) = page.kit(out.path());
     let kit_file = std::fs::read(&kit_path).expect("the kit file");
+
+    // The host on this computer is covered, which sends it the setup and names its writer and
+    // producer in the bundle: the outputs below are read after that.
+    let host = Host::new(&computer, computer.served.origin());
+    host.sets_up();
+    page.recovery
+        .cover_host(&page.account, &host, false)
+        .await
+        .expect("the host is covered");
+    let sent = host.setups_sent();
+    assert_eq!(sent.len(), 1, "the host was sent one setup");
+    let setup = serde_json::to_vec(&sent[0].0).expect("the setup encodes");
+
     let qr = out.path().join("kit.svg");
     page.dialog_returns(&qr);
     page.call(
@@ -1702,7 +1717,8 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
         json!({ "path": qr.to_string_lossy() }),
     )
     .expect("the QR code is saved");
-    let (_, scanned_text, _) = scanned(&std::fs::read_to_string(&qr).expect("the file"));
+    let qr_file = std::fs::read(&qr).expect("the file");
+    let (_, scanned_text, _) = scanned(&String::from_utf8(qr_file.clone()).expect("an SVG"));
     let export = out.path().join("bundle.krexport");
     page.dialog_returns(&export);
     page.call(
@@ -1716,8 +1732,10 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
     let told = page.told().into_bytes();
     let outputs = [
         ("the kit file", kit_file.clone()),
+        ("the QR code file", qr_file),
         ("the QR code's text", scanned_text.clone().into_bytes()),
         ("the offline export", export_file),
+        ("the setup the host was sent", setup.clone()),
         ("the bundle opened with the kit", bundle.clone()),
         ("what the page was told", told),
     ];
@@ -1778,8 +1796,12 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
         "the scan does not read what the QR code holds"
     );
     assert!(
-        String::from_utf8_lossy(&bundle).contains("trusted_writers"),
-        "the scan does not read the bundle"
+        carried_in(&setup, sent[0].0.kit_fingerprint.as_bytes()).is_some(),
+        "the scan does not read the setup the host was sent"
+    );
+    assert!(
+        carried_in(&bundle, host.keys.writer_public_key.as_bytes()).is_some(),
+        "the scan does not read the host's keys in the bundle"
     );
 
     for (output, bytes) in &outputs {
