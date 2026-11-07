@@ -278,9 +278,9 @@ export function attemptWords(attempt: AttemptView, nowMs: number): string {
   switch (attempt.outcome) {
     case 'happened':
       return attempt.kind === 'revoke'
-        ? `${label}: done. Whether each session worker has stopped acting under it is not known.`
+        ? `${label}: the host has recorded it. Whether each session worker has stopped acting under it is not known.`
         : attempt.kind === 'transfer'
-          ? `${label}: done. Whether each session worker has stopped acting under the old access is not known.`
+          ? `${label}: the host has recorded it. Whether each session worker has stopped acting under the old access is not known.`
           : `${label}: done.`
     case 'not_done':
       return `${label}: it did not happen, as far as the host shows, and it cannot now. It is safe to try again.`

@@ -45,10 +45,22 @@ describe('what the page keeps of a result', () => {
     expect(desk.firstTime('action-1')).toBe(false)
     expect(desk.firstTime('action-2')).toBe(true)
 
-    desk.keepRevocation('grant-1', 'Sam', 1_000, '7', { sessions: ['session-a', 'session-b'], cut: false })
-    desk.checked('grant-1', { sessions: ['session-b'], cut: false })
+    desk.keepRevocation('grant-1', 'Sam', 1_000, '7', {
+      sessions: ['session-a', 'session-b'],
+      confirmed: [],
+      cut: false
+    })
+    desk.checked('grant-1', { sessions: ['session-b'], confirmed: ['session-a'], cut: false })
     expect(desk.snapshot().revoked).toEqual([
-      { grantId: 'grant-1', name: 'Sam', atMs: 1_000, revision: '7', waiting: ['session-b'], cut: false }
+      {
+        grantId: 'grant-1',
+        name: 'Sam',
+        atMs: 1_000,
+        revision: '7',
+        waiting: ['session-b'],
+        confirmed: ['session-a'],
+        cut: false
+      }
     ])
   })
 
@@ -59,7 +71,7 @@ describe('what the page keeps of a result', () => {
       told += 1
     })
     const before = desk.snapshot()
-    desk.keepRevocation('grant-1', 'Sam', 1_000, '7', { sessions: [], cut: false })
+    desk.keepRevocation('grant-1', 'Sam', 1_000, '7', { sessions: [], confirmed: [], cut: false })
     expect(told).toBe(1)
     expect(desk.snapshot()).not.toBe(before)
     stop()
@@ -80,12 +92,14 @@ describe('the session workers a revocation still waits for', () => {
       }
     } as unknown as Parameters<typeof waitingOn>[0]
     const waiting = waitingOn(answer)
-    expect(waiting).toEqual({ sessions: ['session-a'], cut: true })
+    expect(waiting).toEqual({ sessions: ['session-a'], confirmed: [], cut: true })
     expect(workersHave(waiting.sessions.length, waiting.cut)).toBe('at least 1 session worker has')
     expect(workersHave(2, false)).toBe('2 session workers have')
   })
 
-  it('names every worker that has not confirmed, and none that has', () => {
+  // KR-REQ-18.14, each worker: the page keeps which sessions' workers have confirmed as well as which
+  // have not, so the person is told each worker's completion and not only the ones still owed.
+  it('names every worker that has not confirmed and every one that has', () => {
     const answer = {
       barrier: {
         authority_revision: '6',
@@ -97,6 +111,10 @@ describe('the session workers a revocation still waits for', () => {
         workers_total: '3'
       }
     } as unknown as Parameters<typeof waitingOn>[0]
-    expect(waitingOn(answer)).toEqual({ sessions: ['session-a', 'session-c'], cut: false })
+    expect(waitingOn(answer)).toEqual({
+      sessions: ['session-a', 'session-c'],
+      confirmed: ['session-b'],
+      cut: false
+    })
   })
 })
