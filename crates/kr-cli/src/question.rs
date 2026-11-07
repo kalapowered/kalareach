@@ -1536,12 +1536,20 @@ impl QuestionHost for Workers {
 
 /// Cancels one question.
 ///
+/// The cancellation is sent once. When its outcome is not established, the command ends as
+/// [`crate::unknown::Unknown::ended`] says and sends nothing more. A later cancellation is made only
+/// by `after_unknown`, the person's own request that names the earlier action: the command reads
+/// that action's receipt from the worker, shows it, refuses unless it is a cancellation of unknown
+/// outcome, and sends a new action that names it and the revision shown.
+///
 /// # Errors
 ///
-/// As [`answer`].
+/// As [`answer`], and a usage failure when `after_unknown` does not name a cancellation whose
+/// outcome the worker could not establish.
 pub async fn cancel(
     paths: &HostPaths,
     question_id: QuestionId,
+    after_unknown: Option<ActionId>,
     build_id: BuildId,
 ) -> Result<Question> {
     let (descriptor, question, mut client) = locate(paths, question_id, build_id).await?;
@@ -1550,18 +1558,90 @@ pub async fn cancel(
         descriptor.session_id,
     )
     .map_err(CliError::Refused)?;
-    let result: QuestionResolveResult = mutate(
+    let quote = match after_unknown {
+        Some(earlier) => Some(earlier_cancellation(&mut client, earlier).await?),
+        None => None,
+    };
+    let unknown = crate::unknown::Unknown {
+        what: "the cancellation",
+        read_back: crate::unknown::ReadBack::of(shown!("{}", descriptor.session_id), None),
+        later: Some(shown!("kr question cancel {}", question_id)),
+    };
+    let result: QuestionResolveResult = crate::unknown::mutate_naming(
         &mut client,
-        &descriptor,
         Method::QuestionCancel,
+        crate::attach::target(&descriptor),
         &QuestionCancelParams {
             session_id: descriptor.session_id,
             question_id,
             expected_revision: question.revision,
         },
+        quote,
+        &unknown,
     )
     .await?;
     shown(result)
+}
+
+/// Reads the receipt of the earlier cancellation a person names and shows it, which is also how the
+/// worker comes to hold that this caller was shown it at that revision, and returns what a later
+/// cancellation names.
+///
+/// # Errors
+///
+/// Returns a usage failure when the action is not a cancellation of unknown outcome, and the
+/// worker's refusal when it holds no such action.
+async fn earlier_cancellation(
+    client: &mut LocalClient,
+    earlier: ActionId,
+) -> Result<answers::Quote> {
+    use kr_protocol::method::MethodName;
+    use kr_protocol::receipt::ReceiptState;
+
+    let outcome = client
+        .request(
+            Method::ActionRead,
+            &ActionReadParams {
+                action_id: earlier,
+                session_id: None,
+            },
+        )
+        .await?;
+    let read: ActionReadResult =
+        outcome
+            .map_err(CliError::Refused)?
+            .to_typed()
+            .map_err(|error| {
+                CliError::Other(shown!(
+                    "the worker's answer could not be read: {}",
+                    Shown::cbor(&error)
+                ))
+            })?;
+    let receipt = read.receipt;
+    if receipt.method != MethodName::from(Method::QuestionCancel) {
+        return Err(CliError::Usage(shown!(
+            "action {} is not a cancellation of a question, so a later cancellation cannot name it",
+            earlier
+        )));
+    }
+    if receipt.state != ReceiptState::Unknown {
+        return Err(CliError::Usage(shown!(
+            "action {} is {}, and not an outcome the worker could not establish, so nothing is \
+             sent: a cancellation is not made again for it",
+            earlier,
+            crate::output::closed_word(&receipt.state)
+        )));
+    }
+    crate::report::say(&shown!(
+        "The earlier cancellation, action {}, stands at revision {} with an outcome the worker \
+         could not establish. This sends a new action that names it.",
+        earlier,
+        receipt.revision
+    ));
+    Ok(answers::Quote {
+        action_id: earlier,
+        revision: receipt.revision.get(),
+    })
 }
 
 /// The question a resolution shows, which the host shows this command whole: it answers as the
@@ -2003,31 +2083,6 @@ async fn read<T: kr_protocol::wire::WireMessage>(
     params: &QuestionReadParams,
 ) -> Result<T> {
     let outcome = client.request(Method::QuestionRead, params).await?;
-    outcome
-        .map_err(CliError::Refused)?
-        .to_typed()
-        .map_err(|error| {
-            CliError::Other(shown!(
-                "the host's answer could not be read: {}",
-                Shown::cbor(&error)
-            ))
-        })
-}
-
-async fn mutate<P, T>(
-    client: &mut LocalClient,
-    descriptor: &WorkerDescriptor,
-    method: Method,
-    params: &P,
-) -> Result<T>
-where
-    P: serde::Serialize + ?Sized,
-    T: kr_protocol::wire::WireMessage,
-{
-    let action_id = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
-    let outcome = client
-        .mutate(method, action_id, crate::attach::target(descriptor), params)
-        .await?;
     outcome
         .map_err(CliError::Refused)?
         .to_typed()
