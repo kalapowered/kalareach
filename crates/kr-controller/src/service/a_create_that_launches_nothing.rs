@@ -2130,6 +2130,52 @@ async fn a_create_that_started_nothing_and_cannot_write_that_it_failed_still_tel
     }
 }
 
+/// KR-REQ-09.09: a repeat that read the reservation while the first attempt was still under way, and
+/// is answered after that attempt settled it as failed, is told that the launch failed. What it
+/// read is older than the answer it owes: the registry shows the failure now, and a repeat told that
+/// the attempt is still under way, or that what became of the session is not known, would be told
+/// what is no longer so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_that_read_the_reservation_before_it_was_settled_is_told_the_launch_failed() {
+    let (temp, controller, _asked) = daemon().await;
+    let environment_id = temp.environment_id();
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let request = create_request(environment_id);
+    let carried = carried(&controller, connection_id, half_a_minute(&controller));
+    controller
+        .place_lookup_panics
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    controller
+        .session_create(&actor_id, &request, carried)
+        .await
+        .into_answer()
+        .expect_err("a create whose look at where the session starts is lost starts nothing");
+    let settled = controller
+        .registry
+        .lock()
+        .await
+        .reservation_for_token(&actor_id, request.action_id.get())
+        .expect("reads the token")
+        .expect("the first attempt reserved the token");
+    assert_eq!(settled.phase, LaunchPhase::Failed);
+
+    for read_then in [LaunchPhase::Reserved, LaunchPhase::Spawned] {
+        let stale = crate::registry::Reservation {
+            phase: read_then,
+            ..settled.clone()
+        };
+        let told = controller
+            .replay_create(&stale)
+            .await
+            .expect_err("a create that started nothing leaves no session to answer with");
+        assert_eq!(
+            told.code(),
+            ErrorCode::ResourceUnavailable,
+            "read as {read_then:?}: {told}"
+        );
+    }
+}
+
 /// KR-REQ-09.09: a create whose reservation cannot move to `spawned` has asked for no worker, and
 /// settles the reservation as failed, so that it stops occupying the environment and a repeat is
 /// told that the launch failed and not that the first attempt is still under way.
