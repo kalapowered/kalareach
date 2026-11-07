@@ -491,7 +491,10 @@ async fn run(cli: Cli) -> Result<Completion> {
                                     session_id: descriptor.session_id,
                                 },
                                 None,
-                                &close_unknown(shown!("{}", descriptor.session_id), wanted),
+                                &close_unknown(
+                                    shown!("{}", descriptor.session_id),
+                                    Some(known.environment_id),
+                                ),
                             )
                             .await?
                         }
@@ -510,7 +513,10 @@ async fn run(cli: Cli) -> Result<Completion> {
                                     session_id: descriptor.session_id,
                                 },
                                 None,
-                                &close_unknown(shown!("{}", descriptor.session_id), wanted),
+                                &close_unknown(
+                                    shown!("{}", descriptor.session_id),
+                                    Some(descriptor.environment_id),
+                                ),
                             )
                             .await?
                         }
