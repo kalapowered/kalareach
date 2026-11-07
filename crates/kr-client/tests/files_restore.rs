@@ -1610,11 +1610,14 @@ fn reread(export: &OfflineExport) -> Arc<ExportSource> {
 /// member name or content in the clear, and everything about it is checked on the way back: the
 /// kit's checksum, the bundle under the kit's key, the publication's signature and the manifest.
 ///
-/// KR-REQ-20.17, the export of an archive only: the file adds no byte to what the service holds. The
-/// bundle is the sealed bundle as stored, and the archive is the publication, the manifest object
-/// and every member object as stored, so what an export can carry of a reusable endpoint or control
-/// private key is what the archive carries, which the daemon's production case shows is none. Not
-/// shown here: the daemon's production, or the other data paths of backup and recovery material.
+/// KR-REQ-20.17, the export of an archive, in part: the sealed bundle in the file equals the one the
+/// service holds, the publication and the manifest object equal the service's, and each member
+/// object the file carries equals the bytes the service holds under its identifier, with as many
+/// member objects as the archive has. Not shown here: that each member object appears once (an
+/// object repeated while another is missing passes the count and the comparison of each), the
+/// file's format line, origin and archive identifier, what the archive itself carries (the daemon's
+/// production case reads the host's), the contents of the sealed bundle, or the other data paths of
+/// backup and recovery material.
 #[tokio::test]
 async fn an_archive_exports_as_one_file_that_restores_with_only_the_kit() {
     let world = World::new();

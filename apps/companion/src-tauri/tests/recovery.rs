@@ -1632,20 +1632,29 @@ fn x25519_secret_of(seed: &[u8]) -> Vec<u8> {
     sha2::Sha512::digest(seed)[..32].to_vec()
 }
 
-/// KR-REQ-20.17, the companion's own outputs only: the kit saved as text, the kit saved as a QR
-/// code (the file and what a scanner reads from it), the offline export of the bundle, the setup
-/// the computer sends a host it covers and the bundle itself, opened with the kit alone once it
-/// names the host, hold none of the private keys this computer keeps in the secure store beside the
-/// recovery seed: the reusable endpoint (transport) key, the control-signing (authorisation) key,
-/// and the stored envelope and notification preview keys with the private keys made from their
-/// seeds. Every text the page was sent is read as well. Each key is looked for as bytes, in
-/// hexadecimal of either case, in either base64 alphabet wherever it lies in a longer value, and as
-/// a list of numbers. The controls are the scan finding a seed in each of those forms, the kit's own
-/// seed in the kit file and in what the QR code scans back to, the kit's fingerprint in the setup
-/// and the host's public keys in the bundle, so that the scan reads what the outputs hold. Not shown
-/// here: an export of an archive, which adds no byte to the ciphertext the service holds (the
-/// library's export cases); a key in a binary list of integers, split, reversed or otherwise
-/// transformed; or the other data paths of backup and recovery material.
+/// KR-REQ-20.17, what this case reads of the companion's outputs and no more: the kit file saved as
+/// text; the QR code file and the text a scanner reads from it; the offline export file of the
+/// bundle alone (`archive: null`), as bytes; the setup a host double is sent when the computer
+/// covers it, as the JSON of its parameters; the bundle as the service holds it, opened with the kit
+/// alone once the host is covered (so it names the host's public keys); and the answers to the
+/// commands the page was called with in this case. None of them holds a private key this computer
+/// keeps in the secure store beside the recovery seed: the reusable endpoint (transport) key, the
+/// control-signing (authorisation) key, and the stored envelope and notification preview keys with
+/// the private keys made from their seeds. Each key is looked for as bytes, in hexadecimal of either
+/// case, in either base64 alphabet wherever it lies in a longer value, and as a list of numbers. The
+/// controls that can fail are the scan finding a seed in each of those forms, the kit's seed line in
+/// what the QR code scans back to, the kit's fingerprint in the setup and the host's writer key in
+/// the bundle; the control on the kit file cuts its line from the file itself, so it shows only that
+/// the scan runs over the file's text. Not shown here: the sealed bundle inside the export file and
+/// the one inside the setup, which are scanned as ciphertext only (the case does not open them or
+/// compare them with the service's copy, as `the_bundle_exports_alone_as_a_private_file_of_ciphertext`
+/// compares the export's); the export of an archive, which this case does not make (it exports
+/// `archive: null`; the library's export case reads the file for an archive); the answer of
+/// `cover_host`, which is called directly and so is not among the page's answers; that the derived
+/// private keys are the keys of the pairs (the host's case in the controller's suite checks the
+/// derivation against the public key); a key in a binary list of integers, split, reversed or
+/// otherwise transformed; `kr backup setup`'s outputs; or the other data paths of backup and
+/// recovery material.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_computer_keeps() {
     use kr_crypto::store::{SecretName, SecretStore as _};
@@ -1787,6 +1796,8 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
         .lines()
         .find_map(|line| line.strip_prefix("seed: "))
         .expect("a seed line");
+    // The line is cut from the kit file itself, so this shows only that the scan runs over the
+    // file's text; the code's control below takes the same line from another output.
     assert!(
         carried_in(kit_text.as_bytes(), seed_line.as_bytes()).is_some(),
         "the scan does not read the kit file"

@@ -4168,13 +4168,16 @@ async fn a_collection_key_is_neither_backed_up_nor_restored() {
 
 /// KR-REQ-20.17, the settings part, the import only: an import refuses a member the archive calls
 /// a reusable endpoint (transport) private key, a control-signing (authorisation) private key or a
-/// revoked grant, with the table's reason and before it reads a byte of the member, and puts
-/// nothing back; the settings the archive does carry come back. Each name is offered twice: with
-/// the device's real seeds, kept in a secret store as the product keeps them, and with the real
-/// settings the archive carries, which an import that read the member would put back. Not shown
-/// here: that an export holds none of those keys, which holds because it reads one settings object
-/// from the sync store and no secret store, so no assertion here could fail for it; the other data
-/// paths of backup and recovery material; or a grant that has not been revoked.
+/// revoked grant, with a reason for the named material (the case asserts the refusal names it and
+/// gives a reason, not the reason's wording, which `the_material_table_refuses_a_reusable_key_and_a_revoked_grant`
+/// in `recovery.rs` reads) and before it reads a byte of the member, and puts nothing back; the
+/// settings the archive does carry come back. Each name is offered twice: with the device's real
+/// seeds, kept in a secret store as the product keeps them, and with the real settings the archive
+/// carries, which an import that read the member would put back. Not shown here: that an export
+/// holds none of those keys, which holds because it reads one settings object from the sync store
+/// and no secret store, so no assertion here could fail for it; what the archive producer
+/// (`SettingsArchive`) puts in its bundle, descriptor and manifest, which no case scans for keys;
+/// the other data paths of backup and recovery material; or a grant that has not been revoked.
 #[tokio::test]
 async fn an_import_refuses_an_endpoint_key_a_control_key_and_a_revoked_grant() {
     let world = World::default();
