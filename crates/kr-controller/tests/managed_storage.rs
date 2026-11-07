@@ -3908,6 +3908,113 @@ async fn the_host_makes_a_backup_of_a_closed_session_and_its_configuration_once_
     );
 }
 
+/// Whether `needle` is in `haystack` as it is, in lower-case hexadecimal or in base64url, which
+/// are the ways a document of the host's could carry a key.
+fn is_carried_in(haystack: &[u8], needle: &[u8]) -> bool {
+    let hex: String = needle.iter().map(|byte| format!("{byte:02x}")).collect();
+    [
+        needle.to_vec(),
+        hex.into_bytes(),
+        kr_protocol::scalars::to_base64url(needle).into_bytes(),
+    ]
+    .iter()
+    .any(|form| haystack.windows(form.len()).any(|window| window == form))
+}
+
+/// KR-REQ-20.17, the host's own backup production only: a generation the daemon makes holds the
+/// members the convention names, each of a kind the material table lets a backup carry, and none
+/// holds a private key this host keeps: not its transport (endpoint) key, its authorisation
+/// (control-signing) key, its stored-envelope key, its notification-preview key or its backup
+/// writer's key, whether as the bytes, in hexadecimal or in base64url. The control is the session's
+/// own output, which the same scan finds in the session's member in the one encoding that member
+/// uses, so the scan reads what the members hold. Not shown here: that a restore refuses a member
+/// under a reserved name or a revoked grant, which the restore cases show, or the other data
+/// paths of backup and recovery material.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_generation_the_host_makes_holds_none_of_the_private_keys_the_host_keeps() {
+    use kr_crypto::backup::{Material, may_back_up, member_material};
+    use kr_protocol::pairing::KeyPurpose;
+
+    let timer = HeldTimer::held();
+    let mut closed = None;
+    let rig = Rig::start_with(Arrangement::NORMAL, Arc::clone(&timer), |host| {
+        closed = Some(closed_session(
+            host,
+            b"first line\r\nsecond line\r\n",
+            9_000,
+        ));
+    })
+    .await;
+    let session = closed.expect("a closed session");
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.set_up();
+    rig.until("the first generation is published", |rig| rig.published(1))
+        .await;
+    let members = opened_members(&rig, 1);
+
+    // Every member is of a kind the table lets a backup carry.
+    for name in members.keys() {
+        let material = member_material(name).expect("a name the convention knows");
+        assert!(
+            matches!(
+                material,
+                Material::SessionData | Material::DeviceConfiguration
+            ) && may_back_up(material).is_allowed(),
+            "{name} is {material:?}, which a backup does not carry"
+        );
+    }
+
+    // The private keys the host keeps, read from the secret store the daemon wrote them to.
+    let store =
+        open_store_in(&rig.host.environment().secrets_dir()).expect("the daemon's secret store");
+    let scope = kr_controller::service::net::device_key_scope(rig.host.environment_id());
+    let mut kept = Vec::new();
+    for purpose in [
+        KeyPurpose::Transport,
+        KeyPurpose::Authorisation,
+        KeyPurpose::StoredEnvelope,
+        KeyPurpose::NotificationPreview,
+    ] {
+        let name = kr_crypto::store::SecretName::device_key(&scope, purpose).expect("a name");
+        let seed = store
+            .store
+            .get(&name)
+            .expect("the store reads")
+            .unwrap_or_else(|| panic!("the daemon kept a {purpose:?} key"));
+        kept.push((format!("{purpose:?}"), seed.expose().to_vec()));
+    }
+    let writer = kr_crypto::store::SecretName::backup_writer(&scope).expect("a name");
+    kept.push((
+        "backup writer".to_owned(),
+        store
+            .store
+            .get(&writer)
+            .expect("the store reads")
+            .expect("the daemon kept a backup writer key")
+            .expose()
+            .to_vec(),
+    ));
+    for (name, seed) in &kept {
+        assert!(seed.len() >= 32, "the {name} key is a seed, not a stub");
+    }
+
+    // The control: the scan finds what a member does hold, in the encoding the member uses.
+    let output = b"first line\r\nsecond line\r\n";
+    assert!(
+        is_carried_in(&members[&format!("sessions/{session}.json")], output),
+        "the scan does not read the session's member"
+    );
+    for (member, plaintext) in &members {
+        for (key, seed) in &kept {
+            assert!(
+                !is_carried_in(plaintext, seed),
+                "{member} holds the {key} private key the host keeps"
+            );
+        }
+    }
+}
+
 /// A journal of an earlier build for a closed session, at the schema that build wrote: with the
 /// session's own record in it, or with none where `with_the_session` is false.
 fn journal_of_an_earlier_build(
