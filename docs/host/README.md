@@ -5409,7 +5409,9 @@ Content-history retention, description inference, sync production and backup pro
 prospectively, together. What this host holds itself is removed with them: the retained output goes,
 the spool with it, and the content a settled receipt carries (the intent envelope the caller sent
 and the result the action produced) is taken out of the journal while the receipt's own metadata
-stays, its error message with it (the last list in this section says so). A receipt that has *not* settled keeps its envelope, because recovery reads it and a retry of
+stays, its error message with it (the last list in this section says so). The semantic history each
+agent instance keeps in the worker goes too, and none is recorded while privacy mode is on; what is kept after
+it is turned off begins at that moment, and a reader that asks for earlier history is told there is a gap. A receipt that has *not* settled keeps its envelope, because recovery reads it and a retry of
 an action this host may already have performed is answered from it. It loses its content in the
 transaction that settles it. That transaction reads the journal's own privacy record, and while the
 record says privacy mode is on, a receipt that settles or is rejected is committed without its

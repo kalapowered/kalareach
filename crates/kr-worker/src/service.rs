@@ -4717,6 +4717,8 @@ impl WorkerService {
         let generation = crate::privacy::PrivacyGeneration::new(notice.generation.get());
         let held = self.runtime.session().privacy();
         let mut attention = self.attention_privacy();
+        let mut semantic =
+            crate::broker::semantic::SemanticPrivacy::over(Arc::clone(self.broker()));
         let applied = if !notice.enabled {
             off_the_executor(|| {
                 self.runtime
@@ -4729,7 +4731,13 @@ impl WorkerService {
             off_the_executor(|| {
                 self.runtime
                     .session()
-                    .enable_privacy(generation, &mut [&mut attention])
+                    .enable_privacy(
+                        generation,
+                        &mut [
+                            &mut attention as &mut dyn crate::privacy::PrivacySubsystem,
+                            &mut semantic,
+                        ],
+                    )
                     .map(|_| ())
             })
         } else {
@@ -4737,7 +4745,13 @@ impl WorkerService {
             let enabled = off_the_executor(|| {
                 self.runtime
                     .session()
-                    .enable_privacy(generation, &mut [&mut attention])
+                    .enable_privacy(
+                        generation,
+                        &mut [
+                            &mut attention as &mut dyn crate::privacy::PrivacySubsystem,
+                            &mut semantic,
+                        ],
+                    )
                     .map(|_| ())
             });
             transition.settle().await;
@@ -4747,7 +4761,10 @@ impl WorkerService {
             return failure(RequestId::new(0), &error.to_protocol_error());
         }
         let session = self.runtime.session();
-        let completion = session.reconcile_privacy(&[&attention]);
+        let completion = session.reconcile_privacy(&[
+            &attention as &dyn crate::privacy::PrivacySubsystem,
+            &semantic,
+        ]);
         let privacy = session.privacy();
         let session_id = session.id();
         drop(session);
