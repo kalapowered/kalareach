@@ -220,9 +220,44 @@ impl PrivateTempDir {
     }
 }
 
+/// How long the removal of a [`PrivateTempDir`] is tried again while it is refused.
+const REMOVAL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
+
 impl Drop for PrivateTempDir {
+    /// Removes the directory and what is in it.
+    ///
+    /// On Windows a file that a thread or a process still holds open without sharing refuses the
+    /// removal of the folder it is in, and the holder is usually something that is ending and lets
+    /// go in a moment: a task that was aborted and has not been cancelled yet, a thread that is
+    /// joining. So the removal is tried again for as long as it is refused, and for no longer than
+    /// [`REMOVAL_PATIENCE`], and what is still there at the end is said on the error output, outside
+    /// what a test's capture keeps. It does not fail the case: this directory is made by the suites
+    /// of every platform, and a case that has a holder to wait for, as a host that waits for its
+    /// daemon's lock does, fails on a tree that is left. Elsewhere a refusal is a permission, which
+    /// time does not change, so the removal is tried once.
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        use std::io::Write as _;
+
+        let begun = std::time::Instant::now();
+        loop {
+            match std::fs::remove_dir_all(&self.root) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) if cfg!(windows) && begun.elapsed() < REMOVAL_PATIENCE => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "{} is still there {:?} after its removal was first tried, and the removal \
+                         is refused: {error}",
+                        self.root.display(),
+                        begun.elapsed()
+                    );
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -582,6 +617,38 @@ mod tests {
             std::fs::read(first.path().join("kept")).expect("the file is still there"),
             b"the first owner's"
         );
+    }
+
+    /// A directory whose removal is refused is removed again, and goes once the file that refused it
+    /// is let go of: a file held open without sharing, as a task that is ending holds one. The
+    /// holder lets go when the removal has reached it, which is when the files that precede it in
+    /// the folder are gone, so that nothing here waits for a time.
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_whose_removal_is_refused_is_removed_when_the_file_is_let_go_of() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let place = PrivateTempDir::create();
+        let root = place.path().to_path_buf();
+        let before = root.join("a-file-that-precedes-it");
+        std::fs::write(&before, b"removed first").expect("a file that is removed without trouble");
+        let held = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .share_mode(0)
+            .open(root.join("store.db"))
+            .expect("a file held open without sharing");
+        let holder = std::thread::spawn(move || {
+            while before.exists() {
+                std::thread::yield_now();
+            }
+            drop(held);
+        });
+
+        drop(place);
+
+        holder.join().expect("the holder ended");
+        assert!(!root.exists(), "{} is left", root.display());
     }
 
     /// The address the tests name as unanswered refuses a connection. A machine that answers there
