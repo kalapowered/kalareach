@@ -119,16 +119,19 @@ jobs:
       # the macOS job's seven archives answered 504 for a minute each, and its report ran without
       # them. The archives are kept in the Actions cache under the lock that pins them, so a night
       # does not fetch what an earlier one did. The fetch checks each archive it finds against its
-      # pin and fetches again what does not match, so the cache costs a fetch at worst. The cache
-      # is saved by the default branch's runs only, and only by one that holds every archive.
+      # pin and fetches again what does not match, and a cache step that fails or runs out of its
+      # time does not fail the job, so the cache costs a fetch at worst. The cache is saved by the
+      # default branch's runs only, and only by one that holds every archive, whether or not its
+      # report passed.
       - name: Restore the applications' archives
         id: applications
         if: ${{ inputs.groups == '' || contains(inputs.groups, 'applications') }}
+        continue-on-error: true
         timeout-minutes: 2
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/kalareach/conformance-applications/archives
-          key: conformance-applications-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/conformance/applications.lock') }}
+          key: conformance-applications-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/conformance/applications.lock', 'scripts/run-conformance.sh') }}
           restore-keys: conformance-applications-${{ runner.os }}-${{ runner.arch }}-
 
       # Every group this platform runs, the applications fetched and built from the pins in
@@ -157,12 +160,13 @@ jobs:
           fi
 
       - name: Save the applications' archives
-        if: ${{ steps.applications-held.outputs.held == 'true' }}
+        if: ${{ !cancelled() && steps.applications-held.outputs.held == 'true' }}
+        continue-on-error: true
         timeout-minutes: 2
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/kalareach/conformance-applications/archives
-          key: conformance-applications-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/conformance/applications.lock') }}
+          key: conformance-applications-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/conformance/applications.lock', 'scripts/run-conformance.sh') }}
 
       - name: Keep the result and the evidence
         if: ${{ !cancelled() }}
@@ -315,15 +319,16 @@ jobs:
       - name: Restore the applications' archives
         id: applications
         if: ${{ inputs.groups == '' || contains(inputs.groups, 'applications') }}
+        continue-on-error: true
         timeout-minutes: 2
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/Library/Caches/kalareach/conformance-applications/archives
-          key: conformance-applications-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/conformance/applications.lock') }}
+          key: conformance-applications-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/conformance/applications.lock', 'scripts/run-conformance.sh') }}
           restore-keys: conformance-applications-${{ runner.os }}-${{ runner.arch }}-
 
       # The step runs every group of the platform one after the other, and it grows with the
-      # suites. It took 206 to 239 minutes on the eight nights of 30 October to 7 November that it
+      # suites. It took 207 to 239 minutes on the eight nights of 30 October to 7 November that it
       # finished, and it ran into its former limit of 240 minutes on the nights of 3 and 9 November,
       # in its last step. Taking the steps a night did not reach at the pace of the steps it did,
       # those two nights needed about 246 and 244 minutes, and 8 November, whose steps ran 14
@@ -356,12 +361,13 @@ jobs:
           fi
 
       - name: Save the applications' archives
-        if: ${{ steps.applications-held.outputs.held == 'true' }}
+        if: ${{ !cancelled() && steps.applications-held.outputs.held == 'true' }}
+        continue-on-error: true
         timeout-minutes: 2
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/Library/Caches/kalareach/conformance-applications/archives
-          key: conformance-applications-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/conformance/applications.lock') }}
+          key: conformance-applications-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/conformance/applications.lock', 'scripts/run-conformance.sh') }}
 
       - name: What the disk has left
         if: ${{ !cancelled() }}
