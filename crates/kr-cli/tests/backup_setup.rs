@@ -951,7 +951,7 @@ fn host_private_keys(rig: &Rig) -> Vec<(String, Vec<u8>)> {
 /// what was shown and sent. Not shown here: a key in a binary list of integers, split, reversed or
 /// otherwise transformed; the files of the host, which hold the keys themselves in the secret
 /// store; the parts of a request the stand-in does not keep (its headers other than the token, a
-/// query on its path, the signature block beyond the body); the daemon's later requests (the
+/// query on its path, the signature block, any member of the signed document other than its body, and the authentication requests, which the stand-in answers before it keeps a record); the daemon's later requests (the
 /// backups it makes), which the production case reads; or the other data paths of backup and
 /// recovery material.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

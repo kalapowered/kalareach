@@ -1853,7 +1853,9 @@ async fn publish_generation(
 /// the host really makes carries (the daemon's production case reads the host's, and the members
 /// here are the case's own); the host's private keys, which this computer never holds; the parts of
 /// a request the stand-in does not keep (its headers other than the token, a query on its path, the
-/// signature block beyond the body); a key in a binary list of integers, split, reversed or
+/// signature block, any member of the signed document other than its body, and the
+/// authentication requests, which the stand-in answers before it keeps a record); a key in a
+/// binary list of integers, split, reversed or
 /// otherwise transformed; `kr backup setup`'s outputs; or the other data paths of backup and
 /// recovery material. The view is sent through a command this suite registers over the host double
 /// and not through `recovery_cover_host`, which needs a connection to a host this suite has none of.
