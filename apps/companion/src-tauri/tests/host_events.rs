@@ -16,14 +16,16 @@
 //! null.
 //!
 //! It opens a real window, so it has its own main thread (`harness = false`) and runs on macOS,
-//! where the Mac lists run it, and on Windows, in WebView2. Linux runs the same publisher without
-//! this check.
+//! where the Mac lists run it, on Windows, in WebView2, and on Linux, in WebKitGTK. A Linux host
+//! with no display gets one from an `Xvfb` the check starts (see `virtual_display`); a host with
+//! neither stands down with a printed reason, unless `KR_REQUIRE_VIRTUAL_DISPLAY` is set, which
+//! makes that a failure.
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 fn main() {
     println!(
-        "host_events: the runtime check runs on macOS and Windows; the payload's unit test holds \
-         the form here"
+        "host_events: the runtime check runs on macOS, Windows and Linux; the payload's unit test \
+         holds the form here"
     );
 }
 
@@ -32,10 +34,35 @@ fn main() {
     std::process::exit(window::run());
 }
 
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "linux")]
+fn main() {
+    use virtual_display::Hosted;
+
+    let code = match virtual_display::hosted() {
+        Hosted::Here => window::run(),
+        Hosted::Ended(code) => code,
+        Hosted::StandsDown(why) => {
+            println!(
+                "host_events: the runtime check stands down, because {why}; the payload's unit \
+                 test holds the form here"
+            );
+            0
+        }
+        Hosted::Failed(why) => {
+            eprintln!("host_events: {why}");
+            1
+        }
+    };
+    std::process::exit(code);
+}
+
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 mod scripted_worker;
 
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "linux")]
+mod virtual_display;
+
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 mod window {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
