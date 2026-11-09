@@ -5527,7 +5527,7 @@ async fn an_unknown_outcome_survives_the_application_ending() {
     assert!(actions_read(&phone).is_empty(), "nothing was asked");
     assert_eq!(
         actions_sent(&phone),
-        [action.clone()],
+        std::slice::from_ref(&action),
         "nothing was registered"
     );
 
@@ -5537,7 +5537,7 @@ async fn an_unknown_outcome_survives_the_application_ending() {
         .enable(&reference, Some(&action))
         .expect("the person asks");
     states_until(&restarted.desk, |states| states == [PushState::On]).await;
-    assert_eq!(actions_read(&phone), [action.clone()]);
+    assert_eq!(actions_read(&phone), std::slice::from_ref(&action));
     assert_eq!(actions_sent(&phone).len(), 2, "registered again");
 }
 
