@@ -78,6 +78,7 @@ function call(over: Partial<RunningCall> = {}): RunningCall {
     delegations: [],
     requests: [],
     admissionMeans: ADMISSION_MEANS,
+    problems: [],
     ...over
   }
 }

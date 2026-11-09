@@ -104,6 +104,7 @@ struct State {
     refuse_all: Option<u16>,
     silent: bool,
     provider_down: bool,
+    thinking_limit: Option<usize>,
     swallow_then_drop: bool,
     accept_then_drop: bool,
     drop_unread: bool,
@@ -181,6 +182,7 @@ impl ControlRoute {
                 refuse_all: None,
                 silent: false,
                 provider_down: false,
+                thinking_limit: None,
                 swallow_then_drop: false,
                 accept_then_drop: false,
                 drop_unread: false,
@@ -282,6 +284,13 @@ impl ControlRoute {
     /// Refuses requests as the service does while its channel to the provider is down.
     pub fn provider_down(&self, down: bool) {
         self.edit(|state| state.provider_down = down);
+    }
+
+    /// Takes `limit` `thinking` requests and refuses the ones after them as the service does while
+    /// its channel to the provider is down, and every other request as it would. `None` takes them
+    /// all.
+    pub fn refuse_thinking_after(&self, limit: Option<usize>) {
+        self.edit(|state| state.thinking_limit = limit);
     }
 
     /// Sends the next request on to the provider and drops the connection without answering it.
@@ -711,7 +720,18 @@ fn answer(shared: &Shared, text: &str) -> (Vec<Value>, bool) {
             false,
         );
     }
-    if state.provider_down {
+    let thinking_taken = state
+        .report
+        .sent
+        .iter()
+        .filter(|sent| sent.command == "thinking")
+        .count();
+    if state.provider_down
+        || (command == "thinking"
+            && state
+                .thinking_limit
+                .is_some_and(|limit| thinking_taken >= limit))
+    {
         return (vec![refuse(&mut state, id, "metering_unavailable")], false);
     }
     state.rate.push_back(now);

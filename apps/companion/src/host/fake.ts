@@ -113,6 +113,7 @@ import type {
   VoiceEnded,
   VoiceFence,
   VoiceOwed,
+  VoiceProblem,
   VoiceScope,
   VoiceStartRequest,
   Written
@@ -769,8 +770,8 @@ export interface FakeHostControls {
   finaliseVoice(finalising: boolean): void
   /** Sets whether the host the call belongs to is reached: `reachable` or `lost`. */
   setVoiceHost(host: 'reachable' | 'lost'): void
-  /** Sets the warning a person is told before starting, or none. */
-  setVoiceWarning(words: string | null): void
+  /** Sets the problems the call met, which the screen shows on the call and after it. */
+  setVoiceProblems(problems: readonly VoiceProblem[]): void
   /** Leaves something owed at the host, until the moment the call would have closed. */
   oweVoice(owed: Partial<VoiceOwed>): void
   /** Settles every revocation owed, as the device does when the host it owed it revokes the grant. */
@@ -1296,7 +1297,7 @@ export function fakeHost(
     settingUp: false,
     ending: false,
     ended: null,
-    warning: null,
+    problems: [],
     owed: [],
     finalising: false,
     brokerReachable: seed.brokerReachable,
@@ -3709,8 +3710,8 @@ export function fakeHost(
     setVoiceHost(host) {
       voice.host = host
     },
-    setVoiceWarning(words) {
-      voice.warning = words
+    setVoiceProblems(problems) {
+      voice.problems = problems
     },
     oweVoice(owed) {
       oweRevocation(owed)
@@ -3864,7 +3865,7 @@ interface VoiceState {
   /** How the last call ended. */
   ended: VoiceEnded | null
   /** What a person is told before starting. */
-  warning: string | null
+  problems: readonly VoiceProblem[]
   /** What this device could not finish, which the host may still hold open. */
   owed: VoiceOwed[]
   /** Whether a call that ended has still to say what the voice service did about it. */
@@ -3921,7 +3922,7 @@ function voiceCallState(voice: VoiceState): VoiceCallState {
   // What has lapsed is forgotten, as the device forgets it.
   const left = {
     ended: voice.ended,
-    warning: voice.warning,
+    problems: voice.problems,
     owed: voice.owed.filter((owed) => owed.until_ms > Date.now()),
     finalising: voice.finalising
   }

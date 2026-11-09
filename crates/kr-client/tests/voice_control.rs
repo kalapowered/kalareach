@@ -175,7 +175,7 @@ impl VoiceControl {
     async fn send_call_start_context(
         &self,
         selection: &VoiceContextSelection,
-    ) -> Result<usize, SendError> {
+    ) -> kr_client::services::voice_control::OpeningContextSent {
         within(
             "the opening context",
             self.0.send_call_start_context(selection),
@@ -1536,10 +1536,10 @@ async fn the_calls_opening_context_goes_as_thinking_within_the_bound_and_inside_
     attached(&mut news).await;
     let selection = selection(20);
 
-    let accepted = control
-        .send_call_start_context(&selection)
-        .await
-        .expect("the opening context is accepted");
+    let sent = control.send_call_start_context(&selection).await;
+    assert_eq!(sent.stopped_by, None, "the opening context is accepted");
+    let accepted = sent.accepted;
+    assert_eq!(sent.total, accepted);
 
     let report = route.report();
     assert_eq!(accepted, report.sent.len());
@@ -1581,6 +1581,10 @@ async fn an_opening_context_larger_than_a_call_may_carry_is_refused_whole() {
 
     let refused = control.send_call_start_context(&selection(2000)).await;
 
-    assert!(matches!(refused, Err(SendError::Invalid(_))), "{refused:?}");
+    assert!(
+        matches!(refused.stopped_by, Some(SendError::Invalid(_))),
+        "{refused:?}"
+    );
+    assert_eq!(refused.accepted, 0);
     assert_eq!(contexts(&route), 0, "none of it was sent");
 }

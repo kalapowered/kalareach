@@ -20,6 +20,7 @@ import {
   closureWords,
   endedWords,
   owedWords,
+  problemWords,
   requestedSeconds,
   runningCallFrom,
   serviceWords,
@@ -109,7 +110,7 @@ export function VoiceRoute({
   const [waitingForHost, setWaitingForHost] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
   /**
-   * What this device last said while it held no call: the warning before a start, what an earlier
+   * What this device last said while it held no call: the problems the last call met, what an earlier
    * call left the host to hold open, and, for a call that ended while no screen was looking, how.
    */
   const [left, setLeft] = useState<VoiceCallState | null>(null)
@@ -424,7 +425,7 @@ export function VoiceRoute({
     for (const owed of left?.owed ?? []) lines.push(owedWords(owed))
     const service = left?.ended ? serviceWords(left.ended) : null
     if (service !== null) lines.push(service)
-    if (left?.warning) lines.push(left.warning)
+    for (const words of problemWords(left?.problems ?? [])) lines.push(words)
     return lines
   }, [endedBefore, left])
 
@@ -601,7 +602,7 @@ export function VoiceRoute({
                 session: null,
                 ended: null,
                 delegations: [],
-                warning: null,
+                problems: [],
                 owed: [],
                 finalising: false
               })

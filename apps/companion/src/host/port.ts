@@ -1096,8 +1096,12 @@ export interface VoiceCallState {
   readonly ended: VoiceEnded | null
   /** The delegations the provider announced, and what this version did with each. */
   readonly delegations: readonly VoiceDelegationRow[]
-  /** What a person is told before starting, from what the last call showed. */
-  readonly warning: string | null
+  /**
+   * What the call met that a person is told, each problem once, from the moment it was met until
+   * another call begins: the screen shows them on the running call, and after it for the person who
+   * starts the next. This is native code's own state for the screen, not a kept type.
+   */
+  readonly problems: readonly VoiceProblem[]
   /**
    * What this device could not finish and the host may still hold open, until the moment the call
    * would have closed. It outlives the call that left it.
@@ -1109,6 +1113,24 @@ export interface VoiceCallState {
    * has since ended, and a screen keeps reading.
    */
   readonly finalising: boolean
+}
+
+/** What kind of problem a call met. */
+export type VoiceProblemKind = 'opening_context' | 'host_path' | 'no_such_call'
+
+/** A problem a call met, in words for a person. */
+export interface VoiceProblem {
+  /**
+   * `opening_context` when the call was not given all of the host's context as its opening context
+   * (the host did not give it, the voice service took part of it, or the call ended first);
+   * `host_path` when the host answered and would not say the call is still its own; `no_such_call`
+   * when the last call found that the voice service has no such call for this account.
+   */
+  readonly kind: VoiceProblemKind
+  /** What a person is told. */
+  readonly words: string
+  /** Whether what it says no longer holds: the host that would not vouch for the call answered since. */
+  readonly over: boolean
 }
 
 /** What the host did about the end of a call, kept apart from what happened on this device. */

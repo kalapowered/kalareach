@@ -667,29 +667,40 @@ impl VoiceControl {
     /// Section 15 ¶9. The selection is project text: it goes as `thinking`, which the model may
     /// use without speaking it, under a first line that says it is data and not instructions, and
     /// is cut at line breaks where it can be into appends of at most [`VOICE_CONTEXT_BYTES`]
-    /// bytes. The control paces them. Returns how many were accepted; the first request that is
-    /// not accepted stops it, so a call can be given a part of its context. The owner calls this
-    /// when the control first attaches.
-    ///
-    /// # Errors
-    ///
-    /// Returns the error of the first request that did not go through, or [`SendError::Invalid`]
-    /// when the selection is larger than a call's opening context may be.
+    /// bytes. The control paces them. The first request that is not accepted stops it, so a call
+    /// can be given a part of its context: the answer says how many appends the service took out
+    /// of how many, and why the next did not go. The owner calls this when the control first
+    /// attaches.
     pub async fn send_call_start_context(
         &self,
         selection: &VoiceContextSelection,
-    ) -> std::result::Result<usize, SendError> {
+    ) -> OpeningContextSent {
         let appends = call_start_appends(selection);
-        if appends.len() > MAX_START_APPENDS {
-            return Err(SendError::Invalid(Shown::said(
-                "the selected context is larger than a call's opening context may be",
-            )));
+        let total = appends.len();
+        if total > MAX_START_APPENDS {
+            // Nothing is sent of a selection larger than a call's opening context may be.
+            return OpeningContextSent {
+                accepted: 0,
+                total,
+                stopped_by: Some(SendError::Invalid(Shown::said(
+                    "the selected context is larger than a call's opening context may be",
+                ))),
+            };
         }
-        for append in &appends {
-            self.send(VoiceCommand::Thinking, None, Some(append))
-                .await?;
+        for (accepted, append) in appends.iter().enumerate() {
+            if let Err(error) = self.send(VoiceCommand::Thinking, None, Some(append)).await {
+                return OpeningContextSent {
+                    accepted,
+                    total,
+                    stopped_by: Some(error),
+                };
+            }
         }
-        Ok(appends.len())
+        OpeningContextSent {
+            accepted: total,
+            total,
+            stopped_by: None,
+        }
     }
 
     /// Closes the call and returns what the service finalised.
@@ -719,6 +730,17 @@ impl VoiceControl {
     pub fn stop(&self) {
         self.stop.notify_one();
     }
+}
+
+/// How much of a call's opening context the service took.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpeningContextSent {
+    /// How many appends the service accepted, from the first.
+    pub accepted: usize,
+    /// How many appends the selection came to.
+    pub total: usize,
+    /// Why the append after the last accepted one did not go through, when one did not.
+    pub stopped_by: Option<SendError>,
 }
 
 /* -------------------------------------------------------------------------- */

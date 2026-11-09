@@ -46,8 +46,9 @@ pub struct VoiceCallState {
     pub ended: Option<EndedView>,
     /// The delegations the provider announced, and what this version did with each.
     pub delegations: Vec<DelegationRow>,
-    /// What a person is told before starting, from what the last call showed.
-    pub warning: Option<String>,
+    /// What the call met that a person is told, each problem once, from the moment it was met until
+    /// another call begins: on the running call, and after it for the person who starts the next.
+    pub problems: Vec<CallProblem>,
     /// What this device could not finish and the host may still hold open, until the moment the
     /// call would have closed. It outlives the call that left it and the calls that follow.
     pub owed: Vec<OwedView>,
@@ -88,7 +89,7 @@ impl VoiceCallState {
             session: None,
             ended: None,
             delegations: Vec::new(),
-            warning: None,
+            problems: Vec::new(),
             owed: Vec::new(),
             owner: 0,
             finalising_owners: std::collections::BTreeSet::new(),
@@ -115,6 +116,38 @@ impl VoiceCallState {
         }
     }
 
+    /// Notes a problem the call met. A problem of the same kind that still stands is the same
+    /// problem, and says what is said of it now; one that is over, and every other kind, is kept
+    /// beside it.
+    pub fn meet(&mut self, kind: ProblemKind, words: String) {
+        if let Some(standing) = self
+            .problems
+            .iter_mut()
+            .find(|each| each.kind == kind && !each.over)
+        {
+            standing.words = words;
+            return;
+        }
+        if self.problems.len() >= MAX_PROBLEMS
+            && let Some(oldest) = self.problems.iter().position(|each| each.over)
+        {
+            self.problems.remove(oldest);
+        }
+        self.problems.push(CallProblem {
+            kind,
+            words,
+            over: false,
+        });
+    }
+
+    /// Says that what a problem of this kind said no longer holds. It stays in the record: the
+    /// call met it.
+    pub fn pass(&mut self, kind: ProblemKind) {
+        for each in self.problems.iter_mut().filter(|each| each.kind == kind) {
+            each.over = true;
+        }
+    }
+
     /// Notes something owed until its `until_ms`, and forgets what has lapsed by `now_ms`.
     ///
     /// Nothing that has not lapsed is dropped to make room: a grant the host may still hold open is
@@ -124,6 +157,35 @@ impl VoiceCallState {
         self.owed.retain(|each| each.until_ms > now_ms);
         self.owed.push(owed);
     }
+}
+
+/// The most problems a call's record keeps that are over. A problem that stands is never dropped
+/// to make room.
+const MAX_PROBLEMS: usize = 16;
+
+/// What kind of problem a call met.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProblemKind {
+    /// The call was not given all of the host's context as its opening context: the host did not
+    /// give it, the voice service took part of it, or the call ended before it was all given.
+    OpeningContext,
+    /// The host answered, but would not say that the call is still its own.
+    HostPath,
+    /// The last call found that the voice service has no such call for this account.
+    NoSuchCall,
+}
+
+/// A problem a call met, in words for a person.
+#[derive(Clone, Debug, Serialize)]
+pub struct CallProblem {
+    /// What kind of problem it is, which the screen branches on.
+    pub kind: ProblemKind,
+    /// What a person is told.
+    pub words: String,
+    /// Whether what it says no longer holds: the host that would not vouch for the call has
+    /// answered since.
+    pub over: bool,
 }
 
 /// Something this device could not finish, which the host may still hold open.
@@ -332,6 +394,54 @@ mod tests {
             host_name: "A host".to_owned(),
             host: None,
         }
+    }
+
+    /// Each problem a call met is kept: a later one of another kind is beside the first and does not
+    /// replace it, a refusal that is repeated is one problem, and one that has passed stays in the
+    /// record, so a refusal after the host answered again is a problem of its own.
+    #[test]
+    fn each_problem_a_call_met_is_kept_and_none_replaces_another() {
+        let mut state = VoiceCallState::no_call();
+        state.meet(ProblemKind::OpeningContext, "no context".to_owned());
+        state.meet(ProblemKind::HostPath, "would not vouch".to_owned());
+        state.meet(ProblemKind::HostPath, "would not vouch, again".to_owned());
+        let words = |state: &VoiceCallState| -> Vec<(ProblemKind, String, bool)> {
+            state
+                .problems
+                .iter()
+                .map(|each| (each.kind, each.words.clone(), each.over))
+                .collect()
+        };
+        assert_eq!(
+            words(&state),
+            [
+                (ProblemKind::OpeningContext, "no context".to_owned(), false),
+                (
+                    ProblemKind::HostPath,
+                    "would not vouch, again".to_owned(),
+                    false
+                ),
+            ]
+        );
+
+        state.pass(ProblemKind::HostPath);
+        state.meet(ProblemKind::HostPath, "would not vouch later".to_owned());
+        assert_eq!(
+            words(&state),
+            [
+                (ProblemKind::OpeningContext, "no context".to_owned(), false),
+                (
+                    ProblemKind::HostPath,
+                    "would not vouch, again".to_owned(),
+                    true
+                ),
+                (
+                    ProblemKind::HostPath,
+                    "would not vouch later".to_owned(),
+                    false
+                ),
+            ]
+        );
     }
 
     /// A grant the host may still hold open is told to the person until it ends by itself, however

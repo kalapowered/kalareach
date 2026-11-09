@@ -112,10 +112,16 @@ describe('before a call exists', () => {
   })
 
   // The device keeps what the last call left, and the screen shows it before another start: the
-  // warning from a service that had no such call, and a grant the host may still hold open.
-  it('shows the warning and what is owed before a start', async () => {
+  // problem of a service that had no such call, and a grant the host may still hold open.
+  it('shows the problems the last call met and what is owed before a start', async () => {
     start((controls) => {
-      controls.setVoiceWarning('The last call found that this voice service has no such call.')
+      controls.setVoiceProblems([
+        {
+          kind: 'no_such_call',
+          words: 'The last call found that this voice service has no such call.',
+          over: false
+        }
+      ])
       controls.oweVoice({ words: 'The host did not confirm that it withdrew the grant.' })
     })
     await waitForChoice()
@@ -304,6 +310,46 @@ describe('starting a call', () => {
 })
 
 describe('while a call is running', () => {
+  // The call's problems are the call's: each one is shown on the call while it runs, and not only
+  // once it has ended. A problem whose cause has passed says so and stays, beside the others.
+  it('shows each problem the call has met on the running call', async () => {
+    start((controls) => {
+      controls.holdAVoiceCall()
+      controls.setVoiceProblems([
+        {
+          kind: 'opening_context',
+          words:
+            'This call was given part of the host’s context for its session: the voice service took 1 of its 3 parts and not the next.',
+          over: false
+        },
+        {
+          kind: 'host_path',
+          words: 'The host answered but would not say the call is still its own: no such call.',
+          over: true
+        }
+      ])
+    })
+
+    const problems = await screen.findByTestId('voice-problems')
+
+    const lines = within(problems).getAllByRole('status')
+    expect(lines).toHaveLength(2)
+    expect(lines[0]).toHaveTextContent('took 1 of its 3 parts and not the next')
+    expect(lines[1]).toHaveTextContent('would not say the call is still its own')
+    expect(lines[1]).toHaveTextContent('This has passed.')
+    expect(lines[0]).not.toHaveTextContent('This has passed.')
+  })
+
+  it('shows no problems on a call that met none', async () => {
+    start((controls) => {
+      controls.holdAVoiceCall()
+    })
+
+    await screen.findByRole('heading', { name: 'Voice session' })
+
+    expect(screen.queryByTestId('voice-problems')).not.toBeInTheDocument()
+  })
+
   // KR-REQ-15.17: the mute the screen shows is the one the device reported back.
   it('mutes the microphone only once the device says it is muted', async () => {
     const person = userEvent.setup()

@@ -38,7 +38,9 @@ use tokio::sync::{mpsc, oneshot};
 pub use cause::Cause;
 pub use host::{AppReach, CallHost, HostReach, Pairing, Reaching};
 pub use kept::{Kept, KeptVoice};
-pub use view::{DelegationRow, EndedView, HostEnd, OwedView, VoiceCallState};
+pub use view::{
+    CallProblem, DelegationRow, EndedView, HostEnd, OwedView, ProblemKind, VoiceCallState,
+};
 
 use crate::error::{CommandError, Result};
 use crate::target::Subject;
@@ -1156,7 +1158,7 @@ impl Calls {
     }
 
     /// What the call is doing, and, when `note` is the host, account and service of a call that
-    /// found no such call, the warning a person is shown before starting another.
+    /// found no such call, the problem a person is shown before starting another.
     #[must_use]
     pub fn state(&self, note: Option<&NoteKey>) -> VoiceCallState {
         let Some(shared) = &self.shared else {
@@ -1186,11 +1188,9 @@ impl Calls {
             .lock()
             .expect("the note lock is not poisoned")
             .clone();
-        if state.warning.is_none()
-            && !state.running
-            && remembered.as_ref().is_some_and(|kept| Some(kept) == note)
-        {
-            state.warning = Some(
+        if !state.running && remembered.as_ref().is_some_and(|kept| Some(kept) == note) {
+            state.meet(
+                ProblemKind::NoSuchCall,
                 "The last call found that this voice service has no such call for this account. \
                  You can start another, and it may end the same way."
                     .to_owned(),
