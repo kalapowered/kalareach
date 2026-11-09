@@ -76,7 +76,15 @@ import {
   type OfferedRole
 } from '../model/sharing'
 import { deskOf } from '../model/sharing-desk'
-import { handedOver, invited, pendingWorkers, rechecked, tookBack, workersHave } from '../model/sharing-results'
+import {
+  handedOver,
+  invited,
+  pendingWorkers,
+  rechecked,
+  tookBack,
+  workersHave,
+  workersListed
+} from '../model/sharing-results'
 import { Transfer } from './Transfer'
 
 /** How often the list of who has access is read again while the screen is open. */
@@ -746,8 +754,8 @@ function SharingTab({
           >
             <span>
               {line.waiting.length > 0
-                ? `The revocation for ${nameWords(line.name)} is recorded at ${momentWords(line.atMs, now)} (authority revision ${line.revision}), and not done: ${workersHave(line.waiting.length, line.cut)} not confirmed yet (${line.waiting.map(sessionIdWords).join(', ')}).${line.confirmed.length > 0 ? ` ${line.cut ? 'Confirmed among those the host listed' : 'Confirmed'}: ${line.confirmed.map(sessionIdWords).join(', ')}.` : ''}`
-                : `Revoked ${nameWords(line.name)} at ${momentWords(line.atMs, now)} (authority revision ${line.revision}).`}
+                ? `The revocation for ${nameWords(line.name)} is recorded at ${momentWords(line.atMs, now)} (authority revision ${line.revision}), and not done: ${workersHave(line.waiting.length, line.cut)} not confirmed yet (${line.waiting.map(sessionIdWords).join(', ')}).${workersListed(line)}`
+                : `Revoked ${nameWords(line.name)} at ${momentWords(line.atMs, now)} (authority revision ${line.revision}).${workersListed(line)}`}
             </span>{' '}
             {line.waiting.length > 0 ? (
               <Button

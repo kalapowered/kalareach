@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest'
 import { EVERY_RIGHT, actionsOf } from '../src/host/fake-state'
 import { actionWords, visibly } from '../src/model/sharing'
 import { SharingDesk } from '../src/model/sharing-desk'
-import { waitingOn, workersHave } from '../src/model/sharing-results'
+import { waitingOn, workersHave, workersListed } from '../src/model/sharing-results'
 
 describe('what an invitation carries, in words', () => {
   it('has words for every right a share can carry, so no protocol name reaches the person', () => {
@@ -48,9 +48,15 @@ describe('what the page keeps of a result', () => {
     desk.keepRevocation('grant-1', 'Sam', 1_000, '7', {
       sessions: ['session-a', 'session-b'],
       confirmed: [],
+      ended: [],
       cut: false
     })
-    desk.checked('grant-1', { sessions: ['session-b'], confirmed: ['session-a'], cut: false })
+    desk.checked('grant-1', {
+      sessions: ['session-b'],
+      confirmed: ['session-a'],
+      ended: ['session-c'],
+      cut: false
+    })
     expect(desk.snapshot().revoked).toEqual([
       {
         grantId: 'grant-1',
@@ -59,6 +65,7 @@ describe('what the page keeps of a result', () => {
         revision: '7',
         waiting: ['session-b'],
         confirmed: ['session-a'],
+        ended: ['session-c'],
         cut: false
       }
     ])
@@ -71,7 +78,7 @@ describe('what the page keeps of a result', () => {
       told += 1
     })
     const before = desk.snapshot()
-    desk.keepRevocation('grant-1', 'Sam', 1_000, '7', { sessions: [], confirmed: [], cut: false })
+    desk.keepRevocation('grant-1', 'Sam', 1_000, '7', { sessions: [], confirmed: [], ended: [], cut: false })
     expect(told).toBe(1)
     expect(desk.snapshot()).not.toBe(before)
     stop()
@@ -92,7 +99,7 @@ describe('the session workers a revocation still waits for', () => {
       }
     } as unknown as Parameters<typeof waitingOn>[0]
     const waiting = waitingOn(answer)
-    expect(waiting).toEqual({ sessions: ['session-a'], confirmed: [], cut: true })
+    expect(waiting).toEqual({ sessions: ['session-a'], confirmed: [], ended: [], cut: true })
     expect(workersHave(waiting.sessions.length, waiting.cut)).toBe('at least 1 session worker has')
     expect(workersHave(2, false)).toBe('2 session workers have')
   })
@@ -114,7 +121,36 @@ describe('the session workers a revocation still waits for', () => {
     expect(waitingOn(answer)).toEqual({
       sessions: ['session-a', 'session-c'],
       confirmed: ['session-b'],
+      ended: [],
       cut: false
     })
+  })
+
+  // KR-REQ-18.14, each worker: a worker whose execution has ended confirmed nothing, so it is kept
+  // and worded as ended, not as confirmed; and the workers the host listed are said whether or not
+  // any is still owed.
+  it('names a worker that has ended as ended, and says each listed worker once none is owed', () => {
+    const answer = {
+      barrier: {
+        authority_revision: '6',
+        workers: [
+          { session_id: 'aaaaaaaa-0000', state: 'acknowledged' },
+          { session_id: 'bbbbbbbb-0000', state: 'ended' }
+        ],
+        workers_total: '2'
+      }
+    } as unknown as Parameters<typeof waitingOn>[0]
+    const waiting = waitingOn(answer)
+    expect(waiting).toEqual({
+      sessions: [],
+      confirmed: ['aaaaaaaa-0000'],
+      ended: ['bbbbbbbb-0000'],
+      cut: false
+    })
+    expect(workersListed(waiting)).toBe(' Confirmed: session aaaaaaaa. Ended: session bbbbbbbb.')
+    expect(workersListed({ confirmed: [], ended: [], cut: false })).toBe('')
+    expect(workersListed({ ...waiting, cut: true })).toBe(
+      ' Confirmed among those the host listed: session aaaaaaaa. Ended among those the host listed: session bbbbbbbb.'
+    )
   })
 })

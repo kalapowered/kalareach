@@ -1039,6 +1039,23 @@ export class ScriptedSharing implements FakeSharing {
   #revocation(summary: GrantSummary, alsoRevoked: readonly string[] = []): RevocationResult {
     const pending = this.#barrierHeld
     this.#barrierHeld = false
+    // The host lists the workers that have not confirmed first, then the ones that have. A worker
+    // whose execution has ended is listed as ended, and it did not confirm anything.
+    const worker = (
+      sessionId: string,
+      state: 'pending' | 'acknowledged' | 'ended'
+    ): RevocationResult['barrier']['workers'][number] => ({
+      acknowledged_revision: state === 'acknowledged' ? '6' : null,
+      detail: state === 'pending' ? 'the session has not acknowledged the revision yet' : '',
+      names_pending: state === 'pending' ? '1' : '0',
+      omitted_actions: '0',
+      possibly_executed: [],
+      possibly_executed_total: '0',
+      rejected_actions: [],
+      rejected_actions_total: '0',
+      session_id: sessionId,
+      state
+    })
     return {
       authority_revision: '6',
       revoked_grants: [...alsoRevoked, summary.grant.grant_id],
@@ -1046,35 +1063,9 @@ export class ScriptedSharing implements FakeSharing {
       barrier: {
         authority_revision: '6',
         workers: pending
-          ? [
-              {
-                acknowledged_revision: null,
-                detail: 'the session has not acknowledged the revision yet',
-                names_pending: '1',
-                omitted_actions: '0',
-                possibly_executed: [],
-                possibly_executed_total: '0',
-                rejected_actions: [],
-                rejected_actions_total: '0',
-                session_id: sessionOf(summary),
-                state: 'pending'
-              },
-              // The host lists the workers that have not confirmed first, then the ones that have.
-              {
-                acknowledged_revision: '6',
-                detail: '',
-                names_pending: '0',
-                omitted_actions: '0',
-                possibly_executed: [],
-                possibly_executed_total: '0',
-                rejected_actions: [],
-                rejected_actions_total: '0',
-                session_id: idOf('5d5d5d5d', 1),
-                state: 'acknowledged'
-              }
-            ]
-          : [],
-        workers_total: pending ? '2' : '0'
+          ? [worker(sessionOf(summary), 'pending'), worker(idOf('5d5d5d5d', 1), 'acknowledged')]
+          : [worker(sessionOf(summary), 'acknowledged'), worker(idOf('5d5d5d5d', 1), 'ended')],
+        workers_total: '2'
       }
     }
   }
