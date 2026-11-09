@@ -3944,7 +3944,7 @@ fn a_tree_whose_removal_is_refused_is_removed_when_the_file_is_let_go_of() {
     let root = place.path().join("tree");
     std::fs::create_dir(&root).expect("a tree");
     let held = std::fs::OpenOptions::new()
-        .create(true)
+        .create_new(true)
         .write(true)
         .share_mode(0)
         .open(root.join("store.db"))
