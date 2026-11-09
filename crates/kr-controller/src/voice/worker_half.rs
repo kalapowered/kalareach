@@ -13,10 +13,10 @@
 //! # Privacy mode
 //!
 //! While privacy mode is on nothing of this half is read. After it is turned off again only what
-//! was produced after the moment privacy mode last took effect is carried (`Published::since_ms`,
-//! which the privacy record keeps, so a restart carries on from the same moment): a worker of an
-//! earlier release keeps its history through the change, a decision can stay pending through it,
-//! and what a worker holds of the interval before is not for a call.
+//! was produced after the moment privacy mode last took effect, or after this daemon last
+//! started if that is later, is carried (`Published::since_ms`): a worker of an earlier release
+//! keeps its history through the change, a decision can stay pending through it, and what a worker
+//! holds of the interval before is not for a call.
 //!
 //! # What a decision is
 //!
@@ -40,9 +40,10 @@ pub const MAX_HISTORY_PARTS: usize = 64;
 /// The reason given when privacy mode is on.
 pub const PRIVACY_ON: &str = "privacy mode is on, so none of the session's worker was read";
 
-/// The reason given for what was produced before the moment the context may start from: the
-/// moment privacy mode last took effect.
-pub const BEFORE_PRIVACY_CHANGE: &str = "produced before privacy mode last changed";
+/// The reason given for what was produced before the moment the context may start from: privacy
+/// mode's last change, or this daemon's last start, whichever is later.
+pub const BEFORE_PRIVACY_CHANGE: &str =
+    "produced before privacy mode last changed or this daemon last started, whichever is later";
 
 /// What the daemon read of one session's worker for the default context.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

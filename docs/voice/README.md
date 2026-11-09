@@ -261,13 +261,9 @@ first two when it is turned on, and a worker removes its semantic history and re
 is on. The daemon reads none of them while it is on. After privacy mode is turned off the daemon
 carries only what was produced after the moment it took effect, because a worker of an earlier
 release keeps its history through the change and a decision can stay pending through it; what that
-keeps out is counted. The daemon takes that moment inside the record's own transaction, once it
-holds the privacy state, and the record keeps it. A restart therefore carries on from the same
-moment: what the worker produced after the change stays in a call, and what it produced before
-stays out. A record an earlier release wrote keeps the moment the change was asked for, which is
-earlier than the moment it took effect by as long as the change waited; the daemon reads it as it
-stands until privacy mode next changes, so what was produced while that change waited, in practice
-a decision that stayed pending, can be carried until then. A report a hook made over a connection admitted in privacy mode, or before
+keeps out is counted. The record keeps when a change was asked for and not when it took effect, so
+a daemon that starts over a host that has ever changed privacy mode carries only what is produced
+after its own start. A report a hook made over a connection admitted in privacy mode, or before
 privacy mode last changed, is not kept by the worker; a hook that started in privacy mode and
 connected after it ended is kept, because the platform's record of when a hook started is on a
 clock that has no reading of now to compare it with. If the privacy mode is turned on whilst the

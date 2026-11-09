@@ -835,12 +835,13 @@ async fn nothing_produced_before_privacy_mode_last_changed_is_carried_after_it()
     world.stop().await;
 }
 
-/// KR-REQ-15.20 and KR-REQ-24.27: a restart keeps the cutoff. The record holds the moment privacy
-/// mode took effect, and a daemon that starts over it carries what the worker produced after that
-/// moment, whenever the daemon started, and keeps out and counts what was produced before it, as
-/// the daemon before the restart did.
+/// KR-REQ-15.20 and KR-REQ-24.27: after a restart over a host that has changed privacy mode, the
+/// context carries only what is produced after the daemon's start. The record keeps the moment the
+/// last change was asked for, so what the worker produced between that moment and the start is
+/// kept out and counted with the boundary's reason, whatever the worker still holds, and what it
+/// produces after the start is carried.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_restart_keeps_the_moment_privacy_mode_took_effect_as_the_cutoff() {
+async fn a_restart_keeps_out_what_came_before_the_start_and_carries_what_comes_after() {
     let world = World::start().await;
     let agent = world.agent();
     world.worker().ask("before");
@@ -849,35 +850,60 @@ async fn a_restart_keeps_the_moment_privacy_mode_took_effect_as_the_cutoff() {
     world.adopted.set_privacy(false).await;
     let changed = world.privacy_changed_at().await;
 
-    // What a worker that kept its history through the change would still hold: an entry stamped
-    // before it. What the worker produces after the change is stamped after it, and before the
-    // restart.
+    // What the worker holds after the change and before the restart: an entry stamped before the
+    // change, which a worker that kept its history would still hold, and an entry and a decision
+    // stamped after it. The restart comes later than all of them.
     world.said(agent, "kept from before the change", changed - 1);
     world.said(agent, "after the change", changed + 1);
-    world.worker().ask_at("after", changed + 1);
+    world.worker().ask_at("between", changed + 1);
     until_the_clock_passes(changed + 1).await;
 
     let world = world.restarted().await;
     assert_eq!(
         world.privacy_changed_at().await,
         changed,
-        "the record still says when privacy mode took effect after the restart"
+        "the record keeps the moment the change was asked for, and a restart reads it back as it is"
     );
-    let result = world.context().await;
-    assert_eq!(
-        result.selection.recent_messages,
-        vec!["message: after the change".to_owned()],
-        "{result:?}"
-    );
-    assert_eq!(result.selection.pending_decisions.len(), 1, "{result:?}");
+    let before_the_start = world.context().await;
     assert!(
-        result.selection.pending_decisions[0].contains("(after)"),
-        "{result:?}"
+        before_the_start.selection.recent_messages.is_empty()
+            && before_the_start.selection.pending_decisions.is_empty(),
+        "{before_the_start:?}"
     );
     assert_eq!(
-        withheld(&result, kr_controller::voice::BEFORE_PRIVACY_CHANGE),
-        Some(2),
-        "the entry and the decision from before are counted: {result:?}"
+        withheld(
+            &before_the_start,
+            kr_controller::voice::BEFORE_PRIVACY_CHANGE
+        ),
+        Some(4),
+        "the two entries and the two decisions from before the start are counted: {before_the_start:?}"
+    );
+
+    let later = kr_ipc::now_ms().get() + 5;
+    world.said(agent, "after the start", later);
+    world.worker().ask_at("later", later);
+    let after_the_start = world.context().await;
+    assert_eq!(
+        after_the_start.selection.recent_messages,
+        vec!["message: after the start".to_owned()],
+        "{after_the_start:?}"
+    );
+    assert_eq!(
+        after_the_start.selection.pending_decisions.len(),
+        1,
+        "{after_the_start:?}"
+    );
+    assert!(
+        after_the_start.selection.pending_decisions[0].contains("(later)"),
+        "{after_the_start:?}"
+    );
+    assert_eq!(
+        withheld(
+            &after_the_start,
+            kr_controller::voice::BEFORE_PRIVACY_CHANGE
+        ),
+        Some(4),
+        "what came before the start stays counted: {after_the_start:?}"
     );
     world.stop().await;
 }
