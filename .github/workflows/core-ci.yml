@@ -2284,8 +2284,13 @@ jobs:
       - name: Build the worker the native backend's session case starts
         run: cargo build --locked -p kr-worker
 
-      # The backend, its boundary, and the shared client's upload sequence.
+      # The backend, its boundary, and the shared client's upload sequence. Its `host_events` check
+      # opens a real window, and on this runner's Linux leg that takes a display: the check starts
+      # an `Xvfb` of its own, which the image carries. A runner without one would let the check
+      # stand down with a printed reason and pass, so here a missing display fails it.
       - name: Test the native backend
+        env:
+          KR_REQUIRE_VIRTUAL_DISPLAY: "1"
         run: cargo test --locked -p companion-tauri -p kr-client
 
       - name: What the disk holds after the native backend's tests
