@@ -335,26 +335,30 @@ final class PairingTests: DeviceTestCase {
         return found
     }
 
-    /// Whether `texts` hold a refusal whose own title says that the host named by `prefix` refused. The
-    /// tree gives a row's texts one after another under one element: its kind, the host its head
-    /// names, then the title, as one text or as the host's name and the rest of it ("refused to show
-    /// its inbox"). So the title's own name is the text before the rest, the head's the one before
-    /// that, and a title that names no host leaves the kind where its name should be.
-    static func titleNames(_ prefix: String, in texts: [(label: String, parent: [Int])]) -> Bool {
+    /// The texts of the refusal whose own title says that the host named by `prefix` refused, or nil
+    /// when `texts` hold none. The tree gives a row's texts one after another under one element: its
+    /// kind, the host its head names, then the title, as one text or as the host's name and the rest of
+    /// it ("refused to show its inbox"), then the host's words. So the title's own name is the text
+    /// before the rest, the head's the one before that, and a title that names no host leaves the kind
+    /// where its name should be. What the row says is its head, its title and the one text after the
+    /// title, as long as they stand under the same element: not what some other row says.
+    static func refusalRow(_ prefix: String, in texts: [(label: String, parent: [Int])]) -> [String]? {
         let rest = "refused to show its inbox"
         for (at, text) in texts.enumerated() where text.label.hasSuffix(rest) {
+            var first: Int?
             if text.label.trimmingCharacters(in: .whitespaces) == rest {
                 if at > 1, texts[at - 1].parent == text.parent, texts[at - 2].parent == text.parent,
-                   texts[at - 1].label.hasPrefix(prefix), texts[at - 2].label.hasPrefix(prefix) { return true }
+                   texts[at - 1].label.hasPrefix(prefix), texts[at - 2].label.hasPrefix(prefix) { first = at - 2 }
             } else if text.label.hasPrefix(prefix) {
                 // One text: the head, just before it, names the host too.
-                if at > 0, texts[at - 1].parent == text.parent, texts[at - 1].label.hasPrefix(prefix) { return true }
+                if at > 0, texts[at - 1].parent == text.parent, texts[at - 1].label.hasPrefix(prefix) { first = at - 1 }
+            }
+            if let first {
+                return texts[first...min(at + 1, texts.count - 1)].filter { $0.parent == text.parent }.map { $0.label }
             }
         }
-        return false
+        return nil
     }
-
-    private func refusalTitleNames(_ prefix: String) -> Bool { Self.titleNames(prefix, in: pageTexts()) }
 
     // MARK: The cases
 
@@ -702,9 +706,15 @@ final class PairingTests: DeviceTestCase {
         XCTAssertFalse(shows("refused to show its inbox"), "the inbox says a host refused it before any host did")
         askHost("bound", timeout: 180)
         let refusal = app.staticTexts.matching(NSPredicate(format: "label ENDSWITH 'refused to show its inbox'")).firstMatch
-        eventually("the inbox to say the second host refused it", timeout: 180) { refusalTitleNames("environment \(environment)") }
-        XCTAssertTrue(shows("offline-validity policy has lapsed"), "the inbox does not give the host's own words for the refusal")
-        XCTAssertTrue(shows("It answered, so contact is not lost"), "the inbox does not say the host answered, so contact is not lost")
+        // What the refused row says, read from one snapshot of the tree in which its title names the second host.
+        var row: [String] = []
+        eventually("the inbox to say the second host refused it", timeout: 180) {
+            row = Self.refusalRow("environment \(environment)", in: pageTexts()) ?? []
+            return !row.isEmpty
+        }
+        say("PAIRING-NOTE the refusal's row reads: \(row)")
+        XCTAssertTrue(row.contains { $0.contains("offline-validity policy has lapsed") }, "the refusal's row does not give the host's own words for the refusal: \(row)")
+        XCTAssertTrue(row.contains { $0.contains("It answered, so contact is not lost") }, "the refusal's row does not say the host answered, so contact is not lost: \(row)")
         XCTAssertFalse(shows("is out of contact"), "the inbox calls a host that refused it out of contact")
         let approval = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Waiting for you. ' AND label CONTAINS 'An approval is waiting for you'")).firstMatch
         XCTAssertTrue(approval.exists, "the first host's rows are not listed beside the refusal")

@@ -900,22 +900,24 @@ def a_host_that_refuses(phone: Phone, directory: Path, port: str) -> None:
     # Everything is judged on one reading of the screen, so that what it lacks is lacking from a screen
     # that holds the refusal.
     labels = [(node["label"], node["box"]) for node in phone.screen() if node["label"]]
-    refused = next((box for label, box in labels if refusal(label)), None)
+    refused = next(((label, box) for label, box in labels if refusal(label)), None)
     if refused is None:
         phone.give_up("the screen read for the refusal does not hold it")
+    row, refused_box = refused
     holds = lambda text: any(text in label for label, _ in labels)
-    print(f"PAIRING-NOTE the refusal's node reads: {next(label for label, _ in labels if refusal(label))!r}", flush=True)
-    # The host's own words, which the row gives after its title.
-    if not holds("offline-validity policy has lapsed"):
-        phone.give_up("the inbox does not give the host's own words for the refusal")
-    if not holds("It answered, so contact is not lost"):
-        phone.give_up("the inbox does not say the host answered, so contact is not lost")
+    print(f"PAIRING-NOTE the refusal's node reads: {row!r}", flush=True)
+    # The host's own words, which the row gives after its title: in this row's own text, not in some
+    # other row of the screen.
+    if "offline-validity policy has lapsed" not in row:
+        phone.give_up("the refusal's row does not give the host's own words for the refusal")
+    if "It answered, so contact is not lost" not in row:
+        phone.give_up("the refusal's row does not say the host answered, so contact is not lost")
     if holds("is out of contact"):
         phone.give_up("the inbox calls a host that refused it out of contact")
     approval = next((box for label, box in labels if label.startswith("Waiting for you. An approval is waiting for you")), None)
     if approval is None:
         phone.give_up("the first host's rows are not listed beside the refusal")
-    if refused[1] >= approval[1]:
+    if refused_box[1] >= approval[1]:
         phone.give_up("the refusal is not drawn above the first host's rows")
     phone.shot("inbox-host-refused")
     say("the inbox shows a host that refused it, in the host's words, above what the host in use holds")
