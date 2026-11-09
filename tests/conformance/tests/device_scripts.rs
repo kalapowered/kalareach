@@ -135,6 +135,8 @@ struct Setup<'a> {
     /// emulator, which stays up until the script that started it has gone or has asked it to stop,
     /// has booted. The device is not listed before the script starts its own.
     boots_as: Option<&'a str>,
+    /// Output folders of an earlier run that anyone could read, holding a file anyone could read.
+    readable_outputs: bool,
 }
 
 impl Run {
@@ -459,6 +461,24 @@ fn run_with(
     if let Some(name) = setup.boots_as {
         fs::write(root.join("running-avd.txt"), format!("{name}\n")).expect("a name");
     }
+    if setup.readable_outputs {
+        let folder = root.join("artefacts/pairing-device-android");
+        fs::create_dir_all(&folder).expect("a directory");
+        fs::write(folder.join("earlier.log"), "an earlier run\n").expect("a log");
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).expect("readable");
+        fs::set_permissions(
+            folder.join("earlier.log"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .expect("readable");
+        let shots = root.join("shots");
+        fs::create_dir_all(&shots).expect("a directory");
+        fs::write(shots.join("earlier.png"), "a picture\n").expect("a picture");
+        fs::set_permissions(&shots, fs::Permissions::from_mode(0o755)).expect("readable");
+        fs::set_permissions(shots.join("earlier.png"), fs::Permissions::from_mode(0o644))
+            .expect("readable");
+    }
+
     // The SDK's two programs. The emulator lists what the machine has and, asked to start a
     // device, only records it. The debug bridge reports the running emulator and its device, and
     // says the boot is complete only where a script waits for that.
@@ -610,6 +630,7 @@ fn run_with(
         .env("ANDROID_HOME", &sdk)
         .env("KR_TEST_ARTIFACTS_DIR", root.join("artefacts"))
         .env("KR_MOBILE_SCREENSHOT_DIR", root.join("scratch"))
+        .env("KR_PAIRING_SHOTS", root.join("shots"))
         // A port nothing answers on, so that a machine that has an emulator's controller up does not
         // refuse the pairing script's cases; the case that wants a taken port names one.
         .env("KR_PAIRING_GRPC_PORT", free_port().to_string())
@@ -826,6 +847,57 @@ fn the_pairing_script_starts_no_emulator_while_its_controllers_port_is_taken() {
     assert!(run.output.contains(&port), "{}", run.output);
     assert!(run.started().is_empty(), "{:?}", run.started());
     drop(taken);
+}
+
+/// What the pairing run writes may hold a phone's log with an invitation's secret in it: its folders
+/// are for its owner alone and so is every file in them, whatever an earlier run left there.
+#[test]
+fn the_pairing_runs_output_is_for_its_owner_alone() {
+    let run = run_with(
+        pairing_script(),
+        &[KALAREACH],
+        None,
+        &[],
+        &Setup {
+            readable_outputs: true,
+            ..Setup::default()
+        },
+    );
+    let mut problems = Vec::new();
+    let mut files = 0;
+    for folder in ["artefacts/pairing-device-android", "shots"] {
+        let mut pending = vec![run.directory.path().join(folder)];
+        while let Some(path) = pending.pop() {
+            let mode = fs::metadata(&path)
+                .expect("what the run left")
+                .permissions()
+                .mode()
+                & 0o777;
+            if path.is_dir() {
+                if mode != 0o700 {
+                    problems.push(format!("{} is {mode:o}", path.display()));
+                }
+                pending.extend(
+                    fs::read_dir(&path)
+                        .expect("a folder")
+                        .map(|entry| entry.expect("an entry").path()),
+                );
+            } else {
+                files += 1;
+                if mode != 0o600 {
+                    problems.push(format!("{} is {mode:o}", path.display()));
+                }
+            }
+        }
+    }
+    // The earlier run's two files and what this run wrote are all read.
+    assert!(files > 3, "the run left {files} files\n{}", run.output);
+    assert!(
+        problems.is_empty(),
+        "{}\n{}",
+        problems.join("\n"),
+        run.output
+    );
 }
 
 fn pairing_script() -> &'static Script {

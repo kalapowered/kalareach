@@ -62,10 +62,19 @@
 #   scripts/e2e-pairing-device.sh android
 #
 # KR_PAIRING_IOS_APP and KR_PAIRING_ANDROID_APK name a build to install instead of making one.
-# KR_PAIRING_SHOTS is where the screenshots go (default /tmp/kr-pair-phone).
+# KR_PAIRING_SHOTS is where the screenshots go (default /tmp/kr-pair-phone); KR_PAIRING_GRPC_PORT is the
+# port of the Android emulator's controller (default 8754), which must be free: the camera is moved
+# through it, so a port that already answers would move another emulator's.
+#
+# The phone's logs are searched for every form of an invitation's text and secret. The folders this run
+# writes into (the output folder and the screenshots) are for the account that runs it alone, made before
+# anything is captured, and so is every file in them. A log in which the search finds a secret is kept
+# there, for that person to read, and the judge's text says which; it is for them to remove.
 #
 # Exit codes: 0 every check passed, 2 bad usage or a failed check, 3 the device is not available.
 set -uo pipefail
+# Nothing this run writes is readable by another account.
+umask 077
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 companion="$here/apps/companion"
@@ -81,7 +90,22 @@ esac
 artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/pairing-device-$platform"
 shots="${KR_PAIRING_SHOTS:-/tmp/kr-pair-phone}"
 cache="${HOME}/Library/Caches/kalareach-tests/pairing-device"
+# The output may hold a phone's log with an invitation's secret in it, so its folders are made for this
+# account alone (the umask above) before anything is captured, those that were there are brought to it,
+# and so is every file in them at the end. The screenshots' folder is the run's own: a shared folder
+# (`/tmp` itself) or another account's is refused, and only its pictures and notes are brought to it.
 mkdir -p "${artefacts:?}" "${shots:?}" "${cache:?}"
+if [ ! -O "$shots" ] || [ -k "$shots" ]; then
+    printf 'KR_PAIRING_SHOTS names %s, which is shared or another account'"'"'s: name a folder of its own\n' "$shots" >&2
+    exit 2
+fi
+keep_private() {
+    chmod 700 "$artefacts" "$shots" 2>/dev/null
+    find "$artefacts" -type d -exec chmod 700 {} + 2>/dev/null
+    find "$artefacts" -type f -exec chmod 600 {} + 2>/dev/null
+    find "$shots" -maxdepth 1 -type f \( -name '*.png' -o -name '*.txt' \) -exec chmod 600 {} + 2>/dev/null
+}
+keep_private
 app_id=to.kala.reach
 log="$artefacts/run.log"
 : >"${log:?}"
@@ -104,6 +128,7 @@ emulator_checked=0
 logs_searched=0
 log_problem=""
 logs_found=0
+logs_kept=""
 # A line the run puts into the phone's log before the first invitation is scanned, and when the run
 # began: a search of the log must find the line, which shows the log reaches back to the first scans.
 run_marker="kr-pairing-run-$(uuidgen | tr 'A-F' 'a-f')"
@@ -166,6 +191,7 @@ finish() {
     fi
     [ -z "$plist_saved" ] || cp "$plist_saved" "$plist" 2>/dev/null
     rm -rf "${harness:?}"
+    keep_private
 }
 trap finish EXIT
 
@@ -265,10 +291,11 @@ host_file() { # <name>
 
 # Searches one of the phone's logs for every form of an invitation's text and secret that the host
 # recorded: the log is read whole, and a match in it fails the run. A log that could not be read, that
-# does not show the application at work, or that does not hold the line the run put in it before the
-# first scan (so that it may begin after the first secrets were handled) is a failed check and never
-# an empty one: a reader that fails prints nothing, and nothing holds no secret.
-search_log() { # <extended pattern the application's own lines match> <command that prints the log...>
+# does not show the application's own process at work, or that does not hold the line the run put in it
+# before the first scan (so that it may begin after the first secrets were handled) is a failed check and
+# never an empty one: a reader that fails prints nothing, and nothing holds no secret. A log in which a
+# secret is found is kept whole in the output folder, for the person to read.
+search_log() { # <extended pattern only the application's own process's lines match> <command that prints the log...>
     local application="$1"
     shift
     cat "$harness"/secrets-*.txt >"$harness/secrets.all" 2>/dev/null
@@ -295,7 +322,13 @@ search_log() { # <extended pattern the application's own lines match> <command t
     local searched=0
     grep -q -i -F -f "$harness/secrets.all" "$harness/log-searched.txt" || searched=$?
     case "$searched" in
-        0) logs_found=1 ;;
+        0)
+            logs_found=1
+            # Kept whole, for this account alone (the folder is, and so is the file), since the other
+            # logs of the run are cut to the end of a buffer or to the application's own tag.
+            cp "$harness/log-searched.txt" "$artefacts/log-with-a-secret-$((logs_searched + 1)).txt"
+            logs_kept="$logs_kept $artefacts/log-with-a-secret-$((logs_searched + 1)).txt"
+            ;;
         1) ;;
         *) log_problem="the search of the log failed"; return 0 ;;
     esac
@@ -330,7 +363,7 @@ judge() { # <driver output>
     if [ "$logs_searched" -ge 1 ] && [ "$logs_found" = 0 ] && [ -z "$log_problem" ]; then
         say "check=no log holds an invitation's text or secret ok=1 detail=$logs_searched log read whole"
     else
-        say "check=no log holds an invitation's text or secret ok=0 detail=searched $logs_searched, found $logs_found${log_problem:+, $log_problem}"
+        say "check=no log holds an invitation's text or secret ok=0 detail=searched $logs_searched, found $logs_found${log_problem:+, $log_problem}${logs_kept:+; the log that held one is kept whole, for the person to read, at${logs_kept} (the folder and its files are for the account that ran this alone): remove it when read}"
         bad=1
     fi
     result="$(host_file challenge-open.txt)"
