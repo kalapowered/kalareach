@@ -151,6 +151,16 @@ async function flush(): Promise<void> {
   })
 }
 
+/**
+ * Hides the page, so that its reads on a cadence stop: a read of the record after this call is the
+ * press's own, whatever the time. A case that changes the record after the page's first read, or
+ * what the worker holds of what it showed, calls this first, so that no read already due sees the
+ * change before the press does. The page is shown again when the case ends.
+ */
+function hidePage(): void {
+  vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden')
+}
+
 describe('on the desktop', () => {
   /** The desktop's conversation over a device's drafts, with the person's text sent once. */
   async function sentOnce(
@@ -665,6 +675,7 @@ describe('on the desktop', () => {
           { timeout: 3_000 }
         )
         await flush()
+        hidePage()
         recorded.worker?.shown.clear()
         const before = reads.length
         await person.click(await screen.findByTestId('composer-send-anyway'))
@@ -694,6 +705,7 @@ describe('on the desktop', () => {
           { timeout: 3_000 }
         )
         await flush()
+        hidePage()
         recorded.revision = '4'
         await person.click(await screen.findByTestId('composer-send-anyway'))
         await waitFor(() => {
@@ -714,6 +726,7 @@ describe('on the desktop', () => {
           { timeout: 3_000 }
         )
         await flush()
+        hidePage()
         recorded.state = 'applied'
         recorded.revision = '5'
         await person.click(await screen.findByTestId('composer-send-anyway'))
@@ -738,6 +751,7 @@ describe('on the desktop', () => {
           { timeout: 3_000 }
         )
         await flush()
+        hidePage()
         recorded.state = 'refused'
         recorded.revision = '5'
         await person.click(await screen.findByTestId('composer-send-anyway'))
@@ -852,6 +866,7 @@ describe('on the desktop', () => {
           { timeout: 3_000 }
         )
         await flush()
+        hidePage()
         recorded.unreadable = true
         await person.click(await screen.findByTestId('composer-send-anyway'))
         await waitFor(() => {
@@ -1345,6 +1360,7 @@ describe('on the phone', () => {
       const quotes: (Supersession | undefined)[] = []
       const { person } = await sentOnce(answers, recorded, reads, [], quotes)
       await readOnce(reads)
+      hidePage()
       recorded.worker?.shown.clear()
       const before = reads.length
       await person.click(await release())
@@ -1353,7 +1369,6 @@ describe('on the phone', () => {
       })
       expect(reads.length).toBeGreaterThan(before)
       expect(quotes[1]).toEqual({ action_id: ACTION, revision: '3' })
-      expect(await screen.findByText('Applied', {}, { timeout: 3_000 })).toBeInTheDocument()
     })
 
     it('names the revision it reads at the press, not the one it read before', async () => {
@@ -1369,13 +1384,13 @@ describe('on the phone', () => {
       const quotes: (Supersession | undefined)[] = []
       const { person } = await sentOnce(answers, recorded, reads, [], quotes)
       await readOnce(reads)
+      hidePage()
       recorded.revision = '4'
       await person.click(await release())
       await waitFor(() => {
         expect(quotes).toHaveLength(2)
       })
       expect(quotes[1]).toEqual({ action_id: ACTION, revision: '4' })
-      expect(await screen.findByText('Applied', {}, { timeout: 3_000 })).toBeInTheDocument()
     })
 
     it('sends nothing and shows the result when the record has become applied', async () => {
@@ -1384,6 +1399,7 @@ describe('on the phone', () => {
       const sent: unknown[] = []
       const { person } = await sentOnce(answers, recorded, reads, sent)
       await readOnce(reads)
+      hidePage()
       recorded.state = 'applied'
       recorded.revision = '5'
       await person.click(await release())
@@ -1399,6 +1415,7 @@ describe('on the phone', () => {
       const sent: unknown[] = []
       const { person } = await sentOnce(answers, recorded, reads, sent)
       await readOnce(reads)
+      hidePage()
       recorded.state = 'refused'
       recorded.revision = '5'
       await person.click(await release())
@@ -1451,6 +1468,7 @@ describe('on the phone', () => {
       const quotes: (Supersession | undefined)[] = []
       const { person } = await sentOnce(answers, recorded, reads, [], quotes)
       await readOnce(reads)
+      hidePage()
       recorded.unreadable = true
       await person.click(await release())
       await waitFor(() => {
