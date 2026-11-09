@@ -2524,6 +2524,8 @@ impl Session {
         let deadline = self.deadline_for(FENCE);
         let (mut prompt_generation, mut reader_revision) = asking_about;
         let mut asked = 0;
+        let mut not_drained = 0;
+        let mut moved = 0;
         loop {
             asked += 1;
             let id = self.ask(WorkerRequest::Fence(RootEditorFenceParams {
@@ -2543,11 +2545,13 @@ impl Session {
                     {
                         return Ok(ReaderMark::of_acknowledgement(&acknowledgement, lifetime));
                     }
+                    not_drained += 1;
                     self.pump(Duration::from_millis(25));
                 }
                 Some((BridgeAnswer::Fence(RootEditorFenceResult::Refused(refusal)), _))
                     if refusal.reason == kr_protocol::root::FenceRefusalReason::ReaderMoved =>
                 {
+                    moved += 1;
                     let Some(report) = self.next_reader_report(deadline, |_| true) else {
                         return Err(format!(
                             "the reader moved under every one of {asked} fences in {FENCE:?} and \
@@ -2558,9 +2562,13 @@ impl Session {
                     reader_revision = report.idle.reader_revision;
                 }
                 None => {
+                    // The last fence is the one the time ran out on; the ones before it were
+                    // answered, as not drained or as for a reader that had moved.
                     return Err(format!(
-                        "nothing answered any of {asked} fences in {FENCE:?}, so the reader did \
-                         not say it had read what was typed"
+                        "the last of {asked} fences in {FENCE:?} was not answered in time \
+                         ({not_drained} before it were answered as not drained, {moved} as for a \
+                         reader that had moved), so the reader did not say it had read what was \
+                         typed"
                     ));
                 }
                 Some((other, _)) => {
