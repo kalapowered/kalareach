@@ -1048,9 +1048,12 @@ prints the receipt on standard error, and sends a new close that names the actio
 shown, through the control daemon where one is running, which passes the request to the worker
 whole. It refuses, with exit status 2 and nothing sent, an action that is not a close or whose
 receipt does not stand in the `unknown` state; an action the worker holds no receipt for is the
-worker's own refusal. For a session the command finds no live worker for, because it has closed
-or its descriptor cannot be found, there is no worker to read an earlier close from: the command
-exits with 2 and sends nothing. When the new close's outcome is not known either, the command
+worker's own refusal. For a session with no descriptor, because it has closed or its descriptor
+cannot be found, there is no worker to read an earlier close from: the command exits with 2 and
+sends nothing. When a descriptor remains but its worker is gone, the command exits with 3 and
+sends nothing. When the receipt cannot be shown on standard error, the command exits with 1 and
+sends nothing, because a later close names a result the person was shown. When the new close's
+outcome is not known either, the command
 stops again with `OUTCOME_UNKNOWN` and names the new action, which the flag then takes in turn. An
 earlier close that stays unknown keeps holding later plain closes back while the worker lives; the
 worker names the newest one in its refusal, and that is the action the flag takes. A failure of the
