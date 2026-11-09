@@ -114,6 +114,23 @@ jobs:
         timeout-minutes: 15
         run: bash scripts/build-plugin-fixtures.sh
 
+      # The release archives of the applications the matrix runs come from their projects' hosts,
+      # and a host can answer every request for a few minutes with an error: on 8 November four of
+      # the macOS job's seven archives answered 504 for a minute each, and its report ran without
+      # them. The archives are kept in the Actions cache under the lock that pins them, so a night
+      # does not fetch what an earlier one did. The fetch checks each archive it finds against its
+      # pin and fetches again what does not match, so the cache costs a fetch at worst. The cache
+      # is saved by the default branch's runs only, and only by one that holds every archive.
+      - name: Restore the applications' archives
+        id: applications
+        if: ${{ inputs.groups == '' || contains(inputs.groups, 'applications') }}
+        timeout-minutes: 2
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kalareach/conformance-applications/archives
+          key: conformance-applications-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/conformance/applications.lock') }}
+          restore-keys: conformance-applications-${{ runner.os }}-${{ runner.arch }}-
+
       # Every group this platform runs, the applications fetched and built from the pins in
       # tests/conformance/applications.lock. The step fails when the run did.
       - name: The conformance report
@@ -127,6 +144,25 @@ jobs:
             arguments+=(--group "$name")
           done
           bash scripts/run-conformance.sh ${arguments[@]+"${arguments[@]}"}
+
+      # The index the fetch wrote names a program it could not install as unavailable.
+      - name: Check that every application's archive is held
+        id: applications-held
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.applications.outputs.cache-hit != 'true' && (inputs.groups == '' || contains(inputs.groups, 'applications')) }}
+        timeout-minutes: 1
+        run: |
+          index="$HOME/.cache/kalareach/conformance-applications/index.json"
+          if [ -f "$index" ] && ! grep -q '"status": "unavailable"' "$index"; then
+            echo "held=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save the applications' archives
+        if: ${{ steps.applications-held.outputs.held == 'true' }}
+        timeout-minutes: 2
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kalareach/conformance-applications/archives
+          key: conformance-applications-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/conformance/applications.lock') }}
 
       - name: Keep the result and the evidence
         if: ${{ !cancelled() }}
@@ -271,6 +307,19 @@ jobs:
         timeout-minutes: 15
         run: bash scripts/build-plugin-fixtures.sh
 
+      # The applications' release archives, kept under the lock that pins them, as the Linux job
+      # above has them: a host that answers 504 for a few minutes does not take the matrix's
+      # applications from a night that holds their archives.
+      - name: Restore the applications' archives
+        id: applications
+        if: ${{ inputs.groups == '' || contains(inputs.groups, 'applications') }}
+        timeout-minutes: 2
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/Library/Caches/kalareach/conformance-applications/archives
+          key: conformance-applications-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/conformance/applications.lock') }}
+          restore-keys: conformance-applications-${{ runner.os }}-${{ runner.arch }}-
+
       - name: The conformance report
         timeout-minutes: 240
         env:
@@ -282,6 +331,25 @@ jobs:
             arguments+=(--group "$name")
           done
           bash scripts/run-conformance.sh ${arguments[@]+"${arguments[@]}"}
+
+      # The index the fetch wrote names a program it could not install as unavailable.
+      - name: Check that every application's archive is held
+        id: applications-held
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.applications.outputs.cache-hit != 'true' && (inputs.groups == '' || contains(inputs.groups, 'applications')) }}
+        timeout-minutes: 1
+        run: |
+          index="$HOME/Library/Caches/kalareach/conformance-applications/index.json"
+          if [ -f "$index" ] && ! grep -q '"status": "unavailable"' "$index"; then
+            echo "held=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save the applications' archives
+        if: ${{ steps.applications-held.outputs.held == 'true' }}
+        timeout-minutes: 2
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/Library/Caches/kalareach/conformance-applications/archives
+          key: conformance-applications-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/conformance/applications.lock') }}
 
       - name: What the disk has left
         if: ${{ !cancelled() }}
