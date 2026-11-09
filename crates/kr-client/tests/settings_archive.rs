@@ -731,6 +731,51 @@ fn manifest_payload_as(
         .expect("a manifest payload")
 }
 
+/// The keys the wraps of a generation seal for `reader`, as the reader unwraps them: the manifest's
+/// key and each member's. A scan reads them, so that a wrap that holds a key the device keeps in
+/// place of the member's own is read, and not only its ciphertext.
+fn keys_sealed_for(
+    reader: &ArchiveReader<'_>,
+    sender: &kr_protocol::scalars::StoredEnvelopeKey,
+    descriptor: &kr_protocol::archive::ArchiveDescriptor,
+    payload: &kr_protocol::archive::ManifestPayload,
+) -> Vec<(String, Vec<u8>)> {
+    let reader_id = reader.key_id();
+    let unwrap = |wrap: &kr_protocol::archive::SealedKeyWrap| -> Vec<u8> {
+        match reader {
+            ArchiveReader::Device(keys) => {
+                kr_crypto::archive::unwrap_object_key(keys, sender, wrap, &wrap.context)
+            }
+            ArchiveReader::Recovery(recovery) => {
+                kr_crypto::archive::unwrap_object_key_with_recovery(
+                    recovery,
+                    sender,
+                    wrap,
+                    &wrap.context,
+                )
+            }
+        }
+        .expect("a wrap addressed to the reader opens")
+        .expose()
+        .to_vec()
+    };
+    let mut keys = Vec::new();
+    for wrap in &descriptor.manifest_key_wraps {
+        if wrap.context.recipient_key_id == reader_id {
+            keys.push(("the manifest's key".to_owned(), unwrap(wrap)));
+        }
+    }
+    for wrap in &payload.member_key_wraps {
+        if wrap.context.recipient_key_id == reader_id {
+            keys.push((
+                format!("the key of member object {}", wrap.context.object_id),
+                unwrap(wrap),
+            ));
+        }
+    }
+    keys
+}
+
 /// The manifest object's payload in the two encodings a scan reads it in: the canonical bytes it was
 /// sealed as, and the JSON a client sees.
 fn payload_encodings(payload: &kr_protocol::archive::ManifestPayload) -> Vec<(String, Vec<u8>)> {
@@ -758,8 +803,9 @@ fn payload_encodings(payload: &kr_protocol::archive::ManifestPayload) -> Vec<(St
 /// canonical bytes; the manifest object decrypted whole, as a `ManifestPayload`, with the signed
 /// manifest and every member key wrap (the sealed keys and the clear context fields of the wraps
 /// among them), once as canonical bytes and once as JSON, with its wraps counted (one for each
-/// member and each recipient of the archive, so none is unused and none is a key sealed in place of
-/// a member's); the settings member's plaintext; and every request sent to the storage and manifest services, each
+/// member and for the archive's one recipient, the reader the case opens it as, so none is unused)
+/// and the keys they seal, which the reader unwraps (the manifest's and the member's), read as
+/// well; the settings member's plaintext; and every request sent to the storage and manifest services, each
 /// body, the content beside it and the account token. Each key is looked for as bytes, in
 /// hexadecimal of either case, in either base64 alphabet wherever it lies in a longer value, and as
 /// a list of numbers. The controls are the scan finding a key where one is put, in each form and
@@ -772,7 +818,9 @@ fn payload_encodings(payload: &kr_protocol::archive::ManifestPayload) -> Vec<(St
 /// service holds it and the stored bytes of the objects, which are read only as the ciphertext sent
 /// (a key sealed inside them is read through the opened bundle and archive); the parts of a request
 /// the stand-in does not keep (its headers other than the token, a query on its path, the
-/// signature block beyond the body); a key in a binary list of integers, split, reversed or
+/// signature block, any member of the signed document other than its body, and the
+/// authentication requests, which the stand-in answers before it keeps a record); a key in a
+/// binary list of integers, split, reversed or
 /// otherwise transformed; the seed of the recovery kit, which is not an endpoint or a control key;
 /// or the other data paths of backup and recovery material.
 #[tokio::test]
@@ -930,6 +978,11 @@ async fn the_settings_archive_holds_none_of_the_private_keys_the_device_keeps() 
         .map(|wrap| wrap.context.recipient_key_id)
         .collect();
     assert_eq!(
+        recipients,
+        [reader.key_id()],
+        "the archive has one recipient, the reader the case opens it as, so the case opens every wrap"
+    );
+    assert_eq!(
         wraps.len(),
         payload.manifest.manifest.objects.len() * recipients.len(),
         "the manifest object holds a wrap that is not for a member and a recipient of the archive"
@@ -946,6 +999,13 @@ async fn the_settings_archive_holds_none_of_the_private_keys_the_device_keeps() 
             assert_eq!(wanted, 1, "one wrap for each member and recipient");
         }
     }
+    // The keys the wraps seal, as the reader unwraps them: the manifest's and each member's.
+    let sealed_keys = keys_sealed_for(&reader, &sender, &descriptor, &payload);
+    assert_eq!(
+        sealed_keys.len(),
+        1 + payload.manifest.manifest.objects.len(),
+        "the manifest's key and the key of each member"
+    );
     let probe_hash: [u8; 32] = probe.as_slice().try_into().expect("a 32-byte seed");
     for (where_, in_the_sealed_key) in [
         ("the sealed key of an unused wrap", true),
@@ -1004,6 +1064,7 @@ async fn the_settings_archive_holds_none_of_the_private_keys_the_device_keeps() 
         ),
     ];
     clear.extend(payload_encodings(&payload));
+    clear.extend(sealed_keys);
     clear.extend(sent);
     assert_eq!(
         carried_keys(&clear, &kept),

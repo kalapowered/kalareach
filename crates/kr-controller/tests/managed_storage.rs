@@ -3903,6 +3903,53 @@ fn manifest_payload_as(
         .expect("a manifest payload")
 }
 
+/// The keys the wraps of a generation seal for `reader`, as the reader unwraps them: the manifest's
+/// key and each member's. A scan reads them, so that a wrap that holds a key the host keeps in place
+/// of the member's own is read, and not only its ciphertext.
+fn keys_sealed_for(
+    reader: &kr_crypto::backup::ArchiveReader<'_>,
+    sender: &kr_protocol::scalars::StoredEnvelopeKey,
+    descriptor: &kr_protocol::archive::ArchiveDescriptor,
+    payload: &kr_protocol::archive::ManifestPayload,
+) -> Vec<(String, Vec<u8>)> {
+    use kr_crypto::backup::ArchiveReader;
+
+    let reader_id = reader.key_id();
+    let unwrap = |wrap: &kr_protocol::archive::SealedKeyWrap| -> Vec<u8> {
+        match reader {
+            ArchiveReader::Device(keys) => {
+                kr_crypto::archive::unwrap_object_key(keys, sender, wrap, &wrap.context)
+            }
+            ArchiveReader::Recovery(recovery) => {
+                kr_crypto::archive::unwrap_object_key_with_recovery(
+                    recovery,
+                    sender,
+                    wrap,
+                    &wrap.context,
+                )
+            }
+        }
+        .expect("a wrap addressed to the reader opens")
+        .expose()
+        .to_vec()
+    };
+    let mut keys = Vec::new();
+    for wrap in &descriptor.manifest_key_wraps {
+        if wrap.context.recipient_key_id == reader_id {
+            keys.push(("the manifest's key".to_owned(), unwrap(wrap)));
+        }
+    }
+    for wrap in &payload.member_key_wraps {
+        if wrap.context.recipient_key_id == reader_id {
+            keys.push((
+                format!("the key of member object {}", wrap.context.object_id),
+                unwrap(wrap),
+            ));
+        }
+    }
+    keys
+}
+
 /// A generation is made of a closed session and the configuration document, uploaded, published,
 /// and opened by the recovery recipient with the members the convention names. A second pass finds
 /// nothing changed and makes no second generation; a changed document, a day later, makes the next
@@ -4095,8 +4142,9 @@ fn x25519_secret_of(seed: &[u8]) -> Vec<u8> {
 /// (it is not encrypted); the manifest object decrypted whole, as a `ManifestPayload`, with the
 /// signed manifest and every member key wrap (the sealed keys and the clear context fields of the
 /// wraps among them), once as the bytes of its canonical encoding and once as the JSON a client
-/// would see, with its wraps counted (one for each member and each recipient of the archive, so none
-/// is unused and none is a key sealed in place of a member's); each member's plaintext, so a member that shares a name
+/// would see, with its wraps counted (one for each member and for the archive's one recipient, the
+/// reader the case opens it as, so none is unused) and the keys they seal, which the reader
+/// unwraps (the manifest's and each member's), read as well; each member's plaintext, so a member that shares a name
 /// with another is read as well; the publication as the service holds it, with its descriptor, its
 /// writer's key identifier, its time and its signature; and every request the daemon sent the
 /// service, each body, the content beside it and the account token. It asserts the service holds no
@@ -4110,7 +4158,7 @@ fn x25519_secret_of(seed: &[u8]) -> Vec<u8> {
 /// reads what was sent. Not shown here: the stored bytes of the objects, which are read only as
 /// the ciphertext the daemon sent (a key sealed inside them is read through the opened archive); the
 /// parts of a request the stand-in does not keep (its headers other than the token, a query on its
-/// path, the signature block beyond the body); a key in a binary list of integers, split, reversed
+/// path, the signature block, any member of the signed document other than its body, and the authentication requests, which the stand-in answers before it keeps a record); a key in a binary list of integers, split, reversed
 /// or otherwise transformed; that a restore refuses a member under a reserved name or a revoked
 /// grant, which the restore cases show; or the other data paths of backup and recovery material.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4372,6 +4420,11 @@ async fn a_generation_the_host_makes_holds_none_of_the_private_keys_the_host_kee
         .iter()
         .map(|wrap| wrap.context.recipient_key_id)
         .collect();
+    assert_eq!(
+        recipients,
+        [rig.device.key_id()],
+        "the archive has one recipient, the reader the case opens it as, so the case opens every wrap"
+    );
     let objects = &generation.payload.manifest.manifest.objects;
     assert_eq!(
         wraps.len(),
@@ -4390,6 +4443,18 @@ async fn a_generation_the_host_makes_holds_none_of_the_private_keys_the_host_kee
             assert_eq!(wanted, 1, "one wrap for each member and recipient");
         }
     }
+    // The keys the wraps seal, as the reader unwraps them: the manifest's and each member's.
+    let sealed = keys_sealed_for(
+        &kr_crypto::backup::ArchiveReader::Device(&rig.device),
+        daemon_producer(&rig.host).public(),
+        &held_publication.payload.descriptor,
+        &generation.payload,
+    );
+    assert_eq!(
+        sealed.len(),
+        1 + objects.len(),
+        "the manifest's key and the key of each member"
+    );
 
     // Every request the daemon sent the service: the document, the content beside it, the token.
     let mut sent = Vec::new();
@@ -4434,6 +4499,7 @@ async fn a_generation_the_host_makes_holds_none_of_the_private_keys_the_host_kee
     ];
     assert!(!clear[0].1.is_empty() && !clear[1].1.is_empty());
     clear.extend(payload_encodings(&generation.payload));
+    clear.extend(sealed);
     clear.extend(
         generation
             .members
