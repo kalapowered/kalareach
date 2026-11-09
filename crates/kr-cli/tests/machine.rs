@@ -1347,6 +1347,57 @@ async fn a_step_that_could_not_be_written_is_taken_by_the_next_finish() {
     assert_eq!(pair.b.group().machine_id, into);
 }
 
+/// KR-REQ-23.24, the client's half: `finish --after-unknown` is the person's later request after an
+/// outcome the environment could not establish, and follows nothing else. B's step was not written,
+/// so when the step is sent again B refuses it in its definite word and does not leave its outcome
+/// unknown. Naming that action sends nothing: the command ends as a refused flag, the step stays
+/// `sent` under the same action, and B holds no receipt it did not hold before. A plain `finish` then
+/// takes the step under a new action, as it does without the flag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_later_request_that_names_an_action_the_environment_refused_sends_nothing() {
+    let pair = Pair::start().await;
+    let (shared, into, started) = merge_with_b_answer_lost(&pair, |b| {
+        b.controller.fail_the_next_machine_write();
+    });
+    assert_eq!(started["steps"][1]["state"], "sent", "{started}");
+    let first = text(&started["steps"][1]["action_id"]);
+    let held = receipts_of(&pair.b);
+
+    let (status, refused) = pair.a.kr_json(
+        Some(pair.bridges.path()),
+        &["host", "machine", "finish", "--after-unknown", &first],
+    );
+    assert_eq!(status, Some(2), "{refused}");
+    assert_eq!(refused["code"], "INVALID_ARGUMENT", "{refused}");
+    let said = text(&refused["message"]);
+    assert!(
+        said.contains(&first) && said.contains("--after-unknown"),
+        "the refusal names the action and the flag: {said}"
+    );
+    assert_eq!(refused["steps"][1]["state"], "sent", "{refused}");
+    assert_eq!(
+        text(&refused["steps"][1]["action_id"]),
+        first,
+        "no new action was made for the step: {refused}"
+    );
+    assert_eq!(refused["kept"], Value::Bool(true), "{refused}");
+    assert_eq!(receipts_of(&pair.b), held, "B was sent no new action");
+    assert_eq!(
+        pair.b.group().machine_id,
+        shared.machine_id,
+        "nothing was written"
+    );
+
+    let finished = pair.at_a(&["host", "machine", "finish"]);
+    assert_eq!(finished["steps"][1]["state"], "done", "{finished}");
+    assert_ne!(
+        text(&finished["steps"][1]["action_id"]),
+        first,
+        "without the flag the step is taken under a new action"
+    );
+    assert_eq!(pair.b.group().machine_id, into);
+}
+
 /// KR-REQ-23.24, the client's half: an action whose outcome the environment cannot establish is not
 /// sent again under a new action by `finish` itself. B's step was not written, and B then cannot
 /// look up its receipts, so its answer to the step's action is an outcome nobody knows while its

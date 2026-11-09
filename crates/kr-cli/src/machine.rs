@@ -1094,7 +1094,7 @@ fn conclusion(plan: &Plan, removal: Result<()>, stopped: &[Stopped]) -> (bool, O
     let failure = if let Err(error) = removal {
         Some(error)
     } else if !stopped.is_empty() {
-        Some(unknown_outcome(stopped))
+        Some(halted(stopped))
     } else if pending {
         Some(CliError::Unfinished {
             code: ErrorCode::EnvironmentUnavailable,
@@ -1336,40 +1336,71 @@ enum Verdict {
     Unknown,
 }
 
-/// A step an environment answered with an outcome it could not establish, and the record it showed.
+/// A step `finish` stopped at, and why.
 struct Stopped {
     environment_id: EnvironmentId,
-    /// The action the step was sent under, which the environment could not say the outcome of.
+    /// The action the step was sent under.
     action_id: ActionId,
-    /// The group the environment's record showed then.
-    record: MachineGroup,
+    halt: Halt,
 }
 
-/// What `finish` ends as when environments answered steps with outcomes they could not establish:
-/// each action and the record its environment shows, and how a later request is made. Nothing new
-/// was sent for any of them.
-fn unknown_outcome(stopped: &[Stopped]) -> CliError {
-    let mut said = Shown::said(
-        "an environment answered a step with an outcome it could not establish, so the step stays \
-         sent and nothing new is sent for it:",
-    );
+/// Why `finish` stopped at a step.
+enum Halt {
+    /// The environment answered the action with an outcome it could not establish, and showed this
+    /// record then.
+    Unknown(MachineGroup),
+    /// The person's `--after-unknown` named the action, and the environment refused it with this
+    /// code instead of leaving its outcome unknown, so the flag does not apply to it.
+    NotUnknown(ErrorCode),
+}
+
+/// What `finish` ends as when it stopped at steps. For a step an environment answered with an
+/// outcome it could not establish: its action, the record the environment shows and how a later
+/// request is made, with nothing new sent for it. For an action the person's `--after-unknown`
+/// named that its environment did not leave unknown: that the flag does not apply to it and nothing
+/// new was sent for it, which refuses the flag, so it ends the command as a usage error.
+fn halted(stopped: &[Stopped]) -> CliError {
+    let mut said: Option<Shown> = None;
+    let mut refused_flag = false;
     for each in stopped {
-        said = shown!(
-            "{} environment {} answered action {}, and its record shows group {} at revision {} \
-             (`kr host machine finish --after-unknown {}` sends the step as a new action, which \
-             the environment takes only while its record is still that group at that \
-             revision);",
-            said,
-            each.environment_id,
-            each.action_id,
-            each.record.machine_id.get(),
-            each.record.revision,
-            each.action_id
-        );
+        let part = match &each.halt {
+            Halt::Unknown(record) => shown!(
+                "environment {} answered action {} with an outcome it could not establish, and \
+                 its record shows group {} at revision {} (`kr host machine finish \
+                 --after-unknown {}` sends the step as a new action, which the environment takes \
+                 only while its record is still that group at that revision): the step stays sent \
+                 and nothing new is sent for it",
+                each.environment_id,
+                each.action_id,
+                record.machine_id.get(),
+                record.revision,
+                each.action_id
+            ),
+            Halt::NotUnknown(code) => {
+                refused_flag = true;
+                shown!(
+                    "environment {} refused action {} ({}) and did not leave its outcome unknown, \
+                     so `--after-unknown` does not apply to it and nothing new was sent for it: \
+                     `kr host machine finish` without the flag asks the step again",
+                    each.environment_id,
+                    each.action_id,
+                    *code
+                )
+            }
+        };
+        said = Some(match said {
+            Some(before) => shown!("{}; {}", before, part),
+            None => part,
+        });
     }
-    CliError::Unfinished {
-        code: ErrorCode::OutcomeUnknown,
-        message: said,
+    let message = said.unwrap_or_else(|| Shown::said("no step was stopped at"));
+    if refused_flag {
+        CliError::Usage(message)
+    } else {
+        CliError::Unfinished {
+            code: ErrorCode::OutcomeUnknown,
+            message,
+        }
     }
 }
 
@@ -1500,8 +1531,20 @@ async fn settle(
             }
             Verdict::Pending => return Ok(()),
             // The environment's own definite word on the action: a new one is composed, which asks
-            // against the same record.
-            Verdict::AskAgain => None,
+            // against the same record. A person's `--after-unknown` that names this action is a
+            // request to follow an unknown outcome, and this action's was not one, so the flag is
+            // refused and nothing new is made for it.
+            Verdict::AskAgain => {
+                if after == Some(step.action_id) {
+                    stopped.push(Stopped {
+                        environment_id: step.environment_id,
+                        action_id: step.action_id,
+                        halt: Halt::NotUnknown(error.code),
+                    });
+                    return Ok(());
+                }
+                None
+            }
             // An outcome the environment could not establish is shown to the person with the
             // record it holds, and a new action follows only when the person asks for one that
             // names this action.
@@ -1514,7 +1557,7 @@ async fn settle(
                     stopped.push(Stopped {
                         environment_id: step.environment_id,
                         action_id: named,
-                        record: record.clone(),
+                        halt: Halt::Unknown(record.clone()),
                     });
                     return Ok(());
                 }
@@ -1545,7 +1588,7 @@ async fn settle(
                 stopped.push(Stopped {
                     environment_id: step.environment_id,
                     action_id: earlier,
-                    record,
+                    halt: Halt::Unknown(record),
                 });
                 return Ok(());
             }
