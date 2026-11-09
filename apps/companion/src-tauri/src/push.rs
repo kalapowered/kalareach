@@ -39,8 +39,9 @@
 //! (`unsettled`: the action, words that say why it is not settled, the digest of the token the
 //! registration proposed, the choice of previews it carried, and when). The entry is cleared when
 //! the host's answer settles the action: the host took the registration, or refused it for good,
-//! or `action.read` says which. It stays when the host did not say, whether the answer was lost,
-//! the host said it could not establish the outcome, or the application ended before it heard.
+//! or `action.read` says which, and when the account it was made under is deleted. It stays when
+//! the host did not say, whether the answer was lost, the host said it could not establish the
+//! outcome, or the application ended before it heard.
 //!
 //! A record that cannot be read (damaged, or written by a build this one does not know) holds each
 //! host's authorisation identifier, so it is moved aside whole and never written over. The desk
@@ -1295,7 +1296,8 @@ impl PushDesk {
     /// when the host is forgotten, so none writes over what follows. Each host that has a record is
     /// then marked as needing the person, kept as it is until the person turns it on again, and
     /// never started by a look. The pairing, the authorisation identifier and the choice of
-    /// previews are kept.
+    /// previews are kept. A registration whose outcome was not known is not: the person's request
+    /// registers as for any host the deletion left.
     ///
     /// Says whether it is done: the paired hosts were read and what was marked is on disk. A list
     /// that cannot be read is not an empty one, so nothing is marked on it and the caller asks
@@ -1334,6 +1336,10 @@ impl PushDesk {
                         updated_ms: now,
                         registered: None,
                         lost: true,
+                        // The service may have removed a registration whose outcome was not known
+                        // with the rest, so it is not one to read: what the person is told is the
+                        // deletion, and the request that follows starts the sequence over.
+                        unsettled: None,
                         ..kept
                     };
                     marked = true;

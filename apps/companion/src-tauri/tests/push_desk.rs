@@ -5349,6 +5349,56 @@ async fn a_request_that_does_not_name_the_registration_the_host_stands_at_sends_
     assert_eq!(actions_sent(&phone), [action]);
 }
 
+/// KR-REQ-23.24 beside a deleted account: the service may have removed the registration whose
+/// outcome was unknown with the rest, so it is not kept as one to read. The person's next request is
+/// a registration like any other after the deletion: the whole sequence runs, and a host that would
+/// say it took the earlier registration is not what turns the host on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_account_deleted_after_an_unknown_outcome_leaves_the_whole_sequence_to_the_next_request()
+{
+    let (_host, phone, reference, action) = a_phone_whose_registration_has_no_known_outcome().await;
+    phone.registered.lock().expect("the script").read_says = Some(RegistrationRead::Taken);
+    let proposals = proposed(&phone.gateway).len();
+
+    assert!(phone.desk.account_deleted(), "the host was marked and kept");
+
+    assert_eq!(phone.view().hosts[0].state, PushState::NeedsAttention);
+    assert_eq!(unknown_of(&phone), None, "nothing is left to ask about");
+    assert!(
+        record_of(&phone).get("unsettled").is_none(),
+        "{}",
+        record_of(&phone)
+    );
+    // A request that names the registration the page was shown before the deletion is for a view
+    // the host has left.
+    phone
+        .desk
+        .enable(&reference, Some(&action))
+        .expect("the request is answered");
+    assert_eq!(actions_sent(&phone), std::slice::from_ref(&action));
+
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks again");
+    phone.until(|states| states == [PushState::On]).await;
+
+    assert!(
+        actions_read(&phone).is_empty(),
+        "the earlier registration was not read: {:?}",
+        actions_read(&phone)
+    );
+    assert!(
+        proposed(&phone.gateway).len() > proposals,
+        "the whole sequence ran again"
+    );
+    assert_eq!(
+        actions_sent(&phone).len(),
+        2,
+        "registered again, under a new action"
+    );
+}
+
 /// The unknown outcome outlives the application: a start reads it from the record, the page is told
 /// it as before, and a look reads the result and registers nothing. A registration that was about to
 /// be sent when the application ended is as unknown, since it is kept before it is sent.
