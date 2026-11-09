@@ -1178,10 +1178,13 @@ const RESTORE_PROBE: &str = "KR_ATTACH_RESTORE_PROBE";
 ///
 /// KR-REQ-08.55, the part about the outer console after detach: the person's outer console is not
 /// left in the wrong mode when an attachment ends. Its input and output modes after `kr attach`
-/// has gone are the ones it had before, although the command changed them while it ran. Not shown
-/// here: an inner `wsl.exe`, `ssh` or nested ConPTY transition's mode reset stopping at KR's
-/// boundary, which kr-term's recordings and mode cases show. The session here runs the command
-/// shell and nothing nested in it.
+/// has gone are the ones it had before, although the pair was different while the command ran.
+/// The attachment here ends because `kr close` closes its session. Not shown here: a detach that
+/// leaves the session running, the outer terminal's own modes (mouse, paste, alternate screen),
+/// which the case does not read, and a nested `wsl.exe`, `ssh` or ConPTY transition's own mode
+/// reset: kr-term's `conpty_sources` and `win32_input` cases show that no request or reset for
+/// mode 9001 that reaches the worker goes on to a client. The session runs the command shell and
+/// nothing nested in it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_console_an_attachment_ran_in_is_given_back_in_the_modes_it_had() {
     if std::env::var_os(RESTORE_PROBE).is_some() {
