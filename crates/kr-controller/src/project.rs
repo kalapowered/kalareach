@@ -62,6 +62,8 @@ pub struct ProjectModule {
     service: Arc<ProjectService>,
     /// This host's owner, once one is enrolled.
     owner: OnceLock<Arc<HostOwner>>,
+    /// How often the sweep of the challenges runs.
+    sweep_every: std::time::Duration,
     /// How many sweeps of the challenges have finished.
     #[cfg(feature = "testing")]
     sweeps: Arc<tokio::sync::watch::Sender<u64>>,
@@ -277,9 +279,19 @@ impl ProjectModule {
         Ok(Self {
             service: Arc::new(service),
             owner: OnceLock::new(),
+            sweep_every: CHALLENGE_SWEEP,
             #[cfg(feature = "testing")]
             sweeps: Arc::new(tokio::sync::watch::channel(0).0),
         })
+    }
+
+    /// Makes the sweep of the challenges that [`Self::enrol_owner`] starts run every `every`, after
+    /// the one it runs at once. A suite that looks at what the sweep holds gives it a period no
+    /// test reaches, so that no sweep but the first can run while it looks. For this host's own
+    /// tests; nothing in the daemon sets it.
+    #[cfg(feature = "testing")]
+    pub fn sweep_challenges_every(&mut self, every: std::time::Duration) {
+        self.sweep_every = every;
     }
 
     /// A count that changes each time a sweep of the challenges finishes. For this host's own
@@ -345,10 +357,11 @@ impl ProjectModule {
         })?;
         let service = Arc::downgrade(&self.service);
         let owner = Arc::downgrade(&owner);
+        let period = self.sweep_every;
         #[cfg(feature = "testing")]
         let finished = Arc::clone(&self.sweeps);
         runtime.spawn(async move {
-            let mut every = tokio::time::interval(CHALLENGE_SWEEP);
+            let mut every = tokio::time::interval(period);
             every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 every.tick().await;

@@ -4612,17 +4612,23 @@ async fn a_copy_that_found_no_claim_is_given_the_record_the_first_attempt_left_m
 /// hang reaches it.
 const FIRST_SWEEP_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// A project service on an environment of its own, built as the daemon builds its own. The cases
-/// lend it a daemon's pairing service as its owner.
+/// The period the cases give the sweep after its first sweep, which runs at enrolment: one no case
+/// reaches, so that no other sweep can run while a case looks at what the sweep holds or lets go of.
+const NO_SECOND_SWEEP: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 60 * 60);
+
+/// A project service on an environment of its own, built as the daemon builds its own, whose sweep
+/// runs once, at enrolment, and not again. The cases lend it a daemon's pairing service as its
+/// owner.
 async fn a_project_module() -> (
     kr_ipc::testing::TempHost,
     PrivateTempDir,
     kr_controller::project::ProjectModule,
 ) {
     let temp = kr_ipc::testing::TempHost::create();
-    let module = kr_controller::project::ProjectModule::open(&temp.environment())
+    let mut module = kr_controller::project::ProjectModule::open(&temp.environment())
         .await
         .expect("the project service opens");
+    module.sweep_challenges_every(NO_SECOND_SWEEP);
     (temp, PrivateTempDir::create(), module)
 }
 
@@ -4679,8 +4685,8 @@ async fn until_the_first_sweep_finishes(module: &kr_controller::project::Project
 /// Two challenges are issued half a lifetime apart, and the ledger's clock is taken on past the
 /// first one's lifetime and short of the second's. The sweep the enrolment starts lets go of the
 /// first, so a call for it finds none left, and leaves the second, which the same call finds once
-/// the ledger has let go of it too. The case relies on no later sweep coming between its steps,
-/// which `CHALLENGE_SWEEP` allows: a process stopped for that long fails it, and never passes it.
+/// the ledger has let go of it too. The module's sweep runs once, at enrolment, so nothing but the
+/// first sweep lets go of anything while the case looks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_challenge_sweep_lets_go_of_the_challenges_the_ledger_let_go_and_of_no_other() {
     let owned = owned(&owner_keys()).await;
@@ -4739,9 +4745,8 @@ async fn the_challenge_sweep_lets_go_of_the_challenges_the_ledger_let_go_and_of_
 /// A module that goes takes its owner with it, and with the owner its hold on the pairing service
 /// and the stores that service holds: the sweep the module started holds neither between its
 /// sweeps. The sweep has finished once when the module goes, so what it kept is what it keeps while
-/// it waits for its next tick, and the case does not wait for one. It relies on that tick not
-/// coming before the module goes, which `CHALLENGE_SWEEP` allows: a process stopped for that long
-/// fails it, and never passes it.
+/// it waits for its next tick, and the case does not wait for one: the module's sweep runs once, at
+/// enrolment, and no other sweep is there to hold the owner at the look.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_project_module_that_goes_leaves_nothing_of_its_owner_to_the_challenge_sweep() {
     let owned = owned(&owner_keys()).await;
