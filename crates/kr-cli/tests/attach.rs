@@ -2196,6 +2196,13 @@ async fn a_close_whose_outcome_the_worker_could_not_establish_is_sent_again_only
         refusal.contains(&earlier.to_string()),
         "and the refusal names it: {refusal}"
     );
+    assert!(
+        refusal.contains(&format!(
+            "kr close {session} --environment {} --after-unknown {earlier}",
+            hosted.descriptor.environment_id
+        )),
+        "and says the command that makes the later request: {refusal}"
+    );
     assert!(live(&hosted), "and nothing was closed");
 
     // An action that is not a close of unknown outcome is not one a later close names: another

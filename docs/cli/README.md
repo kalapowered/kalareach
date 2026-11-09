@@ -1038,7 +1038,9 @@ session's worker when none is. It sends one request, under an action it makes fo
 outcome of that request is not known (see the exit codes), the command ends with exit status 1 and
 `OUTCOME_UNKNOWN`, names the action and the `kr action read <action> --session <session>
 --environment <environment>` that shows what the host holds of it, and sends nothing again. If the session's worker holds that close as an
-outcome it could not establish, a plain `kr close` is refused while it does.
+outcome it could not establish, a plain `kr close` is refused while it does. The refusal gives the worker's words, which name the
+earlier close, and then the `kr action read` command that shows it and the `kr close <session> --environment <environment>
+--after-unknown <action>` command that makes the later request.
 
 `kr close [id] --after-unknown <action>` is the person's later request. It reads that action's
 receipt from the session's worker, which also notes for the worker that this caller was shown it,
@@ -1340,7 +1342,8 @@ send.
 `kr question cancel` sends the cancellation once. When the worker cannot say what became of it, or the
 connection ends after it was written, the command exits with 1 and `OUTCOME_UNKNOWN`, names the
 action, the `kr action read` that shows its receipt and the later request, and sends nothing again.
-A plain `kr question cancel` after that is refused by the worker while the earlier outcome stands.
+A plain `kr question cancel` after that is refused by the worker while the earlier outcome stands,
+and the refusal ends with the `--after-unknown` command that makes the later request.
 `kr question cancel <question_id> --after-unknown <action>` is the person's later request: it reads
 that action's receipt from the worker, which also notes for the worker that this caller was shown it,
 prints the receipt on standard error, and sends a new action that names the action and the revision

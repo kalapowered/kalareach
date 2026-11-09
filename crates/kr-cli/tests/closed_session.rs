@@ -1004,6 +1004,15 @@ async fn a_close_the_daemons_worker_could_not_establish_is_closed_only_by_the_pe
             .is_some_and(|said| said.contains(&earlier.to_string())),
         "and the refusal names it: {refused}"
     );
+    assert!(
+        refused["message"]
+            .as_str()
+            .is_some_and(|said| said.contains(&format!(
+                "kr close {session} --environment {} --after-unknown {earlier}",
+                host.temp.environment_id()
+            ))),
+        "and says the command that makes the later request: {refused}"
+    );
     let listed = host.kr_json(&["list"]);
     assert_eq!(
         listed["sessions"].as_array().map(Vec::len),

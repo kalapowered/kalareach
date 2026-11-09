@@ -929,6 +929,15 @@ fn admit(state: &Mutex<State>, arrival: &Arrival) -> Result<(), ProtocolError> {
         {
             Ok(())
         }
+        // A request that names nothing is refused in the worker's own words, which name the action
+        // that stands.
+        (Some(uncertain), None) => Err(ProtocolError::new(
+            ErrorCode::DraftConflict,
+            format!(
+                "action {uncertain} for this subject has an uncertain outcome; a later request has \
+                 to name it and the revision it was read at"
+            ),
+        )),
         _ => Err(ProtocolError::new(
             ErrorCode::DraftConflict,
             "an earlier action has an uncertain outcome that this one does not name",
@@ -2517,6 +2526,14 @@ async fn a_cancellation_of_unknown_outcome_is_sent_again_only_by_the_persons_lat
     host.behave(Behaviour::Serves);
     let (status, plain) = host.json(&["question", "cancel", &question]);
     assert_ne!(status, Some(0), "{plain}");
+    assert!(
+        plain["message"].as_str().is_some_and(|said| {
+            said.contains(&format!(
+                "kr question cancel {question} --after-unknown {first}"
+            ))
+        }),
+        "and the refusal says the command that makes the later request: {plain}"
+    );
     assert_eq!(host.stops().len(), 2, "this run sent one request");
     assert_eq!(host.arrivals()[0].quoted, None, "and it quoted nothing");
     assert_eq!(

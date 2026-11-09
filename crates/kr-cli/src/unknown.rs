@@ -8,7 +8,9 @@
 //! to be made in sight of the earlier result. So the command ends with `OUTCOME_UNKNOWN`, names the
 //! action and says where the person reads what the host holds of it. [`earlier`] is the person's
 //! later request: it reads the earlier action's receipt from the worker that keeps it, shows it, and
-//! returns what the new request names.
+//! returns what the new request names. A plain run again is refused by the worker while the earlier
+//! outcome stands, and [`Unknown::refused`] adds to that refusal the command that makes the later
+//! request.
 
 use kr_client::answers::{self, Quote};
 use kr_client::shown;
@@ -22,6 +24,10 @@ use kr_protocol::method::{Method, MethodName};
 use kr_protocol::receipt::{ActionReadParams, ActionReadResult, ReceiptState};
 
 use crate::error::{CliError, Result};
+
+/// How a worker's refusal of a request that names no earlier action words itself when an earlier
+/// action of the same subject has an uncertain outcome: that action's identifier stands just before.
+const STANDS: &str = " for this subject has an uncertain outcome";
 
 /// What a command says when one of its mutations ended with an outcome nobody established.
 pub struct Unknown {
@@ -123,6 +129,35 @@ impl Unknown {
             ),
         }
     }
+
+    /// What the command ends as when the host refused its request.
+    ///
+    /// A worker holds an uncertain outcome against every later request that does not name it, and
+    /// its refusal names the action that stands. Where the command has a later request, the person
+    /// is also told the command that makes it: the refusal alone does not say there is one.
+    #[must_use]
+    pub fn refused(&self, refusal: ProtocolError) -> CliError {
+        let (Some(command), Some(action)) = (&self.later, standing(&refusal)) else {
+            return CliError::Refused(refusal);
+        };
+        CliError::refused_in_its_own_words(
+            refusal.code,
+            shown!(
+                "{}\n`{}` shows what the host holds of it, and `{} --after-unknown {}` makes the \
+                 later request that names it",
+                Shown::protocol(&refusal),
+                self.read_back.command(action),
+                command.clone(),
+                action
+            ),
+        )
+    }
+}
+
+/// The action a worker's refusal says stands in the way of a request that names none.
+fn standing(refusal: &ProtocolError) -> Option<ActionId> {
+    let (before, _) = refusal.message.split_once(STANDS)?;
+    before.rsplit(' ').next()?.parse().ok()
 }
 
 /// Calls a mutation on a worker or a daemon that a person's command made, once.
@@ -136,7 +171,8 @@ impl Unknown {
 ///
 /// # Errors
 ///
-/// Returns the host's refusal, a failure before anything was written, or the unknown outcome.
+/// Returns the host's refusal ([`Unknown::refused`]), a failure before anything was written, or the
+/// unknown outcome.
 pub async fn mutate_naming<P, T>(
     client: &mut LocalClient,
     method: Method,
@@ -166,7 +202,7 @@ where
         Ok(Err(refusal)) if refusal.code == ErrorCode::OutcomeUnknown => {
             Err(unknown.ended(action_id, Cause::Host(&refusal)))
         }
-        Ok(Err(refusal)) => Err(CliError::Refused(refusal)),
+        Ok(Err(refusal)) => Err(unknown.refused(refusal)),
         Err(error @ IpcError::NotInLevel(_)) => Err(CliError::Ipc(error)),
         Err(_) => Err(unknown.ended(action_id, Cause::Connection)),
     }
