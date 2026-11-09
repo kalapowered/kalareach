@@ -58,7 +58,7 @@ fn a_copy_that_is_not_the_packed_archive_says_which_of_the_two_differs() {
     assert!(
         matches!(
             held_to(&packed, digest, &copy),
-            Err(Unequal::Copy { first_difference }) if first_difference == at as u64
+            Err(Unequal::Copy { first_difference, .. }) if first_difference == at as u64
         ),
         "{:?}",
         held_to(&packed, digest, &copy)
@@ -82,7 +82,7 @@ fn a_copy_that_is_not_the_packed_archive_says_which_of_the_two_differs() {
     std::fs::write(&packed, &damaged).expect("the packed archive changes");
     std::fs::copy(&packed, &copy).expect("a copy of the changed archive");
     assert!(
-        matches!(held_to(&packed, digest, &copy), Err(Unequal::Packed)),
+        matches!(held_to(&packed, digest, &copy), Err(Unequal::Packed { .. })),
         "{:?}",
         held_to(&packed, digest, &copy)
     );

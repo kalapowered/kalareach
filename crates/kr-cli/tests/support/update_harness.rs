@@ -999,7 +999,7 @@ impl Assembled {
         std::fs::copy(packed, archive).expect("a copy of the archive");
         if let Err(unequal) = held_to(packed, *digest, archive) {
             panic!(
-                "the copy at {} is not the archive packed at {}: {unequal:?}",
+                "the copy at {} is not the archive packed at {}: {unequal}",
                 archive.display(),
                 packed.display()
             );
@@ -1011,17 +1011,68 @@ impl Assembled {
 #[derive(Debug)]
 enum Unequal {
     /// The packed archive reads as it did when it was packed, and the copy differs from it.
-    Copy { first_difference: u64 },
+    Copy {
+        /// The byte at which the two first differ: where the shorter ends, when one is a prefix of
+        /// the other.
+        first_difference: u64,
+        length: u64,
+        digest: [u8; 32],
+    },
     /// The packed archive no longer reads as it did when it was packed.
-    Packed,
+    Packed { digest: [u8; 32] },
+}
+
+impl std::fmt::Display for Unequal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Copy {
+                first_difference,
+                length,
+                digest,
+            } => write!(
+                formatter,
+                "the packed archive reads as it did when it was packed; the copy is {length} \
+                 bytes, reads as {}, and first differs from it at byte {first_difference}",
+                hex_of(digest)
+            ),
+            Self::Packed { digest } => write!(
+                formatter,
+                "the packed archive has changed since it was packed: it reads now as {}",
+                hex_of(digest)
+            ),
+        }
+    }
 }
 
 /// Holds `copy` to the archive packed at `packed`, which read as `digest` when it was packed.
-fn held_to(_packed: &Path, digest: [u8; 32], copy: &Path) -> Result<(), Unequal> {
+///
+/// A copy that does not read as `digest` is compared with the packed archive as it reads now, so
+/// that the failure says which of the two is not what was packed, and where the copy first differs.
+fn held_to(packed: &Path, digest: [u8; 32], copy: &Path) -> Result<(), Unequal> {
     if file_digest(copy) == digest {
         return Ok(());
     }
-    Err(Unequal::Copy { first_difference: 0 })
+    let now = file_digest(packed);
+    if now != digest {
+        return Err(Unequal::Packed { digest: now });
+    }
+    let archive = std::fs::read(packed).expect("the packed archive");
+    let copied = std::fs::read(copy).expect("the copy");
+    let first_difference = archive
+        .iter()
+        .zip(&copied)
+        .position(|(wanted, found)| wanted != found)
+        .unwrap_or(archive.len().min(copied.len()));
+    Err(Unequal::Copy {
+        first_difference: first_difference as u64,
+        length: copied.len() as u64,
+        digest: file_digest(copy),
+    })
+}
+
+/// A digest as lower-case hexadecimal.
+fn hex_of(digest: &[u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// The SHA-256 of the file at `path`, read whole.
@@ -1100,10 +1151,15 @@ fn pack(tree: &Path, top: &str, archive: &Path) {
         )
         .expect("a file is written");
     }
-    writer.finish().expect("the archive is written");
+    writer
+        .finish()
+        .and_then(|file| file.sync_all().map_err(Into::into))
+        .expect("the archive is written");
 }
 
-/// Packs `tree` as an archive whose entries are under `top`, gzipped quickly.
+/// Packs `tree` as an archive whose entries are under `top`, gzipped quickly. The archive is on the
+/// disk when this returns: the write ends with the file synced, and what is read back, taken a digest
+/// of and copied after it is the file as the disk holds it.
 #[cfg(unix)]
 fn pack(tree: &Path, top: &str, archive: &Path) {
     let file = std::fs::File::create(archive).expect("an archive");
@@ -1116,7 +1172,7 @@ fn pack(tree: &Path, top: &str, archive: &Path) {
     builder
         .into_inner()
         .and_then(flate2::write::GzEncoder::finish)
-        .and_then(|mut file| file.flush())
+        .and_then(|file| file.sync_all())
         .expect("the archive is written");
 }
 
