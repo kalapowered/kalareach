@@ -8258,9 +8258,22 @@ one that holds a raw 8-bit control, which can end it and begin another. A page t
 inside one withholds that part of it, and a string that has begun and not ended is left out of the
 page until it ends, because nothing yet says what it is. A reader that asks where the output ends is
 told where it may read to. The worker keeps up to 65,536 such ranges apart for a session; past that
-it joins the nearest, and the words between two joined ranges are replaced too. The local owner is
-paged the output as it was written. The worker cannot tell a device that holds `files.read` from one
-that does not, since the scope a forwarded read carries states no rights, so no device is paged one.
+it joins the nearer half of the pairs of neighbours into one range each, and the words between two
+joined ranges are replaced too. The local owner is paged the output as it was written. The worker
+cannot tell a device that holds `files.read` from one that does not, since the scope a forwarded
+read carries states no rights, so no device is paged one.
+
+What the live policy delivers to the attachment that holds the input lease, and to none other, is
+not served either: the text of an OSC 52 clipboard write, of an OSC 9, 99 or 777 notification, and
+a progress report. A page served to a caller under a grant has each such string replaced by NUL as
+it has a file's, and the local owner is paged it as written. Strings that only describe the screen
+are still paged as written: a title, the working directory of OSC 7, the target of an OSC 8 link,
+and the marks of OSC 133 and 633. The live stream leaves them out for the holder of a share, and a
+page of retained output does not.
+
+A worker an earlier release started stays where it was started until its session ends, and it
+serves its pages as written, so the withholding holds for the sessions whose worker this release
+started.
 A transfer that is not a control string, as ZMODEM is not, is paged as written. So is a run the
 engine reads as text but another terminal may read as a control, such as an encoded 8-bit control
 (`U+009D`): a client that replays a page into a terminal classifies it first.

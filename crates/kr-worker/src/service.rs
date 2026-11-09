@@ -8670,7 +8670,9 @@ impl WorkerService {
         };
         // What a terminal takes for a file or a picture is a file's bytes, and needs a file grant
         // of its own that the scope a read carries never states, so only a reader that holds one
-        // by being the local owner is given it: no attachment is, of the live stream.
+        // by being the local owner is given it: no attachment is, of the live stream. The text of
+        // a clipboard write or a notification goes, of the live stream, to the attachment that
+        // holds the input lease alone, so the same reader is not paged it either.
         let files = if filter.scope().reads_files() {
             crate::history::Files::Served
         } else {

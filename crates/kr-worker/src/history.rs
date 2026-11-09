@@ -106,15 +106,16 @@ pub enum Reach {
     },
 }
 
-/// Whether a reader of retained output is given what a terminal takes for a file or a picture.
+/// Whether a reader of retained output is given what a terminal takes for a file or a picture, and
+/// the text of what the live policy delivers to the attachment that holds the input lease alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Files {
     /// The output as it was written.
     Served,
-    /// The output with each control string of the extension class, and each whose payload a
-    /// terminal could frame differently from the engine, replaced by NUL, byte for byte, so that no
-    /// cursor moves, and with no sequence that has begun and not ended: nothing yet says what it
-    /// is.
+    /// The output with each control string of the extension class or the side-effect class, and
+    /// each whose payload a terminal could frame differently from the engine, replaced by NUL, byte
+    /// for byte, so that no cursor moves, and with no sequence that has begun and not ended:
+    /// nothing yet says what it is.
     Withheld,
 }
 
@@ -1490,7 +1491,8 @@ impl OutputHistory {
     }
 
     /// Reads one page of retained output for a reader that reaches `reach` of it and is not given
-    /// what a terminal takes for a file or a picture ([`Files::Withheld`]).
+    /// what a terminal takes for a file or a picture, nor the text of a clipboard write or a
+    /// notification ([`Files::Withheld`]).
     ///
     /// The page is [`Self::page_within`]'s with each such control string replaced by NUL, byte for
     /// byte, so every cursor in it is where it was, and cut where `settled` is when it reaches

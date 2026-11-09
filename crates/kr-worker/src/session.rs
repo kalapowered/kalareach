@@ -4153,7 +4153,8 @@ impl Session {
     }
 
     /// Reads one page of retained output for a reader that reaches `reach` of it, and is given
-    /// what a terminal takes for a file or a picture only when `files` says so.
+    /// what a terminal takes for a file or a picture, and the text of a clipboard write or a
+    /// notification, only when `files` says so.
     ///
     /// # Errors
     ///

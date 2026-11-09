@@ -127,9 +127,11 @@ pub struct FeedOutcome {
     /// The spans of control strings that no reader of the raw stream may be given as they were
     /// written: those of the extension class (an inline file of the iTerm2 protocol, a sixel
     /// picture, a Kitty graphics command, a string of a kind the profile names no class for, and a
-    /// string discarded whole), and any other string whose payload a terminal could frame
+    /// string discarded whole), those of the side-effect class (the text of a clipboard write or of
+    /// a notification, a progress report), which the policy delivers to the attachment that holds
+    /// the input lease and to none other, and any other string whose payload a terminal could frame
     /// differently from this engine, since a raw 8-bit control inside it can end it and begin
-    /// another. Of these, the first are what a terminal takes for a file or a picture.
+    /// another. A terminal takes some of the extension class for a file or a picture.
     pub withheld_strings: Vec<ByteSpan>,
     /// Side effects to route.
     pub side_effects: Vec<SideEffect>,
@@ -582,8 +584,10 @@ impl Engine {
                     | EventKind::Dcs { .. }
                     | EventKind::OtherString { .. }
                     | EventKind::Discarded { .. }
-            ) && (event.class == SequenceClass::Extension
-                || !event.kind.payload_is_direct_safe())
+            ) && (matches!(
+                event.class,
+                SequenceClass::Extension | SequenceClass::SideEffect
+            ) || !event.kind.payload_is_direct_safe())
             {
                 push_span(&mut outcome.withheld_strings, event.span);
             }
