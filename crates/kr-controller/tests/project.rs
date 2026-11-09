@@ -4673,13 +4673,14 @@ async fn until_the_first_sweep_finishes(module: &kr_controller::project::Project
 }
 
 /// The sweep lets go of what the owner's ledger has let go of, while the daemon runs, and of
-/// nothing else: a challenge nobody answers holds its directory only until the ledger's lifetime
-/// for it is over, whether or not a location method runs.
+/// nothing else: a challenge nobody answers keeps its directory open until a sweep, or a location
+/// method, finds that the ledger has let go of it.
 ///
 /// Two challenges are issued half a lifetime apart, and the ledger's clock is taken on past the
 /// first one's lifetime and short of the second's. The sweep the enrolment starts lets go of the
 /// first, so a call for it finds none left, and leaves the second, which the same call finds once
-/// the ledger has let go of it too.
+/// the ledger has let go of it too. The case relies on no later sweep coming between its steps,
+/// which `CHALLENGE_SWEEP` allows: a process stopped for that long fails it, and never passes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_challenge_sweep_lets_go_of_the_challenges_the_ledger_let_go_and_of_no_other() {
     let owned = owned(&owner_keys()).await;
@@ -4731,13 +4732,16 @@ async fn the_challenge_sweep_lets_go_of_the_challenges_the_ledger_let_go_and_of_
         "the sweep left the challenge the ledger still held"
     );
     drop(module);
+    drop(owner);
     let _ = owned.stop().await;
 }
 
-/// A module that goes takes its owner with it, and through the owner the pairing service and the
-/// stores it holds: the sweep it started holds neither between its sweeps. The sweep has finished
-/// once when the module goes, so what it kept is what it keeps while it waits for its next tick,
-/// and the case does not wait for one.
+/// A module that goes takes its owner with it, and with the owner its hold on the pairing service
+/// and the stores that service holds: the sweep the module started holds neither between its
+/// sweeps. The sweep has finished once when the module goes, so what it kept is what it keeps while
+/// it waits for its next tick, and the case does not wait for one. It relies on that tick not
+/// coming before the module goes, which `CHALLENGE_SWEEP` allows: a process stopped for that long
+/// fails it, and never passes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_project_module_that_goes_leaves_nothing_of_its_owner_to_the_challenge_sweep() {
     let owned = owned(&owner_keys()).await;
@@ -4756,7 +4760,7 @@ async fn a_project_module_that_goes_leaves_nothing_of_its_owner_to_the_challenge
     drop(module);
     assert!(
         lent.upgrade().is_none(),
-        "the owner, and the pairing service it holds, went with the module that was lent them"
+        "the owner, and with it the module's hold on the pairing service, went with the module"
     );
     let _ = owned.stop().await;
 }
