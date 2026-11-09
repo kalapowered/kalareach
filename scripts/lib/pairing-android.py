@@ -64,9 +64,12 @@ AWAY = ([-1.807, 0.32, 3.584], [0.0, 30.0, 0.0])
 VIEW_SECONDS = 6
 
 # How long a scan is given in all: every view its seconds, and a minute besides for the wrong codes
-# put away on the way. A wrong code restarts the scanner at the same view; it never gives the scan
-# more time than this.
+# put away on the way. A wrong code restarts the scanner at the same view. No view is moved to, and no
+# wrong code put away, once that time has passed, and each step of putting one away is given only the
+# time that is left (at least STEP_SECONDS, so a step that takes a second is not cut short), so a scan
+# can end a few seconds after its time and never gives a view any more.
 SCAN_SECONDS = len(VIEWS) * VIEW_SECONDS + 60
+STEP_SECONDS = 5
 
 
 def look(port: str, view) -> None:
@@ -293,8 +296,22 @@ def scan(
     phone.press(opener)
     began = time.monotonic()
     limit = began + SCAN_SECONDS
+
+    def left() -> float:
+        """The time the scan has left, and nothing once its time has passed."""
+        return max(limit - time.monotonic(), 0.0)
+
+    def step_time(most: float) -> float:
+        """What a step of putting a wrong code away is given: its own limit, or what is left."""
+        return min(most, max(left(), STEP_SECONDS))
+
+    given = 0
     for view in VIEWS:
+        # A view is moved to only while the scan has time; once it has none, no view is given any.
+        if left() <= 0:
+            break
         look(port, view)
+        given += 1
         end = min(time.monotonic() + VIEW_SECONDS, limit)
         while time.monotonic() < end:
             nodes = phone.screen()
@@ -306,15 +323,29 @@ def scan(
             if any(wanted(each) for each in labels):
                 return
             if any(stale(each) for each in labels):
-                phone.press("Cancel")
-                phone.wait(lambda each: each == "Pair with a host", "the pairing screen after the wrong code was put away")
-                phone.press("Scan code")
+                # The wrong code is put away and the scanner opened again only while there is time for it,
+                # and each step is given the time that is left, so a retry that starts before the limit
+                # does not run on past it for the steps' own limits.
+                if left() <= 0:
+                    break
+                phone.press("Cancel", step_time(30))
+                if left() <= 0:
+                    break
+                phone.wait(
+                    lambda each: each == "Pair with a host",
+                    "the pairing screen after the wrong code was put away",
+                    step_time(60),
+                )
+                if left() <= 0:
+                    break
+                phone.press("Scan code", step_time(30))
                 end = min(time.monotonic() + VIEW_SECONDS, limit)
                 continue
             time.sleep(0.3)
     phone.give_up(
-        f"timed out waiting for {what}: the scanner read the picture at none of {len(VIEWS)} views in "
-        f"{time.monotonic() - began:.0f} s (a scan is given at most {SCAN_SECONDS} s)"
+        f"timed out waiting for {what}: the scanner did not read the picture at any of the {given} of "
+        f"{len(VIEWS)} views the scan had time for, in {time.monotonic() - began:.0f} s (a scan's time is "
+        f"{SCAN_SECONDS} s; no view or wrong-code retry starts after it)"
     )
 
 
