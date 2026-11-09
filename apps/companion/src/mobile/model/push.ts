@@ -16,8 +16,11 @@ import type { PushView } from '../../host/port'
 export interface Notifications {
   /** Null until native code has answered once. */
   readonly view: PushView | null
-  /** Turns notifications on for the host `reference` names. */
-  readonly enable: (reference: string) => Promise<void>
+  /**
+   * Turns notifications on for the host `reference` names. For a host whose last registration has
+   * an outcome nobody knows, `afterUnknown` is that registration's action, as the row showed it.
+   */
+  readonly enable: (reference: string, afterUnknown?: string) => Promise<void>
   /** Chooses whether the notifications of the host `reference` names show what needs the person. */
   readonly setPreviews: (reference: string, on: boolean) => Promise<void>
   /** Opens this application's page in the system's settings. */
@@ -57,8 +60,8 @@ export function useNotifications(): Notifications {
   }, [port, take])
 
   const enable = useCallback(
-    async (reference: string) => {
-      take(await port.pushEnable(reference))
+    async (reference: string, afterUnknown?: string) => {
+      take(await port.pushEnable(reference, afterUnknown))
     },
     [port, take]
   )

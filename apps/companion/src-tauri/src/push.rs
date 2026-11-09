@@ -33,8 +33,14 @@
 //! the registration that last turned the host on proposed, the choice of previews and the choice the
 //! host was last told, and the last outcome in words. It holds no token, no key and no
 //! credential. The credential exists in memory between the gateway's issue and the host's answer
-//! and is never kept: a registration whose answer was lost is made again under a new action with a
-//! fresh credential, which is what the host expects.
+//! and is never kept.
+//!
+//! A registration is sent under an action the phone names, and the phone keeps it before it sends
+//! (`unsettled`: the action, words that say why it is not settled, the digest of the token the
+//! registration proposed, the choice of previews it carried, and when). The entry is cleared when
+//! the host's answer settles the action: the host took the registration, or refused it for good,
+//! or `action.read` says which. It stays when the host did not say, whether the answer was lost,
+//! the host said it could not establish the outcome, or the application ended before it heard.
 //!
 //! A record that cannot be read (damaged, or written by a build this one does not know) holds each
 //! host's authorisation identifier, so it is moved aside whole and never written over. The desk
@@ -48,9 +54,19 @@
 //!
 //! # What repeats
 //!
-//! Each step is safe to repeat, so a restart, a lost answer or a changed token is mended by doing
-//! the sequence again for the host that asked: the same installation key, the same authorisation
-//! identifier, a new action. A change of the token is found by comparing, not by being told: a run
+//! Each step is safe to repeat, so a restart before the registration was sent, a refusal for now or
+//! a changed token is mended by doing the sequence again for the host that asked: the same
+//! installation key, the same authorisation identifier, a new action. A registration whose outcome
+//! is not known is not repeated by the phone of its own accord, since a new action after an
+//! uncertain one replaces what the host may already hold: a look asks the host about the action
+//! and settles it when the host says what became of it, and a new registration is made after an
+//! unknown one only when the person asks for it, with the earlier result shown to them, which is
+//! asked once more before the new one is sent. The host is asked by sending the exact request again
+//! on a connection of its own, which it answers from its record of the action and never acts on
+//! twice. That request holds the credential the gateway issued, so it is kept in memory only, for
+//! as long as the outcome is unknown; after a restart the host is asked for its receipt
+//! (`action.read`) instead. A change of the token is found by
+//! comparing, not by being told: a run
 //! writes a host on only when it has read the token again and found the one it proposed, and each
 //! look compares the digest the record keeps with the token the provider holds and registers a host
 //! that is on with another again, so no exit of the application can lose a change. A
@@ -71,10 +87,11 @@ use kr_client::services::push::{InstallationSigner, PushGateway, Registration};
 use kr_client::services::{
     HttpDeadlines, HttpService, PushService, ServiceHttp, ServiceSigner, managed_response_limits,
 };
+use kr_client::session::ComposedMutation;
 use kr_client::{Said as _, Shown};
 use kr_ipc::paths::{read_owner_only_file, write_owner_only_file};
 use kr_protocol::ids::DeviceKeyRevision;
-use kr_protocol::ids::{DeviceId, PushRegistrationId, PushSenderRecordId};
+use kr_protocol::ids::{ActionId, DeviceId, PushRegistrationId, PushSenderRecordId};
 use kr_protocol::push::{
     DevicePushRegisterParams, DevicePushRegisterResult, PushPlatform, PushRegistrationProposal,
     PushSenderIssueRequest, RegistrationToken, token_digest,
@@ -200,6 +217,29 @@ struct HostPush {
     /// The choice the host was last told. None reads as on, for the same reason.
     #[serde(default)]
     told_previews: Option<bool>,
+    /// A registration sent to the host whose outcome is not known. A record written before it was
+    /// kept, and a host with no such registration, have none; a build that does not know the field
+    /// reads the record without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unsettled: Option<Unsettled>,
+}
+
+/// A registration the host may or may not have taken: what the phone keeps from before it sends one
+/// until the host's answer, or `action.read`, settles it. It holds no token, no key and no
+/// credential.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Unsettled {
+    /// The action the registration was sent under, which is never sent again and is read for its
+    /// result.
+    action_id: ActionId,
+    /// Why it is not settled, in words for the person.
+    words: String,
+    /// The digest of the token the registration proposed: what the host is on for when it took it.
+    digest: Digest256,
+    /// The choice of previews the registration carried.
+    previews: bool,
+    /// When it was sent, in UTC milliseconds.
+    at_ms: u64,
 }
 
 impl HostPush {
@@ -215,6 +255,7 @@ impl HostPush {
             lost: false,
             previews: true,
             told_previews: None,
+            unsettled: None,
         }
     }
 }
@@ -249,6 +290,47 @@ const ASIDE_NAMES: u32 = 1_000;
 const BESIDE_THE_HOST_IN_USE: &str = "This host is reached through the same relay as the host you \
                                       are using. Choose Try again to turn notifications on for it; \
                                       the host in use reconnects afterwards.";
+
+/// What a registration that was sent, or was about to be, is kept as until the host's answer
+/// settles it: what a restart leaves, and what the person is told then.
+const SENT_WORDS: &str = "This phone registered with the host and was interrupted before it heard \
+                          whether the host took the registration. Notifications from the host may \
+                          not arrive until a registration is known to be taken. This phone asks \
+                          the host what became of it, and registers again only when you ask it to.";
+
+/// What the person is told when the record could not be written before a registration was sent.
+const NOT_KEPT_BEFORE_SENDING: &str = "This phone could not keep a record of the registration it \
+                                       was about to send, so it sent none. Try again.";
+
+/// What the person is told of a registration whose outcome is not known, with `why` the host's
+/// failure or silence.
+fn unknown_words(why: &str, full: bool) -> String {
+    let what = if full {
+        "taken this phone as a destination"
+    } else {
+        "taken this choice of previews"
+    };
+    let may_not_notify = if full {
+        ""
+    } else {
+        " It may not be able to notify this phone until a registration is known to be taken."
+    };
+    format!(
+        "The host may or may not have {what}: {why}.{may_not_notify} This phone asks the host what \
+         became of it, and registers again only when you ask it to."
+    )
+}
+
+/// What the host said of a registration whose answer this phone did not hear.
+enum Settling {
+    /// The host took it, and the choice of previews and the preview key are told: the digest of the
+    /// token it proposed.
+    Taken(Digest256),
+    /// The host did not take it, for the reason in words.
+    NotTaken(String),
+    /// The host cannot say, or would not, in words.
+    Undecided(String),
+}
 
 /// The choice a record that holds none reads as.
 const fn previews_on() -> bool {
@@ -288,6 +370,18 @@ pub struct HostPushView {
     /// What the person chose for the text of the notification: true shows what needs them, false
     /// only that something does. The choice as recorded, whether or not the host has been told.
     pub previews: bool,
+    /// The registration whose outcome is not known, when there is one and nothing is running: the
+    /// words above say so, and a new registration is made only when the person asks for it, naming
+    /// this one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unknown: Option<UnknownView>,
+}
+
+/// A registration the host may or may not have taken, as the page is shown it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct UnknownView {
+    /// The action it was sent under, which the person's request for a new registration names.
+    pub action_id: String,
 }
 
 /// Where one host's notifications stand, as the page tells them.
@@ -349,9 +443,24 @@ pub enum LineStop {
     /// This phone stopped itself before it asked the host, or after it was answered: the words are
     /// its own, and the host refused nothing.
     Phone(String),
-    /// The host refused the change, did not answer it, or answered with what this phone does not
-    /// read.
+    /// The host refused the change for good or for now, or the change could not be sent: nothing
+    /// took effect, and the words say why.
     Host(String),
+    /// The change was sent and the host may have made it: the answer was lost, the host said it
+    /// could not establish the outcome, or what it answered is not one this phone reads. The words
+    /// say why the outcome is not known.
+    Unknown(String),
+}
+
+/// What the host says became of a registration this phone sent and did not hear the answer to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RegistrationRead {
+    /// The host took it.
+    Taken,
+    /// The host did not take it, and will not: it refused it or never admitted it.
+    NotTaken(String),
+    /// The host cannot say, or would not: the words say what it answered.
+    Undecided(String),
 }
 
 /// What only the platform can say or do about notifications.
@@ -383,6 +492,9 @@ enum Job {
     /// whose digest this holds: the person's choice of previews changed, and nothing the provider
     /// or the gateway holds did.
     Delivery(Digest256),
+    /// The host is asked what became of a registration whose answer this phone did not hear, and
+    /// nothing is registered: the registration it was sent under is `unsettled`.
+    Settle,
 }
 
 /// What a run does once the host has been told.
@@ -434,11 +546,16 @@ pub type LineFuture<'a, T> =
 /// its run is still wanted before it makes the connection and before each change, so a host the
 /// person forgot meanwhile is sent nothing.
 pub trait HostLine: Send {
-    /// Sends `device.push.register`, and answers what the host answered.
+    /// Sends `device.push.register` under `action`, which the desk named and kept before this is
+    /// called, and answers what the host answered. An outcome the host may have made is
+    /// [`LineStop::Unknown`], never [`LineStop::Host`].
     fn register(
         &mut self,
+        action: ActionId,
         params: DevicePushRegisterParams,
     ) -> LineFuture<'_, DevicePushRegisterResult>;
+    /// Reads what the host recorded of the registration sent under `action` (`action.read`).
+    fn read_registration(&mut self, action: ActionId) -> LineFuture<'_, RegistrationRead>;
     /// Sends `device.preview_key.update`, which says which preview key this phone holds and at
     /// which revision. When the host answers, the line records the revision, since a connection
     /// offers the revision the host holds and is refused at another.
@@ -809,6 +926,14 @@ impl PushDesk {
                     words,
                     settings: kept.is_some_and(|kept| kept.settings),
                     previews: kept.is_none_or(|kept| kept.previews),
+                    // Offered only once the run that sent the registration has ended: while it
+                    // runs the registration is not one the person is asked about.
+                    unknown: kept
+                        .filter(|kept| kept.phase == Phase::Attention)
+                        .and_then(|kept| kept.unsettled.as_ref())
+                        .map(|unsettled| UnknownView {
+                            action_id: unsettled.action_id.to_string(),
+                        }),
                 }
             })
             .collect();
@@ -831,16 +956,35 @@ impl PushDesk {
     /// The host is the one the person chose, held from here to the end: a sequence that outlives a
     /// change of the host in use still ends at the host it began for.
     ///
+    /// A host whose registration has an outcome nobody knows is registered again only on this
+    /// request, which names that registration (`after_unknown`, the action the page was shown): a
+    /// request that names none, or another than the one the host stands at now, is for a view the
+    /// host has since left, and nothing is sent. The sequence reads what the host recorded of the
+    /// earlier registration first, and registers again only if the host did not take it.
+    ///
     /// # Errors
     ///
     /// Returns a refusal when this phone is not paired with that host.
-    pub fn enable(self: &Arc<Self>, reference: &str) -> Result<PushView> {
+    pub fn enable(
+        self: &Arc<Self>,
+        reference: &str,
+        after_unknown: Option<&str>,
+    ) -> Result<PushView> {
         let host = self
             .device
             .host_by_reference(reference)
             .ok_or_else(crate::hosts::unknown_host)?;
         if self.write_blocked {
             // A host started now would be one this phone could not remember.
+            return Ok(self.view());
+        }
+        let standing = lock(&self.state)
+            .record
+            .hosts
+            .get(&host.host_device_id.to_string())
+            .and_then(|kept| kept.unsettled.as_ref())
+            .map(|unsettled| unsettled.action_id.to_string());
+        if standing.as_deref() != after_unknown {
             return Ok(self.view());
         }
         // A host that is on, and is shown as needing the person only because the receivers could not
@@ -1073,6 +1217,12 @@ impl PushDesk {
                         }
                     }
                     Phase::Working => (None, None),
+                    // A registration whose outcome is not known is read, never replaced: a new one
+                    // is made only when the person asks for it.
+                    Phase::Attention if kept.unsettled.is_some() => (
+                        (!kept.lost && after_a_minute).then_some(Job::Settle),
+                        Some("Asking the host what became of the registration."),
+                    ),
                     Phase::Attention => ((!kept.lost && after_a_minute).then_some(Job::Full), None),
                 };
                 let Some(job) = due else {
@@ -1330,6 +1480,7 @@ impl PushDesk {
             kept.settings = false;
             kept.updated_ms = now;
             kept.registered = Some(registered);
+            kept.unsettled = None;
             self.keep(&state.record);
         }
         self.tell_page();
@@ -1446,18 +1597,206 @@ impl PushDesk {
         }
         match job {
             Job::Full => {
+                // The person asked for a new registration after one whose outcome is not known.
+                // What the host recorded of the earlier one is read first, so that a registration
+                // it took is not made twice.
+                if let Some(earlier) = self.earlier(host.host_device_id, run) {
+                    match self.settle(host, run, reach, &earlier).await? {
+                        Settling::Taken(digest) => return Ok(digest),
+                        // The host refused it for good: a new registration is a new intent.
+                        Settling::NotTaken(_) => self.clear_unsettled(host.host_device_id, run),
+                        // The host cannot say, and the person asked with that result shown.
+                        Settling::Undecided(_) => {}
+                    }
+                }
                 let (gateway, proposed) = self.propose(host, run).await?;
-                self.tell_host(host, run, reach, gateway.as_ref(), true)
+                self.tell_host(host, run, reach, gateway.as_ref(), true, proposed)
                     .await?;
                 Ok(proposed)
             }
             Job::Delivery(registered) => {
                 let (_, gateway) = self.gateway()?;
-                self.tell_host(host, run, reach, gateway.as_ref(), false)
+                self.tell_host(host, run, reach, gateway.as_ref(), false, registered)
                     .await?;
                 Ok(registered)
             }
+            Job::Settle => {
+                let Some(earlier) = self.earlier(host.host_device_id, run) else {
+                    return Err(forgotten_host());
+                };
+                match self.settle(host, run, reach, &earlier).await? {
+                    Settling::Taken(digest) => Ok(digest),
+                    Settling::NotTaken(why) => {
+                        self.clear_unsettled(host.host_device_id, run);
+                        Err(
+                            format!("The host did not take the registration: {why}. Try again.")
+                                .into(),
+                        )
+                    }
+                    Settling::Undecided(why) => Err(format!(
+                        "{} Asked again, the host did not settle it: {why}",
+                        earlier.words
+                    )
+                    .into()),
+                }
+            }
         }
+    }
+
+    /// The registration of `host` whose outcome is not known, while `run` holds the host.
+    fn earlier(&self, host: DeviceId, run: u64) -> Option<Unsettled> {
+        let state = lock(&self.state);
+        if !state.holds(host, run) {
+            return None;
+        }
+        state
+            .record
+            .hosts
+            .get(&host.to_string())
+            .and_then(|kept| kept.unsettled.clone())
+    }
+
+    /// Keeps the registration the run is about to send, before it is sent, so that nothing that
+    /// happens to the application after it can lose that it was. Fails, in words, when the run no
+    /// longer holds its host or the record cannot be written: nothing is sent then.
+    fn sending(
+        &self,
+        host: DeviceId,
+        run: u64,
+        unsettled: Unsettled,
+    ) -> std::result::Result<(), Stop> {
+        let mut state = lock(&self.state);
+        if !state.holds(host, run) {
+            return Err(forgotten_host());
+        }
+        let Some(kept) = state.record.hosts.get_mut(&host.to_string()) else {
+            return Err(forgotten_host());
+        };
+        let before = kept.unsettled.replace(unsettled);
+        if self.keep_checked(&state.record) {
+            return Ok(());
+        }
+        if let Some(kept) = state.record.hosts.get_mut(&host.to_string()) {
+            kept.unsettled = before;
+        }
+        Err(NOT_KEPT_BEFORE_SENDING.to_owned().into())
+    }
+
+    /// Says why the registration the run sent is not settled, and keeps it so. The words are what
+    /// the person is shown.
+    fn unknown(&self, host: DeviceId, run: u64, why: &str, full: bool) -> Stop {
+        let words = unknown_words(why, full);
+        {
+            let mut state = lock(&self.state);
+            if state.holds(host, run)
+                && let Some(unsettled) = state
+                    .record
+                    .hosts
+                    .get_mut(&host.to_string())
+                    .and_then(|kept| kept.unsettled.as_mut())
+            {
+                unsettled.words.clone_from(&words);
+                self.keep(&state.record);
+            }
+        }
+        words.into()
+    }
+
+    /// The host's answer settled the registration: it is no longer kept as one that is not.
+    fn clear_unsettled(&self, host: DeviceId, run: u64) {
+        let mut state = lock(&self.state);
+        if !state.holds(host, run) {
+            return;
+        }
+        if let Some(kept) = state.record.hosts.get_mut(&host.to_string()) {
+            kept.unsettled = None;
+        }
+        self.keep(&state.record);
+    }
+
+    /// Asks the host what it recorded of the registration `earlier` it may have taken, over a
+    /// connection of its own. When it took it, what remains of that registration is told: the
+    /// choice of previews it carried is what the host was told, and then the preview key.
+    async fn settle(
+        &self,
+        host: &PairedHost,
+        run: u64,
+        reach: Reach,
+        earlier: &Unsettled,
+    ) -> std::result::Result<Settling, Stop> {
+        let wanted = || self.wanted(host.host_device_id, run);
+        if !wanted() {
+            return Err(forgotten_host());
+        }
+        let mut line = self.registrar.connect(host, reach).await.map_err(|words| {
+            if wanted() {
+                format!(
+                    "This phone could not reach the host to ask what became of the registration: \
+                     {words}"
+                )
+                .into()
+            } else {
+                forgotten_host()
+            }
+        })?;
+        if !wanted() {
+            return Err(forgotten_host());
+        }
+        let read = match line.read_registration(earlier.action_id).await {
+            Ok(read) => read,
+            Err(LineStop::Phone(words)) => return Err(words.into()),
+            Err(LineStop::Host(words) | LineStop::Unknown(words)) => {
+                RegistrationRead::Undecided(words)
+            }
+        };
+        if !wanted() {
+            return Err(forgotten_host());
+        }
+        match read {
+            RegistrationRead::Taken => {
+                self.told(host.host_device_id, run, earlier.previews);
+                self.tell_the_key(host, line.as_mut())
+                    .await
+                    .map_err(|stop| {
+                        if !wanted() {
+                            return forgotten_host();
+                        }
+                        match stop {
+                            LineStop::Phone(words) => words.into(),
+                            LineStop::Host(words) | LineStop::Unknown(words) => format!(
+                                "The host took this phone as a destination, but did not confirm \
+                                 its preview key: {words}"
+                            )
+                            .into(),
+                        }
+                    })?;
+                Ok(Settling::Taken(earlier.digest))
+            }
+            RegistrationRead::NotTaken(why) => Ok(Settling::NotTaken(why)),
+            RegistrationRead::Undecided(why) => Ok(Settling::Undecided(why)),
+        }
+    }
+
+    /// Tells the host which preview key this phone holds, at the revision it holds now.
+    async fn tell_the_key(
+        &self,
+        host: &PairedHost,
+        line: &mut dyn HostLine,
+    ) -> std::result::Result<(), LineStop> {
+        // The revision the host holds, read now: the record may have moved since this run began.
+        let revision = self
+            .device
+            .pairing()
+            .hosts
+            .by_device(host.host_device_id)
+            .ok()
+            .flatten()
+            .map_or(host.device_key_revision, |held| held.device_key_revision);
+        line.update_preview_key(
+            *self.device.identity().keys.notification_preview.public(),
+            revision,
+        )
+        .await
     }
 
     /// The gateway this phone's requests go to, and the origin it is at.
@@ -1630,6 +1969,7 @@ impl PushDesk {
         reach: Reach,
         gateway: &dyn PushService,
         full: bool,
+        digest: Digest256,
     ) -> std::result::Result<(), Stop> {
         // The host is the one the person chose. A phone that was unpaired or forgot the host
         // meanwhile stops here, before the host is asked anything.
@@ -1662,11 +2002,13 @@ impl PushDesk {
             if !wanted() {
                 return forgotten_host();
             }
+            // An outcome nobody knows is told apart only for the registration, before this is
+            // reached; for any other step it is what it always was.
             match (stop, step) {
                 (LineStop::Phone(words), _) => words.into(),
                 // The host took the registration, and it is the preview key that it refused or did
                 // not answer: it holds this phone as a destination, and the key may be there too.
-                (LineStop::Host(words), Step::PreviewKey) => format!(
+                (LineStop::Host(words) | LineStop::Unknown(words), Step::PreviewKey) => format!(
                     "The host took this phone as a destination, but did not confirm its preview \
                      key: {words}"
                 )
@@ -1675,15 +2017,17 @@ impl PushDesk {
                 // the host holds: a host that refuses what follows, or whose answer is lost, may
                 // hold one the gateway no longer takes, and may not be able to notify this phone
                 // until a registration is taken.
-                (LineStop::Host(words), Step::Register) if !full => format!(
-                    "The host did not take this choice of previews, and it may not be able to \
+                (LineStop::Host(words) | LineStop::Unknown(words), Step::Register) if !full => {
+                    format!(
+                        "The host did not take this choice of previews, and it may not be able to \
                      notify this phone until it takes a registration: {words}"
-                )
-                .into(),
-                (LineStop::Host(words), _) if !full => {
+                    )
+                    .into()
+                }
+                (LineStop::Host(words) | LineStop::Unknown(words), _) if !full => {
                     format!("The host did not take this choice of previews: {words}").into()
                 }
-                (LineStop::Host(words), _) => {
+                (LineStop::Host(words) | LineStop::Unknown(words), _) => {
                     format!("The host did not take this phone as a destination: {words}").into()
                 }
             }
@@ -1712,34 +2056,53 @@ impl PushDesk {
         if !wanted() {
             return Err(forgotten_host());
         }
-        line.register(DevicePushRegisterParams {
-            credential: issued.credential,
-            // The host seals a preview to the key it holds for this phone when this is true, and
-            // the receivers open it with the keys filed before the host was reached.
-            previews_enabled: previews,
-        })
-        .await
-        .map_err(|stop| not_taken(stop, Step::Register))?;
+        // The registration is sent under an action this phone names and keeps first: whatever
+        // happens from here, a registration that may have been taken is known to have been sent,
+        // and is not replaced by one of this phone's own accord.
+        let action = ActionId::new(kr_ipc::new_uuid());
+        self.sending(
+            host.host_device_id,
+            run,
+            Unsettled {
+                action_id: action,
+                words: SENT_WORDS.to_owned(),
+                digest,
+                previews,
+                at_ms: (self.wiring.clock)(),
+            },
+        )?;
+        let answer = line
+            .register(
+                action,
+                DevicePushRegisterParams {
+                    credential: issued.credential,
+                    // The host seals a preview to the key it holds for this phone when this is
+                    // true, and the receivers open it with the keys filed before the host was
+                    // reached.
+                    previews_enabled: previews,
+                },
+            )
+            .await;
+        match answer {
+            Ok(_) => {}
+            Err(LineStop::Unknown(why)) => {
+                let stop = self.unknown(host.host_device_id, run, &why, full);
+                return Err(if wanted() { stop } else { forgotten_host() });
+            }
+            Err(stop) => {
+                // The host did not take it, or it was never sent: it is settled.
+                self.clear_unsettled(host.host_device_id, run);
+                return Err(not_taken(stop, Step::Register));
+            }
+        }
         if !wanted() {
             return Err(forgotten_host());
         }
         self.told(host.host_device_id, run, previews);
         if full {
-            // The revision the host holds, read now: the record may have moved since this run began.
-            let revision = self
-                .device
-                .pairing()
-                .hosts
-                .by_device(host.host_device_id)
-                .ok()
-                .flatten()
-                .map_or(host.device_key_revision, |held| held.device_key_revision);
-            line.update_preview_key(
-                *self.device.identity().keys.notification_preview.public(),
-                revision,
-            )
-            .await
-            .map_err(|stop| not_taken(stop, Step::PreviewKey))?;
+            self.tell_the_key(host, line.as_mut())
+                .await
+                .map_err(|stop| not_taken(stop, Step::PreviewKey))?;
         }
         // The line is not needed any more, and the hold on the host's endpoint goes with it.
         drop(line);
@@ -1760,6 +2123,8 @@ impl PushDesk {
     }
 
     /// Records that the host was told `previews`, while `run` holds it.
+    /// The host took a registration that carried the choice `previews`: it was told that, and no
+    /// registration of this host is unsettled any more.
     fn told(&self, host: DeviceId, run: u64, previews: bool) {
         let mut state = lock(&self.state);
         if !state.holds(host, run) {
@@ -1767,6 +2132,7 @@ impl PushDesk {
         }
         if let Some(kept) = state.record.hosts.get_mut(&host.to_string()) {
             kept.told_previews = Some(previews);
+            kept.unsettled = None;
         }
         self.keep(&state.record);
     }
@@ -2190,7 +2556,13 @@ fn after_a_restart(mut record: Record, now_ms: u64) -> Record {
     for kept in record.hosts.values_mut() {
         if kept.phase == Phase::Working {
             kept.phase = Phase::Attention;
-            "Turning on notifications was interrupted. Try again.".clone_into(&mut kept.words);
+            // A registration that was sent, or about to be, and not settled stays unsettled: what
+            // the person is told is that, and not that the run can be tried again.
+            match &kept.unsettled {
+                Some(unsettled) => kept.words.clone_from(&unsettled.words),
+                None => "Turning on notifications was interrupted. Try again."
+                    .clone_into(&mut kept.words),
+            }
             kept.settings = false;
             kept.updated_ms = kept.updated_ms.min(now_ms);
         }
@@ -2336,14 +2708,36 @@ async fn within_the_answer<T>(
         .unwrap_or_else(|_| Err("the host did not answer in time".to_owned()))
 }
 
+/// The registrations sent whose outcome is not known, each as it was composed, by the host they went
+/// to: the exact request a repeat sends, which the host answers from its record of the action. A
+/// request holds the credential the gateway issued, so it is kept in memory only: it is dropped when
+/// the host answers, when a later registration of the same host is composed in its place, and when
+/// the application ends, and it is never written. After a restart the result is read with
+/// `action.read` instead, for a host that keeps a receipt for it.
+type Repeats = Arc<Mutex<BTreeMap<DeviceId, (ActionId, ComposedMutation)>>>;
+
 /// The product's way to the host: a connection opened for the host, as the device the host made.
-pub struct ConnectionRegistrar(pub Arc<Device>);
+pub struct ConnectionRegistrar {
+    device: Arc<Device>,
+    repeats: Repeats,
+}
+
+impl ConnectionRegistrar {
+    /// The way to the hosts `device` is paired with.
+    #[must_use]
+    pub fn new(device: Arc<Device>) -> Self {
+        Self {
+            device,
+            repeats: Repeats::default(),
+        }
+    }
+}
 
 impl Registrar for ConnectionRegistrar {
     fn beside_the_host_in_use<'a>(&'a self, host: &'a PairedHost) -> AskFuture<'a> {
         Box::pin(async move {
-            let in_use = || self.0.host_in_use().map(|using| using.network_config);
-            self.0
+            let in_use = || self.device.host_in_use().map(|using| using.network_config);
+            self.device
                 .pairing()
                 .link
                 .would_refuse_visit(&host.network_config, &in_use)
@@ -2361,7 +2755,7 @@ impl Registrar for ConnectionRegistrar {
             // a visit to another host that shares its relay would close it, and so would the
             // host in use reconnecting. A look's run asks the pool whether the host in use allows
             // it, in the same request as the hold.
-            let link = &self.0.pairing().link;
+            let link = &self.device.pairing().link;
             let unreached = |_| "the host did not answer in time".to_owned();
             let held = match reach {
                 Reach::Asked => {
@@ -2372,7 +2766,7 @@ impl Registrar for ConnectionRegistrar {
                     .await
                 }
                 Reach::Visit => {
-                    let in_use = || self.0.host_in_use().map(|using| using.network_config);
+                    let in_use = || self.device.host_in_use().map(|using| using.network_config);
                     tokio::time::timeout(
                         crate::connection::CONNECT_WITHIN,
                         link.visit_hold(&host.network_config, &in_use),
@@ -2383,17 +2777,18 @@ impl Registrar for ConnectionRegistrar {
             .map_err(unreached)?
             .map_err(|error| error.said().into_string())?;
             let connection = match reach {
-                Reach::Asked => crate::connection::Connection::paired(&self.0, host).await,
-                Reach::Visit => crate::connection::Connection::visited(&self.0, host)
+                Reach::Asked => crate::connection::Connection::paired(&self.device, host).await,
+                Reach::Visit => crate::connection::Connection::visited(&self.device, host)
                     .await
                     .map_err(crate::connection::Unopened::into_error),
             }
             .map_err(|error| error.message)?;
             Ok(Box::new(ConnectionLine {
                 connection,
-                device: Arc::clone(&self.0),
+                device: Arc::clone(&self.device),
                 host_device_id: host.host_device_id,
                 device_id: host.device_id,
+                repeats: Arc::clone(&self.repeats),
                 _held: held,
             }) as Box<dyn HostLine + 'a>)
         })
@@ -2408,6 +2803,8 @@ struct ConnectionLine {
     host_device_id: DeviceId,
     /// The host's identifier for this phone.
     device_id: DeviceId,
+    /// The registrations whose outcome is not known, as composed.
+    repeats: Repeats,
     /// The hold on the host's endpoint, kept until the line is dropped.
     _held: kr_client::pairing::link::EndpointHold,
 }
@@ -2422,42 +2819,162 @@ impl ConnectionLine {
             None => Ok(()),
         }
     }
+
+    /// The registrations whose outcome is not known, as composed.
+    fn repeats(&self) -> MutexGuard<'_, BTreeMap<DeviceId, (ActionId, ComposedMutation)>> {
+        lock(&self.repeats)
+    }
+
+    /// What the host says of the registration `composed` when it is sent again exactly. The host
+    /// answers it from its record: the result when it took the registration, and the refusal when it
+    /// refused it. A refusal is not taken for the host's decision about the registration, since a
+    /// host that no longer admits this phone refuses a repeat for that reason as well, so only a
+    /// result, or a receipt that says what became of it, settles the action.
+    async fn repeated(&self, action: ActionId, composed: &ComposedMutation) -> RegistrationRead {
+        use kr_protocol::receipt::ReceiptState;
+
+        let session = self.connection.session();
+        let sent = tokio::time::timeout(ANSWER_WITHIN, session.repeat(composed)).await;
+        session.settle(action).await;
+        match sent {
+            Err(_) => RegistrationRead::Undecided("the host did not answer in time".to_owned()),
+            Ok(Ok(kr_client::Settled::Result(_))) => RegistrationRead::Taken,
+            Ok(Ok(kr_client::Settled::Receipt(receipt))) => match receipt.state {
+                ReceiptState::Applied => RegistrationRead::Taken,
+                ReceiptState::Refused | ReceiptState::Rejected => RegistrationRead::NotTaken(
+                    "the host recorded that it did not take it".to_owned(),
+                ),
+                other => RegistrationRead::Undecided(format!(
+                    "the host holds it as {}, which does not say whether it was taken",
+                    other.as_str()
+                )),
+            },
+            Ok(Err(error)) => RegistrationRead::Undecided(CommandError::from(error).message),
+        }
+    }
+
+    /// What the host says of the registration sent under `action` when asked for its receipt.
+    async fn receipt(&self, action: ActionId) -> RegistrationRead {
+        use kr_protocol::receipt::{ActionReadParams, ReceiptState};
+
+        let read = within_the_answer(async {
+            self.connection
+                .session()
+                .read_receipt(&ActionReadParams {
+                    action_id: action,
+                    session_id: None,
+                })
+                .await
+                .map_err(|error| CommandError::from(error).message)
+        })
+        .await;
+        match read {
+            Ok(read) if read.receipt.action_id != action => {
+                RegistrationRead::Undecided("the host answered about another action".to_owned())
+            }
+            Ok(read) => match read.receipt.state {
+                ReceiptState::Applied => RegistrationRead::Taken,
+                ReceiptState::Refused => {
+                    RegistrationRead::NotTaken("the host recorded that it refused it".to_owned())
+                }
+                ReceiptState::Rejected => RegistrationRead::NotTaken(
+                    "the host recorded that it rejected it before acting".to_owned(),
+                ),
+                other => RegistrationRead::Undecided(format!(
+                    "the host holds it as {}, which does not say whether it was taken",
+                    other.as_str()
+                )),
+            },
+            Err(words) => RegistrationRead::Undecided(words),
+        }
+    }
 }
 
 impl HostLine for ConnectionLine {
     fn register(
         &mut self,
+        action: ActionId,
         params: DevicePushRegisterParams,
     ) -> LineFuture<'_, DevicePushRegisterResult> {
         Box::pin(async move {
+            use kr_client::ClientError;
             use kr_protocol::envelope::ActionTarget;
             use kr_protocol::method::Method;
 
             self.still_the_account()?;
-            let settled = within_the_answer(async {
-                self.connection
-                    .session()
-                    .mutate(
-                        Method::DevicePushRegister,
-                        ActionTarget::environment(self.connection.environment_id()),
-                        None,
-                        &crate::commands::NoPreconditions {},
-                        &params,
-                        crate::commands::MUTATION_TTL,
-                    )
-                    .await
-                    .map_err(|error| CommandError::from(error).message)
-            })
-            .await
-            .map_err(LineStop::Host)?;
-            match settled {
-                kr_client::Settled::Result(value) => value.to_typed().map_err(|_| {
-                    LineStop::Host("its answer was not one this phone reads".to_owned())
-                }),
-                kr_client::Settled::Receipt(_) => Err(LineStop::Host(
+            let session = self.connection.session();
+            // Composed first, so that the action is the desk's own and is known whatever happens
+            // after the request is sent.
+            let composed = session
+                .compose(
+                    Method::DevicePushRegister,
+                    action,
+                    ActionTarget::environment(self.connection.environment_id()),
+                    None,
+                    &crate::commands::NoPreconditions {},
+                    &params,
+                    crate::commands::MUTATION_TTL,
+                )
+                .await
+                .map_err(|error| LineStop::Host(CommandError::from(error).message))?;
+            // Kept in memory before it is sent, as composed, so that the host can be asked about
+            // it again with the exact request, which is how it answers for an action of its own.
+            self.repeats()
+                .insert(self.host_device_id, (action, composed.clone()));
+            match tokio::time::timeout(ANSWER_WITHIN, session.send(&composed)).await {
+                // The request was sent and nothing came back: the host may have taken it.
+                Err(_) => Err(LineStop::Unknown(
+                    "the host did not answer in time".to_owned(),
+                )),
+                Ok(Ok(kr_client::Settled::Result(value))) => {
+                    session.settle(action).await;
+                    self.repeats().remove(&self.host_device_id);
+                    value.to_typed().map_err(|_| {
+                        LineStop::Unknown("its answer was not one this phone reads".to_owned())
+                    })
+                }
+                Ok(Ok(kr_client::Settled::Receipt(_))) => Err(LineStop::Unknown(
                     "it did not say it had taken the registration".to_owned(),
                 )),
+                // The connection ended after the request was sent, or the host said it could not
+                // establish the outcome: the action stays unresolved, and is asked about, not sent
+                // again.
+                Ok(Err(
+                    error @ (ClientError::SubmissionUncertain { .. }
+                    | ClientError::OutcomeUnknown { .. }),
+                )) => Err(LineStop::Unknown(CommandError::from(error).message)),
+                // The host refused it, for good or for now, or it could not be sent.
+                Ok(Err(error)) => {
+                    session.settle(action).await;
+                    self.repeats().remove(&self.host_device_id);
+                    Err(LineStop::Host(CommandError::from(error).message))
+                }
             }
+        })
+    }
+
+    fn read_registration(&mut self, action: ActionId) -> LineFuture<'_, RegistrationRead> {
+        Box::pin(async move {
+            self.still_the_account()?;
+            let held = self
+                .repeats()
+                .get(&self.host_device_id)
+                .filter(|(held, _)| *held == action)
+                .map(|(_, composed)| composed.clone());
+            let read = match held {
+                // The exact request again, on this connection, which is not the one that sent it: the
+                // host answers it from its record of the action, and never acts on it twice.
+                Some(composed) => self.repeated(action, &composed).await,
+                // Nothing in memory to repeat, as after a restart: the host is asked for its receipt.
+                None => self.receipt(action).await,
+            };
+            if matches!(
+                read,
+                RegistrationRead::Taken | RegistrationRead::NotTaken(_)
+            ) {
+                self.repeats().remove(&self.host_device_id);
+            }
+            Ok(read)
         })
     }
 
@@ -2570,6 +3087,7 @@ mod tests {
             lost: false,
             previews: true,
             told_previews: None,
+            unsettled: None,
         }
     }
 

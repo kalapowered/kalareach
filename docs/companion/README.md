@@ -584,8 +584,35 @@ notify this phone until it takes a registration. A host that took the registrati
 the preview key, or whose answer to the key was lost, is said to hold this phone as a destination and
 not to have confirmed its key.
 
-The page asks five commands of the backend: `push_view`, `push_enable`, `push_previews`,
-`push_refresh` and `notification_route`, and is told of a change on the `kr://push` event. Every view
+A registration whose outcome nobody knows is kept as that and is not replaced by the phone of its
+own accord. It is one whose answer was lost (the connection ended after it was sent, or the host did
+not answer within a minute), whose answer the host gave as one it could not establish or the phone
+cannot read, or that was sent when the application ended. The row says so, with the earlier result
+in the words ("The host may or may not have taken this phone as a destination: ..."), offers
+"Register again" in place of "Try again", and names the registration it shows when the person presses
+it. Neither a look when the application comes to the front nor the minute that lets a refusal be
+tried again makes another registration: each asks the host about that action over a connection of
+its own, at most once a minute, and the registration is settled when the host says what became of
+it. The host is asked by sending the exact request again, which it answers from its record of the
+action and never acts on twice; that request holds the credential the gateway issued, so the phone
+keeps it in memory only, while the outcome is unknown, and drops it when the host answers, when
+another registration of that host is sent and when the application ends. After a restart the host
+is asked for its receipt (`action.read`) instead. If the host took it, the host is on, the choice of
+previews it carried is the one the host was told, and the preview key is told; if its receipt says it
+refused it or never admitted it, the row says so and the next look registers again, as it does for
+any refusal. Any other answer leaves the registration unknown and the row says what the host
+answered: a refusal in answer to the repeat is not taken for the host's decision about the
+registration, since a host that no longer admits this phone refuses a repeat for that reason too,
+so the person decides. The person's request asks about the earlier registration once more before it
+registers again, and registers again, under a new action, unless the host says it took the earlier
+one; a request that names another registration than the one the host stands at, or none,
+is for a view the host has left, and sends nothing. A refusal of the host, a refusal for now, and a
+registration that was never sent (the phone could not reach the host or could not keep its record
+first) are not unknown, and are retried as before.
+
+The page asks five commands of the backend: `push_view`, `push_enable` (with, once a registration
+has no known outcome, the action of that registration), `push_previews`, `push_refresh` and
+`notification_route`, and is told of a change on the `kr://push` event. Every view
 the backend hands the page carries a revision, counted in the order the views are read. The page keeps
 the view with the highest revision it has seen, whether it came on the event or as the answer to a
 command, and drops an older one: an answer read before a change can arrive after it. `push.rs`
@@ -593,8 +620,15 @@ sequences the steps for the host the person chose and holds the result in `push/
 data directory: per host, whether the person asked, the authorisation identifier this phone issued for
 it (so that asking again issues under the same one), the digest of the token the registration that
 last turned the host on proposed, the choice of previews and the choice the host was last told (a
-record from before the choice existed reads as on), and the last outcome in words. The file holds no
-token, no key and no credential. A file that cannot be read, damaged or
+record from before the choice existed reads as on), and the last outcome in words. For a host whose
+registration has no known outcome the entry has one more field, `unsettled`: the action the
+registration was sent under, words that say why it is not settled, the digest of the token it
+proposed, the choice of previews it carried, and the time it was sent. It is written before the
+registration is sent, so that the application ending cannot lose that one was; it is cleared when
+the host's answer settles it (the host took it, or refused it) or `action.read` says which, and it is
+replaced by the new registration's own entry when the person asks for one and it is sent. A host with none has no such field in its
+entry, a record without it reads as none, and a release that does not keep it reads the record and
+ignores it. The file holds no token, no key and no credential. A file that cannot be read, damaged or
 written by a build this one does not know, is moved aside as `push/push.unreadable-<time>.json`
 and never written over, and the failure is logged. The new record marks each host paired at that
 moment as lost: the page shows it as needing the person, in place of off, across restarts, until the

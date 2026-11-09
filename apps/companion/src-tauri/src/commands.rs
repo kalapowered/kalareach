@@ -2751,12 +2751,21 @@ pub fn push_view(state: State<'_, AppState>) -> Result<crate::push::PushView> {
 /// The page names the host by the reference the pairing screen listed it under. Native code asks
 /// the system, asks the notification service, waits for its own receiver to answer the challenge,
 /// and gives the host the credential; the page is told where it stands on `kr://push`.
+///
+/// A host whose last registration has an outcome nobody knows is registered again only when the
+/// person asks for it with `after_unknown`, the action of that registration as the page was shown
+/// it: a request that does not name the registration the host stands at is for a view it has since
+/// left, and sends nothing.
 #[tauri::command]
-pub fn push_enable(state: State<'_, AppState>, reference: String) -> Result<crate::push::PushView> {
+pub fn push_enable(
+    state: State<'_, AppState>,
+    reference: String,
+    after_unknown: Option<String>,
+) -> Result<crate::push::PushView> {
     state
         .push()
         .ok_or_else(|| CommandError::unsupported("notifications are a phone's"))?
-        .enable(&reference)
+        .enable(&reference, after_unknown.as_deref())
 }
 
 /// Chooses whether the notifications of the host the page named show what needs the person, or only

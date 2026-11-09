@@ -775,8 +775,11 @@ function Pasted({
  *
  * Off asks for them to be turned on. While the steps run the words say which one, announced politely
  * and never as an alert: nothing is wrong. A stop says what is, and offers another go, and the
- * system's settings when that is where the person has to act. On says so and asks for nothing: only
- * the host ends a destination, and the system's setting stops the notifications on this phone.
+ * system's settings when that is where the person has to act. A registration the host may or may
+ * not have taken is said so, with the earlier result in the words, and the one thing offered is to
+ * register again: native code makes no other registration of its own accord after it, and this
+ * press names the registration shown. On says so and asks for nothing: only the host ends a
+ * destination, and the system's setting stops the notifications on this phone.
  *
  * Beneath the words, once the person has asked for notifications, is one choice: whether the
  * notification shows what needs them or only that something does. It takes effect at once on this
@@ -819,12 +822,18 @@ function HostNotifications({
             data-testid="notifications-enable"
             onClick={() => {
               setFailure(null)
-              enable(host.reference).catch((error: unknown) => {
+              // A host whose registration nobody knows the outcome of is registered again only
+              // by this press, which names the registration the words above describe.
+              enable(host.reference, row?.unknown?.action_id).catch((error: unknown) => {
                 setFailure(failureMessage(error))
               })
             }}
           >
-            {state === 'off' ? 'Turn on notifications' : 'Try again'}
+            {state === 'off'
+              ? 'Turn on notifications'
+              : row?.unknown === undefined
+                ? 'Try again'
+                : 'Register again'}
           </Button>
           {row?.settings === true ? (
             <Button

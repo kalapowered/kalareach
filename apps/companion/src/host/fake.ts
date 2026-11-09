@@ -782,6 +782,11 @@ export interface FakeHostControls {
   setPush(view: Omit<PushView, 'revision'>): void
   /** The references the person turned notifications on for, in order. */
   readonly pushEnabled: string[]
+  /**
+   * The registration each of those requests named as the one the person was shown with no known
+   * outcome, in the same order: undefined for a request that named none.
+   */
+  readonly pushEnabledAfter: (string | undefined)[]
   /** The choices the person made about the text of the notifications, in order. */
   readonly pushPreviewChoices: { readonly reference: string; readonly on: boolean }[]
   /** How many times the page asked native code to look again at where notifications stand. */
@@ -1124,6 +1129,7 @@ export function fakeHost(
     }
   })()
   const pushEnabled: string[] = []
+  const pushEnabledAfter: (string | undefined)[] = []
   const pushPreviewChoices: { reference: string; on: boolean }[] = []
   const pushLooks = { count: 0 }
   const pushListeners = new Set<(view: PushView) => void>()
@@ -2383,11 +2389,12 @@ export function fakeHost(
       return terminalOpensAnswer.then(() => view.handle)
     },
     pushView: () => Promise.resolve(push),
-    pushEnable: (reference) => {
+    pushEnable: (reference, afterUnknown) => {
       if (!pairing.hosts.some((host) => host.reference === reference)) {
         refuse('INVALID_ARGUMENT', 'This computer is not paired with that host.')
       }
       pushEnabled.push(reference)
+      pushEnabledAfter.push(afterUnknown)
       publishPush({
         ...push,
         hosts: [
@@ -3726,6 +3733,7 @@ export function fakeHost(
       publishPush(view)
     },
     pushEnabled,
+    pushEnabledAfter,
     pushPreviewChoices,
     pushLooks,
     routeNextTapTo(route) {
