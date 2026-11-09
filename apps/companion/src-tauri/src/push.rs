@@ -575,7 +575,9 @@ pub trait HostLine: Send {
         action: ActionId,
         params: DevicePushRegisterParams,
     ) -> LineFuture<'_, DevicePushRegisterResult>;
-    /// Reads what the host recorded of the registration sent under `action` (`action.read`).
+    /// Reads what the host recorded of the registration sent under `action`: a line that holds the
+    /// request it sent asks by sending it again, and one that does not asks for the receipt
+    /// (`action.read`).
     fn read_registration(&mut self, action: ActionId) -> LineFuture<'_, RegistrationRead>;
     /// Sends `device.preview_key.update`, which says which preview key this phone holds and at
     /// which revision. When the host answers, the line records the revision, since a connection
@@ -1047,7 +1049,9 @@ impl PushDesk {
     /// request, which names that registration (`after_unknown`, the action the page was shown): a
     /// request that names none, or another than the one the host stands at now, is for a view the
     /// host has since left, and nothing is sent. The sequence reads what the host recorded of the
-    /// earlier registration first, and registers again only if the host did not take it.
+    /// earlier registration first, and registers again unless the host says it took it: a read that
+    /// is undecided, or that says the host refused it, is followed by a new registration in the
+    /// same run, since the person asked for one.
     ///
     /// # Errors
     ///
@@ -2793,10 +2797,10 @@ async fn within_the_answer<T>(
 /// The registrations sent whose outcome is not known, each as it was composed, by the host they went
 /// to: the exact request a repeat sends, which the host answers from its record of the action. A
 /// request holds the credential the gateway issued, so it is kept in memory only: it is dropped when
-/// the host answers, when a later registration of the same host is composed in its place, when the
-/// host is forgotten or the account deleted, and when the application ends, and it is never written. After a restart none is held, and a look asks
-/// nothing; the person's request reads the result with `action.read`, for a host that keeps a
-/// receipt for it.
+/// the host's answer settles it, when a later registration of the same host is sent in its place,
+/// when the host is forgotten or the account deleted, and when the application ends, and it is never
+/// written. After a restart none is held, and a look asks nothing; the person's request reads the
+/// result with `action.read`, for a host that keeps a receipt for it.
 type Repeats = Arc<Mutex<Held<ComposedMutation>>>;
 
 /// What is kept in memory to send again, one request for each host, and how many times each host
@@ -2841,14 +2845,33 @@ impl<T: Clone> Held<T> {
             .map(|(_, request)| request.clone())
     }
 
-    /// Whether a request is held for `host` under `action`.
+    /// Whether a request is held for `host` under `action`. Nothing is copied.
     fn holds(&self, host: DeviceId, action: ActionId) -> bool {
-        self.get(host, action).is_some()
+        self.requests
+            .get(&host)
+            .is_some_and(|(held, _)| *held == action)
     }
 
-    /// Drops what is held for `host`: the host answered, or said what became of it.
-    fn settled(&mut self, host: DeviceId) {
-        self.requests.remove(&host);
+    /// Drops the request held for `host` under `action`: the host answered it, or said what became
+    /// of it. A request held under another action stays: an answer that is late belongs to the
+    /// registration it was sent for, and the host may have been sent another since.
+    fn settled(&mut self, host: DeviceId, action: ActionId) {
+        if self.holds(host, action) {
+            self.requests.remove(&host);
+        }
+    }
+
+    /// Drops what is held for `host` for any action but `action`, which is about to be sent: the
+    /// registration the host is asked about is the one the phone sends now, and what was held was
+    /// for an earlier one.
+    fn superseded_by(&mut self, host: DeviceId, action: ActionId) {
+        if self
+            .requests
+            .get(&host)
+            .is_some_and(|(held, _)| *held != action)
+        {
+            self.requests.remove(&host);
+        }
     }
 
     /// Drops what is held for `host`, which was forgotten: no line made before this keeps another.
@@ -3071,6 +3094,9 @@ impl HostLine for ConnectionLine {
             use kr_protocol::envelope::ActionTarget;
             use kr_protocol::method::Method;
 
+            // The desk kept this registration before it called, in place of the one it was asked
+            // about: what is held for the host is for an earlier action, whatever happens next.
+            self.repeats().superseded_by(self.host_device_id, action);
             self.still_the_account()?;
             let session = self.connection.session();
             // Composed first, so that the action is the desk's own and is known whatever happens
@@ -3107,7 +3133,7 @@ impl HostLine for ConnectionLine {
                 Ok(Ok(kr_client::Settled::Result(value))) => match value.to_typed() {
                     Ok(result) => {
                         session.settle(action).await;
-                        self.repeats().settled(self.host_device_id);
+                        self.repeats().settled(self.host_device_id, action);
                         Ok(result)
                     }
                     // The host answered, and what it said is not a result this phone reads: it
@@ -3129,7 +3155,7 @@ impl HostLine for ConnectionLine {
                 // The host refused it, for good or for now, or it could not be sent.
                 Ok(Err(error)) => {
                     session.settle(action).await;
-                    self.repeats().settled(self.host_device_id);
+                    self.repeats().settled(self.host_device_id, action);
                     Err(LineStop::Host(CommandError::from(error).message))
                 }
             }
@@ -3152,7 +3178,7 @@ impl HostLine for ConnectionLine {
                 read,
                 RegistrationRead::Taken | RegistrationRead::NotTaken(_)
             ) {
-                self.repeats().settled(self.host_device_id);
+                self.repeats().settled(self.host_device_id, action);
             }
             Ok(read)
         })
@@ -3391,27 +3417,15 @@ mod tests {
         }
     }
 
-    /// KR-REQ-23.24: the answer to a registration sent again settles it only when it is a result this
-    /// phone reads or a receipt for that action that says what became of it. An answer that is
-    /// neither, or a receipt of another action, leaves it unknown.
+    /// KR-REQ-23.24: the answer to a registration sent again settles it only when it is a receipt for
+    /// that action that says what became of it; a receipt of another action leaves it unknown. (A
+    /// result the phone cannot read is shown over a real connection, where it is sent.)
     #[test]
-    fn only_a_result_the_phone_reads_or_a_receipt_for_the_action_settles_a_repeated_registration() {
-        use kr_protocol::envelope::ParamsValue;
+    fn a_receipt_settles_a_repeated_registration_only_for_its_own_action() {
         use kr_protocol::receipt::ReceiptState;
 
         let action = ActionId::new(kr_ipc::new_uuid());
         let other = ActionId::new(kr_ipc::new_uuid());
-        let unreadable = kr_client::Settled::Result(
-            ParamsValue::from_typed(&"not a result of the method").expect("a text encodes"),
-        );
-        assert!(
-            matches!(
-                read_of_the_repeat(action, &unreadable),
-                RegistrationRead::Undecided(_)
-            ),
-            "a result that is no registration's is not the host taking it"
-        );
-
         let applied =
             |of| kr_client::Settled::Receipt(Box::new(receipt_of(of, ReceiptState::Applied)));
         assert_eq!(
@@ -3479,6 +3493,37 @@ mod tests {
             "a line made after, for the host paired again, keeps its own"
         );
         assert!(held.holds(host, action));
+    }
+
+    /// What a registrar keeps to send again for the registration the phone sent last is not dropped
+    /// by the late answer to one it sent before: the cleanup of a run that lost its claim, running
+    /// after a new run kept its own request, leaves the new one in place, and the new request
+    /// replaces what was held when it is about to be sent.
+    #[test]
+    fn a_late_answer_to_an_earlier_registration_leaves_the_request_held_for_a_newer_one() {
+        let host = DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16]));
+        let earlier = ActionId::new(kr_ipc::new_uuid());
+        let newer = ActionId::new(kr_ipc::new_uuid());
+        let mut held = Held::<&str>::default();
+        let now = held.forgettings(host);
+        assert!(held.keep(host, now, earlier, "the earlier request"));
+        held.superseded_by(host, newer);
+        assert!(
+            !held.holds(host, earlier),
+            "a registration about to be sent drops what was held for an earlier one"
+        );
+        assert!(held.keep(host, now, newer, "the newer request"));
+
+        held.settled(host, earlier);
+
+        assert!(
+            held.holds(host, newer),
+            "the answer to the earlier registration is not the answer to this one"
+        );
+        held.superseded_by(host, newer);
+        assert!(held.holds(host, newer), "control: the same action is kept");
+        held.settled(host, newer);
+        assert!(!held.holds(host, newer), "control: its own answer drops it");
     }
 
     /// A time later than the start's own is a clock set back: the retry is not delayed by it.
