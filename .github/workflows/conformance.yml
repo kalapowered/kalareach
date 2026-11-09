@@ -61,7 +61,7 @@ jobs:
       KR_TEST_ARTIFACTS_DIR: /tmp/kr-conformance-evidence
     steps:
       - name: Free the disk the build needs
-        timeout-minutes: 10
+        timeout-minutes: 6
         run: |
           df -h /
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
@@ -69,7 +69,7 @@ jobs:
           df -h /
 
       - name: Check out
-        timeout-minutes: 5
+        timeout-minutes: 3
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install the pinned toolchain
@@ -82,7 +82,7 @@ jobs:
       # The companion application's backend links the system WebView and the window toolkit. The
       # curses headers are for the applications the matrix builds from their release's source.
       - name: Install the build dependencies
-        timeout-minutes: 10
+        timeout-minutes: 6
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes \
@@ -90,11 +90,11 @@ jobs:
             libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libncurses-dev
 
       - name: Install the component target
-        timeout-minutes: 5
+        timeout-minutes: 3
         run: rustup target add wasm32-wasip2
 
       - name: Install pnpm
-        timeout-minutes: 5
+        timeout-minutes: 3
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
         with:
           version: 11.14.0
@@ -111,7 +111,7 @@ jobs:
           package-manager-cache: ${{ inputs.groups == '' || contains(inputs.groups, 'typescript') }}
 
       - name: Build the test components
-        timeout-minutes: 15
+        timeout-minutes: 5
         run: bash scripts/build-plugin-fixtures.sh
 
       # The release archives of the applications the matrix runs come from their projects' hosts,
@@ -135,7 +135,12 @@ jobs:
           restore-keys: conformance-applications-${{ runner.os }}-${{ runner.arch }}-
 
       # Every group this platform runs, the applications fetched and built from the pins in
-      # tests/conformance/applications.lock. The step fails when the run did.
+      # tests/conformance/applications.lock. The step fails when the run did. It took 152 to 207
+      # minutes on the eleven nights of 30 October to 9 November (207 on 8 November), and the job
+      # 155 to 210. The limits of the job's steps add up to 286 of its 300 minutes, the other steps'
+      # each at least twice the longest its step took in those nights (the disk step, at 2.7
+      # minutes, has 6). The report's 240 minutes are 33 over the slowest night, and 14 over it with
+      # the fetch's worst case (about 20 minutes, in scripts/run-conformance.sh) added.
       - name: The conformance report
         timeout-minutes: 240
         env:
@@ -193,7 +198,7 @@ jobs:
 
       - name: Keep the result and the evidence
         if: ${{ !cancelled() }}
-        timeout-minutes: 10
+        timeout-minutes: 5
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: conformance-linux
@@ -215,7 +220,7 @@ jobs:
       KR_TEST_ARTIFACTS_DIR: /tmp/kr-conformance-evidence
     steps:
       - name: Check out
-        timeout-minutes: 5
+        timeout-minutes: 3
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # The disk as the image arrives and what takes the room on it, and from here to the last
@@ -292,7 +297,7 @@ jobs:
           cargo --version
 
       - name: Install the component target
-        timeout-minutes: 5
+        timeout-minutes: 3
         run: rustup target add wasm32-wasip2
 
       # The iOS unit tests of the phones group build the library that opens a sealed notification
@@ -301,7 +306,7 @@ jobs:
       # that phase fails and no test of the scheme runs.
       - name: Install the iOS simulator target
         if: ${{ inputs.groups == '' || contains(inputs.groups, 'phones') }}
-        timeout-minutes: 5
+        timeout-minutes: 3
         run: rustup target add aarch64-apple-ios-sim
 
       # The worker's pseudo-terminal suite drives each shell section 3 names; the runner has Bash
@@ -316,7 +321,7 @@ jobs:
           fish --version
 
       - name: Install pnpm
-        timeout-minutes: 5
+        timeout-minutes: 3
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
         with:
           version: 11.14.0
@@ -333,7 +338,7 @@ jobs:
           package-manager-cache: ${{ inputs.groups == '' || contains(inputs.groups, 'typescript') }}
 
       - name: Build the test components
-        timeout-minutes: 15
+        timeout-minutes: 5
         run: bash scripts/build-plugin-fixtures.sh
 
       # The applications' release archives, kept under the lock that pins them and the script that
@@ -351,17 +356,20 @@ jobs:
           restore-keys: conformance-applications-${{ runner.os }}-${{ runner.arch }}-
 
       # The step runs every group of the platform one after the other, and it grows with the
-      # suites. It took 207 to 239 minutes on the eight nights of 30 October to 7 November that it
-      # finished, and it ran into its former limit of 240 minutes on the nights of 3 and 9 November,
-      # in its last step. Taking the steps a night did not reach at the pace of the steps it did,
-      # those two nights needed about 246 and 244 minutes, and 8 November, whose steps ran 14
-      # percent slower than those of 7 November and which waited out a download outage, about 265.
-      # The limit is what the job's limit leaves once the other steps have theirs, less 3 minutes
-      # for the set-up and clean-up that no step limit counts: the limits of the job's steps add up
-      # to 352 of its 355 minutes, which is under GitHub's six hours. That is 20 minutes more than
-      # the slowest night that was not slowed by the outage.
+      # suites. It took 207 to 240 minutes on the eleven nights of 30 October to 9 November, and it
+      # ran into its former limit of 240 minutes on 3, 8 and 9 November. Taking the steps a night
+      # did not reach at the pace of the steps it did, those nights needed about 246, 262 and 244
+      # minutes: 8 November's runner ran 14 percent slower than 7 November's, and the outage of that
+      # night's downloads added 3 minutes more. The limit is what the job's limit leaves once the
+      # other steps have theirs, less 3 minutes for the set-up and clean-up that no step limit
+      # counts. Those steps' limits add up to 63 minutes, each at least twice the longest its step
+      # took in the eleven nights (the disk step, at 3.8 minutes, has 8), so the limits of the
+      # job's steps add up to 352 of its 355 minutes, under GitHub's six hours. The report's 289
+      # minutes are 24 over 8 November's need with its outage, 27 over it without, and 8 over it
+      # with the fetch's worst case (about 20 minutes, in scripts/run-conformance.sh) in place of
+      # the outage.
       - name: The conformance report
-        timeout-minutes: 266
+        timeout-minutes: 289
         env:
           REPORT_GROUPS: ${{ inputs.groups }}
         run: |
@@ -423,7 +431,7 @@ jobs:
 
       - name: Keep the result and the evidence
         if: ${{ !cancelled() }}
-        timeout-minutes: 10
+        timeout-minutes: 5
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: conformance-macos
