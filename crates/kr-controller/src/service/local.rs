@@ -316,6 +316,20 @@ impl Controller {
         self.before_a_door_effect.arm()
     }
 
+    /// Arms the pause the next copy of an action stops at once its window has refused it and it has
+    /// looked for the claim of its action and found none while another arrival may carry the action
+    /// out, before it asks again whether that arrival still may. Returns the end that says the copy
+    /// has arrived, and the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_a_copy_looked_for_a_claim(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.after_a_copy_looked_for_a_claim.arm()
+    }
+
     /// Arms the signal that the next copy of an action to wait, because its window is refused and
     /// an arrival under the same identifier has not decided what it is doing, gives. Returns the end
     /// that says the copy is waiting. It fires once.
@@ -1024,7 +1038,25 @@ impl Controller {
                 // Asked before the claim is, so that a first attempt that writes its claim and ends
                 // between the two is read as its claim and not missed as an absent one.
                 let another_holds = another_may_carry_it_out(&mut arrival).await;
-                match self.transfer.settles(actor_id, &mutation, method).await {
+                let mut settling = self.transfer.settles(actor_id, &mutation, method).await;
+                // No claim while another arrival may carry the action out: that arrival may since
+                // have been refused before it did anything, or have written its claim and ended.
+                // Asked again, and the claim read again if it has gone, in that order, because a
+                // claim only moves from absent to open to settled: an arrival that is gone has
+                // left its claim, if it left one, where the second reading finds it.
+                if matches!(settling, crate::transfer::Settling::No) && another_holds {
+                    #[cfg(feature = "testing")]
+                    self.after_a_copy_looked_for_a_claim.wait().await;
+                    if another_may_carry_it_out(&mut arrival).await {
+                        return self.the_attempt_that_holds_the_action(
+                            &mutation,
+                            connection_id,
+                            admitted,
+                        );
+                    }
+                    settling = self.transfer.settles(actor_id, &mutation, method).await;
+                }
+                match settling {
                     crate::transfer::Settling::Open => None,
                     // The claim was settled between the lookup above and this one, by another copy
                     // of the action or by the sweep: what it recorded is the answer, under the
@@ -1039,16 +1071,8 @@ impl Controller {
                         }
                         return DoorReply::Answered(answer);
                     }
-                    // No claim, and no other arrival may carry the action out: a first admission,
-                    // which has no window. If one may, the first attempt has not reached its claim
-                    // and goes on to carry the action out.
-                    crate::transfer::Settling::No if another_holds => {
-                        return self.the_attempt_that_holds_the_action(
-                            &mutation,
-                            connection_id,
-                            admitted,
-                        );
-                    }
+                    // No claim, and no arrival that may carry the action out: a first admission,
+                    // which has no window.
                     crate::transfer::Settling::No => {
                         return DoorReply::Refused(ControlFrame::Response(Response {
                             request_id: mutation.request_id,
@@ -1063,27 +1087,32 @@ impl Controller {
             // claim is that what became of the action is not known. An action with no claim is a
             // first admission, and is refused for its window, unless another arrival may carry
             // the action out: a copy that arrives before the first attempt has written its claim
-            // is told that the attempt has not finished.
+            // is told that what became of the action is not known.
             Err(error @ ControllerError::WindowExpired { .. })
                 if crate::project::ProjectModule::serves(method) =>
             {
                 // Asked before the claim is, as for a transfer action above.
                 let another_holds = another_may_carry_it_out(&mut arrival).await;
-                let held = match self.project.held_answer(actor_id, &mutation, method).await {
-                    Some(held) => held,
-                    None if another_holds => {
+                let mut held = self.project.held_answer(actor_id, &mutation, method).await;
+                // No claim while another arrival may carry the action out: asked again, and the
+                // claim read again if it has gone, as for a transfer action above.
+                if held.is_none() && another_holds {
+                    #[cfg(feature = "testing")]
+                    self.after_a_copy_looked_for_a_claim.wait().await;
+                    if another_may_carry_it_out(&mut arrival).await {
                         return self.the_attempt_that_holds_the_action(
                             &mutation,
                             connection_id,
                             admitted,
                         );
                     }
-                    None => {
-                        return DoorReply::Refused(ControlFrame::Response(Response {
-                            request_id: mutation.request_id,
-                            outcome: Outcome::Error(error.to_protocol_error()),
-                        }));
-                    }
+                    held = self.project.held_answer(actor_id, &mutation, method).await;
+                }
+                let Some(held) = held else {
+                    return DoorReply::Refused(ControlFrame::Response(Response {
+                        request_id: mutation.request_id,
+                        outcome: Outcome::Error(error.to_protocol_error()),
+                    }));
                 };
                 if let Err(error) = self.check_retained_answer(connection_id, admitted) {
                     return DoorReply::Refused(error_reply(

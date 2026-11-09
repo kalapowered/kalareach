@@ -612,6 +612,12 @@ pub struct Controller {
     /// its claim. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     before_a_door_effect: ReadPause,
+    /// Where this host's own tests stop a copy of an action at the local door that its window
+    /// refuses, once it has looked for the claim of the action and found none while another arrival
+    /// may carry the action out, so that the other arrival can end in between. Compiled away in
+    /// every shipped build.
+    #[cfg(feature = "testing")]
+    after_a_copy_looked_for_a_claim: ReadPause,
     /// Where this host's own tests stop a paired device's mutation once its worker has answered,
     /// before the answer is checked against the device's authority, so that the authority can
     /// change in between. Compiled away in every shipped build.

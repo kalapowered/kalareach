@@ -4463,3 +4463,145 @@ async fn two_copies_refused_for_their_window_at_once_are_not_told_the_outcome_is
     assert!(!host.work().join("made").exists(), "no copy made anything");
     let _ = host.stop().await;
 }
+
+/// KR-REQ-09.09: a copy of a project action that its window refuses, and that found another arrival
+/// which may carry the action out, is told what the host holds when that arrival ends having done
+/// nothing. The arrival was the first attempt, refused at the last admission before its effect, so
+/// the action never ran and no claim was written: the copy is refused for its window as a first
+/// action would be, and not told that the outcome is not known.
+///
+/// The first attempt is stopped after the daemon has admitted it, and the copy after it has looked
+/// for a claim and found none while the first attempt held the action. The host then owes a fence,
+/// which refuses the first attempt where it is asked, and the case lets both go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
+async fn a_copy_is_refused_for_its_window_when_the_attempt_it_found_is_refused_before_any_effect() {
+    let host = host().await;
+    let mut first = client(&host).await;
+    let original = composed(
+        &mut first,
+        host.environment_id,
+        Method::ProjectInit,
+        ActionId::new(kr_ipc::new_uuid()),
+        &ProjectInitParams {
+            destination: host.destination("made"),
+            label: "made".to_owned(),
+            initial_branch: Nullable::null(),
+        },
+    )
+    .await;
+    let (arrived, let_it_go_on) = host.controller.pause_before_a_door_effect();
+    let (looked, let_the_copy_go_on) = host.controller.pause_after_a_copy_looked_for_a_claim();
+    let running = {
+        let original = original.clone();
+        tokio::spawn(async move { first.repeat(&original).await })
+    };
+    arrived
+        .await
+        .expect("the first attempt has been admitted and has not claimed");
+
+    let mut second = client(&host).await;
+    let copy = tokio::spawn(async move { second.repeat(&original).await });
+    looked
+        .await
+        .expect("the copy has looked for a claim and found none");
+
+    host.controller.hold_fence(true);
+    let_it_go_on.send(()).expect("the first attempt is waiting");
+    let refused = failure(
+        running
+            .await
+            .expect("the first attempt ran")
+            .expect("the call reaches the daemon"),
+    );
+    host.controller.hold_fence(false);
+    assert_eq!(
+        refused.code,
+        ErrorCode::PermissionDenied,
+        "the first attempt is refused where its admission is asked: {refused:?}"
+    );
+
+    let_the_copy_go_on.send(()).expect("the copy is waiting");
+    let told = failure(
+        copy.await
+            .expect("the copy ran")
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(
+        told.code,
+        ErrorCode::PermissionDenied,
+        "nothing ran, so the copy is refused for its window: {told:?}"
+    );
+    assert!(
+        !host.work().join("made").exists(),
+        "no attempt made the project"
+    );
+    let _ = host.stop().await;
+}
+
+/// KR-REQ-09.09: a copy of a project action that its window refuses, and that found no claim while
+/// another arrival may carry the action out, is given the record that arrival left when it has
+/// ended by the time the copy asks again. The first attempt carried the action out and settled its
+/// claim after the copy looked for it, so the copy reads the claim once more, and is neither told
+/// that the outcome is not known nor refused for its window.
+///
+/// The copy is stopped after it has looked for a claim and found none, and the first attempt runs
+/// to its end before the case lets the copy go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
+async fn a_copy_that_found_no_claim_is_given_the_record_the_first_attempt_left_meanwhile() {
+    let host = host().await;
+    let mut first = client(&host).await;
+    let original = composed(
+        &mut first,
+        host.environment_id,
+        Method::ProjectInit,
+        ActionId::new(kr_ipc::new_uuid()),
+        &ProjectInitParams {
+            destination: host.destination("made"),
+            label: "made".to_owned(),
+            initial_branch: Nullable::null(),
+        },
+    )
+    .await;
+    let (arrived, let_it_go_on) = host.controller.pause_before_a_door_effect();
+    let (looked, let_the_copy_go_on) = host.controller.pause_after_a_copy_looked_for_a_claim();
+    let running = {
+        let original = original.clone();
+        tokio::spawn(async move { first.repeat(&original).await })
+    };
+    arrived
+        .await
+        .expect("the first attempt has been admitted and has not claimed");
+
+    let mut second = client(&host).await;
+    let copy = tokio::spawn(async move { second.repeat(&original).await });
+    looked
+        .await
+        .expect("the copy has looked for a claim and found none");
+
+    let_it_go_on.send(()).expect("the first attempt is waiting");
+    let made: ProjectInitResult = typed(
+        &running
+            .await
+            .expect("the first attempt ran")
+            .expect("the call reaches the daemon")
+            .expect("project.init succeeds"),
+    );
+    let_the_copy_go_on.send(()).expect("the copy is waiting");
+    let given: ProjectInitResult = typed(
+        &copy
+            .await
+            .expect("the copy ran")
+            .expect("the call reaches the daemon")
+            .expect("the copy is given the record the first attempt left"),
+    );
+    assert_eq!(given, made, "the action was carried out once");
+    let _ = host.stop().await;
+}

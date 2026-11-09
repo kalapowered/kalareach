@@ -1194,6 +1194,8 @@ impl Controller {
             #[cfg(feature = "testing")]
             before_a_door_effect: ReadPause::default(),
             #[cfg(feature = "testing")]
+            after_a_copy_looked_for_a_claim: ReadPause::default(),
+            #[cfg(feature = "testing")]
             after_the_worker_answered: ReadPause::default(),
             #[cfg(feature = "testing")]
             after_a_frame_is_answered: ReadPause::default(),

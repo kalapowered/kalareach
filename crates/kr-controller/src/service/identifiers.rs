@@ -354,8 +354,10 @@ impl Arrival {
     /// waits for it: refused while the first attempt goes on to run, it would have a refusal the
     /// host cannot stand behind, and told that the outcome is not known because of an arrival that
     /// is refused as well, it would be told what is not so. An arrival decides without waiting for
-    /// anything this one holds, so the wait ends. It must be asked before the claim is read: asked
-    /// after, it can find the arrival that ran gone, its claim written and settled in between.
+    /// anything this one holds, so the wait ends. It is asked before the claim is read, so that an
+    /// arrival that ran and ended in between has left its claim to be found. A copy that finds no
+    /// claim while an arrival may carry the action out asks again, because that arrival may since
+    /// have been refused before it did anything, and reads the claim once more if it has gone.
     pub(super) async fn another_may_carry_it_out(&mut self) -> bool {
         if self.stage == Stage::Undecided {
             {
