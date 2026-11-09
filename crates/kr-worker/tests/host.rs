@@ -73,6 +73,38 @@ impl WorkerSupervisor for WorkerWithPackageRoot {
     }
 }
 
+/// Starts the worker through this host's own supervisor with a variable of the host's own in its
+/// environment, which every process the worker starts without clearing its environment inherits,
+/// whatever becomes of that process's parent.
+#[cfg(unix)]
+#[derive(Debug)]
+struct MarkedWorkers {
+    /// The variable and its value, joined as the environment holds them.
+    marker: (String, String),
+    inner: Box<dyn WorkerSupervisor>,
+}
+
+#[cfg(unix)]
+impl WorkerSupervisor for MarkedWorkers {
+    fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
+        let mut told = launch.clone();
+        told.desktop_environment.push(self.marker.clone());
+        self.inner.start(&told)
+    }
+
+    fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
+        self.inner.start_service(launch)
+    }
+
+    fn describe(&self) -> &'static str {
+        "this host's supervisor, with the worker's environment marked"
+    }
+
+    fn readiness(&self) -> kr_controller::supervision::Readiness {
+        self.inner.readiness()
+    }
+}
+
 /// One request the daemon made of its supervisor.
 #[derive(Clone, Debug)]
 struct Launch {
@@ -342,6 +374,10 @@ struct Host {
     /// reads.
     #[cfg(unix)]
     standard_error: Option<Arc<HeldStandardError>>,
+    /// The variable, with a value no other process has, that the workers this daemon starts are
+    /// given, when a test looks for what they started by it.
+    #[cfg(unix)]
+    lineage: Option<(String, String)>,
 }
 
 impl Host {
@@ -382,6 +418,8 @@ impl Host {
             platform_service: false,
             #[cfg(unix)]
             standard_error: None,
+            #[cfg(unix)]
+            lineage: None,
         }
     }
 
@@ -429,6 +467,30 @@ impl Host {
     fn with_a_standard_error_nobody_reads(mut self) -> Self {
         self.standard_error = Some(HeldStandardError::new());
         self
+    }
+
+    /// Gives each worker this daemon starts a variable in its environment that nothing else on the
+    /// machine has, so that a case can find what the worker started by it.
+    #[cfg(unix)]
+    fn marking_workers(mut self) -> Self {
+        self.lineage = Some((
+            "KR_TEST_WORKER_LINEAGE".to_owned(),
+            kr_ipc::new_uuid().to_string(),
+        ));
+        self
+    }
+
+    /// The supervisor the daemon starts workers through: `inner`, and with the environment marked
+    /// where the host asks for it.
+    fn with_the_marking(&self, inner: Box<dyn WorkerSupervisor>) -> Box<dyn WorkerSupervisor> {
+        #[cfg(unix)]
+        if let Some(marker) = &self.lineage {
+            return Box::new(MarkedWorkers {
+                marker: marker.clone(),
+                inner,
+            });
+        }
+        inner
     }
 
     /// Starts the daemon's workers with a standard error whose reading end is closed, so that every
@@ -626,7 +688,7 @@ impl Host {
         // else fails at once.
         let started = std::time::Instant::now();
         kr_controller::testing::taken_over(|| {
-            let supervisor = self.temp.supervisor(
+            let supervisor = self.temp.supervisor(self.with_the_marking(
                 match (self.worker_packages.clone(), self.launched.clone()) {
                     (Some(packages), _) => Box::new(WorkerWithPackageRoot {
                         packages,
@@ -639,7 +701,7 @@ impl Host {
                     }),
                     (None, None) => self.platform_supervisor(),
                 },
-            );
+            ));
             start_daemon(
                 &environment,
                 supervisor,
@@ -1768,15 +1830,19 @@ async fn a_worker_that_cannot_reach_its_controller_says_why_and_ends_whatever_it
 /// KR-REQ-05.08: an idle session that has been asked to run nothing is its worker and its root
 /// shell. The daemon asks its supervisor to start the worker and nothing else: no plugin runtime
 /// or other separately supervised service, lazily or otherwise. And nothing the worker itself
-/// starts beside the shell stays running, which on Windows leaves the pseudo-console's host.
+/// starts beside the shell stays running, whether it is still the worker's child or a short-lived
+/// child of the worker left it running as a process of its own; on Windows what the worker starts
+/// beside the shell is the pseudo-console's host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_idle_session_runs_nothing_beside_its_shell() {
     let host = Host::create().recording_launches();
+    #[cfg(unix)]
+    let host = host.marking_workers();
     let _controller = host.start().await;
     let mut client = host.client().await;
     let created = create(&mut client, &host).await;
     #[cfg(unix)]
-    nothing_the_worker_started_beside_the_shell_runs(&created).await;
+    nothing_the_worker_started_beside_the_shell_runs(&host, &created).await;
     #[cfg(windows)]
     only_the_pseudo_console_runs_beside_the_shell(&host, &created);
     // Everything the daemon asked the platform to run for this environment, over the whole of it.
@@ -1798,49 +1864,134 @@ async fn an_idle_session_runs_nothing_beside_its_shell() {
     close(&mut client, &host, created.session.session_id).await;
 }
 
-/// Over a few seconds of idling, no process the worker started beside the root shell stays.
+/// What the worker started that is running now beside the root shell, on a Unix host: a process
+/// that the worker started and that is not the root shell or something the shell started.
+///
+/// The worker's children are read from the process table. What a child of theirs left running as a
+/// process of its own, with its parent gone, is read by what it took from the worker: the
+/// working directory the host gave the worker, which a process the worker starts without a
+/// directory of its own begins in, and the variable the host put in the worker's environment, which
+/// one that does not clear its environment inherits. Each is the kernel's own record of the
+/// process and says nothing about when it started or how long it has run.
+///
+/// Neither reaches what the worker starts with a directory and an environment of their own: the
+/// root shell, and the server of a backend, which is the worker's child. What such a server starts
+/// and leaves running is not read here, and a process that clears both itself is not either. macOS
+/// shows no environment for the system's own programs, such as `sh`, so for those the directory is
+/// the record.
 #[cfg(unix)]
-async fn nothing_the_worker_started_beside_the_shell_runs(created: &SessionCreateResult) {
-    let root = u32::try_from(
-        created
-            .session
-            .root_process
-            .as_ref()
-            .expect("the session names its root shell")
-            .pid
-            .get(),
-    )
-    .expect("a process identifier");
-    let worker = processes()
-        .into_iter()
-        .find_map(|(pid, parent)| (pid == root).then_some(parent))
-        .expect("the root shell has a parent");
+struct BesideTheShell {
+    worker: u32,
+    root: u32,
+    /// The directory the host gave the worker, as the kernel spells it.
+    directory: PathBuf,
+    /// The variable the host put in the worker's environment, and its value.
+    marker: (String, String),
+}
 
-    // For a second of idling, every process whose parent is the worker is noted.
-    let mut beside_the_shell = std::collections::BTreeSet::new();
-    for _ in 0..10 {
-        for (pid, parent) in processes() {
-            if parent == worker && pid != root {
-                beside_the_shell.insert(pid);
-            }
+#[cfg(unix)]
+impl BesideTheShell {
+    fn of(host: &Host, created: &SessionCreateResult) -> Self {
+        let root = u32::try_from(
+            created
+                .session
+                .root_process
+                .as_ref()
+                .expect("the session names its root shell")
+                .pid
+                .get(),
+        )
+        .expect("a process identifier");
+        let worker = processes()
+            .into_iter()
+            .find_map(|(pid, parent)| (pid == root).then_some(parent))
+            .expect("the root shell has a parent");
+        let directory = std::fs::canonicalize(host.paths().worker_dir(created.session.session_id))
+            .expect("the worker's own directory exists");
+        Self {
+            worker,
+            root,
+            directory,
+            marker: host
+                .lineage
+                .clone()
+                .expect("this host marks the workers it starts"),
         }
+    }
+
+    /// The processes that run now, by the start identity that tells one from another that came to
+    /// have the same number.
+    fn running(&self) -> Vec<kr_protocol::identity::ProcessStartIdentity> {
+        let table = processes();
+        let mut shell = std::collections::BTreeSet::from([self.root]);
+        while let Some(started) = table
+            .iter()
+            .find(|(pid, parent)| shell.contains(parent) && !shell.contains(pid))
+            .map(|(pid, _)| *pid)
+        {
+            shell.insert(started);
+        }
+        let directories = working_directories(&table);
+        let marked = carrying(&self.marker, &table);
+        table
+            .iter()
+            .filter(|&&(pid, parent)| {
+                pid != self.worker
+                    && !shell.contains(&pid)
+                    && (parent == self.worker
+                        || marked.contains(&pid)
+                        || directories
+                            .get(&pid)
+                            .is_some_and(|directory| directory.starts_with(&self.directory)))
+            })
+            // A process that has gone since the table was read is one that was not staying.
+            .filter_map(|&(pid, _)| kr_ipc::identity::process_start_identity(pid).ok())
+            .collect()
+    }
+}
+
+/// An idle session's worker has started nothing beside the root shell that is running once what it
+/// asks its platform short questions of has ended.
+///
+/// A worker asks its platform short questions, such as whether its desktop is still there, and
+/// each of those is a process that ends at once. A backend is a process that stays. For a second
+/// of idling every process the worker started beside the shell is noted; the case then decides by
+/// whether those processes end, and it waits for them to for as long as the liveness bound, which
+/// only says how long a slow machine is given to end a question. A process that a short-lived
+/// child of the worker left running as a process of its own is noted as the worker's own children
+/// are, and an idle session that ran one fails the case at the bound, naming it.
+///
+/// The second of idling, and the polling after it, say how often the table is read: what decides
+/// is whether a noted process is the one that was noted and is still running. A backend the worker
+/// started later than that second after it had reported its session is not looked for.
+#[cfg(unix)]
+async fn nothing_the_worker_started_beside_the_shell_runs(
+    host: &Host,
+    created: &SessionCreateResult,
+) {
+    let beside = BesideTheShell::of(host, created);
+    let mut noted = std::collections::BTreeSet::new();
+    for _ in 0..10 {
+        noted.extend(beside.running());
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    // A worker asks its platform short questions, such as whether its desktop is still there, and
-    // each of those is a process that ends at once. A backend is a process that stays, so whatever
-    // the worker started beside the shell is looked for again a second later, twice.
-    for _ in 0..2 {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        let running = processes();
-        beside_the_shell.retain(|pid| {
-            running
-                .iter()
-                .any(|(other, parent)| other == pid && *parent == worker)
-        });
-    }
+    let started = std::time::Instant::now();
+    let staying = loop {
+        let now: std::collections::BTreeSet<_> = beside.running().into_iter().collect();
+        let staying: Vec<_> = noted.intersection(&now).collect();
+        if staying.is_empty() {
+            break None;
+        }
+        if started.elapsed() > LIVENESS_DEADLINE {
+            break Some(format!("{staying:?}"));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
     assert!(
-        beside_the_shell.is_empty(),
-        "nothing the worker started beside its shell is still running: {beside_the_shell:?}"
+        staying.is_none(),
+        "nothing the worker started beside its shell is still running after {:?}: {}",
+        started.elapsed(),
+        staying.unwrap_or_default()
     );
 }
 
@@ -1905,6 +2056,80 @@ fn processes() -> Vec<(u32, u32)> {
             let mut fields = line.split_whitespace();
             Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
         })
+        .collect()
+}
+
+/// The working directory of each process in `table` that the kernel will tell this user, by
+/// process. A process that is gone, or that belongs to another user, has none here.
+#[cfg(target_os = "linux")]
+fn working_directories(table: &[(u32, u32)]) -> std::collections::HashMap<u32, PathBuf> {
+    table
+        .iter()
+        .filter_map(|&(pid, _)| {
+            std::fs::read_link(format!("/proc/{pid}/cwd"))
+                .ok()
+                .map(|directory| (pid, directory))
+        })
+        .collect()
+}
+
+/// The working directory of each of this user's processes, by process, from one reading of the
+/// kernel's table of open files.
+#[cfg(target_os = "macos")]
+fn working_directories(_table: &[(u32, u32)]) -> std::collections::HashMap<u32, PathBuf> {
+    let output = std::process::Command::new("/usr/sbin/lsof")
+        .args([
+            "-a",
+            "-u",
+            &rustix::process::getuid().as_raw().to_string(),
+            "-d",
+            "cwd",
+            "-Fpn",
+        ])
+        .output()
+        .unwrap_or_else(|error| panic!("the process table could not be read: {error}"));
+    let mut directories = std::collections::HashMap::new();
+    let mut pid = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(number) = line.strip_prefix('p') {
+            pid = number.parse::<u32>().ok();
+        } else if let (Some(pid), Some(directory)) = (pid, line.strip_prefix('n')) {
+            directories.insert(pid, PathBuf::from(directory));
+        }
+    }
+    directories
+}
+
+/// The processes in `table` whose environment holds `marker`, as the kernel shows it to this user.
+#[cfg(target_os = "linux")]
+fn carrying(marker: &(String, String), table: &[(u32, u32)]) -> std::collections::HashSet<u32> {
+    let entry = format!("{}={}", marker.0, marker.1);
+    table
+        .iter()
+        .filter(|&&(pid, _)| {
+            std::fs::read(format!("/proc/{pid}/environ")).is_ok_and(|bytes| {
+                bytes
+                    .split(|&byte| byte == 0)
+                    .any(|held| held == entry.as_bytes())
+            })
+        })
+        .map(|&(pid, _)| pid)
+        .collect()
+}
+
+/// The processes whose environment holds `marker`, as `ps` prints it after a process's arguments.
+/// It prints none for the system's own programs, which hide it.
+#[cfg(target_os = "macos")]
+fn carrying(marker: &(String, String), _table: &[(u32, u32)]) -> std::collections::HashSet<u32> {
+    let entry = format!("{}={}", marker.0, marker.1);
+    let output = std::process::Command::new("ps")
+        .args(["-E", "-ww", "-A", "-o", "pid=,command="])
+        .output()
+        .expect("lists the processes with their environments");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.contains(&entry))
+        .filter_map(|line| line.split_whitespace().next()?.parse().ok())
         .collect()
 }
 
