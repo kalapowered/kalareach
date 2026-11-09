@@ -1520,7 +1520,9 @@ pub struct MachineFinishArguments {
     /// The command shows the earlier action and the environment's record on standard error and
     /// sends the step as a new action, which the environment takes only while its record is still
     /// the one the step was approved against. The new action names no earlier action. Without this,
-    /// a step in that state is never sent again under a new action.
+    /// a step in that state is never sent again under a new action. An action whose environment
+    /// refused it, and did not leave its outcome unknown, is not one this follows: nothing is sent
+    /// for it.
     #[arg(long, value_name = "ACTION")]
     pub after_unknown: Option<String>,
 }
