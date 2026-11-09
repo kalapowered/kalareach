@@ -1483,25 +1483,33 @@ fn checkpoint_of(sealed: &Sealed) -> ArchiveCheckpoint {
 /// every writer, producer and collection the bundle held carried through as it was.
 ///
 /// KR-REQ-20.17, the restore's write-back of that checkpoint only, and only what this case reads:
-/// the output of the preview and of the restore, the bundle the service holds after the restore
-/// (opened with the kit's seed, as the JSON a client sees and as canonical bytes), and every
-/// request the service was sent, each body, the content beside it and the account token, hold none
-/// of the private keys the host keeps. The host keeps two sets of four keys (transport, which is
-/// the reusable endpoint key; authorisation, which is the control-signing key; stored envelope; and
-/// notification preview): the controller identity and the device keys it pairs with; the case reads
-/// their eight seeds from the secret store the daemon wrote them to (and the backup writer's seed
-/// when the host has one), and the private keys of the four X25519 pairs, each checked against the
-/// pair's public key. Each key is looked for as bytes, in hexadecimal of either case, in either
-/// base64 alphabet wherever it lies in a longer value, and as a list of numbers. The controls are
-/// the scan finding each form where a key is put, the report's `checkpoint_recorded` member in the
-/// restore's output, the bundle's writer key in the bundle and the bundle's ciphertext in the
-/// requests. Not shown here: the local call to the daemon that carries the bundle
-/// (`backup.bundle.write`) and its reply, whose parameters are typed and refuse unknown members;
-/// what the restore writes into its folder, which the restore cases read for the members and fields
-/// they name and not for the host's keys; the second restore's requests; the parts of a request the stand-in does not keep (its headers other than the token,
-/// a query on its path, the signature block, any member of the signed document other than its body, and the authentication requests, which the stand-in answers before it keeps a record); a key in a binary list of integers,
-/// split, reversed or otherwise transformed; or the other data paths of backup and recovery
-/// material.
+/// the output of the preview and of the restore, each with `--json` and without it (a person reads
+/// the text, which other branches print than the document), the bundle the service holds after the
+/// restore (opened with the kit's seed, as the JSON a client sees and as canonical bytes), and
+/// every request the service was sent, each body, the content beside it and the account token,
+/// hold none of the private keys the host keeps. The restore without `--json` is the second one
+/// into a folder of its own, so the words it prints for the checkpoint are those of a bundle that
+/// already records it; the words for the first record are the document's `checkpoint` member. The
+/// host keeps two sets of four keys (transport, which is the reusable endpoint key; authorisation,
+/// which is the control-signing key; stored envelope; and notification preview): the controller
+/// identity and the device keys it pairs with; the case reads their eight seeds from the secret
+/// store the daemon wrote them to (and the backup writer's seed when the host has one), and the
+/// private keys of the four X25519 pairs, each checked against the pair's public key. Each key is
+/// looked for as bytes, in hexadecimal of either case, in either base64 alphabet wherever it lies
+/// in a longer value, and as a list of numbers. The controls are the scan finding each form where
+/// a key is put (each built apart from the scan's own list of forms), the report's
+/// `checkpoint_recorded` member in the restore's output, the word `Restored` in the output without
+/// `--json` (and the digest the preview without it prints, which the restore is given), the
+/// bundle's writer key in the bundle and the bundle's ciphertext in the requests. Not shown here:
+/// the local call to the daemon that carries the bundle (`backup.bundle.write`) and its reply,
+/// whose parameters are typed and refuse unknown members; what the restore writes into its folder,
+/// which the restore cases read for the members and fields they name and not for the host's keys;
+/// the requests of the restore at the end of the case that finds its generation recorded; the
+/// parts of a request the stand-in does not keep (its headers other than the token, a query on its
+/// path, the signature block, any member of the signed document other than its body, and the
+/// authentication requests, which the stand-in answers before it keeps a record); a key in a
+/// binary list of integers, split, reversed or otherwise transformed; or the other data paths of
+/// backup and recovery material.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restore_records_the_generation_it_verified_in_the_bundle() {
     let world = World::new();
@@ -1547,6 +1555,56 @@ async fn a_restore_records_the_generation_it_verified_in_the_bundle() {
     let report: Value = serde_json::from_slice(&restored.stdout).expect("a document");
     assert_eq!(report["checkpoint_recorded"], true, "{report}");
 
+    // The same two commands without `--json`, into a folder of their own: the text a person reads is
+    // printed by other branches than the document is. The digest is the one the text preview prints.
+    let into_text = folder(&rig, "text");
+    let text_arg = into_text.display().to_string();
+    let text_preview = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &text_arg,
+                "--kit-file",
+                &kit_arg,
+                "--preview",
+            ],
+            None,
+        )
+        .await;
+    assert!(
+        text_preview.status.success(),
+        "{}",
+        text(&text_preview.stderr)
+    );
+    let text_digest = text(&text_preview.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("Digest of this plan: "))
+        .expect("the preview prints its digest")
+        .trim()
+        .to_owned();
+    let text_restored = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &text_arg,
+                "--kit-file",
+                &kit_arg,
+                "--confirm-plan",
+                &text_digest,
+            ],
+            None,
+        )
+        .await;
+    assert!(
+        text_restored.status.success(),
+        "{}",
+        text(&text_restored.stderr)
+    );
+
     let after = stored_bundle(&rig, &world);
 
     // What the restore printed, wrote to the service and recorded holds none of the host's keys.
@@ -1565,6 +1623,14 @@ async fn a_restore_records_the_generation_it_verified_in_the_bundle() {
         (
             "the restore's output".to_owned(),
             [restored.stdout.clone(), restored.stderr.clone()].concat(),
+        ),
+        (
+            "the preview's output without --json".to_owned(),
+            [text_preview.stdout.clone(), text_preview.stderr.clone()].concat(),
+        ),
+        (
+            "the restore's output without --json".to_owned(),
+            [text_restored.stdout.clone(), text_restored.stderr.clone()].concat(),
         ),
         ("the bundle as JSON".to_owned(), bundle_json.clone()),
         (
@@ -1642,6 +1708,10 @@ async fn a_restore_records_the_generation_it_verified_in_the_bundle() {
     assert!(
         carried_in(&restored.stdout, b"checkpoint_recorded").is_some(),
         "the scan does not read the restore's output"
+    );
+    assert!(
+        carried_in(&text_restored.stdout, b"Restored").is_some(),
+        "the scan does not read the restore's output without --json"
     );
     let writer = after
         .trusted_writers
