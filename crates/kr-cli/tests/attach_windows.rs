@@ -580,11 +580,11 @@ impl Read for HeldBack {
 /// writes last reaches this side of the console after the command has ended, and a wait that ended
 /// with the command failed a command that had done what was asked.
 ///
-/// `cmd.exe` writes a marker, which the console's reader holds back until the command has been seen
-/// to end. The marker is spelled in the command line so that the line does not hold it. The wait
-/// takes its first look at the console with the marker held back and the command ended, which is
-/// where a wait that ended with the command fails, and only after that look is the marker let
-/// through; the wait must then find it.
+/// `cmd.exe` writes a marker, which the console's reader holds back until the wait has looked at the
+/// console once after the command has been seen to end. The marker is spelled in the command line
+/// so that the line does not hold it. That first look is taken with the marker held back and the
+/// command ended, which is where a wait that ended with the command fails, and only after it is the
+/// marker let through; the wait must then find it.
 #[test]
 fn a_command_that_ends_is_waited_for_until_the_console_has_shown_what_it_wrote() {
     const MARKER: &str = "kr-last-words";
