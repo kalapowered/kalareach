@@ -714,6 +714,12 @@ export interface HostInbox {
   readonly sessions: readonly NumberedSession[]
 }
 
+/** A registration the host may or may not have taken: its answer was lost or it could not say. */
+export interface PushUnknown {
+  /** The action the registration was sent under, which a request for another one names. */
+  readonly action_id: string
+}
+
 /** Where one paired host's notifications stand, as native code tells it. */
 export interface PushHostView {
   /** The host, by the reference the pairing screen lists it under. */
@@ -729,6 +735,12 @@ export interface PushHostView {
    * that something does. It is the choice as recorded, which the host is told when it is on.
    */
   readonly previews: boolean
+  /**
+   * The registration whose outcome nobody knows, when there is one and nothing is running: the
+   * words say so, and native code makes a new registration only when the person asks for it, naming
+   * this one. Absent when there is none.
+   */
+  readonly unknown?: PushUnknown
 }
 
 /** What the screen shows of notifications: whether this device has any, and each paired host's. */
@@ -2099,8 +2111,13 @@ export interface HostPort {
    * phone a place the host can send them to: native code asks the system, asks the notification
    * service, answers its challenge and hands the host what it needs. Resolves with where they
    * stand at once; later changes arrive through {@link HostPort.onPush}.
+   *
+   * A host whose last registration has an outcome nobody knows ({@link PushHostView.unknown}) is
+   * registered again only on the person's request, which names that registration by its action
+   * (`afterUnknown`): native code reads what the host recorded of it first, and sends nothing for a
+   * request that names another or none.
    */
-  pushEnable(reference: string): Promise<PushView>
+  pushEnable(reference: string, afterUnknown?: string): Promise<PushView>
   /**
    * Chooses whether the notifications of the host `reference` name show what needs the person
    * (`on`) or only that something does. Resolves with where they stand at once: the choice is

@@ -1069,6 +1069,13 @@ struct LinkState {
     /// The method of the requests the host refuses, on any connection to it, and its refusal: the
     /// connection is admitted and every other request is answered.
     refusing_request: Option<(String, kr_protocol::error::ProtocolError)>,
+    /// The method of the requests whose answer is lost: each is sent to the host, which acts on it,
+    /// and the connection then fails for the caller as one that ended.
+    losing_answer_to: Option<String>,
+    /// How many requests and mutations of each method were sent to a host, on any connection.
+    sent: std::collections::BTreeMap<String, usize>,
+    /// The action each mutation sent to a host was sent under, by method, in the order sent.
+    sent_actions: std::collections::BTreeMap<String, Vec<String>>,
     /// Whether a connection to a host whose grant answers to an organisation is held the moment its
     /// lease has been presented, before anything else is done on it.
     holding_presented: bool,
@@ -1191,6 +1198,35 @@ impl LinkControl {
             refusal.map(|(method, refusal)| (method.as_str().to_owned(), refusal));
     }
 
+    /// Makes the answer to every request of `method`, on any connection to the host, lost: it is
+    /// sent and the host acts on it, and the caller is told the connection ended. Or stops that.
+    pub fn lose_the_answer_to(&self, method: Option<kr_protocol::method::Method>) {
+        self.state.lock().expect("the record").losing_answer_to =
+            method.map(|method| method.as_str().to_owned());
+    }
+
+    /// The action each mutation of `method` was sent under, in the order sent, on any connection.
+    pub fn sent_actions(&self, method: kr_protocol::method::Method) -> Vec<String> {
+        self.state
+            .lock()
+            .expect("the record")
+            .sent_actions
+            .get(method.as_str())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// How many requests and mutations of `method` were sent to a host, on any connection.
+    pub fn sent(&self, method: kr_protocol::method::Method) -> usize {
+        self.state
+            .lock()
+            .expect("the record")
+            .sent
+            .get(method.as_str())
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Holds each connection to a host whose grant answers to an organisation, from now on, the
     /// moment its lease has been presented and before anything else is done on it, until the test
     /// releases them.
@@ -1291,15 +1327,30 @@ impl LinkControl {
 
     /// What the host answers `frame` with when the test made it refuse that request.
     fn refusal_of(&self, frame: &ControlFrame) -> Option<kr_protocol::error::ProtocolError> {
-        let ControlFrame::Request(request) = frame else {
-            return None;
-        };
+        let method = method_of(frame)?;
         let state = self.state.lock().expect("the record");
         state
             .refusing_request
             .as_ref()
-            .filter(|(method, _)| method == request.method.as_str())
+            .filter(|(refused, _)| refused == method)
             .map(|(_, refusal)| refusal.clone())
+    }
+
+    /// Counts `frame` among the requests sent, and says whether its answer is to be lost.
+    fn sent_and_lost(&self, frame: &ControlFrame) -> bool {
+        let Some(method) = method_of(frame) else {
+            return false;
+        };
+        let mut state = self.state.lock().expect("the record");
+        *state.sent.entry(method.to_owned()).or_default() += 1;
+        if let ControlFrame::Mutation(request) = frame {
+            state
+                .sent_actions
+                .entry(method.to_owned())
+                .or_default()
+                .push(request.action_id.to_string());
+        }
+        state.losing_answer_to.as_deref() == Some(method)
     }
 
     /// Holds `frame` before it is sent when it is the request the test asked to hold.
@@ -1420,6 +1471,15 @@ impl ControlledLink {
     }
 }
 
+/// The method a request or a mutation frame names, and none for any other frame.
+fn method_of(frame: &ControlFrame) -> Option<&str> {
+    match frame {
+        ControlFrame::Request(request) => Some(request.method.as_str()),
+        ControlFrame::Mutation(request) => Some(request.method.as_str()),
+        _ => None,
+    }
+}
+
 /// A transport that holds the request a test asked to hold, and otherwise carries every frame, and
 /// every question, as the transport under it does.
 #[derive(Debug)]
@@ -1470,7 +1530,13 @@ impl kr_client::transport::ControlTransport for Tapped {
             if let Some(refusal) = self.control.refusal_of(frame) {
                 return Err(kr_client::ClientError::Host(refusal));
             }
-            self.inner.send(frame).await
+            let lost = self.control.sent_and_lost(frame);
+            self.inner.send(frame).await?;
+            if lost {
+                // The host has the request and acts on it; the caller never hears.
+                return Err(kr_client::ClientError::ConnectionEnded);
+            }
+            Ok(())
         })
     }
 

@@ -2181,7 +2181,7 @@ async fn a_push_run_sends_its_changes_only_under_the_account_its_connection_was_
         .into_iter()
         .find(|host| host.proposed_grant.organisation.as_ref().is_some())
         .expect("the member host");
-    let registrar = ConnectionRegistrar(Arc::clone(&device));
+    let registrar = ConnectionRegistrar::new(Arc::clone(&device));
     let mut line = registrar
         .connect(&host, Reach::Visit)
         .await

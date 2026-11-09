@@ -30,7 +30,7 @@ use companion_tauri::AppState;
 use companion_tauri::device::Device;
 use companion_tauri::push::{
     AskFuture, ConnectionRegistrar, GatewayFor, HostLine, LineFuture, LineStop, Native, PushDesk,
-    PushFuture, PushState, PushView, Reach, Registrar, Wiring,
+    PushFuture, PushState, PushView, Reach, Registrar, RegistrationRead, Wiring,
 };
 use futures_util::FutureExt as _;
 use kr_client::pairing::paired::PairedHost;
@@ -38,7 +38,7 @@ use kr_client::services::relay::{ServiceHttp, ServiceHttpAnswer};
 use kr_client::services::{ManagedService, PushService, ServiceFuture, push};
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::{MemoryStore, SecretName, SecretStore, load_notification_preview_key};
-use kr_protocol::ids::DeviceKeyRevision;
+use kr_protocol::ids::{ActionId, DeviceKeyRevision};
 use kr_protocol::pairing::KeyPurpose;
 use kr_protocol::push::{
     DevicePushRegisterParams, DevicePushRegisterResult, PushRegistrationAnswer,
@@ -47,7 +47,7 @@ use kr_protocol::push::{
 use kr_protocol::rights::ActionRight;
 use net_support::Host;
 use serde_json::{Value, json};
-use support::{WATCHDOG, pair, phone_paired_with};
+use support::{LinkControl, WATCHDOG, pair, phone_paired_with, unpaired_phone_controlled};
 
 const VECTORS: &str = include_str!("../../../../fixtures/push/push.json");
 
@@ -337,6 +337,13 @@ struct Registered {
     key_update_stops: Option<LineStop>,
     /// What a connection to the host fails with, when it does.
     connect_fails: Option<String>,
+    /// The actions registrations were sent under, in the order they were sent.
+    actions: Vec<ActionId>,
+    /// What the host says it recorded of a registration whose result is read, when it says
+    /// anything: the host cannot say otherwise.
+    read_says: Option<RegistrationRead>,
+    /// The actions whose results were read, in the order they were read.
+    reads: Vec<ActionId>,
 }
 
 /// Waits for as long as `held` says of the script that a step is held.
@@ -399,13 +406,26 @@ fn registration_answer(device: &str) -> DevicePushRegisterResult {
 }
 
 impl HostLine for Line {
+    fn read_registration(&mut self, action: ActionId) -> LineFuture<'_, RegistrationRead> {
+        Box::pin(async move {
+            let mut script = self.script.lock().expect("what was handed");
+            script.reads.push(action);
+            Ok(script
+                .read_says
+                .clone()
+                .unwrap_or_else(|| RegistrationRead::Undecided("the host cannot say".to_owned())))
+        })
+    }
+
     fn register(
         &mut self,
+        action: ActionId,
         params: DevicePushRegisterParams,
     ) -> LineFuture<'_, DevicePushRegisterResult> {
         Box::pin(async move {
             let stop = {
                 let mut script = self.script.lock().expect("what was handed");
+                script.actions.push(action);
                 script.credentials.push((
                     self.host,
                     json!({
@@ -847,7 +867,10 @@ async fn a_host_the_person_asked_for_is_handed_the_credential_the_gateway_issued
         PushState::Off,
         "nothing before the person asks"
     );
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone.until(|states| states == [PushState::On]).await;
 
     let handed = phone.registered.lock().expect("what was handed");
@@ -896,7 +919,10 @@ async fn a_build_given_its_own_gateway_registers_there_and_its_receivers_answer_
     )
     .await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone.until(|states| states == [PushState::On]).await;
 
     // Every request the phone made went to the build's gateway.
@@ -1057,7 +1083,10 @@ async fn the_push_desk_talks_to_the_gateway_client_it_was_given() {
     );
     let reference = opened.desk.view().hosts[0].reference.clone();
 
-    opened.desk.enable(&reference).expect("the person asks");
+    opened
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     states_until(&opened.desk, |states| states == [PushState::On]).await;
 
     let registration = calls.lock().expect("the record").clone();
@@ -1282,7 +1311,10 @@ async fn a_stop_the_phone_made_itself_is_not_shown_as_the_host_refusing() {
     let own = "Sign in again: the account on this phone changed.";
     phone.registered.lock().expect("the script").register_stops =
         Some(LineStop::Phone(own.to_owned()));
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone
         .until(|states| states == [PushState::NeedsAttention])
         .await;
@@ -1293,7 +1325,7 @@ async fn a_stop_the_phone_made_itself_is_not_shown_as_the_host_refusing() {
         Some(LineStop::Host(refusal.to_owned()));
     phone
         .desk
-        .enable(&reference)
+        .enable(&reference, None)
         .expect("the person asks again");
     phone.until_words("The host did not take this phone").await;
     assert!(
@@ -1314,7 +1346,10 @@ async fn the_keys_filed_for_the_receivers_are_the_preview_key_the_host_was_told_
     let host = Host::start(&owner).await;
     let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone.until(|states| states == [PushState::On]).await;
 
     let filed = held_keys(&phone).expect("the receivers were handed keys");
@@ -1423,7 +1458,10 @@ async fn two_hosts_that_ask_together_register_one_after_the_other() {
     let phone = desk(&[&first, &second], &owner, Receiver::new(FIRST_TOKEN)).await;
     assert_eq!(phone.view().hosts.len(), 2);
     for reference in phone.references() {
-        phone.desk.enable(&reference).expect("the person asks");
+        phone
+            .desk
+            .enable(&reference, None)
+            .expect("the person asks");
     }
     phone
         .until(|states| states == [PushState::On, PushState::On])
@@ -1461,7 +1499,10 @@ async fn a_token_that_changes_while_a_host_registers_is_registered_again_when_th
     receiver.with(|state| state.answering = false);
     let phone = desk(&[&host], &owner, receiver).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone.until(|states| states == [PushState::Working]).await;
     // The run is waiting for its challenge to be answered, as the provider changes the token.
     tokio::time::timeout(WATCHDOG, async {
@@ -1511,7 +1552,10 @@ async fn a_token_that_arrives_a_moment_after_the_permission_is_waited_for() {
     receiver.with(|state| state.reads_without_a_token = 3);
     let phone = desk(&[&host], &owner, receiver).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone.until(|states| states == [PushState::On]).await;
     assert_eq!(
         phone
@@ -1541,7 +1585,10 @@ async fn a_look_the_application_makes_by_itself_never_asks_the_system_for_permis
     let phone = desk(&[&host], &owner, receiver).await;
     let reference = phone.references().remove(0);
     let asked = |phone: &Desk| phone.receiver.state.lock().expect("the receiver").asked;
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone.until_words("off for this app").await;
     assert_eq!(asked(&phone), 1, "the person's own choice asked the system");
 
@@ -1558,7 +1605,7 @@ async fn a_look_the_application_makes_by_itself_never_asks_the_system_for_permis
     // The person chooses again, and only then is the system asked once more.
     phone
         .desk
-        .enable(&reference)
+        .enable(&reference, None)
         .expect("the person asks again");
     phone.until_words("off for this app").await;
     assert_eq!(asked(&phone), 2);
@@ -1575,7 +1622,10 @@ async fn a_token_the_provider_gave_while_the_application_was_not_running_is_regi
     let host = Host::start(&owner).await;
     let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone.until(|states| states == [PushState::On]).await;
 
     // The application ends, and the provider gives another token while it is gone.
@@ -1608,7 +1658,10 @@ async fn a_change_found_while_a_run_is_under_way_is_not_lost_when_the_applicatio
     receiver.with(|state| state.answering = false);
     let phone = desk(&[&host], &owner, receiver).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     eventually("the first token was proposed", || {
         proposed(&phone.gateway) == [FIRST_TOKEN]
     })
@@ -1666,7 +1719,10 @@ async fn the_application_ending_in_the_look_that_found_a_new_token_loses_it_for_
     let second = Host::start(&owner).await;
     let phone = desk(&[&first, &second], &owner, Receiver::new(FIRST_TOKEN)).await;
     for reference in phone.references() {
-        phone.desk.enable(&reference).expect("the person asks");
+        phone
+            .desk
+            .enable(&reference, None)
+            .expect("the person asks");
     }
     phone
         .until(|states| states == [PushState::On, PushState::On])
@@ -1726,7 +1782,10 @@ async fn a_token_that_changed_and_changed_back_is_not_registered_again() {
     let host = Host::start(&owner).await;
     let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone.until(|states| states == [PushState::On]).await;
 
     phone.receiver.token_is(SECOND_TOKEN);
@@ -1748,7 +1807,10 @@ async fn a_token_that_changed_back_while_a_run_proposed_the_other_is_registered_
     receiver.with(|state| state.answering = false);
     let phone = desk(&[&host], &owner, receiver).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     eventually("the other token was proposed", || {
         proposed(&phone.gateway) == [SECOND_TOKEN]
     })
@@ -1768,7 +1830,10 @@ async fn a_record_with_no_digest_is_registered_again_at_the_next_look() {
     let host = Host::start(&owner).await;
     let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone.until(|states| states == [PushState::On]).await;
 
     // The record as an earlier build wrote it: without the digest.
@@ -1817,7 +1882,10 @@ async fn a_host_forgotten_while_its_run_is_waiting_is_not_made_again_by_that_run
     receiver.with(|state| state.answering = false);
     let phone = desk(&[&host], &owner, receiver).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     eventually("the token was proposed", || {
         proposed(&phone.gateway) == [FIRST_TOKEN]
     })
@@ -1835,7 +1903,7 @@ async fn a_host_forgotten_while_its_run_is_waiting_is_not_made_again_by_that_run
     // Paired again, the person turns it on, and the challenge of the old run is answered.
     phone
         .desk
-        .enable(&reference)
+        .enable(&reference, None)
         .expect("the person asks again");
     phone.receiver.with(|state| state.answering = true);
     phone.until(|states| states == [PushState::On]).await;
@@ -1867,7 +1935,10 @@ async fn a_run_that_ends_without_finishing_leaves_the_retry_and_not_working() {
     receiver.with(|state| state.permission_panics = true);
     let phone = desk(&[&host], &owner, receiver).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone
         .until(|states| states == [PushState::NeedsAttention])
         .await;
@@ -1881,7 +1952,10 @@ async fn a_list_of_paired_hosts_that_cannot_be_read_marks_nothing() {
     let host = Host::start(&owner).await;
     let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone.until(|states| states == [PushState::On]).await;
 
     phone.receiver.token_is(SECOND_TOKEN);
@@ -1929,7 +2003,10 @@ async fn a_run_that_cannot_read_the_token_at_its_end_does_not_turn_the_host_on()
     receiver.with(|state| state.token_readable_for = Some(1));
     let phone = desk(&[&host], &owner, receiver).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone
         .until(|states| states == [PushState::NeedsAttention])
         .await;
@@ -1955,7 +2032,10 @@ async fn a_late_answer_to_a_runs_last_read_does_not_hide_a_change_a_look_saw() {
     });
     let phone = desk(&[&host], &owner, receiver).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     eventually("the comparison read was asked", || {
         phone
             .receiver
@@ -1997,7 +2077,10 @@ async fn the_run_of_a_forgotten_host_does_not_use_the_consent_of_the_run_that_re
     });
     let phone = desk(&[&host], &owner, receiver).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     eventually("the first run read the permission", || {
         phone
             .receiver
@@ -2018,7 +2101,7 @@ async fn the_run_of_a_forgotten_host_does_not_use_the_consent_of_the_run_that_re
     phone.desk.forgotten(paired.host_device_id);
     phone
         .desk
-        .enable(&reference)
+        .enable(&reference, None)
         .expect("the person asks again");
     eventually("the second run read the permission", || {
         phone
@@ -2065,7 +2148,10 @@ async fn a_look_whose_older_answer_arrives_last_does_not_hide_a_change_another_l
     });
     let phone = desk(&[&host], &owner, receiver).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     let reads = || {
         phone
             .receiver
@@ -2139,7 +2225,10 @@ async fn the_host_is_forgotten_while(
     };
     hold(true);
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     eventually("the run is at the step", || match step {
         Step::GatewayIssue => phone.gateway.issue_requests() == 1,
         Step::Connection => {
@@ -2237,7 +2326,10 @@ async fn a_host_that_took_the_registration_and_refused_the_key_is_not_said_to_re
         .expect("the script")
         .key_update_stops = Some(LineStop::Host("the host did not take it".to_owned()));
 
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone
         .until(|states| states == [PushState::NeedsAttention])
         .await;
@@ -2272,7 +2364,10 @@ async fn a_host_that_cannot_be_reached_is_not_issued_an_authorisation() {
     let reference = phone.references().remove(0);
     phone.registered.lock().expect("the script").connect_fails =
         Some("the host did not answer in time".to_owned());
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone
         .until(|states| states == [PushState::NeedsAttention])
         .await;
@@ -2292,7 +2387,7 @@ async fn a_host_that_cannot_be_reached_is_not_issued_an_authorisation() {
     phone.registered.lock().expect("the script").connect_fails = None;
     phone
         .desk
-        .enable(&reference)
+        .enable(&reference, None)
         .expect("the person asks again");
     phone.until(|states| states == [PushState::On]).await;
     assert_eq!(phone.gateway.issue_requests(), 1);
@@ -2361,12 +2456,18 @@ async fn a_host_forgotten_while_it_waits_for_its_turn_proposes_nothing() {
     receiver.with(|state| state.answering = false);
     let phone = desk(&[&first, &second], &owner, receiver).await;
     let references = phone.references();
-    phone.desk.enable(&references[0]).expect("the person asks");
+    phone
+        .desk
+        .enable(&references[0], None)
+        .expect("the person asks");
     eventually("the first token was proposed", || {
         proposed(&phone.gateway) == [FIRST_TOKEN]
     })
     .await;
-    phone.desk.enable(&references[1]).expect("the person asks");
+    phone
+        .desk
+        .enable(&references[1], None)
+        .expect("the person asks");
     // The second host is the newest, which the page lists first: its run says it is waiting for the
     // slot once it has passed every check before it.
     phone
@@ -2423,7 +2524,10 @@ async fn a_record_that_cannot_be_read_is_set_aside_and_its_hosts_are_marked_lost
         let receiver = Receiver::new(FIRST_TOKEN);
         let phone = desk(&[&first, &second], &owner, Arc::clone(&receiver)).await;
         let references = phone.references();
-        phone.desk.enable(&references[0]).expect("the person asks");
+        phone
+            .desk
+            .enable(&references[0], None)
+            .expect("the person asks");
         phone
             .until(|states| states == [PushState::Off, PushState::On])
             .await;
@@ -2489,7 +2593,7 @@ async fn a_record_that_cannot_be_read_is_set_aside_and_its_hosts_are_marked_lost
         );
         again
             .desk
-            .enable(&references[0])
+            .enable(&references[0], None)
             .expect("the person asks again");
         states_until(&again.desk, |states| {
             states == [PushState::Off, PushState::NeedsAttention, PushState::On]
@@ -2518,7 +2622,10 @@ async fn a_phone_whose_record_was_spoiled(bytes: &[u8]) -> (Host, Desk) {
     let host = Host::start(&owner).await;
     let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone.until(|states| states == [PushState::On]).await;
     let record = phone._phone.data.path().join("push").join("push.json");
     kr_ipc::paths::write_owner_only_file(&record, bytes).expect("the record is spoiled");
@@ -2589,7 +2696,7 @@ async fn a_lost_host_the_person_started_over_is_tried_again_like_any_other() {
     });
     restarted
         .desk
-        .enable(&reference)
+        .enable(&reference, None)
         .expect("the person asks again");
     eventually("the run ended", || Arc::strong_count(&restarted.desk) == 1).await;
     let view = restarted.desk.view();
@@ -2629,7 +2736,10 @@ async fn a_record_the_system_fails_to_read_is_left_in_place_and_not_written_over
     let host = Host::start(&owner).await;
     let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone.until(|states| states == [PushState::On]).await;
     let data = phone._phone.data.path();
     let record = data.join("push").join("push.json");
@@ -2649,7 +2759,7 @@ async fn a_record_the_system_fails_to_read_is_left_in_place_and_not_written_over
     // Neither turning the host on nor forgetting it changes the record.
     restarted
         .desk
-        .enable(&reference)
+        .enable(&reference, None)
         .expect("the person asks again");
     let paired = phone
         .device
@@ -2715,7 +2825,7 @@ async fn a_record_that_could_not_be_set_aside_is_not_written_over() {
     let reference = phone.references().remove(0);
     restarted
         .desk
-        .enable(&reference)
+        .enable(&reference, None)
         .expect("the person asks again");
     assert_eq!(Arc::strong_count(&restarted.desk), 1, "no run was started");
     assert_eq!(
@@ -2733,7 +2843,10 @@ async fn a_run_reaches_its_host_as_the_person_asked_and_a_look_as_a_visit() {
     let host = Host::start(&owner).await;
     let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone.until(|states| states == [PushState::On]).await;
 
     phone.receiver.token_is(SECOND_TOKEN);
@@ -2824,8 +2937,13 @@ struct WatchedLine<'a> {
 }
 
 impl HostLine for WatchedLine<'_> {
+    fn read_registration(&mut self, action: ActionId) -> LineFuture<'_, RegistrationRead> {
+        self.real.read_registration(action)
+    }
+
     fn register(
         &mut self,
+        _action: ActionId,
         params: DevicePushRegisterParams,
     ) -> LineFuture<'_, DevicePushRegisterResult> {
         Box::pin(async move {
@@ -2857,7 +2975,7 @@ async fn desk_over_the_product_registrar(hosts: &[&Host], owner: &DeviceKeys) ->
         Receiver::new(FIRST_TOKEN),
         |device, script| {
             Arc::new(Watched {
-                real: ConnectionRegistrar(Arc::clone(device)),
+                real: ConnectionRegistrar::new(Arc::clone(device)),
                 script: Arc::clone(script),
             }) as Arc<dyn Registrar>
         },
@@ -2882,7 +3000,7 @@ async fn answers(connection: &companion_tauri::connection::Connection) -> bool {
 /// The host takes this phone's preview key at `revision` over the product's own line, as a
 /// rotation would send it.
 async fn the_host_takes_revision(phone: &Desk, host: &PairedHost, revision: u64) {
-    let registrar = ConnectionRegistrar(Arc::clone(&phone.device));
+    let registrar = ConnectionRegistrar::new(Arc::clone(&phone.device));
     let mut line = registrar
         .connect(host, Reach::Asked)
         .await
@@ -2948,7 +3066,7 @@ async fn a_revision_behind_the_one_the_host_holds_is_refused_and_the_phones_reco
     the_host_takes_revision(&phone, &paired, 2).await;
 
     let current = paired.clone();
-    let registrar = ConnectionRegistrar(Arc::clone(&phone.device));
+    let registrar = ConnectionRegistrar::new(Arc::clone(&phone.device));
     let mut line = registrar
         .connect(&current, Reach::Asked)
         .await
@@ -3014,7 +3132,10 @@ async fn a_visit_beside_a_run_cannot_close_the_endpoint_the_run_holds() {
 
     // The person asks, and the run is held with its connection open.
     holding(true);
-    phone.desk.enable(&references[1]).expect("the person asks");
+    phone
+        .desk
+        .enable(&references[1], None)
+        .expect("the person asks");
     eventually("the run connected", || connections() == 1).await;
     assert!(
         companion_tauri::connection::Connection::visited(&phone.device, &visited_host)
@@ -3078,7 +3199,10 @@ async fn a_look_that_holds_a_host_does_not_stop_the_person_choosing_a_host_on_it
         .device
         .use_host(host(0).host_device_id)
         .expect("the host in use");
-    phone.desk.enable(&references[1]).expect("the person asks");
+    phone
+        .desk
+        .enable(&references[1], None)
+        .expect("the person asks");
     eventually("the first run ended", || {
         state_of(&phone, &references[1]) == PushState::On && Arc::strong_count(&phone.desk) == 1
     })
@@ -3143,7 +3267,10 @@ async fn a_look_never_cuts_off_the_host_in_use_for_a_host_beside_it() {
         .expect("the host in use");
 
     // The person turns notifications on for the host beside the host in use.
-    phone.desk.enable(&references[1]).expect("the person asks");
+    phone
+        .desk
+        .enable(&references[1], None)
+        .expect("the person asks");
     eventually("the run ended", || {
         phone
             .registered
@@ -3223,7 +3350,10 @@ async fn a_forgotten_host_that_never_answers_does_not_keep_the_relay_it_was_reac
     phone.registered.lock().expect("what was sent").hold_answer = true;
 
     // The host has the registration and does not answer.
-    phone.desk.enable(&references[1]).expect("the person asks");
+    phone
+        .desk
+        .enable(&references[1], None)
+        .expect("the person asks");
     eventually("the registration was sent", || {
         phone
             .registered
@@ -3285,7 +3415,10 @@ async fn the_endpoint_of_a_host_is_not_held_while_the_preview_keys_are_filed() {
     let other_host = host(2);
     phone.receiver.with(|state| state.keys_hold = Some(1));
 
-    phone.desk.enable(&references[1]).expect("the person asks");
+    phone
+        .desk
+        .enable(&references[1], None)
+        .expect("the person asks");
     eventually("the run is filing the keys", || {
         phone
             .receiver
@@ -3317,7 +3450,10 @@ async fn the_receivers_hold_a_hosts_key_before_the_host_is_registered() {
         .expect("what was handed")
         .hold_answer = true;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     eventually("the host has been handed the registration", || {
         !phone
             .registered
@@ -3346,7 +3482,10 @@ async fn the_receivers_hold_the_keys_of_the_paired_hosts_and_nothing_of_a_forgot
     let second = Host::start(&owner).await;
     let phone = desk(&[&first, &second], &owner, Receiver::new(FIRST_TOKEN)).await;
     for reference in phone.references() {
-        phone.desk.enable(&reference).expect("the person asks");
+        phone
+            .desk
+            .enable(&reference, None)
+            .expect("the person asks");
         phone
             .until(|states| !states.contains(&PushState::Working))
             .await;
@@ -3399,7 +3538,10 @@ async fn an_older_set_of_keys_is_never_filed_after_a_newer_one() {
     )
     .await;
     for reference in phone.references() {
-        phone.desk.enable(&reference).expect("the person asks");
+        phone
+            .desk
+            .enable(&reference, None)
+            .expect("the person asks");
         phone
             .until(|states| !states.contains(&PushState::Working))
             .await;
@@ -3478,7 +3620,10 @@ async fn a_list_of_paired_hosts_that_cannot_be_read_leaves_the_receivers_keys_as
     let host = Host::start(&owner).await;
     let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone.until(|states| states == [PushState::On]).await;
     let before = phone
         .receiver
@@ -3517,7 +3662,10 @@ async fn a_phone_with_notifications_on() -> (Host, Desk, String) {
     let host = Host::start(&owner).await;
     let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone.until(|states| states == [PushState::On]).await;
     (host, phone, reference)
 }
@@ -3673,7 +3821,7 @@ async fn a_choice_the_host_could_not_be_told_stays_recorded_and_try_again_sends_
         .expect("off again");
 
     phone.registered.lock().expect("the script").register_stops = None;
-    phone.desk.enable(&reference).expect("Try again");
+    phone.desk.enable(&reference, None).expect("Try again");
     phone.until(|states| states == [PushState::On]).await;
     assert_eq!(
         proposed(&phone.gateway),
@@ -3740,7 +3888,10 @@ async fn a_choice_made_while_a_run_tells_the_host_is_told_after_it() {
     let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
     let reference = phone.references().remove(0);
     phone.registered.lock().expect("the script").hold_answer = true;
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     eventually("the host was handed the registration", || {
         previews_asked(&phone).len() == 1
     })
@@ -3783,7 +3934,7 @@ async fn an_earlier_record_with_no_choice_reads_as_previews_on() {
         restarted.desk.view().hosts[0].previews,
         "an earlier record reads as on"
     );
-    restarted.desk.enable(&reference).expect("Try again");
+    restarted.desk.enable(&reference, None).expect("Try again");
     states_until(&restarted.desk, |states| states == [PushState::On]).await;
     assert_eq!(previews_asked(&phone).last(), Some(&true));
 }
@@ -3912,7 +4063,7 @@ async fn a_host_a_blocked_desk_never_heard_of_shows_the_restart_words_once_the_l
     );
     blocked
         .desk
-        .enable(&shown.reference)
+        .enable(&shown.reference, None)
         .expect("the person asks");
     assert_eq!(Arc::strong_count(&blocked.desk), 1, "no run was started");
 }
@@ -3982,7 +4133,10 @@ async fn a_page_callback_that_fails_in_the_look_does_not_leave_a_host_working_wi
     let second = Host::start(&owner).await;
     let phone = desk(&[&first, &second], &owner, Receiver::new(FIRST_TOKEN)).await;
     for reference in phone.references() {
-        phone.desk.enable(&reference).expect("the person asks");
+        phone
+            .desk
+            .enable(&reference, None)
+            .expect("the person asks");
     }
     phone
         .until(|states| states == [PushState::On, PushState::On])
@@ -4078,7 +4232,7 @@ async fn a_choice_made_for_a_host_never_asked_for_notifications_changes_nothing(
 async fn a_run_that_began_before_the_choice_does_not_tell_the_host_off_ahead_of_the_receivers() {
     let (_host, phone, reference) = a_phone_with_notifications_on().await;
     phone.gateway.hold_issue(true);
-    phone.desk.enable(&reference).expect("Try again");
+    phone.desk.enable(&reference, None).expect("Try again");
     eventually("the run is at the gateway", || {
         phone.gateway.issue_requests() == 2
     })
@@ -4204,7 +4358,10 @@ async fn a_filing_the_receivers_never_answer_does_not_hold_the_choices_and_filin
     receiver.with(|state| state.keys_patience = Duration::from_millis(100));
     let phone = desk(&[&host], &owner, receiver).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone.until(|states| states == [PushState::On]).await;
     let asked = |phone: &Desk| {
         phone
@@ -4308,7 +4465,7 @@ async fn previews_turned_off_reach_the_host_though_the_key_cannot_be_taken_out_i
     let restarted = reopened(&phone);
     phone.receiver.with(|state| state.keys_fail = true);
 
-    restarted.desk.enable(&reference).expect("Try again");
+    restarted.desk.enable(&reference, None).expect("Try again");
 
     states_until(&restarted.desk, |states| {
         states == [PushState::NeedsAttention]
@@ -4353,7 +4510,10 @@ async fn keys_the_receivers_cannot_be_handed_leave_the_host_registered_and_a_loo
     let reference = phone.references().remove(0);
     phone.receiver.with(|state| state.keys_fail = true);
 
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
 
     phone
         .until(|states| states == [PushState::NeedsAttention])
@@ -4407,7 +4567,7 @@ async fn keys_the_receivers_cannot_be_handed_leave_the_host_registered_and_a_loo
             .keys_refused
     };
     let before = refused(&phone);
-    phone.desk.enable(&reference).expect("Try again");
+    phone.desk.enable(&reference, None).expect("Try again");
     assert_eq!(
         phone.view().hosts[0].state,
         PushState::NeedsAttention,
@@ -4422,7 +4582,7 @@ async fn keys_the_receivers_cannot_be_handed_leave_the_host_registered_and_a_loo
     assert_eq!(phone.gateway.issue_requests(), 1);
 
     phone.receiver.with(|state| state.keys_fail = false);
-    phone.desk.enable(&reference).expect("Try again");
+    phone.desk.enable(&reference, None).expect("Try again");
     phone.until(|states| states == [PushState::On]).await;
 
     assert_eq!(held_keys(&phone).expect("keys").senders.len(), 1);
@@ -4609,7 +4769,7 @@ async fn a_view_read_earlier_never_reaches_the_page_after_one_read_later() {
     let phone = desk(&[&first, &second], &owner, Receiver::new(FIRST_TOKEN)).await;
     let references = phone.references();
     for reference in &references {
-        phone.desk.enable(reference).expect("the person asks");
+        phone.desk.enable(reference, None).expect("the person asks");
         phone
             .until(|states| !states.contains(&PushState::Working))
             .await;
@@ -4696,7 +4856,10 @@ async fn an_account_that_was_deleted_leaves_each_host_needing_the_person_until_i
     let host = Host::start(&owner).await;
     let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone.until(|states| states == [PushState::On]).await;
     let proposals = proposed(&phone.gateway).len();
 
@@ -4718,7 +4881,7 @@ async fn an_account_that_was_deleted_leaves_each_host_needing_the_person_until_i
 
     phone
         .desk
-        .enable(&reference)
+        .enable(&reference, None)
         .expect("the person asks again");
     phone.until(|states| states == [PushState::On]).await;
     assert!(
@@ -4737,7 +4900,10 @@ async fn a_run_under_way_when_the_account_is_deleted_hands_the_host_nothing() {
     receiver.with(|state| state.answering = false);
     let phone = desk(&[&host], &owner, receiver).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     eventually("the token was proposed", || {
         proposed(&phone.gateway) == [FIRST_TOKEN]
     })
@@ -4748,7 +4914,7 @@ async fn a_run_under_way_when_the_account_is_deleted_hands_the_host_nothing() {
     // The person turns it on again and the challenge of the old run is answered.
     phone
         .desk
-        .enable(&reference)
+        .enable(&reference, None)
         .expect("the person asks again");
     phone.receiver.with(|state| state.answering = true);
     phone.until(|states| states == [PushState::On]).await;
@@ -4773,7 +4939,10 @@ async fn a_deleted_account_marks_nothing_on_a_list_of_hosts_that_cannot_be_read(
     let host = Host::start(&owner).await;
     let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone.until(|states| states == [PushState::On]).await;
 
     let file = find(phone._phone.data.path(), "hosts.json").expect("the paired hosts' file");
@@ -4803,7 +4972,10 @@ async fn a_closed_account_marks_each_host_once_however_many_looks_find_it() {
     let host = Host::start(&owner).await;
     let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone.until(|states| states == [PushState::On]).await;
     let state = AppState::new();
     state.push_opened(Arc::clone(&phone.desk));
@@ -4819,7 +4991,7 @@ async fn a_closed_account_marks_each_host_once_however_many_looks_find_it() {
 
     phone
         .desk
-        .enable(&reference)
+        .enable(&reference, None)
         .expect("the person turns it on again");
     phone.until(|states| states == [PushState::On]).await;
     account.deletion_status(&state, true).await.expect("a look");
@@ -4839,7 +5011,10 @@ async fn a_deleted_account_marks_only_hosts_with_a_record_and_the_mark_survives_
     let second = Host::start(&owner).await;
     let phone = desk(&[&first, &second], &owner, Receiver::new(FIRST_TOKEN)).await;
     let reference = phone.references().remove(0);
-    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
     phone
         .until(|states| states == [PushState::Off, PushState::On])
         .await;
@@ -4857,4 +5032,585 @@ async fn a_deleted_account_marks_only_hosts_with_a_record_and_the_mark_survives_
         .map(|host| host.state)
         .collect();
     assert_eq!(states, [PushState::Off, PushState::NeedsAttention]);
+}
+
+/* -------------------------------------------------------------------------------------------- */
+/* A registration whose outcome is not known                                                    */
+/* -------------------------------------------------------------------------------------------- */
+
+/// The actions the registrations were sent under, in the order they were sent.
+fn actions_sent(phone: &Desk) -> Vec<String> {
+    phone
+        .registered
+        .lock()
+        .expect("what was sent")
+        .actions
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// The actions whose results the phone asked the host for, in the order it asked.
+fn actions_read(phone: &Desk) -> Vec<String> {
+    phone
+        .registered
+        .lock()
+        .expect("what was sent")
+        .reads
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// The action of the registration the page is told nobody knows the outcome of, when it is.
+fn unknown_of(phone: &Desk) -> Option<String> {
+    phone.view().hosts[0]
+        .unknown
+        .as_ref()
+        .map(|unknown| unknown.action_id.clone())
+}
+
+/// What the record on disk says of the first host.
+fn record_of(phone: &Desk) -> Value {
+    let file = find(phone._phone.data.path(), "push.json").expect("the record");
+    let record: Value =
+        serde_json::from_slice(&std::fs::read(&file).expect("the record")).expect("json");
+    record["hosts"]
+        .as_object()
+        .expect("hosts")
+        .values()
+        .next()
+        .expect("a host")
+        .clone()
+}
+
+/// A phone whose host was asked to take the registration and whose answer was lost: the connection
+/// ended after the request was sent. The person asked once, and the page is told the outcome is not
+/// known.
+async fn a_phone_whose_registration_has_no_known_outcome() -> (Host, Desk, String, String) {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
+    let reference = phone.references().remove(0);
+    phone.registered.lock().expect("the script").register_stops = Some(LineStop::Unknown(
+        "the connection ended after the request was sent".to_owned(),
+    ));
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
+    phone
+        .until(|states| states == [PushState::NeedsAttention])
+        .await;
+    phone.registered.lock().expect("the script").register_stops = None;
+    let action = unknown_of(&phone).expect("the registration's outcome is not known");
+    (host, phone, reference, action)
+}
+
+/// KR-REQ-23.24: a registration whose answer was lost is kept as one nobody knows the outcome of,
+/// with its action and the words, and no look, at a return to the foreground or a minute later, makes
+/// another by itself: each reads what the host recorded of it, and a host that cannot say leaves it
+/// unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_registration_whose_answer_was_lost_is_not_replaced_by_a_look() {
+    let (_host, phone, _reference, action) =
+        a_phone_whose_registration_has_no_known_outcome().await;
+    let shown = phone.view().hosts.remove(0);
+    assert!(
+        shown.words.contains("may or may not have taken"),
+        "{:?}",
+        shown.words
+    );
+    assert!(
+        shown
+            .words
+            .contains("the connection ended after the request was sent"),
+        "the earlier result is in the words: {:?}",
+        shown.words
+    );
+    assert_eq!(
+        actions_sent(&phone),
+        std::slice::from_ref(&action),
+        "sent under this action"
+    );
+    assert_eq!(record_of(&phone)["unsettled"]["action_id"], action.as_str());
+
+    for looks in 1..=2 {
+        phone.let_time_pass();
+        look(&phone.desk).await;
+        eventually("the look asked the host what became of it", || {
+            actions_read(&phone).len() == looks
+        })
+        .await;
+        phone
+            .until(|states| states == [PushState::NeedsAttention])
+            .await;
+        assert_eq!(actions_read(&phone), vec![action.clone(); looks]);
+        assert_eq!(
+            actions_sent(&phone),
+            std::slice::from_ref(&action),
+            "no registration was made after the unknown one"
+        );
+        assert_eq!(
+            proposed(&phone.gateway),
+            [FIRST_TOKEN],
+            "nothing was proposed to the gateway again"
+        );
+        assert_eq!(unknown_of(&phone), Some(action.clone()), "still unknown");
+    }
+}
+
+/// A host that took the registration and whose answer was lost is on once a look reads that: the
+/// registration is not made again, the preview key is told, and nothing is kept as unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_look_that_reads_that_the_host_took_the_registration_turns_it_on_without_another() {
+    let (_host, phone, _reference, action) =
+        a_phone_whose_registration_has_no_known_outcome().await;
+    phone.registered.lock().expect("the script").read_says = Some(RegistrationRead::Taken);
+
+    phone.let_time_pass();
+    look(&phone.desk).await;
+
+    phone.until(|states| states == [PushState::On]).await;
+    assert_eq!(
+        actions_sent(&phone),
+        [action],
+        "no other registration was made"
+    );
+    assert_eq!(unknown_of(&phone), None);
+    assert!(
+        record_of(&phone).get("unsettled").is_none(),
+        "settled: {}",
+        record_of(&phone)
+    );
+    assert_eq!(
+        phone.registered.lock().expect("the script").keys.len(),
+        1,
+        "the preview key the registration was owed is told"
+    );
+}
+
+/// A host that did not take the registration is a refusal as any other: the record is cleared, the
+/// words say the host did not take it, and the next look registers again as it always did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_look_that_reads_that_the_host_did_not_take_it_settles_it_as_a_refusal() {
+    let (_host, phone, _reference, action) =
+        a_phone_whose_registration_has_no_known_outcome().await;
+    phone.registered.lock().expect("the script").read_says = Some(RegistrationRead::NotTaken(
+        "the host recorded that it refused it".to_owned(),
+    ));
+
+    phone.let_time_pass();
+    look(&phone.desk).await;
+    eventually("the look read the result", || {
+        actions_read(&phone).len() == 1
+    })
+    .await;
+    phone
+        .until(|states| states == [PushState::NeedsAttention])
+        .await;
+    let shown = phone.view().hosts.remove(0);
+    assert!(
+        shown.words.contains("did not take the registration"),
+        "{:?}",
+        shown.words
+    );
+    assert!(shown.unknown.is_none(), "it is settled");
+    assert!(record_of(&phone).get("unsettled").is_none());
+    assert_eq!(actions_sent(&phone), std::slice::from_ref(&action));
+
+    // A refusal is retried by the next look, as it always was.
+    phone.let_time_pass();
+    look(&phone.desk).await;
+    phone.until(|states| states == [PushState::On]).await;
+    assert_eq!(actions_sent(&phone).len(), 2, "registered again");
+}
+
+/// The host's refusal is no unknown outcome: it is the words, and the next look registers again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_registration_the_host_refused_is_retried_by_the_next_look_as_before() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
+    let reference = phone.references().remove(0);
+    phone.registered.lock().expect("the script").register_stops = Some(LineStop::Host(
+        "the host does not accept this credential".to_owned(),
+    ));
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
+    phone
+        .until(|states| states == [PushState::NeedsAttention])
+        .await;
+    assert_eq!(
+        unknown_of(&phone),
+        None,
+        "a refusal is not an unknown outcome"
+    );
+    assert!(record_of(&phone).get("unsettled").is_none());
+    assert!(
+        phone.view().hosts[0]
+            .words
+            .contains("did not take this phone as a destination"),
+        "{:?}",
+        phone.view().hosts[0].words
+    );
+
+    phone.registered.lock().expect("the script").register_stops = None;
+    phone.let_time_pass();
+    look(&phone.desk).await;
+
+    phone.until(|states| states == [PushState::On]).await;
+    assert_eq!(
+        actions_sent(&phone).len(),
+        2,
+        "registered again, under a new action"
+    );
+    assert!(
+        actions_read(&phone).is_empty(),
+        "nothing was unknown to read"
+    );
+}
+
+/// A new registration after an unknown one is made when the person asks for it, naming the earlier
+/// one they were shown: the earlier result is read first, and a host that cannot say is registered
+/// under a new action, which clears what was kept of the earlier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_person_can_register_again_after_an_unknown_outcome() {
+    let (_host, phone, reference, action) = a_phone_whose_registration_has_no_known_outcome().await;
+
+    phone
+        .desk
+        .enable(&reference, Some(&action))
+        .expect("the person asks again");
+
+    phone.until(|states| states == [PushState::On]).await;
+    assert_eq!(
+        actions_read(&phone),
+        std::slice::from_ref(&action),
+        "read before the new one"
+    );
+    let sent = actions_sent(&phone);
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[0], action);
+    assert_ne!(sent[1], action, "a new action, for a new intent");
+    assert_eq!(unknown_of(&phone), None);
+    assert!(record_of(&phone).get("unsettled").is_none());
+}
+
+/// If the host took the earlier registration, the person's request for another does not make one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_for_another_registration_does_not_make_one_the_host_took() {
+    let (_host, phone, reference, action) = a_phone_whose_registration_has_no_known_outcome().await;
+    phone.registered.lock().expect("the script").read_says = Some(RegistrationRead::Taken);
+
+    phone
+        .desk
+        .enable(&reference, Some(&action))
+        .expect("the person asks again");
+
+    phone.until(|states| states == [PushState::On]).await;
+    assert_eq!(
+        actions_sent(&phone),
+        [action],
+        "the host took it: no second one"
+    );
+    assert_eq!(unknown_of(&phone), None);
+}
+
+/// A request that does not name the registration the host stands at sends nothing: the page was
+/// shown another view, and the host's own state is what it is told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_that_does_not_name_the_registration_the_host_stands_at_sends_nothing() {
+    let (_host, phone, reference, action) = a_phone_whose_registration_has_no_known_outcome().await;
+    let connected = phone.registered.lock().expect("the script").connected.len();
+
+    for named in [None, Some("00000000-0000-4000-8000-000000000000")] {
+        let view = phone
+            .desk
+            .enable(&reference, named)
+            .expect("the request is answered");
+        assert_eq!(view.hosts[0].state, PushState::NeedsAttention);
+        assert_eq!(
+            view.hosts[0]
+                .unknown
+                .as_ref()
+                .map(|each| each.action_id.clone()),
+            Some(action.clone())
+        );
+    }
+
+    assert_eq!(
+        phone.registered.lock().expect("the script").connected.len(),
+        connected,
+        "the host was not reached"
+    );
+    assert_eq!(actions_sent(&phone), [action]);
+}
+
+/// The unknown outcome outlives the application: a start reads it from the record, the page is told
+/// it as before, and a look reads the result and registers nothing. A registration that was about to
+/// be sent when the application ended is as unknown, since it is kept before it is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_outcome_survives_the_application_ending() {
+    let (_host, phone, _reference, action) =
+        a_phone_whose_registration_has_no_known_outcome().await;
+
+    let restarted = reopened(&phone);
+
+    let shown = restarted.desk.view().hosts.remove(0);
+    assert_eq!(shown.state, PushState::NeedsAttention);
+    assert_eq!(
+        shown.unknown.map(|each| each.action_id),
+        Some(action.clone())
+    );
+    assert!(
+        shown.words.contains("may or may not have taken"),
+        "{:?}",
+        shown.words
+    );
+    restarted.let_time_pass();
+    look(&restarted.desk).await;
+    eventually("the look read the result", || {
+        actions_read(&phone).len() == 1
+    })
+    .await;
+    assert_eq!(actions_sent(&phone), [action], "nothing was registered");
+}
+
+/// The application ending while a registration waits for its answer leaves it unknown, not a run
+/// to try again: a look after the start reads it and makes no other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_registration_sent_when_the_application_ended_is_not_made_again_at_the_start() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
+    let reference = phone.references().remove(0);
+    phone.registered.lock().expect("the script").hold_answer = true;
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
+    eventually("the registration was sent", || {
+        actions_sent(&phone).len() == 1
+    })
+    .await;
+    let action = actions_sent(&phone).remove(0);
+
+    // The application ends here: the next start reads the record the first left.
+    let restarted = reopened(&phone);
+
+    let shown = restarted.desk.view().hosts.remove(0);
+    assert_eq!(shown.state, PushState::NeedsAttention);
+    assert_eq!(
+        shown.unknown.map(|each| each.action_id),
+        Some(action.clone())
+    );
+    restarted.let_time_pass();
+    look(&restarted.desk).await;
+    eventually("the look read the result", || {
+        actions_read(&phone).len() == 1
+    })
+    .await;
+    assert_eq!(actions_sent(&phone), [action], "nothing was registered");
+    assert_eq!(
+        proposed(&restarted.gateway),
+        Vec::<String>::new(),
+        "nothing was proposed"
+    );
+}
+
+/// What the retained release's record types are, as that release wrote them: a record of the
+/// notifications desk, whose top level refuses a key it does not know and whose host entries do not.
+mod earlier_release {
+    use std::collections::BTreeMap;
+
+    use kr_protocol::ids::PushSenderRecordId;
+    use kr_protocol::scalars::Digest256;
+    use serde::Deserialize;
+
+    #[derive(Debug, PartialEq, Eq, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum Phase {
+        Working,
+        On,
+        Attention,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[allow(
+        dead_code,
+        reason = "read to prove the record parses, as the release reads it"
+    )]
+    pub struct HostPush {
+        pub sender_record_id: Option<PushSenderRecordId>,
+        pub phase: Phase,
+        pub words: String,
+        #[serde(default)]
+        pub settings: bool,
+        pub updated_ms: u64,
+        #[serde(default)]
+        pub registered: Option<Digest256>,
+        #[serde(default)]
+        pub lost: bool,
+        #[serde(default = "previews_on")]
+        pub previews: bool,
+        #[serde(default)]
+        pub told_previews: Option<bool>,
+    }
+
+    const fn previews_on() -> bool {
+        true
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Record {
+        pub version: u32,
+        pub hosts: BTreeMap<String, HostPush>,
+    }
+}
+
+/// The record a build writes of a registration nobody knows the outcome of is read by the release
+/// that did not keep it, which ignores the entry: the host reads as one that needs the person.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_with_an_unknown_registration_reads_under_the_earlier_releases_types() {
+    let (_host, phone, _reference, action) =
+        a_phone_whose_registration_has_no_known_outcome().await;
+    let file = find(phone._phone.data.path(), "push.json").expect("the record");
+    let bytes = std::fs::read(&file).expect("the record");
+    assert_eq!(record_of(&phone)["unsettled"]["action_id"], action.as_str());
+
+    let earlier: earlier_release::Record =
+        serde_json::from_slice(&bytes).expect("the earlier release reads it");
+
+    assert_eq!(earlier.version, 1);
+    let host = earlier.hosts.values().next().expect("a host");
+    assert_eq!(host.phase, earlier_release::Phase::Attention);
+    assert!(
+        host.words.contains("may or may not have taken"),
+        "{:?}",
+        host.words
+    );
+}
+
+/// A record that holds no unknown registration reads as holding none, and says nothing of one: the
+/// field is not written for a host that has none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_that_holds_no_unknown_registration_reads_as_none_and_writes_none() {
+    let (_host, phone, _reference) = a_phone_with_notifications_on().await;
+    assert!(
+        record_of(&phone).get("unsettled").is_none(),
+        "{}",
+        record_of(&phone)
+    );
+
+    let restarted = reopened(&phone);
+
+    assert!(restarted.desk.view().hosts[0].unknown.is_none());
+    assert_eq!(restarted.desk.view().hosts[0].state, PushState::On);
+}
+
+/// A desk over the product's own registrar and a phone whose connections to its host the test
+/// controls: what it sends goes to the real host, and an answer can be lost on the way back.
+async fn desk_over_a_controlled_link(
+    host: &Host,
+    owner: &DeviceKeys,
+    control: &Arc<LinkControl>,
+) -> Desk {
+    let phone = unpaired_phone_controlled(host, control);
+    pair(&phone, host, owner, &[ActionRight::SessionView]).await;
+    let device = phone.companion.device();
+    let receiver = Receiver::new(FIRST_TOKEN);
+    let registered = Arc::new(Mutex::new(Registered::default()));
+    let opened = open_at(
+        official_origin(),
+        phone.data.path(),
+        &device,
+        &receiver,
+        Arc::new(ConnectionRegistrar::new(Arc::clone(&device))),
+    );
+    Desk {
+        desk: opened.desk,
+        receiver,
+        gateway: opened.gateway,
+        registered,
+        device,
+        clock_ahead_ms: opened.clock_ahead_ms,
+        changes: opened.changes,
+        views: opened.views,
+        gate: opened.gate,
+        _phone: phone,
+    }
+}
+
+/// KR-REQ-23.24, over the product's own connection to a real host: a registration the host
+/// received and whose answer never came back is an unknown outcome. The phone sent it under one
+/// action, and every look after asks the host about that action by sending the exact request again
+/// on a connection of its own, which the host answers from its record; none sends a registration
+/// under another action.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_registration_whose_answer_is_lost_on_a_real_connection_is_asked_about_and_never_replaced()
+ {
+    use kr_protocol::method::Method;
+
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let control = LinkControl::new();
+    let phone = desk_over_a_controlled_link(&host, &owner, &control).await;
+    let reference = phone.references().remove(0);
+    control.lose_the_answer_to(Some(Method::DevicePushRegister));
+
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
+    phone
+        .until(|states| states == [PushState::NeedsAttention])
+        .await;
+
+    let action = unknown_of(&phone).expect("the outcome is not known");
+    assert_eq!(
+        control.sent_actions(Method::DevicePushRegister),
+        std::slice::from_ref(&action)
+    );
+    assert!(
+        phone.view().hosts[0]
+            .words
+            .contains("may or may not have taken"),
+        "{:?}",
+        phone.view().hosts[0].words
+    );
+    assert_eq!(record_of(&phone)["unsettled"]["action_id"], action.as_str());
+
+    control.lose_the_answer_to(None);
+    phone.let_time_pass();
+    look(&phone.desk).await;
+    eventually("the look asked the host about the action again", || {
+        control.sent(Method::DevicePushRegister) == 2
+    })
+    .await;
+    phone
+        .until(|states| states == [PushState::NeedsAttention])
+        .await;
+
+    assert_eq!(
+        control.sent_actions(Method::DevicePushRegister),
+        [action.clone(), action.clone()],
+        "the host was asked about the same action, and no registration went under another"
+    );
+    assert_eq!(proposed(&phone.gateway), [FIRST_TOKEN]);
+    assert_eq!(
+        control.sent(Method::ActionRead),
+        0,
+        "the exact request was sent again, which is how the host answers for an action of its own"
+    );
+    assert!(
+        phone.view().hosts[0]
+            .words
+            .contains("Asked again, the host"),
+        "{:?}",
+        phone.view().hosts[0].words
+    );
 }

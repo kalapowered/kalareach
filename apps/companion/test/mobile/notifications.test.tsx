@@ -273,6 +273,67 @@ describe('the notifications of a paired host', () => {
     expect(within(row).queryByRole('button', { name: 'Open settings' })).toBeNull()
   })
 
+  // A registration the host may or may not have taken is told as that, with the earlier result in
+  // the words. The one thing offered is to register again, and the request names the registration
+  // the person was shown, so that a request made against a view the host has left sends nothing.
+  it('offers to register again after an outcome nobody knows, naming the registration shown', async () => {
+    const person = userEvent.setup()
+    const { controls } = start()
+    const row = await openHosts()
+    act(() => {
+      controls.setPush({
+        available: true,
+        hosts: [
+          {
+            reference: 'studio-reference',
+            state: 'needs_attention',
+            words:
+              'The host may or may not have taken this phone as a destination: the connection ended after the request was sent.',
+            settings: false,
+            previews: true,
+            unknown: { action_id: '6f1c2a40-8a1e-4b6d-9d57-0c4f3a6e1b11' }
+          }
+        ]
+      })
+    })
+    expect(await within(row).findByText(/may or may not have taken this phone/)).toBeInTheDocument()
+    expect(within(row).queryByRole('button', { name: 'Try again' })).toBeNull()
+
+    await person.click(within(row).getByRole('button', { name: 'Register again' }))
+
+    await waitFor(() => {
+      expect(controls.pushEnabledAfter).toEqual(['6f1c2a40-8a1e-4b6d-9d57-0c4f3a6e1b11'])
+    })
+  })
+
+  it('names no registration when the host refused it, and offers Try again as before', async () => {
+    const person = userEvent.setup()
+    const { controls } = start()
+    const row = await openHosts()
+    act(() => {
+      controls.setPush({
+        available: true,
+        hosts: [
+          {
+            reference: 'studio-reference',
+            state: 'needs_attention',
+            words: 'The host did not take this phone as a destination: it refused.',
+            settings: false,
+            previews: true
+          }
+        ]
+      })
+    })
+    await within(row).findByText(/it refused/)
+    expect(within(row).queryByRole('button', { name: 'Register again' })).toBeNull()
+
+    await person.click(within(row).getByRole('button', { name: 'Try again' }))
+
+    await waitFor(() => {
+      expect(controls.pushEnabledAfter).toEqual([undefined])
+    })
+  })
+
   it('looks again each time the application comes to the front, whichever screen it is on', async () => {
     const { controls } = start()
     // The application opens on the attention screen and the person never opens Hosts.

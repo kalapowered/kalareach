@@ -180,7 +180,7 @@ async fn enable<R: Runtime>(app: &AppHandle<R>, checks: &mut Checks<'_>) -> bool
         ));
         return false;
     };
-    if let Err(error) = commands::push_enable(app.state(), reference) {
+    if let Err(error) = commands::push_enable(app.state(), reference, None) {
         checks.push(Check::found(
             "notifications are asked for",
             false,

@@ -961,7 +961,7 @@ pub fn start_push<R: tauri::Runtime>(
         data,
         Arc::clone(&device),
         Arc::new(push::PluginNative(app.clone())),
-        Arc::new(push::ConnectionRegistrar(device)),
+        Arc::new(push::ConnectionRegistrar::new(device)),
         push::Wiring::product()?,
         move |view| {
             let _ = emitter.emit(push::PUSH_EVENT, view);
