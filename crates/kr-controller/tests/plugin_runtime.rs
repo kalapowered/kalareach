@@ -485,10 +485,15 @@ async fn until_within<T, Fut>(patience: Duration, what: &str, mut check: impl Fn
 where
     Fut: std::future::Future<Output = Option<T>>,
 {
-    until_found(patience, what, || {
-        let look = check();
-        async move { look.await.ok_or_else(String::new) }
-    })
+    until_found(
+        patience,
+        what,
+        || {
+            let look = check();
+            async move { look.await.ok_or_else(String::new) }
+        },
+        || async { String::new() },
+    )
     .await
 }
 
@@ -496,9 +501,18 @@ where
 /// runs out of patience says what its looks saw and when, and not only what it waited for: each
 /// look that differed from the one before, with the seconds since the wait began when it was first
 /// seen (the first eight and the last eight when there are more, and how many are left out).
-async fn until_found<T, Fut>(patience: Duration, what: &str, mut check: impl FnMut() -> Fut) -> T
+///
+/// `explain` is asked once, when the wait has run out, for what is worth saying of how things stand
+/// at the end and is too slow to ask at each look.
+async fn until_found<T, Fut, Why>(
+    patience: Duration,
+    what: &str,
+    mut check: impl FnMut() -> Fut,
+    explain: impl FnOnce() -> Why,
+) -> T
 where
     Fut: std::future::Future<Output = Result<T, String>>,
+    Why: std::future::Future<Output = String>,
 {
     let began = tokio::time::Instant::now();
     let deadline = began + patience;
@@ -511,11 +525,13 @@ where
         if !seen.is_empty() && looks.last().is_none_or(|(_, last)| *last != seen) {
             looks.push((began.elapsed(), seen));
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "waited {patience:?} for {what}{}",
-            looks_in_words(&looks)
-        );
+        if tokio::time::Instant::now() >= deadline {
+            let end = explain().await;
+            panic!(
+                "waited {patience:?} for {what}{}{end}",
+                looks_in_words(&looks)
+            );
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -555,11 +571,19 @@ struct Look {
         kr_protocol::ids::BrokerBindingId,
         kr_protocol::admission::ComponentReport,
     )>,
-    /// The workers that gave those reports.
-    workers: Vec<SessionId>,
     /// Whether the controller counted a current report from every worker. Where it did not, the
     /// reports may be the last ones accepted, which say nothing of where a component stands now.
     counted: bool,
+}
+
+/// What a look says of how current its reports are.
+fn counting_in_words(counted: bool) -> &'static str {
+    if counted {
+        "the controller counted a current report from every worker"
+    } else {
+        "the controller could not count a current report from every worker, so these may be the \
+         reports last accepted"
+    }
 }
 
 /// What the workers' reports of components say, one binding to a phrase, for a wait that ran out:
@@ -1230,42 +1254,37 @@ impl World {
     async fn looked(&self) -> Look {
         let controller = self.controller();
         let counted = controller.refresh_admissions().await;
-        let mut reports = Vec::new();
+        let reports = controller
+            .reported_components()
+            .into_iter()
+            .map(|(_, binding_id, report)| (binding_id, report))
+            .collect();
+        Look { reports, counted }
+    }
+
+    /// How things stand with the workers' rounds at the end of a wait that ran out, for telling a
+    /// worker that did not answer from a view the controller did not refresh: how many of the
+    /// workers that gave reports have a round that has not ended, and what the catalogue noted.
+    /// It is not a proof of either, since a round that timed out is no longer out, and it is asked
+    /// once, when the wait has run out, because the catalogue's notes can take up to five seconds
+    /// to read.
+    async fn rounds_in_words(&self) -> String {
+        let controller = self.controller();
         let mut workers = Vec::new();
-        for (session_id, binding_id, report) in controller.reported_components() {
-            reports.push((binding_id, report));
+        for (session_id, _, _) in controller.reported_components() {
             if !workers.contains(&session_id) {
                 workers.push(session_id);
             }
         }
-        Look {
-            reports,
-            workers,
-            counted,
-        }
-    }
-
-    /// What a look says of how current its reports are. Where the controller could not count a
-    /// current report from every worker, it also says how many of the workers that gave the
-    /// reports have a round that has not ended and what the catalogue noted: further evidence for
-    /// telling a worker that did not answer from a view the controller did not refresh, not a
-    /// proof of either, since a round that timed out is no longer out.
-    async fn counting_in_words(&self, look: &Look) -> String {
-        if look.counted {
-            return "the controller counted a current report from every worker".to_owned();
-        }
-        let controller = self.controller();
-        let out = look
-            .workers
+        let out = workers
             .iter()
             .filter(|worker| controller.admission_round_out(**worker))
             .count();
         let notes = controller.catalogue_warnings().await;
         format!(
-            "the controller could not count a current report from every worker, so these may be \
-             the reports last accepted; {out} of {} workers have a round that has not ended; \
-             the catalogue's notes: {}",
-            look.workers.len(),
+            "; when the wait ran out, {out} of {} workers had a round that had not ended; the \
+             catalogue's notes: {}",
+            workers.len(),
             if notes.is_empty() {
                 "none".to_owned()
             } else {
@@ -1732,10 +1751,11 @@ async fn a_plugin_runtime_that_ends_with_a_registration_unanswered_takes_no_work
                 None => Err(reports_in_words(
                     &look.reports,
                     first_binding,
-                    &world.counting_in_words(&look).await,
+                    counting_in_words(look.counted),
                 )),
             }
         },
+        || world.rounds_in_words(),
     )
     .await;
 
