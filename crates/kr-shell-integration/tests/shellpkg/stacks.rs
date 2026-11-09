@@ -1500,6 +1500,7 @@ impl Session {
         let deadline = self.deadline_for(FENCE);
         let mut asked = (enter.prompt_generation, enter.reader_revision);
         let mut attempts = 0;
+        let mut moved = 0;
         loop {
             attempts += 1;
             let id = self.ask(WorkerRequest::Fence(RootEditorFenceParams {
@@ -1520,6 +1521,7 @@ impl Session {
                 Some(BridgeAnswer::Fence(RootEditorFenceResult::Refused(refusal)))
                     if refusal.reason == kr_protocol::root::FenceRefusalReason::ReaderMoved =>
                 {
+                    moved += 1;
                     let Some(report) = self.next_reader_report(deadline, |_| true) else {
                         return Err(format!(
                             "the reader moved under every one of {attempts} fences in {FENCE:?} \
@@ -1528,12 +1530,14 @@ impl Session {
                     };
                     asked = (report.idle.prompt_generation, report.idle.reader_revision);
                 }
-                // Nothing answered. Something that is not this reader has the terminal, and what
-                // it is holding cannot be read from here.
+                // The last fence got no answer; the ones before it were answered as for a reader
+                // that had moved. Something that is not this reader has the terminal, and what it
+                // is holding cannot be read from here.
                 None => {
                     return Err(format!(
-                        "nothing answered any of {attempts} fences in {FENCE:?}, so this session \
-                         read no state of the reader's at all"
+                        "the last of {attempts} fences in {FENCE:?} got no answer within the wait \
+                         ({moved} before it were answered as for a reader that had moved), so this \
+                         session read no state of the reader's"
                     ));
                 }
                 other => {
