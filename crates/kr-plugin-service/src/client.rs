@@ -1499,6 +1499,8 @@ async fn read_frames(mut reader: FrameReader, pending: Arc<Pending>, notices: No
         };
         match frame {
             Frame::Response { reply_to, body } => {
+                // No await between taking the waiter and acting on its answer: a task is stopped
+                // only at an await, so the guard above never empties the account between the two.
                 if let Some(waiter) = pending.take(reply_to) {
                     waiter.answered(body);
                 }

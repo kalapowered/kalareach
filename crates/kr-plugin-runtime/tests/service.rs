@@ -3611,9 +3611,10 @@ async fn a_hold_that_two_calls_reach_lets_both_of_them_go_when_it_is_released() 
 // set since. A task that a release has woken must not go on to wait at the next hold: the test that
 // sets one would then wait for a task that has no more to do with it than the one before.
 //
-// A hold is set and a task stops at it; a second hold is set before the first is released, as one is
-// by a test that sets its next hold as soon as it has released the last. The release of the first
-// lets the task go, and the second has no task at it.
+// A hold is set and a task stops at it; a second hold is set before the first is released. That is
+// the state a woken task finds when a test sets its next hold after the release and before the task
+// runs again, reached here without a race. The release of the first lets the task go, and the second
+// has no task at it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_task_leaves_the_hold_it_stopped_at_when_that_hold_is_released_whatever_hold_is_set_since()
  {
