@@ -3120,17 +3120,18 @@ async fn an_answer_to_a_question_is_never_inserted_into_the_terminal() {
 ///
 /// A real session runs a program that records every byte it reads from its terminal. The control
 /// daemon's checks connection asks the worker's service to perform the checks twice, once naming
-/// a file and once naming none. A headless session is asked for the file read alone, so each
-/// answer holds that one record: none names synthetic input, the one check that sends input and
-/// needs a test context of its own. Then the person types a sentinel, which is how the recording
+/// a file and once naming none. The request names no check: the worker performs the checks its
+/// own context allows, and a headless session's is the file read alone, so each answer holds that
+/// one record: none names synthetic input, the one check that sends input and needs a test context
+/// of its own. Then the person types a sentinel, which is how the recording
 /// is known to be complete, and it holds the sentinel and nothing else.
 ///
 /// Not shown here: that the tree the read check opens is left as it was, which
 /// `desktop_checks.rs`'s `the_authorised_file_check_leaves_the_file_and_its_directory_as_they_were`
 /// shows; the screen image, the accessible element and the application launch, which only a
-/// desktop-bound worker is asked for and this build performs only on macOS, so that what their
-/// operations do to another application is not observed here, a headless session being asked for
-/// none of them; and a keystroke delivered inside an isolated test context, which no check in this
+/// desktop-bound worker performs and this build performs only on macOS, so that what their
+/// operations do to another application is not observed here, a headless session performing none
+/// of them; and a keystroke delivered inside an isolated test context, which no check in this
 /// build delivers.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
