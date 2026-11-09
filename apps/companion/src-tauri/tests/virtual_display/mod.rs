@@ -162,13 +162,14 @@ fn on_path(program: &str) -> bool {
 ///
 /// The server is not to outlive this process, whatever ends it. Where the host has `setpriv`, the
 /// server is started under it with `--pdeathsig TERM`, so the kernel signals the server when this
-/// process goes, at any moment, the one between the server saying its display and the copy starting
-/// included; the signal is tied to the thread that started it, and this runs on the main thread,
-/// which lasts as long as the process. `-terminate` covers a host without `setpriv`: the server
-/// then ends itself when the last program using it goes, which ends it after a killed process only
-/// on the condition that no X client outlives the copy (the D-Bus autolaunch of a host with
-/// `dbus-x11` and no session bus starts one that stays until the server ends), and not at all
-/// when the process goes before the copy has connected, because no client has then come or gone.
+/// process goes: from the instant `setpriv` has set the signal, a few milliseconds after the start,
+/// and so also in the time between the server saying its display and the copy starting. The signal
+/// is tied to the thread that started the server, and this runs on the main thread, which lasts as
+/// long as the process. `-terminate` covers a host without `setpriv`: the server then ends itself
+/// when the last program using it goes, which ends it after a killed process only on the condition
+/// that no X client outlives the copy (the D-Bus autolaunch of a host with `dbus-x11` and no
+/// session bus starts one that stays until the server ends), and not at all when the process goes
+/// before the copy has connected, because no client has then come or gone.
 fn start() -> Result<(Server, String), Start> {
     if !on_path("Xvfb") {
         return Err(Start::NotInstalled);
