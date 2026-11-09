@@ -658,6 +658,58 @@ struct PluginHost {
     _fence: HostFence,
 }
 
+/// The directory the plugin host files its compiled components in, under its environment's state
+/// directory.
+const PLUGIN_CACHE_DIRECTORY: &str = "plugin-cache";
+
+/// What the plugin host says of the compiled components it holds, read from its own health answer,
+/// and what its compiled-code cache takes on disk, read from the directory.
+#[derive(Clone, Copy, Debug)]
+struct CacheAccount {
+    /// How many bindings are live in the host.
+    live_bindings: u64,
+    /// How many compiled components the host holds in memory.
+    components: u64,
+    /// How many bytes of compiled artefact those components were made from.
+    artefact_bytes: u64,
+    /// How many bytes the cache's directory holds.
+    on_disk_bytes: u64,
+}
+
+impl CacheAccount {
+    /// Whether the account shows a host serving a compiled component: every figure is one a
+    /// reading that failed to find the host's account would not have.
+    fn shows_a_serving_host(&self) -> bool {
+        self.live_bindings >= 1
+            && self.components >= 1
+            && self.artefact_bytes > 0
+            && self.on_disk_bytes > 0
+    }
+}
+
+/// The bytes of every file under `directory`.
+fn directory_bytes(directory: &Path) -> Result<u64, String> {
+    let mut total = 0;
+    for entry in std::fs::read_dir(directory)
+        .map_err(|error| format!("the directory {}: {error}", directory.display()))?
+    {
+        let entry =
+            entry.map_err(|error| format!("an entry of {}: {error}", directory.display()))?;
+        let kind = entry
+            .file_type()
+            .map_err(|error| format!("the kind of {}: {error}", entry.path().display()))?;
+        total += if kind.is_dir() {
+            directory_bytes(&entry.path())?
+        } else {
+            entry
+                .metadata()
+                .map_err(|error| format!("the size of {}: {error}", entry.path().display()))?
+                .len()
+        };
+    }
+    Ok(total)
+}
+
 /// The supervisor the plugin host is started through: the host tree's own, so the tree's teardown
 /// counts it among what it ends. It keeps the job's label, which its retirement needs.
 struct Supervised {
@@ -841,6 +893,24 @@ impl PluginHost {
         } else {
             Err("the fixture package's binding did not answer a snapshot".to_owned())
         }
+    }
+
+    /// Reads the host's account of what it holds, through the connection this run registered its
+    /// binding on, and the size of its compiled-code cache on disk.
+    async fn account(&self, environment: &EnvironmentPaths) -> Result<CacheAccount, String> {
+        let health = within("the plugin host's health", async {
+            self._client
+                .health()
+                .await
+                .map_err(|error| format!("the plugin host's health: {error}"))
+        })
+        .await?;
+        Ok(CacheAccount {
+            live_bindings: health.live_bindings,
+            components: health.resident_components,
+            artefact_bytes: health.resident_bytes,
+            on_disk_bytes: directory_bytes(&environment.state_dir().join(PLUGIN_CACHE_DIRECTORY))?,
+        })
     }
 
     /// Ends the plugin host, and what the service manager keeps of it.
@@ -1076,9 +1146,19 @@ struct Figures {
     stalled: Vec<String>,
     failed_views: Vec<String>,
     not_live: Vec<SessionId>,
+    /// The plugin host's account of its compiled components at the end of the window: none when no
+    /// host was serving, and the reason when the account could not be read.
+    plugin_cache: Option<Result<CacheAccount, String>>,
 }
 
 /// Section 27's stress run.
+///
+/// KR-PERF-003, for the part that the whole-product report includes the shared plugin service and
+/// its compiled caches while the service is active: the run starts the plugin host with a binding
+/// of a compiled component, reads the host's account of what it holds through its health answer and
+/// the size of its cache on disk, prints them in the whole-product record beside the host's
+/// resident size, and asserts that the account was read and shows a compiled component. The idle
+/// bound and the report with adapters and the description model active are not shown here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "runs for several minutes by design; scripts/bench-all.sh runs it"]
 async fn fifty_sessions_with_sustained_output() {
@@ -1091,6 +1171,18 @@ async fn fifty_sessions_with_sustained_output() {
 
     let p95 = percentile(&figures.samples, 0.95);
     let p99 = percentile(&figures.samples, 0.99);
+    // A host that served has an account that says so: the figures are read from it, so a report that
+    // left them out, or read the wrong place, fails here and does not only omit them.
+    if let Some(account) = &figures.plugin_cache {
+        let account = account
+            .as_ref()
+            .unwrap_or_else(|failure| panic!("the plugin host's account was not read: {failure}"));
+        assert!(
+            account.shows_a_serving_host(),
+            "the plugin host served a binding of a compiled component, and its account shows it: \
+             {account:?}"
+        );
+    }
     assert!(
         figures.not_live.is_empty(),
         "every session was still live at the end of the window: {:?} were not",
@@ -1449,6 +1541,10 @@ async fn stress(host: &Host, run: &mut Run) -> Result<Figures, String> {
         .filter_map(|pid| last_resident.get(pid))
         .sum();
     let plugin_now = plugin_pid.and_then(|pid| last_resident.get(&pid).copied());
+    let plugin_cache = match &run.plugin {
+        Some(plugin) => Some(plugin.account(&host.temp.environment()).await),
+        None => None,
+    };
     let host_now: u64 = last_resident.values().sum();
     let kib = |value: u64| size(value * 1024);
     let configuration = format!(
@@ -1594,6 +1690,24 @@ async fn stress(host: &Host, run: &mut Run) -> Result<Figures, String> {
         plugin_now.map_or_else(|| "not running".to_owned(), kib)
     ));
     lines.push(format!("  plugin host       {serving}"));
+    lines.push(format!(
+        "  compiled cache    {}",
+        match &plugin_cache {
+            Some(Ok(account)) => format!(
+                "the host holds {} compiled component{} in memory, made from {} of compiled \
+                 artefact, for {} live binding{}; the cache's directory holds {} on disk (the \
+                 host's own account, read through its health answer)",
+                account.components,
+                if account.components == 1 { "" } else { "s" },
+                size(account.artefact_bytes),
+                account.live_bindings,
+                if account.live_bindings == 1 { "" } else { "s" },
+                size(account.on_disk_bytes)
+            ),
+            Some(Err(reason)) => format!("not read: {reason}"),
+            None => "not running".to_owned(),
+        }
+    ));
     lines.push("  description model not active in this run".to_owned());
     lines.push(
         "  bound             section 27 asks for this figure to be reported and sets no bound on it"
@@ -1683,5 +1797,6 @@ async fn stress(host: &Host, run: &mut Run) -> Result<Figures, String> {
         stalled,
         failed_views,
         not_live,
+        plugin_cache,
     })
 }
