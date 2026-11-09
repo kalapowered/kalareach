@@ -432,10 +432,12 @@ fn a_switch_an_attesting_bridge_detects_invalidates_the_questions_asked_under_th
 /// hand to the new thread, and the agent's own poll reads it as ended with no answer. The question
 /// asked in the newly selected thread is its own: pending, under the new binding revision, with no
 /// answer, and untouched by the answers that went before. The feed carries the one answer once, on
-/// the question it answered. Not shown here: that the worker has no path that delivers an answer
-/// into an agent thread's input, which no case exercises (the ledger holds no thread to deliver
-/// to); the terminal half, which is the session's own input staying free of an answer; or the
-/// agent's tool call that waits.
+/// the question it answered. Not shown here: the worker's own delivery into an agent thread's
+/// input (the ledger holds no thread to deliver to), which `agent_service.rs`'s
+/// `an_answer_is_not_inserted_into_the_thread_the_agent_selected_after_asking` shows through the
+/// worker's service and a recording transport; the terminal half, which `input_lease.rs`'s
+/// `an_answer_to_a_question_is_never_inserted_into_the_terminal` shows; or the agent's tool call
+/// that waits.
 #[test]
 fn an_answer_does_not_follow_the_agent_into_a_newly_selected_thread() {
     let instance = ApplicationInstanceId::new(Uuid::from_bytes([13; 16]));
