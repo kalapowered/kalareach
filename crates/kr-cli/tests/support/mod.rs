@@ -143,6 +143,7 @@ end_what_runs_from() {
 ///
 /// It is in a process group of its own, so that a harness that ends a run by ending the group it
 /// started does not end the watcher with it.
+#[cfg(unix)]
 pub fn watch(root: &Path) -> Option<std::process::ChildStdin> {
     let mut command = std::process::Command::new("sh");
     command
@@ -155,12 +156,42 @@ pub fn watch(root: &Path) -> Option<std::process::ChildStdin> {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
 
         command.process_group(0);
     }
+    command.spawn().ok()?.stdin.take()
+}
+
+/// Starts the watcher of `root`, and returns the end of the pipe it reads: when that end closes, the
+/// watcher removes `root`.
+///
+/// The watcher is the command interpreter of the system directory, which every Windows has: it runs
+/// `sort`, which reads its input to the end and writes nothing, and then, only if that ended well,
+/// removes the directory. A
+/// POSIX shell is not one every Windows machine has on its search path, and a run whose watcher
+/// does not start leaves its directory in the temporary directory for good. The path reaches the
+/// interpreter in the environment, quoted, so that no character in it is read as part of the
+/// command. What still runs from `root` when the run ends keeps its file, and the directory with
+/// it. The watcher has a process group of its own and no window.
+#[cfg(windows)]
+pub fn watch(root: &Path) -> Option<std::process::ChildStdin> {
+    use std::os::windows::process::CommandExt as _;
+
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let system = std::env::var_os("SystemRoot")?;
+    let mut command =
+        std::process::Command::new(Path::new(&system).join("System32").join("cmd.exe"));
+    command
+        .raw_arg("/d /c sort >nul && rmdir /s /q \"%KR_WATCHED_DIRECTORY%\"")
+        .env("KR_WATCHED_DIRECTORY", root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     command.spawn().ok()?.stdin.take()
 }
 
@@ -188,9 +219,10 @@ pub fn watch(root: &Path) -> Option<std::process::ChildStdin> {
 /// is given has to be there and has to say something: a removal is never asked for with an empty
 /// or missing path, and the shell refuses to run one rather than working out what that would mean.
 ///
-/// The watcher is a POSIX shell found on `PATH` on every platform. On Windows that is the one Git
-/// for Windows installs, which the CI runner has on `PATH`; a Windows machine without one on `PATH`
-/// keeps each run's directory in its own temporary directory, because the sweep below is Unix only.
+/// The watcher is a POSIX shell found on `PATH` on Unix and the system directory's command
+/// interpreter on Windows, so a machine keeps no run's directory for want of a program on its search
+/// path. A watcher that did not start is only a watcher that did not: on Unix the sweep below answers
+/// for the run.
 fn take_it_away_when_this_run_ends(root: &Path) {
     static HELD: Mutex<Vec<std::process::ChildStdin>> = Mutex::new(Vec::new());
 
