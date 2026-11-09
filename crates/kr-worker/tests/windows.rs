@@ -1328,6 +1328,37 @@ fn kr_req_12_16_a_directory_converted_to_a_link_is_seen_and_its_grant_reads_noth
     );
 }
 
+/// Runs a case that hosts workers over a tree of its own, on a runtime of its own, and fails when
+/// the tree is still in the temporary folder once the runtime has ended.
+///
+/// A worker's service is served by tasks of the runtime, and some of them (the host's maintenance,
+/// which waits out a beat of a minute) are not ended by anything but the runtime ending; they hold
+/// the worker's journal until then, and a folder with a file held open is not removed. So the tree
+/// is made outside the runtime and is let go of after the runtime has ended, and the files are
+/// free by then, as they are when a worker's process ends. The runtime is the multi-thread kind that
+/// a case which hosts a worker runs on.
+fn on_a_tree(
+    case: for<'a> fn(
+        &'a kr_ipc::testing::TempHost,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>,
+) {
+    let temp = kr_ipc::testing::TempHost::create();
+    let root = temp.root().to_path_buf();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(case(&temp));
+    drop(runtime);
+    drop(temp);
+    assert!(
+        !root.exists(),
+        "{} is left in the temporary folder",
+        root.display()
+    );
+}
+
 /// A worker this test hosts: a session whose root shell is PowerShell, served on the environment's
 /// endpoint for its display number, and the descriptor a local caller finds it by.
 struct Worker {
@@ -1488,12 +1519,15 @@ fn open_pipe(endpoint: &kr_ipc::paths::Endpoint) -> std::fs::File {
 /// worker serves, the list is protected, owned by this account and grants nobody the machine does
 /// not already trust, and the worker behind it answers the challenge of the descriptor it is
 /// published under.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn each_worker_keeps_a_journal_of_its_own_and_is_reached_on_a_pipe_of_its_own() {
+#[test]
+fn each_worker_keeps_a_journal_of_its_own_and_is_reached_on_a_pipe_of_its_own() {
+    on_a_tree(|temp| Box::pin(each_worker_keeps_a_journal_of_its_own(temp)));
+}
+
+async fn each_worker_keeps_a_journal_of_its_own(temp: &kr_ipc::testing::TempHost) {
     use std::os::windows::io::AsHandle as _;
 
-    let temp = kr_ipc::testing::TempHost::create();
-    let workers = [worker(&temp, 1).await, worker(&temp, 2).await];
+    let workers = [worker(temp, 1).await, worker(temp, 2).await];
     assert_ne!(
         workers[0].journal, workers[1].journal,
         "one journal per worker"
@@ -1546,12 +1580,15 @@ async fn each_worker_keeps_a_journal_of_its_own_and_is_reached_on_a_pipe_of_its_
 /// the pipe rather than by anything it sends. What it does is recorded under the local owner, and
 /// nothing it sends names anyone else. The worker still checks the scope of every request itself,
 /// so a mutation aimed at another session is refused rather than served.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_local_caller_on_a_workers_pipe_is_served_as_its_owner_and_held_to_its_session() {
+#[test]
+fn a_local_caller_on_a_workers_pipe_is_served_as_its_owner_and_held_to_its_session() {
+    on_a_tree(|temp| Box::pin(a_local_caller_is_served_as_its_owner(temp)));
+}
+
+async fn a_local_caller_is_served_as_its_owner(temp: &kr_ipc::testing::TempHost) {
     use kr_protocol::scalars::Nullable;
 
-    let temp = kr_ipc::testing::TempHost::create();
-    let hosted = worker(&temp, 1).await;
+    let hosted = worker(temp, 1).await;
     let mut client = kr_ipc::client::LocalClient::connect(
         &hosted.endpoint,
         kr_protocol::local::LocalClientKind::Cli,
@@ -1630,8 +1667,12 @@ async fn a_local_caller_on_a_workers_pipe_is_served_as_its_owner_and_held_to_its
 /// marker that ends the line. Shift and Return is the key this is shown with: its legacy spelling is
 /// a bare carriage return, which the console reads back as Return with no modifier, so an
 /// application that is told Return with Shift held was given the record and not the legacy bytes.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn key_records_written_to_a_real_pseudo_console_reach_the_application_as_key_events() {
+#[test]
+fn key_records_written_to_a_real_pseudo_console_reach_the_application_as_key_events() {
+    on_a_tree(|temp| Box::pin(key_records_reach_the_application(temp)));
+}
+
+async fn key_records_reach_the_application(temp: &kr_ipc::testing::TempHost) {
     use kr_ipc::client::LocalClient;
     use kr_protocol::attachment::{
         AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
@@ -1640,9 +1681,8 @@ async fn key_records_written_to_a_real_pseudo_console_reach_the_application_as_k
     use kr_protocol::local::LocalClientKind;
     use kr_protocol::scalars::{CanonicalSet, Nullable};
 
-    let temp = kr_ipc::testing::TempHost::create();
     let hosted = worker_running(
-        &temp,
+        temp,
         1,
         "Write-Host 'kr-ready.'; \
          $key = [Console]::ReadKey($true); \
