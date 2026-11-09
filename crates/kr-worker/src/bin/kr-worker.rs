@@ -59,7 +59,7 @@ use kr_worker::environment::{ExecutionContext, build as build_environment};
 use kr_worker::history::DEFAULT_RESIDENT_BYTES;
 use kr_worker::output::DEFAULT_SEND_QUEUE_BYTES;
 use kr_worker::pty::ShellCommand;
-use kr_worker::runtime::{CLOSURE_NOTICE_TIMEOUT, start_or_record};
+use kr_worker::runtime::{CLOSURE_NOTICE_TIMEOUT, SHELL_END_BOUND, start_or_record};
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::SessionConfig;
 
@@ -114,14 +114,6 @@ struct Arguments {
 /// that drains takes a line in far less than this; one that has stopped draining holds the end of
 /// the process for this long and no longer.
 const DIAGNOSTICS_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// How long a worker whose launch failed gives its root shell to be seen to end before it stops
-/// waiting for it.
-///
-/// The session's closure asks the shell to stop and forces it after five seconds, so a shell that
-/// can be ended is gone well inside this. One that is not seen to end is not reported on, because
-/// the failure is reported only of a shell that has ended.
-const SHELL_END_BOUND: std::time::Duration = std::time::Duration::from_secs(15);
 
 fn main() -> ExitCode {
     let ended = serve();
@@ -489,10 +481,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         // A create that could not deliver the managed contract leaves a closure record rather than
         // a shell nobody is going to use.
         runtime.close(ClosureReason::RootLaunchFailed).1.release();
-        if tokio::time::timeout(SHELL_END_BOUND, runtime.wait_root_ended())
-            .await
-            .is_ok()
-        {
+        if runtime.root_ended_within(SHELL_END_BOUND).await {
             let _ = writer
                 .write_message(&ControlFrame::WorkerFailed(error.clone()))
                 .await;

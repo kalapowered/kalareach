@@ -2629,3 +2629,64 @@ async fn a_session_that_launched_its_shell_and_cannot_start_ends_the_shell() {
         "the shell the session launched is still running"
     );
 }
+
+/// KR-REQ-09.09: a worker whose launch failed waits for its root shell to end for the bound it is
+/// given and no longer, and says whether the shell ended. A shell it does not see end is one it
+/// does not report over, so a wait that never gave up would leave the worker without an answer to
+/// give.
+///
+/// The shell here reads its input for ever until it is closed, so it has not ended when the bound
+/// does: the case decides by what the wait returns, and a wait without a bound never returns.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_runtime_gives_up_waiting_for_a_shell_that_is_still_running_at_the_bound() {
+    let host = kr_ipc::testing::TempHost::create();
+    let mut session = Session::open(configuration(&host, "exec cat")).expect("opens");
+    session.launch().expect("launches");
+    let runtime = std::sync::Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
+
+    let ended = tokio::time::timeout(
+        Duration::from_secs(60),
+        runtime.root_ended_within(Duration::from_millis(100)),
+    )
+    .await
+    .expect("the wait gave up at its bound");
+    assert!(!ended, "the shell is still running");
+
+    runtime.close(ClosureReason::CloseRequested).1.release();
+    assert!(
+        runtime.root_ended_within(LIVENESS_DEADLINE).await,
+        "the shell ended once the session was closed"
+    );
+    closure_record(&runtime, "the closure finishes").await;
+}
+
+/// KR-REQ-09.09: the same for a session that has no runtime, which waits on the thread it is
+/// called on. The wait is made on a thread of its own, so that a wait without a bound fails the case
+/// rather than holding it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_gives_up_waiting_for_a_shell_that_is_still_running_at_the_bound() {
+    let host = kr_ipc::testing::TempHost::create();
+    let mut session = Session::open(configuration(&host, "exec cat")).expect("opens");
+    session.launch().expect("launches");
+
+    let (told, heard) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let ended = session.wait_root_ended_for(Duration::from_millis(100));
+        let _ = told.send((session, ended));
+    });
+    let (mut session, ended) = heard
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the wait gave up at its bound");
+    assert!(!ended, "the shell is still running");
+
+    assert!(
+        session.end_launched_shell(LIVENESS_DEADLINE),
+        "the shell ended once the session was asked to end it"
+    );
+}

@@ -5088,19 +5088,38 @@ impl Session {
         shell.map(|()| remaining)
     }
 
-    /// Ends the root shell this session launched, and what the session owns, and waits until the
-    /// shell has gone.
+    /// Ends the root shell this session launched, and what the session owns, and waits for the
+    /// shell to go for at most `within`. Returns whether the shell is known to have ended.
     ///
     /// A start that fails after the launch has no closure to do it, because nothing reads or writes
-    /// the terminal. The shell is forced to stop and, when it was signalled, waited for, so that it
-    /// has ended when this returns. A shell the kernel will not describe is not signalled and is
-    /// not waited for. A session that launched no shell has nothing to end.
-    pub fn end_launched_shell(&mut self) {
+    /// the terminal. The shell is forced to stop and, when it was signalled, waited for. A shell the
+    /// kernel will not describe is not signalled and is not waited for, and one that is not seen to
+    /// end within the bound is given up on: neither is known to have ended. A session that launched
+    /// no shell has nothing to end.
+    pub fn end_launched_shell(&mut self, within: Duration) -> bool {
         if self.force_close().is_err() {
-            return;
+            return false;
         }
-        if let Some(shell) = self.shell.as_mut() {
-            let _ = shell.wait();
+        self.wait_root_ended_for(within)
+    }
+
+    /// Waits, for at most `within`, until the root shell has ended, and returns whether it has. A
+    /// session that launched none has ended it already.
+    ///
+    /// This blocks the thread it is called on, and is for a session that has no runtime yet. A
+    /// runtime waits through [`SessionRuntime::root_ended_within`].
+    ///
+    /// [`SessionRuntime::root_ended_within`]: crate::runtime::SessionRuntime::root_ended_within
+    pub fn wait_root_ended_for(&mut self, within: Duration) -> bool {
+        let until = Instant::now() + within;
+        loop {
+            if self.root_has_ended() {
+                return true;
+            }
+            if Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 

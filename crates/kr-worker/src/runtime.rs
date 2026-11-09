@@ -37,6 +37,16 @@ use crate::trace::Site;
 /// the answer the person gets.
 pub const QUALIFICATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a worker whose launch failed gives its root shell to be seen to end before it stops
+/// waiting for it.
+///
+/// The session's closure asks the shell to stop and forces it after five seconds, so a shell that
+/// can be ended is gone well inside this. One that is not seen to end is not reported on, because
+/// a failure is reported only of a shell that has ended. The control daemon adds this to the time it
+/// waits for a managed session's worker, so that the reason the worker gives when the shell it
+/// started never qualifies reaches the caller.
+pub const SHELL_END_BOUND: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// How many read batches may wait for ingestion before the read loop slows down.
 pub const READ_QUEUE_DEPTH: usize = 64;
 
@@ -745,9 +755,19 @@ impl SessionRuntime {
     ///
     /// Returns an error when the terminal's reader or writer cannot be taken.
     pub fn start(
-        mut session: Session,
+        session: Session,
         shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
     ) -> Result<Self> {
+        Self::start_and_say_if_the_shell_ended(session, shared_clock)
+            .map_err(|failure| failure.error)
+    }
+
+    /// Starts the runtime as [`Self::start`] does, and says of a start that fails whether the
+    /// root shell the session had launched is known to have ended.
+    fn start_and_say_if_the_shell_ended(
+        mut session: Session,
+        shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
+    ) -> std::result::Result<Self, StartFailure> {
         // The shell is already launched, and a session that cannot take its terminal has nothing
         // that will close it: it is ended here, so the failure this returns is never reported while
         // the shell it started is still running.
@@ -757,8 +777,8 @@ impl SessionRuntime {
         {
             Ok(taken) => taken,
             Err(error) => {
-                session.end_launched_shell();
-                return Err(error);
+                let shell_ended = session.end_launched_shell(SHELL_END_BOUND);
+                return Err(StartFailure { error, shell_ended });
             }
         };
         // The session's time contract, which the writer reads UTC through when a batch carries a
@@ -1602,17 +1622,21 @@ impl SessionRuntime {
         self.sink.activity.supervision_is_looking()
     }
 
-    /// Waits until the root shell has ended, and returns at once for a session that has none.
+    /// Waits, for at most `within`, until the root shell has ended, and returns whether it has.
+    /// A session that has none has ended it already.
     ///
-    /// It gives up by itself never: a caller that cannot wait for ever bounds it. It does not wait
-    /// for the rest of the closure, which drains the terminal and ends the session's servers.
-    pub async fn wait_root_ended(&self) {
-        loop {
-            if self.session().root_has_ended() {
-                return;
+    /// It does not wait for the rest of the closure, which drains the terminal and ends the
+    /// session's servers.
+    pub async fn root_ended_within(&self, within: std::time::Duration) -> bool {
+        let wait = async {
+            loop {
+                if self.session().root_has_ended() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        };
+        tokio::time::timeout(within, wait).await.is_ok()
     }
 
     /// Waits until the session has finished closing and returns its record.
@@ -2229,23 +2253,45 @@ pub fn start_or_record(
         }));
     }
     let shell = session.root_identity();
-    SessionRuntime::start(session, shared_clock)
+    SessionRuntime::start_and_say_if_the_shell_ended(session, shared_clock)
         .map(Arc::new)
-        .map_err(|error| {
-            // A start that fails after the launch ends the shell, and a shell the kernel does not
-            // show to have ended is one the failure is not reported over.
-            let shell_may_run = shell.is_some_and(|shell| {
-                !matches!(
-                    kr_ipc::identity::process_state(&shell),
-                    kr_ipc::identity::ProcessState::Ended
-                )
+        .map_err(|failure| {
+            // A start that fails after the launch ends the shell, and a shell that is not shown to
+            // have ended is one the failure is not reported over.
+            let shell_may_run = shell_may_run(failure.shell_ended, || {
+                shell
+                    .as_ref()
+                    .map_or(kr_ipc::identity::ProcessState::Ended, |shell| {
+                        kr_ipc::identity::process_state(shell)
+                    })
             });
             Box::new(LaunchFailure {
-                error,
+                error: failure.error,
                 closure: None,
                 shell_may_run,
             })
         })
+}
+
+/// Why a runtime could not be started over a session that had launched its shell, and whether that
+/// shell is known to have ended.
+struct StartFailure {
+    error: WorkerError,
+    /// Whether the session saw the root shell end after it was asked to stop.
+    shell_ended: bool,
+}
+
+/// Whether the root shell of a session whose start failed may still be running.
+///
+/// A shell whose exit the session confirmed has ended, and the process table is not asked about
+/// it: asked afterwards it can fail to answer, and an exit that was seen is not made unknown by
+/// that. The table is asked only when the exit was not confirmed, and a shell it does not show to
+/// have ended may be running.
+fn shell_may_run(
+    confirmed_ended: bool,
+    state: impl FnOnce() -> kr_ipc::identity::ProcessState,
+) -> bool {
+    !confirmed_ended && !matches!(state(), kr_ipc::identity::ProcessState::Ended)
 }
 
 #[cfg(test)]
@@ -2849,5 +2895,27 @@ mod tests {
         ));
         assert!(super::names_powershell("/usr/local/bin/pwsh"));
         assert!(!super::names_powershell("/bin/zsh"));
+    }
+
+    /// A shell whose exit the session saw is not asked about again: asked afterwards the process
+    /// table can fail to answer, and the failure that exit confirmed is not made unknown by it.
+    #[test]
+    fn a_shell_whose_exit_was_seen_is_not_asked_about_in_the_process_table() {
+        let may_run = super::shell_may_run(true, || {
+            panic!("the process table was asked about a shell whose exit was seen")
+        });
+        assert!(!may_run);
+    }
+
+    /// A shell whose exit was not seen may be running unless the process table shows it ended.
+    #[test]
+    fn a_shell_whose_exit_was_not_seen_has_ended_only_when_the_process_table_shows_it() {
+        use kr_ipc::identity::ProcessState;
+
+        assert!(!super::shell_may_run(false, || ProcessState::Ended));
+        assert!(super::shell_may_run(false, || ProcessState::Running));
+        assert!(super::shell_may_run(false, || ProcessState::Unknown {
+            detail: "the process table did not answer".to_owned()
+        }));
     }
 }
