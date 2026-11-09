@@ -59,7 +59,7 @@ use tokio::time::Instant;
 use super::advice::MuteAdvice;
 use super::cause::Cause;
 use super::host::{CallHost, HostReach, Pairing, has_ended, revoke};
-use super::view::{DelegationRow, EndedView, HostEnd, OwedView, VoiceCallState};
+use super::view::{DelegationRow, EndedView, HostEnd, OwedView, ProblemKind, VoiceCallState};
 use super::{Closed, Cmd, NoteKey, ServiceCall, Shared, StartRequest, Started, now_ms};
 use crate::commands::{MUTATION_TTL, NoPreconditions};
 use crate::error::{CommandError, Result};
@@ -98,9 +98,55 @@ enum Internal {
     Probed(Probe),
     /// Whether the model was told a delegation was not acted on.
     Told { delegation_id: String, told: bool },
-    /// What came of giving the call the host's default context: why it did not come, when it did
-    /// not.
-    Opened(std::result::Result<(), &'static str>),
+    /// What came of giving the call the host's default context.
+    Opened(Opened),
+}
+
+/// How giving a call the host's default context came out.
+enum Opened {
+    /// The call was given all of it.
+    Given,
+    /// The host did not give the selection.
+    NotRead,
+    /// The voice service took `accepted` of the `total` parts of it, and not the next.
+    Sent { accepted: usize, total: usize },
+    /// The call ended before it was all given.
+    Cut,
+}
+
+impl Opened {
+    /// What is logged and what a person is told when the call was not given all of the context,
+    /// and nothing when it was.
+    fn problem(&self) -> Option<(&'static str, String)> {
+        match self {
+            Self::Given => None,
+            Self::NotRead => Some((
+                "the host did not give it",
+                "This call was not given all of the host's context for its session: the host did \
+                 not give it."
+                    .to_owned(),
+            )),
+            Self::Sent { accepted: 0, .. } => Some((
+                "the voice service did not take any of it",
+                "This call was not given all of the host's context for its session: the voice \
+                 service did not take any of it."
+                    .to_owned(),
+            )),
+            Self::Sent { accepted, total } => Some((
+                "the voice service took part of it",
+                format!(
+                    "This call was given part of the host's context for its session: the voice \
+                     service took {accepted} of its {total} parts and not the next."
+                ),
+            )),
+            Self::Cut => Some((
+                "the call ended while it was being given",
+                "This call ended while it was being given the host's context for its session, so \
+                 it was not given all of it."
+                    .to_owned(),
+            )),
+        }
+    }
 }
 
 /// What the check of a host path that was lost came to.
@@ -254,8 +300,9 @@ pub(super) struct Owner {
     probing: bool,
     /// Not before when the host path is looked at again, after the host refused to vouch.
     probe_after: Option<Instant>,
-    /// What the host's refusal to vouch for the call said, while it stands.
-    probe_warning: Option<String>,
+    /// The task that gives the call the host's context, from the moment it starts until its
+    /// outcome is taken: one that is still here when the call ends was cut short by the end.
+    opening: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Waits for the next news of the call, or for ever when there is no call.
@@ -335,7 +382,7 @@ impl Owner {
             inbox_gone: false,
             probing: false,
             probe_after: None,
-            probe_warning: None,
+            opening: None,
         }
     }
 
@@ -1267,7 +1314,7 @@ impl Owner {
     /// control sends exactly that selection as the call's opening context, as project text and not
     /// as instructions. A call over several sessions is given the first session's. On a task of
     /// its own so that nothing waits for the host or the service.
-    fn give_the_host_context(&self) {
+    fn give_the_host_context(&mut self) {
         let (Some(control), Some(host), Some(descriptor)) = (
             self.control.clone(),
             self.host.clone(),
@@ -1279,7 +1326,7 @@ impl Owner {
             return;
         };
         let (internal, within) = (self.internal_tx.clone(), self.shared.timings.host_within);
-        tokio::spawn(async move {
+        self.opening = Some(tokio::spawn(async move {
             let params = VoiceContextParams {
                 voice_session_id: descriptor.voice_session_id,
                 session_id,
@@ -1296,15 +1343,46 @@ impl Owner {
             )
             .await
             {
-                Ok(Ok(read)) => control
-                    .send_call_start_context(&read.selection)
-                    .await
-                    .map(|_| ())
-                    .map_err(|_| "the voice service did not take all of it"),
-                _ => Err("the host did not give it"),
+                Ok(Ok(read)) => {
+                    let sent = control.send_call_start_context(&read.selection).await;
+                    if sent.stopped_by.is_none() {
+                        Opened::Given
+                    } else {
+                        Opened::Sent {
+                            accepted: sent.accepted,
+                            total: sent.total,
+                        }
+                    }
+                }
+                _ => Opened::NotRead,
             };
             let _ = internal.send(Internal::Opened(opened));
-        });
+        }));
+    }
+
+    /// Takes what giving the call the host's context came to: it goes on without what it was not
+    /// given, and the call's record says so, for the person who reads it while the call runs and
+    /// after it.
+    fn note_the_opening(&mut self, opened: &Opened) {
+        self.opening = None;
+        if let Some((why, words)) = opened.problem() {
+            tracing::warn!("the call was not given its opening context: {why}");
+            self.view(|state| state.meet(ProblemKind::OpeningContext, words));
+        }
+    }
+
+    /// Settles the opening context as the call ends. What the task reported is taken, and a task
+    /// that has not reported was cut short by the end: nothing it goes on to do is read.
+    fn settle_the_opening(&mut self) {
+        while let Ok(message) = self.internal.try_recv() {
+            if let Internal::Opened(opened) = message {
+                self.note_the_opening(&opened);
+            }
+        }
+        if let Some(task) = self.opening.take() {
+            task.abort();
+            self.note_the_opening(&Opened::Cut);
+        }
     }
 
     /// Tells the model a fixed sentence, on a task of its own so that nothing waits for it.
@@ -1356,20 +1434,8 @@ impl Owner {
                 None
             }
             Internal::Opened(opened) => {
-                // The call goes on without it, and the warning a person reads once the call has
-                // ended says that it was not given all of it. A warning already standing is not
-                // replaced.
-                if let Err(words) = opened {
-                    tracing::warn!("the call was not given its opening context: {words}");
-                    self.view(|state| {
-                        state.warning.get_or_insert_with(|| {
-                            format!(
-                                "This call was not given all of the host's context for its \
-                                 session: {words}."
-                            )
-                        });
-                    });
-                }
+                // The call goes on without what it was not given.
+                self.note_the_opening(&opened);
                 None
             }
             Internal::Probed(probe) => {
@@ -1380,13 +1446,12 @@ impl Owner {
                     // The host answered a refusal: it may not know the call, or may not let this
                     // device read what the probe reads. It is reached, and not known to be back.
                     Probe::Refused(words) => {
-                        let warning = format!(
+                        let problem = format!(
                             "The host answered but would not say the call is still its own: {words}"
                         );
-                        self.probe_warning = Some(warning.clone());
                         self.probe_after =
                             Some(Instant::now() + self.shared.timings.tick * PROBE_PAUSE_TICKS);
-                        self.view(|state| state.warning = Some(warning));
+                        self.view(|state| state.meet(ProblemKind::HostPath, problem));
                     }
                     Probe::Unreached => {}
                 }
@@ -1406,12 +1471,9 @@ impl Owner {
         self.host_lost = false;
         self.probe_after = None;
         // The refusal that stood while the host was out of reach is over with it.
-        let stale = self.probe_warning.take();
         self.view(|state| {
             state.host = "reachable".to_owned();
-            if state.warning == stale {
-                state.warning = None;
-            }
+            state.pass(ProblemKind::HostPath);
         });
         self.tell_model(VoiceCommand::Instructions, None, HOST_BACK);
     }
@@ -1480,6 +1542,9 @@ impl Owner {
     pub(super) async fn end(&mut self, cause: Cause) -> Closed {
         let timings = self.shared.timings;
         let id = self.id;
+        // What the opening context came to is in the record before the call is said to have ended,
+        // so that a person who reads the end reads it too.
+        self.settle_the_opening();
         self.view(|state| {
             state.running = false;
             state.begin_ending(id);

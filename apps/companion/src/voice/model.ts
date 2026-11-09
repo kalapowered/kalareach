@@ -33,7 +33,8 @@ import type {
   VoiceDelegationRow,
   VoiceEnded,
   VoiceFence,
-  VoiceOwed
+  VoiceOwed,
+  VoiceProblem
 } from '../host/port'
 
 /** What the screen says when the host's answer gave no status for its workers that could be read. */
@@ -443,6 +444,20 @@ export interface RunningCall {
    * terms have been read, which a call adopted by a screen that was loaded again waits for.
    */
   readonly admissionMeans: string
+  /**
+   * What the call has met, in words, in the order it met it: the opening context the host or the
+   * voice service did not give in full, the host answering and refusing to vouch for the call. The
+   * device keeps each one, and the screen shows each while the call runs.
+   */
+  readonly problems: readonly string[]
+}
+
+/**
+ * What a person is told of the problems a call met, one line for each. A problem whose cause has
+ * passed says so, and stays: the call met it.
+ */
+export function problemWords(problems: readonly VoiceProblem[]): readonly string[] {
+  return problems.map((each) => (each.over ? `${each.words} This has passed.` : each.words))
 }
 
 /**
@@ -470,7 +485,8 @@ export function runningCallFrom(
     callHost: state.host === 'lost' ? 'lost' : 'reachable',
     delegations: delegationsFrom(state.delegations),
     requests: [],
-    admissionMeans
+    admissionMeans,
+    problems: problemWords(state.problems)
   }
 }
 
@@ -485,7 +501,8 @@ export function callAsReported(call: RunningCall, state: VoiceCallState): Runnin
     playing: state.playing,
     brokerReachable: state.control !== 'unreachable',
     callHost: state.host === 'lost' ? 'lost' : 'reachable',
-    delegations: delegationsFrom(state.delegations)
+    delegations: delegationsFrom(state.delegations),
+    problems: problemWords(state.problems)
   }
 }
 

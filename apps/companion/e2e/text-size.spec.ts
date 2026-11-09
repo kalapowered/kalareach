@@ -243,9 +243,14 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
       '&tab=sessions',
       async (page) => {
         await page.evaluate(() => {
-          window.krTestHost?.setVoiceWarning(
-            'The last call found that this voice service has no such call for this account. You can start another, and it may end the same way.'
-          )
+          window.krTestHost?.setVoiceProblems([
+            {
+              kind: 'no_such_call',
+              words:
+                'The last call found that this voice service has no such call for this account. You can start another, and it may end the same way.',
+              over: false
+            }
+          ])
           window.krTestHost?.oweVoice({
             words:
               'The host did not confirm that it withdrew the grant: the host could not be reached in time.'
@@ -423,9 +428,14 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
         await page.setViewportSize({ width: size === 'default' ? 390 : 320, height: 720 })
         await page.goto(`/harness.html?surface=${surface}&tab=sessions`)
         await page.evaluate(() => {
-          window.krTestHost?.setVoiceWarning(
-            'The last call found that this voice service has no such call for this account. You can start another, and it may end the same way.'
-          )
+          window.krTestHost?.setVoiceProblems([
+            {
+              kind: 'no_such_call',
+              words:
+                'The last call found that this voice service has no such call for this account. You can start another, and it may end the same way.',
+              over: false
+            }
+          ])
           window.krTestHost?.oweVoice({
             words:
               'The host did not confirm that it withdrew the grant: the host could not be reached in time.'

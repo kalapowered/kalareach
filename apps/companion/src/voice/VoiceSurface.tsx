@@ -102,8 +102,9 @@ export interface VoiceSurfaceProps {
   readonly notice: string | null
   /**
    * What the last call left, in words: how it ended when no screen was looking, what this device
-   * could not finish and the host may still hold open, and the warning a person is given before the
-   * next start. Shown before a call and never in place of what the person is deciding.
+   * could not finish and the host may still hold open, and the problems it met, which a person is
+   * given before the next start. Shown before a call and never in place of what the person is
+   * deciding.
    */
   readonly aftermath?: readonly string[]
   /**
@@ -708,6 +709,19 @@ function CallScreen({
           This device is not reaching the host. Mute, stopping the voice and hanging up still work;
           cancelling a turn and reading what the host selected do not, because both go to the host.
         </p>
+      )}
+
+      {/* What the call has met, each problem on its own line: the context the host or the voice
+          service did not give in full, the host not vouching for the call. They are the call's, so
+          they are here while it runs and not only once it has ended. */}
+      {call.problems.length > 0 && (
+        <div className="kr-voice__problems" data-testid="voice-problems">
+          {call.problems.map((words) => (
+            <p key={words} className="kr-voice__refusal" role="status">
+              {words}
+            </p>
+          ))}
+        </div>
       )}
 
       {/* The local controls. All three keep working when nothing else does. */}

@@ -13,6 +13,9 @@
 //! | A call runs from the start to the hang-up, through the host and the service | `a_call_runs_from_the_pages_start_to_its_hang_up` |
 //! | The call is given the host's default context as its opening context and nothing more | `the_call_is_given_the_hosts_default_context_as_its_opening_context_and_nothing_more` |
 //! | A call whose opening context the service refuses goes on, and its state says so | `a_call_whose_opening_context_the_service_refuses_goes_on_and_says_so` |
+//! | A service that refuses a later part of the opening context: the call says it was given part of it | `a_service_that_refuses_a_later_part_of_the_opening_context_says_the_call_was_given_part_of_it` |
+//! | A call that ends while it is given the host's context says so | `a_call_that_ends_while_it_is_given_the_hosts_context_says_so` |
+//! | A host's refusal in the middle of a call is a problem of its own, beside the one the call already had | `a_host_that_is_lost_is_told_to_the_model_and_a_refusal_is_not_its_return` |
 //! | No account token for the voice scope starts nothing | `a_device_with_no_voice_token_starts_nothing` |
 //! | An expired token is refreshed before a start, and the control presents the new one | `an_expired_token_is_refreshed_before_the_start_and_the_control_presents_the_new_one` |
 //! | A token of another account ends the call in words, and a warning stands before the next start | `a_token_of_another_account_ends_the_call_and_a_warning_stands_before_the_next` |
@@ -738,7 +741,7 @@ async fn the_call_is_given_the_hosts_default_context_as_its_opening_context_and_
     );
 
     assert!(
-        scene.state()["warning"].is_null(),
+        problems_of(&scene.state()).is_empty(),
         "a call given its context has nothing to say of it: {}",
         scene.state()
     );
@@ -759,9 +762,41 @@ async fn the_call_is_given_the_hosts_default_context_as_its_opening_context_and_
 const NO_CONTEXT_FROM_THE_HOST: &str =
     "This call was not given all of the host's context for its session: the host did not give it.";
 
-/// Whether a call has no warning but the one every call over a session the host does not run has.
-fn no_warning_but_the_missing_context(warning: Option<&str>) -> bool {
-    warning.is_none_or(|warning| warning == NO_CONTEXT_FROM_THE_HOST)
+/// What a call's record says it met: the kind and the words of each problem, in the order it met
+/// them.
+fn problems_of(state: &serde_json::Value) -> Vec<(String, String)> {
+    state["problems"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the record carries its problems: {state}"))
+        .iter()
+        .map(|each| {
+            (
+                each["kind"].as_str().expect("a kind").to_owned(),
+                each["words"].as_str().expect("words").to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// The words of the problems of `kind` a call's record carries.
+fn problem_words(state: &serde_json::Value, kind: &str) -> Vec<String> {
+    problems_of(state)
+        .into_iter()
+        .filter(|(each, _)| each == kind)
+        .map(|(_, words)| words)
+        .collect()
+}
+
+/// A call's record as the page reads it, for a state that native code kept typed.
+fn as_read(state: &companion_tauri::voice::VoiceCallState) -> serde_json::Value {
+    serde_json::to_value(state).expect("the record encodes")
+}
+
+/// Whether a call has no problem but the one every call over a session the host does not run has.
+fn no_problem_but_the_missing_context(state: &serde_json::Value) -> bool {
+    problems_of(state)
+        .iter()
+        .all(|(kind, words)| kind == "opening_context" && words == NO_CONTEXT_FROM_THE_HOST)
 }
 
 /// The `thinking` requests the voice service's control took, in the order it took them.
@@ -792,14 +827,14 @@ async fn a_call_whose_opening_context_the_service_refuses_goes_on_and_says_so() 
 
     let started = scene.start().await;
     assert!(started["value"]["outcome"]["started"].is_object());
-    let refused = "the voice service did not take all of it";
+    let refused = "the voice service did not take any of it";
     let warned = scene
         .state_where(
-            "the warning that the service did not take the context",
+            "the problem that the service did not take the context",
             |state| {
-                state["warning"]
-                    .as_str()
-                    .is_some_and(|warning| warning.contains(refused))
+                problem_words(state, "opening_context")
+                    .iter()
+                    .any(|words| words.contains(refused))
             },
         )
         .await;
@@ -813,15 +848,173 @@ async fn a_call_whose_opening_context_the_service_refuses_goes_on_and_says_so() 
     scene
         .call("voice_stop", json!({ "voiceSessionId": null }))
         .expect("the call ends");
-    // The page reads the warning once the call has ended: it stands then.
+    // The page reads the problem once the call has ended: it stands then.
     scene
-        .state_where("the ended call's warning", |state| {
+        .state_where("the ended call's problem", |state| {
             state["running"] == false
-                && state["warning"]
-                    .as_str()
-                    .is_some_and(|warning| warning.contains(refused))
+                && problem_words(state, "opening_context")
+                    .iter()
+                    .any(|words| words.contains(refused))
         })
         .await;
+    scene.stop_host().await;
+}
+
+/// A scene over a session the host really runs, whose agent has said `messages`, so that the
+/// context the host selects for a call over it is long enough to go in several parts.
+async fn scene_with_a_history(messages: &[String]) -> Scene {
+    let scene = scene_built(
+        quick(),
+        Some(phone_grant(PHONE_TOKEN, 3600)),
+        None,
+        HttpDeadlines::default(),
+        1,
+    )
+    .await;
+    let worker = &scene.workers[0];
+    let agent = worker.register_agent(Arc::new(net_support::worker::Upstream::default()));
+    let at = kr_ipc::now_ms().get();
+    for (i, text) in messages.iter().enumerate() {
+        worker
+            .service
+            .broker()
+            .observe(
+                agent,
+                "message",
+                text,
+                kr_protocol::scalars::TimestampMs::new(at + i as u64),
+            )
+            .expect("the agent has said something");
+    }
+    scene
+}
+
+/// Three messages of about three hundred bytes each: with what else the host selects, more than
+/// one part of at most five hundred bytes.
+fn long_messages() -> Vec<String> {
+    (1..=3)
+        .map(|i| {
+            format!(
+                "note {i}: {}",
+                "the release is drafted and checked ".repeat(9)
+            )
+        })
+        .collect()
+}
+
+/// KR-REQ-15.20: a voice service that takes the first part of the opening context and refuses a
+/// later one leaves the call going with what it took, and the call's state says that the call was
+/// given part of the context, and how much, while the call runs and after it. The service here is
+/// the local stand-in, which refuses the parts after the first as it does while its provider is
+/// down; no provider is reached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_service_that_refuses_a_later_part_of_the_opening_context_says_the_call_was_given_part_of_it()
+ {
+    let mut scene = scene_with_a_history(&long_messages()).await;
+    scene.stand_in.control().refuse_thinking_after(Some(1));
+
+    let started = scene.start().await;
+    let voice_session_id = started["value"]["outcome"]["started"]["session"]["voice_session_id"]
+        .as_str()
+        .expect("a voice session")
+        .to_owned();
+    // What the host selects for the call, read the way the page reads it: how many parts it comes to.
+    let read: kr_protocol::voice::VoiceContextResult = serde_json::from_value(
+        scene
+            .call(
+                "voice_context",
+                json!({ "params": {
+                    "voice_session_id": voice_session_id,
+                    "session_id": scene.session,
+                    "selected": [],
+                    "delegation_id": null,
+                } }),
+            )
+            .expect("the host selects the context"),
+    )
+    .expect("the selection decodes");
+    let parts = kr_client::services::voice_control::call_start_appends(&read.selection).len();
+    assert!(parts >= 3, "the context goes in several parts: {parts}");
+
+    let said = format!("took 1 of its {parts} parts and not the next");
+    let warned = scene
+        .state_where(
+            "the problem that the call was given part of the context",
+            |state| {
+                problem_words(state, "opening_context")
+                    .iter()
+                    .any(|words| words.contains(&said))
+            },
+        )
+        .await;
+    assert_eq!(warned["running"], true, "the call went on: {warned}");
+    assert_eq!(warned["control"], "connected", "{warned}");
+    assert_eq!(
+        thinking(&scene.stand_in.control().report()).len(),
+        1,
+        "the service took the first part and no other"
+    );
+    assert!(
+        problem_words(&warned, "opening_context")[0].starts_with("This call was given part of"),
+        "{warned}"
+    );
+
+    scene
+        .call("voice_stop", json!({ "voiceSessionId": voice_session_id }))
+        .expect("the call ends");
+    scene
+        .state_where("the ended call's problem", |state| {
+            state["running"] == false
+                && problem_words(state, "opening_context")
+                    .iter()
+                    .any(|words| words.contains(&said))
+        })
+        .await;
+    scene.stop_host().await;
+}
+
+/// KR-REQ-15.20: a call that ends while it is being given the host's context says so: the problem
+/// reaches the call's state before it is said to have ended, however the end came and whatever the
+/// service was doing, and the call that never took a part of it does not claim to have. The service
+/// here is the local stand-in, which reads each request and answers none of them while it is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_that_ends_while_it_is_given_the_hosts_context_says_so() {
+    let mut scene = scene_with_a_history(&long_messages()).await;
+    scene.stand_in.control().hold_requests(true);
+
+    let started = scene.start().await;
+    let voice_session_id = started["value"]["outcome"]["started"]["session"]["voice_session_id"]
+        .as_str()
+        .expect("a voice session")
+        .to_owned();
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    assert!(
+        problems_of(&scene.state()).is_empty(),
+        "nothing is wrong while the context is still going: {}",
+        scene.state()
+    );
+
+    scene
+        .call("voice_stop", json!({ "voiceSessionId": voice_session_id }))
+        .expect("the call ends");
+    let ended = scene
+        .state_where("the ended call's problem", |state| {
+            state["running"] == false
+                && problem_words(state, "opening_context")
+                    .iter()
+                    .any(|words| words.contains("ended while it was being given"))
+        })
+        .await;
+    assert_eq!(ended["ended"]["cause"], "requested", "{ended}");
+    assert!(
+        thinking(&scene.stand_in.control().report()).is_empty(),
+        "the service took none of it"
+    );
+    scene.stand_in.control().hold_requests(false);
     scene.stop_host().await;
 }
 
@@ -885,7 +1078,7 @@ async fn an_expired_token_is_refreshed_before_the_start_and_the_control_presents
 async fn a_token_of_another_account_ends_the_call_and_a_warning_stands_before_the_next() {
     let mut scene = scene().await;
     scene.stand_in.treat_as_another_account(PHONE_TOKEN);
-    assert_eq!(scene.state()["warning"], serde_json::Value::Null);
+    assert!(problems_of(&scene.state()).is_empty());
 
     let started = scene.start().await;
     assert!(started["value"]["outcome"]["started"].is_object());
@@ -912,10 +1105,10 @@ async fn a_token_of_another_account_ends_the_call_and_a_warning_stands_before_th
         "the host closed the call at the service"
     );
     assert!(
-        scene.state()["warning"]
-            .as_str()
-            .is_some_and(|warning| warning.contains("no such call")),
-        "the warning stands: {}",
+        problem_words(&scene.state(), "no_such_call")
+            .iter()
+            .any(|words| words.contains("no such call")),
+        "the problem stands: {}",
         scene.state()
     );
 
@@ -927,7 +1120,7 @@ async fn a_token_of_another_account_ends_the_call_and_a_warning_stands_before_th
         .state_where("a control that attached", |state| {
             state["running"] == true
                 && state["control"] == "connected"
-                && no_warning_but_the_missing_context(state["warning"].as_str())
+                && no_problem_but_the_missing_context(state)
         })
         .await;
     scene.stop_host().await;
@@ -1986,9 +2179,19 @@ async fn a_host_that_is_lost_is_told_to_the_model_and_a_refusal_is_not_its_retur
         })
         .await;
     let refused = scene
-        .state_where("the host's refusal", |state| state["warning"].is_string())
+        .state_where("the host's refusal beside the missing context", |state| {
+            !problem_words(state, "host_path").is_empty()
+                && !problem_words(state, "opening_context").is_empty()
+        })
         .await;
     assert_eq!(refused["host"], "lost", "a refusal is not a return");
+    // A call over a session the host does not run was not given its context. The host's refusal
+    // is another problem the call met, kept beside that one and not in its place.
+    assert_eq!(
+        problem_words(&refused, "opening_context"),
+        [NO_CONTEXT_FROM_THE_HOST],
+        "{refused}"
+    );
     assert_eq!(refused["running"], true, "the call went on");
     assert_eq!(
         instructions(&scene),
@@ -3344,7 +3547,8 @@ async fn the_note_that_the_service_had_no_such_call_survives_a_launch() {
     scene.start().await;
     scene
         .state_where("a call that ended with the note", |state| {
-            state["ended"]["cause"] == "no_such_call" && state["warning"].is_string()
+            state["ended"]["cause"] == "no_such_call"
+                && !problem_words(state, "no_such_call").is_empty()
         })
         .await;
     let generation = match scene.tokens.status() {
@@ -3372,11 +3576,11 @@ async fn the_note_that_the_service_had_no_such_call_survives_a_launch() {
     let other = relaunched.note_key(Some("another-environment".to_owned()), generation);
 
     assert!(
-        relaunched.state(same.as_ref()).warning.is_some(),
+        !problem_words(&as_read(&relaunched.state(same.as_ref())), "no_such_call").is_empty(),
         "the note stands for the same host, account and service"
     );
     assert!(
-        relaunched.state(other.as_ref()).warning.is_none(),
+        problem_words(&as_read(&relaunched.state(other.as_ref())), "no_such_call").is_empty(),
         "and for no other"
     );
     scene.stop_host().await;
@@ -4548,7 +4752,10 @@ async fn a_record_the_system_refused_to_read_is_not_written_over_and_is_taken_up
     })
     .await
     .expect("the call ended with the note");
-    assert!(ended.warning.is_some(), "the note stands in memory");
+    assert!(
+        !problem_words(&as_read(&ended), "no_such_call").is_empty(),
+        "the note stands in memory"
+    );
     assert!(
         ended.owed.is_empty(),
         "nothing is told of a file that cannot be read"
@@ -4562,7 +4769,10 @@ async fn a_record_the_system_refused_to_read_is_not_written_over_and_is_taken_up
         state.owed[0].voice_session_id.as_deref(),
         Some(earlier.to_string().as_str())
     );
-    assert!(state.warning.is_some(), "the note this launch made stands");
+    assert!(
+        !problem_words(&as_read(&state), "no_such_call").is_empty(),
+        "the note this launch made stands"
+    );
     let file = kept_file_where(&directory, |file| {
         file["owed"].as_array().is_some_and(|owed| owed.len() == 1) && !file["note"].is_null()
     })
@@ -4675,7 +4885,7 @@ async fn a_record_the_system_refused_to_read_is_taken_up_in_order_with_what_this
         Some(this_call.as_str())
     );
     assert!(
-        no_warning_but_the_missing_context(locked.warning.as_deref()),
+        no_problem_but_the_missing_context(&as_read(&locked)),
         "the file's note is not read yet"
     );
 
@@ -4692,7 +4902,7 @@ async fn a_record_the_system_refused_to_read_is_taken_up_in_order_with_what_this
         "what the file held, then what this launch owes"
     );
     assert!(
-        no_warning_but_the_missing_context(state.warning.as_deref()),
+        no_problem_but_the_missing_context(&as_read(&state)),
         "the control that attached since forgot the note the file held"
     );
     let file = kept_file_where(&directory, |file| {

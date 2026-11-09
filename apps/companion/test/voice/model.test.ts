@@ -108,6 +108,7 @@ function call(over: Partial<RunningCall> = {}): RunningCall {
     delegations: [],
     requests: [],
     admissionMeans: ADMISSION_MEANS,
+    problems: [],
     ...over
   }
 }
@@ -125,7 +126,7 @@ function callState(over: Partial<VoiceCallState> = {}): VoiceCallState {
     session: null,
     ended: null,
     delegations: [],
-    warning: null,
+    problems: [],
     owed: [],
     finalising: false,
     ...over
