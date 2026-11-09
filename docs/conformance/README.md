@@ -535,9 +535,13 @@ program whose project publishes source only is built there from that release's s
 flags the lock records, against the system's own curses library; tmux is built against a pinned
 libevent built the same way. A release that cannot be fetched or built is recorded as not installed,
 with the reason, and its cases are reported as not run. A release that cannot be fetched is tried
-again after pauses that double, about eight and a half minutes of them in all; the tries of the
-whole fetch share ten minutes, and a release whose turn comes after that gets three tries of 30
-seconds at most. A program whose release could not be fetched is recorded with its address as the
+again, up to 12 times, 30 seconds apart; each try ends within 120 seconds. The tries of one release
+go on while it has had less than what is left of ten minutes for the whole fetch, and a pause that a
+`Retry-After` header asks for is taken only if it ends within that time, so a host that says to come
+back in an hour ends the tries at once. A release whose turn comes when less than a minute is left
+gets three tries of 30 seconds at most. The fetch of the seven releases of a platform then takes
+about 12 minutes at the worst when the host answers errors at once, and about 20 when it holds every
+try to its limit. A program whose release could not be fetched is recorded with its address as the
 reason, and the log names the address of a library; a program
 built against a library that is not installed is not built, and its reason names the library. The
 nightly workflow keeps the release archives in the Actions cache under the lock that pins them and

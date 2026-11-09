@@ -265,20 +265,25 @@ PYTHON
             echo "  $id $version: fetching $url"
             # A release host that answers every request with an error does so for a few minutes
             # at a time (one night's lasted about five), and recording the release as unavailable
-            # over it would say something untrue about it. So a release is tried again after
-            # pauses that double (1, 2, 4 ... 256 seconds, eight and a half minutes in all), each
-            # try ends within 180 seconds, and no new try starts once the tries of the whole fetch
-            # have taken ten minutes. A release whose turn comes after that gets three tries of 30
-            # seconds at most, so that a host that stays down does not take the report's time and
-            # no release goes untried.
-            local retries=9 attempt=180 began=$SECONDS
-            local within=(--retry-max-time $((600 - waited)))
-            if [ "$waited" -gt 540 ]; then
+            # over it would say something untrue about it. So a release is tried again, up to 12
+            # times, 30 seconds apart: curl's own pauses double, and it takes one whole when the
+            # time for tries is out. Each try ends within 120 seconds. The tries of one release go
+            # on while it has had less than what is left of ten minutes for the whole fetch, and
+            # a pause that a Retry-After header asks for is taken only if it ends within that time,
+            # so a host that says to come back in an hour ends the tries at once. A release whose
+            # turn comes when less than a minute is left gets three tries of 30 seconds at most, so
+            # that no release goes untried. The whole fetch of seven releases then takes about 12
+            # minutes at the worst when the host answers errors at once, and about 20 when it holds
+            # every try to its limit (750 seconds for the first release, which has the ten
+            # minutes, and 70 for each of the others).
+            local retries=12 pause=30 attempt=120 budget=$((600 - waited)) began=$SECONDS
+            if [ "$budget" -lt 60 ]; then
                 retries=2
+                pause=10
                 attempt=30
-                within=()
+                budget=60
             fi
-            if ! curl -fsSL --connect-timeout 30 --max-time "$attempt" --retry "$retries" ${within[@]+"${within[@]}"} --retry-all-errors -o "$kept.part" "$url"; then
+            if ! curl -fsSL --connect-timeout 30 --max-time "$attempt" --retry "$retries" --retry-delay "$pause" --retry-max-time "$budget" --retry-all-errors -o "$kept.part" "$url"; then
                 waited=$((waited + SECONDS - began))
                 echo "    $url could not be fetched, so $id $version is not installed"
                 records+=("$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$id" "$version" "$role" unavailable "$url" "$sha" "$kind" - "$url could not be fetched")")
