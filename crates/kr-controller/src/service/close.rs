@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use kr_ipc::client::BoundLink;
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::identity::WorkerProfile;
 use kr_protocol::ids::{SessionEpoch, SessionId};
 use kr_protocol::scalars::{CanonicalSet, Nullable, U64};
@@ -295,6 +296,14 @@ impl Controller {
                     self.settle_close_answer(params.session_id, &reply).await?;
                 }
                 Ok(answer)
+            }
+            // The worker could not say what became of this action. That is its own answer, not a
+            // refusal of the request: section 9 does not let it be reported as one, and the caller
+            // needs the code to name the action and read it back.
+            Err(error) if error.code == ErrorCode::OutcomeUnknown => {
+                Err(ControllerError::Uncertain {
+                    detail: error.message,
+                })
             }
             Err(error) => Err(ControllerError::InvalidArgument(error.to_string())),
         }

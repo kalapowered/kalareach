@@ -49,12 +49,14 @@ pub(super) type Recorded = Arc<std::sync::Mutex<Vec<ControlFrame>>>;
 /// A silent one (`recorded` absent) then reads whatever arrives without replying. That is a
 /// worker that has stopped answering, which is different from one that has gone: the
 /// connection stays open. A recording one keeps every frame it is sent and refuses each
-/// request and forwarded frame at once, so a test can read exactly what reached a worker.
-fn serve_fake_worker(
+/// request and forwarded frame at once, with `refusal` as the code, so a test can read exactly what
+/// reached a worker.
+pub(super) fn serve_fake_worker(
     listener: Listener,
     identity: Arc<WorkerIdentity>,
     endpoint_text: String,
     recorded: Option<Recorded>,
+    refusal: ErrorCode,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -93,7 +95,7 @@ fn serve_fake_worker(
                         (None, other) => match &recorded {
                             None => Vec::new(),
                             Some(recorded) => {
-                                let refusal = answer_of(&other, identity.session_id());
+                                let refusal = answer_of(&other, identity.session_id(), refusal);
                                 recorded
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -180,7 +182,11 @@ pub(super) fn handshake(
 
 /// What a recording worker answers a request or a forwarded frame with: the daemon's own
 /// `session.read` is answered with a live session, and everything else is refused.
-fn answer_of(frame: &ControlFrame, session_id: SessionId) -> Option<ControlFrame> {
+fn answer_of(
+    frame: &ControlFrame,
+    session_id: SessionId,
+    refusal: ErrorCode,
+) -> Option<ControlFrame> {
     let request_id = match frame {
         ControlFrame::Request(request) => {
             if request.method == Method::SessionRead.into() {
@@ -200,7 +206,7 @@ fn answer_of(frame: &ControlFrame, session_id: SessionId) -> Option<ControlFrame
     Some(ControlFrame::Response(kr_protocol::envelope::Response {
         request_id,
         outcome: kr_protocol::envelope::Outcome::Error(kr_protocol::error::ProtocolError::new(
-            ErrorCode::ResourceUnavailable,
+            refusal,
             "this worker records what it is sent and performs none of it",
         )),
     }))
@@ -319,7 +325,13 @@ pub(super) struct Silent {
 /// after a close would then hold the publisher's link and not the close's.
 async fn silent_worker() -> Silent {
     fake_world_reached(|listener, identity, endpoint_text| {
-        serve_fake_worker(listener, identity, endpoint_text, None)
+        serve_fake_worker(
+            listener,
+            identity,
+            endpoint_text,
+            None,
+            ErrorCode::ResourceUnavailable,
+        )
     })
     .await
 }
@@ -328,7 +340,13 @@ async fn silent_worker() -> Silent {
 /// ([`serve_fake_worker`]), and everything a close needs.
 pub(super) async fn fake_worker(recorded: Option<Recorded>) -> Silent {
     fake_world(move |listener, identity, endpoint_text| {
-        serve_fake_worker(listener, identity, endpoint_text, recorded)
+        serve_fake_worker(
+            listener,
+            identity,
+            endpoint_text,
+            recorded,
+            ErrorCode::ResourceUnavailable,
+        )
     })
     .await
 }
