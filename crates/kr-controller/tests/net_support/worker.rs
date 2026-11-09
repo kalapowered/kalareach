@@ -982,6 +982,25 @@ impl Adopted {
         }
     }
 
+    /// Stops the daemon and starts another on the same tree, which adopts the workers again. Every
+    /// client of the daemon is closed first.
+    pub async fn restart(self) -> Self {
+        let Self {
+            host,
+            owner,
+            workers,
+        } = self;
+        let adopted = Self {
+            host: host.restart().await,
+            owner,
+            workers,
+        };
+        for worker in &adopted.workers {
+            adopted.until_adopted(worker).await;
+        }
+        adopted
+    }
+
     /// Stops the daemon.
     pub async fn stop(self) {
         self.host.stop().await;

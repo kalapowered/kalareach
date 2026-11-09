@@ -877,11 +877,10 @@ have the `host.manage` right cannot see any further information while devices wi
 see all the information that is returned by the `privacy.status` report, like when the host last
 changed its privacy mode, if the last change was fully effective, what each session still owes, what
 the host keeps and what has already left the host. The host says it is in the process of changing
-its privacy mode when it is either changing the privacy mode on and waiting for all admitted
-delivery exchanges to finish, when it is recording its state and raising its backup fence as part of
-changing the privacy mode on, when it is about to publish its new state as part of changing the
-privacy mode off and when it is waiting for the daemon to start again after a panic that stopped a
-change part way. While the host says it is in the process of changing its privacy mode, devices will
+its privacy mode when a change, on or off, is waiting for all admitted delivery exchanges to finish,
+when it is recording its state (and raising its backup fence, if it turns privacy mode on), when it
+is about to publish its new state and when it is waiting for the daemon to start again after a panic
+that stopped a change part way. While the host says it is in the process of changing its privacy mode, devices will
 see it as if it was private. Older builds of the host do not have the `privacy` member in
 `host.info`.
 
@@ -5342,7 +5341,9 @@ would then be published; a host that cannot record it does not enter privacy mod
 Privacy mode is always one generation for the entire environment, and is held by the control daemon.
 The daemon remembers the generation, whether privacy mode is on, and for every session whose own
 cleanup for this generation has not yet been shown to be complete, one **obligation** . The daemon’s
-privacy mode state is stored in the file `privacy.sqlite3` in the state directory. Turning privacy
+privacy mode state is stored in the file `privacy.sqlite3` in the state directory, with the moment
+the last change took effect, which `privacy.status` reports as when privacy mode last changed and a
+daemon that starts again reads from there. Turning privacy
 mode on and off using `kr privacy on` and `kr privacy off` happens by sending the daemon a
 `privacy.set` message, which can only be done from the host. A device paired to a host with a grant
 containing `host.manage` can read `privacy.status`, but can’t turn privacy mode on or off. Both
@@ -5417,8 +5418,11 @@ counts as ended only when the registry shows its launch is over: it has no reser
 launch failed after a worker claimed it, or whose session has closed. A session whose worker has not
 reported yet is one this host has not reached, and it holds turning privacy mode off back until its
 worker answers that its cleanup is complete, or the registry shows its launch is over. Otherwise the
-next generation is recorded first, the backup fence is released under it, the delivery fence is
-lifted, and each live session is told until it answers. If a launch never handed a worker its launch
+change takes the privacy state's write side, which waits for every reader and every delivery
+exchange admitted before it, and records the next generation first. The clock is read inside the
+record's transaction, once the admission has been asked, and the record and the state published
+afterwards both hold that moment. The backup fence is then released under the new generation, the
+delivery fence is lifted, and each live session is told until it answers. If a launch never handed a worker its launch
 specification, it never ran a shell, so nothing was retained. The registry, the daemon's own creates
 and the kernel show this in three cases: the launch failed or was fenced before any worker claimed
 it, its launcher exited without claiming it, or its create stopped waiting without recording a

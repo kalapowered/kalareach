@@ -315,8 +315,28 @@ impl World {
         report.changed_at_ms.get()
     }
 
+    /// The same daemon after a restart, with a call a device starts over it: the worker is the one
+    /// the first daemon adopted, still holding what it held.
+    async fn restarted(self) -> Self {
+        let Self { adopted, voice, .. } = self;
+        drop(voice);
+        Self::start_over(adopted.restart().await).await
+    }
+
     async fn stop(self) {
         self.adopted.stop().await;
+    }
+}
+
+/// Waits until the host's clock reads later than `moment`.
+async fn until_the_clock_passes(moment: u64) {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    while kr_ipc::now_ms().get() <= moment {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the clock never passed {moment}"
+        );
+        tokio::task::yield_now().await;
     }
 }
 
@@ -796,6 +816,53 @@ async fn nothing_produced_before_privacy_mode_last_changed_is_carried_after_it()
     world.said(agent, "after the change", after);
     world.worker().ask_at("after", after);
 
+    let result = world.context().await;
+    assert_eq!(
+        result.selection.recent_messages,
+        vec!["message: after the change".to_owned()],
+        "{result:?}"
+    );
+    assert_eq!(result.selection.pending_decisions.len(), 1, "{result:?}");
+    assert!(
+        result.selection.pending_decisions[0].contains("(after)"),
+        "{result:?}"
+    );
+    assert_eq!(
+        withheld(&result, kr_controller::voice::BEFORE_PRIVACY_CHANGE),
+        Some(2),
+        "the entry and the decision from before are counted: {result:?}"
+    );
+    world.stop().await;
+}
+
+/// KR-REQ-15.20 and KR-REQ-24.27: a restart keeps the cutoff. The record holds the moment privacy
+/// mode took effect, and a daemon that starts over it carries what the worker produced after that
+/// moment, whenever the daemon started, and keeps out and counts what was produced before it, as
+/// the daemon before the restart did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_keeps_the_moment_privacy_mode_took_effect_as_the_cutoff() {
+    let world = World::start().await;
+    let agent = world.agent();
+    world.worker().ask("before");
+
+    world.adopted.set_privacy(true).await;
+    world.adopted.set_privacy(false).await;
+    let changed = world.privacy_changed_at().await;
+
+    // What a worker that kept its history through the change would still hold: an entry stamped
+    // before it. What the worker produces after the change is stamped after it, and before the
+    // restart.
+    world.said(agent, "kept from before the change", changed - 1);
+    world.said(agent, "after the change", changed + 1);
+    world.worker().ask_at("after", changed + 1);
+    until_the_clock_passes(changed + 1).await;
+
+    let world = world.restarted().await;
+    assert_eq!(
+        world.privacy_changed_at().await,
+        changed,
+        "the record says when privacy mode took effect, not when the daemon started"
+    );
     let result = world.context().await;
     assert_eq!(
         result.selection.recent_messages,

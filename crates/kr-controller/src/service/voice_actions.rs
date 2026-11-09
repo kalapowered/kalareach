@@ -198,8 +198,8 @@ impl Controller {
     /// run with its reason, and the rest is still served.
     ///
     /// While privacy mode is on nothing is read. After it was on, only what was produced after the
-    /// moment it last took effect, or after this daemon last started if that is later, is carried
-    /// (`Published::since_ms`), so that a worker that kept its history, or a decision that stayed
+    /// moment it last took effect is carried (`Published::since_ms`, which the privacy record keeps
+    /// across a restart), so that a worker that kept its history, or a decision that stayed
     /// pending, through the change cannot give it up to a call.
     async fn voice_worker_half(
         self: &Arc<Self>,
