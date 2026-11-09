@@ -683,7 +683,7 @@ impl Ledger {
     ///
     /// Returns [`BrokerError::StoreFault`] when the connection cannot be changed.
     #[cfg(feature = "testing")]
-    pub fn announce_the_next_wait(&self) -> Result<std::sync::mpsc::Receiver<()>> {
+    pub fn announce_the_next_wait(&mut self) -> Result<std::sync::mpsc::Receiver<()>> {
         let (waiting, announced) = std::sync::mpsc::sync_channel(1);
         *ANNOUNCED_WAIT
             .lock()

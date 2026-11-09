@@ -3364,7 +3364,7 @@ impl Broker {
         self.recorder
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| BrokerError::invalid("a ledger held in memory has no recorder"))?
             .announce_the_next_wait()
     }

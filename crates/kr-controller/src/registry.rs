@@ -3529,7 +3529,7 @@ mod tests {
 
     /// Has another connection to the registry's file hold its write lock, as the device directory
     /// does while it records the host's clock, until `registry` waits for it.
-    fn put_a_writer_ahead(path: &std::path::Path, registry: &Registry) {
+    fn put_a_writer_ahead(path: &std::path::Path, registry: &mut Registry) {
         let writer = Connection::open(path).expect("opens");
         writer
             .execute_batch("BEGIN IMMEDIATE")
@@ -3578,7 +3578,7 @@ mod tests {
             .set_phase(waiting.reservation_id, LaunchPhase::Spawned)
             .expect("spawned");
 
-        put_a_writer_ahead(&path, &registry);
+        put_a_writer_ahead(&path, &mut registry);
         registry
             .claim_rendezvous(
                 waiting.reservation_id,
@@ -3587,11 +3587,11 @@ mod tests {
             .expect("a claim waits for the writer ahead");
         assert!(the_registry_waited(), "the claim waited for it");
 
-        put_a_writer_ahead(&path, &registry);
+        put_a_writer_ahead(&path, &mut registry);
         reserved(&mut registry);
         assert!(the_registry_waited(), "the reservation waited for it");
 
-        put_a_writer_ahead(&path, &registry);
+        put_a_writer_ahead(&path, &mut registry);
         registry
             .forget_workers_of_closed_sessions()
             .expect("the forgetting waits for the writer ahead");

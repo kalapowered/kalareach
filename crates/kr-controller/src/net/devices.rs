@@ -458,8 +458,8 @@ impl LockProbe {
 
     /// The connection, for this crate's own tests to set up what a case needs of it.
     #[cfg(test)]
-    pub(crate) const fn connection(&self) -> &Connection {
-        &self.0
+    pub(crate) const fn connection(&mut self) -> &mut Connection {
+        &mut self.0
     }
 
     /// Takes the registry database's write lock and gives it back at once, to learn that no write

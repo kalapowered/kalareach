@@ -225,8 +225,8 @@ rustls = { version = "=0.23.46", default-features = false, features = ["logging"
 anyhow = "=1.0.104"
 # Apple's blocks, which the user-verification ceremony's completion handler is one of.
 block2 = "=0.6.2"
-rmcp = { version = "=3.4.0", default-features = false, features = ["macros", "schemars", "server", "transport-io"] }
-rusqlite = "=0.40.2"
+rmcp = { version = "=3.9.0", default-features = false, features = ["macros", "schemars", "server", "transport-io"] }
+rusqlite = "=0.41.1"
 rustix = "=1.1.4"
 rustls-pki-types = "=1.15.1"
 # Checks a service's certificate against the platform's own trust store, as the managed-service
