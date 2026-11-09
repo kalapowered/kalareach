@@ -190,6 +190,8 @@ finish() {
         rm -f "${xcconfig:?}"
     fi
     [ -z "$plist_saved" ] || cp "$plist_saved" "$plist" 2>/dev/null
+    [ -z "$xcconfig_saved" ] || rm -f "${xcconfig_saved:?}"
+    [ -z "$plist_saved" ] || rm -f "${plist_saved:?}"
     rm -rf "${harness:?}"
     keep_private
 }
@@ -629,12 +631,13 @@ run_android() {
     # scanner, and answered on its own screen.
     "$adb" -s "$serial" shell pm grant "$app_id" android.permission.POST_NOTIFICATIONS 2>/dev/null
 
+    # The run's line in the phone's log, before the first invitation is made or scanned.
+    "$adb" -s "$serial" shell log -p i -t KrPairingRun "$run_marker" || { say "the run's line could not be put in the phone's log"; return 2; }
     # The emulator reaches this machine's loopback interface as 10.0.2.2, which carries the direct
     # invitation's datagrams. The application's connections to the other service of the code case
     # did not arrive at the host through that address (the host saw no connection at all), so that
     # service is reached on the emulator's own loopback interface, which `adb reverse` ties to the
     # host's listener.
-    "$adb" -s "$serial" shell log -p i -t KrPairingRun "$run_marker" || { say "the run's line could not be put in the phone's log"; return 2; }
     start_harness 10.0.2.2 127.0.0.1 || return 2
     local service_port
     service_port="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["service_port"])' "$harness/ready.json")"
