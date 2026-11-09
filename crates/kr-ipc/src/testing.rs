@@ -254,7 +254,7 @@ impl Drop for PrivateTempDir {
     /// removal of the folder it is in, and the holder is usually something that is ending and lets
     /// go in a moment: a task that was aborted and has not been cancelled yet, a thread that is
     /// joining. So the removal is tried again for as long as it is refused, and for no longer than
-    /// [`REMOVAL_PATIENCE`], and what is not removed at the end is said on the error output, outside
+    /// 20 seconds, and what is not removed at the end is said on the error output, outside
     /// what a test's capture keeps. It does not fail the case: this directory is made by the suites
     /// of every platform, and a case that has a holder to wait for, as a host that waits for its
     /// daemon's lock does, fails on a tree that is left, and one that has a guard of its own
