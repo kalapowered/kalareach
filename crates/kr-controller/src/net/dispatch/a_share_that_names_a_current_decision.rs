@@ -524,7 +524,7 @@ pub(super) fn question(
 // ---------------------------------------------------------------------------------------------
 
 /// The device a test shares with.
-fn recipient() -> DeviceId {
+pub(super) fn recipient() -> DeviceId {
     DeviceId::new(Uuid::from_bytes([0xd1; 16]))
 }
 
@@ -543,7 +543,7 @@ fn naming(
 }
 
 /// The local owner's `grant.create` of `session_id` with `selection`, as action `action`.
-fn share(
+pub(super) fn share(
     environment_id: kr_protocol::ids::EnvironmentId,
     session_id: SessionId,
     action: u8,
@@ -628,7 +628,7 @@ fn refusal_of(answer: Result<ParamsValue, ControllerError>) -> ProtocolError {
 }
 
 /// How many grants the daemon holds.
-fn grants_written(world: &fake::Silent) -> usize {
+pub(super) fn grants_written(world: &fake::Silent) -> usize {
     world
         .controller
         .sharing()
@@ -640,7 +640,7 @@ fn grants_written(world: &fake::Silent) -> usize {
 
 /// Whether the daemon holds the invitation a share written as `action` carries: a share's
 /// invitation takes its identity from its action.
-fn invitation_written(world: &fake::Silent, action: u8) -> bool {
+pub(super) fn invitation_written(world: &fake::Silent, action: u8) -> bool {
     let (_, invitation_id) = kr_protocol::sharing::share_identities(
         &ActorId::new("local:test").expect("a principal"),
         Uuid::from_bytes([action; 16]),
@@ -751,7 +751,8 @@ async fn two_actors_that_send_one_action_identifier_write_two_shares() {
     assert_eq!(grants_written(&world), 2);
 
     // A third actor's attempt under the same identifier ended after it claimed the action and
-    // before it wrote anything: its retry is told the outcome is not known, not given a share.
+    // before it wrote anything: its retry is told that nothing was shared under the action, not
+    // given another actor's share.
     let third = ActorId::new("local:third").expect("a principal");
     let digest = kr_protocol::digest::mutation_digest(&mutation, &third).expect("a digest");
     let crate::grants::ActionClaim::Claimed { hold } = world
@@ -775,7 +776,7 @@ async fn two_actors_that_send_one_action_identifier_write_two_shares() {
     let Outcome::Error(error) = response.outcome else {
         panic!("another actor's share was given to the retry: {response:?}");
     };
-    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    assert_eq!(error.code, ErrorCode::DraftConflict);
     assert_eq!(grants_written(&world), 2);
 
     // The actor that wrote the share is answered it, from its record, and nothing is written.
@@ -1456,10 +1457,11 @@ async fn kr_req_10_51_a_snapshot_is_read_to_its_end_after_the_named_approval() {
 }
 
 /// KR-REQ-10.51: a share whose session's worker cannot be asked is not decided. A worker whose
-/// link fails leaves the action unfinished, so the same request is told its outcome is not known
-/// rather than a refusal it might not deserve, and so does a worker that answers with a transient
-/// refusal of its own, which the share is given as the worker gave it. A session with no worker
-/// this host knows is refused as unknown, and that is the action's answer.
+/// link fails leaves the action unfinished, so the same request is told that nothing was shared
+/// under the action, which this host's own records show, rather than a refusal it might not
+/// deserve, and so does a worker that answers with a transient refusal of its own, which the share
+/// is given as the worker gave it. A session with no worker this host knows is refused as unknown,
+/// and that is the action's answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_10_51_a_share_whose_worker_cannot_be_asked_is_not_decided() {
     let named = approval(0xd1, 1_000);
@@ -1483,7 +1485,7 @@ async fn kr_req_10_51_a_share_whose_worker_cannot_be_asked_is_not_decided() {
     let failed = refusal_of(shared(&world, &mutation).await);
     assert_eq!(failed.code, ErrorCode::ResourceUnavailable, "{failed:?}");
     let again = refusal_of(shared(&world, &mutation).await);
-    assert_eq!(again.code, ErrorCode::OutcomeUnknown, "{again:?}");
+    assert_eq!(again.code, ErrorCode::DraftConflict, "{again:?}");
 
     // A worker that answers, and cannot read its own store: its refusal is the share's, and it
     // says nothing about the action either.
@@ -1507,7 +1509,18 @@ async fn kr_req_10_51_a_share_whose_worker_cannot_be_asked_is_not_decided() {
     let failed = refusal_of(shared(&world, &mutation).await);
     assert_eq!(failed.code, ErrorCode::StorageUnavailable, "{failed:?}");
     let again = refusal_of(shared(&world, &mutation).await);
-    assert_eq!(again.code, ErrorCode::OutcomeUnknown, "{again:?}");
+    assert_eq!(again.code, ErrorCode::DraftConflict, "{again:?}");
+    // The worker's refusal ended an attempt that wrote nothing, which is no reason to hold the
+    // session and device it shared: a share of them under a fresh action is decided afresh, and
+    // is refused by the worker as the first was.
+    let afresh = share(
+        world.environment_id,
+        world.session_id,
+        0x54,
+        naming(5_000, &[], &[named.resource_id]),
+    );
+    let decided = refusal_of(shared(&world, &afresh).await);
+    assert_eq!(decided.code, ErrorCode::StorageUnavailable, "{decided:?}");
 
     // A session the registry holds open and no worker is known for: the worker lookup refuses it.
     let elsewhere = share(

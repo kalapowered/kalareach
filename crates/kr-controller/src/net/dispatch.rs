@@ -435,6 +435,9 @@ mod write_boundary;
 mod a_share_a_device_holds;
 
 #[cfg(test)]
+mod a_share_beside_one_that_runs;
+
+#[cfg(test)]
 mod a_share_that_names_a_current_decision;
 
 #[cfg(test)]
