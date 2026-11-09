@@ -355,13 +355,14 @@ fn a_release_that_cannot_be_fetched_is_named_and_what_needs_it_is_not_built() {
 fn an_archive_the_cache_holds_is_used_only_when_it_is_the_pinned_bytes() {
     let stage = Stage::new();
     let mut lock = lock_of(&stage);
-    // A program whose host serves bytes that are not the pin's.
+    // A program whose host serves a release that unpacks to a program, with other contents than
+    // the pinned one: only the digest tells the two apart.
     let pinned = stage.release("tampered");
-    fs::write(
-        stage.path("served/tampered.tar.gz"),
-        b"not the pinned bytes",
-    )
-    .expect("served");
+    let served = stage.archive(
+        "tampered",
+        &[("bin/tampered", "#!/bin/sh\nexit 1\n".to_owned(), 0o755)],
+    );
+    assert_ne!(served, pinned, "the host's archive is not the pinned one");
     lock.push(application(
         "tampered",
         "program",
@@ -373,8 +374,8 @@ fn an_archive_the_cache_holds_is_used_only_when_it_is_the_pinned_bytes() {
     ));
     stage.write_lock(&lock);
 
-    // The cache holds the library's archive as pinned, and a program's under its pin's name with
-    // other bytes.
+    // The cache holds the library's archive as pinned, and a program's under its pin's name that
+    // is another archive of a program.
     fs::create_dir_all(stage.path("cache/archives")).expect("the archives");
     let library = digest(&stage.path("served/libone.tar.gz"));
     fs::copy(
@@ -383,9 +384,13 @@ fn an_archive_the_cache_holds_is_used_only_when_it_is_the_pinned_bytes() {
     )
     .expect("held");
     let plain = digest(&stage.path("served/plain.tar.gz"));
-    fs::write(
+    stage.archive(
+        "plain-other",
+        &[("bin/plain", "#!/bin/sh\nexit 1\n".to_owned(), 0o755)],
+    );
+    fs::copy(
+        stage.path("served/plain-other.tar.gz"),
         stage.path(&format!("cache/archives/{plain}.tar.gz")),
-        b"bytes that are not the pin's",
     )
     .expect("held");
 
