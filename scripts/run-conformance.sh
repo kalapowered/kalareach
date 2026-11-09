@@ -206,7 +206,7 @@ PYTHON
 )"
 
     local records=()
-    # The seconds spent in tries at fetching, pauses between them included.
+    # The seconds the tries at fetching have taken in all, pauses between them included.
     local waited=0
     # Each library installed so far, as its identifier and its prefix, one per line: a program
     # built after it names it in its build's variables.
@@ -266,12 +266,19 @@ PYTHON
             # A release host that answers every request with an error does so for a few minutes
             # at a time (one night's lasted about five), and recording the release as unavailable
             # over it would say something untrue about it. So a release is tried again after
-            # pauses that double, which is eight minutes of them in all; and once the fetch has
-            # spent five minutes in such pauses and tries, the releases after that are tried once,
-            # so that a host that stays down does not take the report's time.
-            local retries=9 began=$SECONDS
-            [ "$waited" -ge 300 ] && retries=0
-            if ! curl -fsSL --retry "$retries" --retry-all-errors --max-time 600 -o "$kept.part" "$url"; then
+            # pauses that double (1, 2, 4 ... 256 seconds, eight and a half minutes in all), each
+            # try ends within 180 seconds, and no new try starts once the tries of the whole fetch
+            # have taken ten minutes. A release whose turn comes after that gets three tries of 30
+            # seconds at most, so that a host that stays down does not take the report's time and
+            # no release goes untried.
+            local retries=9 attempt=180 began=$SECONDS
+            local within=(--retry-max-time $((600 - waited)))
+            if [ "$waited" -gt 540 ]; then
+                retries=2
+                attempt=30
+                within=()
+            fi
+            if ! curl -fsSL --connect-timeout 30 --max-time "$attempt" --retry "$retries" ${within[@]+"${within[@]}"} --retry-all-errors -o "$kept.part" "$url"; then
                 waited=$((waited + SECONDS - began))
                 echo "    $url could not be fetched, so $id $version is not installed"
                 records+=("$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$id" "$version" "$role" unavailable "$url" "$sha" "$kind" - "$url could not be fetched")")
