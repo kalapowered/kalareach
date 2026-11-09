@@ -26,6 +26,10 @@ use kr_worker::session::{Session, SessionConfig};
 /// measurement.
 const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
 
+/// How many ports a private `sshd` is started on before a refused port is called a fault: each
+/// refusal is a port another process took between its choice and the bind.
+const PORT_ATTEMPTS: usize = 5;
+
 /// A scratch directory that removes itself.
 struct Scratch(std::path::PathBuf);
 
@@ -781,13 +785,37 @@ impl Sshd {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 .expect("owner-only keys");
         }
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|listener| listener.local_addr())
-            .expect("a free loopback port")
-            .port();
+        // sshd binds a port a test names and cannot report one it chose itself, so the port is
+        // chosen here and let go for it to bind, and another process can take it in between. sshd
+        // then says the address is in use and stops without listening: it is started again on
+        // another port, and any other way it stops is a failure.
+        let mut refused = Vec::new();
+        for _ in 0..PORT_ATTEMPTS {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .and_then(|listener| listener.local_addr())
+                .expect("a free loopback port")
+                .port();
+            match Self::listening_on(&sshd, port, &host_key, &authorised, &client_key).await {
+                Ok(server) => return Some(server),
+                Err(said) if said.contains("Address already in use") => refused.push(said),
+                Err(said) => panic!("sshd stopped before it listened: {said}"),
+            }
+        }
+        panic!("sshd found no port free in {PORT_ATTEMPTS} tries: {refused:#?}");
+    }
+
+    /// Starts `sshd` on `port`, and returns it once it says it listens, or what it said when it
+    /// stopped without.
+    async fn listening_on(
+        sshd: &std::path::Path,
+        port: u16,
+        host_key: &std::path::Path,
+        authorised: &std::path::Path,
+        client_key: &std::path::Path,
+    ) -> Result<Self, String> {
         let mut child = std::process::Command::new(sshd)
             .args(["-D", "-e", "-f", "/dev/null", "-h"])
-            .arg(&host_key)
+            .arg(host_key)
             .arg("-p")
             .arg(port.to_string())
             .args(["-o", "ListenAddress=127.0.0.1", "-o", "PidFile=none"])
@@ -815,7 +843,7 @@ impl Sshd {
         let server = Self {
             child,
             port,
-            client_key,
+            client_key: client_key.to_path_buf(),
         };
         // Ready is the moment sshd says it listens: the socket is bound by then, and a connection
         // made after it is held for sshd to accept. The log ends when sshd does, so a server that
@@ -846,8 +874,8 @@ impl Sshd {
             .await
             .expect("the wait for sshd ends")
         {
-            Ok(Ok(())) => Some(server),
-            Ok(Err(said)) => panic!("sshd stopped before it listened: {said}"),
+            Ok(Ok(())) => Ok(server),
+            Ok(Err(said)) => Err(said),
             Err(_) => panic!("sshd never said it listened within {LIVENESS_DEADLINE:?}"),
         }
     }

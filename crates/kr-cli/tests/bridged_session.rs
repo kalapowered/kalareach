@@ -36,6 +36,10 @@ use support::terminal::{self, Answering, Collected, Keys};
 /// How long a wait for something to happen is given. It fails when the thing never happens.
 const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
 
+/// How many ports a private `sshd` is started on before a refused port is called a fault: each
+/// refusal is a port another process took between its choice and the bind.
+const PORT_ATTEMPTS: usize = 5;
+
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
 }
@@ -2033,57 +2037,77 @@ impl PrivateSshd {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 .expect("owner-only keys");
         }
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|listener| listener.local_addr())
-            .expect("a free loopback port")
-            .port();
-        let log = std::fs::File::create(directory.join("sshd.log")).expect("a log");
-        let child = user_manager::spawning(|| {
-            std::process::Command::new(sshd)
-                .current_dir(directory)
-                .args(["-D", "-e", "-f", "/dev/null", "-h"])
-                .arg(&host_key)
-                .arg("-p")
-                .arg(port.to_string())
-                .args(["-o", "ListenAddress=127.0.0.1", "-o", "PidFile=none"])
-                .args([
-                    "-o",
-                    "UsePAM=no",
-                    "-o",
-                    "StrictModes=no",
-                    "-o",
-                    "PermitUserRC=no",
-                ])
-                .arg("-o")
-                .arg(format!("AuthorizedKeysFile={}", authorised.display()))
-                .args(["-o", "PasswordAuthentication=no"])
-                .args(["-o", "KbdInteractiveAuthentication=no"])
-                .arg("-o")
-                .arg(format!("SetEnv {environment}"))
-                .stdin(std::process::Stdio::null())
-                .stdout(log.try_clone().expect("a log handle"))
-                .stderr(log)
-                .spawn()
-        })
-        .expect("sshd starts");
-        let server = Self {
-            child,
-            port,
-            directory: directory.to_path_buf(),
-            ssh,
-            host_key,
-        };
-        // Ready is a connection that is accepted, not a moment that has passed.
-        let started = Instant::now();
-        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(
-                started.elapsed() < LIVENESS_DEADLINE,
-                "sshd never accepted a connection: {}",
-                server.log()
-            );
-            std::thread::sleep(Duration::from_millis(50));
+        // sshd binds a port a test names and cannot report one it chose itself, so the port is
+        // chosen here and let go for it to bind, and another process can take it in between. sshd
+        // then says the address is in use and stops without listening: it is started again on
+        // another port, and any other way it stops is a failure.
+        let mut refused = Vec::new();
+        for _ in 0..PORT_ATTEMPTS {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .and_then(|listener| listener.local_addr())
+                .expect("a free loopback port")
+                .port();
+            let log = std::fs::File::create(directory.join("sshd.log")).expect("a log");
+            let child = user_manager::spawning(|| {
+                std::process::Command::new(&sshd)
+                    .current_dir(directory)
+                    .args(["-D", "-e", "-f", "/dev/null", "-h"])
+                    .arg(&host_key)
+                    .arg("-p")
+                    .arg(port.to_string())
+                    .args(["-o", "ListenAddress=127.0.0.1", "-o", "PidFile=none"])
+                    .args([
+                        "-o",
+                        "UsePAM=no",
+                        "-o",
+                        "StrictModes=no",
+                        "-o",
+                        "PermitUserRC=no",
+                    ])
+                    .arg("-o")
+                    .arg(format!("AuthorizedKeysFile={}", authorised.display()))
+                    .args(["-o", "PasswordAuthentication=no"])
+                    .args(["-o", "KbdInteractiveAuthentication=no"])
+                    .arg("-o")
+                    .arg(format!("SetEnv {environment}"))
+                    .stdin(std::process::Stdio::null())
+                    .stdout(log.try_clone().expect("a log handle"))
+                    .stderr(log)
+                    .spawn()
+            })
+            .expect("sshd starts");
+            let mut server = Self {
+                child,
+                port,
+                directory: directory.to_path_buf(),
+                ssh: ssh.clone(),
+                host_key: host_key.clone(),
+            };
+            // Ready is sshd's own word that it listens, which it says once the socket is bound. A
+            // connection that is accepted says nothing of whose socket it reached when another
+            // process holds the port.
+            let started = Instant::now();
+            loop {
+                let stopped = server.child.try_wait().expect("sshd's state");
+                let said = server.log();
+                if stopped.is_none() && said.contains("Server listening on") {
+                    return Some(server);
+                }
+                if let Some(status) = stopped {
+                    if said.contains("Address already in use") {
+                        refused.push(said);
+                        break;
+                    }
+                    panic!("sshd stopped before it listened, with {status}: {said}");
+                }
+                assert!(
+                    started.elapsed() < LIVENESS_DEADLINE,
+                    "sshd never said it listened: {said}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
-        Some(server)
+        panic!("sshd found no port free in {PORT_ATTEMPTS} tries: {refused:#?}");
     }
 
     fn log(&self) -> String {
