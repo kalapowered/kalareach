@@ -2028,6 +2028,14 @@ async fn a_managed_create_whose_shell_has_no_startup_entry_is_refused_naming_the
 /// has started, so its bound on a create whose worker qualifies a shell is longer than the worker's.
 /// A daemon whose bound ended first would answer that the worker did not report itself, and the
 /// worker's words would reach nobody.
+///
+/// The worker reports that its launch failed only once the shell it started has ended: the daemon
+/// records a launch the worker reported as failed, and a repeat of the create is told the launch
+/// failed, which would be false of a shell still running. The report is held at the moment it is
+/// about to be made, by a seam compiled in for tests, and the shell is looked at there. The shell
+/// ignores the signals that ask a process to stop, so it is gone at that moment only if the worker
+/// forced it before it reported; looked at after the create is answered, it could have been ended
+/// by a worker that reported first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     windows,
@@ -2037,7 +2045,22 @@ async fn a_managed_create_whose_shell_never_qualifies_is_answered_with_the_worke
     let host = Host::create()
         .with_a_silent_shell_package()
         .with_the_startup_entry();
-    let _controller = host.start().await;
+    let release = host.temp.root().join("kr-failure-report-go");
+    let arrived = host.temp.root().join("kr-failure-report-go.arrived");
+    let environment = host.paths();
+    let supervisor = host.temp.supervisor(Box::new(WorkerWithVariable {
+        name: "KR_TEST_HOLD_FAILURE_REPORT",
+        value: release.display().to_string(),
+        inner: host.platform_supervisor(),
+    }));
+    let _controller = start_daemon(
+        &environment,
+        supervisor,
+        host.worker.clone(),
+        host.shell_packages.clone(),
+    )
+    .await
+    .expect("the daemon starts");
     let mut client = host.client().await;
     let mut params = create_params(host.environment_id, host.temp.root());
     params.shell_mode = ShellMode::Managed;
@@ -2065,6 +2088,22 @@ async fn a_managed_create_whose_shell_never_qualifies_is_answered_with_the_worke
     })
     .await;
 
+    until(
+        "the worker to be about to report that its launch failed",
+        || arrived.exists().then_some(()),
+    )
+    .await;
+    assert!(
+        matches!(
+            kr_ipc::identity::process_state(&shell),
+            kr_ipc::identity::ProcessState::Ended
+        ),
+        "the worker was about to report its launch failed while the shell it started (process {}) \
+         was still running",
+        shell.pid.get()
+    );
+    std::fs::write(&release, b"").expect("lets the report go");
+
     let refused = creating
         .await
         .expect("the create ran")
@@ -2074,21 +2113,6 @@ async fn a_managed_create_whose_shell_never_qualifies_is_answered_with_the_worke
     assert!(
         refused.message.contains("did not qualify"),
         "the worker's own words do not reach the caller: {refused}"
-    );
-
-    // The worker reports that its launch failed only once the shell it started has ended: the
-    // daemon records a launch the worker reported as failed, and a repeat of the create is told the
-    // launch failed, which would be false of a shell still running. The shell here ignores the
-    // signals that ask a process to stop, so it is gone only if the worker forced it before it
-    // reported.
-    assert!(
-        matches!(
-            kr_ipc::identity::process_state(&shell),
-            kr_ipc::identity::ProcessState::Ended
-        ),
-        "the worker reported its launch failed while the shell it started (process {}) was still \
-         running",
-        shell.pid.get()
     );
 }
 

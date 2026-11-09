@@ -482,6 +482,8 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         // a shell nobody is going to use.
         runtime.close(ClosureReason::RootLaunchFailed).1.release();
         if runtime.root_ended_within(SHELL_END_BOUND).await {
+            #[cfg(feature = "testing")]
+            hold_failure_report_for_a_test().await;
             let _ = writer
                 .write_message(&ControlFrame::WorkerFailed(error.clone()))
                 .await;
@@ -539,6 +541,28 @@ async fn hold_ready_for_a_test() {
     let Some(release) = std::env::var_os("KR_TEST_HOLD_READY") else {
         return;
     };
+    while !std::path::Path::new(&release).exists() {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Holds the report of a launch that failed until a test lets it go.
+///
+/// A worker reports a failed launch only once its root shell has ended, which a test can check only
+/// from outside the worker and only at the moment of the report: a check made after the report
+/// can be made after a worker that reported early has also ended the shell. A test that is to check
+/// it names a file in `KR_TEST_HOLD_FAILURE_REPORT`. The worker creates the file with the same name
+/// and `.arrived` added when it is about to report, and waits until the named file exists. Without
+/// the variable this returns at once, and the feature that compiles it in is one no shipped build
+/// enables.
+#[cfg(feature = "testing")]
+async fn hold_failure_report_for_a_test() {
+    let Some(release) = std::env::var_os("KR_TEST_HOLD_FAILURE_REPORT") else {
+        return;
+    };
+    let mut arrived = release.clone();
+    arrived.push(".arrived");
+    let _ = std::fs::write(&arrived, b"");
     while !std::path::Path::new(&release).exists() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
