@@ -5446,8 +5446,14 @@ prospectively, together. What this host holds itself is removed with them: the r
 the spool with it, and the content a settled receipt carries (the intent envelope the caller sent
 and the result the action produced) is taken out of the journal while the receipt's own metadata
 stays, its error message with it (the last list in this section says so). The semantic history each
-agent instance keeps in the worker goes too, and none is recorded while privacy mode is on; what is kept after
-it is turned off begins at that moment, and a reader that asks for earlier history is told there is a gap. A receipt that has *not* settled keeps its envelope, because recovery reads it and a retry of
+agent instance keeps in the worker goes too, and none is recorded while privacy mode is on; what is
+kept after it is turned off begins at that moment, and a reader that asks for earlier history is
+told there is a gap. A report a hook made over a connection admitted while privacy mode was on, or
+before it last changed, is not kept either, though a hook that started in privacy mode and
+connected after it ended is, because the platform's record of when a hook started is on a clock
+that has no reading of now to compare it with.
+
+A receipt that has *not* settled keeps its envelope, because recovery reads it and a retry of
 an action this host may already have performed is answered from it. It loses its content in the
 transaction that settles it. That transaction reads the journal's own privacy record, and while the
 record says privacy mode is on, a receipt that settles or is rejected is committed without its
@@ -5458,11 +5464,9 @@ archive takes that content out when it recovers or collects the session, whether
 still owes cleanup and whatever the daemon's privacy mode says by then, and it serves no result from
 a journal with such a record before then.
 
-Privacy mode does not reach these two stores, and the last list in this section names others. The canonical grid keeps its own scrollback, which a client
-can still page through, and the worker keeps a bounded log of the semantic entries that a bound
-agent's bridge or gateway observed (up to 4,096 for each instance, the text of notifications and
-details included, at most 64 KiB for each entry), which `agent.snapshot` serves and the privacy cleanup does not clear. Neither is
-described here as though it were done.
+Privacy mode does not reach the canonical grid's own scrollback, which a client can still page
+through, and the last list in this section names other things it leaves. That is not described here
+as though it were done.
 
 A cleanup that could not finish is not a cleanup that finished. A redaction the store refused and
 a spool file this host could not unlink are both content privacy mode was asked to remove and has

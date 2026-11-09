@@ -64,8 +64,10 @@ and supplies says:
   decisions waiting on a person, and the last twenty semantic messages;
 - capped at eight thousand text tokens, enforced by dropping whole items rather than cutting one in
   half. The host cannot run the provider's encoder, so what it counts is a bound no byte-level
-  tokenizer can exceed (the selection's own byte count), and a selection is therefore often
-  smaller than the cap rather than larger;
+  tokenizer can exceed: the bytes the client sends for the selection, which are each item's text
+  and the label and line break the client writes with it, and the opening line the context begins
+  with. The count a selection reports is its text alone. A selection is therefore often smaller
+  than the cap rather than larger;
 - environment variables and raw terminal scrollback are **excluded until the person selects them**,
   and the two are a closed list rather than a rule to remember. File contents and attachment bytes
   are excluded from every call and cannot be selected: nothing on a host reads them for one.
@@ -228,14 +230,17 @@ session is not shown it. The model's text will not be read if a name is pinned.
 
 The session's worker holds the other half, and the daemon reads it from the worker with the reads
 the worker already serves, over the daemon's own link and within the one time a read of a session
-is given. The semantic messages are the entries of the session's agents, each as its kind and its
-text at the moment it was observed; the last twenty across the agents, oldest first, are the ones
-carried. The decisions waiting on a person are the questions a verified source asked and the
-approvals a decoder gave meaning to, each as its wording or its upstream method and whether it was
-verified. The request behind an approval is not read: it can hold anything the agent was asked to
-do. Nothing else of the worker is read, so its output, its screen, its files, its environment and
-its attachments never come into the context. A part the worker cannot give is reported as withheld,
-with its reason, and the rest is still served.
+is given. The semantic messages are the entries of the session's live agents, each as its kind and
+its text at the moment it was observed; the last twenty across the agents, oldest first, are the
+ones carried, and the cap can keep fewer than twenty. The decisions waiting on a person are the
+questions a verified source asked and the approvals a decoder gave meaning to, each as its wording
+or its upstream method and whether it was verified. The request behind an approval is not read: it
+can hold anything the agent was asked to do. Nothing else of the worker is read, so its output, its
+screen, its files, its environment and its attachments never come into the context. A part the
+worker cannot give is reported as withheld, with its reason, and the rest is still served. A
+worker that an earlier release started does not answer the reads that carry its messages and
+decisions in a form this daemon can read, so the selection says that part could not be read and
+carries the daemon's half as before.
 
 Both halves go into one selection. The shared history filter is applied to every item, then one
 cap, one set of secret patterns and one set of counts cover everything the selection carries. A
@@ -258,9 +263,11 @@ carries only what was produced after the moment it took effect, because a worker
 release keeps its history through the change and a decision can stay pending through it; what that
 keeps out is counted. The record keeps when a change was asked for and not when it took effect, so
 a daemon that starts over a host that has ever changed privacy mode carries only what is produced
-after its own start. If the privacy mode
-is turned on whilst the context is being read the context will be read again, and the answer
-carries none of it. The context will be read
+after its own start. A report a hook made over a connection admitted in privacy mode, or before
+privacy mode last changed, is not kept by the worker; a hook that started in privacy mode and
+connected after it ended is kept, because the platform's record of when a hook started is on a
+clock that has no reading of now to compare it with. If the privacy mode is turned on whilst the
+context is being read the context will be read again, and the answer carries none of it. The context will be read
 at most three times; if the privacy mode keeps changing the request will be refused as transient and
 the device will request it again. The answer is checked once, when the read ends, so the privacy
 mode may still be turned on between that check and the write to the device.
