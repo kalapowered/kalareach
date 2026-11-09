@@ -177,7 +177,9 @@ jobs:
     name: macos
     if: github.event_name != 'workflow_dispatch' || inputs.macos
     runs-on: macos-15
-    timeout-minutes: 330
+    # The limits of the steps add up to less than this one, so a step that hangs is ended and the
+    # steps after it still report. The job's own limit is under GitHub's six hours.
+    timeout-minutes: 355
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
@@ -320,8 +322,18 @@ jobs:
           key: conformance-applications-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/conformance/applications.lock') }}
           restore-keys: conformance-applications-${{ runner.os }}-${{ runner.arch }}-
 
+      # The step runs every group of the platform one after the other, and it grows with the
+      # suites. It took 206 to 239 minutes on the eight nights of 30 October to 7 November that it
+      # finished, and it ran into its former limit of 240 minutes on the nights of 3 and 9 November,
+      # in its last step. Taking the steps a night did not reach at the pace of the steps it did,
+      # those two nights needed about 246 and 244 minutes, and 8 November, whose steps ran 14
+      # percent slower than those of 7 November and which waited out a download outage, about 265.
+      # The limit is what the job's limit leaves once the other steps have theirs, less 3 minutes
+      # for the set-up and clean-up that no step limit counts: the limits of the job's steps add up
+      # to 352 of its 355 minutes, which is under GitHub's six hours. That is 20 minutes more than
+      # the slowest night that was not slowed by the outage.
       - name: The conformance report
-        timeout-minutes: 240
+        timeout-minutes: 266
         env:
           REPORT_GROUPS: ${{ inputs.groups }}
         run: |
