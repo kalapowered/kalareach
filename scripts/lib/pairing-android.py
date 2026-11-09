@@ -291,7 +291,8 @@ def scan(
     """
     wait_for_file(directory, f"{picture}.png.added")
     phone.press(opener)
-    limit = time.monotonic() + SCAN_SECONDS
+    began = time.monotonic()
+    limit = began + SCAN_SECONDS
     for view in VIEWS:
         look(port, view)
         end = min(time.monotonic() + VIEW_SECONDS, limit)
@@ -311,7 +312,10 @@ def scan(
                 end = min(time.monotonic() + VIEW_SECONDS, limit)
                 continue
             time.sleep(0.3)
-    phone.give_up(f"timed out waiting for {what}: the scanner read the picture in none of the {SCAN_SECONDS} s the scan is given, over {len(VIEWS)} views")
+    phone.give_up(
+        f"timed out waiting for {what}: the scanner read the picture at none of {len(VIEWS)} views in "
+        f"{time.monotonic() - began:.0f} s (a scan is given at most {SCAN_SECONDS} s)"
+    )
 
 
 # What the card for the host's own invitation says: it grants the phone an owner's rights, which the
