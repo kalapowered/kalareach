@@ -1104,13 +1104,12 @@ fn a_closed_journal(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
 }
 
 /// A process that is ending has released its locks on a journal's index and not yet its mapping
-/// of it, and a process that opens the journal then is told its disk failed. Every way of opening
-/// a journal asks again until the previous holder has let go, instead of reporting that.
+/// of it. Every way of opening a journal opens it at once then, and the journal holds what that
+/// process committed.
 #[cfg(windows)]
 #[test]
-fn every_way_of_opening_a_journal_waits_for_a_holder_that_has_not_let_go_of_its_index() {
+fn every_way_of_opening_a_journal_goes_on_while_the_previous_holders_mapping_of_its_index_stands() {
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     let (path, index) = a_closed_journal("previous-holder-lets-go");
     type Opener = fn(&Path) -> kr_worker::Result<()>;
@@ -1129,57 +1128,49 @@ fn every_way_of_opening_a_journal_waits_for_a_holder_that_has_not_let_go_of_its_
     ];
     for (name, open) in openers {
         let held = held_index::HeldIndex::on(&index);
-        // The premise: the store itself refuses while the index is held this way.
-        let refused = rusqlite::Connection::open_with_flags(
-            &path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .and_then(|connection| {
-            connection.query_row("SELECT version FROM schema_version", [], |row| {
-                row.get::<_, i64>(0)
-            })
+        open(&path).unwrap_or_else(|error| {
+            panic!("{name}: the open goes on while the index is held: {error}")
         });
-        assert!(
-            matches!(
-                &refused,
-                Err(rusqlite::Error::SqliteFailure(failure, _))
-                    if failure.extended_code == rusqlite::ffi::SQLITE_IOERR_TRUNCATE
-            ),
-            "{name}: the held index makes the store refuse: {refused:?}"
-        );
-
-        let waited = Arc::new(AtomicBool::new(false));
-        let signal = Arc::clone(&waited);
-        kr_flush::release::on_the_next_wait(move || {
-            signal.store(true, Ordering::SeqCst);
-            drop(held);
+        let reader = Journal::open_read_only(&path).unwrap_or_else(|error| {
+            panic!("{name}: the journal reads while the index is held: {error}")
         });
-        let opened = open(&path);
-        assert!(
-            waited.load(Ordering::SeqCst),
-            "{name}: the open reported the refusal instead of waiting for the holder: {opened:?}"
-        );
-        opened.unwrap_or_else(|error| panic!("{name}: the open went on after the wait: {error}"));
+        let receipt = reader
+            .read(actor(), kr_worker::journal::action_id_from([5; 16]))
+            .unwrap_or_else(|error| panic!("{name}: the receipt reads: {error}"))
+            .unwrap_or_else(|| {
+                panic!("{name}: the receipt the previous holder committed is there")
+            });
+        assert_eq!(receipt.state, ReceiptState::Accepted, "{name}");
+        drop(reader);
+        drop(held);
     }
     std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
 }
 
-/// A holder that does not let go is not waited for for ever: the open reports what the store said,
-/// with the store's own result code, which is what tells this failure from a disk that failed.
+/// A previous holder that is slow to let go of its mapping does not keep the next one from
+/// writing: a journal takes a write while the index is held, and reads it once the hold is let go
+/// of, with what the previous holder committed.
 #[cfg(windows)]
 #[test]
-fn an_open_that_a_holder_never_lets_go_of_reports_the_stores_result_code() {
+fn a_journal_takes_a_write_while_the_previous_holders_mapping_of_its_index_stands() {
     let (path, index) = a_closed_journal("previous-holder-stays");
     let held = held_index::HeldIndex::on(&index);
-    let refused = Journal::open_read_only(&path).expect_err("the index is still held");
-    let kr_worker::WorkerError::JournalUnavailable { detail } = &refused else {
-        panic!("a journal that cannot be read is unavailable: {refused:?}");
-    };
-    assert!(
-        detail.contains(&rusqlite::ffi::SQLITE_IOERR_TRUNCATE.to_string()),
-        "the refusal names the store's result code: {detail}"
-    );
+    {
+        let mut journal = Journal::open(&path).expect("the open goes on while the index is held");
+        journal
+            .accept(&submission(6, 6))
+            .expect("accepts while the index is held");
+    }
     drop(held);
+    let reader = Journal::open_read_only(&path).expect("opens read-only");
+    for action in [5, 6] {
+        let receipt = reader
+            .read(actor(), kr_worker::journal::action_id_from([action; 16]))
+            .expect("reads")
+            .unwrap_or_else(|| panic!("the receipt of action {action} is there"));
+        assert_eq!(receipt.state, ReceiptState::Accepted, "action {action}");
+    }
+    drop(reader);
     std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
 }
 

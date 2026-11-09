@@ -13,8 +13,8 @@
 //! hard link inside an application's own directory.
 //!
 //! The same crate holds the other thing every local SQLite store needs from the file system and
-//! nothing else of the host provides: opening a store whose previous holder is still letting go of
-//! it (the `release` module, with the `sqlite` feature).
+//! nothing else of the host provides: opening a store whose index cannot be made ready the moment
+//! it is asked, and asking again (the `release` module, with the `sqlite` feature).
 //!
 //! This crate depends on no other crate of this host, so every one of them can reach it, the
 //! cryptography crate's directory store included.

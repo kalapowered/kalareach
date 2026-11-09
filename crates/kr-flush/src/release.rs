@@ -1,19 +1,22 @@
 //! Opening a store whose previous holder is still letting go of it.
 //!
 //! A store in write-ahead mode keeps an index in a file of its own, and the first process to open
-//! the store after every other holder has gone resets that file. On Windows the reset is refused
-//! while any process still has the file mapped, and a process that is ending releases its locks
-//! on the index before the system removes its mapping. A process that opens the store in that
-//! interval is told `SQLITE_IOERR_TRUNCATE`, which reads as "disk I/O error", although the disk
-//! has not failed and the same open succeeds a moment later. The interval is the end of the
+//! the store after every other holder has gone resets that file. On Windows the file cannot be
+//! truncated while any process still has it mapped, and a process that is ending releases its
+//! locks on the index before the system removes its mapping. The interval is the end of the
 //! previous holder: a worker whose session has just closed, a daemon that was killed and whose
 //! successor took the environment the moment its lock was free, or any process that was ended.
 //!
-//! SQLite does not retry this on Windows, so the openers do: they ask again for as long as the
-//! store gives that answer, and give the answer up once it has lasted [`PATIENCE`], which is the
-//! store being held by something that is not letting go. The same code is also what the store
-//! says when it cannot extend the index for want of room, and that refusal is then given up after
-//! [`PATIENCE`] as it was before the wait.
+//! SQLite 3.54 and later do not refuse an open in that interval: where they cannot truncate the
+//! index they clear its first bytes instead, which has the same effect, and go on. The store opens
+//! at once and holds what its previous holder committed. The refusal an earlier SQLite gave there,
+//! `SQLITE_IOERR_TRUNCATE`, never kept a second process out of a store that a live process held:
+//! the index is reset only by a process that finds nobody else holding the store open.
+//!
+//! The store still answers `SQLITE_IOERR_TRUNCATE`, which reads as "disk I/O error", when it cannot
+//! extend the index for want of room. The openers ask again for as long as the store gives that
+//! answer, and give it up once it has lasted [`PATIENCE`], which is a disk that has no room to
+//! give.
 
 use std::time::{Duration, Instant};
 
@@ -21,15 +24,15 @@ use rusqlite::Connection;
 
 /// Opens the store at `path`, with `flags` or the ones that create it, and reads its first page.
 ///
-/// The first read is what maps the store's write-ahead index, so it is where a store whose
-/// previous holder is still letting go of that index refuses, and the whole open is asked again
-/// for as long as it does ([`once_the_previous_holder_has_let_go`]). Opening the file alone would
-/// not meet the refusal, and the caller's first query would.
+/// The first read is what maps the store's write-ahead index, so it is where a store that cannot
+/// make that index ready refuses, and the whole open is asked again for as long as it does
+/// ([`once_the_previous_holder_has_let_go`]). Opening the file alone would not meet the refusal,
+/// and the caller's first query would.
 ///
 /// # Errors
 ///
-/// Returns the store's refusal: the last one when it still says its previous holder has not let
-/// go after [`PATIENCE`], and any other the first time it is given.
+/// Returns the store's refusal: the last one when it still says its index cannot be made ready
+/// after [`PATIENCE`], and any other the first time it is given.
 pub fn open_connection(
     path: &std::path::Path,
     flags: Option<rusqlite::OpenFlags>,
@@ -84,12 +87,10 @@ pub fn holds_a_row(
     }
 }
 
-/// How long an open that is told the previous holder has not let go yet asks again before it
+/// How long an open that is told its store's index cannot be made ready asks again before it
 /// reports the refusal.
 ///
-/// The interval is the time the system takes to remove one process's mappings, so a store still
-/// refusing after this long is held by a process that is running, not by one that is ending. It
-/// is the same bound the stores give a lock another connection holds.
+/// It is the same bound the stores give a lock another connection holds.
 pub const PATIENCE: Duration = Duration::from_secs(5);
 
 /// How long an open waits between two asks.
@@ -110,7 +111,8 @@ pub fn describe(error: &rusqlite::Error) -> String {
     }
 }
 
-/// Whether the store's answer says its previous holder has not let go of its index yet.
+/// Whether the store's answer is the one it gives an open whose index it could not make ready:
+/// `SQLITE_IOERR_TRUNCATE`, on Windows.
 #[must_use]
 pub fn is_a_holder_letting_go(error: &rusqlite::Error) -> bool {
     cfg!(windows)
@@ -121,8 +123,8 @@ pub fn is_a_holder_letting_go(error: &rusqlite::Error) -> bool {
         )
 }
 
-/// Runs `attempt`, again for as long as the store says its previous holder has not let go of it,
-/// and returns the first answer that says anything else.
+/// Runs `attempt`, again for as long as the store says its index cannot be made ready, and returns
+/// the first answer that says anything else.
 ///
 /// # Errors
 ///
@@ -151,13 +153,13 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Runs `hook` the next time an open on this thread is told its previous holder has not let go,
-/// once, before the open asks again, for this host's own tests.
+/// Runs `hook` the next time an open on this thread is told its store's index cannot be made
+/// ready, once, before the open asks again, for this host's own tests.
 ///
-/// It is how a test lets go of a store at the moment the open is waiting for it, rather than
-/// after a time it chose. It belongs to the calling thread, because an open waits on the thread
-/// that asked, so a test running beside another one cannot be answered with the other's wait. It
-/// is compiled away in every shipped build.
+/// It is how a test acts at the moment the open is waiting, rather than after a time it chose. It
+/// belongs to the calling thread, because an open waits on the thread that asked, so a test
+/// running beside another one cannot be answered with the other's wait. It is compiled away in
+/// every shipped build.
 #[cfg(feature = "testing")]
 pub fn on_the_next_wait(hook: impl FnOnce() + 'static) {
     ON_THE_NEXT_WAIT.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
@@ -172,60 +174,65 @@ fn announce_the_wait() {
     }
 }
 
-/// Shows, for a store's own test, that opening the store waits for a previous holder that is still
-/// letting go of its index, instead of reporting the refusal the store makes meanwhile.
+/// Shows, for a store's own test, that a store whose previous holder is still letting go of its
+/// index opens, and holds what that holder committed.
 ///
 /// `open` opens the store at `database` and lets go of it again. It is called once to make the
-/// store, then with the store's index held mapped, the way a process that is ending holds it: the
-/// premise is checked first, that the store refuses to be read while the index is held, and the
-/// hold is let go of by the open's own first wait, so the open can only succeed by waiting. A store
-/// that reports the refusal fails here.
+/// store, then with the store's index held mapped, the way a process that is ending holds it. The
+/// store must read as it did, its objects and the version it records, while the index is held, and
+/// `open` must succeed then and again once the hold is let go of. SQLite 3.54 and later clear the
+/// first bytes of an index they cannot truncate and go on, so the open does not wait; a store that
+/// reports a refusal there fails here.
 ///
 /// # Panics
 ///
-/// Panics when the store is not refused while its index is held, when the open does not wait, or
-/// when it does not go on once the holder has let go.
+/// Panics when the store cannot be read, or reads differently, while its index is held, and when
+/// `open` fails while it is held or after it has been let go of.
 #[cfg(all(windows, feature = "testing"))]
 pub fn assert_an_open_waits_for_the_previous_holder<E: std::fmt::Debug>(
     database: &std::path::Path,
     open: impl Fn() -> Result<(), E>,
 ) {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     open().expect("the store opens when nothing holds it");
+    let committed = what_the_store_holds(database).expect("the store reads when nothing holds it");
     let mut index = database.as_os_str().to_owned();
     index.push("-shm");
     let held = held_index::HeldIndex::on(std::path::Path::new(&index));
-    // The premise: the store itself refuses while the index is held this way.
-    let refused = Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .and_then(|connection| {
-            connection.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
-                row.get::<_, i64>(0)
-            })
-        });
+    let read = what_the_store_holds(database);
     assert!(
-        matches!(
-            &refused,
-            Err(rusqlite::Error::SqliteFailure(failure, _))
-                if failure.extended_code == rusqlite::ffi::SQLITE_IOERR_TRUNCATE
-        ),
-        "the held index makes the store refuse: {refused:?}"
+        read.as_ref().is_ok_and(|read| *read == committed),
+        "the store reads what its previous holder committed while the index is held: {read:?}"
     );
+    open().expect("the open goes on while the previous holder's mapping of the index stands");
+    drop(held);
+    open().expect("the open goes on once the previous holder has let go");
+    let read = what_the_store_holds(database);
+    assert!(
+        read.as_ref().is_ok_and(|read| *read == committed),
+        "the store reads what its previous holder committed after the open: {read:?}"
+    );
+}
 
-    let waited = Arc::new(AtomicBool::new(false));
-    let signal = Arc::clone(&waited);
-    on_the_next_wait(move || {
-        signal.store(true, Ordering::SeqCst);
-        drop(held);
-    });
-    let opened = open();
-    assert!(
-        waited.load(Ordering::SeqCst),
-        "the open reported the refusal instead of waiting for the holder: {:?}",
-        opened.as_ref().err()
-    );
-    opened.expect("the open went on after the wait");
+/// What the store at `database` holds, read through a connection of its own: the version it
+/// records and every object of its schema, one line each with the statement that made it.
+#[cfg(all(windows, feature = "testing"))]
+fn what_the_store_holds(database: &std::path::Path) -> rusqlite::Result<(i64, Vec<String>)> {
+    let connection =
+        Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+    let mut statement =
+        connection.prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")?;
+    let objects = statement
+        .query_map([], |row| {
+            Ok(format!(
+                "{} {}: {}",
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?.unwrap_or_default()
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((version, objects))
 }
 
 /// A mapping of a store's index file, held the way a process that is ending holds it: mapped, with

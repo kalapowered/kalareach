@@ -3503,10 +3503,11 @@ mod tests {
     }
 }
 
-/// A store whose previous holder is still letting go of its index is waited for, not reported as a
-/// disk that failed. On Windows a process that is ending releases its locks on a store's
+/// A store whose previous holder is still letting go of its index opens at once, and holds what that
+/// holder committed. On Windows a process that is ending releases its locks on a store's
 /// write-ahead index before the system removes its mapping of it, and the next process to open the
-/// store in that interval is told its disk failed, although the same open succeeds a moment later.
+/// store in that interval gets the store: SQLite clears the start of an index it cannot truncate
+/// and goes on.
 #[cfg(all(test, windows))]
 mod a_previous_holder_that_is_letting_go {
     use super::*;

@@ -453,11 +453,10 @@ fn desktop_columns(desktop: &DesktopBinding) -> (Option<String>, Option<i64>) {
 
 /// Opens the registry's file, with `flags` or the ones that create it, and reads its first page.
 ///
-/// The first read is what maps the store's write-ahead index, so it is where a store whose
-/// previous holder is still letting go of that index refuses: a daemon that ended by a kill, and
-/// whose successor takes the environment the moment the lock is free. The open is asked again for
-/// as long as the store says so ([`kr_flush::release`]), and a refusal that lasts is reported with
-/// the store's result code, which tells it from a disk that failed.
+/// The first read is what maps the store's write-ahead index, so it is where a store that cannot
+/// make that index ready refuses. The open is asked again for as long as the store says so
+/// ([`kr_flush::release`]), and a refusal that lasts is reported with the store's result code,
+/// which tells it from a disk that failed.
 fn open_connection(
     path: &std::path::Path,
     flags: Option<rusqlite::OpenFlags>,
@@ -4169,61 +4168,36 @@ mod tests {
 
     /// A daemon that ended by a kill has released its locks on the registry's index and not yet
     /// its mapping of it, and the daemon that takes the environment the moment the lock is free
-    /// opens the registry then. The store tells it its disk failed, although the same open
-    /// succeeds a moment later. Opening the registry asks again until the previous holder has let
-    /// go, instead of reporting that.
+    /// opens the registry then. The registry opens at once, and holds what the previous daemon
+    /// recorded.
     #[cfg(windows)]
     #[test]
-    fn a_registry_opened_while_its_previous_daemon_is_letting_go_is_waited_for() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        use kr_flush::release::{held_index::HeldIndex, on_the_next_wait};
+    fn a_registry_opened_while_its_previous_daemon_is_letting_go_holds_what_it_recorded() {
+        use kr_flush::release::held_index::HeldIndex;
 
         let directory = tempfile::tempdir().expect("a directory");
         let path = directory.path().join("registry.sqlite3");
-        drop(Registry::open(&path, environment()).expect("a registry"));
+        Registry::open(&path, environment())
+            .expect("a registry")
+            .adopt_worker(&worker_row(1, 4_001), Some(&DesktopBinding::none()))
+            .expect("records a worker");
         let mut index = path.clone().into_os_string();
         index.push("-shm");
         let held = HeldIndex::on(std::path::Path::new(&index));
-        // The premise: the store itself refuses while the index is held this way.
-        let refused =
-            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .and_then(|connection| {
-                    connection.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
-                        row.get::<_, i64>(0)
-                    })
-                });
-        assert!(
-            matches!(
-                &refused,
-                Err(rusqlite::Error::SqliteFailure(failure, _))
-                    if failure.extended_code == rusqlite::ffi::SQLITE_IOERR_TRUNCATE
-            ),
-            "the held index makes the store refuse: {refused:?}"
+        let opened = Registry::open(&path, environment())
+            .expect("the open goes on while the previous daemon's mapping of the index stands");
+        assert_eq!(
+            opened.workers().expect("reads the workers"),
+            vec![worker_row(1, 4_001)]
         );
-
-        let waited = Arc::new(AtomicBool::new(false));
-        let signal = Arc::clone(&waited);
-        on_the_next_wait(move || {
-            signal.store(true, Ordering::SeqCst);
-            drop(held);
-        });
-        let opened = Registry::open(&path, environment());
-        assert!(
-            waited.load(Ordering::SeqCst),
-            "the open reported the refusal instead of waiting for the holder: {:?}",
-            opened.as_ref().err()
-        );
-        opened.expect("the open went on after the wait");
+        drop(held);
     }
 
-    /// A holder that does not let go is not waited for for ever: the open reports what the store
-    /// said, with the store's own result code, which is what tells this failure from a disk that
-    /// failed.
+    /// A previous daemon that is slow to let go of its mapping does not keep its successor from
+    /// writing: the registry takes a write while the index is held, and a later open reads it.
     #[cfg(windows)]
     #[test]
-    fn an_open_that_a_previous_daemon_never_lets_go_of_reports_the_stores_result_code() {
+    fn a_registry_takes_a_write_while_its_previous_daemons_mapping_of_the_index_stands() {
         use kr_flush::release::held_index::HeldIndex;
 
         let directory = tempfile::tempdir().expect("a directory");
@@ -4232,14 +4206,16 @@ mod tests {
         let mut index = path.clone().into_os_string();
         index.push("-shm");
         let held = HeldIndex::on(std::path::Path::new(&index));
-        let refused = Registry::open(&path, environment()).expect_err("the index is still held");
-        assert!(
-            refused
-                .to_string()
-                .contains(&rusqlite::ffi::SQLITE_IOERR_TRUNCATE.to_string()),
-            "the refusal names the store's result code: {refused}"
-        );
+        Registry::open(&path, environment())
+            .expect("the open goes on while the index is held")
+            .adopt_worker(&worker_row(1, 4_001), Some(&DesktopBinding::none()))
+            .expect("records a worker while the index is held");
         drop(held);
+        let read = Registry::open_to_read(&path, environment()).expect("a registry reads");
+        assert_eq!(
+            read.workers().expect("reads the workers"),
+            vec![worker_row(1, 4_001)]
+        );
     }
 
     #[test]

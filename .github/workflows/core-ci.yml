@@ -1034,12 +1034,13 @@ jobs:
 
       # A process that is ending releases its locks on a store's write-ahead index before the
       # system removes its mapping of it, and the next process to open the store in that interval
-      # is told its disk failed. Every store a daemon opens waits that out, through the flush
-      # crate's open, and each has a case that holds its index mapped the way an ending process
-      # does and fails unless the open waits. The other stores' cases are run by steps of their own
-      # (the registry's, the attention store's, the plugin catalogue's, the project and transfer
-      # stores', and the worker's journal in the persistence suite); this step runs the rest, in the
-      # daemon's library and the libraries of the stores' crates.
+      # gets the store, with what the process committed in it. Every store a daemon opens goes
+      # through the flush crate's open, and each has a case that holds its index mapped the way an
+      # ending process does and fails unless the open succeeds and the store reads as it did. The
+      # other stores' cases are run by steps of their own (the registry's, the attention store's,
+      # the plugin catalogue's, the project and transfer stores', and the worker's journal in the
+      # persistence suite); this step runs the rest, in the daemon's library and the libraries of
+      # the stores' crates.
       - name: Test that each store waits for the holder that is letting go of it
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-controller -p kr-changeset -p kr-delivery -p kr-describe -p kr-automation --lib a_previous_holder_that_is_letting_go

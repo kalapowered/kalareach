@@ -4554,9 +4554,9 @@ mod tests {
     }
 }
 
-/// A journal whose previous holder is still letting go of its index is waited for, not reported as a
-/// disk that failed. A journal is written in the rollback mode, so it has an index only when an
-/// earlier build left it in write-ahead mode, which is the one a store keeps until it is told
+/// A journal whose previous holder is still letting go of its index opens at once, and holds what
+/// that holder committed. A journal is written in the rollback mode, so it has an index only when
+/// an earlier build left it in write-ahead mode, which is the one a store keeps until it is told
 /// otherwise; this stands one in that mode.
 #[cfg(all(test, windows))]
 mod a_previous_holder_that_is_letting_go {
@@ -4568,8 +4568,8 @@ mod a_previous_holder_that_is_letting_go {
         let database = directory.path().join(WORKFLOW_DB_NAME);
         kr_flush::release::assert_an_open_waits_for_the_previous_holder(&database, || {
             let opened = WorkflowStore::open(directory.path()).map(drop);
-            // The mode an earlier build left it in. Asked for after every open, and asked for in
-            // vain by the open that the held index refuses, which reports that refusal itself.
+            // The mode an earlier build left it in. Asked for after every open, so that the next
+            // open meets an index.
             let _ = Connection::open(&database)
                 .and_then(|connection| connection.pragma_update(None, "journal_mode", "WAL"));
             opened

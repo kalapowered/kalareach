@@ -2173,11 +2173,11 @@ fn forget_unknown(shared: &Shared, lease: RelayLeaseId) {
         .remove(lease.get().as_bytes());
 }
 
-/// The lease record is opened through the wait for a previous holder that is letting go of its
-/// index, not reported as a disk that failed. On Windows a process that is ending releases its
-/// locks on a store's write-ahead index before the system removes its mapping of it, and the next
-/// process to open the store in that interval is told its disk failed, although the same open
-/// succeeds a moment later.
+/// The lease record opens at once while its previous holder is still letting go of its index, and
+/// holds what that holder committed. On Windows a process that is ending releases its locks on a
+/// store's write-ahead index before the system removes its mapping of it, and the next process to
+/// open the store in that interval gets the store: SQLite clears the start of an index it cannot
+/// truncate and goes on.
 #[cfg(all(test, windows))]
 mod a_previous_holder_that_is_letting_go {
     use super::record::{Kept, RELAY_LEASE_RECORD, Record};

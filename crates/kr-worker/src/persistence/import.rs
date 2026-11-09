@@ -168,8 +168,8 @@ pub enum ImportRefusal {
 /// Returns an [`ImportRefusal`] naming what the importer could not read. The journal is then
 /// exactly as it was.
 pub fn import_journal(path: impl AsRef<Path>) -> Result<Imported, ImportRefusal> {
-    // Opened as the journal's own openers are, so that a previous holder still letting go of the
-    // journal's index is waited for and not reported as a journal that cannot be read.
+    // Opened as the journal's own openers are, so that a store that cannot make its index ready is
+    // asked again and not reported as a journal that cannot be read.
     let mut connection = kr_flush::release::open_connection(
         path.as_ref(),
         Some(
@@ -695,7 +695,7 @@ fn unreadable(error: rusqlite::Error) -> ImportRefusal {
     }
 }
 
-/// A journal whose previous holder is still letting go of its index is waited for by the importer,
+/// A journal whose previous holder is still letting go of its index is imported as any other is,
 /// not reported as one that cannot be read.
 #[cfg(all(test, windows))]
 mod a_previous_holder_that_is_letting_go {
