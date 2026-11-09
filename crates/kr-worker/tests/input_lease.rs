@@ -3110,6 +3110,201 @@ async fn an_answer_to_a_question_is_never_inserted_into_the_terminal() {
         .release();
 }
 
+/// One path as a person left it: its modification time and its mode.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+struct Stamp {
+    modified: std::time::SystemTime,
+    mode: u32,
+}
+
+/// What a directory holds as a person left it: its own stamp, and each name in it with its bytes
+/// and its stamp.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+struct TreeState {
+    directory: Stamp,
+    names: Vec<(String, Vec<u8>, Stamp)>,
+}
+
+#[cfg(unix)]
+fn tree_state(directory: &std::path::Path) -> TreeState {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let stamp = |path: &std::path::Path| {
+        let metadata = std::fs::metadata(path).expect("the path's metadata");
+        Stamp {
+            modified: metadata.modified().expect("a modification time"),
+            mode: metadata.permissions().mode(),
+        }
+    };
+    let mut names: Vec<_> = std::fs::read_dir(directory)
+        .expect("lists the directory")
+        .map(|entry| {
+            let path = entry.expect("an entry").path();
+            (
+                path.file_name()
+                    .expect("a name")
+                    .to_string_lossy()
+                    .into_owned(),
+                std::fs::read(&path).expect("reads the file"),
+                stamp(&path),
+            )
+        })
+        .collect();
+    names.sort_by(|first, second| first.0.cmp(&second.0));
+    TreeState {
+        directory: stamp(directory),
+        names,
+    }
+}
+
+/// KR-REQ-03.30, through the worker's real path: a run of the disclosed checks writes nothing to
+/// the terminal of the session whose worker performs it, changes nothing in the tree the file
+/// check reads, and has no record that establishes synthetic input.
+///
+/// A real session runs a program that records every byte it reads from its terminal. The control
+/// daemon's checks connection asks the worker to perform the checks twice, once naming a file in
+/// a directory with another file beside it and once naming none. Each answer holds the one record
+/// a headless session is asked for, the file read: no record names synthetic input, the one check
+/// that sends input and needs a test context of its own. Then the person types a sentinel, which is
+/// how the recording is known to be complete, and it holds the sentinel and nothing else. The
+/// directory holds the same names, bytes, modification times and modes as before.
+///
+/// Shown here: the file read, the one check this host performs for a headless session, through
+/// the worker's service, with the terminal and the tree watched. Not shown here: the screen image,
+/// the accessible element and the application launch, which a desktop-bound worker performs only
+/// on macOS, each against a permission granted per signed application and login session that a
+/// prompt answers at the machine, so no host a test starts on can run them and what their
+/// operations do to another application is not observed here; and a keystroke delivered inside an
+/// isolated test context, which no check in this build delivers.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_of_the_disclosed_checks_sends_nothing_to_the_terminal_and_changes_nothing_it_reads()
+{
+    use kr_protocol::desktop::{
+        CapabilityEvidenceSource, CapabilityState, DesktopChecksRequest, capabilities,
+    };
+    use kr_protocol::ids::RequestId;
+    use kr_protocol::local::ControllerConnectionRole;
+
+    const SENTINEL: &[u8] = b"typed-by-the-person-6208";
+
+    let kept = tempfile::tempdir().expect("a directory for what the application keeps");
+    let received = kept.path().join("received");
+    let wired = wired(&bracketed_recording(&received)).await;
+    let (mut client, attachment, epoch) = typist(&wired).await;
+
+    // The tree the file check reads: the nominated file and another beside it.
+    let tree = tempfile::tempdir().expect("a directory of this test's own");
+    let file = tree.path().join("authorised.txt");
+    std::fs::write(&file, b"the person nominated this").expect("the nominated file");
+    std::fs::write(tree.path().join("beside.txt"), b"not nominated").expect("another file");
+    let before = tree_state(tree.path());
+
+    // The control daemon's checks connection.
+    let mut daemon = BoundLink::connect(&wired.endpoint, build())
+        .await
+        .expect("connects");
+    let role = ControllerConnectionRole::Checks;
+    daemon
+        .send(&ControlFrame::ControllerRole(role))
+        .await
+        .expect("declares the role");
+    match daemon.recv().await.expect("the worker answers") {
+        ControlFrame::ControllerRole(declared) => assert_eq!(declared, role),
+        other => panic!("the worker answered {other:?}"),
+    }
+    let identity = Arc::clone(&wired.controller);
+    let boot = wired.boot.clone();
+    daemon
+        .present_generation(move |nonce| {
+            identity
+                .generation_token(ControllerGeneration::new(1), &boot, nonce)
+                .map_err(kr_ipc::IpcError::from)
+        })
+        .await
+        .expect("the worker accepts the generation");
+
+    for (id, nominated) in [(1, file.to_str()), (2, None)] {
+        daemon
+            .send(&ControlFrame::DesktopChecks(DesktopChecksRequest {
+                request_id: RequestId::new(id),
+                environment_id: wired.environment_id,
+                authorised_file: Nullable(nominated.map(str::to_owned)),
+            }))
+            .await
+            .expect("writes the request");
+        let answer = tokio::time::timeout(LIVENESS_DEADLINE, async {
+            loop {
+                match daemon.recv().await.expect("the worker answers") {
+                    ControlFrame::DesktopChecksAnswer(found) => return found,
+                    ControlFrame::Notification(_) | ControlFrame::Event(_) => {}
+                    other => panic!("the worker answered {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the worker answers in time");
+        assert_eq!(answer.request_id, RequestId::new(id));
+        let [record] = &answer.records[..] else {
+            panic!("the read is the one check performed: {:?}", answer.records);
+        };
+        assert_eq!(
+            record.capability.as_str(),
+            capabilities::AUTHORISED_FILE_READ,
+            "the one record is the read's, and none names synthetic input"
+        );
+        assert_eq!(
+            record.evidence_source,
+            CapabilityEvidenceSource::DisclosedProbe
+        );
+        // With a file the read is established, and with none it is not run.
+        assert_eq!(
+            record.state == CapabilityState::QualifiedAvailable,
+            nominated.is_some(),
+            "{record:?}"
+        );
+        assert_eq!(
+            tree_state(tree.path()),
+            before,
+            "the tree the check reads is as it was after request {id}"
+        );
+    }
+
+    // The person types, and the recording is read once it holds that: what a check wrote to the
+    // terminal would have come before it.
+    write_over(&mut client, &wired, attachment, epoch, 0, SENTINEL)
+        .await
+        .expect("the sentinel is accepted");
+    let arrived = tokio::time::timeout(LIVENESS_DEADLINE, async {
+        loop {
+            if std::fs::read(&received).is_ok_and(|seen| contains(&seen, SENTINEL)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        arrived.is_ok(),
+        "what the person typed reached the application"
+    );
+    assert_eq!(
+        std::fs::read(&received).expect("the recording"),
+        SENTINEL,
+        "what reached the application is what the person typed and nothing a check wrote"
+    );
+
+    drop(daemon);
+    drop(client);
+    wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
+
 /// KR-PERF-002: a close that is admitted discards the prefix the recogniser holds and accepts no
 /// input after it.
 ///
