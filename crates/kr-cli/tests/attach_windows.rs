@@ -112,6 +112,56 @@ impl ConsoleOutput {
         )
         .into_owned()
     }
+
+    /// Waits until `count` finds at least `times` of what it counts in what the console shows. It
+    /// fails when the console's output has ended without it, and when the liveness deadline passes
+    /// after `started`; `command` says how the command that writes to the console stands, for the
+    /// second failure.
+    ///
+    /// A command that has ended can still have its last lines on their way to this side of the
+    /// console, and how long that takes is not this test's to know. So the end of the command does
+    /// not end the wait: the console's thread having read to the end of the output does, and until
+    /// it has, the wait goes on to the deadline. The last lines of a command that ends are mostly
+    /// the reason it ends, and a failure reported at the moment of the end would not show them. The
+    /// output of a pseudo-console usually ends only when the pseudo-console closes, which a test
+    /// holds open for as long as the command's console is wanted, so a marker that never comes is
+    /// mostly reported by the deadline, which says whether the command had ended.
+    fn waits_until(
+        &self,
+        what: &str,
+        count: impl Fn(&str) -> usize,
+        times: usize,
+        started: Instant,
+        mut command: impl FnMut() -> String,
+    ) {
+        loop {
+            // Read before the text is, so that a thread that was done has also added the last bytes.
+            let complete = self.complete();
+            let text = self.text();
+            if count(&text) >= times {
+                return;
+            }
+            assert!(
+                !complete,
+                "{what}: the console showed all it will, and not {times} time(s) of it: {text:?}"
+            );
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "{what}: waited {:?} for the console to show it {times} time(s) while {}: {text:?}",
+                started.elapsed(),
+                command()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// How a command that writes to a console stands, for the words of a failure.
+fn standing_of(name: &str, child: &mut Box<dyn portable_pty::Child + Send + Sync>) -> String {
+    match child.try_wait().expect("the command's state") {
+        Some(status) => format!("{name} had ended ({status})"),
+        None => format!("{name} was running"),
+    }
 }
 
 /// How many numbered lines the program prints that `text` shows: `tick-` and a digit. The line the
@@ -190,43 +240,14 @@ impl Attached {
         keyboard.flush().expect("flushes the console's input");
     }
 
-    /// Waits until `count` finds at least `times` of what it counts in the console's output. It
-    /// fails when the console's output has ended without it, and when the liveness deadline passes.
-    ///
-    /// A command that has ended can still have its last lines on their way to this side of the
-    /// console, and how long that takes is not this test's to know. So its end does not end the
-    /// wait: the console's thread having read to the end of the output does, and until it has, the
-    /// wait goes on to the deadline. The last lines of a command that ends are mostly the reason it
-    /// ends, and a failure reported at the moment of the end would not show them. The output of a
-    /// pseudo-console usually ends only when the pseudo-console closes, which this holds open for as
-    /// long as the command's console is wanted, so a marker that never comes is mostly reported by
-    /// the deadline, which says whether the command had ended.
+    /// Waits until `count` finds at least `times` of what it counts in the console's output, as
+    /// [`ConsoleOutput::waits_until`] says.
     fn shows(&mut self, what: &str, count: impl Fn(&str) -> usize, times: usize) {
-        let started = Instant::now();
-        loop {
-            // Read before the text is, so that a thread that was done has also added the last bytes.
-            let complete = self.output.complete();
-            let text = self.output.text();
-            if count(&text) >= times {
-                return;
-            }
-            assert!(
-                !complete,
-                "{what}: the console showed all it will, and not {times} time(s) of it; the console \
-                 shows: {text:?}"
-            );
-            assert!(
-                started.elapsed() < LIVENESS_DEADLINE,
-                "{what}: waited {:?} for the console to show it {times} time(s) while kr attach {}; \
-                 the console shows: {text:?}",
-                started.elapsed(),
-                match self.child.try_wait().expect("the command's state") {
-                    Some(status) => format!("had ended ({status})"),
-                    None => "was running".to_owned(),
-                },
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let child = &mut self.child;
+        self.output
+            .waits_until(what, count, times, Instant::now(), || {
+                standing_of("kr attach", child)
+            });
     }
 
     /// Whether the command is still running.
@@ -493,38 +514,16 @@ impl Probe {
         keyboard.flush().expect("flushes the console input");
     }
 
-    /// Waits until the console shows `what`. It fails when the console's output has ended without
-    /// it, and when the liveness deadline passes.
-    ///
-    /// A probe that has ended can still have its last lines on their way to this side of the
-    /// console, and how long that takes is not this test's to know. So its end does not end the
-    /// wait: the console's thread having read to the end of the output does, and until it has, the
-    /// wait goes on to the deadline. The output of a pseudo-console usually ends only when the
-    /// pseudo-console closes, which this probe holds open for as long as it lives, so a marker that
-    /// never comes is mostly reported by the deadline, which says whether the probe had ended.
+    /// Waits until the console shows `what`, as [`ConsoleOutput::waits_until`] says.
     fn waits_for(&mut self, what: &str) {
-        loop {
-            // Read before the text is, so that a thread that was done has also added the last bytes.
-            let complete = self.output.complete();
-            if self.output.text().contains(what) {
-                return;
-            }
-            assert!(
-                !complete,
-                "the console showed all it will and not {what:?}: {:?}",
-                self.output.text()
-            );
-            assert!(
-                self.started.elapsed() < LIVENESS_DEADLINE,
-                "waited for the console to show {what:?} while the probe {}: {:?}",
-                match self.child.try_wait().expect("the probe's state") {
-                    Some(status) => format!("had ended ({status})"),
-                    None => "was running".to_owned(),
-                },
-                self.output.text()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let child = &mut self.child;
+        self.output.waits_until(
+            what,
+            |text| text.matches(what).count(),
+            1,
+            self.started,
+            || standing_of("the probe", child),
+        );
     }
 
     /// Everything the console has shown.
@@ -546,6 +545,88 @@ impl Drop for Probe {
     fn drop(&mut self) {
         let _ = self.child.kill();
     }
+}
+
+/// What a console is read through when its last lines are on their way as the command ends: a read
+/// that carries `held` is not handed on until `gate` is set, or until the test has let go of it.
+struct HeldBack {
+    inner: Box<dyn Read + Send>,
+    held: &'static str,
+    gate: Arc<AtomicBool>,
+}
+
+impl Read for HeldBack {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        let carries = String::from_utf8_lossy(&buffer[..read]).contains(self.held);
+        while carries && !self.gate.load(Ordering::SeqCst) && Arc::strong_count(&self.gate) > 1 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(read)
+    }
+}
+
+/// A command that ends is waited for until the console has shown what it wrote. What a command
+/// writes last reaches this side of the console after the command has ended, and a wait that ended
+/// with the command failed a command that had done what was asked.
+///
+/// `cmd.exe` writes a marker, which the console's reader holds back until the command has been seen
+/// to end. The marker is spelled in the command line so that the line does not hold it. The wait
+/// must then find it.
+#[test]
+fn a_command_that_ends_is_waited_for_until_the_console_has_shown_what_it_wrote() {
+    const MARKER: &str = "kr-last-words";
+
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("opens a console");
+    let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+        Arc::new(Mutex::new(pty.master.take_writer().expect("a writer")));
+    let gate = Arc::new(AtomicBool::new(false));
+    let output = ConsoleOutput::collect(
+        Box::new(HeldBack {
+            inner: pty.master.try_clone_reader().expect("a reader"),
+            held: MARKER,
+            gate: Arc::clone(&gate),
+        }),
+        Arc::clone(&writer),
+    );
+    let mut command = CommandBuilder::new(command_shell());
+    command.args(["/c", "echo kr-last^-words"]);
+    let mut child = pty
+        .slave
+        .spawn_command(command)
+        .expect("starts the command");
+    drop(pty.slave);
+
+    let started = Instant::now();
+    while child.try_wait().expect("the command's state").is_none() {
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the command did not end: {:?}",
+            output.text()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !output.text().contains(MARKER),
+        "the command's last words are held back until it has ended: {:?}",
+        output.text()
+    );
+    gate.store(true, Ordering::SeqCst);
+
+    output.waits_until(
+        "what the command wrote",
+        |text| text.matches(MARKER).count(),
+        1,
+        started,
+        || standing_of("the command", &mut child),
+    );
 }
 
 /// KR-REQ-08.53: a console the attachment asks to spell its keys itself spells them, and the reader
