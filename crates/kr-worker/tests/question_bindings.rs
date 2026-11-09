@@ -435,7 +435,8 @@ fn a_switch_an_attesting_bridge_detects_invalidates_the_questions_asked_under_th
 /// the question it answered. Not shown here: the worker's own delivery into an agent thread's
 /// input (the ledger holds no thread to deliver to), which `agent_service.rs`'s
 /// `an_answer_is_not_inserted_into_the_thread_the_agent_selected_after_asking` shows through the
-/// worker's service and a recording transport; the terminal half, which `input_lease.rs`'s
+/// worker's service and a recording transport for an application-scoped question, whose answer
+/// is carried to no thread; the terminal half, which `input_lease.rs`'s
 /// `an_answer_to_a_question_is_never_inserted_into_the_terminal` shows; or the agent's tool call
 /// that waits.
 #[test]
