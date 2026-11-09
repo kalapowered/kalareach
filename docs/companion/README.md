@@ -585,29 +585,28 @@ the preview key, or whose answer to the key was lost, is said to hold this phone
 not to have confirmed its key.
 
 A registration whose outcome nobody knows is kept as that and is not replaced by the phone of its
-own accord. It is one whose answer was lost (the connection ended after it was sent, or the host did
-not answer within a minute), whose answer the host gave as one it could not establish or the phone
-cannot read, or that was sent when the application ended. The row says so, with the earlier result
-in the words ("The host may or may not have taken this phone as a destination: ..."), offers
-"Register again" in place of "Try again", and names the registration it shows when the person presses
-it. Neither a look when the application comes to the front nor the minute that lets a refusal be
-tried again makes another registration: each asks the host about that action over a connection of
-its own, at most once a minute, and the registration is settled when the host says what became of
-it. The host is asked by sending the exact request again, which it answers from its record of the
+own accord. That is a registration whose answer was lost (the connection ended after it was sent,
+or the host did not answer within a minute), one the host answered as an outcome it could not
+establish or in a way the phone cannot read, and one sent when the application ended. The row says
+so, with the earlier result in the words ("The host may or may not have taken this phone as a
+destination: ..."), offers "Register again" in place of "Try again", and names the registration it
+shows when the person presses it. A look when the application comes to the front makes no other
+registration, and neither does the minute that lets a refusal be tried again. Each asks the host
+about that action over a connection of its own, at most once a minute, and the registration is
+settled when the host says what became of it. The host is asked by sending the exact request again, which it answers from its record of the
 action and never acts on twice; that request holds the credential the gateway issued, so the phone
 keeps it in memory only, while the outcome is unknown, and drops it when the host answers, when
 another registration of that host is sent and when the application ends. After a restart the host
 is asked for its receipt (`action.read`) instead. If the host took it, the host is on, the choice of
 previews it carried is the one the host was told, and the preview key is told; if its receipt says it
 refused it or never admitted it, the row says so and the next look registers again, as it does for
-any refusal. Any other answer leaves the registration unknown and the row says what the host
-answered: a refusal in answer to the repeat is not taken for the host's decision about the
-registration, since a host that no longer admits this phone refuses a repeat for that reason too,
-so the person decides. The person's request asks about the earlier registration once more before it
+any refusal. Any other answer leaves the registration unknown, and the row says what the host
+answered. A refusal in answer to the repeat does not settle it, since a host that no longer admits
+this phone refuses a repeat for that reason too, so the person decides. The person's request asks about the earlier registration once more before it
 registers again, and registers again, under a new action, unless the host says it took the earlier
-one; a request that names another registration than the one the host stands at, or none,
-is for a view the host has left, and sends nothing. A refusal of the host, a refusal for now, and a
-registration that was never sent (the phone could not reach the host or could not keep its record
+one. A request that names another registration than the one the host stands at, or none, is for a
+view the host has left, and sends nothing. A refusal by the host, a refusal for now, and a
+registration that was never sent (the phone could not reach the host, or could not keep its record
 first) are not unknown, and are retried as before.
 
 The page asks five commands of the backend: `push_view`, `push_enable` (with, once a registration
