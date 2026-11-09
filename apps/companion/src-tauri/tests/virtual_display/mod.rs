@@ -3,7 +3,8 @@
 //! The window toolkit opens its windows on an X server. A host that runs the tests with no one
 //! logged in, as a build server or a hosted runner does, has none, and no window can be opened on
 //! it. The check then runs as a second copy of its own program under an `Xvfb` this module starts,
-//! and the server is ended when the copy ends, whatever the copy came to. The check runs in a copy
+//! and the server is ended when the copy ends, whatever the copy came to, and when this process
+//! goes (see `start`). The check runs in a copy
 //! because the display is an environment variable, and a process cannot set one for itself
 //! without `unsafe`, which the workspace forbids.
 //!
@@ -61,7 +62,7 @@ pub fn hosted() -> Hosted {
         }
         Err(Start::Failed(why)) => return Hosted::Failed(why),
     };
-    println!("host_events: the window is shown on a virtual display, Xvfb {display}");
+    println!("host_events: the virtual display started, Xvfb {display}");
     let ran = std::env::current_exe().and_then(|program| {
         Command::new(program)
             .args(std::env::args_os().skip(1))
@@ -76,7 +77,14 @@ pub fn hosted() -> Hosted {
     // The server is ended whatever the check came to.
     drop(server);
     match ran {
-        Ok(status) => Hosted::Ended(status.code().unwrap_or(1)),
+        Ok(status) => {
+            use std::os::unix::process::ExitStatusExt as _;
+
+            if let Some(signal) = status.signal() {
+                eprintln!("host_events: the check under Xvfb was ended by signal {signal}");
+            }
+            Hosted::Ended(status.code().unwrap_or(1))
+        }
         Err(error) => Hosted::Failed(format!("the check could not be run under Xvfb: {error}")),
     }
 }
@@ -89,25 +97,90 @@ enum Start {
     Failed(String),
 }
 
+/// How long a server is given to end once it has been asked to, before it is made to.
+///
+/// A server ends in a moment; the bound only says that one which does not will not hold the run.
+const END_BOUND: Duration = Duration::from_secs(30);
+
 /// A running `Xvfb`, ended when this is dropped.
-struct Server(Child);
+///
+/// It is asked to end first, with SIGTERM, so that it removes its socket under `/tmp/.X11-unix` as
+/// it goes: a server that is killed outright leaves the socket behind. Only a server that has not
+/// ended within [`END_BOUND`] is killed.
+struct Server(Option<Child>);
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        let pid = child.id();
+        if !signal("TERM", pid) {
+            // With no `kill` program to ask with, killing it is all that is left.
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(child.wait());
+        });
+        if receiver.recv_timeout(END_BOUND).is_err() {
+            signal("KILL", pid);
+            let _ = receiver.recv_timeout(END_BOUND);
+        }
     }
+}
+
+/// Sends the signal `name` to `pid` with the `kill` program, and says whether it was sent.
+fn signal(name: &str, pid: u32) -> bool {
+    Command::new("kill")
+        .arg(format!("-{name}"))
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Whether `program` is an executable file in a directory of `PATH`.
+fn on_path(program: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|directory| {
+            std::fs::metadata(directory.join(program))
+                .is_ok_and(|file| file.is_file() && file.permissions().mode() & 0o111 != 0)
+        })
+    })
 }
 
 /// Starts an `Xvfb` on a display it picks, and returns it with that display's name.
 ///
 /// The server says the number it took on its standard output once it is serving, so no number is
-/// guessed and no other run's display is taken. It also ends itself when the last program using it
-/// goes, so a run whose test process is killed, and so cannot end it, leaves no server behind once
-/// the copy that was using it has ended: this module connects no client of its own, and the copy
-/// keeps its one connection from its window's start until it ends.
+/// guessed and no other run's display is taken.
+///
+/// The server is not to outlive this process, whatever ends it. Where the host has `setpriv`, the
+/// server is started under it with `--pdeathsig TERM`, so the kernel signals the server when this
+/// process goes, at any moment, the one between the server saying its display and the copy starting
+/// included; the signal is tied to the thread that started it, and this runs on the main thread,
+/// which lasts as long as the process. `-terminate` covers a host without `setpriv`: the server
+/// then ends itself when the last program using it goes, which ends it after a killed process only
+/// on the condition that no X client outlives the copy (the D-Bus autolaunch of a host with
+/// `dbus-x11` and no session bus starts one that stays until the server ends), and not at all
+/// when the process goes before the copy has connected, because no client has then come or gone.
 fn start() -> Result<(Server, String), Start> {
-    let mut child = Command::new("Xvfb")
+    if !on_path("Xvfb") {
+        return Err(Start::NotInstalled);
+    }
+    let mut command = if on_path("setpriv") {
+        let mut command = Command::new("setpriv");
+        command.args(["--pdeathsig", "TERM", "--", "Xvfb"]);
+        command
+    } else {
+        Command::new("Xvfb")
+    };
+    let mut child = command
         .args([
             "-displayfd",
             "1",
@@ -121,16 +194,10 @@ fn start() -> Result<(Server, String), Start> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .spawn()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                Start::NotInstalled
-            } else {
-                Start::Failed(format!("Xvfb could not be started: {error}"))
-            }
-        })?;
+        .map_err(|error| Start::Failed(format!("Xvfb could not be started: {error}")))?;
     let stdout = child.stdout.take().expect("the server's output is piped");
     // From here the server is ended by the guard, whichever way this returns.
-    let server = Server(child);
+    let server = Server(Some(child));
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut line = String::new();
