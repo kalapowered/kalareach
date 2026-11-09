@@ -312,7 +312,7 @@ search_log() { # <extended pattern only the application's own process's lines ma
         return 0
     fi
     if ! grep -q -E "$application" "$harness/log-searched.txt"; then
-        log_problem="the log holds no line of the application, so it does not cover the run ($(wc -l <"$harness/log-searched.txt" | tr -d ' ') lines)"
+        log_problem="the log holds no line of the application's own process, so it does not cover the run ($(wc -l <"$harness/log-searched.txt" | tr -d ' ') lines)"
         return 0
     fi
     if ! grep -q -F "$run_marker" "$harness/log-searched.txt"; then
@@ -525,8 +525,13 @@ run_ios() {
         >"$out" 2>&1 || status=$?
     grep -E "Test Case .* (passed|failed)|error:|XCTAssert|PAIRING" "$out" | sed 's/^/    /' | tee -a "$log"
     xcrun simctl terminate "$udid" "$app_id" >/dev/null 2>&1
-    # From before the run began: its length and a margin of five minutes, never a fixed window.
-    search_log 'KalaReach|to\.kala\.reach' xcrun simctl spawn "$udid" log show --last "$((($(date +%s) - run_started) / 60 + 5))m" --style compact
+    # Every level (the default, info and debug lines), from before the run began: its length and a margin
+    # of five minutes, never a fixed window. A line of the application's own process reads
+    # `KalaReach[<pid>:<thread>]` in this style; the UI test runner, which writes the marker, is
+    # `KalaReachUITests-Runner[...]` and does not match, so the log shows the application at work as well as
+    # the marker.
+    search_log ' KalaReach\[[0-9]+:' xcrun simctl spawn "$udid" log show --info --debug \
+        --last "$((($(date +%s) - run_started) / 60 + 5))m" --style compact
     judge "$out" || status=2
     [ "$status" = 0 ] || return 2
 }
