@@ -254,6 +254,13 @@ pub struct AdmittedBridge {
     pub process: BridgeProcess,
     /// The connection it speaks on.
     pub stream: BridgeStream,
+    /// Where privacy mode stood when the bridge was admitted. What a hook reports over its
+    /// connection is read after that, and is recorded as history only if privacy mode was off
+    /// then and has not changed since ([`ObservationLane::unchanged_since`]). A channel never
+    /// reports an observation, so its mark is not read.
+    ///
+    /// [`ObservationLane::unchanged_since`]: crate::broker::observation::ObservationLane::unchanged_since
+    pub privacy: crate::broker::observation::PrivacyMark,
 }
 
 /// The connection one admitted bridge speaks on.
@@ -819,6 +826,11 @@ impl crate::broker::Broker {
     /// for and suspends rich mutations. A finished tool call that asked a contact question is
     /// recorded with its thread.
     ///
+    /// The observation is recorded as history only if privacy mode was off at `admitted`, where it
+    /// stood when the hook's connection was admitted, and has not been turned on or off since: a
+    /// report made in privacy mode takes its entry number and is not kept, and the thread decision
+    /// above is made all the same.
+    ///
     /// # Errors
     ///
     /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such instance, and
@@ -830,6 +842,7 @@ impl crate::broker::Broker {
         reporter: &BridgeProcess,
         observation: &Observation,
         now: TimestampMs,
+        admitted: crate::broker::observation::PrivacyMark,
     ) -> Result<(ThreadChange, StreamCursor)> {
         let mut state = self.state();
         if instance_of(&mut state, application_instance_id)?
@@ -859,11 +872,14 @@ impl crate::broker::Broker {
                 .remember_request(request.clone(), observation.thread.clone());
         }
         let under = instance.observed_under_report(&observation.thread, reporter.started);
-        let cursor = instance.semantic.append(
+        // The thread decisions above are made whatever privacy mode did; what is kept as history
+        // is only what was reported from outside privacy mode.
+        let cursor = instance.semantic.append_reported(
             observation.event.kind(),
             observation.summary(),
             now,
             under,
+            admitted,
         )?;
         // Said to the description facts while the decision is still held, so an older report can
         // never overwrite what a newer one decided: the facts name the thread the broker vouches
@@ -1592,7 +1608,13 @@ mod tests {
         observation: &Observation,
     ) -> ThreadChange {
         broker
-            .observe_bridge(id, reporter, observation, TimestampMs::new(1))
+            .observe_bridge(
+                id,
+                reporter,
+                observation,
+                TimestampMs::new(1),
+                crate::broker::observation::PrivacyMark::default(),
+            )
             .expect("applied")
             .0
     }
@@ -1643,7 +1665,13 @@ mod tests {
         observation: &Observation,
     ) -> ThreadChange {
         broker
-            .observe_bridge(id, &reporter(id, kernel), observation, TimestampMs::new(1))
+            .observe_bridge(
+                id,
+                &reporter(id, kernel),
+                observation,
+                TimestampMs::new(1),
+                crate::broker::observation::PrivacyMark::default(),
+            )
             .expect("applied")
             .0
     }
@@ -1696,6 +1724,7 @@ mod tests {
                     &reporter(id, 30),
                     &observed(ObservedEvent::Notification, thread),
                     TimestampMs::new(2),
+                    crate::broker::observation::PrivacyMark::default(),
                 )
                 .expect("recorded");
         }
@@ -1730,6 +1759,90 @@ mod tests {
         );
     }
 
+    /// KR-REQ-24.27: what a hook reports is kept as history only if privacy mode was off when its
+    /// connection was admitted and has not changed since, whatever it was when the report was read:
+    /// a report made in privacy mode takes its number and is not kept, the entries kept before it
+    /// stay, and the thread decision it carries is made all the same.
+    #[test]
+    fn a_report_from_a_hook_admitted_in_privacy_mode_is_not_kept_as_history() {
+        let id = instance(1);
+        let broker = broker_with(&[id]);
+        let lane = broker.observation();
+        let reported = |mark, text: &str| {
+            let observation = Observation {
+                text: Some(text.to_owned()),
+                ..observed(ObservedEvent::Notification, "thread-a")
+            };
+            broker
+                .observe_bridge(
+                    id,
+                    &reporter(id, 10),
+                    &observation,
+                    TimestampMs::new(1),
+                    mark,
+                )
+                .expect("applied")
+                .1
+        };
+        let kept = || -> Vec<String> {
+            broker
+                .replay(
+                    id,
+                    None,
+                    &crate::broker::semantic::GrantLowerBound {
+                        from: kr_protocol::ids::StreamCursor::new(1),
+                    },
+                    kr_protocol::semantic::MAX_SEMANTIC_SNAPSHOT_BYTES,
+                )
+                .expect("replays")
+                .entries
+                .into_iter()
+                .map(|entry| entry.text)
+                .collect()
+        };
+
+        // The control: admitted outside privacy mode, and nothing has changed since.
+        let outside = reported(lane.privacy_mark(), "outside");
+        // Admitted in privacy mode, and read after it ended.
+        lane.set_private(true);
+        let in_privacy = lane.privacy_mark();
+        lane.set_private(false);
+        let admitted_private = reported(in_privacy, "made in privacy mode");
+        // Admitted outside privacy mode, and read after privacy mode was on and off again.
+        let before_a_cycle = lane.privacy_mark();
+        lane.set_private(true);
+        lane.set_private(false);
+        let across_a_cycle = reported(before_a_cycle, "across a cycle");
+        // Admitted after the last change.
+        let after = reported(lane.privacy_mark(), "after");
+
+        assert_eq!(kept(), ["outside", "after"]);
+        assert!(
+            outside < admitted_private
+                && admitted_private < across_a_cycle
+                && across_a_cycle < after,
+            "each report takes its number, kept or not"
+        );
+
+        // The thread decision is made whatever privacy mode did.
+        lane.set_private(true);
+        let in_privacy = lane.privacy_mark();
+        lane.set_private(false);
+        let change = broker
+            .observe_bridge(
+                id,
+                &reporter(id, 20),
+                &start("thread-b"),
+                TimestampMs::new(1),
+                in_privacy,
+            )
+            .expect("applied")
+            .0;
+        assert!(matches!(change, ThreadChange::Selected(_)), "{change:?}");
+        assert_eq!(selected(&broker, id).as_deref(), Some("thread-b"));
+        assert_eq!(kept(), ["outside", "after"]);
+    }
+
     /// KR-REQ-12.04: a report from a hook that started before the report that began the current
     /// revision names no turn either, even about the thread selected now: the thread was selected
     /// again since, and the turn running in it began after the report was made.
@@ -1753,6 +1866,7 @@ mod tests {
                     &reporter(id, hook),
                     &observed(ObservedEvent::Notification, "thread-a"),
                     TimestampMs::new(2),
+                    crate::broker::observation::PrivacyMark::default(),
                 )
                 .expect("recorded");
         }

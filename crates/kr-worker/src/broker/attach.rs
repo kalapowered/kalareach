@@ -729,6 +729,9 @@ impl NativeGateway {
             ))
         })?;
         Ok(AuthenticatedBridge {
+            // Marked here, the first moment this host knows of the connection as a bridge's: what
+            // the hook sends over it is read after this, and was made before it.
+            privacy: self.broker.observation().privacy_mark(),
             surface: declared.surface,
             process: crate::broker::bridge::BridgeProcess {
                 identity,
@@ -745,6 +748,13 @@ impl NativeGateway {
     }
 
     /// Reads the one observation an admitted hook sends, applies it, and closes the connection.
+    ///
+    /// What the hook reports is kept as history only if privacy mode was off when its connection
+    /// was admitted and has not changed since, whatever it was when the frame was read: the read
+    /// can wait for the hook for [`BRIDGE_FRAME_DEADLINE`](crate::broker::bridge::BRIDGE_FRAME_DEADLINE),
+    /// and what the hook sends was made before that. A hook that started in privacy mode and
+    /// connected after it ended is not told from one that started after: the platform's record of
+    /// when a hook started is on a clock of its own, which has no reading of now to compare it with.
     ///
     /// The hook sends its observation straight behind its hello, and it waits for this host to
     /// close the connection before it answers its application, so an observation that selects a
@@ -785,6 +795,7 @@ impl NativeGateway {
             &admitted.process,
             &observation,
             kr_ipc::now_ms(),
+            admitted.privacy,
         )?;
         admitted.stream.close().await;
         Ok(crate::broker::bridge::HookReport {
@@ -1132,6 +1143,7 @@ pub struct AuthenticatedBridge {
     surface: crate::broker::bridge::BridgeSurface,
     process: crate::broker::bridge::BridgeProcess,
     stream: crate::broker::bridge::BridgeStream,
+    privacy: crate::broker::observation::PrivacyMark,
 }
 
 impl std::fmt::Debug for AuthenticatedBridge {
@@ -1157,6 +1169,7 @@ impl AuthenticatedBridge {
             surface: self.surface,
             process: self.process,
             stream: self.stream,
+            privacy: self.privacy,
         })
     }
 }

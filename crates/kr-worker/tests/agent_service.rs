@@ -3264,6 +3264,7 @@ impl ServedChannel {
                 Vec::new(),
                 kr_worker::broker::Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
             ),
+            privacy: kr_worker::broker::observation::PrivacyMark::default(),
         };
         let (retire, retired) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(kr_worker::broker::channels::serve(

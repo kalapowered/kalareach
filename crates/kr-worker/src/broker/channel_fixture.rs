@@ -188,6 +188,7 @@ impl Channel {
                 Vec::new(),
                 Framing::new(NativeFraming::JsonLines),
             ),
+            privacy: crate::broker::observation::PrivacyMark::default(),
         };
         let (retire, retired) = tokio::sync::oneshot::channel::<()>();
         let served = tokio::spawn(serve(launch, admitted, async move {

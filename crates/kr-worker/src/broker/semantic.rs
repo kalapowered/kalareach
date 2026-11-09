@@ -36,7 +36,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::broker::observation::ObservationLane;
+use crate::broker::observation::{ObservationLane, PrivacyMark};
 
 use kr_protocol::agent::AgentSnapshotEntry;
 use kr_protocol::ids::{AgentBindingRevision, AgentTurnId, StreamCursor};
@@ -351,6 +351,42 @@ impl SemanticLog {
         discarded
     }
 
+    /// Takes the next entry number, and records nothing.
+    fn spend(&mut self) -> Result<StreamCursor, Exhausted> {
+        let following = self.next.checked_add(1).ok_or(Exhausted)?;
+        let cursor = StreamCursor::new(self.next);
+        self.next = following;
+        Ok(cursor)
+    }
+
+    /// Appends one entry a hook reported over a connection admitted at `admitted`, made under
+    /// `under`, and returns its cursor.
+    ///
+    /// It is read some time after the connection was admitted, and what it holds was made before
+    /// that. It is kept only when privacy mode was off at `admitted` and has not been turned on or
+    /// off since; otherwise it takes its number and is not kept, as under privacy mode in
+    /// [`SemanticLog::append`], and the entries kept before it stay. Nothing is known of when the
+    /// hook's own process started to produce what it reports, so a hook that started in privacy
+    /// mode and connected after it ended is kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Exhausted`] when this log has given its last entry number, and records nothing.
+    pub fn append_reported(
+        &mut self,
+        kind: impl Into<String>,
+        text: impl Into<String>,
+        at: TimestampMs,
+        under: ObservedUnder,
+        admitted: PrivacyMark,
+    ) -> Result<StreamCursor, Exhausted> {
+        // Under privacy mode `append` keeps nothing and clears what is held, as it always does.
+        if self.lane.unchanged_since(admitted) || self.lane.is_private() {
+            return self.append(kind, text, at, under);
+        }
+        self.spend()
+    }
+
     /// Appends one observed entry, made under `under`, and returns its cursor.
     ///
     /// # Errors
@@ -363,9 +399,7 @@ impl SemanticLog {
         at: TimestampMs,
         under: ObservedUnder,
     ) -> Result<StreamCursor, Exhausted> {
-        let following = self.next.checked_add(1).ok_or(Exhausted)?;
-        let cursor = StreamCursor::new(self.next);
-        self.next = following;
+        let cursor = self.spend()?;
         if self.lane.is_private() {
             // Nothing is recorded while privacy mode is on. What a reader asks for from before this
             // is a gap, never an entry.

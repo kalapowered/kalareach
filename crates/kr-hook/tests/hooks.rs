@@ -13,13 +13,15 @@ use std::time::Duration;
 use common::Placed;
 use common::launched::{self, Launch};
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{ActorId, AgentBindingRevision, ConnectionId, SessionEpoch, SessionId};
+use kr_protocol::ids::{
+    ActorId, AgentBindingRevision, ConnectionId, SessionEpoch, SessionId, StreamCursor,
+};
 use kr_protocol::question::{
     Question, QuestionAnswer, QuestionAnswerParams, QuestionCreateParams, QuestionKind,
     QuestionReadParams, QuestionState,
 };
 use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
-use kr_worker::broker::{BridgeSurface, HookReport, ObservedEvent, ThreadChange};
+use kr_worker::broker::{BridgeSurface, GrantLowerBound, HookReport, ObservedEvent, ThreadChange};
 use kr_worker::questions::{Now, Questions, VerifiedSource};
 
 const FIRST_THREAD: &str = "4d1c0a57-1b1e-4c3a-9d2e-6a0f0c5b7e11";
@@ -166,6 +168,71 @@ async fn kr_req_12_18_each_registered_hook_observes_and_answers_neutrally() {
         state.thread_id.as_ref().is_none(),
         "the session ended, so no thread is selected"
     );
+}
+
+/// A notification the application reports to its hook, as Claude Code does when it needs
+/// something of the person.
+fn notified(message: &str) -> Vec<u8> {
+    serde_json::json!({
+        "session_id": FIRST_THREAD,
+        "hook_event_name": "Notification",
+        "message": message,
+        "title": "Permission needed",
+        "notification_type": "permission_prompt",
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// The texts of the observed history the instance keeps, oldest first.
+fn kept(launch: &Launch) -> Vec<String> {
+    launch
+        .broker
+        .replay(
+            launched::instance(),
+            None,
+            &GrantLowerBound {
+                from: StreamCursor::new(1),
+            },
+            kr_protocol::semantic::MAX_SEMANTIC_SNAPSHOT_BYTES,
+        )
+        .expect("the history replays")
+        .entries
+        .into_iter()
+        .map(|entry| entry.text)
+        .collect()
+}
+
+/// KR-REQ-24.27: a hook the application ran in privacy mode is admitted then, and the worker reads
+/// its report after privacy mode has ended. What it reports was made in privacy mode, so it is not
+/// kept as history and takes its entry number all the same; the hook that follows, admitted
+/// outside privacy mode, is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hook_admitted_in_privacy_mode_reports_nothing_that_is_kept() {
+    let placed = Placed::new();
+    let mut launch = start(&placed);
+    let lane = launch.broker.observation();
+
+    lane.set_private(true);
+    let request = launch.hook(&notified("made in privacy mode"));
+    let admitted = launch.accept().await.expect("the hook is admitted");
+    lane.set_private(false);
+    let private = tokio::time::timeout(common::LIVENESS, launch.gateway.observe_hook(admitted))
+        .await
+        .expect("the observation arrives")
+        .expect("and is applied");
+    let outcome = tokio::task::spawn_blocking(move || launched::outcome(&request))
+        .await
+        .expect("the hook ended");
+    assert_eq!(outcome.code, 0, "{}", outcome.stderr);
+    assert!(
+        kept(&launch).is_empty(),
+        "what a hook reported in privacy mode is not kept"
+    );
+
+    let (after, _) = hook(&mut launch, &notified("made after privacy mode")).await;
+    assert!(private.cursor < after.cursor, "the number was spent");
+    assert_eq!(kept(&launch), ["made after privacy mode"]);
 }
 
 fn now(utc_ms: u64) -> Now {

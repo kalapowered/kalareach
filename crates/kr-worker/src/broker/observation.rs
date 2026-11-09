@@ -408,6 +408,20 @@ impl Inner {
     }
 }
 
+/// Where privacy mode stood at one moment: whether it was on, and how many times it had been turned
+/// on or off by then ([`ObservationLane::privacy_mark`]).
+///
+/// A connection a hook made is marked when it is admitted. What the hook reports is read later,
+/// and it is recorded as history only if privacy mode was off at the mark and has not changed
+/// since ([`ObservationLane::unchanged_since`]): a report whose connection was admitted in
+/// privacy mode, or before privacy mode was last turned on or off, is not what privacy mode lets
+/// a worker keep. The default is where a lane that has never changed stands, off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrivacyMark {
+    private: bool,
+    epoch: u64,
+}
+
 /// The queue of what the worker has to offer, the views of what each binding has missed, and the
 /// state the link holds for each binding.
 #[derive(Debug)]
@@ -985,6 +999,27 @@ impl ObservationLane {
     #[must_use]
     pub fn privacy_epoch(&self) -> u64 {
         self.privacy_epoch.load(Ordering::Acquire)
+    }
+
+    /// Reads where privacy mode stands, to be put to [`Self::unchanged_since`] later.
+    ///
+    /// The number is read before the flag, so a change that lands between the two reads is seen
+    /// by [`Self::unchanged_since`] as a change.
+    #[must_use]
+    pub fn privacy_mark(&self) -> PrivacyMark {
+        let epoch = self.privacy_epoch();
+        PrivacyMark {
+            private: self.is_private(),
+            epoch,
+        }
+    }
+
+    /// Returns true when privacy mode was off at `mark` and has been neither turned on nor turned
+    /// off since, so that something taken in at `mark` and recorded now was not made in privacy
+    /// mode.
+    #[must_use]
+    pub fn unchanged_since(&self, mark: PrivacyMark) -> bool {
+        !mark.private && self.privacy_epoch() == mark.epoch && !self.is_private()
     }
 
     /// Holds a binding's state, asked for when privacy mode stood at `epoch`. Nothing is held under

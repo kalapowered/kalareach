@@ -125,6 +125,8 @@ pub async fn serve(
         surface,
         process,
         mut stream,
+        // A channel reports no observation, so privacy mode at its admission is not asked.
+        privacy: _,
     } = admitted;
     if surface != BridgeSurface::Channel {
         stream.close().await;

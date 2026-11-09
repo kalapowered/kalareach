@@ -2700,7 +2700,13 @@ fn selected_by(
     thread: &str,
 ) -> kr_worker::broker::bridge::ThreadChange {
     broker
-        .observe_bridge(id, &hook(kernel), &selects(thread), TimestampMs::new(1))
+        .observe_bridge(
+            id,
+            &hook(kernel),
+            &selects(thread),
+            TimestampMs::new(1),
+            kr_worker::broker::observation::PrivacyMark::default(),
+        )
         .expect("the observation is applied")
         .0
 }
