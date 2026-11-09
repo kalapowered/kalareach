@@ -4288,3 +4288,27 @@ async fn a_refused_claim_leaves_no_registration_once_its_worker_has_ended() {
     .await
     .expect("the registration ended once the worker had");
 }
+
+/// KR-REQ-09.09: a create that launches a managed shell waits for its worker for as long as the
+/// worker takes to give its reason, and the wait of a caller that is not the create outlasts that.
+/// The worker waits for the shell to qualify and then, when it gives up on it, for the shell it
+/// started to end before it reports why; a create whose wait ended first would be answered that the
+/// outcome is not known, where the worker's reason is due.
+#[test]
+fn a_managed_create_waits_for_the_workers_reason_for_as_long_as_the_worker_takes_to_give_it() {
+    use crate::service::create::{CREATE_WAIT, RENDEZVOUS_TIMEOUT, worker_wait};
+
+    let worker = RENDEZVOUS_TIMEOUT
+        + kr_worker::runtime::QUALIFICATION_DEADLINE
+        + kr_worker::runtime::SHELL_END_BOUND;
+    assert!(
+        worker_wait(ShellMode::Managed) >= worker,
+        "the create gives up after {:?}, before its worker's reason can arrive after {worker:?}",
+        worker_wait(ShellMode::Managed)
+    );
+    assert!(
+        CREATE_WAIT > worker_wait(ShellMode::Managed),
+        "a caller of another door gives up no later than the create does"
+    );
+    assert_eq!(worker_wait(ShellMode::NativeCompat), RENDEZVOUS_TIMEOUT);
+}
