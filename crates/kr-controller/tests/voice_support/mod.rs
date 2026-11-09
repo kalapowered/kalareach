@@ -350,15 +350,28 @@ impl StandIn {
     }
 
     /// Brings the service back after [`Self::go_down`] or [`Self::refuse_connections`], on the port
-    /// it had. Fails the case if the port cannot be bound again.
+    /// it had. The port was let go when the service went, and another process can hold it for the
+    /// time of a connection of its own: the bind is tried again for as long as the port is in use.
+    /// Fails the case if the port is still in use when that wait ends, or cannot be bound for
+    /// another reason.
     pub async fn come_up(&self) {
         self.state.lock().expect("the stand-in's state").down = false;
         if self.task.lock().expect("the stand-in's task").is_some() {
             return;
         }
-        let listener = TcpListener::bind(self.address)
-            .await
-            .unwrap_or_else(|error| panic!("the stand-in's port was not free again: {error}"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let listener = loop {
+            match TcpListener::bind(self.address).await {
+                Ok(listener) => break listener,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AddrInUse
+                        && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(error) => panic!("the stand-in's port was not free again: {error}"),
+            }
+        };
         let task = accepting(listener, Arc::clone(&self.route), Arc::clone(&self.state));
         *self.task.lock().expect("the stand-in's task") = Some(task);
     }
