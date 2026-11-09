@@ -353,10 +353,10 @@ impl Run {
         write_private(&self.directory.join(file), text.as_bytes());
     }
 
-    /// Whether a wait that began so as to end by `end` goes on. A wait for what the phone or the
-    /// script does stops at its limit and when the script has said the run is finished, so that a
-    /// failed run ends this suite at once, with its daemons stopped and their trees removed, and not
-    /// when the limit passes.
+    /// Whether a wait that began so as to end by `end` goes on. Every wait of a phase that has a limit
+    /// stops at it and when the script has said the run is finished, so that a failed run ends this
+    /// suite at once, with its daemons stopped and their trees removed, and not when the limit
+    /// passes.
     fn waiting(&self, end: Instant) -> bool {
         Instant::now() < end && !self.directory.join("finish").exists()
     }
@@ -563,7 +563,7 @@ impl Run {
     /// The owner of the second host chooses a bounded offline validity for personal remote access,
     /// with no synchronisation of its authority feed to measure from, so the bound has lapsed as it is
     /// chosen and no clock is waited on. From then on the host refuses every read of a device that
-    /// reaches it, the phone's inbox read among them.
+    /// reaches it.
     ///
     /// The choice is made once the host is serving a connection of the phone: its visit of the inbox
     /// opened one, which may not have read yet. That count is all the host keeps of the phone: it
@@ -585,16 +585,7 @@ impl Run {
                 .expect("the record")
                 .expect("the second host approved the phone"),
         );
-        let end = Instant::now() + STEP;
-        let mut serving = host.connections_of(&phone);
-        while serving == 0 {
-            assert!(
-                self.waiting(end),
-                "the second host served no connection of the phone before the wait ended or the run finished"
-            );
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            serving = host.connections_of(&phone);
-        }
+        // The control is paired and read before the choice, whatever the phone does meanwhile.
         let guest = Device::create().await;
         let proposal = guest_grant(
             kr_ipc::now_ms().get(),
@@ -606,6 +597,17 @@ impl Run {
         let served = connect(host, &guest, &record).await;
         let before = inbox_answer(&served).await;
         served.close();
+        let end = Instant::now() + STEP;
+        let mut serving = host.connections_of(&phone);
+        while serving == 0 {
+            assert!(
+                self.waiting(end),
+                "the second host served no connection of the phone before the wait ended or the run finished"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            serving = host.connections_of(&phone);
+        }
+        // The count is the one the choice is made on: nothing stands between reading it and choosing.
         host.controller()
             .update_policy(|policy| {
                 policy.set_offline_validity(Some(OfflineValidityPolicy {
@@ -795,7 +797,7 @@ impl Run {
         let mut client = self.host().await.client().await;
         let end = Instant::now() + STEP;
         let mut rules = Vec::new();
-        while Instant::now() < end {
+        while self.waiting(end) {
             let read: AttentionReadResult = client
                 .request(
                     Method::AttentionRead,
@@ -878,7 +880,7 @@ impl Run {
             if read.is_ok() {
                 break;
             }
-            assert!(Instant::now() < end, "the daemon never reached the worker");
+            assert!(self.waiting(end), "the daemon never reached the worker");
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         *self.host.write().await = Some(host);
