@@ -5237,6 +5237,41 @@ async fn a_look_that_reads_that_the_host_did_not_take_it_settles_it_as_a_refusal
     assert_eq!(actions_sent(&phone).len(), 2, "registered again");
 }
 
+/// KR-REQ-23.24: the row offers "Register again" with the earlier result in its words for as long as
+/// the registration is kept as one nobody knows the outcome of, whatever stopped a later look: a
+/// look that could not reach the host to ask says so beside the earlier result, and does not
+/// replace it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_look_that_could_not_ask_the_host_leaves_the_earlier_unknown_result_in_the_words() {
+    let (_host, phone, _reference, action) =
+        a_phone_whose_registration_has_no_known_outcome().await;
+    phone.registered.lock().expect("the script").connect_fails =
+        Some("the relay did not answer".to_owned());
+
+    phone.let_time_pass();
+    look(&phone.desk).await;
+    phone
+        .until(|states| states == [PushState::NeedsAttention])
+        .await;
+
+    let shown = phone.view().hosts.remove(0);
+    assert!(
+        shown.words.contains("may or may not have taken"),
+        "the earlier result is still shown: {:?}",
+        shown.words
+    );
+    assert!(
+        shown.words.contains("the relay did not answer"),
+        "what stopped the look is shown with it: {:?}",
+        shown.words
+    );
+    assert_eq!(
+        shown.unknown.map(|each| each.action_id),
+        Some(action),
+        "and the row offers to register again"
+    );
+}
+
 /// The host's refusal is no unknown outcome: it is the words, and the next look registers again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_registration_the_host_refused_is_retried_by_the_next_look_as_before() {
