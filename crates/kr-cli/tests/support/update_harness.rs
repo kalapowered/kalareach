@@ -1049,7 +1049,8 @@ impl std::fmt::Display for Unequal {
 /// A copy that does not read as `digest` is compared with the packed archive as it reads now, so
 /// that the failure says which of the two is not what was packed, and where the copy first differs.
 fn held_to(packed: &Path, digest: [u8; 32], copy: &Path) -> Result<(), Unequal> {
-    if file_digest(copy) == digest {
+    let copied_digest = file_digest(copy);
+    if copied_digest == digest {
         return Ok(());
     }
     let now = file_digest(packed);
@@ -1066,7 +1067,7 @@ fn held_to(packed: &Path, digest: [u8; 32], copy: &Path) -> Result<(), Unequal> 
     Err(Unequal::Copy {
         first_difference: first_difference as u64,
         length: copied.len() as u64,
-        digest: file_digest(copy),
+        digest: copied_digest,
     })
 }
 
@@ -1157,9 +1158,9 @@ fn pack(tree: &Path, top: &str, archive: &Path) {
         .expect("the archive is written");
 }
 
-/// Packs `tree` as an archive whose entries are under `top`, gzipped quickly. The archive is on the
-/// disk when this returns: the write ends with the file synced, and what is read back, taken a digest
-/// of and copied after it is the file as the disk holds it.
+/// Packs `tree` as an archive whose entries are under `top`, gzipped quickly. The file is synced to
+/// the disk before this returns, so that it is not still being written when it is read back,
+/// digested and copied.
 #[cfg(unix)]
 fn pack(tree: &Path, top: &str, archive: &Path) {
     let file = std::fs::File::create(archive).expect("an archive");
