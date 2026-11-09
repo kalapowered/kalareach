@@ -102,7 +102,10 @@ impl Drop for Server {
 /// Starts an `Xvfb` on a display it picks, and returns it with that display's name.
 ///
 /// The server says the number it took on its standard output once it is serving, so no number is
-/// guessed and no other run's display is taken.
+/// guessed and no other run's display is taken. It also ends itself when the last program using it
+/// goes, so a run whose test process is killed, and so cannot end it, leaves no server behind once
+/// the copy that was using it has ended: this module connects no client of its own, and the copy
+/// keeps its one connection from its window's start until it ends.
 fn start() -> Result<(Server, String), Start> {
     let mut child = Command::new("Xvfb")
         .args([
@@ -113,6 +116,7 @@ fn start() -> Result<(Server, String), Start> {
             "1280x720x24",
             "-nolisten",
             "tcp",
+            "-terminate",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
