@@ -591,13 +591,16 @@ establish or in a way the phone cannot read, and one sent when the application e
 so, with the earlier result in the words ("The host may or may not have taken this phone as a
 destination: ..."), offers "Register again" in place of "Try again", and names the registration it
 shows when the person presses it. A look when the application comes to the front makes no other
-registration, and neither does the minute that lets a refusal be tried again. Each asks the host
-about that action over a connection of its own, at most once a minute, and the registration is
-settled when the host says what became of it. The host is asked by sending the exact request again, which it answers from its record of the
+registration, and neither does the minute that lets a refusal be tried again. While the
+application runs, each asks the host about that action over a connection of its own, at most once a
+minute, and the registration is settled when the host says what became of it. The host is asked by sending the exact request again, which it answers from its record of the
 action and never acts on twice; that request holds the credential the gateway issued, so the phone
 keeps it in memory only, while the outcome is unknown, and drops it when the host answers, when
-another registration of that host is sent and when the application ends. After a restart the host
-is asked for its receipt (`action.read`) instead. If the host took it, the host is on, the choice of
+another registration of that host is sent and when the application ends. After a restart none is
+held, and a host answers `action.read` for a registration it took without a session by asking for
+the same request again, so a look asks nothing: the row says that the application ended and that only
+the person can decide, and the person's request asks for the receipt (`action.read`) once before it
+registers again. If the host took it, the host is on, the choice of
 previews it carried is the one the host was told, and the preview key is told; if its receipt says it
 refused it or never admitted it, the row says so and the next look registers again, as it does for
 any refusal. Any other answer leaves the registration unknown, and the row says what the host
@@ -663,7 +666,8 @@ the person, in words that say the phone will check again the next time the appli
 and starts no run; the next look that reads a token shows the host on again, or registers it when
 the token is another. A run the system ended with the application is retried by the first look when
 it was last heard of a minute or more before the start, and waits out the rest of the minute
-otherwise. A tap on a notification opens the application, and
+otherwise; one that had sent its registration, or was about to, is not retried: it is a
+registration whose outcome is not known, and the first look asks nothing about it. A tap on a notification opens the application, and
 `notification_route` hands the page the screen once; the page goes to the attention screen, where
 what needs the person is.
 

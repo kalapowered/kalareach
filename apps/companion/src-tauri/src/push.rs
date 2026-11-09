@@ -65,8 +65,9 @@
 //! asked once more before the new one is sent. The host is asked by sending the exact request again
 //! on a connection of its own, which it answers from its record of the action and never acts on
 //! twice. That request holds the credential the gateway issued, so it is kept in memory only, for
-//! as long as the outcome is unknown; after a restart the host is asked for its receipt
-//! (`action.read`) instead. A change of the token is found by
+//! as long as the outcome is unknown. After a restart none is left: a look asks nothing, the words
+//! say that only the person can decide, and the person's request asks the host for its receipt
+//! (`action.read`) before it registers again. A change of the token is found by
 //! comparing, not by being told: a run
 //! writes a host on only when it has read the token again and found the one it proposed, and each
 //! look compares the digest the record keeps with the token the provider holds and registers a host
@@ -296,8 +297,14 @@ const BESIDE_THE_HOST_IN_USE: &str = "This host is reached through the same rela
 /// settles it: what a restart leaves, and what the person is told then.
 const SENT_WORDS: &str = "This phone registered with the host and was interrupted before it heard \
                           whether the host took the registration. Notifications from the host may \
-                          not arrive until a registration is known to be taken. This phone asks \
-                          the host what became of it, and registers again only when you ask it to.";
+                          not arrive until a registration is known to be taken. This phone \
+                          registers again only when you ask it to.";
+
+/// What follows the words of a registration whose outcome is not known once the application has
+/// ended: the request this phone would send again to ask the host is gone with it, so nothing here
+/// can tell what became of the registration.
+const AFTER_A_RESTART: &str = "The application ended since, so this phone cannot tell what became \
+                               of it. Only you can decide whether to register again.";
 
 /// What the person is told when the record could not be written before a registration was sent.
 const NOT_KEPT_BEFORE_SENDING: &str = "This phone could not keep a record of the registration it \
@@ -317,8 +324,8 @@ fn unknown_words(why: &str, full: bool) -> String {
         " It may not be able to notify this phone until a registration is known to be taken."
     };
     format!(
-        "The host may or may not have {what}: {why}.{may_not_notify} This phone asks the host what \
-         became of it, and registers again only when you ask it to."
+        "The host may or may not have {what}: {why}.{may_not_notify} This phone registers again only \
+         when you ask it to."
     )
 }
 
@@ -537,6 +544,12 @@ pub trait Registrar: Send + Sync {
     fn beside_the_host_in_use<'a>(&'a self, _host: &'a PairedHost) -> AskFuture<'a> {
         Box::pin(async { false })
     }
+
+    /// Whether this phone can ask `host` what became of the registration sent under `action`
+    /// without the person: it holds the request it sent, which the host answers from its record of
+    /// the action. A phone that does not, as after the application ended, would only make a visit
+    /// the host cannot answer, so a look makes none and leaves the decision to the person.
+    fn can_ask(&self, host: DeviceId, action: ActionId) -> bool;
 }
 
 /// A boxed future for a change made over the line.
@@ -1253,9 +1266,15 @@ impl PushDesk {
                     }
                     Phase::Working => (None, None),
                     // A registration whose outcome is not known is read, never replaced: a new one
-                    // is made only when the person asks for it.
+                    // is made only when the person asks for it. A look asks the host only when
+                    // this phone can: with nothing to send again, the host could not answer.
                     Phase::Attention if kept.unsettled.is_some() => (
-                        (!kept.lost && after_a_minute).then_some(Job::Settle),
+                        (!kept.lost
+                            && after_a_minute
+                            && kept.unsettled.as_ref().is_some_and(|unsettled| {
+                                self.registrar.can_ask(id, unsettled.action_id)
+                            }))
+                        .then_some(Job::Settle),
                         Some("Asking the host what became of the registration."),
                     ),
                     Phase::Attention => ((!kept.lost && after_a_minute).then_some(Job::Full), None),
@@ -2596,15 +2615,15 @@ fn after_a_restart(mut record: Record, now_ms: u64) -> Record {
     for kept in record.hosts.values_mut() {
         if kept.phase == Phase::Working {
             kept.phase = Phase::Attention;
-            // A registration that was sent, or about to be, and not settled stays unsettled: what
-            // the person is told is that, and not that the run can be tried again.
-            match &kept.unsettled {
-                Some(unsettled) => kept.words.clone_from(&unsettled.words),
-                None => "Turning on notifications was interrupted. Try again."
-                    .clone_into(&mut kept.words),
-            }
+            "Turning on notifications was interrupted. Try again.".clone_into(&mut kept.words);
             kept.settings = false;
             kept.updated_ms = kept.updated_ms.min(now_ms);
+        }
+        // A registration that was sent, or about to be, and not settled stays unsettled: what the
+        // person is told is that and that only they can decide, and not that the run can be tried
+        // again or that this phone can find out.
+        if let Some(unsettled) = &kept.unsettled {
+            kept.words = format!("{} {AFTER_A_RESTART}", unsettled.words);
         }
     }
     record
@@ -2752,8 +2771,9 @@ async fn within_the_answer<T>(
 /// to: the exact request a repeat sends, which the host answers from its record of the action. A
 /// request holds the credential the gateway issued, so it is kept in memory only: it is dropped when
 /// the host answers, when a later registration of the same host is composed in its place, and when
-/// the application ends, and it is never written. After a restart the result is read with
-/// `action.read` instead, for a host that keeps a receipt for it.
+/// the application ends, and it is never written. After a restart none is held, and a look asks
+/// nothing; the person's request reads the result with `action.read`, for a host that keeps a
+/// receipt for it.
 type Repeats = Arc<Mutex<BTreeMap<DeviceId, (ActionId, ComposedMutation)>>>;
 
 /// The product's way to the host: a connection opened for the host, as the device the host made.
@@ -2783,6 +2803,12 @@ impl Registrar for ConnectionRegistrar {
                 .would_refuse_visit(&host.network_config, &in_use)
                 .await
         })
+    }
+
+    fn can_ask(&self, host: DeviceId, action: ActionId) -> bool {
+        lock(&self.repeats)
+            .get(&host)
+            .is_some_and(|(held, _)| *held == action)
     }
 
     fn connect<'a>(
@@ -3025,7 +3051,8 @@ impl HostLine for ConnectionLine {
                 // The exact request again, on this connection, which is not the one that sent it: the
                 // host answers it from its record of the action, and never acts on it twice.
                 Some(composed) => self.repeated(action, &composed).await,
-                // Nothing in memory to repeat, as after a restart: the host is asked for its receipt.
+                // Nothing in memory to repeat, as after a restart, and the person asked: the host is
+                // asked for its receipt.
                 None => self.receipt(action).await,
             };
             if matches!(
