@@ -483,6 +483,42 @@ async fn the_cap_covers_both_halves_together() {
     world.stop().await;
 }
 
+/// KR-REQ-15.20: the approvals a worker holds are read in full when there are more of them than one
+/// page holds, whatever else reads the session's context at the same time. The worker keeps one
+/// snapshot of its pending resources for each link and replaces it when a first page is asked for
+/// again, so a read that took the link for each page would find another reader's first page
+/// between its own and be refused the rest, and would carry none of the worker's half. Every read
+/// here carries the same decisions and none reports the worker unreadable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reads_at_the_same_time_each_carry_every_page_of_the_workers_approvals() {
+    let world = World::start().await;
+    let agent = world.agent();
+    world.worker().offer_approvals_at(
+        agent,
+        Arc::new(Upstream::default()),
+        None,
+        TimestampMs::new(world.started_ms + 100),
+        300,
+    );
+
+    let reads = futures_util::future::join_all((0..8).map(|_| world.context())).await;
+    let first = &reads[0].selection.pending_decisions;
+    assert!(first.len() > 20, "{:?}", reads[0]);
+    for read in &reads {
+        assert_eq!(&read.selection.pending_decisions, first, "{read:?}");
+        assert!(
+            read.withheld
+                .iter()
+                .all(|run| !run.reason.contains("could not be read")),
+            "the worker is healthy: {read:?}"
+        );
+    }
+    // Every approval the worker held was read: those the selection kept and those the cap dropped.
+    let dropped = withheld(&reads[0], OVER_CAP).unwrap_or(0);
+    assert_eq!(first.len() as u64 + dropped, 300, "{:?}", reads[0]);
+    world.stop().await;
+}
+
 /// KR-REQ-15.20: a secret in either half is replaced and counted, whichever half it came from: a
 /// recognised credential in what an agent said, in a question's context and in a name a person
 /// pinned. The built-in patterns do it; the note beside every selection says that stripping is a

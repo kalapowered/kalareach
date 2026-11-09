@@ -13,6 +13,7 @@ use crate::error::{ControllerError, Result};
 use crate::given::Given;
 
 use super::authority_changes::decoded;
+use super::workers::WorkerLink;
 use super::{Controller, parse};
 
 /// How long the voice service waits on a session's worker for one request.
@@ -272,6 +273,12 @@ impl Controller {
 
     /// The live agent instances of a session and the approvals waiting on a person, paged to the
     /// end. Errs, with nothing said of why, when the worker cannot give them.
+    ///
+    /// The worker keeps one snapshot of its pending resources for each link and replaces it when
+    /// the first page is asked for again, so the pages are read over one link taken for the whole
+    /// read: a read that took the link for each page could find another reader's first page
+    /// between its own and be refused the rest. A snapshot that ended before its last page was
+    /// read is read again from its first, within `deadline`.
     async fn voice_agent_instances(
         &self,
         worker: &crate::directory::KnownWorker,
@@ -284,47 +291,75 @@ impl Controller {
         ),
         (),
     > {
+        use kr_protocol::error::ErrorCode;
         use kr_protocol::recovery::{AgentInstancesParams, AgentInstancesResult};
 
-        let mut agents = Vec::new();
-        let mut resources = Vec::new();
-        let mut from = kr_protocol::scalars::Nullable::null();
-        for part in 0..crate::voice::MAX_HISTORY_PARTS {
-            let page: AgentInstancesResult = self
-                .ask_worker(
-                    worker,
+        let mut link = self.take_worker_link(worker, deadline).await.ok_or(())?;
+        // A request that did not finish is not given back, and the link is closed with the link
+        // that holds it; one that finished, a refusal included, is.
+        'snapshot: loop {
+            let mut agents = Vec::new();
+            let mut resources = Vec::new();
+            let mut from = kr_protocol::scalars::Nullable::null();
+            for part in 0..crate::voice::MAX_HISTORY_PARTS {
+                if tokio::time::Instant::now() >= deadline {
+                    link.give_back();
+                    return Err(());
+                }
+                let level = link.client().level();
+                let params = AgentInstancesParams {
+                    session_id,
+                    agent_resources_from: from,
+                };
+                let answered = tokio::time::timeout_at(
                     deadline,
-                    Method::AgentInstances,
-                    &AgentInstancesParams {
-                        session_id,
-                        agent_resources_from: from,
-                    },
+                    link.client().request(Method::AgentInstances, &params),
                 )
                 .await
-                .ok_or(())?;
-            if part == 0 {
-                agents = page
-                    .agent_instances
-                    .instances
-                    .iter()
-                    .filter(|instance| instance.ended_at.as_ref().is_none())
-                    .map(|instance| instance.application_instance_id)
-                    .collect();
-            }
-            resources.extend(page.agent_resources.resources);
-            match page.agent_resources.continue_after.0 {
-                Some(after_resource_id) => {
-                    from = kr_protocol::scalars::Nullable::some(
-                        kr_protocol::projection::AgentResourceSnapshotContinuation {
-                            snapshot_id: page.agent_resources.snapshot_id,
-                            after_resource_id,
-                        },
-                    );
+                .map_err(|_| ())?
+                .map_err(|_| ())?;
+                let page: AgentInstancesResult = match answered {
+                    Ok(value) => {
+                        let Ok(page) = level.decode_value::<AgentInstancesResult>(&value) else {
+                            link.give_back();
+                            return Err(());
+                        };
+                        page
+                    }
+                    Err(error) if error.code == ErrorCode::ResyncRequired => continue 'snapshot,
+                    Err(_) => {
+                        link.give_back();
+                        return Err(());
+                    }
+                };
+                if part == 0 {
+                    agents = page
+                        .agent_instances
+                        .instances
+                        .iter()
+                        .filter(|instance| instance.ended_at.as_ref().is_none())
+                        .map(|instance| instance.application_instance_id)
+                        .collect();
                 }
-                None => return Ok((agents, resources)),
+                resources.extend(page.agent_resources.resources);
+                match page.agent_resources.continue_after.0 {
+                    Some(after_resource_id) => {
+                        from = kr_protocol::scalars::Nullable::some(
+                            kr_protocol::projection::AgentResourceSnapshotContinuation {
+                                snapshot_id: page.agent_resources.snapshot_id,
+                                after_resource_id,
+                            },
+                        );
+                    }
+                    None => {
+                        link.give_back();
+                        return Ok((agents, resources));
+                    }
+                }
             }
+            link.give_back();
+            return Err(());
         }
-        Err(())
     }
 
     /// One agent's retained semantic history, paged to the end: a history has no tail read, and
@@ -367,6 +402,28 @@ impl Controller {
         None
     }
 
+    /// Takes this daemon's link to a session's worker, waiting for it no longer than `deadline`.
+    /// `None` when the time has run out, before or while waiting, or the link cannot be had. A
+    /// link that came as the time ran out has sent nothing, so it goes back whole.
+    async fn take_worker_link(
+        &self,
+        worker: &crate::directory::KnownWorker,
+        deadline: tokio::time::Instant,
+    ) -> Option<WorkerLink> {
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        let mut link = tokio::time::timeout_at(deadline, self.worker_client(worker))
+            .await
+            .ok()?
+            .ok()?;
+        if tokio::time::Instant::now() >= deadline {
+            link.give_back();
+            return None;
+        }
+        Some(link)
+    }
+
     /// Asks a session's worker one read over this daemon's own link, and gives the link back once
     /// the answer, a refusal included, is read to its end. `None` when the link cannot be had or
     /// the worker does not answer by `deadline` or refuses: a link that did not finish an exchange
@@ -382,18 +439,7 @@ impl Controller {
         P: serde::Serialize + ?Sized,
         R: kr_protocol::wire::WireMessage,
     {
-        if tokio::time::Instant::now() >= deadline {
-            return None;
-        }
-        let mut link = tokio::time::timeout_at(deadline, self.worker_client(worker))
-            .await
-            .ok()?
-            .ok()?;
-        // A link that came as the time ran out has sent nothing, so it goes back whole.
-        if tokio::time::Instant::now() >= deadline {
-            link.give_back();
-            return None;
-        }
+        let mut link = self.take_worker_link(worker, deadline).await?;
         let level = link.client().level();
         let answered = tokio::time::timeout_at(deadline, link.client().request(method, params))
             .await

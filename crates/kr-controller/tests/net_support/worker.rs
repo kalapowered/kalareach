@@ -687,6 +687,19 @@ impl Worker {
         deadline: Option<TimestampMs>,
         recorded_at: TimestampMs,
     ) -> kr_protocol::ids::PendingResourceId {
+        self.offer_approvals_at(instance, upstream, deadline, recorded_at, 1)[0]
+    }
+
+    /// As [`Self::offer_approval_at`], for `count` requests the agent makes one after the other
+    /// over the one connection, each a pending resource of its own.
+    pub fn offer_approvals_at(
+        &self,
+        instance: ApplicationInstanceId,
+        upstream: Arc<dyn UpstreamDispatch>,
+        deadline: Option<TimestampMs>,
+        recorded_at: TimestampMs,
+        count: u64,
+    ) -> Vec<kr_protocol::ids::PendingResourceId> {
         use kr_protocol::gateway::{
             DeclarativeEntry, DeclarativeTable, NativeFraming, NativeMethodClass, RichMethodEntry,
             RichMethodTable, RichOperation,
@@ -790,32 +803,36 @@ impl Worker {
             )
             .expect("the native connection is authenticated");
         broker.bind_connection_dispatch(GatewayConnectionId::new(1), upstream);
-        let opaque = broker
-            .forward_native(
-                GatewayConnectionId::new(1),
-                br#"{"id":11,"method":"session/request_permission"}"#,
-                recorded_at,
-            )
-            .expect("forwarded")
-            .1
-            .expect("it expects a response");
-        broker
-            .interpret(
-                BrokerBindingId::new(Uuid::from_bytes([9; 16])),
-                opaque.resource_id,
-                kr_protocol::broker::DecodedProjection {
-                    schema_version: "kr-approval/1".to_owned(),
-                    summary: "the agent wants to write a file".to_owned(),
-                    decisions: vec![kr_protocol::broker::OfferedDecision {
-                        option_id: "allow".to_owned(),
-                        label: "Allow".to_owned(),
-                    }],
-                },
-                deadline,
-                TimestampMs::new(recorded_at.get() + 1),
-            )
-            .expect("interpreted")
-            .resource_id
+        (0..count)
+            .map(|number| {
+                let request = format!(
+                    r#"{{"id":{},"method":"session/request_permission"}}"#,
+                    11 + number
+                );
+                let opaque = broker
+                    .forward_native(GatewayConnectionId::new(1), request.as_bytes(), recorded_at)
+                    .expect("forwarded")
+                    .1
+                    .expect("it expects a response");
+                broker
+                    .interpret(
+                        BrokerBindingId::new(Uuid::from_bytes([9; 16])),
+                        opaque.resource_id,
+                        kr_protocol::broker::DecodedProjection {
+                            schema_version: "kr-approval/1".to_owned(),
+                            summary: "the agent wants to write a file".to_owned(),
+                            decisions: vec![kr_protocol::broker::OfferedDecision {
+                                option_id: "allow".to_owned(),
+                                label: "Allow".to_owned(),
+                            }],
+                        },
+                        deadline,
+                        TimestampMs::new(recorded_at.get() + 1),
+                    )
+                    .expect("interpreted")
+                    .resource_id
+            })
+            .collect()
     }
 
     /// The binding revision a registered agent is at.
