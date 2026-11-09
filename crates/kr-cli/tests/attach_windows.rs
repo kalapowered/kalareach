@@ -1175,6 +1175,13 @@ const RESTORE_PROBE: &str = "KR_ATTACH_RESTORE_PROBE";
 /// modes a third time once `kr attach` has gone. The modes while the command was attached are not
 /// the modes before it (a command that changed nothing would pass the last check without
 /// restoring anything), and the modes after it are the ones before.
+///
+/// KR-REQ-08.55, the part about the outer console after detach: the person's outer console is not
+/// left in the wrong mode when an attachment ends. Its input and output modes after `kr attach`
+/// has gone are the ones it had before, although the command changed them while it ran. Not shown
+/// here: an inner `wsl.exe`, `ssh` or nested ConPTY transition's mode reset stopping at KR's
+/// boundary, which kr-term's recordings and mode cases show. The session here runs the command
+/// shell and nothing nested in it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_console_an_attachment_ran_in_is_given_back_in_the_modes_it_had() {
     if std::env::var_os(RESTORE_PROBE).is_some() {
