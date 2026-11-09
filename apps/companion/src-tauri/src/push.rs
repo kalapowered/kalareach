@@ -451,8 +451,10 @@ pub enum LineStop {
     /// This phone stopped itself before it asked the host, or after it was answered: the words are
     /// its own, and the host refused nothing.
     Phone(String),
-    /// The host refused the change for good or for now, or the change could not be sent: nothing
-    /// took effect, and the words say why.
+    /// The host refused the change for good or for now, or the change could not be sent: for a
+    /// registration, nothing took effect, and the words say why. A preview key whose answer was
+    /// lost or never came is this too, since the next run tells the host the key again and its
+    /// outcome is not kept.
     Host(String),
     /// The change was sent and the host may have made it: the answer was lost, the host said it
     /// could not establish the outcome, or what it answered is not one this phone reads. The words
@@ -1547,7 +1549,9 @@ impl PushDesk {
     }
 
     /// What a run does when its sequence stopped: the host needs the person, for the reason it
-    /// gives. A run that no longer holds its host writes nothing.
+    /// gives. A host that still holds a registration of unknown outcome keeps its words in front of
+    /// the reason, since the row offers to register again and the person is to see what that is
+    /// after. A run that no longer holds its host writes nothing.
     fn stopped(&self, host: DeviceId, run: u64, stop: &Stop) {
         let now = (self.wiring.clock)();
         {
@@ -1563,7 +1567,13 @@ impl PushDesk {
                 return;
             };
             kept.phase = Phase::Attention;
-            kept.words.clone_from(&stop.words);
+            kept.words = match &kept.unsettled {
+                // The words of an unknown outcome are the stop's own when it is that stop.
+                Some(unsettled) if unsettled.words != stop.words => {
+                    format!("{} {}", unsettled.words, stop.words)
+                }
+                _ => stop.words.clone(),
+            };
             kept.settings = stop.settings;
             kept.updated_ms = now;
             self.keep(&state.record);
@@ -1692,11 +1702,10 @@ impl PushDesk {
                                 .into(),
                         )
                     }
-                    Settling::Undecided(why) => Err(format!(
-                        "{} Asked again, the host did not settle it: {why}",
-                        earlier.words
-                    )
-                    .into()),
+                    // The earlier result is shown with it, as with any stop while it is kept.
+                    Settling::Undecided(why) => {
+                        Err(format!("Asked again, the host did not settle it: {why}").into())
+                    }
                 }
             }
         }
@@ -2181,7 +2190,6 @@ impl PushDesk {
             .map(|kept| kept.previews)
     }
 
-    /// Records that the host was told `previews`, while `run` holds it.
     /// The host took a registration that carried the choice `previews`: it was told that, and no
     /// registration of this host is unsettled any more.
     fn told(&self, host: DeviceId, run: u64, previews: bool) {

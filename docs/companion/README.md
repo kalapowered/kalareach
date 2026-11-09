@@ -590,7 +590,9 @@ or the host did not answer within a minute), one the host answered as an outcome
 establish or in a way the phone cannot read, and one sent when the application ended. The row says
 so, with the earlier result in the words ("The host may or may not have taken this phone as a
 destination: ..."), offers "Register again" in place of "Try again", and names the registration it
-shows when the person presses it. A look when the application comes to the front makes no other
+shows when the person presses it. While the registration is kept, a later stop of a look (the host
+could not be reached to ask, or the host in use is in the way) is shown beside those words, not in
+place of them. A look when the application comes to the front makes no other
 registration, and neither does the minute that lets a refusal be tried again. While the
 application runs, each asks the host about that action over a connection of its own, at most once a
 minute, and the registration is settled when the host says what became of it. The host is asked by sending the exact request again, which it answers from its record of the
