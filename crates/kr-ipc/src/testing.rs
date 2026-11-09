@@ -230,11 +230,12 @@ impl Drop for PrivateTempDir {
     /// removal of the folder it is in, and the holder is usually something that is ending and lets
     /// go in a moment: a task that was aborted and has not been cancelled yet, a thread that is
     /// joining. So the removal is tried again for as long as it is refused, and for no longer than
-    /// [`REMOVAL_PATIENCE`], and what is still there at the end is said on the error output, outside
+    /// [`REMOVAL_PATIENCE`], and what is not removed at the end is said on the error output, outside
     /// what a test's capture keeps. It does not fail the case: this directory is made by the suites
     /// of every platform, and a case that has a holder to wait for, as a host that waits for its
-    /// daemon's lock does, fails on a tree that is left. Elsewhere a refusal is a permission, which
-    /// time does not change, so the removal is tried once.
+    /// daemon's lock does, fails on a tree that is left, and one that has a guard of its own
+    /// removes the tree again after this. Elsewhere a refusal is a permission, which time does not
+    /// change, so the removal is tried once.
     fn drop(&mut self) {
         use std::io::Write as _;
 
@@ -249,8 +250,7 @@ impl Drop for PrivateTempDir {
                 Err(error) => {
                     let _ = writeln!(
                         std::io::stderr(),
-                        "{} is still there {:?} after its removal was first tried, and the removal \
-                         is refused: {error}",
+                        "{} is not removed {:?} after its removal was first tried: {error}",
                         self.root.display(),
                         begun.elapsed()
                     );
