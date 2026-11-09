@@ -2316,9 +2316,10 @@ mod tests {
     }
 
     /// KR-REQ-18.14, a transfer: the giving device's grant is revoked with the transfer, so what the
-    /// command says of it is a revocation's. It states the authority revision, says it is pending
-    /// and names the session whose worker has not fenced it while one has not, and says the grant
-    /// is revoked only when every worker has, or nothing of it when the host's answer was not read.
+    /// command says of it is a revocation's. It states the authority revision, names each worker the
+    /// host listed with its state, says it is pending while a worker has not fenced it, and says the
+    /// grant is revoked only when every worker has, or nothing of it when the host's answer was not
+    /// read.
     #[test]
     fn a_transfer_states_the_revision_and_each_worker_and_says_revoked_only_when_fenced() {
         let written = |lines: Vec<Line>| -> String {
@@ -2351,6 +2352,13 @@ mod tests {
         assert!(
             text.contains("was revoked, at authority revision 4"),
             "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "session {}: acknowledged",
+                SessionId::new(Uuid::from_bytes([2; 16]))
+            )),
+            "a grant every worker has fenced still names each worker and its state: {text}"
         );
 
         let text = written(transfer_lines(3, "Sam", (from, new), None));

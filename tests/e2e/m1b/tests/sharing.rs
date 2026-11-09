@@ -582,6 +582,18 @@ fn a_revocation_a_session_worker_has_not_fenced_is_pending_in_kr_and_complete_on
         counter(&revoked["authority_revision"]) >= stated,
         "the completed revocation states the revision: {revoked}"
     );
+    // The completed revocation still names each worker the host listed, with its state.
+    let complete = host.kr(&["share", "revoke", &grant_id]);
+    let complete_said = String::from_utf8_lossy(&complete.stdout);
+    assert!(
+        complete.status.success(),
+        "a revocation every worker has fenced is a success: {complete_said}"
+    );
+    assert!(
+        complete_said.contains(&format!("session {session_id}: acknowledged"))
+            || complete_said.contains(&format!("session {session_id}: ended")),
+        "the worker that fenced it is named with its state: {complete_said}"
+    );
     let guest = reconnected(&runtime, &guest_device, &guest_paired);
     let after = runtime.block_on(guest.read::<_, kr_protocol::session::SessionReadResult>(
         Method::SessionRead,
