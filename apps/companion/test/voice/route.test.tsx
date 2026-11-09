@@ -340,6 +340,28 @@ describe('while a call is running', () => {
     expect(lines[0]).not.toHaveTextContent('This has passed.')
   })
 
+  // A host that refuses and answers again, over and over, leaves problems that read alike: each is
+  // its own line, and the lines are told apart by their place, which a call only ever adds to.
+  it('shows two problems with the same words as two lines', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const refusal = {
+      kind: 'host_path' as const,
+      words: 'The host answered but would not say the call is still its own: no such call.',
+      over: true
+    }
+    start((controls) => {
+      controls.holdAVoiceCall()
+      controls.setVoiceProblems([refusal, refusal])
+    })
+
+    const problems = await screen.findByTestId('voice-problems')
+
+    expect(within(problems).getAllByRole('status')).toHaveLength(2)
+    // React reports two children that share a key.
+    expect(error).not.toHaveBeenCalled()
+    error.mockRestore()
+  })
+
   it('shows no problems on a call that met none', async () => {
     start((controls) => {
       controls.holdAVoiceCall()

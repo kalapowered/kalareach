@@ -716,8 +716,10 @@ function CallScreen({
           they are here while it runs and not only once it has ended. */}
       {call.problems.length > 0 && (
         <div className="kr-voice__problems" data-testid="voice-problems">
-          {call.problems.map((words) => (
-            <p key={words} className="kr-voice__refusal" role="status">
+          {/* A call only adds problems, and keeps each where it was met, so the place tells
+              two that read alike apart. */}
+          {call.problems.map((words, place) => (
+            <p key={place} className="kr-voice__refusal" role="status">
               {words}
             </p>
           ))}
