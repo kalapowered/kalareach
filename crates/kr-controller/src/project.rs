@@ -332,10 +332,12 @@ impl ProjectModule {
     /// starts makes sure it does so even when none does, so enrolment needs the runtime the sweep
     /// runs on: an owner enrolled without one would hold directories nothing ever lets go of, and
     /// is refused instead. The sweep holds the service and the owner weakly, and takes hold of them
-    /// for one sweep at a time: the owner holds this host's pairing service and its stores, so a
-    /// daemon that is let go of takes them with it, or when the sweep under way at that moment
-    /// ends, and the sweep ends at its next tick without having kept any of them. It runs where
-    /// blocking work belongs, because letting go closes directories.
+    /// for one sweep at a time: the owner holds this host's pairing service and its stores, so the
+    /// sweep keeps none of them between its sweeps, only for the sweep under way when the daemon
+    /// is let go of, and it ends at its next tick. It is not the only holder of the pairing
+    /// service: the transport's accept loop, which is aborted when its listener goes, and the
+    /// tasks that serve connections hold it on their own terms, the second until their connection
+    /// ends. The sweep runs where blocking work belongs, because letting go closes directories.
     ///
     /// # Errors
     ///
