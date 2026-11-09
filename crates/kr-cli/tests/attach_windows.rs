@@ -190,27 +190,40 @@ impl Attached {
         keyboard.flush().expect("flushes the console's input");
     }
 
-    /// Waits until `count` finds at least `times` of what it counts in the console's output; it
-    /// fails when it does not within the liveness deadline, or when the command ends before it
-    /// does.
+    /// Waits until `count` finds at least `times` of what it counts in the console's output. It
+    /// fails when the console's output has ended without it, and when the liveness deadline passes.
+    ///
+    /// A command that has ended can still have its last lines on their way to this side of the
+    /// console, and how long that takes is not this test's to know. So its end does not end the
+    /// wait: the console's thread having read to the end of the output does, and until it has, the
+    /// wait goes on to the deadline. The last lines of a command that ends are mostly the reason it
+    /// ends, and a failure reported at the moment of the end would not show them. The output of a
+    /// pseudo-console usually ends only when the pseudo-console closes, which this holds open for as
+    /// long as the command's console is wanted, so a marker that never comes is mostly reported by
+    /// the deadline, which says whether the command had ended.
     fn shows(&mut self, what: &str, count: impl Fn(&str) -> usize, times: usize) {
         let started = Instant::now();
         loop {
+            // Read before the text is, so that a thread that was done has also added the last bytes.
+            let complete = self.output.complete();
             let text = self.output.text();
             if count(&text) >= times {
                 return;
             }
-            if let Some(status) = self.child.try_wait().expect("the command's state") {
-                panic!(
-                    "{what}: kr attach ended ({status}) before the console showed it {times} \
-                     time(s); the console shows: {text:?}"
-                );
-            }
+            assert!(
+                !complete,
+                "{what}: the console showed all it will, and not {times} time(s) of it; the console \
+                 shows: {text:?}"
+            );
             assert!(
                 started.elapsed() < LIVENESS_DEADLINE,
-                "{what}: waited {:?} for the console to show it {times} time(s); the console \
-                 shows: {text:?}",
+                "{what}: waited {:?} for the console to show it {times} time(s) while kr attach {}; \
+                 the console shows: {text:?}",
                 started.elapsed(),
+                match self.child.try_wait().expect("the command's state") {
+                    Some(status) => format!("had ended ({status})"),
+                    None => "was running".to_owned(),
+                },
             );
             std::thread::sleep(Duration::from_millis(20));
         }
