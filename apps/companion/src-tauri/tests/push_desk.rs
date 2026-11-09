@@ -344,6 +344,9 @@ struct Registered {
     read_says: Option<RegistrationRead>,
     /// The actions whose results were read, in the order they were read.
     reads: Vec<ActionId>,
+    /// Whether the phone holds nothing to ask the host with, as a phone whose application ended
+    /// does: what the product keeps in memory to send again goes with the application.
+    cannot_ask: bool,
 }
 
 /// Waits for as long as `held` says of the script that a step is held.
@@ -361,6 +364,10 @@ async fn while_held(script: &Mutex<Registered>, held: impl Fn(&Registered) -> bo
 struct HostLink(Arc<Mutex<Registered>>);
 
 impl Registrar for HostLink {
+    fn can_ask(&self, _host: kr_protocol::ids::DeviceId, _action: ActionId) -> bool {
+        !self.0.lock().expect("what was handed").cannot_ask
+    }
+
     fn connect<'a>(
         &'a self,
         host: &'a PairedHost,
@@ -2898,6 +2905,10 @@ impl Registrar for Watched {
         self.real.beside_the_host_in_use(host)
     }
 
+    fn can_ask(&self, host: kr_protocol::ids::DeviceId, action: ActionId) -> bool {
+        self.real.can_ask(host, action)
+    }
+
     fn connect<'a>(
         &'a self,
         host: &'a PairedHost,
@@ -5400,12 +5411,14 @@ async fn an_account_deleted_after_an_unknown_outcome_leaves_the_whole_sequence_t
 }
 
 /// The unknown outcome outlives the application: a start reads it from the record, the page is told
-/// it as before, and a look reads the result and registers nothing. A registration that was about to
-/// be sent when the application ended is as unknown, since it is kept before it is sent.
+/// it as before with the words that say only the person can decide, and a look asks the host nothing
+/// and registers nothing, since the request that would ask is not held any more. A registration that
+/// was about to be sent when the application ended is as unknown, since it is kept before it is sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unknown_outcome_survives_the_application_ending() {
-    let (_host, phone, _reference, action) =
-        a_phone_whose_registration_has_no_known_outcome().await;
+    let (_host, phone, reference, action) = a_phone_whose_registration_has_no_known_outcome().await;
+    let connected = phone.registered.lock().expect("the script").connected.len();
+    phone.registered.lock().expect("the script").cannot_ask = true;
 
     let restarted = reopened(&phone);
 
@@ -5420,17 +5433,46 @@ async fn an_unknown_outcome_survives_the_application_ending() {
         "{:?}",
         shown.words
     );
+    assert!(
+        shown.words.contains("Only you can decide"),
+        "the person is told it is theirs to decide: {:?}",
+        shown.words
+    );
     restarted.let_time_pass();
     look(&restarted.desk).await;
-    eventually("the look read the result", || {
-        actions_read(&phone).len() == 1
-    })
-    .await;
-    assert_eq!(actions_sent(&phone), [action], "nothing was registered");
+    assert_eq!(
+        Arc::strong_count(&restarted.desk),
+        1,
+        "the look started no run"
+    );
+    assert_eq!(
+        restarted.desk.view().hosts[0].state,
+        PushState::NeedsAttention
+    );
+    assert_eq!(
+        phone.registered.lock().expect("the script").connected.len(),
+        connected,
+        "the host was not reached"
+    );
+    assert!(actions_read(&phone).is_empty(), "nothing was asked");
+    assert_eq!(
+        actions_sent(&phone),
+        [action.clone()],
+        "nothing was registered"
+    );
+
+    // The person's request is the way out: it asks once more, and registers again.
+    restarted
+        .desk
+        .enable(&reference, Some(&action))
+        .expect("the person asks");
+    states_until(&restarted.desk, |states| states == [PushState::On]).await;
+    assert_eq!(actions_read(&phone), [action.clone()]);
+    assert_eq!(actions_sent(&phone).len(), 2, "registered again");
 }
 
 /// The application ending while a registration waits for its answer leaves it unknown, not a run
-/// to try again: a look after the start reads it and makes no other.
+/// to try again: a look after the start asks nothing and makes no other.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_registration_sent_when_the_application_ended_is_not_made_again_at_the_start() {
     let owner = DeviceKeys::generate().expect("keys");
@@ -5448,7 +5490,9 @@ async fn a_registration_sent_when_the_application_ended_is_not_made_again_at_the
     .await;
     let action = actions_sent(&phone).remove(0);
 
-    // The application ends here: the next start reads the record the first left.
+    // The application ends here: the next start reads the record the first left, and holds
+    // nothing to ask the host with.
+    phone.registered.lock().expect("the script").cannot_ask = true;
     let restarted = reopened(&phone);
 
     let shown = restarted.desk.view().hosts.remove(0);
@@ -5459,10 +5503,12 @@ async fn a_registration_sent_when_the_application_ended_is_not_made_again_at_the
     );
     restarted.let_time_pass();
     look(&restarted.desk).await;
-    eventually("the look read the result", || {
-        actions_read(&phone).len() == 1
-    })
-    .await;
+    assert_eq!(
+        Arc::strong_count(&restarted.desk),
+        1,
+        "the look started no run"
+    );
+    assert!(actions_read(&phone).is_empty(), "nothing was asked");
     assert_eq!(actions_sent(&phone), [action], "nothing was registered");
     assert_eq!(
         proposed(&restarted.gateway),
@@ -5726,4 +5772,55 @@ async fn an_answer_the_phone_cannot_read_leaves_a_registration_unknown_when_aske
         phone.view().hosts[0].words
     );
     assert_eq!(proposed(&phone.gateway), [FIRST_TOKEN]);
+}
+
+/// KR-REQ-23.24 over the product's own registrar: the request a phone sends again to ask the host
+/// about a registration is held in memory, so a phone whose application ended holds none, and a look
+/// does not reach the host for it, with `action.read` or with the request. The person's request is
+/// what asks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_look_after_a_restart_over_a_real_connection_does_not_reach_the_host() {
+    use kr_protocol::method::Method;
+
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let control = LinkControl::new();
+    let phone = desk_over_a_controlled_link(&host, &owner, &control).await;
+    let reference = phone.references().remove(0);
+    control.lose_the_answer_to(Some(Method::DevicePushRegister));
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
+    phone
+        .until(|states| states == [PushState::NeedsAttention])
+        .await;
+    let action = unknown_of(&phone).expect("the outcome is not known");
+    control.lose_the_answer_to(None);
+    let asked = control.asked();
+
+    // The application ends: the next start has the same record, the same device and a registrar
+    // that holds nothing.
+    let restarted = open_at(
+        official_origin(),
+        phone._phone.data.path(),
+        &phone.device,
+        &phone.receiver,
+        Arc::new(ConnectionRegistrar::new(Arc::clone(&phone.device))),
+    );
+    restarted.let_time_pass();
+    look(&restarted.desk).await;
+
+    assert_eq!(
+        Arc::strong_count(&restarted.desk),
+        1,
+        "the look started no run"
+    );
+    assert_eq!(control.asked(), asked, "no connection was made to the host");
+    assert_eq!(control.sent(Method::ActionRead), 0);
+    assert_eq!(
+        control.sent_actions(Method::DevicePushRegister),
+        [action],
+        "nothing was sent again"
+    );
 }
