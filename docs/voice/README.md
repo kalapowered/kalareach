@@ -254,8 +254,11 @@ What a model wrote, what the description host saw and what the worker holds leav
 while the privacy mode is in the same state as it was when they were read. Privacy mode removes the
 first two when it is turned on, and a worker removes its semantic history and records none while it
 is on. The daemon reads none of them while it is on. After privacy mode is turned off the daemon
-carries only what was produced after the moment it last changed, because a worker of an earlier
-release keeps its history through the change; what that keeps out is counted. If the privacy mode
+carries only what was produced after the moment it took effect, because a worker of an earlier
+release keeps its history through the change and a decision can stay pending through it; what that
+keeps out is counted. The record keeps when a change was asked for and not when it took effect, so
+a daemon that starts over a host that has ever changed privacy mode carries only what is produced
+after its own start. If the privacy mode
 is turned on whilst the context is being read the context will be read again, and the answer
 carries none of it. The context will be read
 at most three times; if the privacy mode keeps changing the request will be refused as transient and

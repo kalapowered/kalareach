@@ -167,11 +167,15 @@ pub struct Published {
     pub generation: PrivacyGeneration,
     /// Whether privacy mode is on.
     pub private: bool,
-    /// The moment, on this host's wall clock, this state was published: when privacy mode was
-    /// turned on, or when it was turned off and the daemon began to serve what is produced after
-    /// it. It is read with the state and in the same step, so a reader that needs to tell what
-    /// was produced after privacy mode ended needs no second look at the record. Nought for a
-    /// host that has never changed it.
+    /// The moment, on this host's wall clock, from which what is produced is produced with
+    /// privacy mode in this state. A turning off takes it with the write side of the state held,
+    /// when no reader holds the state it replaces and nothing is still waiting to publish, so
+    /// whatever was produced while privacy mode stood is at or before it. A state restored when
+    /// the daemon starts carries the moment of the start: the record keeps when a change was asked
+    /// for, which a wait for the store can put before the moment it took effect. A turning on
+    /// carries the moment it was asked for, and matters to no reader, which reads nothing while
+    /// privacy mode is on. It is read with the state and in the same step. Nought for a host that
+    /// has never changed it.
     pub since_ms: u64,
 }
 
@@ -692,10 +696,19 @@ impl EnvironmentPrivacy {
         let stored = record.read()?;
         let obligations = record.obligations()?;
         let state = delivery.privacy_state().clone();
+        // What was produced before this start cannot be told from what was produced while privacy
+        // mode still stood, because the record keeps the moment the last change was asked for and
+        // not the moment it took effect. A host that has changed privacy mode serves, from this
+        // start, only what is produced after it.
+        let since_ms = if stored.generation.get() == 0 {
+            0
+        } else {
+            kr_ipc::now_ms().get().max(stored.changed_at_ms.get())
+        };
         state.publish(Published {
             generation: stored.generation,
             private: stored.enabled,
-            since_ms: stored.changed_at_ms.get(),
+            since_ms,
         });
         Ok(Self {
             inner: Mutex::new(Inner {
@@ -907,10 +920,12 @@ impl EnvironmentPrivacy {
         inner.record.disable(resumed.generation, now_ms, admitted)?;
         inner.mode = mode;
         inner.changed_at_ms = now_ms;
-        // Read as the state is published, not when the change was asked for: the request can have
-        // waited for the store, and what is produced while privacy mode still stands is not what
-        // follows it.
-        self.state.publish(Published {
+        // Read with the write side held, not when the change was asked for and not before the
+        // wait for that side: the request can have waited for the store, and a reader can hold the
+        // state it replaces. What is produced while privacy mode still stands is at or before
+        // this moment, and what follows it is not.
+        let change = self.state.change();
+        change.publish(Published {
             generation: resumed.generation,
             private: false,
             since_ms: kr_ipc::now_ms().get(),
@@ -3342,34 +3357,75 @@ mod tests {
         );
     }
 
-    /// KR-REQ-15.20 and KR-REQ-24.27: the state a disabling publishes carries the moment it took
-    /// effect and not the moment the change was asked for. A request can wait for the store, and
-    /// what is produced while privacy mode still stands is not what follows it, so a reader that
-    /// carries only what came after the change draws its line at the state it read.
+    /// KR-REQ-15.20 and KR-REQ-24.27: the moment a disabling publishes is taken once nothing holds
+    /// the state it replaces. A reader that holds privacy mode as on can keep the change waiting,
+    /// and what is produced meanwhile is produced with privacy mode on, so a reader that carries
+    /// only what came after the change must not draw its line before that wait ended.
     #[test]
-    fn a_disabling_publishes_the_moment_it_took_effect_and_not_the_moment_it_was_asked_for() {
+    fn a_disabling_publishes_a_moment_after_the_readers_it_waited_for() {
         let host = Host::open();
         host.privacy
             .enable(&[], at(0), &standing)
             .expect("privacy mode is enabled");
-        let enabled = host.privacy.state().reading().published();
-        assert!(enabled.private);
+        let state = host.privacy.state();
+        let reader = state.reading();
+        let mut produced_while_on = 0;
+        std::thread::scope(|scope| {
+            let disabling = scope.spawn(|| {
+                host.privacy
+                    .disable(at(10), &standing)
+                    .expect("privacy mode is disabled")
+            });
+            while !state.observed().changing {
+                std::thread::yield_now();
+            }
+            // The change has asked to publish and the reader still holds the state it replaces:
+            // from the first moment of the clock after this, nothing is produced under it.
+            produced_while_on = kr_ipc::now_ms().get();
+            while kr_ipc::now_ms().get() <= produced_while_on {
+                std::thread::yield_now();
+            }
+            drop(reader);
+            disabling.join().expect("the disabling ends");
+        });
+        let disabled = state.reading().published();
+        assert!(!disabled.private);
+        assert!(
+            disabled.since_ms > produced_while_on,
+            "published as of {}, while a reader still held privacy mode on at {produced_while_on}",
+            disabled.since_ms
+        );
+    }
+
+    /// KR-REQ-15.20 and KR-REQ-24.27: a daemon that starts over a record that has changed serves
+    /// only what is produced after the start. The record keeps the moment the last change was asked
+    /// for, which a wait for the store can put before the moment it took effect, and a host that
+    /// has never changed it has nothing to draw a line at.
+    #[cfg(unix)]
+    #[test]
+    fn a_restored_state_carries_the_moment_of_the_start_once_privacy_mode_has_changed() {
+        let mut host = Host::open();
+        host.reopen_privacy();
         assert_eq!(
-            enabled.since_ms,
-            at(0).get(),
-            "an enabling is published at its own moment"
+            host.privacy.state().reading().published().since_ms,
+            0,
+            "a host that has never changed privacy mode has no line to draw"
         );
 
-        let before = kr_ipc::now_ms().get();
+        host.privacy
+            .enable(&[], at(0), &standing)
+            .expect("privacy mode is enabled");
         host.privacy
             .disable(at(10), &standing)
             .expect("privacy mode is disabled");
-        let disabled = host.privacy.state().reading().published();
-        assert!(!disabled.private);
+        let before = kr_ipc::now_ms().get();
+        host.reopen_privacy();
+        let restored = host.privacy.state().reading().published();
+        assert!(!restored.private);
         assert!(
-            disabled.since_ms >= before,
-            "published at {} and not at the moment 10 it was asked for; the call began at {before}",
-            disabled.since_ms
+            restored.since_ms >= before,
+            "restored as of {}, which is the moment the change was asked for and not the start at {before}",
+            restored.since_ms
         );
     }
 

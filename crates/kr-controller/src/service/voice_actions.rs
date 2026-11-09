@@ -328,7 +328,7 @@ impl Controller {
 
     /// One agent's retained semantic history, paged to the end: a history has no tail read, and
     /// the last twenty entries are the end of it. `None` when the worker cannot give it, or gives
-    /// more parts than a history can have.
+    /// more parts than a read follows ([`crate::voice::MAX_HISTORY_PARTS`]).
     async fn voice_agent_history(
         &self,
         worker: &crate::directory::KnownWorker,
@@ -388,6 +388,11 @@ impl Controller {
             .await
             .ok()?
             .ok()?;
+        // A link that came as the time ran out has sent nothing, so it goes back whole.
+        if tokio::time::Instant::now() >= deadline {
+            link.give_back();
+            return None;
+        }
         let level = link.client().level();
         let answered = tokio::time::timeout_at(deadline, link.client().request(method, params))
             .await
