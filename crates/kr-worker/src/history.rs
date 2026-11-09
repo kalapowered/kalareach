@@ -216,9 +216,9 @@ const MAX_WITHHELD_RANGES: usize = 65_536;
 /// as written, as ranges of cursors, oldest first.
 ///
 /// The engine names each such string when it ends, so a range is as long as the string and begins
-/// where it did. The ranges are bounded: past the bound every pair of neighbours no further apart
-/// than the median gap becomes one range, in one pass, so a stream of one-byte strings costs a
-/// constant for each. A pair joined withholds the text between them as well and never less.
+/// where it did. The ranges are bounded: past the bound the nearer half of the pairs of neighbours
+/// become one range each, in one pass, so a stream of one-byte strings costs a constant for each.
+/// A pair joined withholds the text between them as well and never less.
 #[derive(Debug, Default)]
 struct WithheldStrings {
     ranges: VecDeque<(u64, u64)>,
@@ -252,10 +252,12 @@ impl WithheldStrings {
         }
     }
 
-    /// Joins every pair of neighbours whose gap is no wider than the median gap.
+    /// Joins the nearer half of the pairs of neighbours: those whose gap is narrower than the
+    /// median gap, and, of those exactly as wide as it, the first as many as bring the pairs joined
+    /// to half.
     ///
-    /// At least half of the pairs are, so the record is at most about half as long afterwards, and
-    /// the work of the pass is spread over the notes it made room for.
+    /// The record is at most about half as long afterwards, and the work of the pass is spread
+    /// over the notes it made room for.
     fn join_the_nearest(&mut self) {
         let mut gaps: Vec<u64> = self
             .ranges
