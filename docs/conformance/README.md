@@ -535,9 +535,10 @@ program whose project publishes source only is built there from that release's s
 flags the lock records, against the system's own curses library; tmux is built against a pinned
 libevent built the same way. A release that cannot be fetched or built is recorded as not installed,
 with the reason, and its cases are reported as not run. A release that cannot be fetched is tried
-again after pauses that double, about eight minutes of them in all, and once the fetch has spent five
-minutes in such tries each later release is tried once. A program whose release could not be fetched
-is recorded with its address as the reason, and the log names the address of a library; a program
+again after pauses that double, about eight and a half minutes of them in all; the tries of the
+whole fetch share ten minutes, and a release whose turn comes after that gets three tries of 30
+seconds at most. A program whose release could not be fetched is recorded with its address as the
+reason, and the log names the address of a library; a program
 built against a library that is not installed is not built, and its reason names the library. The
 nightly workflow keeps the release archives in the Actions cache under the lock that pins them and
 the script that fetches them, and a default-branch run that holds every archive saves them, whether
