@@ -1286,6 +1286,169 @@ async fn a_fresh_host_restores_a_backup_from_the_kit_alone_and_changes_nothing_o
     }
 }
 
+/// The forms in which a document could carry `key`, as the bytes to look for in it: the bytes
+/// themselves and their hexadecimal in either case; and base64 in either alphabet, which puts three
+/// bytes in four characters, so that the characters standing for the key's whole groups of three are
+/// the same wherever the key lies in a longer value. Which groups those are depends on where the key
+/// starts, so each of the three ways it can start is looked for.
+fn forms_of(key: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let hex = |upper: bool| -> Vec<u8> {
+        key.iter()
+            .map(|byte| {
+                if upper {
+                    format!("{byte:02X}")
+                } else {
+                    format!("{byte:02x}")
+                }
+            })
+            .collect::<String>()
+            .into_bytes()
+    };
+    let mut forms = vec![
+        ("as bytes".to_owned(), key.to_vec()),
+        ("in lower-case hexadecimal".to_owned(), hex(false)),
+        ("in upper-case hexadecimal".to_owned(), hex(true)),
+    ];
+    for start in 0..3 {
+        let whole = &key[start..start + (key.len() - start) / 3 * 3];
+        let url = kr_protocol::scalars::to_base64url(whole);
+        forms.push((
+            format!("in base64url from its byte {start}"),
+            url.clone().into_bytes(),
+        ));
+        forms.push((
+            format!("in base64 from its byte {start}"),
+            url.replace('-', "+").replace('_', "/").into_bytes(),
+        ));
+    }
+    forms
+}
+
+/// How `key` is carried in `haystack`, in a form [`forms_of`] names or as serde writes a list of
+/// bytes, a list of numbers, with any space between its items; nothing when it is not.
+fn carried_in(haystack: &[u8], key: &[u8]) -> Option<String> {
+    let found = |needle: &[u8], haystack: &[u8]| {
+        !needle.is_empty()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+    };
+    if let Some((form, _)) = forms_of(key)
+        .into_iter()
+        .find(|(_, needle)| found(needle, haystack))
+    {
+        return Some(form);
+    }
+    let compact: Vec<u8> = haystack
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    let numbers = key
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+        .into_bytes();
+    found(&numbers, &compact).then(|| "as a list of numbers".to_owned())
+}
+
+/// Every key of `kept` that is carried in an object of `clear`, as the object's label and the key's
+/// name with the form. Each object is read on its own.
+fn carried_keys(clear: &[(String, Vec<u8>)], kept: &[(String, Vec<u8>)]) -> Vec<String> {
+    let mut found = Vec::new();
+    for (label, bytes) in clear {
+        for (name, key) in kept {
+            if let Some(form) = carried_in(bytes, key) {
+                found.push(format!("{label} holds the {name} {form}"));
+            }
+        }
+    }
+    found
+}
+
+/// The private keys the host keeps, read from the secret store its daemon wrote them to, as a name
+/// and the bytes: the seeds of the controller identity and of the device keys (transport, which is
+/// the reusable endpoint key; authorisation, which is the control-signing key; stored envelope; and
+/// notification preview), the backup writer's seed when the host has one, and the private keys of
+/// the four X25519 pairs, which are made from their seeds by a hash (the first half of the seed's
+/// SHA-512, which is what libsodium's `crypto_box_seed_keypair` makes of it) and are checked here
+/// against the public key each pair has.
+fn host_private_keys_held(rig: &Rig) -> Vec<(String, Vec<u8>)> {
+    use kr_crypto::store::{SecretName, load_device_keys};
+    use kr_protocol::pairing::KeyPurpose;
+
+    let store = open_store_in(&rig.temp.environment().secrets_dir()).expect("the daemon's store");
+    let identity_scope = rig.temp.environment_id().to_string();
+    let device_scope = kr_controller::service::net::device_key_scope(rig.temp.environment_id());
+    let mut kept = Vec::new();
+    for (whose, scope) in [
+        ("controller identity", &identity_scope),
+        ("device", &device_scope),
+    ] {
+        for purpose in [
+            KeyPurpose::Transport,
+            KeyPurpose::Authorisation,
+            KeyPurpose::StoredEnvelope,
+            KeyPurpose::NotificationPreview,
+        ] {
+            let name = SecretName::device_key(scope, purpose).expect("a name");
+            let seed = store
+                .store
+                .get(&name)
+                .expect("the store reads")
+                .unwrap_or_else(|| panic!("the daemon kept a {whose} {purpose:?} key"));
+            kept.push((format!("{whose} {purpose:?}"), seed.expose().to_vec()));
+        }
+        let pairs = load_device_keys(store.store.as_ref(), scope)
+            .expect("the store reads")
+            .unwrap_or_else(|| panic!("the daemon kept a {whose} set of keys"));
+        for (purpose, public) in [
+            (
+                KeyPurpose::StoredEnvelope,
+                pairs.stored_envelope.public().as_bytes(),
+            ),
+            (
+                KeyPurpose::NotificationPreview,
+                pairs.notification_preview.public().as_bytes(),
+            ),
+        ] {
+            let seed = &kept
+                .iter()
+                .find(|(name, _)| *name == format!("{whose} {purpose:?}"))
+                .expect("the seed was read")
+                .1;
+            let secret =
+                aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA512, seed).as_ref()[..32].to_vec();
+            let derived = aws_lc_rs::agreement::PrivateKey::from_private_key(
+                &aws_lc_rs::agreement::X25519,
+                &secret,
+            )
+            .expect("an X25519 private key")
+            .compute_public_key()
+            .expect("its public key");
+            assert_eq!(
+                derived.as_ref(),
+                public.as_slice(),
+                "the {whose} {purpose:?} private key is the first half of its seed's hash"
+            );
+            kept.push((format!("{whose} {purpose:?} private (derived)"), secret));
+        }
+    }
+    let writer = SecretName::backup_writer(&device_scope).expect("a name");
+    if let Some(seed) = store.store.get(&writer).expect("the store reads") {
+        kept.push(("backup writer".to_owned(), seed.expose().to_vec()));
+    }
+    assert!(
+        kept.len() >= 12,
+        "two sets of four seeds and the four X25519 private keys made from them"
+    );
+    for (name, key) in &kept {
+        assert!(key.len() >= 32, "the {name} key is a key, not a stub");
+    }
+    kept
+}
+
 /// The bundle the service holds for `world`, opened under the kit.
 fn stored_bundle(rig: &Rig, world: &World) -> RecoveryBundle {
     let bytes = rig
@@ -1318,6 +1481,25 @@ fn checkpoint_of(sealed: &Sealed) -> ArchiveCheckpoint {
 /// exists then and the host holds no seed. A restore holds the kit and has verified a generation,
 /// so it records that generation in the bundle: a checkpoint for the archive, one revision on, and
 /// every writer, producer and collection the bundle held carried through as it was.
+///
+/// KR-REQ-20.17, the restore's write-back of that checkpoint only, and only what this case reads:
+/// the output of the preview and of the restore, the bundle the service holds after the restore
+/// (opened with the kit's seed, as the JSON a client sees and as canonical bytes), and every
+/// request the service was sent, each body, the content beside it and the account token, hold none
+/// of the private keys the host keeps. The host keeps two sets of four keys (transport, which is
+/// the reusable endpoint key; authorisation, which is the control-signing key; stored envelope; and
+/// notification preview): the controller identity and the device keys it pairs with; the case reads
+/// their eight seeds from the secret store the daemon wrote them to (and the backup writer's seed
+/// when the host has one), and the private keys of the four X25519 pairs, each checked against the
+/// pair's public key. Each key is looked for as bytes, in hexadecimal of either case, in either
+/// base64 alphabet wherever it lies in a longer value, and as a list of numbers. The controls are
+/// the scan finding each form where a key is put, the folder the restore names in its output, the
+/// bundle's writer key in the bundle and the bundle's ciphertext in the requests. Not shown here:
+/// what the restore writes into its folder (the restore cases read it); the second restore's
+/// requests; the parts of a request the stand-in does not keep (its headers other than the token,
+/// a query on its path, the signature block beyond the body); a key in a binary list of integers,
+/// split, reversed or otherwise transformed; or the other data paths of backup and recovery
+/// material.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restore_records_the_generation_it_verified_in_the_bundle() {
     let world = World::new();
@@ -1364,6 +1546,99 @@ async fn a_restore_records_the_generation_it_verified_in_the_bundle() {
     assert_eq!(report["checkpoint_recorded"], true, "{report}");
 
     let after = stored_bundle(&rig, &world);
+
+    // What the restore printed, wrote to the service and recorded holds none of the host's keys.
+    let kept = host_private_keys_held(&rig);
+    let bundle_json = serde_json::to_vec(&after).expect("a bundle encodes");
+    let sealed_after = rig
+        .served
+        .web()
+        .bundle(&world.locator)
+        .expect("the service holds the bundle");
+    let mut clear = vec![
+        (
+            "the preview's output".to_owned(),
+            [preview.stdout.clone(), preview.stderr.clone()].concat(),
+        ),
+        (
+            "the restore's output".to_owned(),
+            [restored.stdout.clone(), restored.stderr.clone()].concat(),
+        ),
+        ("the bundle as JSON".to_owned(), bundle_json.clone()),
+        (
+            "the bundle as canonical bytes".to_owned(),
+            kr_cbor::to_canonical_vec(&after).expect("a bundle encodes"),
+        ),
+    ];
+    let mut sent = Vec::new();
+    for (at, arrived) in rig.served.web().arrived().iter().enumerate() {
+        let to = format!("request {at} to {}", arrived.path);
+        sent.push((
+            format!("the body of {to}"),
+            serde_json::to_vec(&arrived.body).expect("a body encodes"),
+        ));
+        if let Some(content) = &arrived.content {
+            sent.push((format!("the content of {to}"), content.clone()));
+        }
+        if let Some(token) = &arrived.token {
+            sent.push((format!("the token of {to}"), token.clone().into_bytes()));
+        }
+    }
+    // The controls: the scan finds a key in each form it looks for, wherever the key lies in a
+    // longer value, and reads what the restore printed, the bundle and what was sent.
+    let (_, probe) = &kept[0];
+    for (form, needle) in forms_of(probe) {
+        let document = [b"{\"a\":\"".as_slice(), &needle, b"\"}"].concat();
+        assert!(
+            carried_in(&document, probe).is_some(),
+            "the scan misses a key {form}"
+        );
+    }
+    for alphabet in ["base64url", "base64"] {
+        for before in 0..3 {
+            let mut longer = vec![0x5a_u8; before];
+            longer.extend_from_slice(probe);
+            longer.extend_from_slice(b"tail");
+            let encoded = kr_protocol::scalars::to_base64url(&longer);
+            let encoded = if alphabet == "base64" {
+                encoded.replace('-', "+").replace('_', "/")
+            } else {
+                encoded
+            };
+            let value = format!("{{\"k\":\"{encoded}\"}}").into_bytes();
+            assert!(
+                carried_in(&value, probe).is_some(),
+                "the scan misses a key inside a longer {alphabet} value that starts {before} \
+                 bytes before it"
+            );
+        }
+    }
+    assert!(
+        carried_in(&restored.stdout, into_arg.as_bytes()).is_some(),
+        "the scan does not read the restore's output"
+    );
+    let writer = after
+        .trusted_writers
+        .iter()
+        .next()
+        .expect("the bundle names a writer")
+        .signing_key;
+    assert!(
+        carried_in(&bundle_json, writer.as_bytes()).is_some(),
+        "the scan does not read the bundle's writer key"
+    );
+    assert!(
+        sent.iter()
+            .any(|(_, bytes)| carried_in(bytes, &sealed_after).is_some()),
+        "the scan does not read the bundle in the requests"
+    );
+    clear.extend(sent);
+    assert_eq!(
+        carried_keys(&clear, &kept),
+        Vec::<String>::new(),
+        "something a restore prints or sends holds a private key the host keeps"
+    );
+
     assert_eq!(
         after.checkpoints.iter().cloned().collect::<Vec<_>>(),
         [ArchiveCheckpoint {
