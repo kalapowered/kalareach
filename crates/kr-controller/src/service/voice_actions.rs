@@ -150,7 +150,7 @@ impl Controller {
     ///
     /// Read through this daemon's ordinary session read, so voice sees what any other reader sees
     /// and nothing more. What the session's worker holds of its agents, the decisions waiting on a
-    /// person and the semantic messages, is read beside it ([`Self::voice_worker_half`]); a part
+    /// person and the semantic messages, is read beside it (`voice_worker_half`); a part
     /// that cannot be read is reported as unavailable rather than left out silently.
     ///
     /// Every item carries the moment its content was produced, because that moment is what a

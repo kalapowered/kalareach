@@ -35,7 +35,7 @@ pub const RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 ///
 /// The longest the daemon waits for a session's worker is a managed create's rendezvous, then its
 /// shell's qualification, then the time the worker gives a shell it gave up on to end before it
-/// says why ([`worker_wait`]), and a margin covers what comes before them: the reservation and the
+/// says why (`worker_wait`), and a margin covers what comes before them: the reservation and the
 /// start of the worker. A door that gave up sooner would answer that the outcome is unknown before
 /// the reason the worker gives for a shell that never qualified could reach the caller.
 pub const CREATE_WAIT: std::time::Duration = std::time::Duration::from_secs(
