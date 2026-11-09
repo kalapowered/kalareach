@@ -3110,6 +3110,10 @@ async fn an_answer_to_a_question_is_never_inserted_into_the_terminal() {
         .release();
 }
 
+// ---------------------------------------------------------------------------------------------
+// A run of the disclosed checks, whose case below keeps to the row it names.
+// ---------------------------------------------------------------------------------------------
+
 /// One path as a person left it: its modification time and its mode.
 #[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
@@ -3304,6 +3308,10 @@ async fn a_run_of_the_disclosed_checks_sends_nothing_to_the_terminal_and_changes
         .1
         .release();
 }
+
+// ---------------------------------------------------------------------------------------------
+// KR-PERF-002: what the recogniser's deadline does not wait for, continued.
+// ---------------------------------------------------------------------------------------------
 
 /// KR-PERF-002: a close that is admitted discards the prefix the recogniser holds and accepts no
 /// input after it.
