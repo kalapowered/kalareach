@@ -3560,9 +3560,9 @@ async fn privacy_changed_at_of(host: &Host) -> i64 {
 }
 
 /// KR-REQ-24.27, KR-REQ-15.20: the moment privacy mode last changed is one column that both
-/// releases read the same way. This release's daemon reports the moment the release before wrote,
-/// and not the moment it started, leaves the record as it found it, and writes its own moment in
-/// the same column, which the release before reports after a rollback.
+/// releases read the same way. This release's daemon reports the moment the release before wrote
+/// and leaves the record as it found it, and writes its own moment in the same column, which the
+/// release before reports after a rollback.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_moment_privacy_mode_last_changed_is_read_the_same_by_both_releases() {
     let prepared = Updated::prepare(Setup::default()).await;
@@ -3590,7 +3590,7 @@ async fn the_moment_privacy_mode_last_changed_is_read_the_same_by_both_releases(
     assert_eq!(
         privacy_changed_at_of(host).await,
         before,
-        "this release reports the moment the record holds, and not the moment it started"
+        "this release reports the moment the record holds"
     );
 
     privacy_on_and_off(host).await;

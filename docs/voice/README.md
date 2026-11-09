@@ -266,7 +266,8 @@ holds the privacy state, and the record keeps it. A restart therefore carries on
 moment: what the worker produced after the change stays in a call, and what it produced before
 stays out. A record an earlier release wrote keeps the moment the change was asked for, which is
 earlier than the moment it took effect by as long as the change waited; the daemon reads it as it
-stands until privacy mode next changes. A report a hook made over a connection admitted in privacy mode, or before
+stands until privacy mode next changes, so what was produced while that change waited, in practice
+a decision that stayed pending, can be carried until then. A report a hook made over a connection admitted in privacy mode, or before
 privacy mode last changed, is not kept by the worker; a hook that started in privacy mode and
 connected after it ended is kept, because the platform's record of when a hook started is on a
 clock that has no reading of now to compare it with. If the privacy mode is turned on whilst the

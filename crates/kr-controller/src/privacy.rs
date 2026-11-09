@@ -178,7 +178,8 @@ pub struct Published {
     /// moment it took effect by as long as the change waited, and is read as it stands until the
     /// state next changes. It is the daemon's moment: a worker learns of a change a little later,
     /// and what it produces in between is stamped after this moment and is carried. It is the wall
-    /// clock's, so a step of the clock back across it can put an earlier stamp after it.
+    /// clock's, so a step of the clock back across it can put an earlier stamp after it, and that
+    /// stays so across a restart until the state next changes.
     pub since_ms: u64,
 }
 
@@ -314,8 +315,9 @@ impl PrivacyState {
     /// read-write lock, in which a waiting writer stops new readers, from turning a reader that
     /// waits for something a writer holds into a stall; a new taker of this side goes under the
     /// same rule. A change that takes it holds it across the record's write and its admission, in
-    /// the order the state, then the record's transaction, then the registration hold: nothing that
-    /// holds a later one of those waits for an earlier one.
+    /// the order the state, then (for an enabling) the backup store's hold, then the record's
+    /// transaction, then the registration hold: nothing that holds a later one of those waits for
+    /// an earlier one.
     fn change(&self) -> Change<'_> {
         // Raised before the wait, so a report says a change is under way from the moment this asks
         // for the write side and not only from the moment it holds it.
@@ -567,7 +569,8 @@ pub struct Report {
     pub generation: PrivacyGeneration,
     /// Whether privacy mode is on.
     pub enabled: bool,
-    /// When it last changed: the moment the record took the change, which a start reads back.
+    /// When it last changed: the moment the record took the change, which a start reads back (for
+    /// a record an earlier release wrote, the moment the change was asked for).
     pub changed_at_ms: TimestampMs,
     /// Whether the last change has finished taking effect: the enabling's cleanup reconciled, or
     /// the disabling's releases landed. Every session obligation counts in either state.
@@ -702,7 +705,8 @@ impl EnvironmentPrivacy {
         let obligations = record.obligations()?;
         let state = delivery.privacy_state().clone();
         // The record keeps the moment the last change took effect, so a start serves from the same
-        // moment the daemon before it did, and not from its own start.
+        // moment the daemon before it did, and not from its own start. A record an earlier release
+        // wrote keeps the moment its change was asked for instead (see `Published::since_ms`).
         state.publish(Published {
             generation: stored.generation,
             private: stored.enabled,
@@ -844,17 +848,16 @@ impl EnvironmentPrivacy {
         // record that fails changes nothing there; a fence that fails leaves the readiness guard
         // withholding production, and the steps below try it again.
         let record = &mut inner.record;
-        let mut took_effect = None;
+        // Set by the closure, which has run to its end when the call below answers without an
+        // error: the moment the record's transaction read the clock at.
+        let mut took_effect = now_ms;
         let _raised = self.backup.raise_fence_recorded(generation, now_ms, || {
             let recorded = record.enable(generation, &owing, now_ms, admitted);
             #[cfg(test)]
             if recorded.is_ok() {
                 self.after_record.wait();
             }
-            recorded.map(|moment| took_effect = Some(moment))
-        })?;
-        let took_effect = took_effect.ok_or_else(|| {
-            ControllerError::registry("the privacy record was written without a moment")
+            recorded.map(|moment| took_effect = moment)
         })?;
         inner.mode = mode;
         inner.changed_at_ms = took_effect;
@@ -3591,6 +3594,8 @@ mod tests {
                 std::thread::yield_now();
             }
             let reader = scope.spawn(|| state.reading().published());
+            // The change waits for the record's busy timeout at most (five seconds), so the holder
+            // is let go promptly.
             holder
                 .execute_batch("ROLLBACK;")
                 .expect("the write lock is let go");

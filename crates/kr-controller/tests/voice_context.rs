@@ -861,7 +861,7 @@ async fn a_restart_keeps_the_moment_privacy_mode_took_effect_as_the_cutoff() {
     assert_eq!(
         world.privacy_changed_at().await,
         changed,
-        "the record says when privacy mode took effect, not when the daemon started"
+        "the record still says when privacy mode took effect after the restart"
     );
     let result = world.context().await;
     assert_eq!(
