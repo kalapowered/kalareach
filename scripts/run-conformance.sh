@@ -273,9 +273,10 @@ PYTHON
             # so a host that says to come back in an hour ends the tries at once. A release whose
             # turn comes when less than a minute is left gets three tries of 30 seconds at most, so
             # that no release goes untried. The whole fetch of seven releases then takes about 12
-            # minutes at the worst when the host answers errors at once, and about 20 when it holds
-            # every try to its limit (750 seconds for the first release, which has the ten
-            # minutes, and 70 for each of the others).
+            # minutes when the host answers errors at once, about 19 when it holds every try to its
+            # limit, and 22 and a half at the very most: 750 seconds for the first release, which
+            # has the ten minutes (their end, a pause and a try), and 100 for each of the six others
+            # (60, 10 and 30 seconds).
             local retries=12 pause=30 attempt=120 budget=$((600 - waited)) began=$SECONDS
             if [ "$budget" -lt 60 ]; then
                 retries=2

@@ -540,8 +540,9 @@ go on while it has had less than what is left of ten minutes for the whole fetch
 `Retry-After` header asks for is taken only if it ends within that time, so a host that says to come
 back in an hour ends the tries at once. A release whose turn comes when less than a minute is left
 gets three tries of 30 seconds at most. The fetch of the seven releases of a platform then takes
-about 12 minutes at the worst when the host answers errors at once, and about 20 when it holds every
-try to its limit. A program whose release could not be fetched is recorded with its address as the
+about 12 minutes when the host answers errors at once and about 19 when it holds every try to its
+limit; at the very most it takes 22 and a half minutes. A program whose release could not be fetched is
+recorded with its address as the
 reason, and the log names the address of a library; a program
 built against a library that is not installed is not built, and its reason names the library. The
 nightly workflow keeps the release archives in the Actions cache under the lock that pins them and

@@ -139,8 +139,8 @@ jobs:
       # minutes on the eleven nights of 30 October to 9 November (207 on 8 November), and the job
       # 155 to 210. The limits of the job's steps add up to 286 of its 300 minutes, the other steps'
       # each at least twice the longest its step took in those nights (the disk step, at 2.7
-      # minutes, has 6). The report's 240 minutes are 33 over the slowest night, and 14 over it with
-      # the fetch's worst case (about 20 minutes, in scripts/run-conformance.sh) added.
+      # minutes, has 6). The report's 240 minutes are 33 over the slowest night, and 10 over it with
+      # the fetch's worst case (22 and a half minutes, in scripts/run-conformance.sh) added.
       - name: The conformance report
         timeout-minutes: 240
         env:
@@ -365,9 +365,9 @@ jobs:
       # counts. Those steps' limits add up to 63 minutes, each at least twice the longest its step
       # took in the eleven nights (the disk step, at 3.8 minutes, has 8), so the limits of the
       # job's steps add up to 352 of its 355 minutes, under GitHub's six hours. The report's 289
-      # minutes are 24 over 8 November's need with its outage, 27 over it without, and 8 over it
-      # with the fetch's worst case (about 20 minutes, in scripts/run-conformance.sh) in place of
-      # the outage.
+      # minutes are 24 over 8 November's need with its outage, 27 over it without, and 5 over it
+      # with the fetch's worst case (22 and a half minutes, in scripts/run-conformance.sh) in place
+      # of the outage.
       - name: The conformance report
         timeout-minutes: 289
         env:
