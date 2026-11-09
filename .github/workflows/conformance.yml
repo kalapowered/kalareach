@@ -117,12 +117,12 @@ jobs:
       # The release archives of the applications the matrix runs come from their projects' hosts,
       # and a host can answer every request for a few minutes with an error: on 8 November four of
       # the macOS job's seven archives answered 504 for a minute each, and its report ran without
-      # them. The archives are kept in the Actions cache under the lock that pins them, so a night
-      # does not fetch what an earlier one did. The fetch checks each archive it finds against its
-      # pin and fetches again what does not match, and a cache step that fails or runs out of its
-      # time does not fail the job, so the cache costs a fetch at worst. The cache is saved by the
-      # default branch's runs only, and only by one that holds every archive, whether or not its
-      # report passed.
+      # them. The archives are kept in the Actions cache under the lock that pins them and the
+      # script that names their files, so a night does not fetch what an earlier one did. The
+      # fetch checks each archive it finds against its pin and fetches again what does not match,
+      # and a cache step that fails or runs out of its time does not fail the job, so the cache
+      # costs a fetch at worst. The cache is saved by the default branch's runs only, and only by
+      # one that holds every archive, whether or not its report passed.
       - name: Restore the applications' archives
         id: applications
         if: ${{ inputs.groups == '' || contains(inputs.groups, 'applications') }}
@@ -313,9 +313,9 @@ jobs:
         timeout-minutes: 15
         run: bash scripts/build-plugin-fixtures.sh
 
-      # The applications' release archives, kept under the lock that pins them, as the Linux job
-      # above has them: a host that answers 504 for a few minutes does not take the matrix's
-      # applications from a night that holds their archives.
+      # The applications' release archives, kept under the lock that pins them and the script that
+      # names their files, as the Linux job above has them: a host that answers 504 for a few
+      # minutes does not take the matrix's applications from a night that holds their archives.
       - name: Restore the applications' archives
         id: applications
         if: ${{ inputs.groups == '' || contains(inputs.groups, 'applications') }}
