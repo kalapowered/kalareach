@@ -1702,9 +1702,10 @@ the same way. Step 6 changes for a managed session: the worker binds the root-ed
 environment, and it reports itself ready only after the integration has qualified, which is after the
 user's startup files have run. An integration that fails before that closes the session that was
 being created and records why, and the worker reports the failure only after it has seen the shell end. A
-shell it does not see end within fifteen seconds is not reported on: the daemon finds the worker's
-connection gone, and the create is told that what became of it is not known. A session that fails
-to start after its shell was launched is reported the same way. An explicit compatibility retry is
+shell it does not see end within fifteen seconds is not reported on. The worker's connection then
+ends with no report, and the create is told that what became of it is not known when its own wait
+for the worker ends. A session that fails to start after its shell was launched is reported the same
+way. An explicit compatibility retry is
 a new create request.
 
 **`native_compat`** launches the selected stock shell. It keeps create, attach, detach, close,

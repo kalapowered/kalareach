@@ -353,8 +353,9 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     ) {
         Ok(runtime) => runtime,
         Err(failure) => {
-            // A shell that is not seen to have ended is not reported on, so the daemon finds the
-            // worker's connection gone and tells the create that what became of it is not known.
+            // A shell that is not seen to have ended is not reported on. The worker's connection
+            // then ends with no report, and the daemon answers the create that what became of it
+            // is not known when its own wait for the worker ends.
             if failure.shell_may_run {
                 tell(format_args!(
                     "the root shell is not seen to have ended after the session failed to start, \
@@ -476,8 +477,9 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         // The session is closed first, and the failure is reported, if it can be, once the shell
         // has ended: the daemon records a launch its worker reports as failed, and tells a repeat
         // of the create that the launch failed, which a shell still running would make false. A
-        // shell that is not seen to end within the bound is not reported on: the daemon then finds
-        // the worker's connection gone, and tells the create that what became of it is not known.
+        // shell that is not seen to end within the bound is not reported on: the worker's
+        // connection then ends with no report, and the daemon answers the create that what became
+        // of it is not known when its own wait for the worker ends.
         // A create that could not deliver the managed contract leaves a closure record rather than
         // a shell nobody is going to use.
         runtime.close(ClosureReason::RootLaunchFailed).1.release();
