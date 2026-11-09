@@ -368,30 +368,21 @@ pub(crate) fn barrier_lines(
             "Every affected session's worker has fenced it."
         ));
     }
-    // While any worker has not fenced it, every worker the host listed is stated, so a person
-    // reading a mixed answer sees which sessions have fenced it and which have not. When every one
-    // has, the one line above says so, and only a worker with something more to say is named.
-    let mixed = !barrier.holds();
+    // Every worker the host listed is stated with its state, whether or not any is pending, so a
+    // person sees which sessions have fenced it, which have ended and which have not.
     for worker in &barrier.workers {
         let names_pending = worker.names_pending.get();
         let omitted = worker.omitted_actions.get();
-        if mixed
-            || !worker.state.holds()
-            || !worker.detail.is_empty()
-            || names_pending > 0
-            || omitted > 0
-        {
-            lines.push(if worker.detail.is_empty() {
-                stdout_line!("  session {}: {}", worker.session_id, worker.state.as_str())
-            } else {
-                stdout_line!(
-                    "  session {}: {} ({})",
-                    worker.session_id,
-                    worker.state.as_str(),
-                    crate::shown::exported("WorkerBarrier", "detail", &worker.detail)
-                )
-            });
-        }
+        lines.push(if worker.detail.is_empty() {
+            stdout_line!("  session {}: {}", worker.session_id, worker.state.as_str())
+        } else {
+            stdout_line!(
+                "  session {}: {} ({})",
+                worker.session_id,
+                worker.state.as_str(),
+                crate::shown::exported("WorkerBarrier", "detail", &worker.detail)
+            )
+        });
         if names_pending > 0 {
             lines.push(stdout_line!(
                 "  session {}: {} action name{} not reached this host yet",
@@ -662,8 +653,8 @@ mod tests {
             "{text}"
         );
         assert!(
-            !text.contains(&session(7)),
-            "nothing to say about it: {text}"
+            text.contains(&format!("session {}: acknowledged", session(7))),
+            "a worker with nothing more to say is named with its state too: {text}"
         );
         assert!(
             text.contains("Every affected session's worker has fenced it."),
@@ -708,17 +699,32 @@ mod tests {
         assert!(!error.to_string().contains("at least"), "{error}");
     }
 
+    /// KR-REQ-18.14, each worker: when every worker has fenced the revocation, each one the host
+    /// listed is still named with its state, an ended one as ended and one that acknowledged it as
+    /// acknowledged.
     #[test]
     fn a_revocation_every_worker_fenced_says_so() {
         let device = DeviceId::new(Uuid::from_bytes([1; 16]));
         let text = written(revocation(
             device,
-            &revoked(vec![worker(2, BarrierState::Ended, "")]),
+            &revoked(vec![
+                worker(2, BarrierState::Ended, ""),
+                worker(3, BarrierState::Acknowledged, ""),
+            ]),
         ));
         assert!(
             text.contains("Every affected session's worker has fenced it."),
             "{text}"
         );
+        for (byte, state) in [(2, "ended"), (3, "acknowledged")] {
+            assert!(
+                text.contains(&format!(
+                    "session {}: {state}",
+                    SessionId::new(Uuid::from_bytes([byte; 16]))
+                )),
+                "each listed worker is named with its state: {text}"
+            );
+        }
         let text = written(revocation(device, &revoked(Vec::new())));
         assert!(text.contains("No session's worker was affected."), "{text}");
     }

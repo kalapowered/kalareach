@@ -2064,9 +2064,10 @@ A revocation is complete when every affected session's worker has fenced it, so 
 how far they have got. Until then it is pending, not a success: the command names each worker it
 waits for with the reason the host gives, and exits with 1 and `RESOURCE_UNAVAILABLE`; its `--json`
 document is the host's whole result with the failure beside it. Running it again reports how far
-the revocation has got. While any worker is pending, the command names every worker the host
-listed with its state, so a result where one session's worker has fenced it and another's has not
-says which is which. A worker that has fenced it but whose evidence has not all arrived is named
+the revocation has got. The command names every worker the host listed with its state, whether
+or not any is pending, so a result where one session's worker has fenced it and another's has not
+says which is which, and a complete one says which sessions' workers acknowledged it and which had
+ended. A worker that has fenced it but whose evidence has not all arrived is named
 too, and so is any action a worker could not show did not run before the revocation reached it.
 
 ## `kr action`
@@ -2151,9 +2152,9 @@ and each right that role does not cover, so a viewer share that lets the device 
 listed as `viewer plus question.respond`. A share that carries no role in full, because it has no
 `session.view`, is listed as `custom:` and its rights.
 `kr share revoke` takes a share back, or withdraws an invitation nobody has accepted. A revocation
-is complete when every affected session's worker has fenced it; until then it is pending, and the
-command names every session the host listed with its state, the ones whose workers have fenced it
-as well as the ones that have not, and exits with 1. When the host cut its
+is complete when every affected session's worker has fenced it; until then it is pending and exits
+with 1. Pending or complete, the command names every session the host listed with its state, the
+ones whose workers have fenced it as well as the ones that have not. When the host cut its
 list of workers, it listed those still waiting first, so the command says "at least" before the
 count of them, and `barrier.workers_total` gives how many workers were affected in all. Asking again
 is a new revocation. What the device already saw stays with it. With `--json` it returns `grant_id`
