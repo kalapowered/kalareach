@@ -37,8 +37,13 @@ final class PairingTests: DeviceTestCase {
         super.setUp()
         XCTAssertFalse(directory.isEmpty, "KR_PAIRING_DIR names no directory")
         try? FileManager.default.createDirectory(atPath: shots, withIntermediateDirectories: true)
-        // The script's line in the simulator's log, put there before the first case's first scan, so
-        // that the script can show its search of that log reaches back to the start of the run.
+    }
+
+    /// Once, before the first case: the script's line in the simulator's log, put there ahead of the
+    /// first scan, so that the script can show its search of that log reaches back to the start of
+    /// the run. (A line before every case would let a log that begins at the last case hold it.)
+    override class func setUp() {
+        super.setUp()
         if let marker = ProcessInfo.processInfo.environment["KR_PAIRING_MARKER"], !marker.isEmpty { NSLog("%@", marker) }
     }
 
@@ -342,7 +347,8 @@ final class PairingTests: DeviceTestCase {
                 if at > 1, texts[at - 1].parent == text.parent, texts[at - 2].parent == text.parent,
                    texts[at - 1].label.hasPrefix(prefix), texts[at - 2].label.hasPrefix(prefix) { return true }
             } else if text.label.hasPrefix(prefix) {
-                return true
+                // One text: the head, just before it, names the host too.
+                if at > 0, texts[at - 1].parent == text.parent, texts[at - 1].label.hasPrefix(prefix) { return true }
             }
         }
         return false
