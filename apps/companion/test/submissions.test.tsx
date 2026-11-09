@@ -808,6 +808,38 @@ describe('on the desktop', () => {
         expect(screen.getByTestId('composer-input')).toHaveValue('run the migration and more')
       })
 
+      it('sends nothing when the conversation was left and opened again during the read, though the message is as it was', async () => {
+        const recorded: Recorded = {
+          state: 'unknown',
+          revision: '3',
+          byAction: { [ANOTHER_ACTION]: 'dispatching' }
+        }
+        const reads: string[] = []
+        const sent: unknown[] = []
+        const { person } = await sentOnce(answers, recorded, reads, sent)
+        await waitFor(
+          () => {
+            expect(reads).toContain(ACTION)
+          },
+          { timeout: 3_000 }
+        )
+        await flush()
+        let letGo: () => void = () => undefined
+        recorded.hold = new Promise<void>((resolve) => {
+          letGo = resolve
+        })
+        await person.click(await screen.findByTestId('composer-send-anyway'))
+        // The person leaves the conversation and comes back to it, and writes nothing: the draft the
+        // press was made on is the draft the new view shows.
+        await person.click(screen.getByRole('tab', { name: 'Output' }))
+        await person.click(await screen.findByRole('tab', { name: 'Conversation' }))
+        expect(await screen.findByTestId('composer-input')).toHaveValue('run the migration')
+        letGo()
+        await flush()
+        expect(sent).toHaveLength(1)
+        expect(screen.getByTestId('composer-input')).toHaveValue('run the migration')
+      })
+
       it('names what it read last when the host cannot be asked at the press', async () => {
         const recorded: Recorded = { state: 'unknown', revision: '3' }
         const reads: string[] = []

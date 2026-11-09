@@ -537,8 +537,16 @@ export function Conversation({
   // "I checked; send anyway" reads the record of the earlier prompt again first, so the request
   // names the revision the host holds now. A record that has become applied or refused is shown
   // and nothing is sent: the person has not seen what it came to. A second press while the read is
-  // under way is ignored.
+  // under way is ignored, and so is a press whose view was left meanwhile: the view that opens again
+  // is a new one, and the person presses in it.
   const reading = useRef(false)
+  const here = useRef(true)
+  useEffect(() => {
+    here.current = true
+    return () => {
+      here.current = false
+    }
+  }, [])
   const sendAnyway = useCallback(() => {
     if (reading.current) return
     reading.current = true
@@ -557,6 +565,10 @@ export function Conversation({
         if (outcome.kind === 'settled') {
           settleFromRecord(outcome.localId, outcome.receipt)
           say('The host has since said what became of the earlier prompt. Nothing was sent.', 'danger')
+          return
+        }
+        if (!here.current) {
+          say('This view was left while the earlier prompt was read. Nothing was sent.', 'danger')
           return
         }
         // What the person typed while the record was read is not what the press was made on: it
