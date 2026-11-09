@@ -227,9 +227,9 @@ impl Drop for Tree {
         // this test started that could not be established as ended (a worker still running when its
         // closure was waited for, a registry that could not be read, a launch that named no
         // process). One already failing has said so, and a second panic would end the whole run
-        // instead. The failure says all that the lines above said, so that what the test left is in
-        // the failure's own output, under the test's name, and not only among the lines other tests
-        // write to the same error output.
+        // instead. Where the teardown is what fails, the failure says all that the lines above
+        // said, so that what the test left is in the failure's own output, under the test's name,
+        // and not only among the lines other tests write to the same error output.
         if !std::thread::panicking() {
             let mut left = Vec::new();
             if !jobs_left.is_empty() {
