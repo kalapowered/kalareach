@@ -88,6 +88,10 @@ peer_token="$(uuidgen)"
 emulator_pid=""
 emulator_serial=""
 emulator_adb=""
+# Whether the device on the serial was shown to be KalaReach's virtual device. Until it is, nothing is
+# installed into it, changed in it or stopped through it, and only this script's own emulator process
+# is ended, by its pid.
+emulator_checked=0
 # Set once this run has made its adb forward of the peer's port, so that only that forward is removed.
 peer_forward=""
 # The simulator application's directory for the run's request, set when the run has made it, so that its
@@ -100,9 +104,10 @@ say() { printf '== [voice-call-device] %s\n' "$*" | tee -a "$log"; }
 . "$here/scripts/lib/voice-call-judge.sh"
 
 # Ends what this script started and removes what it made. The harness is asked to finish; its
-# process is ended only when it does not, and only by the pid this script recorded. The emulator is
-# asked to stop through its serial, which the script took only after it found the serial free, and
-# is ended by its pid when it does not stop.
+# process is ended only when it does not, and only by the pid this script recorded. The emulator, once
+# its device was shown to be KalaReach's, is asked to stop through its serial, which the script took only
+# after it found the serial free, and is ended by its pid when it does not stop (an emulator not yet
+# shown to be is ended by its pid alone).
 finish() {
     touch "$harness/finish" 2>/dev/null
     # A later launch of the installed application must not find this run's request or start its peer.
@@ -116,8 +121,12 @@ finish() {
         kill -0 "$harness_pid" 2>/dev/null && kill "$harness_pid" 2>/dev/null
     fi
     if [ -n "$emulator_pid" ] && kill -0 "$emulator_pid" 2>/dev/null; then
-        [ -z "$peer_forward" ] || "$emulator_adb" -s "$emulator_serial" forward --remove "tcp:$peer_port" >/dev/null 2>&1
-        "$emulator_adb" -s "$emulator_serial" emu kill >/dev/null 2>&1
+        if [ "$emulator_checked" = 1 ]; then
+            [ -z "$peer_forward" ] || "$emulator_adb" -s "$emulator_serial" forward --remove "tcp:$peer_port" >/dev/null 2>&1
+            "$emulator_adb" -s "$emulator_serial" emu kill >/dev/null 2>&1
+        else
+            kill "$emulator_pid" 2>/dev/null
+        fi
         local stopped=0
         while kill -0 "$emulator_pid" 2>/dev/null && [ "$stopped" -lt 30 ]; do
             sleep 1
@@ -421,6 +430,16 @@ run_android() {
     done
     # The emulator this script started is the one that answered: its process is still there.
     { [ "$booted" = 1 ] && kill -0 "$emulator_pid" 2>/dev/null; } || { say "the emulator did not come up"; return 3; }
+    # And the device on the serial is KalaReach's virtual device: one that took the serial after the
+    # check that it was free would have answered the boot wait too. Before anything is installed,
+    # set or stopped on it.
+    local reported
+    reported="$(kr_android_device_name "$adb" "$serial")"
+    if [ "$reported" != "$avd" ]; then
+        say "the device on $serial reports ${reported:-no name}, not $avd, so it is left alone: nothing is installed into it, changed in it or stopped through it"
+        return 3
+    fi
+    emulator_checked=1
 
     # Only Wi-Fi carries the run. The emulator's simulated mobile network drops and returns every
     # minute or so, and a loss the run did not make would be read as part of what it measures.

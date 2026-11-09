@@ -137,6 +137,8 @@ struct Setup<'a> {
     boots_as: Option<&'a str>,
     /// Output folders of an earlier run that anyone could read, holding a file anyone could read.
     readable_outputs: bool,
+    /// The device refuses every installation, so that a script that goes on to install ends there.
+    installs_fail: bool,
 }
 
 impl Run {
@@ -461,6 +463,9 @@ fn run_with(
     if let Some(name) = setup.boots_as {
         fs::write(root.join("running-avd.txt"), format!("{name}\n")).expect("a name");
     }
+    if setup.installs_fail {
+        fs::write(root.join("installs-fail"), "").expect("a flag");
+    }
     if setup.readable_outputs {
         let folder = root.join("artefacts/pairing-device-android");
         fs::create_dir_all(&folder).expect("a directory");
@@ -493,8 +498,11 @@ fn run_with(
             // A device that boots stays up until the script that started it has gone or has asked
             // it to stop, as the real one does.
             if setup.boots_as.is_some() {
+                // It is listed by `adb devices` from the moment it is started, on the console port it
+                // was given.
                 format!(
-                    "[ \"$1\" = -list-avds ] || while [ ! -e \"{}\" ] && kill -0 \"$PPID\" 2>/dev/null; do sleep 0.2; done\n",
+                    "[ \"$1\" = -list-avds ] || {{ previous=; for each in \"$@\"; do [ \"$previous\" = -port ] && printf 'emulator-%s\\tdevice\\n' \"$each\" >\"{}\"; previous=$each; done; while [ ! -e \"{}\" ] && kill -0 \"$PPID\" 2>/dev/null; do sleep 0.2; done; }}\n",
+                    root.join("started.txt").display(),
                     stopped.display()
                 )
             } else {
@@ -509,14 +517,17 @@ fn run_with(
         &format!(
             "case \"$*\" in\n\
              *'emu kill'*) : >\"{stopped}\" ;;\n\
+             *install*) [ -f \"{installs_fail}\" ] && exit 1 ;;\n\
              *'emu avd name'*) [ -f \"{running_avd}\" ] && {{ cat \"{running_avd}\"; echo OK; }} ;;\n\
              *getprop*sys.boot_completed*) [ -f \"{booted}\" ] && echo 1 ;;\n\
              *getprop*) echo stand-in ;;\n\
-             devices*) echo 'List of devices attached'; [ -f \"{running}\" ] && cat \"{running}\" ;;\n\
+             devices*) echo 'List of devices attached'; [ -f \"{running}\" ] && cat \"{running}\"; [ -f \"{started}\" ] && cat \"{started}\" ;;\n\
              esac\nexit 0",
             running_avd = root.join("running-avd.txt").display(),
             booted = root.join("booted").display(),
             running = root.join("running.txt").display(),
+            started = root.join("started.txt").display(),
+            installs_fail = root.join("installs-fail").display(),
             stopped = stopped.display(),
         ),
     );
@@ -829,6 +840,134 @@ fn a_device_on_the_pairing_scripts_serial_that_is_not_kalareachs_is_left_alone()
         own.calls.join("\n")
     );
     assert!(own.calling_contains("adb", "kill"), "{}", own.output);
+}
+
+/// The scripts that start an emulator on a serial of their own: every script here but the one that
+/// uses whatever emulator is listed.
+const OWN_SERIAL: [&str; 11] = [
+    "scripts/e2e-pairing-device.sh",
+    "scripts/e2e-android-release.sh",
+    "scripts/e2e-push-device.sh",
+    "scripts/e2e-push-android-receiver.sh",
+    "scripts/store-android.sh",
+    "scripts/e2e-voice-call-bridge.sh",
+    "scripts/e2e-voice-call-device.sh",
+    "scripts/e2e-voice-device.sh",
+    "apps/companion/e2e/android-stores.sh",
+    "apps/companion/e2e/standing-emulator.sh",
+    "apps/companion/e2e/system-text-size-android.sh",
+];
+/// The ones among them that go on to install into the device, whose control run is ended by the
+/// device refusing the installation.
+const INSTALLS: [&str; 7] = [
+    "scripts/e2e-pairing-device.sh",
+    "scripts/e2e-android-release.sh",
+    "scripts/e2e-push-device.sh",
+    "scripts/e2e-push-android-receiver.sh",
+    "scripts/store-android.sh",
+    "scripts/e2e-voice-call-bridge.sh",
+    "scripts/e2e-voice-call-device.sh",
+];
+
+/// Whether a call to the debug bridge only reads: lists the devices, reads a property, asks a device
+/// its name.
+fn only_reads(call: &str) -> bool {
+    let mut words = call.split_whitespace().skip(1).peekable();
+    if words.peek() == Some(&"-s") {
+        words.nth(1);
+    }
+    matches!(
+        (words.next(), words.next(), words.next()),
+        (Some("devices"), _, _)
+            | (Some("shell"), Some("getprop"), _)
+            | (Some("emu"), Some("avd"), Some("name"))
+    )
+}
+
+/// Every script that starts an emulator on a serial of its own asks the device on that serial for its
+/// name once the emulator has booted, and a device that is not KalaReach's has nothing installed
+/// into it, set, driven or stopped: after the start the script's calls to the debug bridge only read.
+/// The same machine with KalaReach's device on the serial goes on to install, and stops the device
+/// when it ends.
+#[test]
+fn a_device_on_any_scripts_own_serial_that_is_not_kalareachs_is_left_alone() {
+    let mut problems = Vec::new();
+    for path in OWN_SERIAL {
+        let script = SCRIPTS
+            .iter()
+            .find(|script| script.path == path)
+            .expect("a script of the cases");
+        let other = run_with(
+            script,
+            &[OTHERS[0], KALAREACH],
+            None,
+            &[],
+            &Setup {
+                boots_as: Some(OTHERS[0]),
+                ..Setup::default()
+            },
+        );
+        let mut wrong = Vec::new();
+        if other.status == Some(0) {
+            wrong.push("it ran to its end".to_string());
+        }
+        // The companion's own scripts stop with a line that does not name the device; the others say
+        // which device answered.
+        if path.starts_with("scripts/") && !other.output.contains(OTHERS[0]) {
+            wrong.push(format!("it did not name {}", OTHERS[0]));
+        }
+        if other.started() != [KALAREACH] {
+            wrong.push(format!("it started {:?}", other.started()));
+        }
+        let changes: Vec<&String> = other
+            .calls
+            .iter()
+            .filter(|call| call.starts_with("adb ") && !only_reads(call))
+            .collect();
+        if !changes.is_empty() {
+            wrong.push(format!("it went on with the other device: {changes:?}"));
+        }
+        if !wrong.is_empty() {
+            problems.push(format!("{path}: {}\n{}", wrong.join(", "), other.output));
+        }
+        // What each script said, for whoever reads the run.
+        println!(
+            "{path}: status {:?}, {} calls to adb, all reads; it said: {}",
+            other.status,
+            other
+                .calls
+                .iter()
+                .filter(|call| call.starts_with("adb "))
+                .count(),
+            other
+                .output
+                .lines()
+                .find(|line| line.contains("left alone") || line.contains("is not the emulator"))
+                .unwrap_or("")
+        );
+
+        if INSTALLS.contains(&path) {
+            let own = run_with(
+                script,
+                &[OTHERS[0], KALAREACH],
+                None,
+                &[],
+                &Setup {
+                    boots_as: Some(KALAREACH),
+                    installs_fail: true,
+                    ..Setup::default()
+                },
+            );
+            if !own.calling_contains("adb", "install") || !own.calling_contains("adb", "kill") {
+                problems.push(format!(
+                    "{path} with KalaReach's device did not install and stop it:\n{}\n{}",
+                    own.output,
+                    own.calls.join("\n")
+                ));
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
 /// The driver moves the emulator's camera through its controller's port of the loopback interface, so

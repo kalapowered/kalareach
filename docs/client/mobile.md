@@ -470,9 +470,10 @@ Every script that starts an Android emulator takes the virtual device from `scri
 When the emulator does not list the device, the script says so by name, starts nothing and reports the
 platform as not available, and `scripts/e2e-mobile.sh` uses an emulator that is already running only when it
 is that device. Other virtual devices on the machine belong to other work, and no script starts, installs
-into, wipes or changes one. `scripts/e2e-pairing-device.sh` also asks the device on its serial for its name
-once it has booted, and installs into, changes or stops nothing unless that is the device, and it starts no
-emulator while the port of the emulator's controller is taken, since the driver moves the camera through it.
+into, wipes or changes one. A script that starts the emulator on a serial of its own also asks the device on
+that serial for its name once it has booted, and installs into, changes, drives or stops nothing unless that is
+the device, since a device that took the serial first is someone else's. `scripts/e2e-pairing-device.sh` starts
+no emulator while the port of the emulator's controller is taken, since its driver moves the camera through it.
 
 ## Files and locks on Android
 

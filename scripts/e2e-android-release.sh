@@ -76,6 +76,10 @@ harness_pid=""
 emulator_pid=""
 emulator_serial=""
 emulator_adb=""
+# Whether the device on the serial was shown to be KalaReach's virtual device. Until it is, nothing is
+# installed into it, changed in it or stopped through it, and only this script's own emulator process
+# is ended, by its pid.
+emulator_checked=0
 rules="$companion/src-tauri/gen/android/app/proguard-rules.pro"
 rules_saved=""
 
@@ -83,8 +87,9 @@ say() { printf '== [release-tls] %s\n' "$*" | tee -a "$log"; }
 
 # Ends what this script started and puts back what it changed: the host is asked to finish and ended
 # by the pid recorded only when it does not; the emulator is asked to stop through its serial after
-# the application and the tunnel it was given are taken away, and ended by its pid when it does not;
-# and the rules file is put back as it was.
+# the application and the tunnel it was given are taken away, and ended by its pid when it does not (an
+# emulator not yet shown to be KalaReach's is ended by its pid alone); and the rules file is put back as
+# it was.
 finish() {
     touch "$harness/finish" 2>/dev/null
     if [ -n "$harness_pid" ]; then
@@ -96,9 +101,13 @@ finish() {
         kill -0 "$harness_pid" 2>/dev/null && kill "$harness_pid" 2>/dev/null
     fi
     if [ -n "$emulator_pid" ] && kill -0 "$emulator_pid" 2>/dev/null; then
-        "$emulator_adb" -s "$emulator_serial" reverse --remove-all >/dev/null 2>&1
-        "$emulator_adb" -s "$emulator_serial" uninstall "$app_id" >/dev/null 2>&1
-        "$emulator_adb" -s "$emulator_serial" emu kill >/dev/null 2>&1
+        if [ "$emulator_checked" = 1 ]; then
+            "$emulator_adb" -s "$emulator_serial" reverse --remove-all >/dev/null 2>&1
+            "$emulator_adb" -s "$emulator_serial" uninstall "$app_id" >/dev/null 2>&1
+            "$emulator_adb" -s "$emulator_serial" emu kill >/dev/null 2>&1
+        else
+            kill "$emulator_pid" 2>/dev/null
+        fi
         local stopped=0
         while kill -0 "$emulator_pid" 2>/dev/null && [ "$stopped" -lt 30 ]; do
             sleep 1
@@ -214,6 +223,15 @@ for _ in $(seq 1 180); do
     sleep 2
 done
 { [ "$booted" = 1 ] && kill -0 "$emulator_pid" 2>/dev/null; } || { say "the emulator did not come up"; exit 3; }
+# And the device on the serial is KalaReach's virtual device: one that took the serial after the
+# check that it was free would have answered the boot wait too. Before anything is installed,
+# set or stopped on it.
+reported="$(kr_android_device_name "$adb" "$serial")"
+if [ "$reported" != "$avd" ]; then
+    say "the device on $serial reports ${reported:-no name}, not $avd, so it is left alone: nothing is installed into it, changed in it or stopped through it"
+    exit 3
+fi
+emulator_checked=1
 
 "$adb" -s "$serial" uninstall "$app_id" >/dev/null 2>&1
 "$adb" -s "$serial" install -r "$apk" >/dev/null || { say "the package did not install"; exit 2; }

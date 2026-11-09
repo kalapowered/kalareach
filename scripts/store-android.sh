@@ -130,11 +130,18 @@ if [ "$mode" = device ]; then
     serial_port=5598
     serial="emulator-$serial_port"
     emulator_pid=""
+    # Whether the device on the serial was shown to be KalaReach's virtual device. Until it is, nothing is
+    # installed into it or stopped through it, and only this script's own emulator process is ended, by its pid.
+    emulator_checked=0
     finish() {
         [ -n "$emulator_pid" ] || return 0
         if kill -0 "$emulator_pid" 2>/dev/null; then
-            "$adb" -s "$serial" uninstall "$app_id" >/dev/null 2>&1
-            "$adb" -s "$serial" emu kill >/dev/null 2>&1
+            if [ "$emulator_checked" = 1 ]; then
+                "$adb" -s "$serial" uninstall "$app_id" >/dev/null 2>&1
+                "$adb" -s "$serial" emu kill >/dev/null 2>&1
+            else
+                kill "$emulator_pid" 2>/dev/null
+            fi
             local stopped=0
             while kill -0 "$emulator_pid" 2>/dev/null && [ "$stopped" -lt 30 ]; do
                 sleep 1
@@ -171,6 +178,15 @@ if [ "$mode" = device ]; then
         sleep 2
     done
     { [ "$booted" = 1 ] && kill -0 "$emulator_pid" 2>/dev/null; } || { say "the emulator did not come up"; exit 3; }
+    # And the device on the serial is KalaReach's virtual device: one that took the serial after the
+    # check that it was free would have answered the boot wait too. Before anything is installed,
+    # set or stopped on it.
+    reported="$(kr_android_device_name "$adb" "$serial")"
+    if [ "$reported" != "$avd" ]; then
+        say "the device on $serial reports ${reported:-no name}, not $avd, so it is left alone: nothing is installed into it, changed in it or stopped through it"
+        exit 3
+    fi
+    emulator_checked=1
 
     page="$("$adb" -s "$serial" shell getconf PAGE_SIZE 2>/dev/null | tr -d '\r')"
     say "the emulator's page size is ${page:-unknown} bytes"

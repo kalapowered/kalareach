@@ -669,6 +669,21 @@ run_android() {
             fi
             sleep 2
         done
+        # And the device on the serial is KalaReach's virtual device: one that took the serial after the
+        # console port was found free would have answered the boot wait too, and it is not driven.
+        local reported=""
+        if [ "$up" = 1 ]; then
+            reported="$(kr_android_device_name "$adb_path" "$android_serial")"
+            if [ "$reported" != "$avd" ]; then
+                say "the device on $android_serial reports ${reported:-no name}, not $avd, so it is left alone: nothing is installed into it, changed in it or driven"
+                kill "$emulator_pid" 2>/dev/null || true
+                android_started_here=0
+                android_pid=""
+                android_serial=""
+                missing_platforms+=("android: the device on the serial is not KalaReach's")
+                return 3
+            fi
+        fi
         if [ "$up" != 1 ]; then
             say "the emulator did not come up within six minutes; see $artefacts/emulator.log"
             # Its own process, by the identity this run recorded, and nothing else.
