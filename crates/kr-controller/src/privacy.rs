@@ -175,7 +175,9 @@ pub struct Published {
     /// for, which a wait for the store can put before the moment it took effect. A turning on
     /// carries the moment it was asked for, and matters to no reader, which reads nothing while
     /// privacy mode is on. It is read with the state and in the same step. Nought for a host that
-    /// has never changed it.
+    /// has never changed it. It is the daemon's moment: a worker learns of a change a little later,
+    /// and what it produces in between is stamped after this moment and is carried. It is the wall
+    /// clock's, so a step of the clock back across it can put an earlier stamp after it.
     pub since_ms: u64,
 }
 
@@ -2948,7 +2950,6 @@ mod tests {
         }
 
         /// Opens the privacy record again over the same subsystems, as a daemon's next start does.
-        #[cfg(unix)]
         fn reopen_privacy(&mut self) {
             self.privacy = EnvironmentPrivacy::open(
                 self.root.path(),
@@ -3376,13 +3377,23 @@ mod tests {
                     .disable(at(10), &standing)
                     .expect("privacy mode is disabled")
             });
-            while !state.observed().changing {
+            // Bounds only a case that has failed: each wait ends when its condition holds.
+            let gives_up = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !state.observed().changing && !disabling.is_finished() {
+                assert!(
+                    std::time::Instant::now() < gives_up,
+                    "the change never asked to publish"
+                );
                 std::thread::yield_now();
             }
             // The change has asked to publish and the reader still holds the state it replaces:
             // from the first moment of the clock after this, nothing is produced under it.
             produced_while_on = kr_ipc::now_ms().get();
             while kr_ipc::now_ms().get() <= produced_while_on {
+                assert!(
+                    std::time::Instant::now() < gives_up,
+                    "the clock never moved on"
+                );
                 std::thread::yield_now();
             }
             drop(reader);
@@ -3401,7 +3412,6 @@ mod tests {
     /// only what is produced after the start. The record keeps the moment the last change was asked
     /// for, which a wait for the store can put before the moment it took effect, and a host that
     /// has never changed it has nothing to draw a line at.
-    #[cfg(unix)]
     #[test]
     fn a_restored_state_carries_the_moment_of_the_start_once_privacy_mode_has_changed() {
         let mut host = Host::open();
@@ -3426,6 +3436,22 @@ mod tests {
             restored.since_ms >= before,
             "restored as of {}, which is the moment the change was asked for and not the start at {before}",
             restored.since_ms
+        );
+
+        // A record whose moment is later than the start (the clock stepped back between them)
+        // keeps the later one.
+        let ahead = kr_ipc::now_ms().get() + 3_600_000;
+        host.privacy
+            .enable(&[], at(20), &standing)
+            .expect("privacy mode is enabled again");
+        host.privacy
+            .disable(TimestampMs::new(ahead), &standing)
+            .expect("privacy mode is disabled again");
+        host.reopen_privacy();
+        assert_eq!(
+            host.privacy.state().reading().published().since_ms,
+            ahead,
+            "a moment later than the start is kept"
         );
     }
 

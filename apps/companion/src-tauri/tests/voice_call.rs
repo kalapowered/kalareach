@@ -791,11 +791,14 @@ async fn a_call_whose_opening_context_the_service_refuses_goes_on_and_says_so() 
     assert!(started["value"]["outcome"]["started"].is_object());
     let refused = "the voice service did not take all of it";
     let warned = scene
-        .state_where("the warning that the service did not take the context", |state| {
-            state["warning"]
-                .as_str()
-                .is_some_and(|warning| warning.contains(refused))
-        })
+        .state_where(
+            "the warning that the service did not take the context",
+            |state| {
+                state["warning"]
+                    .as_str()
+                    .is_some_and(|warning| warning.contains(refused))
+            },
+        )
         .await;
     assert_eq!(warned["running"], true, "the call went on: {warned}");
     assert_eq!(warned["control"], "connected", "{warned}");

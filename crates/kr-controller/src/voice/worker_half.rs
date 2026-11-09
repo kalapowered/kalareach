@@ -13,8 +13,10 @@
 //! # Privacy mode
 //!
 //! While privacy mode is on nothing of this half is read. After it is turned off again only what
-//! was produced after it last changed is carried: a worker of an earlier release keeps its history
-//! through the change, and what such a worker holds of the interval before it is not for a call.
+//! was produced after the moment privacy mode last took effect, or after this daemon last
+//! started if that is later, is carried (`Published::since_ms`): a worker of an earlier release
+//! keeps its history through the change, a decision can stay pending through it, and what a worker
+//! holds of the interval before is not for a call.
 //!
 //! # What a decision is
 //!
@@ -38,8 +40,10 @@ pub const MAX_HISTORY_PARTS: usize = 64;
 /// The reason given when privacy mode is on.
 pub const PRIVACY_ON: &str = "privacy mode is on, so none of the session's worker was read";
 
-/// The reason given for what was produced before privacy mode last changed.
-pub const BEFORE_PRIVACY_CHANGE: &str = "produced before privacy mode last changed";
+/// The reason given for what was produced before the moment the context may start from: privacy
+/// mode's last change, or this daemon's last start, whichever is later.
+pub const BEFORE_PRIVACY_CHANGE: &str =
+    "produced before privacy mode last changed or this daemon last started, whichever is later";
 
 /// What the daemon read of one session's worker for the default context.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -74,8 +78,8 @@ impl WorkerHalf {
         });
     }
 
-    /// Keeps only what was produced after `boundary_ms`, the moment privacy mode last changed, and
-    /// says how many items that kept out.
+    /// Keeps only what was produced after `boundary_ms`, the moment the context may start from
+    /// (`Published::since_ms`), and says how many items that kept out.
     #[must_use]
     pub fn after(mut self, boundary_ms: Option<u64>) -> Self {
         let Some(boundary) = boundary_ms else {
