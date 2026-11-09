@@ -12,8 +12,9 @@
 //! The script and this suite talk through files in `KR_HARNESS_DIR`, on the internal disk (a file
 //! holds an invitation's secret, so it is written for its owner alone). The suite works through the
 //! phases the script asks for, each started by a `go-<phase>` file, in any order and any number of
-//! times, and ends when `finish` appears, which also ends a phase's wait for the phone or the
-//! script. Every phase says when it is done with `done-<phase>`.
+//! times, and ends when `finish` appears, which also ends the waits of a phase that have a limit
+//! (for the phone, the script or the host itself), between one request and the next. Every phase
+//! says when it is done with `done-<phase>`.
 //!
 //! | Phase | The script's file | The suite writes |
 //! | --- | --- | --- |
@@ -353,10 +354,11 @@ impl Run {
         write_private(&self.directory.join(file), text.as_bytes());
     }
 
-    /// Whether a wait that began so as to end by `end` goes on. Every wait of a phase that has a limit
-    /// stops at it and when the script has said the run is finished, so that a failed run ends this
-    /// suite at once, with its daemons stopped and their trees removed, and not when the limit
-    /// passes.
+    /// Whether a wait that began so as to end by `end` goes on. Every wait of this file's phases that
+    /// has a limit stops at it and when the script has said the run is finished, so that a failed run
+    /// ends this suite at once, with its daemons stopped and their trees removed, and not when the
+    /// limit passes. A request already made is not cut short, and the shared pairing and dialling
+    /// helpers of the integration suites keep limits of their own.
     fn waiting(&self, end: Instant) -> bool {
         Instant::now() < end && !self.directory.join("finish").exists()
     }
