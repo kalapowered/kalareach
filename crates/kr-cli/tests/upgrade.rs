@@ -100,7 +100,7 @@ impl Previous {
         // before the manifest said what each shell package is made of, as every retained release
         // is: a rollback to it reads that document, and the release's own `kr` reads it when it
         // installs. A later release before this one writes the form of its own build.
-        assembled = assembled.as_an_earlier_build_wrote_it();
+        assembled = assembled.written_by_an_earlier_build();
         // The stores the release declares it reads are its own, and not this build's: a store this
         // build raised or added is one the release before refuses or does not name, and a rollback
         // to it has to be decided by what the release says it reads, not left to a daemon that
@@ -473,7 +473,7 @@ impl Assembled {
     /// This release as a build before this one wrote it, which the release before this one is: its
     /// manifest has no `agents` and no `dependencies`, and each shell package it lists states its
     /// identity and the revisions of its patches, which is all that build had to say of one.
-    fn as_an_earlier_build_wrote_it(mut self) -> Self {
+    fn written_by_an_earlier_build(mut self) -> Self {
         self.earlier = true;
         self
     }
@@ -2866,7 +2866,6 @@ async fn a_record_of_sends_the_release_before_leaves_beside_a_sent_answer_is_swe
             &leave,
         )
         .expect("the pair is recorded");
-    drop(leave);
     drop(writers);
     let answer_file = kept.join(format!("{question_id}.answer"));
     let record_file = kept.join(format!("{question_id}.send"));
