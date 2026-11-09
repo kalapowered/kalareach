@@ -1010,35 +1010,49 @@ impl Assembled {
 /// How a copy of a packed archive came not to be the archive.
 #[derive(Debug)]
 enum Unequal {
-    /// The packed archive reads as it did when it was packed, and the copy differs from it.
+    /// The packed archive no longer reads as it did when it was packed.
+    Packed { was: [u8; 32], now: [u8; 32] },
+    /// The packed archive reads as it did when it was packed, and the copy, read again, differs from it.
     Copy {
         /// The byte at which the two first differ: where the shorter ends, when one is a prefix of
         /// the other.
         first_difference: u64,
         length: u64,
+        archive_length: u64,
         digest: [u8; 32],
     },
-    /// The packed archive no longer reads as it did when it was packed.
-    Packed { digest: [u8; 32] },
+    /// The copy read as another file the first time and, read again, as the archive: the system gave
+    /// other bytes for the same file.
+    ReadsDifferently { first: [u8; 32] },
 }
 
 impl std::fmt::Display for Unequal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Packed { was, now } => write!(
+                formatter,
+                "the packed archive has changed since it was packed: it read as {} then and reads \
+                 as {} now",
+                hex_of(was),
+                hex_of(now)
+            ),
             Self::Copy {
                 first_difference,
                 length,
+                archive_length,
                 digest,
             } => write!(
                 formatter,
-                "the packed archive reads as it did when it was packed; the copy is {length} \
-                 bytes, reads as {}, and first differs from it at byte {first_difference}",
+                "the packed archive reads as it did when it was packed ({archive_length} bytes); \
+                 the copy is {length} bytes, reads as {}, and first differs from it at byte \
+                 {first_difference}",
                 hex_of(digest)
             ),
-            Self::Packed { digest } => write!(
+            Self::ReadsDifferently { first } => write!(
                 formatter,
-                "the packed archive has changed since it was packed: it reads now as {}",
-                hex_of(digest)
+                "the copy read as {} and then, read again, as the archive: the system gave other \
+                 bytes for the same file",
+                hex_of(first)
             ),
         }
     }
@@ -1046,19 +1060,29 @@ impl std::fmt::Display for Unequal {
 
 /// Holds `copy` to the archive packed at `packed`, which read as `digest` when it was packed.
 ///
-/// A copy that does not read as `digest` is compared with the packed archive as it reads now, so
-/// that the failure says which of the two is not what was packed, and where the copy first differs.
+/// A copy that does not read as `digest` is compared with the packed archive as it reads now, each
+/// read once more into memory and the digests taken of what was read, so that the failure says which
+/// of the two is not what was packed, and where the copy first differs.
 fn held_to(packed: &Path, digest: [u8; 32], copy: &Path) -> Result<(), Unequal> {
-    let copied_digest = file_digest(copy);
-    if copied_digest == digest {
+    use sha2::Digest as _;
+
+    let first = file_digest(copy);
+    if first == digest {
         return Ok(());
     }
-    let now = file_digest(packed);
-    if now != digest {
-        return Err(Unequal::Packed { digest: now });
-    }
     let archive = std::fs::read(packed).expect("the packed archive");
+    let archive_digest: [u8; 32] = sha2::Sha256::digest(&archive).into();
+    if archive_digest != digest {
+        return Err(Unequal::Packed {
+            was: digest,
+            now: archive_digest,
+        });
+    }
     let copied = std::fs::read(copy).expect("the copy");
+    let copied_digest: [u8; 32] = sha2::Sha256::digest(&copied).into();
+    if copied_digest == digest {
+        return Err(Unequal::ReadsDifferently { first });
+    }
     let first_difference = archive
         .iter()
         .zip(&copied)
@@ -1067,6 +1091,7 @@ fn held_to(packed: &Path, digest: [u8; 32], copy: &Path) -> Result<(), Unequal> 
     Err(Unequal::Copy {
         first_difference: first_difference as u64,
         length: copied.len() as u64,
+        archive_length: archive.len() as u64,
         digest: copied_digest,
     })
 }
