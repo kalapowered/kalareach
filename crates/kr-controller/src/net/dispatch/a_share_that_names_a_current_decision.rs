@@ -2341,6 +2341,7 @@ impl Served {
                 Vec::new(),
                 kr_worker::broker::Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
             ),
+            privacy: kr_worker::broker::observation::PrivacyMark::default(),
         };
         let plugin_id = connector.plugin_id();
         let (retire, retired) = tokio::sync::oneshot::channel::<()>();
