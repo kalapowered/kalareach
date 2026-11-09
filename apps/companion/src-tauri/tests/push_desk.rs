@@ -5638,8 +5638,9 @@ mod earlier_release {
     }
 }
 
-/// The record a build writes of a registration nobody knows the outcome of is read by the release
-/// that did not keep it, which ignores the entry: the host reads as one that needs the person.
+/// The record a build writes of a registration nobody knows the outcome of, with the action, the
+/// words, the digest, the choice of previews and the time, is read by the release that did not keep
+/// it, which ignores the entry: the host reads as one that needs the person.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_record_with_an_unknown_registration_reads_under_the_earlier_releases_types() {
     let (_host, phone, _reference, action) =
@@ -5647,6 +5648,11 @@ async fn a_record_with_an_unknown_registration_reads_under_the_earlier_releases_
     let file = find(phone._phone.data.path(), "push.json").expect("the record");
     let bytes = std::fs::read(&file).expect("the record");
     assert_eq!(record_of(&phone)["unsettled"]["action_id"], action.as_str());
+    assert!(
+        record_of(&phone)["unsettled"]["previews"].is_boolean(),
+        "the entry holds the choice of previews the registration carried: {}",
+        record_of(&phone)
+    );
 
     let earlier: earlier_release::Record =
         serde_json::from_slice(&bytes).expect("the earlier release reads it");
