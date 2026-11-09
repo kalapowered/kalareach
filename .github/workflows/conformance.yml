@@ -148,14 +148,37 @@ jobs:
           done
           bash scripts/run-conformance.sh ${arguments[@]+"${arguments[@]}"}
 
-      # The index the fetch wrote names a program it could not install as unavailable.
+      # The archives are held when the index the fetch wrote reads, is for this lock, names every
+      # program the lock pins, and names none of them as unavailable: an index that is empty, cut
+      # short or missing a program is not one to save the archives under.
       - name: Check that every application's archive is held
         id: applications-held
         if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.applications.outputs.cache-hit != 'true' && (inputs.groups == '' || contains(inputs.groups, 'applications')) }}
         timeout-minutes: 1
         run: |
           index="$HOME/.cache/kalareach/conformance-applications/index.json"
-          if [ -f "$index" ] && ! grep -q '"status": "unavailable"' "$index"; then
+          if python3 - "$index" tests/conformance/applications.lock <<'PYTHON'
+          import hashlib
+          import json
+          import sys
+
+          index = json.load(open(sys.argv[1]))
+          lock = open(sys.argv[2], "rb").read()
+          programs = sorted(
+              application["id"]
+              for application in json.loads(lock)["applications"]
+              if application.get("role", "program") == "program"
+          )
+          named = sorted(application["id"] for application in index["applications"])
+          unavailable = [a for a in index["applications"] if a["status"] == "unavailable"]
+          held = (
+              index["lock_sha256"] == hashlib.sha256(lock).hexdigest()
+              and named == programs
+              and not unavailable
+          )
+          sys.exit(0 if held else 1)
+          PYTHON
+          then
             echo "held=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -349,14 +372,37 @@ jobs:
           done
           bash scripts/run-conformance.sh ${arguments[@]+"${arguments[@]}"}
 
-      # The index the fetch wrote names a program it could not install as unavailable.
+      # The archives are held when the index the fetch wrote reads, is for this lock, names every
+      # program the lock pins, and names none of them as unavailable: an index that is empty, cut
+      # short or missing a program is not one to save the archives under.
       - name: Check that every application's archive is held
         id: applications-held
         if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.applications.outputs.cache-hit != 'true' && (inputs.groups == '' || contains(inputs.groups, 'applications')) }}
         timeout-minutes: 1
         run: |
           index="$HOME/Library/Caches/kalareach/conformance-applications/index.json"
-          if [ -f "$index" ] && ! grep -q '"status": "unavailable"' "$index"; then
+          if python3 - "$index" tests/conformance/applications.lock <<'PYTHON'
+          import hashlib
+          import json
+          import sys
+
+          index = json.load(open(sys.argv[1]))
+          lock = open(sys.argv[2], "rb").read()
+          programs = sorted(
+              application["id"]
+              for application in json.loads(lock)["applications"]
+              if application.get("role", "program") == "program"
+          )
+          named = sorted(application["id"] for application in index["applications"])
+          unavailable = [a for a in index["applications"] if a["status"] == "unavailable"]
+          held = (
+              index["lock_sha256"] == hashlib.sha256(lock).hexdigest()
+              and named == programs
+              and not unavailable
+          )
+          sys.exit(0 if held else 1)
+          PYTHON
+          then
             echo "held=true" >> "$GITHUB_OUTPUT"
           fi
 

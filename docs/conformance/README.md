@@ -545,8 +545,9 @@ try to its limit. A program whose release could not be fetched is recorded with 
 reason, and the log names the address of a library; a program
 built against a library that is not installed is not built, and its reason names the library. The
 nightly workflow keeps the release archives in the Actions cache under the lock that pins them and
-the script that fetches them, and a default-branch run that holds every archive saves them, whether
-or not its report passed. The fetch checks each archive it finds there against its pin and fetches
+the script that fetches them, and a default-branch run saves them, whether or not its report passed,
+when its index reads, is for that lock, names every program the lock pins and names none of them as
+not installed. The fetch checks each archive it finds there against its pin and fetches
 again any that does not match, so an outage at a release's host costs nothing on a night that
 already holds its archive. Nothing is taken from a package manager.
 
