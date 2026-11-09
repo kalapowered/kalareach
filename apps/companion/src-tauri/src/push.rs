@@ -719,7 +719,83 @@ struct State {
     next_run: u64,
 }
 
+/// What the person's request to turn notifications on for a host comes to.
+#[derive(Debug, PartialEq, Eq)]
+enum Request {
+    /// The request names a registration other than the one the host stands at: the page was shown
+    /// a view the host has left, and nothing is done.
+    Stale,
+    /// The host is on, and only the keys the receivers hold need filing.
+    Keys,
+    /// A run holds the host already.
+    Busy,
+    /// The run that now holds the host.
+    Run(u64),
+}
+
 impl State {
+    /// A desk's state over `record`, with nothing running.
+    fn over(record: Record) -> Self {
+        Self {
+            record,
+            running: BTreeMap::new(),
+            cancels: BTreeMap::new(),
+            asking: BTreeSet::new(),
+            observed: BTreeMap::new(),
+            unconfirmed: BTreeMap::new(),
+            keys_unfiled: None,
+            views: 0,
+            next_run: 0,
+        }
+    }
+
+    /// What the person's request for `host` comes to, decided and taken in one hold of the state: a
+    /// request that names the registration whose outcome nobody knows that the host stands at, or
+    /// none when there is none, takes the host. The name is compared where the host is claimed, so a
+    /// run that ended unknown between the two cannot be replaced by a request that was made before
+    /// it began.
+    fn request(&mut self, host: DeviceId, after_unknown: Option<&str>, now: u64) -> Request {
+        let key = host.to_string();
+        let standing = self
+            .record
+            .hosts
+            .get(&key)
+            .and_then(|kept| kept.unsettled.as_ref())
+            .map(|unsettled| unsettled.action_id.to_string());
+        if standing.as_deref() != after_unknown {
+            return Request::Stale;
+        }
+        // A host that is on, and is shown as needing the person only because the receivers could not
+        // be handed the keys, has nothing to register again: a sequence would spend the gateway's
+        // issues and retire the credential the host holds, and the store would refuse the keys
+        // again. Try again files the keys, alone.
+        if self.keys_unfiled.is_some()
+            && !self.unconfirmed.contains_key(&host)
+            && self
+                .record
+                .hosts
+                .get(&key)
+                .is_some_and(|kept| kept.phase == Phase::On && !kept.lost)
+        {
+            return Request::Keys;
+        }
+        self.asking.insert(host);
+        // The state says "working" only for a host a run is now taking up: a run that is ending has
+        // said what it has to say.
+        let Some(run) = self.claim(host) else {
+            return Request::Busy;
+        };
+        PushDesk::mark(
+            self,
+            host,
+            Phase::Working,
+            "Asking for permission.",
+            false,
+            now,
+        );
+        Request::Run(run)
+    }
+
     /// Takes the right to run the sequence for `host`, which is refused while a run holds it.
     fn claim(&mut self, host: DeviceId) -> Option<u64> {
         if self.running.contains_key(&host) {
@@ -851,17 +927,7 @@ impl PushDesk {
             native,
             registrar,
             wiring,
-            state: Mutex::new(State {
-                record,
-                running: BTreeMap::new(),
-                cancels: BTreeMap::new(),
-                asking: BTreeSet::new(),
-                observed: BTreeMap::new(),
-                unconfirmed: BTreeMap::new(),
-                keys_unfiled: None,
-                views: 0,
-                next_run: 0,
-            }),
+            state: Mutex::new(State::over(record)),
             registering: tokio::sync::Mutex::new(()),
             filed: tokio::sync::Mutex::new(None),
             choosing: tokio::sync::Mutex::new(()),
@@ -979,59 +1045,27 @@ impl PushDesk {
             // A host started now would be one this phone could not remember.
             return Ok(self.view());
         }
-        let standing = lock(&self.state)
-            .record
-            .hosts
-            .get(&host.host_device_id.to_string())
-            .and_then(|kept| kept.unsettled.as_ref())
-            .map(|unsettled| unsettled.action_id.to_string());
-        if standing.as_deref() != after_unknown {
-            return Ok(self.view());
-        }
-        // A host that is on, and is shown as needing the person only because the receivers could not
-        // be handed the keys, has nothing to register again: a sequence would spend the gateway's
-        // issues and retire the credential the host holds, and the store would refuse the keys
-        // again. Try again files the keys, alone.
-        let only_the_keys = {
-            let state = lock(&self.state);
-            state.keys_unfiled.is_some()
-                && !state.unconfirmed.contains_key(&host.host_device_id)
-                && state
-                    .record
-                    .hosts
-                    .get(&host.host_device_id.to_string())
-                    .is_some_and(|kept| kept.phase == Phase::On && !kept.lost)
-        };
-        if only_the_keys {
-            let desk = Arc::clone(self);
-            tauri::async_runtime::spawn(async move { desk.file_keys_logged().await });
-            return Ok(self.view());
-        }
         let now = (self.wiring.clock)();
-        let run = {
+        let request = {
             let mut state = lock(&self.state);
-            state.asking.insert(host.host_device_id);
-            // The state says "working" only for a host a run is now taking up: a run that is
-            // ending has said what it has to say.
-            let run = state.claim(host.host_device_id);
-            if run.is_some() {
-                Self::mark(
-                    &mut state,
-                    host.host_device_id,
-                    Phase::Working,
-                    "Asking for permission.",
-                    false,
-                    now,
-                );
+            let request = state.request(host.host_device_id, after_unknown, now);
+            if matches!(request, Request::Run(_)) {
                 self.keep(&state.record);
             }
-            run
+            request
         };
-        if let Some(run) = run {
-            // The run starts before the page is told: a host marked working has a run behind it
-            // even when the page's callback fails.
-            self.spawn_run(host, run, Reach::Asked, Job::Full);
-            self.tell_page();
+        match request {
+            Request::Stale | Request::Busy => {}
+            Request::Keys => {
+                let desk = Arc::clone(self);
+                tauri::async_runtime::spawn(async move { desk.file_keys_logged().await });
+            }
+            Request::Run(run) => {
+                // The run starts before the page is told: a host marked working has a run behind
+                // it even when the page's callback fails.
+                self.spawn_run(host, run, Reach::Asked, Job::Full);
+                self.tell_page();
+            }
         }
         Ok(self.view())
     }
@@ -3131,6 +3165,67 @@ mod tests {
         );
         assert_eq!(started.hosts["on"], on);
         assert_eq!(started.hosts["stopped"], stopped);
+    }
+
+    /// KR-REQ-23.24: a request the person made for a view in which the host had no registration of
+    /// unknown outcome does not take the host once a run has sent one and ended without knowing how
+    /// it came out. The window between a request's check and its claim is one the desk's own hold
+    /// closes: no seam outside the state reaches it, so the interleaving is made here, in the order
+    /// it would happen: the request is for the earlier view, a run holds the host, sends, ends
+    /// unknown, and the request is decided afterwards.
+    #[test]
+    fn a_request_made_before_a_run_ended_unknown_does_not_replace_what_that_run_sent() {
+        let id = DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([5; 16]));
+        let key = id.to_string();
+        let mut state = State::over(Record {
+            version: VERSION,
+            hosts: BTreeMap::from([(key.clone(), host(Phase::Attention, false))]),
+        });
+
+        // A look's run holds the host: the request for the view with no unknown outcome finds it
+        // busy, and the run goes on to send.
+        let run = state.claim(id).expect("the look's run");
+        assert_eq!(state.request(id, None, 10), Request::Busy);
+        let action = ActionId::new(kr_ipc::new_uuid());
+        state
+            .record
+            .hosts
+            .get_mut(&key)
+            .expect("the host")
+            .unsettled = Some(Unsettled {
+            action_id: action,
+            words: "unknown".to_owned(),
+            digest: Digest256::from_bytes([1; 32]),
+            previews: true,
+            at_ms: 9,
+        });
+        // The run ends without knowing how its registration came out, and gives the host up.
+        assert!(state.holds(id, run));
+        state.running.remove(&id);
+
+        assert_eq!(
+            state.request(id, None, 11),
+            Request::Stale,
+            "the request is for a view the host has left"
+        );
+        assert!(
+            !state.running.contains_key(&id),
+            "nothing took the host for it"
+        );
+        assert_eq!(
+            state.record.hosts[&key].phase,
+            Phase::Attention,
+            "the host was not marked as working"
+        );
+        assert_eq!(
+            state.request(id, Some("00000000-0000-4000-8000-000000000000"), 12),
+            Request::Stale,
+            "another registration than the one the host stands at is for another view as well"
+        );
+        assert!(matches!(
+            state.request(id, Some(&action.to_string()), 13),
+            Request::Run(_)
+        ));
     }
 
     /// A time later than the start's own is a clock set back: the retry is not delayed by it.

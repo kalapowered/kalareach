@@ -605,7 +605,9 @@ answered. A refusal in answer to the repeat does not settle it, since a host tha
 this phone refuses a repeat for that reason too, so the person decides. The person's request asks about the earlier registration once more before it
 registers again, and registers again, under a new action, unless the host says it took the earlier
 one. A request that names another registration than the one the host stands at, or none, is for a
-view the host has left, and sends nothing. A refusal by the host, a refusal for now, and a
+view the host has left, and sends nothing; the name is compared where the host is claimed, in one
+hold, so a registration that a run sent after the view was read is not replaced by a request made
+for that view. A refusal by the host, a refusal for now, and a
 registration that was never sent (the phone could not reach the host, or could not keep its record
 first) are not unknown, and are retried as before.
 
