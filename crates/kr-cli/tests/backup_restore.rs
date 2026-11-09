@@ -1493,11 +1493,13 @@ fn checkpoint_of(sealed: &Sealed) -> ArchiveCheckpoint {
 /// when the host has one), and the private keys of the four X25519 pairs, each checked against the
 /// pair's public key. Each key is looked for as bytes, in hexadecimal of either case, in either
 /// base64 alphabet wherever it lies in a longer value, and as a list of numbers. The controls are
-/// the scan finding each form where a key is put, the folder the restore names in its output, the
-/// bundle's writer key in the bundle and the bundle's ciphertext in the requests. Not shown here:
-/// what the restore writes into its folder (the restore cases read it); the second restore's
-/// requests; the parts of a request the stand-in does not keep (its headers other than the token,
-/// a query on its path, the signature block beyond the body); a key in a binary list of integers,
+/// the scan finding each form where a key is put, the report's `checkpoint_recorded` member in the
+/// restore's output, the bundle's writer key in the bundle and the bundle's ciphertext in the
+/// requests. Not shown here: the local call to the daemon that carries the bundle
+/// (`backup.bundle.write`) and its reply, whose parameters are typed and refuse unknown members;
+/// what the restore writes into its folder, which the restore cases read for the members and fields
+/// they name and not for the host's keys; the second restore's requests; the parts of a request the stand-in does not keep (its headers other than the token,
+/// a query on its path, the signature block, any member of the signed document other than its body, and the authentication requests, which the stand-in answers before it keeps a record); a key in a binary list of integers,
 /// split, reversed or otherwise transformed; or the other data paths of backup and recovery
 /// material.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1613,8 +1615,22 @@ async fn a_restore_records_the_generation_it_verified_in_the_bundle() {
             );
         }
     }
+    let list = format!(
+        "{{\"k\":[\n  {}\n]}}",
+        probe
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",\n  ")
+    )
+    .into_bytes();
+    assert_eq!(
+        carried_in(&list, probe).as_deref(),
+        Some("as a list of numbers")
+    );
+    // A member the report names, whatever the platform spells a folder with.
     assert!(
-        carried_in(&restored.stdout, into_arg.as_bytes()).is_some(),
+        carried_in(&restored.stdout, b"checkpoint_recorded").is_some(),
         "the scan does not read the restore's output"
     );
     let writer = after
