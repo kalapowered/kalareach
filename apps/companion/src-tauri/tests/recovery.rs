@@ -1827,27 +1827,33 @@ async fn publish_generation(
 
 /// KR-REQ-20.17, what this case reads of the companion's outputs and no more: the kit file saved as
 /// text; the QR code file and the text a scanner reads from it; the offline export file of the
-/// bundle alone (`archive: null`) and the one of an archive the host made and published, as bytes;
-/// the setup a host double is sent when the computer covers it, as the JSON of its parameters; the
+/// bundle alone (`archive: null`) and the one of an archive made for the host double and published
+/// at the service, as bytes; the setup a host double is sent when the computer covers it, as the
+/// JSON of its parameters; the
 /// sealed bundle in the setup and the one in the bundle export, each opened with the kit alone (and
 /// each equal, byte for byte, to the bundle the service holds); the bundle as the service holds
 /// it, opened with the kit alone once the host is covered (so it names the host's public keys); the
-/// view of the host's cover that the page is sent; and the answers to the commands the page was
-/// called with in this case. None of them holds a private key this computer keeps in the secure
+/// view of the host's cover that the page is sent; the answers to the commands the page was called
+/// with in this case; and every request the service was sent in it (the computer's, and the
+/// case's own reads and publication), each body, the content beside it and the token. None of them
+/// holds a private key this computer keeps in the secure
 /// store beside the recovery seed: the reusable endpoint (transport) key, the control-signing
 /// (authorisation) key, and the stored envelope and notification preview keys with the private keys
 /// made from their seeds, which are checked against the public keys of the pairs. Each key is
 /// looked for as bytes, in hexadecimal of either case, in either base64 alphabet wherever it lies in
 /// a longer value, and as a list of numbers. The archive export is made over a generation sealed
 /// for the recovery recipient with production primitives and put at the service; the file is
-/// decoded and equal, object by object, to what the service holds, so it adds no byte of its own.
+/// decoded, with its origin the kit's, its archive the one exported and its publication and objects
+/// equal, object by object, to what the service holds, so it adds no byte of its own.
 /// The controls are the scan finding a seed in each of those forms, the seed printed from the
 /// secure store's own copy in the kit file and in what the QR code scans back to, the kit's
 /// fingerprint in the setup, the host's writer key in the opened bundle, the writer's key
 /// identifier and a member's ciphertext in the archive export, and the cover view's fields in what
-/// the page was told. Not shown here: what an archive the host really makes carries (the daemon's
-/// production case reads the host's, and the members here are the case's own); the host's private
-/// keys, which this computer never holds; a key in a binary list of integers, split, reversed or
+/// the page was told, and the bundle's ciphertext in the requests. Not shown here: what an archive
+/// the host really makes carries (the daemon's production case reads the host's, and the members
+/// here are the case's own); the host's private keys, which this computer never holds; the parts of
+/// a request the stand-in does not keep (its headers other than the token, a query on its path, the
+/// signature block beyond the body); a key in a binary list of integers, split, reversed or
 /// otherwise transformed; `kr backup setup`'s outputs; or the other data paths of backup and
 /// recovery material. The view is sent through a command this suite registers over the host double
 /// and not through `recovery_cover_host`, which needs a connection to a host this suite has none of.
@@ -1923,9 +1929,9 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
     host.sets_up();
     let view = page.cover_host(&host, false).expect("the host is covered");
     assert_eq!(view["state"], "covered");
-    let sent = host.setups_sent();
-    assert_eq!(sent.len(), 1, "the host was sent one setup");
-    let (setup_params, held_exactly) = &sent[0];
+    let sent_setup = host.setups_sent();
+    assert_eq!(sent_setup.len(), 1, "the host was sent one setup");
+    let (setup_params, held_exactly) = &sent_setup[0];
     assert!(
         *held_exactly,
         "the service held exactly the bundle the host was sent when the host was asked"
@@ -1971,6 +1977,10 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
         held_bundle.as_slice(),
         "the setup's bundle is the one the service holds"
     );
+    assert_eq!(
+        bundle_export.service_origin, kit.service_origins[0],
+        "the export names the service the kit names"
+    );
     let seed = RecoverySeed::from_kit(&kit).expect("the kit's seed");
     let bundle_key = seed
         .bundle_key_for(&kit.context(&kit.service_origins[0]).expect("a context"))
@@ -1985,7 +1995,7 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
     let setup_bundle = opened_with_the_kit(setup_params.sealed_bundle.as_slice());
     let export_bundle = opened_with_the_kit(bundle_export.encrypted_bundle.as_slice());
 
-    // An archive the host made and published, listed by the page and exported by it.
+    // An archive made for the host double and published, listed by the page and exported by it.
     let archive = setup_params.archive_id;
     let published = publish_generation(
         &computer,
@@ -2022,10 +2032,23 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
         held_bundle.as_slice(),
         "the archive export's bundle is the one the service holds"
     );
+    assert_eq!(
+        exported.service_origin, kit.service_origins[0],
+        "the archive export names the service the kit names"
+    );
     let carried = exported.archive.0.as_ref().expect("an archive");
     assert_eq!(carried.archive_id, archive);
     assert_eq!(
         carried.publication, published.publication,
+        "the publication that was sent"
+    );
+    assert_eq!(
+        serde_json::to_value(&carried.publication).expect("a publication encodes"),
+        computer
+            .served
+            .web()
+            .publication(&archive.to_string(), 1)
+            .expect("the service holds the publication"),
         "the publication the service holds"
     );
     let service_object = |object: kr_protocol::ids::BackupObjectId| {
@@ -2058,7 +2081,22 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
     }
 
     let told = page.told().into_bytes();
-    let outputs = [
+    // Every request the service was sent: the document, the content beside it, the token.
+    let mut sent = Vec::new();
+    for (at, arrived) in computer.served.web().arrived().iter().enumerate() {
+        let to = format!("request {at} to {}", arrived.path);
+        sent.push((
+            format!("the body of {to}"),
+            serde_json::to_vec(&arrived.body).expect("a body encodes"),
+        ));
+        if let Some(content) = &arrived.content {
+            sent.push((format!("the content of {to}"), content.clone()));
+        }
+        if let Some(token) = &arrived.token {
+            sent.push((format!("the token of {to}"), token.clone().into_bytes()));
+        }
+    }
+    let mut outputs: Vec<(String, Vec<u8>)> = [
         ("the kit file", kit_file.clone()),
         ("the QR code file", qr_file),
         ("the QR code's text", scanned_text.clone().into_bytes()),
@@ -2069,7 +2107,10 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
         ("the export's sealed bundle, opened", export_bundle),
         ("the bundle opened with the kit", bundle.clone()),
         ("what the page was told", told.clone()),
-    ];
+    ]
+    .into_iter()
+    .map(|(label, bytes)| (label.to_owned(), bytes))
+    .collect();
 
     // The controls: the scan finds a key in each form it looks for, wherever the key lies in a
     // longer value, and reads what the kit file and the code hold.
@@ -2134,7 +2175,7 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
         "the scan does not read what the QR code holds"
     );
     assert!(
-        carried_in(&setup, sent[0].0.kit_fingerprint.as_bytes()).is_some(),
+        carried_in(&setup, sent_setup[0].0.kit_fingerprint.as_bytes()).is_some(),
         "the scan does not read the setup the host was sent"
     );
     assert!(
@@ -2153,9 +2194,15 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
         "the scan does not read the member objects in the archive export"
     );
     assert!(
-        carried_in(&told, sent[0].0.kit_fingerprint.as_bytes()).is_some(),
+        carried_in(&told, sent_setup[0].0.kit_fingerprint.as_bytes()).is_some(),
         "the scan does not read the view of the cover"
     );
+    assert!(
+        sent.iter()
+            .any(|(_, bytes)| carried_in(bytes, &held_bundle).is_some()),
+        "the scan does not read the bundle in the requests"
+    );
+    outputs.extend(sent);
 
     for (output, bytes) in &outputs {
         for (name, key) in &kept {
