@@ -4663,10 +4663,13 @@ fn leave_unanswered(
 /// once.
 async fn until_the_first_sweep_finishes(module: &kr_controller::project::ProjectModule) {
     let mut sweeps = module.challenge_sweeps();
-    tokio::time::timeout(FIRST_SWEEP_GUARD, sweeps.wait_for(|finished| *finished >= 1))
-        .await
-        .expect("the first sweep finishes")
-        .expect("the module is still held");
+    tokio::time::timeout(
+        FIRST_SWEEP_GUARD,
+        sweeps.wait_for(|finished| *finished >= 1),
+    )
+    .await
+    .expect("the first sweep finishes")
+    .expect("the module is still held");
 }
 
 /// The sweep lets go of what the owner's ledger has let go of, while the daemon runs, and of
