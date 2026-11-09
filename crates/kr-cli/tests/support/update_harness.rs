@@ -1088,7 +1088,8 @@ impl std::fmt::Display for Unequal {
 ///
 /// A copy that does not read as `digest` is compared with the packed archive as it reads now, each
 /// read once more into memory and the digests taken of what was read, so that the failure says which
-/// of the two is not what was packed, and where the copy first differs.
+/// of the two is not what was packed, and where the copy first differs. A packed archive that reads
+/// as other bytes is read once more before it is said to have changed.
 fn held_to(packed: &Path, digest: [u8; 32], copy: &Path) -> Result<(), Unequal> {
     held_to_reading(packed, digest, copy, &mut |path| {
         std::fs::read(path).expect("a file to compare")
@@ -1112,10 +1113,21 @@ fn held_to_reading(
     let archive = read(packed);
     let archive_digest: [u8; 32] = sha2::Sha256::digest(&archive).into();
     if archive_digest != digest {
-        return Err(Unequal::Packed {
-            was: digest,
-            now: archive_digest,
-            copy: first,
+        // Other bytes once is not a file that changed: it is read once more, and the archive is
+        // said to have changed only when both reads give the same other bytes.
+        let again: [u8; 32] = sha2::Sha256::digest(read(packed)).into();
+        return Err(if again == archive_digest {
+            Unequal::Packed {
+                was: digest,
+                now: archive_digest,
+                copy: first,
+            }
+        } else {
+            Unequal::PackedReadsDifferently {
+                first: archive_digest,
+                second: again,
+                copy: first,
+            }
         });
     }
     let copied = read(copy);
