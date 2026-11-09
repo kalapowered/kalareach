@@ -36,35 +36,43 @@ impl Hold {
 
     /// Waits while a test holds the task, and records that the task has reached the hold.
     ///
-    /// Any number of tasks may wait at one hold, and a release lets every one of them go. The wait
-    /// is made ready before the hold is looked at, so a release that comes between the look and the
-    /// wait reaches it.
+    /// Any number of tasks may wait at one hold, and a release lets every one of them go. A task
+    /// stops at the hold it finds and leaves when that hold is released, whatever hold has been set
+    /// since: a task a release has woken does not go on to wait at the next one. The wait is made
+    /// ready before the hold is looked at, so a release that comes between the look and the wait
+    /// reaches it.
     pub async fn pause(&self) {
-        let mut counted = false;
+        let mut stopped_at: Option<Arc<HoldState>> = None;
         loop {
             let woken = self.wake.notified();
-            let held = {
+            let state = match &stopped_at {
+                Some(state) => Arc::clone(state),
+                None => {
+                    let mut slot = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let Some(state) = slot.as_ref().map(Arc::clone) else {
+                        return;
+                    };
+                    if state.released.load(Ordering::Acquire) {
+                        *slot = None;
+                        return;
+                    }
+                    state.parked.fetch_add(1, Ordering::AcqRel);
+                    stopped_at = Some(Arc::clone(&state));
+                    state
+                }
+            };
+            if state.released.load(Ordering::Acquire) {
                 let mut slot = self
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match slot.as_ref() {
-                    None => return,
-                    Some(state) if state.released.load(Ordering::Acquire) => {
-                        *slot = None;
-                        return;
-                    }
-                    Some(state) => {
-                        if !counted {
-                            counted = true;
-                            state.parked.fetch_add(1, Ordering::AcqRel);
-                        }
-                        Arc::clone(state)
-                    }
+                if slot.as_ref().is_some_and(|set| Arc::ptr_eq(set, &state)) {
+                    *slot = None;
                 }
-            };
-            if held.released.load(Ordering::Acquire) {
-                continue;
+                return;
             }
             woken.await;
         }

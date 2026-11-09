@@ -3607,6 +3607,36 @@ async fn a_hold_that_two_calls_reach_lets_both_of_them_go_when_it_is_released() 
     }
 }
 
+// A task stops at the hold it found and leaves it when that hold is released, whatever hold has been
+// set since. A task that a release has woken must not go on to wait at the next hold: the test that
+// sets one would then wait for a task that has no more to do with it than the one before.
+//
+// A hold is set and a task stops at it; a second hold is set before the first is released, as one is
+// by a test that sets its next hold as soon as it has released the last. The release of the first
+// lets the task go, and the second has no task at it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_task_leaves_the_hold_it_stopped_at_when_that_hold_is_released_whatever_hold_is_set_since()
+ {
+    let hold = Arc::new(kr_plugin_service::hold::Hold::default());
+    let first = hold.set();
+    let waiting = tokio::spawn({
+        let hold = Arc::clone(&hold);
+        async move { hold.pause().await }
+    });
+    reached(&first, "the task never stopped at the first hold").await;
+    let second = hold.set();
+    first.release();
+    tokio::time::timeout(HANG_GUARD, waiting)
+        .await
+        .expect("the task stopped at a hold that was released did not leave it")
+        .expect("the task ended");
+    assert_eq!(
+        second.parked_tasks(),
+        0,
+        "the task that left the first hold stopped at the second"
+    );
+}
+
 // A request about a binding that is read after the unbind of it is about no binding, whatever it
 // asks: the connection no longer stands behind the registration, which is still in the runtime
 // until its removal has run. An event, a revision of the facts and a revision of the attachments
