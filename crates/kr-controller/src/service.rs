@@ -1376,6 +1376,13 @@ mod a_create_that_launches_nothing;
 #[cfg(test)]
 mod a_close_a_worker_never_answers;
 
+/// A close to a worker that answers it with an outcome it cannot establish.
+///
+/// The worker's own answer is passed on as it is: it is not a refusal of the request, and the
+/// caller has to be told it in order to name the action and read it back.
+#[cfg(test)]
+mod a_close_a_worker_cannot_establish;
+
 #[cfg(test)]
 mod a_closed_session_read_held_while_privacy_mode_is_enabled;
 
