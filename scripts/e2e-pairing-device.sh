@@ -581,6 +581,8 @@ run_android() {
     python3 "$here/scripts/lib/pairing-android.py" drive "$adb" "$serial" "$harness" "$shots" "$grpc_port" >"$out" 2>&1 || status=$?
     sed 's/^/    /' "$out" | tee -a "$log"
     # The crash buffer, and the main buffer without the compositor's and the screen reader's polling.
+    # The run's marker is in the main buffer, where the application's lines go: that is the ring whose
+    # reach back to the start of the run the marker shows.
     search_log 'RustStdoutStderr|to\.kala\.reach' "$adb" -s "$serial" logcat -d -b all
     "$adb" -s "$serial" logcat -d -b crash >"$artefacts/crash.log" 2>&1
     "$adb" -s "$serial" logcat -d 2>/dev/null | grep -v -E 'CompositionEngine|AccessibilityNodeInfoDumper' | tail -2000 >"$artefacts/logcat.log"

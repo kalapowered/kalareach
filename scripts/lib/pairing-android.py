@@ -311,7 +311,7 @@ def scan(
                 end = min(time.monotonic() + VIEW_SECONDS, limit)
                 continue
             time.sleep(0.3)
-    phone.give_up(f"timed out waiting for {what}: the scanner read the picture at none of {len(VIEWS)} views")
+    phone.give_up(f"timed out waiting for {what}: the scanner read the picture in none of the {SCAN_SECONDS} s the scan is given, over {len(VIEWS)} views")
 
 
 # What the card for the host's own invitation says: it grants the phone an owner's rights, which the
@@ -855,7 +855,11 @@ def a_host_that_refuses(phone: Phone, directory: Path, port: str) -> None:
     if phone.find(lambda each: "refused to show its inbox" in each) is not None:
         phone.give_up("the inbox says a host refused it before any host did")
     ask_host(directory, "bound", 180)
-    refusal = lambda each: f"environment {environment}" in each and "refused to show its inbox" in each
+    # The row is one node whose text is its parts one after another: its kind, the host its head names,
+    # then the title, the host's name and the rest of it. So the host's name stands twice, the second
+    # just before the rest of the title, and a title that names no host or another one does not match.
+    named = rf"environment {environment} on \S+\s+environment {environment} on \S+\s+refused to show its inbox"
+    refusal = lambda each: re.search(named, each) is not None
     wait_after_touch(phone, refusal, "the inbox to say the second host refused it", 180, at=(0.5, 0.07))
     # Everything is judged on one reading of the screen, so that what it lacks is lacking from a screen
     # that holds the refusal.
@@ -864,6 +868,7 @@ def a_host_that_refuses(phone: Phone, directory: Path, port: str) -> None:
     if refused is None:
         phone.give_up("the screen read for the refusal does not hold it")
     holds = lambda text: any(text in label for label, _ in labels)
+    print(f"PAIRING-NOTE the refusal's node reads: {next(label for label, _ in labels if refusal(label))!r}", flush=True)
     # The host's own words, which the row gives after its title.
     if not holds("offline-validity policy has lapsed"):
         phone.give_up("the inbox does not give the host's own words for the refusal")
