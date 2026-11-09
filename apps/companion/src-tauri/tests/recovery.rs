@@ -1826,39 +1826,44 @@ async fn publish_generation(
 }
 
 /// KR-REQ-20.17, what this case reads of the companion's outputs and no more: the kit file saved as
-/// text; the QR code file and the text a scanner reads from it; the offline export file of the
-/// bundle alone (`archive: null`) and the one of an archive made for the host double and published
-/// at the service, as bytes; the setup a host double is sent when the computer covers it, as the
-/// JSON of its parameters; the
-/// sealed bundle in the setup and the one in the bundle export, each opened with the kit alone (and
-/// each equal, byte for byte, to the bundle the service holds); the bundle as the service holds
-/// it, opened with the kit alone once the host is covered (so it names the host's public keys); the
-/// view of the host's cover that the page is sent; the answers to the commands the page was called
-/// with in this case; and every request the service was sent in it (the computer's, and the
-/// case's own reads and publication), each body, the content beside it and the token. None of them
-/// holds a private key this computer keeps in the secure
-/// store beside the recovery seed: the reusable endpoint (transport) key, the control-signing
-/// (authorisation) key, and the stored envelope and notification preview keys with the private keys
-/// made from their seeds, which are checked against the public keys of the pairs. Each key is
-/// looked for as bytes, in hexadecimal of either case, in either base64 alphabet wherever it lies in
-/// a longer value, and as a list of numbers. The archive export is made over a generation sealed
-/// for the recovery recipient with production primitives and put at the service; the file is
-/// decoded, with its origin the kit's, its archive the one exported and its publication and objects
-/// equal, object by object, to what the service holds, so it adds no byte of its own.
-/// The controls are the scan finding a seed in each of those forms, the seed printed from the
-/// secure store's own copy in the kit file and in what the QR code scans back to, the kit's
-/// fingerprint in the setup, the host's writer key in the opened bundle, the writer's key
-/// identifier and a member's ciphertext in the archive export, and the cover view's fields in what
-/// the page was told, and the bundle's ciphertext in the requests. Not shown here: what an archive
-/// the host really makes carries (the daemon's production case reads the host's, and the members
-/// here are the case's own); the host's private keys, which this computer never holds; the parts of
-/// a request the stand-in does not keep (its headers other than the token, a query on its path, the
-/// signature block, any member of the signed document other than its body, and the
-/// authentication requests, which the stand-in answers before it keeps a record); a key in a
-/// binary list of integers, split, reversed or
-/// otherwise transformed; `kr backup setup`'s outputs; or the other data paths of backup and
-/// recovery material. The view is sent through a command this suite registers over the host double
-/// and not through `recovery_cover_host`, which needs a connection to a host this suite has none of.
+/// text and the seed it gives; the QR code file, the text a scanner reads from it and the seed that
+/// text gives; the offline export file of the bundle alone (`archive: null`) and the one of an
+/// archive made for the host double and published at the service, as bytes; the parameters of the
+/// setup call a host double is sent when the computer covers it, as JSON; the sealed bundle in the
+/// setup and the one in the bundle export, each opened with the kit alone (and each equal, byte for
+/// byte, to the bundle the service holds); the bundle as the service holds it, opened with the kit
+/// alone once the host is covered (so it names the host's public keys); the view of the host's
+/// cover that the page is sent; the answers to the commands the page was called with in this case;
+/// and every request the service was sent in it (the computer's, and the case's own reads and
+/// publication), each body, the content beside it and the token. None of them holds a private key
+/// this computer keeps in the secure store beside the recovery seed: the reusable endpoint
+/// (transport) key, the control-signing (authorisation) key, and the stored envelope and
+/// notification preview keys with the private keys made from their seeds, which are checked against
+/// the public keys of the pairs. Each key is looked for as bytes, in hexadecimal of either case, in
+/// either base64 alphabet wherever it lies in a longer value, and as a list of numbers. The kit
+/// writes its seed as grouped base32, which the scan does not look for, so the seed is decoded from
+/// the kit file and from what the QR code scans back to, and its bytes are scanned: a key this
+/// computer keeps used as the recovery seed is found there. The archive export is made over a
+/// generation sealed for the recovery recipient with production primitives and put at the service;
+/// the file is decoded, with its origin the kit's, its archive the one exported and its publication
+/// and objects equal, object by object, to what the service holds, so it adds no byte of its own.
+/// The controls are the scan finding a key in each of those forms (each built apart from the
+/// scan's own list of forms); a key as the seed the kit gives; the seed the kit file and the QR
+/// code give equal to the secure store's own copy; the seed printed from that copy in the kit file
+/// and in what the QR code scans back to; the kit's fingerprint in the setup; the host's writer key
+/// in the opened bundle; the writer's key identifier and a member's ciphertext in the archive
+/// export; the cover view's fields in what the page was told; and the bundle's ciphertext in the
+/// requests. Not shown here: what an archive the host really makes carries (the daemon's production
+/// case reads the host's, and the members here are the case's own); the host's private keys, which
+/// this computer never holds; the rest of the call the setup's parameters travel in (its target,
+/// preconditions and proof, which the host double is not given); the parts of a request the
+/// stand-in does not keep (its headers other than the token, a query on its path, the signature
+/// block, any member of the signed document other than its body, and the authentication requests,
+/// which the stand-in answers before it keeps a record); a key in a binary list of integers, split,
+/// reversed or otherwise transformed; `kr backup setup`'s outputs; or the other data paths of backup
+/// and recovery material. The view is sent through a command this suite registers over the host
+/// double and not through `recovery_cover_host`, which needs a connection to a host this suite has
+/// none of.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_computer_keeps() {
     use kr_crypto::store::{SecretName, SecretStore as _};
@@ -1949,6 +1954,7 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
     .expect("the QR code is saved");
     let qr_file = std::fs::read(&qr).expect("the file");
     let (_, scanned_text, _) = scanned(&String::from_utf8(qr_file.clone()).expect("an SVG"));
+    let qr_kit = parse_kit(&scanned_text).expect("the QR code scans back to a kit");
     let export = out.path().join("bundle.krexport");
     page.dialog_returns(&export);
     page.call(
@@ -2102,6 +2108,8 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
         ("the kit file", kit_file.clone()),
         ("the QR code file", qr_file),
         ("the QR code's text", scanned_text.clone().into_bytes()),
+        ("the seed the kit file gives", kit.seed.expose().to_vec()),
+        ("the seed the QR code gives", qr_kit.seed.expose().to_vec()),
         ("the offline export of the bundle", export_file),
         ("the offline export of an archive", archive_file.clone()),
         ("the setup the host was sent", setup.clone()),
@@ -2168,11 +2176,26 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
     );
     // The seed's printed form is made from the secure store's own copy of the seed, not cut from
     // the file the scan reads, so a file that left the seed out, or wrote another, fails here.
-    let printed = kr_client::recovery::render_kit(
-        &stored_seed.to_kit(kit.service_origins.clone(), kit.bundle_locator.clone()),
-    )
-    .expect("the kit's text")
-    .to_string();
+    let stored_kit = stored_seed.to_kit(kit.service_origins.clone(), kit.bundle_locator.clone());
+    assert_eq!(
+        kit.seed.expose(),
+        stored_kit.seed.expose(),
+        "the kit file gives the secure store's seed"
+    );
+    assert_eq!(
+        qr_kit.seed.expose(),
+        stored_kit.seed.expose(),
+        "the QR code gives the secure store's seed"
+    );
+    // The seeds above are scanned as their raw bytes, in which a key used as the seed is found.
+    assert_eq!(
+        carried_in(probe, probe).as_deref(),
+        Some("as bytes"),
+        "the scan does not find a key this computer keeps as the seed the kit gives"
+    );
+    let printed = kr_client::recovery::render_kit(&stored_kit)
+        .expect("the kit's text")
+        .to_string();
     let seed_line = printed
         .lines()
         .find_map(|line| line.strip_prefix("seed: "))

@@ -934,26 +934,32 @@ fn host_private_keys(rig: &Rig) -> Vec<(String, Vec<u8>)> {
 }
 
 /// KR-REQ-20.17, `kr backup setup` only, and only what this case reads: the kit the command shows,
-/// everything the terminal shows, the call the daemon is given, the recovery bundle that call
-/// carries and the service holds (opened with the kit's seed alone, as the JSON a client sees and
-/// as canonical bytes), and every request the daemon sends the service, each body, the content
-/// beside it and the account token, hold none of the private keys the host keeps. The host keeps
-/// two sets of four keys (transport, which is the reusable endpoint key; authorisation, which is
-/// the control-signing key; stored envelope; and notification preview): the controller identity
-/// that signs its workers' tokens, and the device keys it pairs with. It also keeps a backup
-/// writer's key. The case reads all nine seeds from the secret store the daemon wrote them to,
-/// after the setup, and for the four X25519 keys the private key made from the seed too, checked
-/// against the public key the pair has. Each key is looked for as bytes, in hexadecimal of either
-/// case, in either base64 alphabet wherever it lies in a longer value, and as a list of numbers.
-/// The controls are the scan finding a key in each of those forms where one is put; the kit's seed
-/// line (printed from the kit as parsed) in the terminal's transcript; the host's writer key in the
-/// bundle; and the bundle's ciphertext in the call and in what the daemon sent, so the scan reads
-/// what was shown and sent. Not shown here: a key in a binary list of integers, split, reversed or
-/// otherwise transformed; the files of the host, which hold the keys themselves in the secret
-/// store; the parts of a request the stand-in does not keep (its headers other than the token, a
-/// query on its path, the signature block, any member of the signed document other than its body, and the authentication requests, which the stand-in answers before it keeps a record); the daemon's later requests (the
-/// backups it makes), which the production case reads; or the other data paths of backup and
-/// recovery material.
+/// the recovery seed that kit gives, everything the terminal shows, the parameters of the call the
+/// daemon is given, the recovery bundle that call carries and the service holds (opened with the
+/// kit's seed alone, as the JSON a client sees and as canonical bytes), and every request the
+/// daemon sends the service, each body, the content beside it and the account token, hold none of
+/// the private keys the host keeps. The host keeps two sets of four keys (transport, which is the
+/// reusable endpoint key; authorisation, which is the control-signing key; stored envelope; and
+/// notification preview): the controller identity that signs its workers' tokens, and the device
+/// keys it pairs with. It also keeps a backup writer's key. The case reads all nine seeds from the
+/// secret store the daemon wrote them to, after the setup, and for the four X25519 keys the private
+/// key made from the seed too, checked against the public key the pair has. Each key is looked for
+/// as bytes, in hexadecimal of either case, in either base64 alphabet wherever it lies in a longer
+/// value, and as a list of numbers. The kit writes its seed as grouped base32, which the scan does
+/// not look for, so the seed is decoded from the kit as the terminal showed it and its bytes are
+/// scanned: a key the host keeps used as the recovery seed is found there. The controls are the
+/// scan finding a key in each of those forms where one is put (each built apart from the scan's own
+/// list of forms); a key as the seed the kit gives; the kit's seed line (printed from the kit as
+/// parsed) in the terminal's transcript; the host's writer key in the bundle; and the bundle's
+/// ciphertext in the call and in what the daemon sent, so the scan reads what was shown and sent.
+/// Not shown here: a key in a binary list of integers, split, reversed or otherwise transformed;
+/// the files of the host, which hold the keys themselves in the secret store; the rest of the call
+/// the parameters travel in (its target, preconditions and proof); the parts of a request the
+/// stand-in does not keep (its headers other than the token, a query on its path, the signature
+/// block, any member of the signed document other than its body, and the authentication requests,
+/// which the stand-in answers before it keeps a record); the daemon's later requests (the backups
+/// it makes), which the production case reads; or the other data paths of backup and recovery
+/// material.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn what_setup_shows_and_sends_holds_none_of_the_private_keys_the_host_keeps() {
     let rig = Rig::start().await;
@@ -1075,6 +1081,12 @@ async fn what_setup_shows_and_sends_holds_none_of_the_private_keys_the_host_keep
         carried_in(&bundle_json, writer.as_bytes()).is_some(),
         "the scan does not read the host's writer key in the bundle"
     );
+    // The seed the kit gives is the one the bundle opened under, and the scan finds a key the host
+    // keeps where that key is the seed.
+    assert!(
+        !carried_keys(&[("a seed".to_owned(), probe.clone())], &kept).is_empty(),
+        "the scan does not find a key the host keeps as the seed the kit gives"
+    );
     assert!(
         contains(&calls[0], &sealed),
         "the scan does not read the bundle in the call"
@@ -1088,8 +1100,15 @@ async fn what_setup_shows_and_sends_holds_none_of_the_private_keys_the_host_keep
     // Everything the command shows and sends, each read on its own.
     let mut clear = vec![
         ("the kit's text".to_owned(), kit.text.clone().into_bytes()),
+        (
+            "the seed the kit gives".to_owned(),
+            parsed.seed.expose().to_vec(),
+        ),
         ("the terminal's transcript".to_owned(), transcript),
-        ("the call the daemon was given".to_owned(), calls[0].clone()),
+        (
+            "the parameters of the call the daemon was given".to_owned(),
+            calls[0].clone(),
+        ),
         ("the bundle as JSON".to_owned(), bundle_json),
         (
             "the bundle as canonical bytes".to_owned(),
