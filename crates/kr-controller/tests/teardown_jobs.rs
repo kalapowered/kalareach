@@ -752,5 +752,9 @@ fn a_tree_that_could_not_establish_what_its_test_started_has_ended_fails_the_tes
         said.contains("could not be established as ended"),
         "the test's failure says what was left: {said}"
     );
+    assert!(
+        said.contains(&root.display().to_string()),
+        "the test's failure says where the tree is kept: {said}"
+    );
     assert!(kept, "the tree was kept");
 }
