@@ -319,8 +319,11 @@ impl ProjectModule {
     /// go. The service lets go of it the next time a location method runs, and the sweep this
     /// starts makes sure it does so even when none does, so enrolment needs the runtime the sweep
     /// runs on: an owner enrolled without one would hold directories nothing ever lets go of, and
-    /// is refused instead. The sweep holds the service weakly, so it ends with the daemon, and it
-    /// runs where blocking work belongs, because letting go closes directories.
+    /// is refused instead. The sweep holds the service and the owner weakly, and takes hold of them
+    /// for one sweep at a time: the owner holds this host's pairing service and its stores, so a
+    /// daemon that is let go of takes them with it, and the sweep ends at its next tick without
+    /// having kept any of them. It runs where blocking work belongs, because letting go closes
+    /// directories.
     ///
     /// # Errors
     ///
@@ -341,6 +344,7 @@ impl ProjectModule {
             )
         })?;
         let service = Arc::downgrade(&self.service);
+        let owner = Arc::downgrade(&owner);
         #[cfg(feature = "testing")]
         let finished = Arc::clone(&self.sweeps);
         runtime.spawn(async move {
@@ -348,14 +352,14 @@ impl ProjectModule {
             every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 every.tick().await;
-                let (service, owner) = (service.clone(), Arc::clone(&owner));
+                let (service, owner) = (service.clone(), owner.clone());
                 let swept = tokio::task::spawn_blocking(move || {
-                    service
-                        .upgrade()
-                        .map(|service| service.expire_challenges(owner.as_ref()))
+                    let (service, owner) = (service.upgrade()?, owner.upgrade()?);
+                    Some(service.expire_challenges(owner.as_ref()))
                 })
                 .await;
-                // No service is the daemon gone, and a sweep that could not run is the end of it.
+                // No service or no owner is the daemon gone, and a sweep that could not run is the
+                // end of it.
                 if !matches!(swept, Ok(Some(_))) {
                     break;
                 }
