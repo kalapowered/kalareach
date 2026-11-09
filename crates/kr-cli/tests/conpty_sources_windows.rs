@@ -663,9 +663,10 @@ fn a_parent_directory_that_is_there_already_is_refused_and_left_as_it_is() {
 }
 
 /// A guard that ends a distribution runs its command when the case that holds it fails, runs it
-/// once, and the case fails when the command does not succeed. The command here is `cmd.exe`
-/// making a directory as data, in place of `wsl.exe --terminate`, which this case must not run on a
-/// distribution it did not start.
+/// once, and the case fails when the command does not succeed. The command here is a closure that
+/// makes a directory with `std::fs::create_dir`, in a folder whose name holds `&`, in place of
+/// `wsl.exe --terminate`, which this case must not run on a distribution it did not start; the
+/// command that fails is `cmd.exe` exiting with 3.
 #[test]
 fn a_distribution_the_case_started_is_ended_when_the_case_fails_after_that() {
     // The marker is in a folder whose name holds `&`, which `cmd.exe` would read as the end of a
