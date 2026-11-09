@@ -74,7 +74,7 @@ import {
   leavesOutcomeUnknown,
   type Submission
 } from '../../model/receipts'
-import { supersessionFor, type Supersession } from '../../model/receipt-reads'
+import type { Supersession } from '../../model/receipt-reads'
 import { readBeforeQuoting, useReceiptReads } from '../../app/receipts'
 import { renderMarkdown } from '../../markdown/render'
 import type { TerminalGrid, TerminalRoom, TerminalScreen, TerminalWheel } from '../../host/port'
@@ -662,7 +662,7 @@ export function MobileSession({
   }
 
   const send = useCallback(
-    (text: string, anyway = false, read?: Supersession | null) => {
+    (text: string, anyway = false, quoting: Supersession | null = null) => {
       const now = Date.now()
       // The opening this send is made under. Its answer may come after the screen has opened the
       // session again, and then it settles its own record and nothing the new opening shows.
@@ -708,15 +708,7 @@ export function MobileSession({
       // later request: it names the earlier action and the revision of its record they were shown,
       // which is the one `sendAnyway` has just read. With nothing of that kind to name it names
       // nothing, and the host decides.
-      const quote = anyway
-        ? read === undefined
-          ? supersessionFor(
-              lifecycle.state.submissions.filter((each) => isForSession(each.localId, sessionId)),
-              receiptReads,
-              draft.target
-            )
-          : read
-        : null
+      const quote = anyway ? quoting : null
       ask(async () => {
         // The prompt is sent only once the stored draft is this window's to send: another window
         // that holds the same draft claims it first, and the other one sends nothing.
@@ -888,15 +880,23 @@ export function MobileSession({
   // nothing is sent: the person has not seen what it came to. A second press while the read is
   // under way is ignored.
   const reading = useRef(false)
+  // The draft as it stands now, which the press compares with the draft it was made on.
+  const draftNow = useRef(draft)
+  useEffect(() => {
+    draftNow.current = draft
+  })
   const sendAnyway = useCallback(() => {
     if (reading.current) return
     reading.current = true
     const text = draft.text
+    const pressedOn = draft.revision
+    // The screen's opening at the press: the read and the send are made under it, or not at all.
+    const opening = openings.tokenOf(sessionId)
     void readBeforeQuoting({
       port,
       receiptReads,
       sessionId,
-      opening: openings.tokenOf(sessionId),
+      opening,
       submissions: mine,
       to: draft.target
     })
@@ -904,6 +904,16 @@ export function MobileSession({
         if (outcome.kind === 'settled') {
           settleFromRecord(outcome.localId, outcome.receipt)
           say('The host has since said what became of the earlier prompt. Nothing was sent.', 'danger')
+          return
+        }
+        if (!openings.isCurrent(sessionId, opening)) {
+          say('This screen was opened again while the earlier prompt was read. Nothing was sent.', 'danger')
+          return
+        }
+        // What the person typed while the record was read is not what the press was made on: it
+        // stays where it is, and the next press sends it.
+        if (draftNow.current.revision !== pressedOn) {
+          say('The message changed while the earlier prompt was read. Nothing was sent.', 'danger')
           return
         }
         send(text, true, outcome.quote)

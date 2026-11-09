@@ -995,8 +995,15 @@ async fn a_close_the_daemons_worker_could_not_establish_is_closed_only_by_the_pe
         read["state"], "unknown",
         "the worker's recovery settled it: {read}"
     );
-    let plain = host.kr(&["close", &session]);
-    assert_ne!(plain.status.code(), Some(0), "the earlier outcome stands");
+    let (status, refused) = host.json(&["close", &session]);
+    assert_eq!(status, Some(8), "the earlier outcome stands: {refused}");
+    assert_eq!(refused["code"], "INVALID_ARGUMENT", "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .is_some_and(|said| said.contains(&earlier.to_string())),
+        "and the refusal names it: {refused}"
+    );
     let listed = host.kr_json(&["list"]);
     assert_eq!(
         listed["sessions"].as_array().map(Vec::len),

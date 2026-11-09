@@ -13,7 +13,7 @@ worker directly for what a session owns.
 | `kr export <id> --output <file>` | — | Write a closed session's retained output to a file you name, as a JSON document or an asciicast recording, in this environment or an enrolled one |
 | `kr backup setup [--replace]` | — | Set this host's backups up: show a recovery kit once and turn on a backup of closed sessions and the host's configuration, made at most once a day |
 | `kr backup restore --into <folder>` | — | Open a backup of this host's data with the recovery kit and write it as readable files into a folder you made; it records the generation it verified in the recovery bundle and, only when asked, applies the backup's device configuration to this host |
-| `kr close [id]` | `kr c` | Close a session and terminate the processes it owns |
+| `kr close [id] [--after-unknown <action>]` | `kr c` | Close a session and terminate the processes it owns |
 | `kr list` | `kr l` | List sessions with their display numbers, states, foreground applications and shells |
 | `kr status [id]` | `kr s` | Show one session's state |
 | `kr question [list/show/answer/cancel]` | — | Read and answer the questions agents are waiting on |
@@ -1046,10 +1046,9 @@ prints the receipt on standard error, and sends a new close that names the actio
 shown, through the control daemon where one is running, which passes the request to the worker
 whole. It refuses, with exit status 2 and nothing sent, an action that is not a close or whose
 receipt does not stand in the `unknown` state; an action the worker holds no receipt for is the
-worker's own refusal. A session with no live worker, one that has closed or whose descriptor is
-gone, holds no earlier close for the flag to name: the command exits with 2 and sends nothing, and
-`kr close` without the flag asks the control daemon, which answers from the closure it recorded or
-says it does not know the session. When the new close's outcome is not known either, the command
+worker's own refusal. For a session the command finds no live worker for, because it has closed
+or its descriptor cannot be found, there is no worker to read an earlier close from: the command
+exits with 2 and sends nothing. When the new close's outcome is not known either, the command
 stops again with `OUTCOME_UNKNOWN` and names the new action, which the flag then takes in turn. An
 earlier close that stays unknown keeps holding later plain closes back while the worker lives; the
 worker names the newest one in its refusal, and that is the action the flag takes. A failure of the

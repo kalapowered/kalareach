@@ -72,6 +72,8 @@ interface Recorded {
    * from `shown` is the worker having forgotten what it showed, as a restart does.
    */
   worker?: { readonly shown: Map<string, string> }
+  /** Holds every read of the record until the promise is settled, so a test acts while it is read. */
+  hold?: Promise<void>
 }
 
 /** The refusal a worker makes of a quote it will not take. */
@@ -112,10 +114,11 @@ function answering(
       if (recorded.unreadable === true) return Promise.reject(new Error('the host did not answer'))
       recorded.worker?.shown.set(params.action_id, recorded.revision ?? '1')
       const state = recorded.byAction?.[params.action_id] ?? recorded.state
-      return Promise.resolve({
+      const read = {
         receipt: receiptAt(state, params.action_id, recorded.revision),
         result: null
-      })
+      }
+      return recorded.hold === undefined ? Promise.resolve(read) : recorded.hold.then(() => read)
     }
   }
 }
@@ -619,13 +622,18 @@ describe('on the desktop', () => {
         { timeout: 3_000 }
       )
       await flush()
+      const before = reads.length
       await person.click(await screen.findByTestId('composer-send-anyway'))
       await waitFor(() => {
         expect(screen.getByTestId('composer-input')).toHaveValue('run the migration')
       })
       expect(quotes[1]).toEqual({ action_id: ACTION, revision: '3' })
       // The refusal is the host's word that the record is not what was shown, and the page reads it
-      // again at once: the next press quotes the revision that is there now.
+      // again at once, besides the read the press made: before anything is pressed again, the record
+      // has been read twice since the first press.
+      await waitFor(() => {
+        expect(reads.length).toBeGreaterThanOrEqual(before + 2)
+      })
       await person.click(await screen.findByTestId('composer-send-anyway'))
       await waitFor(() => {
         expect(quotes).toHaveLength(3)
@@ -744,6 +752,34 @@ describe('on the desktop', () => {
         await flush()
         expect(sent).toHaveLength(1)
         expect(screen.getByTestId('composer-input')).toHaveValue('run the migration')
+      })
+
+      it('sends nothing, and leaves what was typed, when the message changed while the record was read', async () => {
+        const recorded: Recorded = {
+          state: 'unknown',
+          revision: '3',
+          byAction: { [ANOTHER_ACTION]: 'dispatching' }
+        }
+        const reads: string[] = []
+        const sent: unknown[] = []
+        const { person } = await sentOnce(answers, recorded, reads, sent)
+        await waitFor(
+          () => {
+            expect(reads).toContain(ACTION)
+          },
+          { timeout: 3_000 }
+        )
+        await flush()
+        let release: () => void = () => undefined
+        recorded.hold = new Promise<void>((resolve) => {
+          release = resolve
+        })
+        await person.click(await screen.findByTestId('composer-send-anyway'))
+        await person.type(screen.getByTestId('composer-input'), ' and more')
+        release()
+        await flush()
+        expect(sent).toHaveLength(1)
+        expect(screen.getByTestId('composer-input')).toHaveValue('run the migration and more')
       })
 
       it('names what it read last when the host cannot be asked at the press', async () => {
@@ -1312,6 +1348,43 @@ describe('on the phone', () => {
       await flush()
       expect(sent).toHaveLength(1)
       expect(screen.getByLabelText('Message this session')).toHaveValue('run the migration')
+    })
+
+    it('sends nothing, and leaves what was typed, when the message changed while the record was read', async () => {
+      const recorded: Recorded = { state: 'unknown', revision: '3', byAction: { [ANOTHER_ACTION]: 'applied' } }
+      const reads: string[] = []
+      const sent: unknown[] = []
+      const { person } = await sentOnce(answers, recorded, reads, sent)
+      await readOnce(reads)
+      let letGo: () => void = () => undefined
+      recorded.hold = new Promise<void>((resolve) => {
+        letGo = resolve
+      })
+      await person.click(await release())
+      await person.type(screen.getByLabelText('Message this session'), ' and more')
+      letGo()
+      await flush()
+      expect(sent).toHaveLength(1)
+      expect(screen.getByLabelText('Message this session')).toHaveValue('run the migration and more')
+    })
+
+    it('sends nothing when the screen was opened again while the record was read', async () => {
+      const recorded: Recorded = { state: 'unknown', revision: '3', byAction: { [ANOTHER_ACTION]: 'applied' } }
+      const reads: string[] = []
+      const sent: unknown[] = []
+      const { person } = await sentOnce(answers, recorded, reads, sent)
+      await readOnce(reads)
+      let letGo: () => void = () => undefined
+      recorded.hold = new Promise<void>((resolve) => {
+        letGo = resolve
+      })
+      await person.click(await release())
+      // The person leaves the session and opens it again: a new opening takes the screen's place.
+      await person.click(screen.getByRole('button', { name: 'Back to sessions' }))
+      await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+      letGo()
+      await flush()
+      expect(sent).toHaveLength(1)
     })
 
     it('names what it read last when the host cannot be asked at the press', async () => {

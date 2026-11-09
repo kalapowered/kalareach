@@ -567,17 +567,15 @@ async fn run(cli: Cli) -> Result<Completion> {
                         }
                     }
                 }
-                // No descriptor, so the session is closed or was never here. The daemon knows
-                // which, and it resolves a display number through the reservations it retains.
-                // No worker is left to hold an earlier close of it, so there is nothing for the
-                // flag to name.
+                // No descriptor, so the session is closed or was never here, or its descriptor
+                // cannot be found. The daemon knows which, and it resolves a display number through
+                // the reservations it retains. Without a descriptor there is no worker to read an
+                // earlier close from, so there is nothing for the flag to name.
                 None => {
                     if after_unknown.is_some() {
                         return Err(CliError::Usage(Shown::said(
-                            "no live worker holds a close for this session, so there is no earlier \
-                             close to name; `kr close` without --after-unknown asks the control \
-                             daemon, which answers from the closure it recorded or says it does not \
-                             know",
+                            "this command found no live worker for the session, so it cannot read \
+                             the receipt of an earlier close and sends nothing",
                         )));
                     }
                     let mut client = open_controller(&environment.paths, build_id()).await?;

@@ -99,7 +99,7 @@ import {
   type DraftTarget
 } from '../model/drafts'
 import { FrameBatcher } from '../model/frame'
-import { supersessionFor, type Supersession } from '../model/receipt-reads'
+import type { Supersession } from '../model/receipt-reads'
 import { eventIsFor } from '../model/sessions'
 import {
   answered,
@@ -384,7 +384,7 @@ export function Conversation({
   )
 
   const send = useCallback(
-    (action: ComposerAction, anyway = false, read?: Supersession | null) => {
+    (action: ComposerAction, anyway = false, named: Supersession | null = null) => {
       const binding = agent.binding
       const instance = agent.instance
       if (binding === null || instance === null) return
@@ -447,12 +447,7 @@ export function Conversation({
       // later request: it names the earlier action and the revision of its record they were shown,
       // which is the one `sendAnyway` has just read. With nothing of that kind to name it names
       // nothing, and the host decides.
-      const quote =
-        anyway && action === 'submit'
-          ? read === undefined
-            ? supersessionFor(state.submissions, receiptReads, written)
-            : read
-          : null
+      const quote = anyway && action === 'submit' ? named : null
       const dispatch = () =>
         action === 'submit'
           ? port.composerSubmit({ target, draft_id: null, text: typed }, undefined, quote ?? undefined)
@@ -535,7 +530,6 @@ export function Conversation({
       returnRefusedText,
       refresh,
       unconfirmed,
-      state.submissions,
       receiptReads
     ]
   )
@@ -545,9 +539,15 @@ export function Conversation({
   // and nothing is sent: the person has not seen what it came to. A second press while the read is
   // under way is ignored.
   const reading = useRef(false)
+  // The draft as it stands now, which the press compares with the draft it was made on.
+  const draftNow = useRef(draft)
+  useEffect(() => {
+    draftNow.current = draft
+  })
   const sendAnyway = useCallback(() => {
     if (reading.current) return
     reading.current = true
+    const pressedOn = draft.revision
     void readBeforeQuoting({
       port,
       receiptReads,
@@ -562,12 +562,18 @@ export function Conversation({
           say('The host has since said what became of the earlier prompt. Nothing was sent.', 'danger')
           return
         }
+        // What the person typed while the record was read is not what the press was made on: it
+        // stays where it is, and the next press sends it.
+        if (draftNow.current.revision !== pressedOn) {
+          say('The message changed while the earlier prompt was read. Nothing was sent.', 'danger')
+          return
+        }
         send('submit', true, outcome.quote)
       })
       .finally(() => {
         reading.current = false
       })
-  }, [port, receiptReads, sessionId, state.submissions, presented.target, settleFromRecord, say, send])
+  }, [port, receiptReads, sessionId, state.submissions, presented.target, draft, settleFromRecord, say, send])
 
   /**
    * A dropped or pasted file goes through the transfer service, and the handle it publishes is kept

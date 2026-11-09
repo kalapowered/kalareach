@@ -2186,7 +2186,16 @@ async fn a_close_whose_outcome_the_worker_could_not_establish_is_sent_again_only
     // A plain close is not the person's later request: the worker holds the earlier outcome
     // against it.
     let plain = kr_against(&hosted, &["close", &session]);
-    assert_ne!(plain.status.code(), Some(0), "the earlier outcome stands");
+    let refusal = String::from_utf8_lossy(&plain.stderr);
+    assert_eq!(
+        plain.status.code(),
+        Some(8),
+        "the earlier outcome stands: {refusal}"
+    );
+    assert!(
+        refusal.contains(&earlier.to_string()),
+        "and the refusal names it: {refusal}"
+    );
     assert!(live(&hosted), "and nothing was closed");
 
     // An action that is not a close of unknown outcome is not one a later close names: another
