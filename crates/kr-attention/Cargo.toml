@@ -14,7 +14,7 @@ publish.workspace = true
 hmac.workspace = true
 # The secret that digest is taken under is drawn from the cryptography crate's random source.
 kr-crypto.workspace = true
-# The store is opened the way every store is, waiting out a previous holder that is letting go.
+# The store is opened the way every store is, asking again while its index cannot be made ready.
 kr-flush = { workspace = true, features = ["sqlite"] }
 kr-protocol.workspace = true
 # The feature store is a small table of its own beside the session journal: per-actor

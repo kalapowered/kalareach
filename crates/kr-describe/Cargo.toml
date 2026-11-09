@@ -24,7 +24,7 @@ required-features = ["testing"]
 # transcript is built the same way every other signature in this product is built.
 kr-cbor.workspace = true
 kr-crypto.workspace = true
-# The names store is opened the way every store is, waiting out a previous holder that is letting go.
+# The names store is opened the way every store is, asking again while its index cannot be made ready.
 kr-flush = { workspace = true, features = ["sqlite"] }
 # The description process reports its own start identity when it says it is ready, so the daemon
 # can end that process and no other.

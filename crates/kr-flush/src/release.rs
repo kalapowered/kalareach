@@ -26,7 +26,7 @@ use rusqlite::Connection;
 ///
 /// The first read is what maps the store's write-ahead index, so it is where a store that cannot
 /// make that index ready refuses, and the whole open is asked again for as long as it does
-/// ([`once_the_previous_holder_has_let_go`]). Opening the file alone would not meet the refusal,
+/// ([`while_the_index_cannot_be_made_ready`]). Opening the file alone would not meet the refusal,
 /// and the caller's first query would.
 ///
 /// # Errors
@@ -37,7 +37,7 @@ pub fn open_connection(
     path: &std::path::Path,
     flags: Option<rusqlite::OpenFlags>,
 ) -> rusqlite::Result<Connection> {
-    once_the_previous_holder_has_let_go(|| {
+    while_the_index_cannot_be_made_ready(|| {
         let connection = match flags {
             Some(flags) => Connection::open_with_flags(path, flags)?,
             None => Connection::open(path)?,
@@ -114,7 +114,7 @@ pub fn describe(error: &rusqlite::Error) -> String {
 /// Whether the store's answer is the one it gives an open whose index it could not make ready:
 /// `SQLITE_IOERR_TRUNCATE`, on Windows.
 #[must_use]
-pub fn is_a_holder_letting_go(error: &rusqlite::Error) -> bool {
+pub fn is_an_index_that_cannot_be_made_ready(error: &rusqlite::Error) -> bool {
     cfg!(windows)
         && matches!(
             error,
@@ -130,13 +130,15 @@ pub fn is_a_holder_letting_go(error: &rusqlite::Error) -> bool {
 ///
 /// Returns the store's last refusal when it still says so after [`PATIENCE`], and every other
 /// refusal the first time it is given.
-pub fn once_the_previous_holder_has_let_go<T>(
+pub fn while_the_index_cannot_be_made_ready<T>(
     mut attempt: impl FnMut() -> rusqlite::Result<T>,
 ) -> rusqlite::Result<T> {
     let deadline = Instant::now() + PATIENCE;
     loop {
         match attempt() {
-            Err(error) if is_a_holder_letting_go(&error) && Instant::now() < deadline => {
+            Err(error)
+                if is_an_index_that_cannot_be_made_ready(&error) && Instant::now() < deadline =>
+            {
                 #[cfg(feature = "testing")]
                 announce_the_wait();
                 std::thread::sleep(BETWEEN_ASKS);
@@ -148,7 +150,8 @@ pub fn once_the_previous_holder_has_let_go<T>(
 
 #[cfg(feature = "testing")]
 thread_local! {
-    /// What a test runs the next time an open on this thread waits for a previous holder.
+    /// What a test runs the next time an open on this thread is told its store's index cannot be
+    /// made ready and asks again.
     static ON_THE_NEXT_WAIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -156,9 +159,9 @@ thread_local! {
 /// Runs `hook` the next time an open on this thread is told its store's index cannot be made
 /// ready, once, before the open asks again, for this host's own tests.
 ///
-/// It is how a test acts at the moment the open is waiting, rather than after a time it chose. It
-/// belongs to the calling thread, because an open waits on the thread that asked, so a test
-/// running beside another one cannot be answered with the other's wait. It is compiled away in
+/// It is how a test acts at the moment the open asks again, rather than after a time it chose. It
+/// belongs to the calling thread, because an open asks again on the thread that opened, so a test
+/// running beside another one cannot be answered with the other's refusal. It is compiled away in
 /// every shipped build.
 #[cfg(feature = "testing")]
 pub fn on_the_next_wait(hook: impl FnOnce() + 'static) {
@@ -239,9 +242,10 @@ fn what_the_store_holds(database: &std::path::Path) -> rusqlite::Result<(i64, Ve
 /// no lock on the index, for this host's own tests.
 ///
 /// The system removes a process's mappings after it has released its locks, so for that interval
-/// an index nobody has locked is one nobody may reset. A test holds one to stand a store in that
-/// interval on purpose. It compiles to nothing without the `testing` feature, and no shipped build
-/// enables it.
+/// the index is mapped and nobody has it locked. The next process to open the store finds nobody
+/// holding it, cannot truncate the index while it is mapped, and clears its first bytes instead. A
+/// test holds one to stand a store in that interval on purpose. It compiles to nothing without
+/// the `testing` feature, and no shipped build enables it.
 #[cfg(all(windows, feature = "testing"))]
 pub mod held_index {
     use std::os::windows::ffi::OsStrExt as _;
@@ -261,8 +265,8 @@ pub mod held_index {
 
     /// A file, a mapping of it and a view of the mapping, held until this is dropped.
     ///
-    /// The three are kept as integers, which are the system's own values for them and can be
-    /// moved into the hook a test leaves for the store's next wait.
+    /// The three are kept as integers, which are the system's own values for them and let this be
+    /// moved between threads.
     pub struct HeldIndex {
         file: usize,
         mapping: usize,

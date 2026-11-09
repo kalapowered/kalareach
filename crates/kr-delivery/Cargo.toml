@@ -18,7 +18,7 @@ hmac.workspace = true
 kr-attention.workspace = true
 kr-cbor.workspace = true
 kr-crypto.workspace = true
-# The journal is opened the way every store is, waiting out a previous holder that is letting go.
+# The journal is opened the way every store is, asking again while its index cannot be made ready.
 kr-flush = { workspace = true, features = ["sqlite"] }
 kr-protocol.workspace = true
 # The history filter and the privacy contract both live in the worker crate: this producer is a

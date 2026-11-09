@@ -524,7 +524,9 @@ fn link_count(_connection: &Connection, file: &Path) -> Result<u64> {
 ///
 /// One of the two places in this crate that call a library without a safe interface, the other
 /// being the Windows call that reads the file's metadata from the handle this one borrows.
-/// `rusqlite` offers no safe way to ask: the questions this needs answered are about the file
+/// `rusqlite`'s `Connection::file_control` is safe for the Unix question (`HasMoved`) and has no
+/// form for the Windows one (`SQLITE_FCNTL_WIN32_GET_HANDLE`, which answers with a handle), so
+/// both are asked through this one call. The questions this needs answered are about the file
 /// SQLite has open, and the alternative - opening the file again to look at it - is the thing that
 /// must not happen, because on the Unix family closing any descriptor for a file drops every lock
 /// this process holds on it.

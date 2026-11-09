@@ -11,7 +11,7 @@ publish.workspace = true
 [dependencies]
 kr-attention.workspace = true
 kr-changeset.workspace = true
-# The journal is opened the way every store is, waiting out a previous holder that is letting go.
+# The journal is opened the way every store is, asking again while its index cannot be made ready.
 kr-flush = { workspace = true, features = ["sqlite"] }
 kr-ipc.workspace = true
 kr-project.workspace = true
