@@ -3101,6 +3101,96 @@ mod tests {
         // Strings spaced evenly do not all join: the text between two of the newer ones stays.
         let newer = (ranges * 3 / 4) as usize * 6 + 4;
         assert_eq!(&page.bytes.as_slice()[newer..newer + 4], b"cdab");
+        // And the record is bounded, which the bytes alone do not show.
+        assert!(
+            history.withheld.ranges.len() <= MAX_WITHHELD_RANGES,
+            "the record holds {} ranges",
+            history.withheld.ranges.len()
+        );
+    }
+
+    /// Past the bound the nearer half of the pairs of neighbours join and the farther half do not:
+    /// the text between two strings that lie far apart is paged, and the text between two that lie
+    /// near is not. Of the pairs exactly as far apart as the median, only as many join as bring the
+    /// joined pairs to half, so the first of them join and the rest do not.
+    #[test]
+    fn past_the_bound_the_nearer_half_of_the_ranges_join_and_the_farther_half_stay_apart() {
+        let ranges = MAX_WITHHELD_RANGES as u64 + 1;
+        let widths = [2_u64, 4, 6, 8];
+        let mut history = OutputHistory::in_memory(1 << 22);
+        let mut written = Vec::new();
+        let mut named = Vec::new();
+        // The text between range `n` and the next, as the cursors it lies between.
+        let mut between = Vec::new();
+        for n in 0..ranges {
+            let start = written.len() as u64;
+            written.extend_from_slice(b"RR");
+            named.push((start, start + 2));
+            if n + 1 < ranges {
+                let width = widths[(n % 4) as usize];
+                between.push((n, start + 2, start + 2 + width));
+                written.extend(std::iter::repeat_n(b'g', width as usize));
+            }
+        }
+        history.append(&written);
+        history.note_withheld_strings(&named);
+        assert!(
+            history.withheld.ranges.len() <= MAX_WITHHELD_RANGES / 2,
+            "one pass leaves half the record: it holds {} ranges",
+            history.withheld.ranges.len()
+        );
+
+        let end = written.len() as u64;
+        let page = history
+            .page_without_files(0, u64::MAX, Reach::Whole, end)
+            .expect("pages");
+        assert_eq!(page.bytes.len(), written.len(), "no byte moves");
+        for &(start, stop) in &named {
+            assert!(
+                page.bytes.as_slice()[start as usize..stop as usize]
+                    .iter()
+                    .all(|&byte| byte == 0),
+                "the range {start}..{stop} is withheld"
+            );
+        }
+        // Gaps of 2 and 4 are narrower than the median, 6. One gap of 6 is joined, the first, since
+        // half the pairs are joined once it is, and no gap of 8 is.
+        for (n, from, to) in between {
+            let width = to - from;
+            let joined = width < 6 || (width == 6 && n == 2);
+            let text = &page.bytes.as_slice()[from as usize..to as usize];
+            if joined {
+                assert!(
+                    text.iter().all(|&byte| byte == 0),
+                    "the text {from}..{to} between two near ranges is withheld"
+                );
+            } else {
+                assert!(
+                    text.iter().all(|&byte| byte == b'g'),
+                    "the text {from}..{to} between two far ranges is paged"
+                );
+            }
+        }
+    }
+
+    /// A page asked for past the output the engine has settled, when what is retained begins after
+    /// the settled point, begins where what is retained does and never before it.
+    #[test]
+    fn a_page_past_a_settled_point_that_output_has_left_begins_at_the_oldest_retained_cursor() {
+        let mut history = OutputHistory::in_memory(8);
+        history.append(b"0123456789abcdef");
+        let oldest = history.oldest_retained_cursor();
+        let settled = 4;
+        assert!(
+            oldest > settled,
+            "the settled point is before what is retained"
+        );
+        let page = history
+            .page_without_files(100, 64, Reach::Whole, settled)
+            .expect("pages");
+        assert_eq!(page.from_cursor.get(), oldest);
+        assert_eq!(page.next_cursor.get(), oldest);
+        assert!(page.bytes.is_empty());
     }
 
     /// A range that reaches past the oldest retained cursor keeps its tail withheld: output that

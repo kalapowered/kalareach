@@ -893,17 +893,63 @@ fn printed() -> (Vec<u8>, Vec<u8>) {
         (raw_c1, true),
         (b"\x1b]1337;CurrentDir=/tmp\x07".to_vec(), false),
     ];
+    woven(&sequences)
+}
+
+/// One word inside each payload `side_effects_printed` writes that a device is not given.
+const SIDE_EFFECT_PAYLOADS: [&str; 4] = [
+    "Q0xJUEJPQVJEU0VDUkVUUEFZTE9BRA==",
+    "NOTIFYNINEPAYLOAD",
+    "NOTIFYKITTYPAYLOAD",
+    "NOTIFYRXVTPAYLOAD",
+];
+
+/// What an application prints that the live policy keeps from every attachment but the one that
+/// holds the input lease, with plain words between: a write to the clipboard (the base64 of
+/// `CLIPBOARDSECRETPAYLOAD`), a notification of OSC 9, one of the Kitty protocol, one of rxvt, and
+/// a progress report, which holds no word to look for. A window title between them is the
+/// control: a device is paged it as written.
+///
+/// The second is the same output with each sequence a device is not given replaced, byte for
+/// byte, by NUL.
+fn side_effects_printed() -> (Vec<u8>, Vec<u8>) {
+    let sequences: [(Vec<u8>, bool); 6] = [
+        (
+            format!("\x1b]52;c;{}\x07", SIDE_EFFECT_PAYLOADS[0]).into_bytes(),
+            true,
+        ),
+        (
+            format!("\x1b]9;{}\x07", SIDE_EFFECT_PAYLOADS[1]).into_bytes(),
+            true,
+        ),
+        (
+            format!("\x1b]99;i=1:d=1:p=body;{}\x1b\\", SIDE_EFFECT_PAYLOADS[2]).into_bytes(),
+            true,
+        ),
+        (
+            format!("\x1b]777;notify;title;{}\x07", SIDE_EFFECT_PAYLOADS[3]).into_bytes(),
+            true,
+        ),
+        (b"\x1b]9;4;1;50\x07".to_vec(), true),
+        (b"\x1b]0;a title\x07".to_vec(), false),
+    ];
+    woven(&sequences)
+}
+
+/// `sequences` as an application prints them, with plain words before each and after the last, and
+/// the same output with each one marked as withheld replaced, byte for byte, by NUL.
+fn woven(sequences: &[(Vec<u8>, bool)]) -> (Vec<u8>, Vec<u8>) {
     let mut written = Vec::new();
     let mut shown = Vec::new();
-    for (number, (sequence, withheld)) in sequences.into_iter().enumerate() {
+    for (number, (sequence, withheld)) in sequences.iter().enumerate() {
         let words = format!("words {number} ").into_bytes();
         written.extend_from_slice(&words);
         shown.extend_from_slice(&words);
-        written.extend_from_slice(&sequence);
-        if withheld {
+        written.extend_from_slice(sequence);
+        if *withheld {
             shown.extend(std::iter::repeat_n(0_u8, sequence.len()));
         } else {
-            shown.extend_from_slice(&sequence);
+            shown.extend_from_slice(sequence);
         }
     }
     written.extend_from_slice(b"last words");
@@ -997,5 +1043,152 @@ async fn a_string_the_application_has_not_ended_is_paged_to_a_device_without_fil
     );
 
     device.close();
+    rig.stop().await;
+}
+
+/// A device that holds `session.view` and a history that reaches every moment is not paged what
+/// the live policy keeps from every attachment but the one that holds the input lease: the text of
+/// a clipboard write or of a notification, and a progress report. The local owner is.
+///
+/// Each such sequence comes back as NUL, byte for byte, whatever size a page is cut to, so a page
+/// that begins or ends inside one withholds that part of it and every cursor is where it was. A
+/// window title between them, which the live policy sends on, is paged as written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_is_not_paged_the_clipboard_text_and_the_notifications_an_application_printed() {
+    let rig = Rig::start().await;
+    let device = rig.pair_holding(Some(0), &[ActionRight::SessionView]).await;
+    let (written, shown) = side_effects_printed();
+    let start = print(&rig, &written).await;
+
+    let owner = owner_paged(&rig, start).await;
+    assert_eq!(owner, written, "the owner is paged what was written");
+
+    for limit in [WHOLE, 7] {
+        let paged = device_paged(&device, rig.session_id(), start, limit).await;
+        for marker in SIDE_EFFECT_PAYLOADS {
+            assert!(
+                !holds(&paged, marker),
+                "pages of {limit} bytes hold {marker}"
+            );
+        }
+        assert_eq!(
+            paged, shown,
+            "pages of {limit} bytes are the words and the title, and NUL where each side effect lay"
+        );
+    }
+
+    device.close();
+    rig.stop().await;
+}
+
+/// `payload` as an inline file between plain words, enough of them that the output is an interval
+/// of its own in the worker's record of when it was produced, and the same output with the file
+/// replaced, byte for byte, by NUL.
+fn a_file_among_words(payload: &str) -> (Vec<u8>, Vec<u8>) {
+    let words = vec![b'w'; 150];
+    let file = format!("\x1b]1337;File=name=eA==;inline=1:{payload}\x07").into_bytes();
+    let mut written = words.clone();
+    written.extend_from_slice(&file);
+    written.extend_from_slice(&words);
+    let mut shown = words.clone();
+    shown.extend(std::iter::repeat_n(0_u8, file.len()));
+    shown.extend_from_slice(&words);
+    (written, shown)
+}
+
+/// A device whose history begins part way through the output is not paged a file printed from
+/// there on, and a device whose history begins after all of it is paged none of the output that
+/// exists and, once a file is printed, only that file's place: the reach a device's grant gives it
+/// narrows what it is paged and never what is withheld from it.
+///
+/// The record the worker keeps of when the output was produced is read back before anything is
+/// asked, so a bound that did not fall where the case says fails by saying so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_whose_history_begins_part_way_is_not_paged_the_files_printed_from_there_on() {
+    let rig = Rig::start().await;
+    let (earlier, _) = a_file_among_words("EARLYFILEPAYLOAD");
+    let (later, later_shown) = a_file_among_words("LATERFILEPAYLOAD");
+    let (last, last_shown) = a_file_among_words("LASTFILEPAYLOAD");
+    let markers = ["EARLYFILEPAYLOAD", "LATERFILEPAYLOAD", "LASTFILEPAYLOAD"];
+
+    print(&rig, &earlier).await;
+    let reaches_from = rig.end().await;
+    until_the_clock_has_moved(Duration::from_millis(150)).await;
+    let bound = kr_ipc::now_ms().get();
+    let part_way = rig
+        .pair_holding(Some(bound), &[ActionRight::SessionView])
+        .await;
+
+    assert_eq!(print(&rig, &later).await, reaches_from);
+    let after_later = rig.end().await;
+    until_the_clock_has_moved(Duration::from_millis(150)).await;
+    let past_the_end = kr_ipc::now_ms().get();
+    let none_yet = rig
+        .pair_holding(Some(past_the_end), &[ActionRight::SessionView])
+        .await;
+
+    let times = rig.times(after_later);
+    let before = times
+        .iter()
+        .find(|interval| interval.from < reaches_from && interval.to == reaches_from)
+        .expect("an interval ends where the later output begins");
+    let after = times
+        .iter()
+        .find(|interval| interval.from == reaches_from)
+        .expect("an interval begins where the later output does");
+    assert!(
+        before.proven && before.at_ms < bound,
+        "the earlier output was written before the bound {bound}: {times:?}"
+    );
+    assert!(
+        after.proven && after.at_ms >= bound && after.at_ms < past_the_end,
+        "the later output was written between the bounds {bound} and {past_the_end}: {times:?}"
+    );
+
+    // Reach::From: the page begins where the grant's reach does, and the file in it is withheld.
+    let page = device_page_of(&part_way, rig.session_id(), 0, WHOLE).await;
+    assert_eq!(page.from_cursor.get(), reaches_from);
+    assert_eq!(page.bytes.as_slice(), later_shown.as_slice());
+    let gap = page.gap.0.expect("the page says what it leaves out");
+    assert_eq!(
+        (gap.from_cursor.get(), gap.to_cursor.get()),
+        (0, reaches_from)
+    );
+
+    // Reach::Nothing: every moment of the output is before the grant's, so none of it is paged.
+    let page = device_page_of(&none_yet, rig.session_id(), 0, WHOLE).await;
+    assert!(page.bytes.is_empty(), "nothing is paged: {page:?}");
+    assert_eq!(
+        (page.from_cursor.get(), page.next_cursor.get()),
+        (after_later, after_later)
+    );
+
+    // What is printed from then on reaches that device, and the file in it is withheld.
+    let last_starts = print(&rig, &last).await;
+    assert_eq!(last_starts, after_later);
+    let times = rig.times(last_starts + last.len() as u64);
+    let reached = times
+        .iter()
+        .find(|interval| interval.from == last_starts)
+        .expect("an interval begins where the last output does");
+    assert!(
+        reached.proven && reached.at_ms >= past_the_end,
+        "the last output was written after the bound {past_the_end}: {times:?}"
+    );
+    let page = device_page_of(&none_yet, rig.session_id(), 0, WHOLE).await;
+    assert_eq!(page.from_cursor.get(), last_starts);
+    assert_eq!(page.bytes.as_slice(), last_shown.as_slice());
+
+    for paged in [
+        device_paged(&part_way, rig.session_id(), 0, 4_099).await,
+        device_paged(&none_yet, rig.session_id(), 0, 4_099).await,
+    ] {
+        for marker in markers {
+            assert!(!holds(&paged, marker), "pages hold {marker}");
+        }
+    }
+
+    part_way.close();
+    none_yet.close();
     rig.stop().await;
 }
