@@ -78,6 +78,26 @@ fn a_copy_that_is_not_the_packed_archive_says_which_of_the_two_differs() {
         held_to(&packed, digest, &copy)
     );
 
+    // A packed archive that reads as other bytes once and as itself the next time has not changed:
+    // the system gave other bytes for the same file, and that is what is said, not that the
+    // archive changed.
+    std::fs::write(&copy, &damaged).expect("a damaged copy");
+    let mut reads_of_the_archive = 0;
+    let outcome = held_to_reading(&packed, digest, &copy, &mut |path| {
+        let mut read = std::fs::read(path).expect("a file");
+        if path == packed {
+            reads_of_the_archive += 1;
+            if reads_of_the_archive == 1 {
+                read[0] ^= 0xff;
+            }
+        }
+        read
+    });
+    assert!(
+        matches!(outcome, Err(Unequal::PackedReadsDifferently { .. })),
+        "{outcome:?}"
+    );
+
     // A packed archive that changed after it was packed: its copy is the archive as it is now, and
     // it is the packed archive that is said to differ.
     std::fs::write(&packed, &damaged).expect("the packed archive changes");

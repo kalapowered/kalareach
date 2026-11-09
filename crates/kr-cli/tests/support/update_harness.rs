@@ -1010,8 +1010,21 @@ impl Assembled {
 /// How a copy of a packed archive came not to be the archive.
 #[derive(Debug)]
 enum Unequal {
-    /// The packed archive no longer reads as it did when it was packed.
-    Packed { was: [u8; 32], now: [u8; 32] },
+    /// The packed archive no longer reads as it did when it was packed: it read as other bytes both
+    /// times it was read now, and the copy's first read was `copy`.
+    Packed {
+        was: [u8; 32],
+        now: [u8; 32],
+        copy: [u8; 32],
+    },
+    /// The packed archive read as other bytes than it was packed as the first time it was read now
+    /// and as something else the second: the system gave other bytes for the same file, and the
+    /// archive is not said to have changed. The copy's first read was `copy`.
+    PackedReadsDifferently {
+        first: [u8; 32],
+        second: [u8; 32],
+        copy: [u8; 32],
+    },
     /// The packed archive reads as it did when it was packed, and the copy, read again, differs from it.
     Copy {
         /// The byte at which the two first differ: where the shorter ends, when one is a prefix of
@@ -1029,12 +1042,25 @@ enum Unequal {
 impl std::fmt::Display for Unequal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Packed { was, now } => write!(
+            Self::Packed { was, now, copy } => write!(
                 formatter,
                 "the packed archive has changed since it was packed: it read as {} then and reads \
-                 as {} now",
+                 as {} now; the copy read as {}",
                 hex_of(was),
-                hex_of(now)
+                hex_of(now),
+                hex_of(copy)
+            ),
+            Self::PackedReadsDifferently {
+                first,
+                second,
+                copy,
+            } => write!(
+                formatter,
+                "the packed archive read as {} and then, read again, as {}: the system gave other \
+                 bytes for the same file; the copy read as {}",
+                hex_of(first),
+                hex_of(second),
+                hex_of(copy)
             ),
             Self::Copy {
                 first_difference,
@@ -1064,21 +1090,35 @@ impl std::fmt::Display for Unequal {
 /// read once more into memory and the digests taken of what was read, so that the failure says which
 /// of the two is not what was packed, and where the copy first differs.
 fn held_to(packed: &Path, digest: [u8; 32], copy: &Path) -> Result<(), Unequal> {
+    held_to_reading(packed, digest, copy, &mut |path| {
+        std::fs::read(path).expect("a file to compare")
+    })
+}
+
+/// [`held_to`], with `read` giving the bytes of a file each time it is asked, so that a case can
+/// make the system give other bytes for the same file.
+fn held_to_reading(
+    packed: &Path,
+    digest: [u8; 32],
+    copy: &Path,
+    read: &mut dyn FnMut(&Path) -> Vec<u8>,
+) -> Result<(), Unequal> {
     use sha2::Digest as _;
 
     let first = file_digest(copy);
     if first == digest {
         return Ok(());
     }
-    let archive = std::fs::read(packed).expect("the packed archive");
+    let archive = read(packed);
     let archive_digest: [u8; 32] = sha2::Sha256::digest(&archive).into();
     if archive_digest != digest {
         return Err(Unequal::Packed {
             was: digest,
             now: archive_digest,
+            copy: first,
         });
     }
-    let copied = std::fs::read(copy).expect("the copy");
+    let copied = read(copy);
     let copied_digest: [u8; 32] = sha2::Sha256::digest(&copied).into();
     if copied_digest == digest {
         return Err(Unequal::ReadsDifferently { first });
