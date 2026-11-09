@@ -597,22 +597,23 @@ registration, and neither does the minute that lets a refusal be tried again. Wh
 application runs, each asks the host about that action over a connection of its own, at most once a
 minute, and the registration is settled when the host says what became of it. The host is asked by sending the exact request again, which it answers from its record of the
 action and never acts on twice; that request holds the credential the gateway issued, so the phone
-keeps it in memory only, while the outcome is unknown, and drops it when the host answers, when
-another registration of that host is sent, when the host is forgotten or the account is deleted, and
-when the application ends. After a restart none is
-held, and a host answers `action.read` for a registration it took without a session by asking for
-the same request again, so a look asks nothing: the row says that the application ended and that only
-the person can decide, and the person's request asks for the receipt (`action.read`) once before it
-registers again. If the host took it, the host is on, the choice of
-previews it carried is the one the host was told, and the preview key is told; if its receipt says it
-refused it or never admitted it, the row says so and the next look registers again, as it does for
-any refusal. Any other answer leaves the registration unknown, and the row says what the host
-answered. A refusal in answer to the repeat does not settle it, since a host that no longer admits
-this phone refuses a repeat for that reason too, so the person decides; neither does an answer the
-phone cannot read as the registration's result, or a receipt for another action, and the request
-stays in memory to be sent again. The person's request asks about the earlier registration once more before it
-registers again, and registers again, under a new action, unless the host says it took the earlier
-one. A request that names another registration than the one the host stands at, or none, is for a
+keeps it in memory only, while the outcome is unknown, and drops it when the host's answer settles
+it, when another registration of that host is sent, when the host is forgotten or the account is
+deleted, and when the application ends. A late answer to an earlier registration drops nothing that
+is held for a later one. If the host took it, the host is on, the choice of previews it carried is
+the one the host was told, and the preview key is told; if its receipt says it refused it or never
+admitted it, the row says so and the next look registers again, as it does for any refusal. Any
+other answer leaves the registration unknown, and the row says what the host answered. A refusal in
+answer to the repeat does not settle it, since a host that no longer admits this phone refuses a
+repeat for that reason too, so the person decides; neither does an answer the phone cannot read as
+the registration's result, or a receipt for another action, and the request stays in memory to be
+sent again. After a restart none is held, and a host answers `action.read` for an action it routed
+to itself and not to a session by asking for the same request again, so a look asks nothing: the row
+says that the application ended and that only the person can decide. The person's request asks about
+the earlier registration once more before it registers again (after a restart by `action.read`), and
+registers again, under a new action, unless the host says it took the earlier one: a read that is
+undecided, or that says the host refused it, is followed by the new registration in the same run.
+A request that names another registration than the one the host stands at, or none, is for a
 view the host has left, and sends nothing; the name is compared where the host is claimed, in one
 hold, so a registration that a run sent after the view was read is not replaced by a request made
 for that view. A refusal by the host, a refusal for now, and a
