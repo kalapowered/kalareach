@@ -134,7 +134,7 @@ struct Churn {
     /// host answers a removal for the registration it was about, which can be one that was still
     /// being made and was refused, and nothing in the answer says which. The count can stay above
     /// what the host holds then, which keeps the queue, until the next removal that nothing
-    /// overlapped or until the client is dropped.
+    /// overlapped or until the connection ends.
     live: usize,
 }
 
@@ -418,9 +418,9 @@ struct Pending {
     waiting: Mutex<HashMap<u64, Waiter>>,
     closed: AtomicBool,
     transport: Mutex<Option<Transport>>,
-    /// What the client is doing about each identifier it is registering or removing. It is kept
-    /// here, with the waiting set, because it is only about answers this connection can still
-    /// bring: when the connection ends it is emptied with them.
+    /// What the client is doing about each identifier it is registering or removing. It is only
+    /// about answers this connection can still bring, so the task that reads the connection empties
+    /// it when that task ends (see [`ClearsWhenTheReaderEnds`]).
     churning: Arc<Churning>,
 }
 
@@ -494,9 +494,7 @@ impl Pending {
     /// Drops every waiting sender and records that the connection is gone.
     ///
     /// Dropping a sender is what tells its caller the host closed the connection, at once, rather
-    /// than each caller waiting out its own deadline for an answer that cannot arrive. What the
-    /// client knew of its registrations goes with them: no answer will come to act on it, and a
-    /// client over a closed connection refuses every request and cannot be connected again.
+    /// than each caller waiting out its own deadline for an answer that cannot arrive.
     fn close(&self) {
         // The flag is set under the lock an admission takes, so an admission either happens before
         // the connection ended or is refused by it; there is no order in which it happens after.
@@ -509,9 +507,6 @@ impl Pending {
         };
         // Outside the lock: what a waiter holds takes locks of its own when it goes.
         drop(drained);
-        if let Ok(mut churning) = self.churning.lock() {
-            churning.clear();
-        }
         // And the transport goes with them: a reader still waiting on the socket, a writer still
         // sending events, or a socket still half open would be this client carrying on with a
         // connection it has declared over.
@@ -1472,8 +1467,28 @@ impl Called {
     }
 }
 
+/// Empties the client's account of its registrations and removals when the task that reads the
+/// connection ends, however it ends: it reaches the end of the connection, or whoever closes the
+/// connection stops it.
+///
+/// That task is the only one that acts on an answer. Whoever closes the connection can run beside
+/// it, and an answer it has taken from the waiting set and not yet acted on is acted on by this task
+/// before it ends, so the account is emptied after the last answer has been settled and not
+/// between its being taken and its being acted on. A client over a closed connection refuses every
+/// request and cannot be connected again, so nothing would read what it kept.
+struct ClearsWhenTheReaderEnds(Arc<Pending>);
+
+impl Drop for ClearsWhenTheReaderEnds {
+    fn drop(&mut self) {
+        if let Ok(mut churning) = self.0.churning.lock() {
+            churning.clear();
+        }
+    }
+}
+
 /// Reads frames until the connection ends, then tells everyone waiting that it has.
 async fn read_frames(mut reader: FrameReader, pending: Arc<Pending>, notices: NoticeSink) {
+    let _account = ClearsWhenTheReaderEnds(Arc::clone(&pending));
     loop {
         let frame: Frame = match reader.read_message_without_schema().await {
             Ok(frame) => frame,
