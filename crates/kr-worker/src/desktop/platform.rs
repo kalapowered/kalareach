@@ -222,6 +222,9 @@ enum Printed {
 /// The difference between a command that failed and one that never ran is part of the distinction
 /// [`Reading`] exists for; the other part is what a failure said. Nothing here interpolates text
 /// into a command line: the argument vector is a vector.
+///
+/// The programs run here are the only ones an idle worker starts beside its root shell. The
+/// idle-session case in `tests/host.rs` names them, so a program added here is added there.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run(program: &str, arguments: &[&str]) -> Printed {
     // The child writes to files of this reading's own rather than to pipes. A pipe has to be read

@@ -1830,11 +1830,14 @@ async fn a_worker_that_cannot_reach_its_controller_says_why_and_ends_whatever_it
 /// KR-REQ-05.08: an idle session that has been asked to run nothing is its worker and its root
 /// shell. The daemon asks its supervisor to start the worker and nothing else: no plugin runtime
 /// or other separately supervised service, lazily or otherwise. And nothing the worker itself
-/// starts beside the shell stays running. On a Unix host that is every process the worker started,
-/// whether it is still the worker's child or a short-lived child of the worker left it running as
-/// a process of its own. On Windows the case reads the worker's children by their recorded
-/// parent, which leaves the pseudo-console's host and nothing else, and does not see a process
-/// that a child of the worker left running.
+/// starts beside the shell stays running. On Linux that is every process the worker started: the
+/// worker adopts each orphan, so one that a short-lived child of the worker left running as a
+/// process of its own is its child. On macOS the case reads the worker's children, and finds what
+/// a short-lived child left running by the directory the worker gave it or the variable in its
+/// environment, so it does not see what a backend server starts and leaves, nor a program that
+/// clears both. On Windows the case reads the worker's children by their recorded parent, which
+/// leaves the pseudo-console's host and nothing else, and does not see a process that a child of
+/// the worker left running.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_idle_session_runs_nothing_beside_its_shell() {
     let host = Host::create().recording_launches();
@@ -1959,70 +1962,80 @@ impl BesideTheShell {
     }
 }
 
-/// How long a process noted beside the shell is given to end before it is taken for a backend.
-///
-/// The worker asks its platform short questions, such as whether its desktop is still there, and
-/// each of those is a process it waits for and ends at its own deadline of two seconds, so a
-/// process that outlives five of those is not one. This only says how long a slow machine is given
-/// to end a question: the case passes as soon as every process it noted has ended.
+/// The programs an idle worker runs to ask its platform a short question: whether its desktop is
+/// still there, and which process leads its login session. Each is a process the worker waits for
+/// and ends at a deadline of its own, and it is the only kind of process the worker starts beside
+/// the root shell of a session that was asked to run nothing. The worker's desktop module names
+/// them where it runs them.
 #[cfg(unix)]
-const QUESTION_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+const PLATFORM_QUESTIONS: [&str; 3] = ["launchctl", "ioreg", "loginctl"];
 
-/// An idle session's worker has started nothing beside the root shell that stays running.
+/// An idle session's worker has started nothing beside the root shell that is not a question it
+/// asks its platform, and every question it asked has ended.
 ///
-/// A backend is a process that stays and a platform question is one that ends, and a process that
-/// is running cannot be told from the other by looking at it once. For a second of idling every
-/// process the worker started beside the shell is noted, by its start identity. The case then waits
-/// for each of them to end, and fails, naming them, when one still runs at [`QUESTION_BOUND`] or
-/// when the kernel will not say whether it does. What is asked of a noted process is whether it
-/// ended, read from the kernel by its identity: it is not looked for again by where it runs, so a
-/// process that gives up its directory after it was noted is still the one that was noted. A
-/// process that a short-lived child of the worker left running as a process of its own is noted as
-/// the worker's own children are.
+/// For a second of idling every process the worker started beside the shell is noted, by its start
+/// identity, and its program is read. A process that runs any other program fails the case at once,
+/// naming it: a backend is not told from a question by how long it lives, which no case can control,
+/// but by what it runs. Each question noted is then waited for until it ends, which the kernel says
+/// by the identity: a process the kernel will not describe has not ended, and the wait fails,
+/// naming it, only at the liveness bound, which is there so that a question that never ends fails
+/// the case and not so that anything is passed or failed by how long it took. Nothing noted is
+/// looked for again by where it runs, so a process that gives up its directory after it was
+/// noted is still the one that was noted. A process that a short-lived child of the worker left
+/// running as a process of its own is noted as the worker's own children are.
 ///
-/// The second of idling says how often the table is read, and a backend that the worker starts
-/// later than that after it has reported its session is not looked for. Whether a process stays
-/// cannot be known without a bound on how long a question takes, which is why one remains.
+/// The second of idling says how often the table is read, and a process that the worker starts
+/// later than that after it has reported its session is not looked for.
 #[cfg(unix)]
 async fn nothing_the_worker_started_beside_the_shell_runs(
     host: &Host,
     created: &SessionCreateResult,
 ) {
+    use kr_ipc::identity::{ProcessReading, ProcessState, process_state, read_process};
+
     let beside = BesideTheShell::of(host, created);
     let mut noted = Vec::new();
     for _ in 0..10 {
         for identity in beside.running() {
-            if !noted.contains(&identity) {
-                noted.push(identity);
+            if noted.contains(&identity) {
+                continue;
+            }
+            match read_process(&identity) {
+                ProcessReading::Running(facts) => {
+                    let program = facts.name.unwrap_or_default();
+                    assert!(
+                        PLATFORM_QUESTIONS.contains(&program.as_str()),
+                        "the worker started {program:?} beside its shell, which is no question it \
+                         asks its platform: {identity:?}"
+                    );
+                    noted.push(identity);
+                }
+                // It ended while it was read: it was a question.
+                ProcessReading::Ended => {}
+                ProcessReading::Unknown { detail } => {
+                    panic!("what the worker started as {identity:?} could not be read: {detail}")
+                }
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     let started = std::time::Instant::now();
-    let staying = loop {
+    loop {
         let staying: Vec<_> = noted
             .iter()
-            .filter(|identity| {
-                !matches!(
-                    kr_ipc::identity::process_state(identity),
-                    kr_ipc::identity::ProcessState::Ended
-                )
-            })
+            .map(|identity| (identity, process_state(identity)))
+            .filter(|(_, state)| !matches!(state, ProcessState::Ended))
             .collect();
         if staying.is_empty() {
-            break None;
+            return;
         }
-        if started.elapsed() > QUESTION_BOUND {
-            break Some(format!("{staying:?}"));
-        }
+        assert!(
+            started.elapsed() <= LIVENESS_DEADLINE,
+            "a question the worker asked its platform has not ended after {:?}: {staying:?}",
+            started.elapsed()
+        );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    };
-    assert!(
-        staying.is_none(),
-        "nothing the worker started beside its shell is still running after {:?}: {}",
-        started.elapsed(),
-        staying.unwrap_or_default()
-    );
+    }
 }
 
 /// What the worker has started, on Windows: its root shell, and the host of the pseudo-console the
@@ -2076,17 +2089,37 @@ fn only_the_pseudo_console_runs_beside_the_shell(host: &Host, created: &SessionC
 /// Every process on this machine, with its parent.
 #[cfg(unix)]
 fn processes() -> Vec<(u32, u32)> {
-    let output = std::process::Command::new("ps")
-        .args(["-A", "-o", "pid=,ppid="])
-        .output()
-        .expect("lists the processes");
-    String::from_utf8_lossy(&output.stdout)
+    let output = read_table(std::process::Command::new("ps").args(["-A", "-o", "pid=,ppid="]));
+    String::from_utf8_lossy(&output)
         .lines()
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
             Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
         })
         .collect()
+}
+
+/// What a command that reads the machine's process table prints. A command that failed has read
+/// nothing, and a case that took its empty output for an empty table would find no process, so it is
+/// run again and then stops the case. Three readings are all that a table that is changing while it
+/// is read can need.
+#[cfg(unix)]
+fn read_table(command: &mut std::process::Command) -> Vec<u8> {
+    let mut failure = String::new();
+    for _ in 0..3 {
+        match command.output() {
+            Ok(output) if output.status.success() => return output.stdout,
+            Ok(output) => {
+                failure = format!(
+                    "{}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            Err(error) => failure = error.to_string(),
+        }
+    }
+    panic!("the process table could not be read by {command:?}: {failure}")
 }
 
 /// The working directory of each process in `table` that the kernel will tell this user, by
@@ -2107,20 +2140,17 @@ fn working_directories(table: &[(u32, u32)]) -> std::collections::HashMap<u32, P
 /// kernel's table of open files.
 #[cfg(target_os = "macos")]
 fn working_directories(_table: &[(u32, u32)]) -> std::collections::HashMap<u32, PathBuf> {
-    let output = std::process::Command::new("/usr/sbin/lsof")
-        .args([
-            "-a",
-            "-u",
-            &rustix::process::getuid().as_raw().to_string(),
-            "-d",
-            "cwd",
-            "-Fpn",
-        ])
-        .output()
-        .unwrap_or_else(|error| panic!("the process table could not be read: {error}"));
+    let output = read_table(std::process::Command::new("/usr/sbin/lsof").args([
+        "-a",
+        "-u",
+        &rustix::process::getuid().as_raw().to_string(),
+        "-d",
+        "cwd",
+        "-Fpn",
+    ]));
     let mut directories = std::collections::HashMap::new();
     let mut pid = None;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
+    for line in String::from_utf8_lossy(&output).lines() {
         if let Some(number) = line.strip_prefix('p') {
             pid = number.parse::<u32>().ok();
         } else if let (Some(pid), Some(directory)) = (pid, line.strip_prefix('n')) {
@@ -2152,11 +2182,14 @@ fn carrying(marker: &(String, String), table: &[(u32, u32)]) -> std::collections
 #[cfg(target_os = "macos")]
 fn carrying(marker: &(String, String), _table: &[(u32, u32)]) -> std::collections::HashSet<u32> {
     let entry = format!("{}={}", marker.0, marker.1);
-    let output = std::process::Command::new("ps")
-        .args(["-E", "-ww", "-A", "-o", "pid=,command="])
-        .output()
-        .expect("lists the processes with their environments");
-    String::from_utf8_lossy(&output.stdout)
+    let output = read_table(std::process::Command::new("ps").args([
+        "-E",
+        "-ww",
+        "-A",
+        "-o",
+        "pid=,command=",
+    ]));
+    String::from_utf8_lossy(&output)
         .lines()
         .filter(|line| line.contains(&entry))
         .filter_map(|line| line.split_whitespace().next()?.parse().ok())
