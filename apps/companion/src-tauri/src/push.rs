@@ -552,6 +552,11 @@ pub trait Registrar: Send + Sync {
     /// the action. A phone that does not, as after the application ended, would only make a visit
     /// the host cannot answer, so a look makes none and leaves the decision to the person.
     fn can_ask(&self, host: DeviceId, action: ActionId) -> bool;
+
+    /// Drops whatever this registrar keeps for `host`, which the person forgot or whose account
+    /// was deleted: the request it would send again holds a credential nothing will ask about.
+    /// Nothing a task that began before this keeps for the host after it.
+    fn forgotten(&self, _host: DeviceId) {}
 }
 
 /// A boxed future for a change made over the line.
@@ -1337,6 +1342,9 @@ impl PushDesk {
                 self.keep(&state.record);
             }
         }
+        // After the run lost its claim: what the registrar kept to ask the host with is dropped, and
+        // no run that began before this keeps another.
+        self.registrar.forgotten(host);
         self.tell_page();
         // The host's key is not the receivers' to open its previews with any more.
         let desk = Arc::clone(self);
@@ -1366,6 +1374,7 @@ impl PushDesk {
                 return false;
             }
         };
+        let mut marked_hosts = Vec::new();
         let kept = {
             let mut state = lock(&self.state);
             let mut marked = false;
@@ -1375,6 +1384,7 @@ impl PushDesk {
                 if !state.record.hosts.contains_key(&key) {
                     continue;
                 }
+                marked_hosts.push(id);
                 state.running.remove(&id);
                 if let Some((_, cancel)) = state.cancels.remove(&id) {
                     cancel.notify_one();
@@ -1402,6 +1412,11 @@ impl PushDesk {
             }
             !marked || self.keep_checked(&state.record)
         };
+        // After the runs lost their claims: what the registrar kept to ask each host with is
+        // dropped, as the service may have removed what it was for.
+        for id in marked_hosts {
+            self.registrar.forgotten(id);
+        }
         self.tell_page();
         // The hosts' keys are not the receivers' to open previews with while they are not on.
         let desk = Arc::clone(self);
@@ -2778,11 +2793,70 @@ async fn within_the_answer<T>(
 /// The registrations sent whose outcome is not known, each as it was composed, by the host they went
 /// to: the exact request a repeat sends, which the host answers from its record of the action. A
 /// request holds the credential the gateway issued, so it is kept in memory only: it is dropped when
-/// the host answers, when a later registration of the same host is composed in its place, and when
-/// the application ends, and it is never written. After a restart none is held, and a look asks
+/// the host answers, when a later registration of the same host is composed in its place, when the
+/// host is forgotten or the account deleted, and when the application ends, and it is never written. After a restart none is held, and a look asks
 /// nothing; the person's request reads the result with `action.read`, for a host that keeps a
 /// receipt for it.
-type Repeats = Arc<Mutex<BTreeMap<DeviceId, (ActionId, ComposedMutation)>>>;
+type Repeats = Arc<Mutex<Held<ComposedMutation>>>;
+
+/// What is kept in memory to send again, one request for each host, and how many times each host
+/// was forgotten. A line records that count when it is made, and keeps a request only while it is
+/// the count the registrar has: a task that outlives the forgetting of its host cannot put back what
+/// was dropped.
+struct Held<T> {
+    requests: BTreeMap<DeviceId, (ActionId, T)>,
+    forgettings: BTreeMap<DeviceId, u64>,
+}
+
+impl<T> Default for Held<T> {
+    fn default() -> Self {
+        Self {
+            requests: BTreeMap::new(),
+            forgettings: BTreeMap::new(),
+        }
+    }
+}
+
+impl<T: Clone> Held<T> {
+    /// How many times `host` was forgotten.
+    fn forgettings(&self, host: DeviceId) -> u64 {
+        self.forgettings.get(&host).copied().unwrap_or(0)
+    }
+
+    /// Keeps `request`, sent under `action` to `host`, in place of the one held for the host, unless
+    /// the host was forgotten since `forgettings` was read. Says whether it did.
+    fn keep(&mut self, host: DeviceId, forgettings: u64, action: ActionId, request: T) -> bool {
+        if self.forgettings(host) != forgettings {
+            return false;
+        }
+        self.requests.insert(host, (action, request));
+        true
+    }
+
+    /// The request held for `host` under `action`.
+    fn get(&self, host: DeviceId, action: ActionId) -> Option<T> {
+        self.requests
+            .get(&host)
+            .filter(|(held, _)| *held == action)
+            .map(|(_, request)| request.clone())
+    }
+
+    /// Whether a request is held for `host` under `action`.
+    fn holds(&self, host: DeviceId, action: ActionId) -> bool {
+        self.get(host, action).is_some()
+    }
+
+    /// Drops what is held for `host`: the host answered, or said what became of it.
+    fn settled(&mut self, host: DeviceId) {
+        self.requests.remove(&host);
+    }
+
+    /// Drops what is held for `host`, which was forgotten: no line made before this keeps another.
+    fn forget(&mut self, host: DeviceId) {
+        self.requests.remove(&host);
+        *self.forgettings.entry(host).or_insert(0) += 1;
+    }
+}
 
 /// The product's way to the host: a connection opened for the host, as the device the host made.
 pub struct ConnectionRegistrar {
@@ -2814,9 +2888,11 @@ impl Registrar for ConnectionRegistrar {
     }
 
     fn can_ask(&self, host: DeviceId, action: ActionId) -> bool {
-        lock(&self.repeats)
-            .get(&host)
-            .is_some_and(|(held, _)| *held == action)
+        lock(&self.repeats).holds(host, action)
+    }
+
+    fn forgotten(&self, host: DeviceId) {
+        lock(&self.repeats).forget(host);
     }
 
     fn connect<'a>(
@@ -2863,6 +2939,9 @@ impl Registrar for ConnectionRegistrar {
                 host_device_id: host.host_device_id,
                 device_id: host.device_id,
                 repeats: Arc::clone(&self.repeats),
+                // Read before anything is sent: the host is forgotten after the run lost its claim,
+                // so a line that reads a count that already includes it is never sent a request.
+                forgettings: lock(&self.repeats).forgettings(host.host_device_id),
                 _held: held,
             }) as Box<dyn HostLine + 'a>)
         })
@@ -2879,6 +2958,8 @@ struct ConnectionLine {
     device_id: DeviceId,
     /// The registrations whose outcome is not known, as composed.
     repeats: Repeats,
+    /// How many times the host had been forgotten when this line was made.
+    forgettings: u64,
     /// The hold on the host's endpoint, kept until the line is dropped.
     _held: kr_client::pairing::link::EndpointHold,
 }
@@ -2895,7 +2976,7 @@ impl ConnectionLine {
     }
 
     /// The registrations whose outcome is not known, as composed.
-    fn repeats(&self) -> MutexGuard<'_, BTreeMap<DeviceId, (ActionId, ComposedMutation)>> {
+    fn repeats(&self) -> MutexGuard<'_, Held<ComposedMutation>> {
         lock(&self.repeats)
     }
 
@@ -3008,8 +3089,16 @@ impl HostLine for ConnectionLine {
                 .map_err(|error| LineStop::Host(CommandError::from(error).message))?;
             // Kept in memory before it is sent, as composed, so that the host can be asked about
             // it again with the exact request, which is how it answers for an action of its own.
-            self.repeats()
-                .insert(self.host_device_id, (action, composed.clone()));
+            // A host forgotten since this line was made is sent nothing, and nothing of it is kept.
+            let kept = self.repeats().keep(
+                self.host_device_id,
+                self.forgettings,
+                action,
+                composed.clone(),
+            );
+            if !kept {
+                return Err(LineStop::Phone(forgotten_host().words));
+            }
             match tokio::time::timeout(ANSWER_WITHIN, session.send(&composed)).await {
                 // The request was sent and nothing came back: the host may have taken it.
                 Err(_) => Err(LineStop::Unknown(
@@ -3018,7 +3107,7 @@ impl HostLine for ConnectionLine {
                 Ok(Ok(kr_client::Settled::Result(value))) => match value.to_typed() {
                     Ok(result) => {
                         session.settle(action).await;
-                        self.repeats().remove(&self.host_device_id);
+                        self.repeats().settled(self.host_device_id);
                         Ok(result)
                     }
                     // The host answered, and what it said is not a result this phone reads: it
@@ -3040,7 +3129,7 @@ impl HostLine for ConnectionLine {
                 // The host refused it, for good or for now, or it could not be sent.
                 Ok(Err(error)) => {
                     session.settle(action).await;
-                    self.repeats().remove(&self.host_device_id);
+                    self.repeats().settled(self.host_device_id);
                     Err(LineStop::Host(CommandError::from(error).message))
                 }
             }
@@ -3050,11 +3139,7 @@ impl HostLine for ConnectionLine {
     fn read_registration(&mut self, action: ActionId) -> LineFuture<'_, RegistrationRead> {
         Box::pin(async move {
             self.still_the_account()?;
-            let held = self
-                .repeats()
-                .get(&self.host_device_id)
-                .filter(|(held, _)| *held == action)
-                .map(|(_, composed)| composed.clone());
+            let held = self.repeats().get(self.host_device_id, action);
             let read = match held {
                 // The exact request again, on this connection, which is not the one that sent it: the
                 // host answers it from its record of the action, and never acts on it twice.
@@ -3067,7 +3152,7 @@ impl HostLine for ConnectionLine {
                 read,
                 RegistrationRead::Taken | RegistrationRead::NotTaken(_)
             ) {
-                self.repeats().remove(&self.host_device_id);
+                self.repeats().settled(self.host_device_id);
             }
             Ok(read)
         })
@@ -3362,6 +3447,38 @@ mod tests {
             ),
             "a refusal recorded for another action is not this one's"
         );
+    }
+
+    /// What a registrar keeps to send again is dropped when its host is forgotten, and a task that
+    /// began before that cannot put it back: the line that was made first holds a count that is no
+    /// longer the registrar's. No seam outside the registrar reaches a late task, so the order is made
+    /// here: the line is made, the host is forgotten, and the line keeps its request.
+    #[test]
+    fn a_line_made_before_its_host_was_forgotten_cannot_keep_a_request_for_it() {
+        let host = DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([6; 16]));
+        let action = ActionId::new(kr_ipc::new_uuid());
+        let mut held = Held::<&str>::default();
+        let before = held.forgettings(host);
+        assert!(held.keep(host, before, action, "the request"));
+        assert!(
+            held.holds(host, action),
+            "control: a line keeps its request"
+        );
+
+        held.forget(host);
+
+        assert!(!held.holds(host, action), "what was kept is dropped");
+        assert!(
+            !held.keep(host, before, action, "a late request"),
+            "a line made before the host was forgotten keeps nothing"
+        );
+        assert!(!held.holds(host, action));
+        let after = held.forgettings(host);
+        assert!(
+            held.keep(host, after, action, "a request"),
+            "a line made after, for the host paired again, keeps its own"
+        );
+        assert!(held.holds(host, action));
     }
 
     /// A time later than the start's own is a clock set back: the retry is not delayed by it.
