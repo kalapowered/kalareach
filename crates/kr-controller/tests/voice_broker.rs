@@ -658,20 +658,14 @@ async fn account_report(host: &net_support::Host) -> AccountReport {
         .expect("a report")
 }
 
-/// A loopback port nothing holds now.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("a loopback port")
-        .local_addr()
-        .expect("an address")
-        .port()
-}
-
-/// Has the daemon listen for sign-ins on `port` instead of the registered address.
-fn listen_for_sign_ins_on(host: &net_support::Host, port: u16) {
+/// Has the daemon listen for sign-ins on a loopback port the system gives it, a new one at each
+/// sign-in, instead of the registered address. The report of a sign-in that is waiting names the
+/// address the daemon bound, and a case reads it from there: a port a case chose and let go is one
+/// another process can take before the daemon binds it.
+fn listen_for_sign_ins(host: &net_support::Host) {
     host.controller()
         .host_account()
-        .listen_on(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+        .listen_on(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
 }
 
 /// Waits until no sign-in is waiting or finishing, and returns where the host stands.
@@ -1051,14 +1045,17 @@ async fn an_operator_signs_the_host_in_and_a_call_presents_the_account_it_signed
     let owner = DeviceKeys::generate().expect("owner keys");
     let host =
         net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
-    // One address for both attempts, as the registered one is: the second can bind it only if the
-    // first has let it go.
-    listen_for_sign_ins_on(&host, free_port());
+    listen_for_sign_ins(&host);
     let before = account_report(&host).await;
     assert_eq!(before.state, AccountState::SignedOut);
     assert_eq!(before.service.as_ref(), Some(&broker.origin));
 
     let (first_url, first_address) = start_sign_in(&host).await;
+    // One address for both attempts, as the registered one is: the second can bind the address the
+    // first listens on only if the first has let it go.
+    host.controller()
+        .host_account()
+        .listen_on(first_address.parse().expect("the address the daemon bound"));
     let (second_url, second_address) = start_sign_in(&host).await;
     assert_eq!(
         first_address, second_address,
@@ -1175,7 +1172,7 @@ async fn a_sign_in_that_does_not_complete_leaves_the_host_signed_out_and_says_wh
     let owner = DeviceKeys::generate().expect("owner keys");
     let host =
         net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
-    listen_for_sign_ins_on(&host, free_port());
+    listen_for_sign_ins(&host);
 
     // The service does not redeem a code it did not issue.
     let (url, address) = start_sign_in(&host).await;
@@ -1202,7 +1199,9 @@ async fn a_sign_in_that_does_not_complete_leaves_the_host_signed_out_and_says_wh
 
     // Another program holds the address.
     let held = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
-    listen_for_sign_ins_on(&host, held.local_addr().expect("an address").port());
+    host.controller()
+        .host_account()
+        .listen_on(held.local_addr().expect("an address"));
     let refused = host
         .client()
         .await
@@ -1235,7 +1234,7 @@ async fn a_sign_in_request_sent_again_is_answered_from_the_first() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host =
         net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
-    listen_for_sign_ins_on(&host, free_port());
+    listen_for_sign_ins(&host);
     let action = ActionId::new(kr_ipc::new_uuid());
     let mut asked = Vec::new();
     let mut waiting = Vec::new();
@@ -1291,7 +1290,7 @@ async fn a_sign_in_never_changes_the_account_a_call_closes_under() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host =
         net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
-    listen_for_sign_ins_on(&host, free_port());
+    listen_for_sign_ins(&host);
     sign_in_with(&host, broker.issue_grant(600)).await;
 
     // A sign-in begins, and then a call opens while the person is in the browser.
@@ -1502,7 +1501,7 @@ async fn a_sign_out_ends_the_sign_in_that_is_waiting() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host =
         net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
-    listen_for_sign_ins_on(&host, free_port());
+    listen_for_sign_ins(&host);
     let (url, address) = start_sign_in(&host).await;
     broker.expect_sign_in(&url);
 
@@ -1538,7 +1537,7 @@ async fn an_account_never_changes_under_a_call_whose_start_is_waiting_on_the_bro
     let owner = DeviceKeys::generate().expect("owner keys");
     let host =
         net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
-    listen_for_sign_ins_on(&host, free_port());
+    listen_for_sign_ins(&host);
     sign_in_with(&host, broker.issue_grant(600)).await;
     let (_device, session, session_id, prepared) = ready(&host, &owner).await;
     let (url, address) = start_sign_in(&host).await;
@@ -1685,7 +1684,7 @@ async fn a_call_that_opens_while_a_sign_in_is_exchanged_leaves_the_account_as_it
     let owner = DeviceKeys::generate().expect("owner keys");
     let host =
         net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
-    listen_for_sign_ins_on(&host, free_port());
+    listen_for_sign_ins(&host);
     sign_in_with(&host, broker.issue_grant(600)).await;
     let (url, address) = start_sign_in(&host).await;
     broker.expect_sign_in(&url);
@@ -1776,7 +1775,7 @@ async fn a_start_that_meets_an_account_being_changed_waits_and_is_refused_when_t
     let owner = DeviceKeys::generate().expect("owner keys");
     let host =
         net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
-    listen_for_sign_ins_on(&host, free_port());
+    listen_for_sign_ins(&host);
     sign_in_with(&host, broker.issue_grant(600)).await;
     let (_device, session, session_id, prepared) = ready(&host, &owner).await;
     let (url, address) = start_sign_in(&host).await;
@@ -1843,7 +1842,7 @@ async fn a_start_that_meets_an_account_being_changed_waits_and_is_made_under_the
     let owner = DeviceKeys::generate().expect("owner keys");
     let host =
         net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
-    listen_for_sign_ins_on(&host, free_port());
+    listen_for_sign_ins(&host);
     sign_in_with(&host, broker.issue_grant(600)).await;
     let (_device, session, session_id, prepared) = ready(&host, &owner).await;
     let (url, address) = start_sign_in(&host).await;
@@ -1905,7 +1904,7 @@ async fn a_turned_away_grant_the_queue_cannot_hold_is_still_sent_to_the_service(
     let owner = DeviceKeys::generate().expect("owner keys");
     let host =
         net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
-    listen_for_sign_ins_on(&host, free_port());
+    listen_for_sign_ins(&host);
     sign_in_with(&host, broker.issue_grant(600)).await;
     // The preparation asks for a token, which settles what the daemon found when it started.
     let (_device, session, session_id, prepared) = ready(&host, &owner).await;
@@ -1951,7 +1950,7 @@ async fn a_sign_in_the_host_cannot_keep_is_sent_to_the_service_to_be_ended() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host =
         net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
-    listen_for_sign_ins_on(&host, free_port());
+    listen_for_sign_ins(&host);
     sign_in_with(&host, broker.issue_grant(600)).await;
     // The preparation asks for a token, which settles what the daemon found when it started.
     let _prepared = ready(&host, &owner).await;
@@ -1983,7 +1982,7 @@ async fn a_sign_in_the_service_refuses_after_issuing_tokens_has_them_ended() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host =
         net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
-    listen_for_sign_ins_on(&host, free_port());
+    listen_for_sign_ins(&host);
     let (url, address) = start_sign_in(&host).await;
     broker.expect_sign_in(&url);
     broker.answer_with_another_nonce();
@@ -2460,7 +2459,7 @@ async fn a_call_whose_deadline_passes_while_a_sign_in_is_exchanged_keeps_the_acc
         wall.clocks(),
     )
     .await;
-    listen_for_sign_ins_on(&host, free_port());
+    listen_for_sign_ins(&host);
     sign_in_with(&host, broker.issue_grant(600)).await;
     let (url, address) = start_sign_in(&host).await;
     broker.expect_sign_in(&url);

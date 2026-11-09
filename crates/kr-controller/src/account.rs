@@ -319,7 +319,10 @@ impl HostAccount {
     }
 
     /// Listens on `address` instead of the registered loopback address, for a test that runs
-    /// several daemons at once.
+    /// several daemons at once. With port 0 the system gives each sign-in a free port when the
+    /// daemon binds it, and the report of the waiting sign-in names the address that was bound: a
+    /// test reads it from there and never chooses a port itself, which another process can take
+    /// between the choice and the bind.
     #[cfg(feature = "testing")]
     pub fn listen_on(&self, address: std::net::SocketAddr) {
         *self.inner.loopback.lock().expect("the test address") = Some(address);

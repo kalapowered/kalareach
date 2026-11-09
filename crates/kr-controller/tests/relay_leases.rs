@@ -2925,15 +2925,12 @@ async fn the_hosts_sign_in_asks_for_the_right_to_bill_relay_traffic() {
     use kr_protocol::ids::ActionId;
 
     let rig = Rig::start_signed_in(false).await;
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("a loopback port")
-        .local_addr()
-        .expect("an address")
-        .port();
+    // A port the system gives the daemon when the sign-in starts: one this case chose and let go
+    // could be taken by another process before the daemon binds it.
     rig.host
         .controller()
         .host_account()
-        .listen_on(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+        .listen_on(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
     let mut local = rig.host.client().await;
     local
         .mutate(
