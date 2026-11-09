@@ -3548,6 +3548,65 @@ async fn a_restore_is_about_the_registration_the_connection_held_when_the_reques
     .await;
 }
 
+/// Returns once `count` tasks have stopped at `hold`.
+async fn reached_by(hold: &kr_plugin_service::hold::HoldHandle, count: usize, what: &str) {
+    tokio::time::timeout(HANG_GUARD, async {
+        while hold.parked_tasks() < count {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(what);
+}
+
+// A hold that more than one call reaches lets every one of them go when it is released. Two
+// snapshots are read while the calls are held, and both stand at the hold before it is released:
+// a release that woke one of them would leave the other waiting for a release that has been made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hold_that_two_calls_reach_lets_both_of_them_go_when_it_is_released() {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let served = Served::start_unbinding_within(HANG_GUARD).await;
+    let (path, digest, bytes) = served.install("well-behaved", &wasm);
+    let component = ComponentSource {
+        path,
+        digest,
+        bytes,
+    };
+    let mut raw = Raw::connect(&served).await;
+    let request = components::request("well-behaved", 1);
+    let registered = raw.register(&request, &component).await;
+    assert!(
+        matches!(registered, ResponseBody::Registered { .. }),
+        "the binding was answered with {registered:?}"
+    );
+
+    let hold = served.host.hold_calls_before_they_run();
+    let mut asked = Vec::new();
+    for _ in 0..2 {
+        asked.push(
+            raw.send(RequestBody::Snapshot {
+                binding_id: request.binding_id.get(),
+                deadline_ms: 20_000,
+            })
+            .await,
+        );
+    }
+    reached_by(&hold, 2, "the two calls never both stopped at the hold").await;
+    hold.release();
+
+    let answered = tokio::time::timeout(HANG_GUARD, raw.collect(&asked))
+        .await
+        .expect("a call that was held when the hold was released was never let go");
+    for answer in answered {
+        assert!(
+            matches!(answer, ResponseBody::Called { .. }),
+            "a call held with another was answered with {answer:?}"
+        );
+    }
+}
+
 // A registration is the connection's from the moment the request is read, and not from the moment
 // its component has been read and compiled. An unbind that comes in between is about it: it is
 // answered as an unbind of a binding that exists, and the registration is refused when it gets
