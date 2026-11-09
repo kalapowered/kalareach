@@ -718,7 +718,7 @@ impl PluginHost {
                     .await
             }
             RequestBody::Event { binding_id, event } => {
-                let binding = self.binding(served.owner, binding_id)?;
+                let binding = standing_binding(served, binding_id)?;
                 // A binding the runtime disabled interprets nothing, and a worker that is told so
                 // stops offering it anything.
                 if let Some(reason) = binding.disabled_reason() {
@@ -882,7 +882,7 @@ impl PluginHost {
             }
             RequestBody::ReviseFacts { binding_id, facts } => {
                 check_facts(&facts).map_err(refused)?;
-                let binding = self.binding(served.owner, binding_id)?;
+                let binding = standing_binding(served, binding_id)?;
                 // The plugin a binding serves is fixed when it is registered.
                 if facts.plugin_id != binding.request().facts.plugin_id {
                     return Err(refused(
@@ -897,7 +897,7 @@ impl PluginHost {
                 attachments,
             } => {
                 check_attachments(&attachments).map_err(refused)?;
-                let binding = self.binding(served.owner, binding_id)?;
+                let binding = standing_binding(served, binding_id)?;
                 binding.set_attachments(attachments_of(&attachments));
                 Ok(ResponseBody::Revised)
             }
@@ -1319,16 +1319,22 @@ impl PluginHost {
             host_public_key: *self.identity.public_key(),
         }
     }
+}
 
-    fn binding(
-        &self,
-        owner: BindingOwner,
-        binding_id: Uuid,
-    ) -> Result<Arc<crate::runtime::binding::BindingHandle>, (String, bool)> {
-        self.runtime
-            .binding(owner, BindingId::new(binding_id))
-            .ok_or_else(|| no_such_binding(binding_id))
-    }
+/// Returns the binding this connection stands behind under an identifier now, for the requests the
+/// reading task answers without entering a component. The runtime may still hold a registration
+/// the connection stopped standing behind when it read an unbind, until the removal has run, and
+/// a request read after that unbind is not about it.
+fn standing_binding(
+    served: &Served,
+    binding_id: Uuid,
+) -> Result<Arc<BindingHandle>, (String, bool)> {
+    served
+        .registered
+        .lock()
+        .ok()
+        .and_then(|held| held.standing_binding(binding_id))
+        .ok_or_else(|| no_such_binding(binding_id))
 }
 
 /// The compile pool's hold, and the gate file that keeps it.

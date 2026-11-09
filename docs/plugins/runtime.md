@@ -496,7 +496,10 @@ registration, and to no other request about it. A call (`snapshot`, `prepare_act
 `restore`, `decode`, `encode`) is about the live binding the connection stood behind under the
 identifier when the request was read. One read after an unbind of that binding is refused as a call
 on a binding the connection does not hold, and one read before it is never carried out in a
-registration made after it.
+registration made after it. An `event`, a `revise_facts` and a `revise_attachments`, which the
+reading task answers, are judged the same way: read after an unbind of the binding, each is refused
+as a request about a binding the connection does not hold, although the runtime holds the
+registration until its removal has run.
 
 A document travels as its own frames, chunked so each fits one, and every piece names the document it
 belongs to; only the last is marked as the last. That is how a reader knows which notices go together

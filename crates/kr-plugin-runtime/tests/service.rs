@@ -3607,6 +3607,92 @@ async fn a_hold_that_two_calls_reach_lets_both_of_them_go_when_it_is_released() 
     }
 }
 
+// A request about a binding that is read after the unbind of it is about no binding, whatever it
+// asks: the connection no longer stands behind the registration, which is still in the runtime
+// until its removal has run. An event, a revision of the facts and a revision of the attachments
+// are answered on the task that reads the connection, and are judged the way a call is, by what
+// the connection stood behind when they were read, and not by whatever the runtime holds when the
+// host gets to them: the registration that is leaving is not given an observation it will never
+// interpret nor facts nobody will read, with an answer that says it was.
+//
+// The unbind is read and its task is held where it starts, so that the registration is still in
+// the runtime when the three requests are read. Each is asked of the binding first, as a control.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_event_and_a_revision_read_after_the_unbind_of_a_binding_are_about_no_binding() {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let served = Served::start_unbinding_within(HANG_GUARD).await;
+    let (path, digest, bytes) = served.install("well-behaved", &wasm);
+    let component = ComponentSource {
+        path,
+        digest,
+        bytes,
+    };
+    let mut raw = Raw::connect(&served).await;
+    let request = components::request("well-behaved", 1);
+    let registered = raw.register(&request, &component).await;
+    assert!(
+        matches!(registered, ResponseBody::Registered { .. }),
+        "the binding was answered with {registered:?}"
+    );
+    let binding_id = request.binding_id.get();
+    let event = || RequestBody::Event {
+        binding_id,
+        event: kr_plugin_service::vocabulary::wire_event(&components::scrape("se-0", "x")),
+    };
+    let facts = || RequestBody::ReviseFacts {
+        binding_id,
+        facts: kr_plugin_service::vocabulary::wire_facts(&components::facts("well-behaved")),
+    };
+    let attachments = || RequestBody::ReviseAttachments {
+        binding_id,
+        attachments: Vec::new(),
+    };
+
+    let admitted = raw.ask(event()).await;
+    assert!(
+        matches!(admitted, ResponseBody::Admitted { .. }),
+        "an event for the standing registration was answered with {admitted:?}"
+    );
+    for (name, body) in [("facts", facts()), ("attachments", attachments())] {
+        let revised = raw.ask(body).await;
+        assert!(
+            matches!(revised, ResponseBody::Revised),
+            "a revision of the {name} of the standing registration was answered with {revised:?}"
+        );
+    }
+
+    let hold = served.host.hold_unbinds_before_they_run();
+    let leaving = raw.send_unbind(&request).await;
+    reached(&hold, "the unbind's task never started").await;
+    let gone = kr_plugin_runtime::RuntimeError::NoSuchBinding {
+        binding: request.binding_id.get().to_string(),
+    }
+    .to_string();
+    for (name, body) in [
+        ("event", event()),
+        ("revision of the facts", facts()),
+        ("revision of the attachments", attachments()),
+    ] {
+        let answered = raw.ask(body).await;
+        assert!(
+            matches!(
+                &answered,
+                ResponseBody::Refused { detail, disabled: false, .. } if *detail == gone
+            ),
+            "an {name} read after the unbind of the binding was answered with {answered:?}, and \
+             not as a request about a binding that is gone"
+        );
+    }
+    hold.release();
+    let removed = raw.collect(&[leaving]).await.pop().expect("one answer");
+    assert!(
+        matches!(removed, ResponseBody::Unbound { existed: true }),
+        "the unbind was answered with {removed:?}"
+    );
+}
+
 // A client whose connection has ended holds no record of the registrations it had made. What it
 // knows of an identifier is there to act on the answers the host brings, and none will come: the
 // client refuses every request from then on and cannot be connected again, so a record kept for
