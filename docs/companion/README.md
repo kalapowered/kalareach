@@ -598,7 +598,8 @@ application runs, each asks the host about that action over a connection of its 
 minute, and the registration is settled when the host says what became of it. The host is asked by sending the exact request again, which it answers from its record of the
 action and never acts on twice; that request holds the credential the gateway issued, so the phone
 keeps it in memory only, while the outcome is unknown, and drops it when the host answers, when
-another registration of that host is sent and when the application ends. After a restart none is
+another registration of that host is sent, when the host is forgotten or the account is deleted, and
+when the application ends. After a restart none is
 held, and a host answers `action.read` for a registration it took without a session by asking for
 the same request again, so a look asks nothing: the row says that the application ended and that only
 the person can decide, and the person's request asks for the receipt (`action.read`) once before it

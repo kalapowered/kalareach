@@ -347,6 +347,8 @@ struct Registered {
     /// Whether the phone holds nothing to ask the host with, as a phone whose application ended
     /// does: what the product keeps in memory to send again goes with the application.
     cannot_ask: bool,
+    /// The hosts the registrar was told to drop what it kept for, in the order it was told.
+    forgotten: Vec<kr_protocol::ids::DeviceId>,
 }
 
 /// Waits for as long as `held` says of the script that a step is held.
@@ -366,6 +368,10 @@ struct HostLink(Arc<Mutex<Registered>>);
 impl Registrar for HostLink {
     fn can_ask(&self, _host: kr_protocol::ids::DeviceId, _action: ActionId) -> bool {
         !self.0.lock().expect("what was handed").cannot_ask
+    }
+
+    fn forgotten(&self, host: kr_protocol::ids::DeviceId) {
+        self.0.lock().expect("what was handed").forgotten.push(host);
     }
 
     fn connect<'a>(
@@ -2909,6 +2915,10 @@ impl Registrar for Watched {
         self.real.can_ask(host, action)
     }
 
+    fn forgotten(&self, host: kr_protocol::ids::DeviceId) {
+        self.real.forgotten(host);
+    }
+
     fn connect<'a>(
         &'a self,
         host: &'a PairedHost,
@@ -5443,6 +5453,31 @@ async fn an_account_deleted_after_an_unknown_outcome_leaves_the_whole_sequence_t
         2,
         "registered again, under a new action"
     );
+}
+
+/// What a registrar keeps to ask a host about a registration with holds the credential the gateway
+/// issued, so it is dropped when the person forgets the host and when the account the registration
+/// was made under is deleted: nothing will ask about either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_registrar_is_told_to_drop_what_it_kept_for_a_forgotten_host_and_a_deleted_account() {
+    let (_host, phone, _reference, _action) =
+        a_phone_whose_registration_has_no_known_outcome().await;
+    let host = phone.device.pairing().hosts.list().expect("the hosts")[0].host_device_id;
+    let told = || {
+        phone
+            .registered
+            .lock()
+            .expect("the script")
+            .forgotten
+            .clone()
+    };
+    assert!(told().is_empty());
+
+    assert!(phone.desk.account_deleted());
+    assert_eq!(told(), [host], "the account was deleted");
+
+    phone.desk.forgotten(host);
+    assert_eq!(told(), [host, host], "the host was forgotten");
 }
 
 /// The unknown outcome outlives the application: a start reads it from the record, the page is told
