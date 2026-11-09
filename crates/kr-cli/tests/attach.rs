@@ -33,7 +33,7 @@ use rustix::termios::SpecialCodeIndex;
 mod support;
 
 use support::terminal::{self, Answering, Collected, Keys};
-use support::{command_binaries, kr, kr_attach_guard};
+use support::{close_plants, command_binaries, kr, kr_attach_guard};
 
 /// A session this test hosts, with its descriptor published where `kr` will find it.
 struct Hosted {
@@ -2114,6 +2114,130 @@ async fn close_without_a_session_named_closes_the_one_it_runs_inside() {
                 | kr_protocol::session::SessionState::Closed
         ),
         "the session it runs inside is closing"
+    );
+}
+
+/// Runs `kr` against the hosted session's host, outside any session, with nothing of the person
+/// running the test.
+fn kr_against(hosted: &Hosted, line: &[&str]) -> std::process::Output {
+    std::process::Command::new(kr())
+        .args(line)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env(
+            "KR_RUNTIME_DIR",
+            hosted.temp.paths().runtime_root().display().to_string(),
+        )
+        .env(
+            "KR_STATE_DIR",
+            hosted.temp.paths().state_root().display().to_string(),
+        )
+        .current_dir("/")
+        .output()
+        .expect("runs the command")
+}
+
+/// KR-REQ-23.24, with a real worker: after a close whose outcome the worker could not establish, a
+/// plain `kr close` is refused while that outcome stands, and the person's later request,
+/// `--after-unknown` with the action, reads the receipt, shows it, and sends a new close that names
+/// it and the revision shown, which the worker admits and carries out. An action that is not a close
+/// of unknown outcome is not named, and sends nothing.
+///
+/// The worker is the real one, over a real endpoint, and the unknown close is in its journal as a
+/// close whose dispatch was never settled leaves it; no `kr` suite can make a worker answer a close
+/// that way, so the earlier close is planted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_whose_outcome_the_worker_could_not_establish_is_sent_again_only_by_the_persons_later_request()
+ {
+    use kr_protocol::ids::ActionId;
+    use kr_protocol::method::Method;
+    use kr_protocol::receipt::ReceiptState;
+    use kr_protocol::scalars::{Digest256, Uuid};
+
+    let hosted = hosted("printf 'kr-ready.'; exec cat").await;
+    let subject =
+        close_plants::the_subject_of_a_close(hosted.descriptor.environment_id, hosted.session_id);
+    let session = hosted.session_id.to_string();
+    let plant = |action: ActionId, method: Method, subject: Digest256, settled: ReceiptState| {
+        let mut worker = hosted.runtime.session();
+        close_plants::plant_a_dispatch(
+            worker.journal_mut().expect("a journal"),
+            action,
+            method,
+            subject,
+            Some(settled),
+        )
+    };
+    let live = |hosted: &Hosted| {
+        !matches!(
+            hosted.runtime.state(),
+            kr_protocol::session::SessionState::Closing
+                | kr_protocol::session::SessionState::Closed
+        )
+    };
+    let earlier = ActionId::new(Uuid::from_bytes([61; 16]));
+    let revision = plant(
+        earlier,
+        Method::SessionClose,
+        subject,
+        ReceiptState::Unknown,
+    );
+
+    // A plain close is not the person's later request: the worker holds the earlier outcome
+    // against it.
+    let plain = kr_against(&hosted, &["close", &session]);
+    assert_ne!(plain.status.code(), Some(0), "the earlier outcome stands");
+    assert!(live(&hosted), "and nothing was closed");
+
+    // An action that is not a close of unknown outcome is not one a later close names: another
+    // method's receipt, a close that was carried out, and an action the worker holds nothing of.
+    let answer = ActionId::new(Uuid::from_bytes([62; 16]));
+    plant(
+        answer,
+        Method::QuestionAnswer,
+        Digest256::from_bytes([77; 32]),
+        ReceiptState::Unknown,
+    );
+    let carried_out = ActionId::new(Uuid::from_bytes([63; 16]));
+    plant(
+        carried_out,
+        Method::SessionClose,
+        subject,
+        ReceiptState::Applied,
+    );
+    let nothing = ActionId::new(Uuid::from_bytes([64; 16]));
+    for (named, status) in [(answer, 2), (carried_out, 2), (nothing, 8)] {
+        let output = kr_against(
+            &hosted,
+            &["close", &session, "--after-unknown", &named.to_string()],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(status),
+            "action {named}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(live(&hosted), "and nothing was closed");
+    }
+
+    // The person's later request.
+    let output = kr_against(
+        &hosted,
+        &["close", &session, "--after-unknown", &earlier.to_string()],
+    );
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{said}");
+    assert!(
+        said.contains(&earlier.to_string()) && said.contains(&format!("revision {revision}")),
+        "the earlier outcome is shown first: {said}"
+    );
+    assert!(
+        matches!(
+            hosted.runtime.state(),
+            kr_protocol::session::SessionState::Closing
+                | kr_protocol::session::SessionState::Closed
+        ),
+        "and the new close was carried out"
     );
 }
 

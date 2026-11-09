@@ -75,16 +75,33 @@ fn worker() -> &'static Path {
     })
 }
 
+/// What a test does to a worker's place before the worker starts in it.
+type BeforeStart = Arc<dyn Fn(&kr_ipc::paths::EnvironmentPaths, &WorkerLaunch) + Send + Sync>;
+
 /// The detached supervisor, counting every worker it is asked to start.
-#[derive(Debug)]
 struct Counting {
     inner: DetachedSupervisor,
     starts: Arc<AtomicUsize>,
+    /// Runs before each worker starts, in the environment the worker is started for.
+    before: Option<(kr_ipc::paths::EnvironmentPaths, BeforeStart)>,
+}
+
+impl std::fmt::Debug for Counting {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Counting")
+            .field("inner", &self.inner)
+            .field("starts", &self.starts)
+            .finish_non_exhaustive()
+    }
 }
 
 impl WorkerSupervisor for Counting {
     fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
         self.starts.fetch_add(1, Ordering::SeqCst);
+        if let Some((environment, before)) = &self.before {
+            before(environment, launch);
+        }
         self.inner.start(launch)
     }
 
@@ -130,6 +147,12 @@ impl Drop for Host {
 
 impl Host {
     async fn start() -> Self {
+        Self::start_before(None).await
+    }
+
+    /// Starts a host whose supervisor runs `before` in the worker's place just before each worker
+    /// starts: what a host that has run before looks like to the worker that starts in it.
+    async fn start_before(before: Option<BeforeStart>) -> Self {
         let worker = worker().to_path_buf();
         let temp = kr_ipc::testing::TempHost::create();
         let work = temp.root().join("w");
@@ -156,6 +179,7 @@ impl Host {
             supervisor: Box::new(Counting {
                 inner: DetachedSupervisor::new(),
                 starts: Arc::clone(&starts),
+                before: before.map(|before| (environment.clone(), before)),
             }),
             worker_program: worker,
             build_id: build(),
@@ -924,4 +948,67 @@ fn a_worker_in_a_directory_with_an_odd_path_is_found_and_ended() {
         bystander.child.try_wait().expect("asked after").is_none(),
         "a worker running from a directory the path merely starts with, `run dir`, is left alone"
     );
+}
+
+/// KR-REQ-23.24, through the control daemon: a close the session's worker could not establish stands
+/// against every later close, so a plain `kr close` is refused and the session stays; the person's
+/// later request, `--after-unknown` with the action, reads the receipt from the worker, shows it, and
+/// sends a new close that names it and the revision shown, which the daemon passes on whole and the
+/// worker admits.
+///
+/// The worker is a process of its own, and the earlier close is in its journal before it starts, as
+/// a close it was dispatching when an earlier worker of the session stopped leaves it. The worker's
+/// own recovery settles that as an outcome it could not establish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_the_daemons_worker_could_not_establish_is_closed_only_by_the_persons_later_request()
+ {
+    use kr_protocol::ids::ActionId;
+    use kr_protocol::method::Method;
+    use kr_protocol::scalars::Uuid;
+
+    let earlier = ActionId::new(Uuid::from_bytes([61; 16]));
+    let host = Host::start_before(Some(Arc::new(move |environment, launch| {
+        let path = environment.journal_database(launch.session_id);
+        std::fs::create_dir_all(path.parent().expect("a directory")).expect("the journals' place");
+        let mut journal = kr_worker::journal::Journal::open(&path).expect("a journal");
+        support::close_plants::plant_a_dispatch(
+            &mut journal,
+            earlier,
+            Method::SessionClose,
+            support::close_plants::the_subject_of_a_close(launch.environment_id, launch.session_id),
+            None,
+        );
+    })))
+    .await;
+    let (session, _) = host.create();
+
+    // The worker holds the earlier close as an outcome it could not establish, and a plain close,
+    // which names nothing, is refused while that stands.
+    let read = host.kr_json(&[
+        "action",
+        "read",
+        &earlier.to_string(),
+        "--session",
+        &session,
+    ]);
+    assert_eq!(
+        read["state"], "unknown",
+        "the worker's recovery settled it: {read}"
+    );
+    let plain = host.kr(&["close", &session]);
+    assert_ne!(plain.status.code(), Some(0), "the earlier outcome stands");
+    let listed = host.kr_json(&["list"]);
+    assert_eq!(
+        listed["sessions"].as_array().map(Vec::len),
+        Some(1),
+        "and the session is live: {listed}"
+    );
+    assert_eq!(listed["sessions"][0]["state"], "live", "{listed}");
+
+    // The person's later request.
+    let later = host.kr(&["close", &session, "--after-unknown", &earlier.to_string()]);
+    let said = String::from_utf8_lossy(&later.stderr);
+    assert_eq!(later.status.code(), Some(0), "{said}");
+    assert!(said.contains(&earlier.to_string()), "{said}");
+    host.wait_for_no_descriptor(&session);
 }

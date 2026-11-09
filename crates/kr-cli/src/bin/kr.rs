@@ -481,6 +481,13 @@ async fn run(cli: Cli) -> Result<Completion> {
             // owns the registry and writes the closure record. With no daemon the command still
             // works: it closes the worker directly, and the daemon reconciles the record when it
             // comes back.
+            let after_unknown = arguments
+                .after_unknown
+                .as_deref()
+                .map(|text| {
+                    kr_cli::daemon::identifier::<kr_protocol::ids::ActionId>(text, "an action")
+                })
+                .transpose()?;
             let located = match find(&paths, &selector, wanted) {
                 Ok((known, descriptor)) => Some((known, descriptor)),
                 Err(CliError::UnknownSession(_)) => None,
@@ -488,8 +495,31 @@ async fn run(cli: Cli) -> Result<Completion> {
             };
             let closed = match located {
                 Some((known, descriptor)) => {
+                    // The person's later request: the earlier close's receipt is read from the
+                    // session's worker, which keeps it and notes what this caller was shown, and is
+                    // shown before anything is sent. The send then names it, whichever way it goes.
+                    let (quote, held) = match after_unknown {
+                        Some(action) => {
+                            let mut worker = open_worker(&descriptor, build_id()).await?;
+                            kr_cli::helper::read_only_same(
+                                worker.acknowledgement().build.as_ref(),
+                                descriptor.display_number.get(),
+                                "close",
+                            )?;
+                            let quote = kr_cli::unknown::earlier(
+                                &mut worker,
+                                action,
+                                Method::SessionClose,
+                                "close",
+                            )
+                            .await?;
+                            (Some(quote), Some(worker))
+                        }
+                        None => (None, None),
+                    };
                     match open_controller(&known.paths, build_id()).await {
                         Ok(mut client) => {
+                            drop(held);
                             kr_cli::unknown::mutate_naming::<_, SessionCloseResult>(
                                 &mut client,
                                 Method::SessionClose,
@@ -497,21 +527,28 @@ async fn run(cli: Cli) -> Result<Completion> {
                                 &SessionCloseParams {
                                     session_id: descriptor.session_id,
                                 },
-                                None,
+                                quote,
                                 &close_unknown(
                                     shown!("{}", descriptor.session_id),
                                     Some(known.environment_id),
+                                    true,
                                 ),
                             )
                             .await?
                         }
                         Err(_) => {
-                            let mut client = open_worker(&descriptor, build_id()).await?;
-                            kr_cli::helper::read_only_same(
-                                client.acknowledgement().build.as_ref(),
-                                descriptor.display_number.get(),
-                                "close",
-                            )?;
+                            let mut client = match held {
+                                Some(worker) => worker,
+                                None => {
+                                    let client = open_worker(&descriptor, build_id()).await?;
+                                    kr_cli::helper::read_only_same(
+                                        client.acknowledgement().build.as_ref(),
+                                        descriptor.display_number.get(),
+                                        "close",
+                                    )?;
+                                    client
+                                }
+                            };
                             kr_cli::unknown::mutate_naming::<_, SessionCloseResult>(
                                 &mut client,
                                 Method::SessionClose,
@@ -519,10 +556,11 @@ async fn run(cli: Cli) -> Result<Completion> {
                                 &SessionCloseParams {
                                     session_id: descriptor.session_id,
                                 },
-                                None,
+                                quote,
                                 &close_unknown(
                                     shown!("{}", descriptor.session_id),
                                     Some(descriptor.environment_id),
+                                    true,
                                 ),
                             )
                             .await?
@@ -531,7 +569,17 @@ async fn run(cli: Cli) -> Result<Completion> {
                 }
                 // No descriptor, so the session is closed or was never here. The daemon knows
                 // which, and it resolves a display number through the reservations it retains.
+                // No worker is left to hold an earlier close of it, so there is nothing for the
+                // flag to name.
                 None => {
+                    if after_unknown.is_some() {
+                        return Err(CliError::Usage(Shown::said(
+                            "no live worker holds a close for this session, so there is no earlier \
+                             close to name; `kr close` without --after-unknown asks the control \
+                             daemon, which answers from the closure it recorded or says it does not \
+                             know",
+                        )));
+                    }
                     let mut client = open_controller(&environment.paths, build_id()).await?;
                     let session_id =
                         kr_cli::resolve::retained_session(&mut client, &selector).await?;
@@ -541,7 +589,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                         session_target(environment.environment_id, session_id),
                         &SessionCloseParams { session_id },
                         None,
-                        &close_unknown(shown!("{}", session_id), wanted),
+                        &close_unknown(shown!("{}", session_id), wanted, false),
                     )
                     .await?
                 }
@@ -2289,14 +2337,28 @@ fn parse_environment(named: Option<&str>) -> Result<Option<EnvironmentId>> {
 
 /// What `kr close` says when its close ended with an outcome nobody established: the session whose
 /// worker keeps the receipt, and the environment it was found in, or the one the command was given.
-fn close_unknown(session: Shown, environment: Option<EnvironmentId>) -> kr_cli::unknown::Unknown {
+///
+/// `worker_holds` says that a live worker holds the close, so the person's later request is
+/// `kr close <session> --after-unknown <action>`. A close sent for a session with no live worker has
+/// none: nothing there holds an earlier close for the flag to name.
+fn close_unknown(
+    session: Shown,
+    environment: Option<EnvironmentId>,
+    worker_holds: bool,
+) -> kr_cli::unknown::Unknown {
+    let environment = environment.map(|environment_id| shown!("{}", environment_id));
+    let later = worker_holds.then(|| match &environment {
+        Some(environment) => shown!(
+            "kr close {} --environment {}",
+            session.clone(),
+            environment.clone()
+        ),
+        None => shown!("kr close {}", session.clone()),
+    });
     kr_cli::unknown::Unknown {
         what: "the close",
-        read_back: kr_cli::unknown::ReadBack::of(
-            session,
-            environment.map(|environment_id| shown!("{}", environment_id)),
-        ),
-        later: None,
+        read_back: kr_cli::unknown::ReadBack::of(session, environment),
+        later,
     }
 }
 

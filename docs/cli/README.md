@@ -1038,10 +1038,23 @@ session's worker when none is. It sends one request, under an action it makes fo
 outcome of that request is not known (see the exit codes), the command ends with exit status 1 and
 `OUTCOME_UNKNOWN`, names the action and the `kr action read <action> --session <session>
 --environment <environment>` that shows what the host holds of it, and sends nothing again. If the session's worker holds that close as an
-outcome it could not establish, a plain `kr close` is refused while it does, and the command has no
-later request of its own: read the receipt, and look at `kr list`, to see whether the session
-closed. A failure of the control daemon's own connection to the worker reaches `kr` as the
-daemon's refusal, and is reported as that refusal, without the action named.
+outcome it could not establish, a plain `kr close` is refused while it does.
+
+`kr close [id] --after-unknown <action>` is the person's later request. It reads that action's
+receipt from the session's worker, which also notes for the worker that this caller was shown it,
+prints the receipt on standard error, and sends a new close that names the action and the revision
+shown, through the control daemon where one is running, which passes the request to the worker
+whole. It refuses, with exit status 2 and nothing sent, an action that is not a close or whose
+receipt does not stand in the `unknown` state; an action the worker holds no receipt for is the
+worker's own refusal. A session with no live worker, one that has closed or whose descriptor is
+gone, holds no earlier close for the flag to name: the command exits with 2 and sends nothing, and
+`kr close` without the flag asks the control daemon, which answers from the closure it recorded or
+says it does not know the session. When the new close's outcome is not known either, the command
+stops again with `OUTCOME_UNKNOWN` and names the new action, which the flag then takes in turn. An
+earlier close that stays unknown keeps holding later plain closes back while the worker lives; the
+worker names the newest one in its refusal, and that is the action the flag takes. A failure of the
+control daemon's own connection to the worker reaches `kr` as the daemon's refusal, and is reported
+as that refusal, without the action named.
 
 ## `kr export`
 
@@ -1408,8 +1421,10 @@ after the request may have been written, the host's answer cannot be read, or th
 it cannot say what became of it, they exit with 1 and `OUTCOME_UNKNOWN`. They name the action the
 request was made as and the `kr action read <action> --session <session>` (with `--environment`
 for a session of another environment) that shows what the host holds of it, and send nothing
-again, under that action or a new one. A request the connection could not carry was not
-written, and is not an unknown outcome.
+again, under that action or a new one. Only the person's later request sends a new action:
+`kr close --after-unknown <action>` or `kr question cancel --after-unknown <action>`, which shows
+the earlier outcome first. A request the connection could not carry was not written, and is not an
+unknown outcome.
 
 `kr attach`, and `kr new` when it attaches, exit 0 when the session closed cleanly, 1 when it closed
 any other way, and 3 when the connection ended before a whole closure record arrived. [When the

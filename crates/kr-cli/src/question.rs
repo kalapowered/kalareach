@@ -1559,7 +1559,10 @@ pub async fn cancel(
     )
     .map_err(CliError::Refused)?;
     let quote = match after_unknown {
-        Some(earlier) => Some(earlier_cancellation(&mut client, earlier).await?),
+        Some(earlier) => Some(
+            crate::unknown::earlier(&mut client, earlier, Method::QuestionCancel, "cancellation")
+                .await?,
+        ),
         None => None,
     };
     let unknown = crate::unknown::Unknown {
@@ -1581,73 +1584,6 @@ pub async fn cancel(
     )
     .await?;
     shown(result)
-}
-
-/// Reads the receipt of the earlier cancellation a person names and shows it, which is also how the
-/// worker comes to hold that this caller was shown it at that revision, and returns what a later
-/// cancellation names.
-///
-/// # Errors
-///
-/// Returns a usage failure when the action is not a cancellation of unknown outcome, and the
-/// worker's refusal when it holds no such action.
-async fn earlier_cancellation(
-    client: &mut LocalClient,
-    earlier: ActionId,
-) -> Result<answers::Quote> {
-    use kr_protocol::method::MethodName;
-    use kr_protocol::receipt::ReceiptState;
-
-    let outcome = client
-        .request(
-            Method::ActionRead,
-            &ActionReadParams {
-                action_id: earlier,
-                session_id: None,
-            },
-        )
-        .await?;
-    let read: ActionReadResult =
-        outcome
-            .map_err(CliError::Refused)?
-            .to_typed()
-            .map_err(|error| {
-                CliError::Other(shown!(
-                    "the worker's answer could not be read: {}",
-                    Shown::cbor(&error)
-                ))
-            })?;
-    let receipt = read.receipt;
-    if receipt.method != MethodName::from(Method::QuestionCancel) {
-        return Err(CliError::Usage(shown!(
-            "action {} is not a cancellation of a question, so a later cancellation cannot name it",
-            earlier
-        )));
-    }
-    if receipt.state != ReceiptState::Unknown {
-        return Err(CliError::Usage(shown!(
-            "action {} is {}, and not an outcome the worker could not establish, so nothing is \
-             sent: a cancellation is not made again for it",
-            earlier,
-            crate::output::closed_word(&receipt.state)
-        )));
-    }
-    if !crate::report::shown_before_going_on(&shown!(
-        "The earlier cancellation, action {}, stands at revision {} with an outcome the worker \
-         could not establish. This sends a new action that names it.",
-        earlier,
-        receipt.revision
-    )) {
-        return Err(CliError::Other(shown!(
-            "the earlier cancellation, action {}, could not be shown on standard error, so \
-             nothing is sent: a later cancellation names a result the person was shown",
-            earlier
-        )));
-    }
-    Ok(answers::Quote {
-        action_id: earlier,
-        revision: receipt.revision.get(),
-    })
 }
 
 /// The question a resolution shows, which the host shows this command whole: it answers as the

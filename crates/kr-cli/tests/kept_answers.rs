@@ -649,6 +649,23 @@ async fn serve_one(
                         .unwrap_or_else(PoisonError::into_inner)
                         .stops
                         .push((mutation.method.as_str().to_owned(), mutation.action_id));
+                    // The worker's own rule holds a close back as it does an answer: an earlier close
+                    // of unknown outcome stands in the way unless the new one names it after it was
+                    // shown.
+                    if mutation.method.as_str() == "session.close"
+                        && behaviour != Behaviour::EndsAfterReadingARequestToStop
+                    {
+                        let arrival = arrive(&state, &mutation);
+                        if let Err(error) = admit(&state, &arrival) {
+                            let _ = writer
+                                .write_message(&ControlFrame::Response(Response {
+                                    request_id: mutation.request_id,
+                                    outcome: Outcome::Error(error),
+                                }))
+                                .await;
+                            continue;
+                        }
+                    }
                     match behaviour {
                         Behaviour::EndsAfterReadingARequestToStop => return,
                         Behaviour::CannotSayWhatBecameOfRequestsToStop => {
@@ -669,6 +686,18 @@ async fn serve_one(
                             continue;
                         }
                         _ => {}
+                    }
+                    if mutation.method.as_str() == "session.close" {
+                        let _ = writer
+                            .write_message(&ControlFrame::Response(Response {
+                                request_id: mutation.request_id,
+                                outcome: match close(&state, mutation.action_id) {
+                                    Ok(value) => Outcome::Ok(value),
+                                    Err(error) => Outcome::Error(error),
+                                },
+                            }))
+                            .await;
+                        continue;
                     }
                     if mutation.method.as_str() == "question.cancel" {
                         let arrival = arrive(&state, &mutation);
@@ -907,17 +936,19 @@ fn admit(state: &Mutex<State>, arrival: &Arrival) -> Result<(), ProtocolError> {
     }
 }
 
-/// The revision of an action's receipt that the worker serves: a cancellation's receipt stands at a
-/// different revision from an answer's, so a request that quotes the wrong one is told apart.
+/// The revision of an action's receipt that the worker serves: a cancellation's and a close's
+/// receipts each stand at a different revision from an answer's, so a request that quotes the
+/// wrong one is told apart.
 fn served_revision(state: &State, action_id: ActionId) -> u64 {
-    if state
+    let method = state
         .stops
         .iter()
-        .any(|(method, id)| method == "question.cancel" && *id == action_id)
-    {
-        5
-    } else {
-        3
+        .find(|(_, id)| *id == action_id)
+        .map(|(method, _)| method.as_str());
+    match method {
+        Some("question.cancel") => 5,
+        Some("session.close") => 7,
+        _ => 3,
     }
 }
 
@@ -944,14 +975,15 @@ fn read_receipt(state: &Mutex<State>, params: &ParamsValue) -> Result<ParamsValu
         receipt: Receipt {
             action_id: params.action_id,
             actor_id: ActorId::new("local:test").expect("an actor"),
-            method: if state
+            method: match state
                 .stops
                 .iter()
-                .any(|(method, id)| method == "question.cancel" && *id == params.action_id)
+                .find(|(_, id)| *id == params.action_id)
+                .map(|(method, _)| method.as_str())
             {
-                kr_protocol::method::Method::QuestionCancel.into()
-            } else {
-                kr_protocol::method::Method::QuestionAnswer.into()
+                Some("question.cancel") => kr_protocol::method::Method::QuestionCancel.into(),
+                Some("session.close") => kr_protocol::method::Method::SessionClose.into(),
+                _ => kr_protocol::method::Method::QuestionAnswer.into(),
             },
             method_version: kr_protocol::method::MethodVersion::V1,
             revision: U64::new(served_revision(&state, params.action_id)),
@@ -1038,6 +1070,20 @@ fn cancel(
     let whole = QuestionResolveResult::whole(question.clone());
     state.receipts.push((action_id, ReceiptState::Applied));
     ParamsValue::from_typed(&whole).map_err(|error| refusal(&error.to_string()))
+}
+
+/// Answers `session.close`: the session is closing.
+fn close(state: &Mutex<State>, action_id: ActionId) -> Result<ParamsValue, ProtocolError> {
+    let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+    state.receipts.push((action_id, ReceiptState::Applied));
+    ParamsValue::from_typed(&kr_protocol::session::SessionCloseResult {
+        session_id: state.question.session_id,
+        state: kr_protocol::session::SessionState::Closing,
+        durability: kr_protocol::session::Durability::Durable,
+        closure: Nullable::null(),
+        session: None,
+    })
+    .map_err(|error| refusal(&error.to_string()))
 }
 
 /// KR-REQ-11.63: an answer the worker could not take is kept on this device, the person is told,
@@ -2590,5 +2636,86 @@ async fn a_close_whose_outcome_is_not_known_names_its_action_and_is_sent_once() 
             )),
             "{behaviour:?}: {said}"
         );
+        assert!(
+            said.contains(&format!(
+                "kr close {session} --environment {} --after-unknown {}",
+                host.environment.environment_id(),
+                stops[0].1
+            )),
+            "and the later request: {behaviour:?}: {said}"
+        );
     }
+}
+
+/// KR-REQ-23.24, the client's half, for a close sent again: `kr close --after-unknown` with the
+/// action of a close whose outcome the worker could not establish reads that receipt, shows it on
+/// standard error, and sends a new action that names it and the revision shown, which the worker
+/// admits under its own rule. A worker that cannot say what became of that one either ends `kr`
+/// again, naming the new action and the later request that names it; nothing is sent where standard
+/// error takes nothing, and none for a session with no live worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_of_unknown_outcome_is_sent_again_only_by_the_persons_later_request() {
+    let host = Host::start(Behaviour::CannotSayWhatBecameOfRequestsToStop).await;
+    let session = host.state().question.session_id;
+    let (status, stopped) = host.json(&["close", "1"]);
+    assert_eq!(status, Some(1), "{stopped}");
+    let first = host.stops()[0].1;
+
+    // The earlier outcome is shown before a new action goes. Where standard error takes nothing it
+    // cannot be shown, so nothing is sent.
+    #[cfg(target_os = "linux")]
+    {
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("/dev/full");
+        let output = std::process::Command::new(support::kr())
+            .args(["close", "1", "--after-unknown", &first.to_string()])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &host.home)
+            .env("KR_RUNTIME_DIR", host.temp.paths().runtime_root())
+            .env("KR_STATE_DIR", host.temp.paths().state_root())
+            .current_dir(host.temp.root())
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(full))
+            .output()
+            .expect("kr runs");
+        assert_ne!(output.status.code(), Some(0));
+        assert_eq!(host.stops().len(), 1, "nothing was sent");
+    }
+
+    // The person's later request. The worker cannot say what became of this one either.
+    let output = host.kr(&["close", "1", "--after-unknown", &first.to_string()]);
+    assert_eq!(output.status.code(), Some(1));
+    let shown = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        shown.contains(&first.to_string()) && shown.contains("revision 7"),
+        "the earlier outcome is shown first: {shown}"
+    );
+    assert!(host.state().shown.contains(&first), "the receipt was read");
+    let stops = host.stops();
+    assert_eq!(stops.len(), 2, "one request was sent");
+    let second = stops[1].1;
+    assert_ne!(second, first, "a new action");
+    let arrival = host.arrivals().pop().expect("an arrival");
+    assert_eq!(arrival.quoted, Some(first), "it names the earlier action");
+    assert_eq!(
+        arrival.quoted_revision,
+        Some(7),
+        "and the revision of the receipt that was shown"
+    );
+    assert!(
+        shown.contains(&format!(
+            "kr close {session} --environment {} --after-unknown {second}",
+            host.environment.environment_id()
+        )),
+        "it ends again, naming the new action and the request that names it: {shown}"
+    );
+
+    // With no live worker there is no earlier close to name.
+    std::fs::remove_file(&host.descriptor).expect("the descriptor goes");
+    let output = host.kr(&["close", "1", "--after-unknown", &second.to_string()]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(host.stops().len(), 2, "and nothing was sent");
 }

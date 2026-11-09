@@ -6,7 +6,9 @@
 //! action was performed and does
 //! not send it again, under that identifier or a new one: a later request is the person's, and has
 //! to be made in sight of the earlier result. So the command ends with `OUTCOME_UNKNOWN`, names the
-//! action and says where the person reads what the host holds of it.
+//! action and says where the person reads what the host holds of it. [`earlier`] is the person's
+//! later request: it reads the earlier action's receipt from the worker that keeps it, shows it, and
+//! returns what the new request names.
 
 use kr_client::answers::{self, Quote};
 use kr_client::shown;
@@ -16,7 +18,8 @@ use kr_ipc::error::IpcError;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::ActionId;
-use kr_protocol::method::Method;
+use kr_protocol::method::{Method, MethodName};
+use kr_protocol::receipt::{ActionReadParams, ActionReadResult, ReceiptState};
 
 use crate::error::{CliError, Result};
 
@@ -167,4 +170,81 @@ where
         Err(error @ IpcError::NotInLevel(_)) => Err(CliError::Ipc(error)),
         Err(_) => Err(unknown.ended(action_id, Cause::Connection)),
     }
+}
+
+/// Reads the receipt of the earlier action a person names and shows it, which is also how the worker
+/// comes to hold that this caller was shown it at that revision, and returns what a later request
+/// for the same thing names.
+///
+/// `client` is a connection to the worker that keeps the receipt, `method` the method the earlier
+/// action was made with, and `what` that mutation as a noun ("close").
+///
+/// # Errors
+///
+/// Returns a usage failure when the action is not a request for `method` whose outcome the worker
+/// could not establish, when its receipt could not be shown on standard error (nothing is sent: a
+/// later request names a result the person was shown), and the worker's refusal when it holds no
+/// such action.
+pub async fn earlier(
+    client: &mut LocalClient,
+    action: ActionId,
+    method: Method,
+    what: &'static str,
+) -> Result<Quote> {
+    let outcome = client
+        .request(
+            Method::ActionRead,
+            &ActionReadParams {
+                action_id: action,
+                session_id: None,
+            },
+        )
+        .await?;
+    let read: ActionReadResult =
+        outcome
+            .map_err(CliError::Refused)?
+            .to_typed()
+            .map_err(|error| {
+                CliError::Other(shown!(
+                    "the worker's answer could not be read: {}",
+                    Shown::cbor(&error)
+                ))
+            })?;
+    let receipt = read.receipt;
+    if receipt.method != MethodName::from(method) {
+        return Err(CliError::Usage(shown!(
+            "action {} is not a {}, so a later {} cannot name it",
+            action,
+            what,
+            what
+        )));
+    }
+    if receipt.state != ReceiptState::Unknown {
+        return Err(CliError::Usage(shown!(
+            "action {} is {}, and not an outcome the worker could not establish, so nothing is \
+             sent: a {} is not made again for it",
+            action,
+            crate::output::closed_word(&receipt.state),
+            what
+        )));
+    }
+    if !crate::report::shown_before_going_on(&shown!(
+        "The earlier {}, action {}, stands at revision {} with an outcome the worker could not \
+         establish. This sends a new action that names it.",
+        what,
+        action,
+        receipt.revision
+    )) {
+        return Err(CliError::Other(shown!(
+            "the earlier {}, action {}, could not be shown on standard error, so nothing is sent: \
+             a later {} names a result the person was shown",
+            what,
+            action,
+            what
+        )));
+    }
+    Ok(Quote {
+        action_id: action,
+        revision: receipt.revision.get(),
+    })
 }

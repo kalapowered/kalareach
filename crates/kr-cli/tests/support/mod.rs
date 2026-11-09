@@ -8,6 +8,7 @@
 // helper another binary uses is dead code from this one's point of view.
 #![allow(dead_code)]
 
+pub mod close_plants;
 pub mod terminal;
 
 use std::path::{Path, PathBuf};

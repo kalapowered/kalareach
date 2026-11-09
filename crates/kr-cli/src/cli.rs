@@ -2079,6 +2079,12 @@ pub struct CloseArguments {
     /// The environment, when a display number is ambiguous.
     #[arg(long)]
     pub environment: Option<String>,
+    /// Make a later close after an earlier one whose outcome the host could not establish.
+    ///
+    /// The command shows that earlier action's receipt and sends a new action that names it and the
+    /// revision shown. Without this, the close is sent once, and is never sent again.
+    #[arg(long, value_name = "ACTION")]
+    pub after_unknown: Option<String>,
 }
 
 /// `kr list`.
