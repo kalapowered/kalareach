@@ -74,8 +74,8 @@ import {
   leavesOutcomeUnknown,
   type Submission
 } from '../../model/receipts'
-import { supersessionFor } from '../../model/receipt-reads'
-import { useReceiptReads } from '../../app/receipts'
+import { supersessionFor, type Supersession } from '../../model/receipt-reads'
+import { readBeforeQuoting, useReceiptReads } from '../../app/receipts'
 import { renderMarkdown } from '../../markdown/render'
 import type { TerminalGrid, TerminalRoom, TerminalScreen, TerminalWheel } from '../../host/port'
 import { leftBlankOnPhone, stretchesOf, styleOf } from '../../terminal/cells'
@@ -662,7 +662,7 @@ export function MobileSession({
   }
 
   const send = useCallback(
-    (text: string, anyway = false) => {
+    (text: string, anyway = false, read?: Supersession | null) => {
       const now = Date.now()
       // The opening this send is made under. Its answer may come after the screen has opened the
       // session again, and then it settles its own record and nothing the new opening shows.
@@ -705,14 +705,17 @@ export function MobileSession({
       // they wrote it at: the host refuses it if that conversation has moved on since.
       const { applicationInstanceId: instance, agentBindingRevision: revision } = draft.target
       // A person who checked sends a prompt past an outcome nobody could establish as an explicit
-      // later request: it names the earlier action and the revision of its record they were shown.
-      // With nothing of that kind to name it names nothing, and the host decides.
+      // later request: it names the earlier action and the revision of its record they were shown,
+      // which is the one `sendAnyway` has just read. With nothing of that kind to name it names
+      // nothing, and the host decides.
       const quote = anyway
-        ? supersessionFor(
-            lifecycle.state.submissions.filter((each) => isForSession(each.localId, sessionId)),
-            receiptReads,
-            draft.target
-          )
+        ? read === undefined
+          ? supersessionFor(
+              lifecycle.state.submissions.filter((each) => isForSession(each.localId, sessionId)),
+              receiptReads,
+              draft.target
+            )
+          : read
         : null
       ask(async () => {
         // The prompt is sent only once the stored draft is this window's to send: another window
@@ -880,6 +883,35 @@ export function MobileSession({
     [lifecycle, book, sessionId]
   )
   useReceiptReads({ sessionId, connected, submissions: mine, onReceipt: settleFromRecord, gate })
+  // "I checked; send anyway" reads the record of the earlier prompt again first, so the request
+  // names the revision the host holds now. A record that has become applied or refused is shown and
+  // nothing is sent: the person has not seen what it came to. A second press while the read is
+  // under way is ignored.
+  const reading = useRef(false)
+  const sendAnyway = useCallback(() => {
+    if (reading.current) return
+    reading.current = true
+    const text = draft.text
+    void readBeforeQuoting({
+      port,
+      receiptReads,
+      sessionId,
+      opening: openings.tokenOf(sessionId),
+      submissions: mine,
+      to: draft.target
+    })
+      .then((outcome) => {
+        if (outcome.kind === 'settled') {
+          settleFromRecord(outcome.localId, outcome.receipt)
+          say('The host has since said what became of the earlier prompt. Nothing was sent.', 'danger')
+          return
+        }
+        send(text, true, outcome.quote)
+      })
+      .finally(() => {
+        reading.current = false
+      })
+  }, [port, receiptReads, sessionId, openings, mine, draft, settleFromRecord, say, send])
   // The connection's words for contact lost. A session whose own link is being taken up again, with
   // the connection to the host still up, says the same, in the same words, and, as the connection's
   // do, nothing before the shell has answered whether the host is in contact.
@@ -918,7 +950,7 @@ export function MobileSession({
         disabled={!submittable(draft) || !submitOffer.offered || busy}
         style={{ minBlockSize: target }}
         onClick={() => {
-          send(draft.text, true)
+          sendAnyway()
         }}
       >
         {SEND_ANYWAY_WORDS}

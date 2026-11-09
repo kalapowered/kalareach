@@ -99,7 +99,7 @@ import {
   type DraftTarget
 } from '../model/drafts'
 import { FrameBatcher } from '../model/frame'
-import { supersessionFor } from '../model/receipt-reads'
+import { supersessionFor, type Supersession } from '../model/receipt-reads'
 import { eventIsFor } from '../model/sessions'
 import {
   answered,
@@ -120,7 +120,7 @@ import {
   type Submission
 } from '../model/receipts'
 import { useBook, useSessionDraft } from '../app/drafts'
-import { useReceiptReads } from '../app/receipts'
+import { readBeforeQuoting, useReceiptReads } from '../app/receipts'
 import { ApprovalRequests } from './Approvals'
 import { KeptAnswers, QuestionRequests } from './Questions'
 
@@ -384,7 +384,7 @@ export function Conversation({
   )
 
   const send = useCallback(
-    (action: ComposerAction, anyway = false) => {
+    (action: ComposerAction, anyway = false, read?: Supersession | null) => {
       const binding = agent.binding
       const instance = agent.instance
       if (binding === null || instance === null) return
@@ -444,11 +444,14 @@ export function Conversation({
             }
       const turn = binding.turn_id ?? ''
       // A person who checked sends a prompt past an outcome nobody could establish as an explicit
-      // later request: it names the earlier action and the revision of its record they were shown.
-      // With nothing of that kind to name it names nothing, and the host decides.
+      // later request: it names the earlier action and the revision of its record they were shown,
+      // which is the one `sendAnyway` has just read. With nothing of that kind to name it names
+      // nothing, and the host decides.
       const quote =
         anyway && action === 'submit'
-          ? supersessionFor(state.submissions, receiptReads, written)
+          ? read === undefined
+            ? supersessionFor(state.submissions, receiptReads, written)
+            : read
           : null
       const dispatch = () =>
         action === 'submit'
@@ -536,6 +539,35 @@ export function Conversation({
       receiptReads
     ]
   )
+
+  // "I checked; send anyway" reads the record of the earlier prompt again first, so the request
+  // names the revision the host holds now. A record that has become applied or refused is shown
+  // and nothing is sent: the person has not seen what it came to. A second press while the read is
+  // under way is ignored.
+  const reading = useRef(false)
+  const sendAnyway = useCallback(() => {
+    if (reading.current) return
+    reading.current = true
+    void readBeforeQuoting({
+      port,
+      receiptReads,
+      sessionId,
+      opening: undefined,
+      submissions: state.submissions,
+      to: presented.target
+    })
+      .then((outcome) => {
+        if (outcome.kind === 'settled') {
+          settleFromRecord(outcome.localId, outcome.receipt)
+          say('The host has since said what became of the earlier prompt. Nothing was sent.', 'danger')
+          return
+        }
+        send('submit', true, outcome.quote)
+      })
+      .finally(() => {
+        reading.current = false
+      })
+  }, [port, receiptReads, sessionId, state.submissions, presented.target, settleFromRecord, say, send])
 
   /**
    * A dropped or pasted file goes through the transfer service, and the handle it publishes is kept
@@ -978,7 +1010,7 @@ export function Conversation({
         }}
         onAction={send}
         onSendAnyway={() => {
-          send('submit', true)
+          sendAnyway()
         }}
       />
     </div>

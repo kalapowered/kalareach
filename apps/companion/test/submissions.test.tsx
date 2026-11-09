@@ -66,7 +66,20 @@ interface Recorded {
   revision?: string
   /** True when the host cannot be asked what it recorded. */
   unreadable?: boolean
+  /**
+   * Makes the host hold a quote to the worker's rule: it is admitted only at the revision the
+   * record stands at now, and only when this device was shown that revision by a read. Deleting
+   * from `shown` is the worker having forgotten what it showed, as a restart does.
+   */
+  worker?: { readonly shown: Map<string, string> }
 }
+
+/** The refusal a worker makes of a quote it will not take. */
+const QUOTE_REFUSED = Object.assign(new Error('the earlier result has not been shown'), {
+  code: 'DRAFT_CONFLICT',
+  message: 'the earlier result has not been shown',
+  user_action: 'retry'
+})
 
 /**
  * A port whose prompts are answered with `answer` (or, for the one asked for the nth time, with
@@ -85,12 +98,19 @@ function answering(
     composerSubmit: (params, _opening, supersedes) => {
       sent.push(params)
       quotes.push(supersedes)
+      if (supersedes !== undefined && recorded.worker !== undefined) {
+        const current = recorded.revision ?? '1'
+        if (supersedes.revision !== current || recorded.worker.shown.get(supersedes.action_id) !== current) {
+          return Promise.reject(QUOTE_REFUSED)
+        }
+      }
       const given = typeof answer === 'function' ? answer(sent.length) : answer
       return given instanceof Error ? Promise.reject(given) : Promise.resolve(given)
     },
     actionRead: (params) => {
       reads.push(params.action_id)
       if (recorded.unreadable === true) return Promise.reject(new Error('the host did not answer'))
+      recorded.worker?.shown.set(params.action_id, recorded.revision ?? '1')
       const state = recorded.byAction?.[params.action_id] ?? recorded.state
       return Promise.resolve({
         receipt: receiptAt(state, params.action_id, recorded.revision),
@@ -582,7 +602,11 @@ describe('on the desktop', () => {
       const reads: string[] = []
       const quotes: (Supersession | undefined)[] = []
       const { person } = await sentOnce(
-        (attempt) => (attempt === 1 ? UNCONFIRMED : attempt === 2 ? refused : UNCONFIRMED),
+        (attempt) => {
+          // The host's record moves on while the prompt is on its way, after the page read it.
+          if (attempt === 2) recorded.revision = '4'
+          return attempt === 1 ? UNCONFIRMED : attempt === 2 ? refused : UNCONFIRMED
+        },
         recorded,
         reads,
         [],
@@ -595,8 +619,6 @@ describe('on the desktop', () => {
         { timeout: 3_000 }
       )
       await flush()
-      // The host's record moved on while the page held the revision it had read.
-      recorded.revision = '4'
       await person.click(await screen.findByTestId('composer-send-anyway'))
       await waitFor(() => {
         expect(screen.getByTestId('composer-input')).toHaveValue('run the migration')
@@ -609,6 +631,140 @@ describe('on the desktop', () => {
         expect(quotes).toHaveLength(3)
       })
       expect(quotes[2]).toEqual({ action_id: ACTION, revision: '4' })
+    })
+
+    // KR-REQ-23.24: the later request the person makes names the record the host holds when they
+    // press, and nothing is sent past a result that was settled since they looked.
+    describe('read again by the person who sends anyway', () => {
+      const states = () =>
+        [...screen.getByTestId('pending-actions').querySelectorAll('li')].map((each) => each.dataset.state)
+      const answers = (attempt: number) =>
+        attempt === 1
+          ? UNCONFIRMED
+          : { receipt: receiptAt('dispatching', ANOTHER_ACTION), value: null, action_id: ANOTHER_ACTION }
+
+      it('names the revision the host holds at the press when the worker no longer remembers showing it', async () => {
+        // A worker that restarted forgot what it showed this device, and refuses a quote of a record
+        // the device was not shown by a read it still holds.
+        const recorded: Recorded = {
+          state: 'unknown',
+          revision: '3',
+          byAction: { [ANOTHER_ACTION]: 'dispatching' },
+          worker: { shown: new Map() }
+        }
+        const reads: string[] = []
+        const quotes: (Supersession | undefined)[] = []
+        const { person } = await sentOnce(answers, recorded, reads, [], quotes)
+        await waitFor(
+          () => {
+            expect(reads).toContain(ACTION)
+          },
+          { timeout: 3_000 }
+        )
+        await flush()
+        recorded.worker?.shown.clear()
+        const before = reads.length
+        await person.click(await screen.findByTestId('composer-send-anyway'))
+        await waitFor(() => {
+          expect(states()).toEqual(['unknown', 'sent'])
+        })
+        expect(reads.length).toBeGreaterThan(before)
+        expect(quotes[1]).toEqual({ action_id: ACTION, revision: '3' })
+      })
+
+      it('names the revision it reads at the press, not the one it read before', async () => {
+        // A state only a scripted host reaches: a real record that is unknown moves only to applied
+        // or refused. It tells the revision read at the press from the revision read before it.
+        const recorded: Recorded = {
+          state: 'unknown',
+          revision: '3',
+          byAction: { [ANOTHER_ACTION]: 'dispatching' },
+          worker: { shown: new Map() }
+        }
+        const reads: string[] = []
+        const quotes: (Supersession | undefined)[] = []
+        const { person } = await sentOnce(answers, recorded, reads, [], quotes)
+        await waitFor(
+          () => {
+            expect(reads).toContain(ACTION)
+          },
+          { timeout: 3_000 }
+        )
+        await flush()
+        recorded.revision = '4'
+        await person.click(await screen.findByTestId('composer-send-anyway'))
+        await waitFor(() => {
+          expect(states()).toEqual(['unknown', 'sent'])
+        })
+        expect(quotes[1]).toEqual({ action_id: ACTION, revision: '4' })
+      })
+
+      it('sends nothing and shows the result when the record has become applied', async () => {
+        const recorded: Recorded = { state: 'unknown', revision: '3' }
+        const reads: string[] = []
+        const sent: unknown[] = []
+        const { person } = await sentOnce(answers, recorded, reads, sent)
+        await waitFor(
+          () => {
+            expect(reads).toContain(ACTION)
+          },
+          { timeout: 3_000 }
+        )
+        await flush()
+        recorded.state = 'applied'
+        recorded.revision = '5'
+        await person.click(await screen.findByTestId('composer-send-anyway'))
+        await waitFor(() => {
+          expect(states()).toEqual(['applied'])
+        })
+        await flush()
+        expect(sent).toHaveLength(1)
+        // The words were done once: nothing keeps them in the composer for a second send.
+        expect(screen.getByTestId('composer-input')).toHaveValue('')
+      })
+
+      it('sends nothing, and gives the text back, when the record has become refused', async () => {
+        const recorded: Recorded = { state: 'unknown', revision: '3' }
+        const reads: string[] = []
+        const sent: unknown[] = []
+        const { person } = await sentOnce(answers, recorded, reads, sent)
+        await waitFor(
+          () => {
+            expect(reads).toContain(ACTION)
+          },
+          { timeout: 3_000 }
+        )
+        await flush()
+        recorded.state = 'refused'
+        recorded.revision = '5'
+        await person.click(await screen.findByTestId('composer-send-anyway'))
+        await waitFor(() => {
+          expect(states()).toEqual(['refused'])
+        })
+        await flush()
+        expect(sent).toHaveLength(1)
+        expect(screen.getByTestId('composer-input')).toHaveValue('run the migration')
+      })
+
+      it('names what it read last when the host cannot be asked at the press', async () => {
+        const recorded: Recorded = { state: 'unknown', revision: '3' }
+        const reads: string[] = []
+        const quotes: (Supersession | undefined)[] = []
+        const { person } = await sentOnce(answers, recorded, reads, [], quotes)
+        await waitFor(
+          () => {
+            expect(reads).toContain(ACTION)
+          },
+          { timeout: 3_000 }
+        )
+        await flush()
+        recorded.unreadable = true
+        await person.click(await screen.findByTestId('composer-send-anyway'))
+        await waitFor(() => {
+          expect(quotes).toHaveLength(2)
+        })
+        expect(quotes[1]).toEqual({ action_id: ACTION, revision: '3' })
+      })
     })
 
     it('names the action the host named when it refused the quote of another that the page picked', async () => {
@@ -1061,6 +1217,116 @@ describe('on the phone', () => {
     })
     expect(quotes[0]).toBeUndefined()
     expect(quotes[1]).toEqual({ action_id: ACTION, revision: '3' })
+  })
+
+  // KR-REQ-23.24: the later request the person makes names the record the host holds when they
+  // press, and nothing is sent past a result that was settled since they looked.
+  describe('read again by the person who sends anyway', () => {
+    const second: Settled<AgentMutationResult> = {
+      receipt: receiptAt('dispatching', ANOTHER_ACTION),
+      value: null,
+      action_id: ANOTHER_ACTION
+    }
+    const answers = (attempt: number) => (attempt === 1 ? UNCONFIRMED : second)
+    const release = () => screen.findByRole('button', { name: 'I checked; send anyway' })
+    /** Waits until the page has read the earlier record and the screen has settled. */
+    async function readOnce(reads: string[]): Promise<void> {
+      await waitFor(
+        () => {
+          expect(reads).toContain(ACTION)
+        },
+        { timeout: 3_000 }
+      )
+      await flush()
+    }
+
+    it('names the revision the host holds at the press when the worker no longer remembers showing it', async () => {
+      const recorded: Recorded = {
+        state: 'unknown',
+        revision: '3',
+        byAction: { [ANOTHER_ACTION]: 'applied' },
+        worker: { shown: new Map() }
+      }
+      const reads: string[] = []
+      const quotes: (Supersession | undefined)[] = []
+      const { person } = await sentOnce(answers, recorded, reads, [], quotes)
+      await readOnce(reads)
+      recorded.worker?.shown.clear()
+      const before = reads.length
+      await person.click(await release())
+      await waitFor(() => {
+        expect(quotes).toHaveLength(2)
+      })
+      expect(reads.length).toBeGreaterThan(before)
+      expect(quotes[1]).toEqual({ action_id: ACTION, revision: '3' })
+      expect(await screen.findByText('Applied', {}, { timeout: 3_000 })).toBeInTheDocument()
+    })
+
+    it('names the revision it reads at the press, not the one it read before', async () => {
+      // A state only a scripted host reaches: a real record that is unknown moves only to applied
+      // or refused. It tells the revision read at the press from the revision read before it.
+      const recorded: Recorded = {
+        state: 'unknown',
+        revision: '3',
+        byAction: { [ANOTHER_ACTION]: 'applied' },
+        worker: { shown: new Map() }
+      }
+      const reads: string[] = []
+      const quotes: (Supersession | undefined)[] = []
+      const { person } = await sentOnce(answers, recorded, reads, [], quotes)
+      await readOnce(reads)
+      recorded.revision = '4'
+      await person.click(await release())
+      await waitFor(() => {
+        expect(quotes).toHaveLength(2)
+      })
+      expect(quotes[1]).toEqual({ action_id: ACTION, revision: '4' })
+      expect(await screen.findByText('Applied', {}, { timeout: 3_000 })).toBeInTheDocument()
+    })
+
+    it('sends nothing and shows the result when the record has become applied', async () => {
+      const recorded: Recorded = { state: 'unknown', revision: '3' }
+      const reads: string[] = []
+      const sent: unknown[] = []
+      const { person } = await sentOnce(answers, recorded, reads, sent)
+      await readOnce(reads)
+      recorded.state = 'applied'
+      recorded.revision = '5'
+      await person.click(await release())
+      expect(await screen.findByText('Applied', {}, { timeout: 3_000 })).toBeInTheDocument()
+      await flush()
+      expect(sent).toHaveLength(1)
+      expect(screen.getByLabelText('Message this session')).toHaveValue('')
+    })
+
+    it('sends nothing, and gives the text back, when the record has become refused', async () => {
+      const recorded: Recorded = { state: 'unknown', revision: '3' }
+      const reads: string[] = []
+      const sent: unknown[] = []
+      const { person } = await sentOnce(answers, recorded, reads, sent)
+      await readOnce(reads)
+      recorded.state = 'refused'
+      recorded.revision = '5'
+      await person.click(await release())
+      expect(await screen.findByText('Refused by the host', {}, { timeout: 3_000 })).toBeInTheDocument()
+      await flush()
+      expect(sent).toHaveLength(1)
+      expect(screen.getByLabelText('Message this session')).toHaveValue('run the migration')
+    })
+
+    it('names what it read last when the host cannot be asked at the press', async () => {
+      const recorded: Recorded = { state: 'unknown', revision: '3' }
+      const reads: string[] = []
+      const quotes: (Supersession | undefined)[] = []
+      const { person } = await sentOnce(answers, recorded, reads, [], quotes)
+      await readOnce(reads)
+      recorded.unreadable = true
+      await person.click(await release())
+      await waitFor(() => {
+        expect(quotes).toHaveLength(2)
+      })
+      expect(quotes[1]).toEqual({ action_id: ACTION, revision: '3' })
+    })
   })
 
   it('names nothing when the earlier record could not be read', async () => {

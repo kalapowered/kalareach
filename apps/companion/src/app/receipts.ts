@@ -16,6 +16,13 @@ import { useEffect, useRef } from 'react'
 
 import type { Receipt } from '@kalareach/protocol'
 
+import type { HostPort } from '../host/port'
+import {
+  supersessionFor,
+  type Conversation,
+  type ReceiptReads,
+  type Supersession
+} from '../model/receipt-reads'
 import { applyReceipt, type Submission } from '../model/receipts'
 import type { OpeningGate } from './agent'
 import { readOnCadence } from './cadence'
@@ -120,4 +127,60 @@ export function useReceiptReads({
       reads.stop()
     }
   }, [connected, owing, port, receiptReads, sessionId, token, waiting])
+}
+
+/** What reading the earlier prompt's record before a later prompt is sent came to. */
+export type QuoteAfterReading =
+  /** Send the prompt, naming `quote` when it is not null. */
+  | { readonly kind: 'quote'; readonly quote: Supersession | null }
+  /** The host has since said what became of the earlier prompt: show it, and send nothing. */
+  | { readonly kind: 'settled'; readonly localId: string; readonly receipt: Receipt }
+
+/**
+ * Reads the record of the earlier prompt a later one would name, so that the later request quotes
+ * the revision the host holds now.
+ *
+ * The page quotes what it read last, and that read can be seconds old, or lost to a restart of the
+ * worker that noted what this device was shown. The earlier prompt `supersessionFor` picks stays
+ * the one asked about. A record that still says unknown is quoted at the revision just read. One
+ * that has become applied or refused is not quoted and sends nothing: the person has not seen what
+ * it came to, and a prompt sent past an applied one could run the work twice. A record that says
+ * only that the host has the action stands in no prompt's way, so nothing is named, and the host
+ * decides. A host that cannot be asked now leaves the last read as the quote, which the host admits
+ * only while its record is still that one.
+ */
+export async function readBeforeQuoting({
+  port,
+  receiptReads,
+  sessionId,
+  opening,
+  submissions,
+  to
+}: {
+  readonly port: HostPort
+  readonly receiptReads: ReceiptReads
+  readonly sessionId: string
+  readonly opening: string | undefined
+  readonly submissions: readonly Submission[]
+  readonly to: Conversation
+}): Promise<QuoteAfterReading> {
+  const named = supersessionFor(submissions, receiptReads, to)
+  if (named === null) return { kind: 'quote', quote: null }
+  const earlier = submissions.find((each) => each.actionId === named.action_id)
+  if (earlier === undefined) return { kind: 'quote', quote: named }
+  let receipt: Receipt
+  try {
+    receipt = (await port.actionRead({ action_id: named.action_id, session_id: sessionId }, opening))
+      .receipt
+  } catch {
+    return { kind: 'quote', quote: named }
+  }
+  receiptReads.note(receipt)
+  if (receipt.state === 'unknown') {
+    return { kind: 'quote', quote: { action_id: named.action_id, revision: receipt.revision } }
+  }
+  if (receipt.state === 'applied' || receipt.state === 'refused' || receipt.state === 'rejected') {
+    return { kind: 'settled', localId: earlier.localId, receipt }
+  }
+  return { kind: 'quote', quote: null }
 }
