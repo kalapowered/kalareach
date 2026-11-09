@@ -534,7 +534,13 @@ and refused inside the repository; nothing in it is read, written or replaced th
 program whose project publishes source only is built there from that release's source, with the
 flags the lock records, against the system's own curses library; tmux is built against a pinned
 libevent built the same way. A release that cannot be fetched or built is recorded as not installed,
-with the reason, and its cases are reported as not run. Nothing is taken from a package manager.
+with the reason, and its cases are reported as not run. For a release that could not be fetched the
+reason is its address. A program built against a library that is not installed is not built, and its
+reason names the library. The nightly workflow keeps the release archives in the Actions cache under
+the lock that pins them, and only a default-branch run that holds every archive saves them. The fetch
+checks each archive it finds there against its pin and fetches again any that does not match, so an
+outage at a release's host costs nothing on a night that already holds its archive. Nothing is taken
+from a package manager.
 
 | Program | Version | Installed from | Cases |
 | --- | --- | --- | --- |
