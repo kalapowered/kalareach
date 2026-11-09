@@ -10,25 +10,46 @@
 
 import type { GrantCreateResult, GrantTransferResult, RevocationResult } from '@kalareach/protocol'
 
-import { nameWords } from './sharing'
-import type { SharingDesk, Waiting } from './sharing-desk'
+import { nameWords, sessionIdWords } from './sharing'
+import type { Revoked, SharingDesk, Waiting } from './sharing-desk'
 
 /** Says something to the person, as the page's toast does. */
 export type Say = (text: string, tone?: 'success' | 'danger' | 'pending') => void
 
 /**
- * The session workers a revocation still waits for, and those that have confirmed it. The host
- * names the workers that have not confirmed before any that has, and says how many there were in
- * all, so when it cut its list the names of those waiting are a floor and those that confirmed are
- * only the ones it listed.
+ * The session workers a revocation still waits for, those that have confirmed it and those that
+ * have ended. The host names the workers that have not confirmed before any that has, and says how
+ * many there were in all, so when it cut its list the names of those waiting are a floor and the
+ * others are only the ones it listed. A worker that has ended confirmed nothing: it can no longer
+ * act, which is a different statement.
  */
 export function waitingOn(result: RevocationResult): Waiting {
   const { workers, workers_total: total } = result.barrier
+  const sessionsIn = (state: 'pending' | 'acknowledged' | 'ended'): string[] =>
+    workers.filter((worker) => worker.state === state).map((worker) => worker.session_id)
   return {
-    sessions: workers.filter((worker) => worker.state === 'pending').map((worker) => worker.session_id),
-    confirmed: workers.filter((worker) => worker.state !== 'pending').map((worker) => worker.session_id),
+    sessions: sessionsIn('pending'),
+    confirmed: sessionsIn('acknowledged'),
+    ended: sessionsIn('ended'),
     cut: Number(total) > workers.length
   }
+}
+
+/**
+ * What a kept revocation says of the workers the host listed that it no longer waits for, whether
+ * or not another is still owed: " Confirmed: session a. Ended: session b.", with a leading space,
+ * and nothing when it listed none. When the host cut its list, these are only the ones it listed.
+ */
+export function workersListed(line: Pick<Revoked, 'confirmed' | 'ended' | 'cut'>): string {
+  const among = line.cut ? ' among those the host listed' : ''
+  const parts: string[] = []
+  if (line.confirmed.length > 0) {
+    parts.push(`Confirmed${among}: ${line.confirmed.map(sessionIdWords).join(', ')}.`)
+  }
+  if (line.ended.length > 0) {
+    parts.push(`Ended${among}: ${line.ended.map(sessionIdWords).join(', ')}.`)
+  }
+  return parts.length === 0 ? '' : ` ${parts.join(' ')}`
 }
 
 /** How many workers a revocation still waits for. */

@@ -27,6 +27,8 @@ export interface Revoked {
   readonly waiting: readonly string[]
   /** The sessions whose workers have confirmed it, among those the host listed. */
   readonly confirmed: readonly string[]
+  /** The sessions whose workers have ended, among those the host listed: they confirmed nothing. */
+  readonly ended: readonly string[]
   /**
    * Whether the host cut its list of workers: it names the ones that have not confirmed before any
    * that has, so a cut list is a floor, and more may be waiting than it names.
@@ -39,6 +41,8 @@ export interface Waiting {
   readonly sessions: readonly string[]
   /** The sessions whose workers have confirmed it, among those the host listed. */
   readonly confirmed: readonly string[]
+  /** The sessions whose workers have ended, among those the host listed. */
+  readonly ended: readonly string[]
   readonly cut: boolean
 }
 
@@ -145,6 +149,7 @@ export class SharingDesk {
           revision,
           waiting: waiting.sessions,
           confirmed: waiting.confirmed,
+          ended: waiting.ended,
           cut: waiting.cut
         }
       ]
@@ -161,7 +166,13 @@ export class SharingDesk {
     this.#change({
       revoked: this.#kept.revoked.map((line) =>
         line.grantId === grantId
-          ? { ...line, waiting: waiting.sessions, confirmed: waiting.confirmed, cut: waiting.cut }
+          ? {
+              ...line,
+              waiting: waiting.sessions,
+              confirmed: waiting.confirmed,
+              ended: waiting.ended,
+              cut: waiting.cut
+            }
           : line
       )
     })

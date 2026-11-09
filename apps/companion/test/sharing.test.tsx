@@ -341,6 +341,33 @@ describe('who has access', () => {
     expect(screen.getByTestId('recently-revoked').textContent).toMatch(/authority revision 6/)
     expect(controls.sharing.sent().revoke).toBe(2)
   })
+
+  // KR-REQ-18.14, each worker: when the host lists workers and none is owed, the line still names
+  // each one's state. A worker whose execution has ended is said to have ended, and not to have
+  // confirmed the revocation.
+  it('names each listed session worker once none is owed, an ended one as ended', async () => {
+    const { controls, person } = await openSharing()
+    await person.click(screen.getByRole('radio', { name: PHONE }))
+    await person.click(screen.getByTestId('invite'))
+    await waitFor(() => {
+      expect(controls.sharing.grants()).toHaveLength(1)
+    })
+    controls.sharing.deviceAccepts(controls.sharing.grants()[0]?.grant.grant_id ?? '')
+    await reread()
+    const row = await waitFor(() => {
+      const found = screen.getByTestId('access').querySelector('[data-state="active"]')
+      expect(found).not.toBeNull()
+      return found as HTMLElement
+    })
+
+    await person.click(within(row).getByTestId('revoke'))
+    const line = await screen.findByTestId('recently-revoked')
+    expect(line.textContent).toMatch(/^Revoked /)
+    expect(line.textContent).not.toMatch(/not done|not confirmed yet/)
+    expect(line.textContent).toMatch(/Confirmed: session 8a7b6c50/)
+    expect(line.textContent).toMatch(/Ended: session 5d5d5d5d/)
+    expect(line.textContent).not.toMatch(/Confirmed: [^.]*session 5d5d5d5d/)
+  })
 })
 
 describe('a revocation some session worker has not confirmed', () => {
@@ -380,7 +407,8 @@ describe('a revocation some session worker has not confirmed', () => {
     await waitFor(() => {
       expect(screen.getByTestId('recently-revoked').textContent).toMatch(/^Revoked /)
     })
-    expect(screen.getByTestId('recently-revoked').textContent).not.toMatch(/not done|session 8a7b6c50/)
+    expect(screen.getByTestId('recently-revoked').textContent).not.toMatch(/not done|not confirmed yet/)
+    expect(screen.getByTestId('recently-revoked').textContent).toMatch(/Confirmed: session 8a7b6c50/)
   })
 
   // KR-REQ-18.14, a withdrawn invitation: withdrawing an invitation nobody has accepted is a
