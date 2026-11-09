@@ -347,8 +347,6 @@ struct Registered {
     /// Whether the phone holds nothing to ask the host with, as a phone whose application ended
     /// does: what the product keeps in memory to send again goes with the application.
     cannot_ask: bool,
-    /// The hosts the registrar was told to drop what it kept for, in the order it was told.
-    forgotten: Vec<kr_protocol::ids::DeviceId>,
 }
 
 /// Waits for as long as `held` says of the script that a step is held.
@@ -368,10 +366,6 @@ struct HostLink(Arc<Mutex<Registered>>);
 impl Registrar for HostLink {
     fn can_ask(&self, _host: kr_protocol::ids::DeviceId, _action: ActionId) -> bool {
         !self.0.lock().expect("what was handed").cannot_ask
-    }
-
-    fn forgotten(&self, host: kr_protocol::ids::DeviceId) {
-        self.0.lock().expect("what was handed").forgotten.push(host);
     }
 
     fn connect<'a>(
@@ -5455,29 +5449,70 @@ async fn an_account_deleted_after_an_unknown_outcome_leaves_the_whole_sequence_t
     );
 }
 
-/// What a registrar keeps to ask a host about a registration with holds the credential the gateway
-/// issued, so it is dropped when the person forgets the host and when the account the registration
-/// was made under is deleted: nothing will ask about either.
+/// What the product's registrar keeps to ask a host about a registration with holds the credential
+/// the gateway issued, so it is dropped when the account the registration was made under is deleted
+/// and when the person forgets the host: nothing will ask about either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_registrar_is_told_to_drop_what_it_kept_for_a_forgotten_host_and_a_deleted_account() {
-    let (_host, phone, _reference, _action) =
-        a_phone_whose_registration_has_no_known_outcome().await;
-    let host = phone.device.pairing().hosts.list().expect("the hosts")[0].host_device_id;
-    let told = || {
-        phone
-            .registered
-            .lock()
-            .expect("the script")
-            .forgotten
-            .clone()
+async fn what_the_registrar_kept_for_a_host_is_dropped_when_the_account_is_deleted_or_the_host_forgotten()
+ {
+    use kr_protocol::method::Method;
+
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let control = LinkControl::new();
+    let phone = unpaired_phone_controlled(&host, &control);
+    pair(&phone, &host, &owner, &[ActionRight::SessionView]).await;
+    let device = phone.companion.device();
+    let registrar = Arc::new(ConnectionRegistrar::new(Arc::clone(&device)));
+    let opened = open_at(
+        official_origin(),
+        phone.data.path(),
+        &device,
+        &Receiver::new(FIRST_TOKEN),
+        Arc::clone(&registrar) as Arc<dyn Registrar>,
+    );
+    let paired = device.pairing().hosts.list().expect("the hosts").remove(0);
+    let reference = opened.desk.view().hosts.remove(0).reference;
+    control.lose_the_answer_to(Some(Method::DevicePushRegister));
+    let action_sent = |index: usize| -> ActionId {
+        control.sent_actions(Method::DevicePushRegister)[index]
+            .parse()
+            .expect("an action")
     };
-    assert!(told().is_empty());
 
-    assert!(phone.desk.account_deleted());
-    assert_eq!(told(), [host], "the account was deleted");
+    opened
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
+    states_until(&opened.desk, |states| states == [PushState::NeedsAttention]).await;
+    assert!(
+        registrar.can_ask(paired.host_device_id, action_sent(0)),
+        "control: the request is kept while the outcome is unknown"
+    );
 
-    phone.desk.forgotten(host);
-    assert_eq!(told(), [host, host], "the host was forgotten");
+    assert!(opened.desk.account_deleted());
+
+    assert!(
+        !registrar.can_ask(paired.host_device_id, action_sent(0)),
+        "the account was deleted"
+    );
+
+    opened
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks again");
+    states_until(&opened.desk, |states| states == [PushState::NeedsAttention]).await;
+    assert!(
+        registrar.can_ask(paired.host_device_id, action_sent(1)),
+        "control: the second registration is kept"
+    );
+
+    opened.desk.forgotten(paired.host_device_id);
+
+    assert!(
+        !registrar.can_ask(paired.host_device_id, action_sent(1)),
+        "the host was forgotten"
+    );
 }
 
 /// The unknown outcome outlives the application: a start reads it from the record, the page is told
