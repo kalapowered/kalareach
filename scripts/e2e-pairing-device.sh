@@ -411,9 +411,9 @@ judge() { # <driver output>
     result="$(host_file bound-result.txt)"
     case "$result" in
         "phone connections served at the choice: "[1-9]*"control before read: served items=0control after host.info: refused PermissionDenied: "*"offline-validity policy has lapsed"*"control after session.open: refused PermissionDenied: "*"offline-validity policy has lapsed"*"control after read: refused PermissionDenied: "*"offline-validity policy has lapsed"*)
-            say "check=the second host served the phone's connection, and once its owner bounded offline validity refused another guest's host identity, connection opening and inbox read alike ok=1 detail=$result" ;;
+            say "check=the second host was serving a connection of the phone when its owner chose a bounded offline validity, and then refused three requests of one control guest (host identity, connection opening, inbox read) alike ok=1 detail=$result" ;;
         *)
-            say "check=the second host served the phone's connection, and once its owner bounded offline validity refused another guest's host identity, connection opening and inbox read alike ok=0 detail=${result:-no record}"
+            say "check=the second host was serving a connection of the phone when its owner chose a bounded offline validity, and then refused three requests of one control guest (host identity, connection opening, inbox read) alike ok=0 detail=${result:-no record}"
             bad=1 ;;
     esac
     result="$(host_file connections.txt)"
