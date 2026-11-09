@@ -172,13 +172,14 @@ pub fn watch(root: &Path) -> Option<std::process::ChildStdin> {
 /// removes the directory. A POSIX shell is not one every Windows machine has on its search path, and
 /// a run whose watcher does not start leaves its directory in the temporary directory for good.
 ///
-/// The interpreter starts with no start-up command of its account (`/d`) and with delayed
-/// expansion off (`/v:off`), which the machine's settings could otherwise turn on, and the path
-/// reaches it in the environment, quoted, so that no character in it is read as part of the
-/// command. It starts in the system directory, which is where `sort` is, so that neither the
-/// directory of the run nor the search path decides which program that is. What still runs from
-/// `root` when the run ends keeps its file, and the directory with it. The watcher has a process
-/// group of its own and no window.
+/// The interpreter starts with none of the start-up commands of the machine or its account (`/d`)
+/// and with delayed expansion off (`/v:off`), which the machine's settings could otherwise turn on,
+/// and the path reaches it in the environment, quoted, so that no character in it is read as part
+/// of the command. It starts in the system directory, which is where `sort` is, and runs that file
+/// by its own name there (`.\sort.exe`), so that neither the search path nor a setting about the
+/// current directory decides which program that is. What still runs from `root` when the run ends
+/// keeps its file, and the directory with it. The watcher has a process group of its own and no
+/// window.
 #[cfg(windows)]
 pub fn watch(root: &Path) -> Option<std::process::ChildStdin> {
     use std::os::windows::process::CommandExt as _;
@@ -189,7 +190,7 @@ pub fn watch(root: &Path) -> Option<std::process::ChildStdin> {
     let system = Path::new(&std::env::var_os("SystemRoot")?).join("System32");
     let mut command = std::process::Command::new(system.join("cmd.exe"));
     command
-        .raw_arg("/d /v:off /c sort >nul && rmdir /s /q \"%KR_WATCHED_DIRECTORY%\"")
+        .raw_arg("/d /v:off /c .\\sort.exe >nul && rmdir /s /q \"%KR_WATCHED_DIRECTORY%\"")
         .current_dir(&system)
         .env("KR_WATCHED_DIRECTORY", root)
         .stdin(std::process::Stdio::piped())
@@ -220,10 +221,11 @@ pub fn watch(root: &Path) -> Option<std::process::ChildStdin> {
 ///
 /// The removal follows the read rather than merely coming after it. A shell that could not run the
 /// read at all, or whose read was ended by a signal, has learned nothing about this process, and a
-/// watcher that has learned nothing leaves the directory for a later run to answer for. On Unix the
-/// path it is given has to be there and has to say something: a removal is never asked for with an
-/// empty or missing path, and the shell refuses to run one rather than working out what that would
-/// mean. On Windows the path is in the environment, and an unset one is not removed.
+/// watcher that has learned nothing leaves the directory, for a later run to answer for on Unix and
+/// for good on Windows. On Unix the path it is given has to be there and has to say something: a
+/// removal is never asked for with an empty or missing path, and the shell refuses to run one
+/// rather than working out what that would mean. On Windows the path is in the environment, and an
+/// unset one is not removed.
 ///
 /// The watcher is a POSIX shell found on `PATH` on Unix and the system directory's command
 /// interpreter on Windows, so a machine keeps no run's directory for want of a program on its search
