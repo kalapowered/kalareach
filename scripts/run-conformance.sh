@@ -237,6 +237,20 @@ PYTHON
             records+=("$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$id" "$version" "$role" installed "$url" "$sha" "$kind" "${executable:+$target/$executable}" -)")
             continue
         fi
+        # A program built against a library that is not installed is not built: its own build
+        # would stop at its configure step, with a log that says nothing of why the library is
+        # missing, and the fetch above has said that already.
+        local missing="" library
+        for library in ${libraries//,/ }; do
+            if ! grep -q "^$library"$'\t' <<< "$prefixes"; then
+                missing="${missing:+$missing, }$library"
+            fi
+        done
+        if [ -n "$missing" ]; then
+            echo "  $id $version: needs $missing, which is not installed, so it is not built"
+            records+=("$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$id" "$version" "$role" unavailable "$url" "$sha" "$kind" - "it needs $missing, which is not installed")")
+            continue
+        fi
         local extension="${url##*/}"
         extension="${extension#*.tar}"
         local kept="$archives/$sha.tar$extension"
@@ -251,8 +265,8 @@ PYTHON
             # with an error is a passing condition, and recording the release as unavailable over
             # one would say something untrue about it.
             if ! curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors --max-time 600 -o "$kept.part" "$url"; then
-                echo "    could not be fetched"
-                records+=("$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$id" "$version" "$role" unavailable "$url" "$sha" "$kind" - "the release could not be fetched")")
+                echo "    $url could not be fetched, so $id $version is not installed"
+                records+=("$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$id" "$version" "$role" unavailable "$url" "$sha" "$kind" - "$url could not be fetched")")
                 continue
             fi
             local got
@@ -287,11 +301,6 @@ PYTHON
                     [ -n "$library" ] && pair="${pair//\{$library\}/$prefix}"
                 done <<< "$prefixes"
                 variables+=("$pair")
-            done
-            for library in ${libraries//,/ }; do
-                if ! grep -q "^$library"$'\t' <<< "$prefixes"; then
-                    echo "    needs $library, which is not installed"
-                fi
             done
             # shellcheck disable=SC2086
             if ! (cd "$work/tree" \
