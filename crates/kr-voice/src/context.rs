@@ -2,8 +2,9 @@
 //!
 //! Section 15 ¶12 states the default: session description, current working directory, active
 //! application, pending decision summaries and the last twenty semantic messages, capped at eight
-//! thousand text tokens. File contents, environment variables, raw terminal scrollback and
-//! attachment bytes are excluded unless the person selects them.
+//! thousand text tokens. Environment variables and raw terminal scrollback are excluded unless the
+//! person selects them. File contents and attachment bytes are excluded from every call and cannot
+//! be selected: nothing on a host reads them for one.
 //!
 //! # The history bound is checked twice
 //!

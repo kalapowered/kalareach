@@ -20,12 +20,13 @@
 //! **What the coordinator may send.** The bounded selection of section 15 ¶12 — session
 //! description, working directory, active application, pending decision summaries and the last
 //! twenty semantic messages, capped at eight thousand text tokens — plus whatever content classes
-//! the person explicitly selected. File contents, environment variables, raw terminal scrollback
-//! and attachment bytes are excluded until selected, and the exclusion is a closed vocabulary
-//! ([`kr_protocol::voice::VoiceContextClass`]) rather than a rule to remember. Configured secret
-//! patterns are replaced on the way out; that is a **secondary** measure and this crate says so
-//! beside every selection it produces, because filtering does not prove the remainder holds no
-//! secrets.
+//! the person explicitly selected. Environment variables and raw terminal scrollback are excluded
+//! until selected, and the exclusion is a closed vocabulary
+//! ([`kr_protocol::voice::VoiceContextClass`]) rather than a rule to remember. File contents and
+//! attachment bytes are excluded from every call and cannot be selected: nothing on a host reads
+//! them for one. Configured secret patterns are replaced on the way out; that is a **secondary**
+//! measure and this crate says so beside every selection it produces, because filtering does not
+//! prove the remainder holds no secrets.
 //!
 //! **Where it sends it.** To the paired client that asked, and nowhere else. The host does not
 //! reach the managed broker with context: section 15 ¶9 routes selected context and host results
