@@ -855,10 +855,11 @@ def a_host_that_refuses(phone: Phone, directory: Path, port: str) -> None:
     if phone.find(lambda each: "refused to show its inbox" in each) is not None:
         phone.give_up("the inbox says a host refused it before any host did")
     ask_host(directory, "bound", 180)
-    # The row is one node whose text is its parts one after another: its kind, the host its head names,
-    # then the title, the host's name and the rest of it. So the host's name stands twice, the second
-    # just before the rest of the title, and a title that names no host or another one does not match.
-    named = rf"environment {environment} on \S+\s+environment {environment} on \S+\s+refused to show its inbox"
+    # The row is one node whose text is its parts one after another with nothing between them: its
+    # kind, the host its head names, the title's name and the title's rest (" refused to show its
+    # inbox"), then the host's words. So the host's name stands twice, the second just before the rest
+    # of the title, and a title that names no host or another one does not match.
+    named = rf"environment {environment} on [a-z]+\s*environment {environment} on [a-z]+\s+refused to show its inbox"
     refusal = lambda each: re.search(named, each) is not None
     wait_after_touch(phone, refusal, "the inbox to say the second host refused it", 180, at=(0.5, 0.07))
     # Everything is judged on one reading of the screen, so that what it lacks is lacking from a screen
