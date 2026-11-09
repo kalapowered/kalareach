@@ -4605,3 +4605,155 @@ async fn a_copy_that_found_no_claim_is_given_the_record_the_first_attempt_left_m
     assert_eq!(given, made, "the action was carried out once");
     let _ = host.stop().await;
 }
+
+// ----- the challenge sweep ----------------------------------------------------------------------
+
+/// The longest a case waits for the first sweep, which runs as soon as an owner is enrolled. Only a
+/// hang reaches it.
+const FIRST_SWEEP_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A project service on an environment of its own, built as the daemon builds its own. The cases
+/// lend it a daemon's pairing service as its owner.
+async fn a_project_module() -> (
+    kr_ipc::testing::TempHost,
+    PrivateTempDir,
+    kr_controller::project::ProjectModule,
+) {
+    let temp = kr_ipc::testing::TempHost::create();
+    let module = kr_controller::project::ProjectModule::open(&temp.environment())
+        .await
+        .expect("the project service opens");
+    (temp, PrivateTempDir::create(), module)
+}
+
+/// Issues a challenge for the owner's own location at `directory`, as the first submission of an
+/// authorisation does, and leaves it unanswered.
+fn leave_unanswered(
+    module: &kr_controller::project::ProjectModule,
+    owner: &kr_controller::project::HostOwner,
+    environment_id: EnvironmentId,
+    directory: &Path,
+    seed: u8,
+) {
+    use kr_protocol::project::{LocationAuthorisation, LocationPurpose};
+
+    std::fs::create_dir(directory).expect("a directory to authorise");
+    let actor = kr_protocol::ids::ActorId::new("local:owner").expect("a principal");
+    let claim = kr_project::store::Action {
+        actor_id: actor.clone(),
+        action_id: kr_protocol::scalars::Uuid::from_bytes([seed; 16]),
+        method: Method::ProjectLocationAuthorise.as_str().to_owned(),
+        payload_digest: kr_protocol::scalars::Digest256::from_bytes([seed; 32]),
+    };
+    let params = location_params(environment_id, directory, LocationPurpose::Destination);
+    let answered = module
+        .service()
+        .project_location_authorise(&actor, &params, Some(&claim), Some(owner))
+        .expect("the challenge is issued");
+    assert!(
+        matches!(
+            answered.outcome,
+            LocationAuthorisation::ConfirmationRequired { .. }
+        ),
+        "a first submission with no proof is answered with its challenge"
+    );
+}
+
+/// Waits until the first sweep of `module` has finished, which is the one an enrolment starts at
+/// once.
+async fn until_the_first_sweep_finishes(module: &kr_controller::project::ProjectModule) {
+    let mut sweeps = module.challenge_sweeps();
+    tokio::time::timeout(FIRST_SWEEP_GUARD, sweeps.wait_for(|finished| *finished >= 1))
+        .await
+        .expect("the first sweep finishes")
+        .expect("the module is still held");
+}
+
+/// The sweep lets go of what the owner's ledger has let go of, while the daemon runs, and of
+/// nothing else: a challenge nobody answers holds its directory only until the ledger's lifetime
+/// for it is over, whether or not a location method runs.
+///
+/// Two challenges are issued half a lifetime apart, and the ledger's clock is taken on past the
+/// first one's lifetime and short of the second's. The sweep the enrolment starts lets go of the
+/// first, so a call for it finds none left, and leaves the second, which the same call finds once
+/// the ledger has let go of it too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_challenge_sweep_lets_go_of_the_challenges_the_ledger_let_go_and_of_no_other() {
+    let owned = owned(&owner_keys()).await;
+    let (temp, work, module) = a_project_module().await;
+    let owner = Arc::new(kr_controller::project::HostOwner::new(Arc::clone(
+        owned.network.pairing(),
+    )));
+    let ledger = owned.network.pairing().owner();
+    let lifetime = std::time::Duration::from_millis(kr_pairing::confirm::CONFIRMATION_LIFETIME_MS);
+    let environment_id = temp.environment_id();
+
+    leave_unanswered(
+        &module,
+        &owner,
+        environment_id,
+        &work.path().join("first"),
+        1,
+    );
+    ledger.pass(lifetime / 2);
+    leave_unanswered(
+        &module,
+        &owner,
+        environment_id,
+        &work.path().join("second"),
+        2,
+    );
+    ledger.pass(lifetime / 2 + std::time::Duration::from_secs(1));
+
+    module
+        .enrol_owner(Arc::clone(&owner))
+        .expect("the owner is enrolled");
+    until_the_first_sweep_finishes(&module).await;
+    assert_eq!(
+        module
+            .service()
+            .expire_challenges(owner.as_ref())
+            .expect("the challenges are read"),
+        0,
+        "the sweep let go of the challenge whose lifetime was over"
+    );
+
+    ledger.pass(lifetime / 2);
+    assert_eq!(
+        module
+            .service()
+            .expire_challenges(owner.as_ref())
+            .expect("the challenges are read"),
+        1,
+        "the sweep left the challenge the ledger still held"
+    );
+    drop(module);
+    let _ = owned.stop().await;
+}
+
+/// A module that goes takes its owner with it, and through the owner the pairing service and the
+/// stores it holds: the sweep it started holds neither between its sweeps. The sweep has finished
+/// once when the module goes, so what it kept is what it keeps while it waits for its next tick,
+/// and the case does not wait for one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_project_module_that_goes_leaves_nothing_of_its_owner_to_the_challenge_sweep() {
+    let owned = owned(&owner_keys()).await;
+    let (_temp, _work, module) = a_project_module().await;
+    let owner = Arc::new(kr_controller::project::HostOwner::new(Arc::clone(
+        owned.network.pairing(),
+    )));
+    let lent = Arc::downgrade(&owner);
+
+    module.enrol_owner(owner).expect("the owner is enrolled");
+    until_the_first_sweep_finishes(&module).await;
+    assert!(
+        lent.upgrade().is_some(),
+        "the module holds the owner it was lent while it is held"
+    );
+    drop(module);
+    assert!(
+        lent.upgrade().is_none(),
+        "the owner, and the pairing service it holds, went with the module that was lent them"
+    );
+    let _ = owned.stop().await;
+}

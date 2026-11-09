@@ -62,6 +62,9 @@ pub struct ProjectModule {
     service: Arc<ProjectService>,
     /// This host's owner, once one is enrolled.
     owner: OnceLock<Arc<HostOwner>>,
+    /// How many sweeps of the challenges have finished.
+    #[cfg(feature = "testing")]
+    sweeps: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
 /// How often expired owner challenges are let go, with the directories they held open.
@@ -274,7 +277,17 @@ impl ProjectModule {
         Ok(Self {
             service: Arc::new(service),
             owner: OnceLock::new(),
+            #[cfg(feature = "testing")]
+            sweeps: Arc::new(tokio::sync::watch::channel(0).0),
         })
+    }
+
+    /// A count that changes each time a sweep of the challenges finishes. For this host's own
+    /// tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn challenge_sweeps(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.sweeps.subscribe()
     }
 
     /// Returns the service itself.
@@ -328,6 +341,8 @@ impl ProjectModule {
             )
         })?;
         let service = Arc::downgrade(&self.service);
+        #[cfg(feature = "testing")]
+        let finished = Arc::clone(&self.sweeps);
         runtime.spawn(async move {
             let mut every = tokio::time::interval(CHALLENGE_SWEEP);
             every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -344,6 +359,8 @@ impl ProjectModule {
                 if !matches!(swept, Ok(Some(_))) {
                     break;
                 }
+                #[cfg(feature = "testing")]
+                finished.send_modify(|sweeps| *sweeps += 1);
             }
         });
         Ok(())
