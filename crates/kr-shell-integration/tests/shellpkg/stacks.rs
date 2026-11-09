@@ -2566,9 +2566,10 @@ impl Session {
                     // The last fence is the one that got no answer; the ones before it were
                     // answered, as not drained or as for a reader that had moved.
                     return Err(format!(
-                        "the last of {asked} fences in {FENCE:?} got no answer ({not_drained} \
-                         before it were answered as not drained, {moved} as for a reader that had \
-                         moved), so the reader did not say it had read what was typed"
+                        "the last of {asked} fences in {FENCE:?} got no answer within the wait \
+                         ({not_drained} before it were answered as not drained, {moved} as for a \
+                         reader that had moved), so the reader did not say it had read what was \
+                         typed"
                     ));
                 }
                 Some((other, _)) => {
