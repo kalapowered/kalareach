@@ -28,6 +28,66 @@ mod user_manager;
 
 include!("support/update_harness.rs");
 
+/// A copy of a packed archive that is not the archive is refused by the comparison every copy is held
+/// to, and the refusal says which of the two differs: the copy, from the byte it first differs at, or
+/// the packed archive, which changed after it was packed.
+#[test]
+fn a_copy_that_is_not_the_packed_archive_says_which_of_the_two_differs() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let packed = directory.path().join("release.tar.gz");
+    let copy = directory.path().join("copy.tar.gz");
+    // Longer than the 1 MiB the digest reads at a time, so that the byte that differs is in a later
+    // read than the first.
+    let bytes: Vec<u8> = (0..3_000_000_u32)
+        .map(|number| u8::try_from(number % 251).expect("a byte"))
+        .collect();
+    std::fs::write(&packed, &bytes).expect("a packed archive");
+    let digest = file_digest(&packed);
+
+    std::fs::copy(&packed, &copy).expect("a copy");
+    assert!(
+        held_to(&packed, digest, &copy).is_ok(),
+        "a copy that is the archive is held"
+    );
+
+    // A copy with one byte that is not the archive's: it is the copy that differs, at that byte.
+    let at = 1_500_000;
+    let mut damaged = bytes.clone();
+    damaged[at] ^= 0xff;
+    std::fs::write(&copy, &damaged).expect("a damaged copy");
+    assert!(
+        matches!(
+            held_to(&packed, digest, &copy),
+            Err(Unequal::Copy { first_difference }) if first_difference == at as u64
+        ),
+        "{:?}",
+        held_to(&packed, digest, &copy)
+    );
+
+    // A copy that is cut short differs where it ends.
+    std::fs::write(&copy, &bytes[..2_000_000]).expect("a short copy");
+    assert!(
+        matches!(
+            held_to(&packed, digest, &copy),
+            Err(Unequal::Copy {
+                first_difference: 2_000_000
+            })
+        ),
+        "{:?}",
+        held_to(&packed, digest, &copy)
+    );
+
+    // A packed archive that changed after it was packed: its copy is the archive as it is now, and
+    // it is the packed archive that is said to differ.
+    std::fs::write(&packed, &damaged).expect("the packed archive changes");
+    std::fs::copy(&packed, &copy).expect("a copy of the changed archive");
+    assert!(
+        matches!(held_to(&packed, digest, &copy), Err(Unequal::Packed)),
+        "{:?}",
+        held_to(&packed, digest, &copy)
+    );
+}
+
 /// A program that is older than a source it was built from, one built from another checkout's sources,
 /// and one whose list names a source that is gone are each refused by name, and a program newer than
 /// every source it lists, one with no list and one with a list older than itself are not. This is the

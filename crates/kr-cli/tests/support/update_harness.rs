@@ -997,13 +997,31 @@ impl Assembled {
         });
         let (packed, digest) = packed.as_ref().unwrap_or_else(|why| panic!("{why}"));
         std::fs::copy(packed, archive).expect("a copy of the archive");
-        assert!(
-            file_digest(archive) == *digest,
-            "the copy at {} is not the archive packed at {}",
-            archive.display(),
-            packed.display()
-        );
+        if let Err(unequal) = held_to(packed, *digest, archive) {
+            panic!(
+                "the copy at {} is not the archive packed at {}: {unequal:?}",
+                archive.display(),
+                packed.display()
+            );
+        }
     }
+}
+
+/// How a copy of a packed archive came not to be the archive.
+#[derive(Debug)]
+enum Unequal {
+    /// The packed archive reads as it did when it was packed, and the copy differs from it.
+    Copy { first_difference: u64 },
+    /// The packed archive no longer reads as it did when it was packed.
+    Packed,
+}
+
+/// Holds `copy` to the archive packed at `packed`, which read as `digest` when it was packed.
+fn held_to(_packed: &Path, digest: [u8; 32], copy: &Path) -> Result<(), Unequal> {
+    if file_digest(copy) == digest {
+        return Ok(());
+    }
+    Err(Unequal::Copy { first_difference: 0 })
 }
 
 /// The SHA-256 of the file at `path`, read whole.
