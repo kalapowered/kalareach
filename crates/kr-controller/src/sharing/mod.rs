@@ -501,6 +501,28 @@ impl SharingService {
         }))
     }
 
+    /// Whether a share wrote the identities that a build before share identities were scoped to the
+    /// actor derived from `action`.
+    ///
+    /// A registry such a build wrote can hold a share whose claim never recorded its answer, and
+    /// the identities the claim's actor now derives do not find it. So where a share is absent
+    /// under the current identities, this says whether it is present under those, which the host
+    /// cannot attribute to the actor, so what became of the action is not known.
+    ///
+    /// Remove this once no supported release can open a registry written by a build that derived a
+    /// share's identities from the action alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot be read.
+    pub(crate) fn shared_under_earlier_identities(
+        &self,
+        action: kr_protocol::scalars::Uuid,
+    ) -> Result<bool> {
+        let (grant_id, invitation_id) = earlier_share_identities(action);
+        Ok(self.shared(grant_id, invitation_id)?.is_some())
+    }
+
     /// Redeems an invitation and activates the grant it carries, once.
     ///
     /// Section 25: an invitation is single use. Redemption is where that is true of the *grant*:
@@ -760,6 +782,26 @@ impl SharingService {
             .map(|record| record.grant)
             .collect())
     }
+}
+
+/// The identities of the grant and of the invitation of a share written as `action` by a build
+/// before they were scoped to the actor: the digest of the action and the purpose `grant` or
+/// `invitation` alone. See [`SharingService::shared_under_earlier_identities`], which says when to
+/// remove it.
+pub(crate) fn earlier_share_identities(
+    action: kr_protocol::scalars::Uuid,
+) -> (GrantId, InvitationId) {
+    let derived = |purpose: &[u8]| {
+        let digest =
+            kr_cbor::sha256(&[b"kr-sharing/1".as_slice(), purpose, action.as_bytes()].concat());
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        kr_protocol::scalars::Uuid::from_bytes(bytes)
+    };
+    (
+        GrantId::new(derived(b"grant")),
+        InvitationId::new(derived(b"invitation")),
+    )
 }
 
 /// Whether this grant is a persistent enlargement, and so needs the owner's confirmation.

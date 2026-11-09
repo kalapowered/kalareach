@@ -123,9 +123,36 @@ impl Controller {
         );
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        self.sharing
-            .grants()
-            .claim_action(actor_id, mutation.action_id, &digest, now_ms)
+        // A share is the one change here whose second attempt, under a fresh action, repeats an
+        // effect nobody can undo: another grant and another invitation. So a fresh share of the
+        // subject of one that is still running is refused, at both doors, which end here. Params
+        // that do not parse name no subject, and are refused as they are where the share is made.
+        let subject = (mutation.method.method() == Some(Method::GrantCreate))
+            .then(|| {
+                mutation
+                    .params
+                    .to_typed::<kr_protocol::sharing::GrantCreateParams>()
+                    .ok()
+            })
+            .flatten()
+            .map(|params| crate::grants::ShareSubject {
+                session_id: params.session_id,
+                recipient_device_id: params.recipient_device_id,
+            });
+        match subject {
+            Some(subject) => self.sharing.grants().claim_share(
+                actor_id,
+                mutation.action_id,
+                &digest,
+                now_ms,
+                &subject,
+            ),
+            None => {
+                self.sharing
+                    .grants()
+                    .claim_action(actor_id, mutation.action_id, &digest, now_ms)
+            }
+        }
     }
 
     /// The answer an authority change an earlier attempt claimed is owed.
@@ -296,30 +323,73 @@ impl Controller {
                     detail: detail.clone(),
                 }))
             }
+            // A share whose attempt ended without its store saying whether it wrote anything is
+            // still read as running, and what it wrote is read as it is for an ended one; where
+            // nothing is found it is not known.
+            crate::grants::ActionRecord::InFlight
+                if mutation.method.method() == Some(Method::GrantCreate)
+                    && self.sharing.grants().doubted(actor_id, mutation.action_id) =>
+            {
+                Some(self.what_a_share_came_to(actor_id, mutation, |_| {
+                    ControllerError::Uncertain {
+                        detail: "this action's share ended without this host's store saying \
+                                 whether it was written; the host says what it did once it \
+                                 restarts, and asking again under this action then answers"
+                            .to_owned(),
+                    }
+                }))
+            }
             crate::grants::ActionRecord::InFlight => {
                 Some(Err(ControllerError::attempt_still_running()))
             }
             crate::grants::ActionRecord::Unfinished => match mutation.method.method() {
                 Some(Method::GrantRevoke | Method::DeviceRevoke | Method::GrantTransfer) => None,
+                // This host wrote the share and the claim in one database, so an attempt that
+                // ended, which cannot be running, either wrote the share or wrote nothing.
                 Some(Method::GrantCreate) => {
-                    let (grant_id, invitation_id) =
-                        kr_protocol::sharing::share_identities(actor_id, mutation.action_id.get());
-                    // The claim shows the first attempt began, so a registry that cannot be read
-                    // here, or holds a row for the share that cannot be decoded, has not said that
-                    // the share was never made.
-                    Some(
-                        self.sharing
-                            .shared(grant_id, invitation_id)
-                            .map_err(|_| ControllerError::record_unreadable("authority changes"))
-                            .and_then(|shared| match shared {
-                                Some(shared) => encode(&shared),
-                                None => Err(unfinished_and_unknown()),
-                            }),
-                    )
+                    Some(self.what_a_share_came_to(actor_id, mutation, |earlier| {
+                        if earlier {
+                            unfinished_and_unknown()
+                        } else {
+                            nothing_was_shared()
+                        }
+                    }))
                 }
                 _ => Some(Err(unfinished_and_unknown())),
             },
         }
+    }
+
+    /// What a share that no attempt is running for came to, from what it wrote.
+    ///
+    /// A grant and the invitation that carries it take identities derived from the actor and the
+    /// action and are written in one commit with nothing else, so finding them is finding what the
+    /// action wrote, and the answer is rebuilt from them rather than proposed again. Where they are
+    /// not found, `absent` says what that means, told whether a build before identities were
+    /// scoped to the actor wrote a share for the action, which this host cannot attribute to the
+    /// actor: with none of either, the share was never written. A registry that cannot be read, or
+    /// holds a row for the share that cannot be decoded, has not said that it was never made.
+    fn what_a_share_came_to(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        absent: impl FnOnce(bool) -> ControllerError,
+    ) -> Result<ParamsValue> {
+        let unreadable = |_| ControllerError::record_unreadable("authority changes");
+        let (grant_id, invitation_id) =
+            kr_protocol::sharing::share_identities(actor_id, mutation.action_id.get());
+        if let Some(shared) = self
+            .sharing
+            .shared(grant_id, invitation_id)
+            .map_err(unreadable)?
+        {
+            return encode(&shared);
+        }
+        let earlier = self
+            .sharing
+            .shared_under_earlier_identities(mutation.action_id.get())
+            .map_err(unreadable)?;
+        Err(absent(earlier))
     }
 
     /// What an unfinished revocation did, answered the way a revocation that finds its work done
@@ -1154,7 +1224,7 @@ impl Controller {
             }
             (method, _) => match method {
                 Method::GrantCreate => {
-                    self.grant_create(actor_id, caller, mutation, carried, claimed_at_ms)
+                    self.grant_create(actor_id, caller, mutation, carried, claimed_at_ms, &hold)
                         .await
                 }
                 Method::GrantRedeem => self.grant_redeem(mutation, caller, carried, &hold).await,
@@ -1200,8 +1270,13 @@ impl Controller {
                 | Method::OrganisationWithdraw
                 | Method::OrganisationExclusiveSet
         ) && outcome.is_ok();
-        if !kept {
-            self.settle_claim(&hold, &outcome)?;
+        if !kept && let Err(unrecorded) = self.settle_claim(&hold, &outcome) {
+            // A share that was written and whose result could not be kept is one whose store
+            // cannot be trusted to say what it did, so its subject stays held until a restart.
+            if method == Method::GrantCreate {
+                hold.doubt();
+            }
+            return Err(unrecorded);
         }
         drop(hold);
         outcome
@@ -1371,6 +1446,7 @@ impl Controller {
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
         claimed_at_ms: u64,
+        hold: &crate::grants::ClaimHold,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::sharing::GrantCreateParams = parse(&mutation.params)?;
         if params.owner_confirmation.is_present() {
@@ -1442,14 +1518,33 @@ impl Controller {
         // by the time the write happens.
         let registry = self.registry.lock().await;
         self.check_admission(&registry, &carried)?;
+        let writing = std::cell::Cell::new(false);
         let result = self.sharing.share(&request, || {
             self.check_admission(&registry, &carried)?;
             require_open_session(&registry, request.session_id)?;
-            self.recipient_still_paired(caller, request.recipient_device_id, &pairing)
+            self.recipient_still_paired(caller, request.recipient_device_id, &pairing)?;
+            // The checks are done: what follows inside the transaction is the grant, the
+            // invitation and the commit.
+            writing.set(true);
+            Ok(())
         });
         drop(registry);
         self.settle_floor();
-        encode(&result?)
+        // A store that fails once the share is being written, the commit included, has not said
+        // that nothing was written: the transaction may stand after a restart. Any other storage
+        // failure, a worker's own among them, ended an attempt that wrote nothing.
+        if writing.get()
+            && result
+                .as_ref()
+                .is_err_and(|error| error.code() == ErrorCode::StorageUnavailable)
+        {
+            hold.doubt();
+        }
+        // The share is written, so a result that cannot be encoded is not a refusal of it: nothing
+        // is kept for it, and a repeat finds what was written.
+        encode(&result?).map_err(|error| ControllerError::Uncertain {
+            detail: format!("the share was written and its answer could not be encoded: {error}"),
+        })
     }
 
     /// What the issuer of a share is shown of the current questions and approvals it names, as the
@@ -2950,6 +3045,19 @@ pub(super) fn destination_identifier(
             "a destination identifier is 1 to 128 bytes with no control characters".to_owned(),
         )
     })
+}
+
+/// The answer to a share whose attempt ended without recording what it did, when the records show
+/// that it wrote nothing: nothing was shared under the action, and it is not performed again.
+fn nothing_was_shared() -> ControllerError {
+    ControllerError::Refused {
+        code: ErrorCode::DraftConflict,
+        detail:
+            "an earlier attempt at this action ended before it shared anything, so nothing was \
+                 shared under this action and it is not performed again; share again under a new \
+                 action"
+                .to_owned(),
+    }
 }
 
 /// What an unfinished revocation's records show it did, once they show nothing left to do.

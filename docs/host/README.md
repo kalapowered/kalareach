@@ -7552,7 +7552,15 @@ caller whose window has closed, or whose daemon has restarted since, is still to
 * for an attempt that ended without recording what it did (the daemon stopped, or the attempt's
   task ended, in between), what this host's own records prove it did, and otherwise
   `OUTCOME_UNKNOWN`. A share is answered from the grant and the invitation it wrote, which take
-  identities derived from the actor and the action. A revocation writes what it withdrew beside its action's
+  identities derived from the actor and the action and are written in one commit in the same file
+  as the claim, so an attempt that has ended either wrote the share, which is the answer, or wrote
+  nothing, and a repeat is told with `DRAFT_CONFLICT` that nothing was shared under the action,
+  that it is not performed again and that a share under a new action shares again. A claim an
+  earlier build wrote, before a share's identities were scoped to the actor, can sit beside a share
+  under the earlier identities that this host cannot attribute to the actor, so it is
+  `OUTCOME_UNKNOWN`; a share whose store failed while it was written, or whose result could not be
+  kept, is read as running until the host restarts, which reads the store as it stands. A
+  revocation writes what it withdrew beside its action's
   claim, in the transaction that withdraws, and is answered from that once nothing is left for it
   to do: for a grant revocation, the grant it names stands revoked; for a device revocation, the
   device's own record stands revoked, its last write, and so does every grant the device holds.
@@ -7564,6 +7572,24 @@ caller whose window has closed, or whose daemon has restarted since, is still to
   action that changed it: a device's record can hold a preview key because another action
   registered the same one. So a revocation short of that or with no such record, a preview-key
   registration, a destination's credential or a voice change in this state is `OUTCOME_UNKNOWN`.
+
+A share asked for under a fresh action is refused with `DRAFT_CONFLICT` while another share of the
+same actor, session and recipient is still running in this daemon, at the owner's door and at a
+paired device's alike, and the refusal is kept as that action's answer, so a repeat of it is told
+the same. It names the running share's action: once that has ended, asking again under it says what
+it did, and a new share is made only if it did nothing. The hold is the running attempt and lasts as
+long as it does, kept in memory and not on disk; a share whose store could not say whether it wrote
+anything holds its subject until the host restarts. Nothing holds a share after the earlier one has
+ended, so a caller that never received the earlier answer, because its reply was lost, because a
+paired device's wait for the effect ended first and told it that the outcome was not known, or
+because the host stopped between the share and the record of its result, and that asks again under a
+new action instead of the same one, is admitted and writes a second share of the same session to
+the same device. That is the limit of what this host enforces, for a share, of the rule that a
+replacement action after an uncertain result is rejected: it is rejected while this host cannot
+prove the earlier result, and the person's later request to show the earlier result is the
+client's. A client that does not replace an action by itself is what keeps that from happening: `kr` stops at an unknown outcome, and the companion's own attempt gate covers its own
+attempts. Reading what the earlier action did is a repeat of it, which carries the request: no read
+names a share's claim, since no record of one holds the method it was made under.
 
 No attempt takes over a claim, however long ago it was written: an attempt that is still running is
 not known to have stopped, and one that stopped may already have reached its effect. So a retry

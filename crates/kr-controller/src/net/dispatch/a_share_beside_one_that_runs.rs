@@ -276,11 +276,7 @@ async fn kr_req_23_24_a_fresh_share_is_refused_while_an_earlier_share_of_its_sub
         (&mut held_to_another, &owner, &to_another),
         (&mut held_by_other, &other_actor, &by_other),
     ] {
-        assert!(
-            until_claimed(held, &world, actor, mutation)
-                .await
-                .is_none()
-        );
+        assert!(until_claimed(held, &world, actor, mutation).await.is_none());
         assert_eq!(
             claim(&world, actor, mutation),
             Some(ActionRecord::InFlight),
@@ -288,19 +284,22 @@ async fn kr_req_23_24_a_fresh_share_is_refused_while_an_earlier_share_of_its_sub
         );
     }
 
+    // Every share waiting for the registry is polled together: the registry hands itself to each
+    // waiter in turn, so one that is not polled would hold the others behind it.
     drop(registry);
-    running
-        .await
+    let (first_answer, in_elsewhere_answer, to_another_answer, by_other_answer) =
+        tokio::join!(running, held_elsewhere, held_to_another, held_by_other);
+    first_answer
         .into_answer()
         .expect("the first share is written");
+    for answer in [in_elsewhere_answer, to_another_answer, by_other_answer] {
+        answer.into_answer().expect("the share is written");
+    }
     assert!(invitation_written(&world, 0x01));
     assert!(
         !invitation_written(&world, 0x02),
         "the refused share wrote nothing"
     );
-    for share in [held_elsewhere, held_to_another, held_by_other] {
-        share.await.into_answer().expect("the share is written");
-    }
 
     let copied = starting(&world, &owner, AuthorityCaller::Owner, &replacement)
         .await
@@ -475,7 +474,7 @@ async fn kr_req_23_24_a_share_whose_result_cannot_be_kept_is_found_and_holds_its
     let later = viewing(&world, world.session_id, recipient(), 0x42);
 
     let mut running = starting(&world, &owner, AuthorityCaller::Owner, &first).await;
-    let mut refusing = starting(&world, &owner, AuthorityCaller::Owner, &later).await;
+    let refusing = starting(&world, &owner, AuthorityCaller::Owner, &later).await;
     let registry = world.controller.registry.lock().await;
     assert!(
         until_claimed(&mut running, &world, &owner, &first)

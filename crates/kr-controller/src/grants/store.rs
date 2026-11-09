@@ -180,15 +180,36 @@ pub enum ActionRecord {
 /// One claim's key: the actor, and the action as its sixteen bytes.
 type ClaimKey = (String, [u8; 16]);
 
+/// What a running `grant.create` shares, and with whom: the subject two shares of one actor have in
+/// common when a later one would repeat an earlier one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShareSubject {
+    /// The session the share is of.
+    pub session_id: SessionId,
+    /// The device the share is to.
+    pub recipient_device_id: DeviceId,
+}
+
+/// What this daemon knows of one running attempt.
+#[derive(Debug, Default)]
+struct LiveClaim {
+    /// What the attempt shares, when it is a `grant.create`: a fresh share of the same subject by
+    /// the same actor is refused while this entry stands.
+    subject: Option<ShareSubject>,
+    /// Whether the attempt ended without it being known whether its share was written, so that the
+    /// entry stands until this process ends ([`ClaimHold::doubt`]).
+    doubtful: bool,
+}
+
 /// The claims whose attempts are running in this daemon.
 ///
 /// In memory, because it describes this process: a claim written by a daemon that has since
 /// stopped belongs to an attempt that stopped with it.
 #[derive(Debug, Default)]
-struct LiveClaims(std::sync::Mutex<BTreeSet<ClaimKey>>);
+struct LiveClaims(std::sync::Mutex<BTreeMap<ClaimKey, LiveClaim>>);
 
 impl LiveClaims {
-    fn held(&self) -> std::sync::MutexGuard<'_, BTreeSet<ClaimKey>> {
+    fn held(&self) -> std::sync::MutexGuard<'_, BTreeMap<ClaimKey, LiveClaim>> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -209,9 +230,28 @@ pub struct ClaimHold {
     key: ClaimKey,
 }
 
+impl ClaimHold {
+    /// Keeps this attempt's entry for as long as this daemon runs, however the attempt ends.
+    ///
+    /// For an attempt that ended after it may have written what it was claimed for, and whose
+    /// store could not say whether it did: a share whose transaction failed after it began, or
+    /// whose result could not be kept. Such an attempt is not known to have ended without its
+    /// effect, so it is still read as running, and the subject it holds stays held, until a
+    /// restart reads the store as it stands.
+    pub fn doubt(&self) {
+        if let Some(entry) = self.live.held().get_mut(&self.key) {
+            entry.doubtful = true;
+        }
+    }
+}
+
 impl Drop for ClaimHold {
     fn drop(&mut self) {
-        self.live.held().remove(&self.key);
+        let mut live = self.live.held();
+        if live.get(&self.key).is_some_and(|entry| entry.doubtful) {
+            return;
+        }
+        live.remove(&self.key);
     }
 }
 
@@ -2140,6 +2180,56 @@ impl GrantDirectory {
         payload_digest: &Digest256,
         now_ms: u64,
     ) -> Result<ActionClaim> {
+        self.claim(actor_id, action_id, payload_digest, now_ms, None)
+    }
+
+    /// As [`Self::claim_action`], for a `grant.create` of `subject`: a fresh action is refused
+    /// while another attempt of the same actor is running for the same subject.
+    ///
+    /// Two shares of one session to one device by one actor are a repeat unless the second is
+    /// asked for after the first is known to have ended, and the second is told so in the same
+    /// transaction that reads the claims: the refusal is kept as the fresh action's own answer, so
+    /// a repeat of it is answered alike, and nothing is claimed for the attempt, which performs
+    /// nothing. A repeat of the running attempt's own action is not a fresh action and is read as
+    /// [`ActionRecord::InFlight`], as it always is.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::claim_action`], and [`ControllerError::Refused`] under `DRAFT_CONFLICT` for a
+    /// fresh action refused for the subject's sake.
+    pub fn claim_share(
+        &self,
+        actor_id: &ActorId,
+        action_id: ActionId,
+        payload_digest: &Digest256,
+        now_ms: u64,
+        subject: &ShareSubject,
+    ) -> Result<ActionClaim> {
+        self.claim(actor_id, action_id, payload_digest, now_ms, Some(subject))
+    }
+
+    /// Whether the attempt that claimed this action ended without it being known whether it wrote
+    /// what it was claimed for, and is still read as running for that reason ([`ClaimHold::doubt`]).
+    pub fn doubted(&self, actor_id: &ActorId, action_id: ActionId) -> bool {
+        self.live
+            .held()
+            .get(&claim_key(actor_id, action_id))
+            .is_some_and(|entry| entry.doubtful)
+    }
+
+    fn claim(
+        &self,
+        actor_id: &ActorId,
+        action_id: ActionId,
+        payload_digest: &Digest256,
+        now_ms: u64,
+        subject: Option<&ShareSubject>,
+    ) -> Result<ActionClaim> {
+        /// What the transaction did: wrote a claim for this attempt, found one, or kept a refusal.
+        enum Claimed {
+            Taken(ActionClaim),
+            Refused(ControllerError),
+        }
         let key = claim_key(actor_id, action_id);
         let begun = std::cell::Cell::new(false);
         let claimed = self.in_transaction(|connection| {
@@ -2152,7 +2242,44 @@ impl GrantDirectory {
             if let Some(record) = read_claim(connection, &key, payload_digest, &self.live)
                 .map_err(|error| error.found_unreadable("action claims"))?
             {
-                return Ok(ActionClaim::Recorded(record));
+                return Ok(Claimed::Taken(ActionClaim::Recorded(record)));
+            }
+            // Asked while the connection is held, which is the lock a claim is registered under,
+            // so two fresh actions for one subject cannot both find it free.
+            let earlier = subject.and_then(|subject| {
+                self.live
+                    .held()
+                    .iter()
+                    .find(|(held, entry)| {
+                        held.0 == key.0 && entry.subject.as_ref() == Some(subject)
+                    })
+                    .map(|(held, entry)| (held.1, entry.doubtful))
+            });
+            if let Some((earlier, doubtful)) = earlier {
+                let detail = the_share_that_holds_it(
+                    ActionId::new(kr_protocol::scalars::Uuid::from_bytes(earlier)),
+                    doubtful,
+                );
+                connection
+                    .execute(
+                        "INSERT INTO authority_receipts
+                             (actor_id, action_id, payload_digest, claimed_at_ms, result,
+                              recorded_at_ms, refusal_code, refusal_detail)
+                         VALUES (?1, ?2, ?3, ?4, NULL, ?4, ?5, ?6)",
+                        params![
+                            key.0,
+                            key.1.as_slice(),
+                            payload_digest.as_bytes().as_slice(),
+                            i64::try_from(now_ms).unwrap_or(i64::MAX),
+                            ErrorCode::DraftConflict.as_str(),
+                            detail,
+                        ],
+                    )
+                    .map_err(ControllerError::registry)?;
+                return Ok(Claimed::Refused(ControllerError::Refused {
+                    code: ErrorCode::DraftConflict,
+                    detail,
+                }));
             }
             connection
                 .execute(
@@ -2171,19 +2298,27 @@ impl GrantDirectory {
             // Registered inside the transaction, which holds the store's lock: nothing can read
             // the new row before its hold is there. A commit that then fails drops the hold with
             // the claim it was returned in.
-            self.live.held().insert(key.clone());
-            Ok(ActionClaim::Claimed {
+            self.live.held().insert(
+                key.clone(),
+                LiveClaim {
+                    subject: subject.copied(),
+                    doubtful: false,
+                },
+            );
+            Ok(Claimed::Taken(ActionClaim::Claimed {
                 hold: ClaimHold {
                     live: Arc::clone(&self.live),
                     key: key.clone(),
                 },
-            })
+            }))
         });
         // A transaction that could not be begun read nothing either, and is told as the read in it
         // is. One that began and failed to commit has written nothing that stands.
         match claimed {
             Err(error) if !begun.get() => Err(error.found_unreadable("action claims")),
-            claimed => claimed,
+            Err(error) => Err(error),
+            Ok(Claimed::Taken(claim)) => Ok(claim),
+            Ok(Claimed::Refused(refusal)) => Err(refusal),
         }
     }
 
@@ -2241,7 +2376,7 @@ impl GrantDirectory {
         self.with(|connection| {
             // Asked while the connection is held, which is the lock a result is recorded under,
             // so an attempt that has just recorded its own result is not settled over.
-            if self.live.held().contains(&key) {
+            if self.live.held().contains_key(&key) {
                 return Ok(false);
             }
             connection
@@ -3289,6 +3424,26 @@ fn record_result(
     }
 }
 
+/// What a fresh share is told when an earlier share of the same session to the same device, by
+/// the same actor, holds its subject: still running, or ended without its store saying whether it
+/// wrote anything.
+fn the_share_that_holds_it(earlier: ActionId, doubtful: bool) -> String {
+    if doubtful {
+        format!(
+            "an earlier share of this session to this device, action {earlier}, ended without \
+             this host knowing whether it was written, because its store failed; the host says \
+             what it did once it restarts, and a new share of this session to this device waits \
+             until then"
+        )
+    } else {
+        format!(
+            "an earlier share of this session to this device, action {earlier}, has not ended; \
+             once it has, ask again under that action, which says what it did, and share again \
+             only if it did nothing"
+        )
+    }
+}
+
 /// One claim row, as the store reads it back: the digest, the result once there is one, and the
 /// refusal's code and words once there is one of those.
 type ClaimRow = (Vec<u8>, Option<Vec<u8>>, Option<String>, Option<String>);
@@ -3339,7 +3494,7 @@ fn read_claim(
             detail: refusal_detail.unwrap_or_default(),
         }));
     }
-    if live.held().contains(key) {
+    if live.held().contains_key(key) {
         return Ok(Some(ActionRecord::InFlight));
     }
     Ok(Some(ActionRecord::Unfinished))

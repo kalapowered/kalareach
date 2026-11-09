@@ -61,7 +61,8 @@ pub use policy::{HostPolicy, PolicyIntersection};
 pub use remote_refusal::RemoteRefusal;
 pub use store::{
     ActionClaim, ActionRecord, ClaimHold, CloseHold, ExclusiveEnding, GrantDirectory, GrantRecord,
-    GrantRevocation, MAX_GRANTS_PER_TREE, OfferRecord, an_owner_device_can_recover, can_recover,
+    GrantRevocation, MAX_GRANTS_PER_TREE, OfferRecord, ShareSubject, an_owner_device_can_recover,
+    can_recover,
 };
 pub use vocabulary::{rights_for, unconditional_rights_for};
 
