@@ -3408,6 +3408,102 @@ mod tests {
         );
     }
 
+    /// KR-REQ-24.27: a disabling that is refused, or whose store refuses the write, leaves the row
+    /// it found: privacy mode on at its generation, nothing published and nothing left raised. One
+    /// that stops after the record committed and before it published leaves the new row whole, and
+    /// the next start serves privacy mode off at the new generation, from its own start.
+    #[test]
+    fn a_disabling_that_is_refused_or_stopped_leaves_one_whole_row() {
+        let mut host = Host::open();
+        host.privacy
+            .enable(&[], at(0), &standing)
+            .expect("privacy mode is enabled");
+        let state = host.privacy.state();
+        let on = host
+            .privacy
+            .inner()
+            .record
+            .read()
+            .expect("the record reads");
+        let published_on = state.now();
+        let stands_as_it_was = |host: &Host| {
+            let stored = host
+                .privacy
+                .inner()
+                .record
+                .read()
+                .expect("the record reads");
+            assert_eq!(stored, on, "the row is the one found");
+            assert_eq!(state.now(), published_on, "nothing was published");
+            assert!(!state.observed().changing, "nothing is left raised");
+        };
+
+        // The admission lapses once the record's transaction is held.
+        let lapsed = |_write: &mut dyn FnMut() -> Result<()>| {
+            Err(ControllerError::WindowExpired {
+                detail: "the action's deadline passed".to_owned(),
+            })
+        };
+        assert!(matches!(
+            host.privacy.disable(at(10), &lapsed),
+            Err(ControllerError::WindowExpired { .. })
+        ));
+        stands_as_it_was(&host);
+
+        // The store refuses the write.
+        let refuse = Connection::open(host.root.path().join(PRIVACY_RECORD)).expect("the record");
+        refuse
+            .execute_batch(
+                "CREATE TRIGGER refuse_the_record BEFORE UPDATE ON privacy_record
+                 BEGIN SELECT RAISE(ABORT, 'this store refused the record'); END;",
+            )
+            .expect("the record will be refused");
+        let refused = host
+            .privacy
+            .disable(at(20), &standing)
+            .expect_err("a record this environment cannot write down");
+        assert!(
+            refused.to_string().contains("refused the record"),
+            "{refused}"
+        );
+        stands_as_it_was(&host);
+        refuse
+            .execute_batch("DROP TRIGGER refuse_the_record")
+            .expect("the record is accepted again");
+
+        // The change stops after the record committed and before it was published.
+        let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            host.privacy
+                .disable(at(30), &|write: &mut dyn FnMut() -> Result<()>| {
+                    write()?;
+                    panic!("the daemon stops after the record committed")
+                })
+        }));
+        assert!(stopped.is_err());
+        let off = host
+            .privacy
+            .inner()
+            .record
+            .read()
+            .expect("the record reads");
+        assert!(!off.enabled);
+        assert_eq!(off.generation, PrivacyGeneration::new(2));
+        assert!(state.now().private, "nothing was published");
+        let started = kr_ipc::now_ms().get();
+        host.reopen_privacy();
+        let restored = host.privacy.state().now();
+        assert_eq!(
+            (restored.private, restored.generation.get()),
+            (false, 2),
+            "the next start serves the new state"
+        );
+        assert!(
+            restored.since_ms >= started,
+            "the next start serves from its own start ({started}), not from {}",
+            restored.since_ms
+        );
+    }
+
     /// KR-REQ-15.20 and KR-REQ-24.27: a daemon that starts over a record that has changed serves
     /// only what is produced after the start. The record keeps the moment the last change was asked
     /// for, which a wait for the store can put before the moment it took effect, and a host that
