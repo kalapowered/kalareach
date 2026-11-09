@@ -5664,3 +5664,66 @@ async fn a_registration_whose_answer_is_lost_on_a_real_connection_is_asked_about
         phone.view().hosts[0].words
     );
 }
+
+/// KR-REQ-23.24: an answer to a registration that the phone cannot read as the host's result is not
+/// the host saying it took the registration. The registration stays unknown, the request is kept to
+/// be sent again, and a look that sends it again and is answered in a way the phone cannot read
+/// leaves it unknown too: the host is not turned on by it, and nothing is registered under another
+/// action.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_the_phone_cannot_read_leaves_a_registration_unknown_when_asked_about_again() {
+    use kr_protocol::method::Method;
+
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let control = LinkControl::new();
+    let phone = desk_over_a_controlled_link(&host, &owner, &control).await;
+    let reference = phone.references().remove(0);
+    control.garble_the_answer_to(Some(Method::DevicePushRegister));
+
+    phone
+        .desk
+        .enable(&reference, None)
+        .expect("the person asks");
+    phone
+        .until(|states| states == [PushState::NeedsAttention])
+        .await;
+
+    let action = unknown_of(&phone).expect("the outcome is not known");
+    assert!(
+        phone.view().hosts[0]
+            .words
+            .contains("not one this phone reads"),
+        "{:?}",
+        phone.view().hosts[0].words
+    );
+
+    phone.let_time_pass();
+    look(&phone.desk).await;
+    eventually("the look sent the same request again", || {
+        control.sent(Method::DevicePushRegister) == 2
+    })
+    .await;
+    phone
+        .until(|states| states == [PushState::NeedsAttention])
+        .await;
+
+    assert_eq!(
+        control.sent_actions(Method::DevicePushRegister),
+        [action.clone(), action.clone()],
+        "the same action was asked about, and no registration went under another"
+    );
+    assert_eq!(
+        unknown_of(&phone),
+        Some(action),
+        "an answer the phone cannot read does not settle it"
+    );
+    assert!(
+        phone.view().hosts[0]
+            .words
+            .contains("Asked again, the host did not settle it"),
+        "{:?}",
+        phone.view().hosts[0].words
+    );
+    assert_eq!(proposed(&phone.gateway), [FIRST_TOKEN]);
+}

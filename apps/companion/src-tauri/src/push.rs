@@ -2869,33 +2869,22 @@ impl ConnectionLine {
     /// answers it from its record: the result when it took the registration, and the refusal when it
     /// refused it. A refusal is not taken for the host's decision about the registration, since a
     /// host that no longer admits this phone refuses a repeat for that reason as well, so only a
-    /// result, or a receipt that says what became of it, settles the action.
+    /// result this phone reads, or a receipt for this action that says what became of it, settles
+    /// the action.
     async fn repeated(&self, action: ActionId, composed: &ComposedMutation) -> RegistrationRead {
-        use kr_protocol::receipt::ReceiptState;
-
         let session = self.connection.session();
         let sent = tokio::time::timeout(ANSWER_WITHIN, session.repeat(composed)).await;
         session.settle(action).await;
         match sent {
             Err(_) => RegistrationRead::Undecided("the host did not answer in time".to_owned()),
-            Ok(Ok(kr_client::Settled::Result(_))) => RegistrationRead::Taken,
-            Ok(Ok(kr_client::Settled::Receipt(receipt))) => match receipt.state {
-                ReceiptState::Applied => RegistrationRead::Taken,
-                ReceiptState::Refused | ReceiptState::Rejected => RegistrationRead::NotTaken(
-                    "the host recorded that it did not take it".to_owned(),
-                ),
-                other => RegistrationRead::Undecided(format!(
-                    "the host holds it as {}, which does not say whether it was taken",
-                    other.as_str()
-                )),
-            },
+            Ok(Ok(answer)) => read_of_the_repeat(action, &answer),
             Ok(Err(error)) => RegistrationRead::Undecided(CommandError::from(error).message),
         }
     }
 
     /// What the host says of the registration sent under `action` when asked for its receipt.
     async fn receipt(&self, action: ActionId) -> RegistrationRead {
-        use kr_protocol::receipt::{ActionReadParams, ReceiptState};
+        use kr_protocol::receipt::ActionReadParams;
 
         let read = within_the_answer(async {
             self.connection
@@ -2909,24 +2898,50 @@ impl ConnectionLine {
         })
         .await;
         match read {
-            Ok(read) if read.receipt.action_id != action => {
-                RegistrationRead::Undecided("the host answered about another action".to_owned())
-            }
-            Ok(read) => match read.receipt.state {
-                ReceiptState::Applied => RegistrationRead::Taken,
-                ReceiptState::Refused => {
-                    RegistrationRead::NotTaken("the host recorded that it refused it".to_owned())
-                }
-                ReceiptState::Rejected => RegistrationRead::NotTaken(
-                    "the host recorded that it rejected it before acting".to_owned(),
-                ),
-                other => RegistrationRead::Undecided(format!(
-                    "the host holds it as {}, which does not say whether it was taken",
-                    other.as_str()
-                )),
-            },
+            Ok(read) => read_of_the_receipt(action, &read.receipt),
             Err(words) => RegistrationRead::Undecided(words),
         }
+    }
+}
+
+/// What a receipt the host returned says of the registration sent under `action`: taken, refused or
+/// rejected for good, or too little to say. A receipt for another action says nothing of this one.
+fn read_of_the_receipt(
+    action: ActionId,
+    receipt: &kr_protocol::receipt::Receipt,
+) -> RegistrationRead {
+    use kr_protocol::receipt::ReceiptState;
+
+    if receipt.action_id != action {
+        return RegistrationRead::Undecided("the host answered about another action".to_owned());
+    }
+    match receipt.state {
+        ReceiptState::Applied => RegistrationRead::Taken,
+        ReceiptState::Refused => {
+            RegistrationRead::NotTaken("the host recorded that it refused it".to_owned())
+        }
+        ReceiptState::Rejected => RegistrationRead::NotTaken(
+            "the host recorded that it rejected it before acting".to_owned(),
+        ),
+        other => RegistrationRead::Undecided(format!(
+            "the host holds it as {}, which does not say whether it was taken",
+            other.as_str()
+        )),
+    }
+}
+
+/// What the host's answer to a registration sent again exactly says of the registration sent under
+/// `action`. The host answers a repeat of an action it took with the method's result: a result the
+/// phone cannot read as that is not the host saying it took the registration.
+fn read_of_the_repeat(action: ActionId, answer: &kr_client::Settled) -> RegistrationRead {
+    match answer {
+        kr_client::Settled::Result(value) => match value.to_typed::<DevicePushRegisterResult>() {
+            Ok(_) => RegistrationRead::Taken,
+            Err(_) => {
+                RegistrationRead::Undecided("its answer was not one this phone reads".to_owned())
+            }
+        },
+        kr_client::Settled::Receipt(receipt) => read_of_the_receipt(action, receipt),
     }
 }
 
@@ -2966,13 +2981,18 @@ impl HostLine for ConnectionLine {
                 Err(_) => Err(LineStop::Unknown(
                     "the host did not answer in time".to_owned(),
                 )),
-                Ok(Ok(kr_client::Settled::Result(value))) => {
-                    session.settle(action).await;
-                    self.repeats().remove(&self.host_device_id);
-                    value.to_typed().map_err(|_| {
-                        LineStop::Unknown("its answer was not one this phone reads".to_owned())
-                    })
-                }
+                Ok(Ok(kr_client::Settled::Result(value))) => match value.to_typed() {
+                    Ok(result) => {
+                        session.settle(action).await;
+                        self.repeats().remove(&self.host_device_id);
+                        Ok(result)
+                    }
+                    // The host answered, and what it said is not a result this phone reads: it
+                    // may have taken the registration, so the request stays to be asked again.
+                    Err(_) => Err(LineStop::Unknown(
+                        "its answer was not one this phone reads".to_owned(),
+                    )),
+                },
                 Ok(Ok(kr_client::Settled::Receipt(_))) => Err(LineStop::Unknown(
                     "it did not say it had taken the registration".to_owned(),
                 )),
@@ -3226,6 +3246,87 @@ mod tests {
             state.request(id, Some(&action.to_string()), 13),
             Request::Run(_)
         ));
+    }
+
+    /// A receipt of `action` in `state`, as a host returns one.
+    fn receipt_of(
+        action: ActionId,
+        state: kr_protocol::receipt::ReceiptState,
+    ) -> kr_protocol::receipt::Receipt {
+        use kr_protocol::scalars::{Nullable, TimestampMs, U64};
+
+        kr_protocol::receipt::Receipt {
+            action_id: action,
+            actor_id: kr_protocol::ids::ActorId::new("a-device").expect("an actor"),
+            method: kr_protocol::method::Method::DevicePushRegister.into(),
+            method_version: kr_protocol::method::MethodVersion::V1,
+            revision: U64::new(1),
+            state,
+            reason: Nullable::null(),
+            payload_digest: Digest256::from_bytes([2; 32]),
+            accepted_deadline_ms: Nullable::null(),
+            error: Nullable::null(),
+            error_withheld: false,
+            updated_at_ms: TimestampMs::new(1),
+        }
+    }
+
+    /// KR-REQ-23.24: the answer to a registration sent again settles it only when it is a result this
+    /// phone reads or a receipt for that action that says what became of it. An answer that is
+    /// neither, or a receipt of another action, leaves it unknown.
+    #[test]
+    fn only_a_result_the_phone_reads_or_a_receipt_for_the_action_settles_a_repeated_registration() {
+        use kr_protocol::envelope::ParamsValue;
+        use kr_protocol::receipt::ReceiptState;
+
+        let action = ActionId::new(kr_ipc::new_uuid());
+        let other = ActionId::new(kr_ipc::new_uuid());
+        let unreadable = kr_client::Settled::Result(
+            ParamsValue::from_typed(&"not a result of the method").expect("a text encodes"),
+        );
+        assert!(
+            matches!(
+                read_of_the_repeat(action, &unreadable),
+                RegistrationRead::Undecided(_)
+            ),
+            "a result that is no registration's is not the host taking it"
+        );
+
+        let applied =
+            |of| kr_client::Settled::Receipt(Box::new(receipt_of(of, ReceiptState::Applied)));
+        assert_eq!(
+            read_of_the_repeat(action, &applied(action)),
+            RegistrationRead::Taken,
+            "control: a receipt that says the action was applied"
+        );
+        assert!(
+            matches!(
+                read_of_the_repeat(action, &applied(other)),
+                RegistrationRead::Undecided(_)
+            ),
+            "a receipt of another action says nothing of this one"
+        );
+        for state in [ReceiptState::Refused, ReceiptState::Rejected] {
+            let read = read_of_the_receipt(action, &receipt_of(action, state));
+            assert!(
+                matches!(read, RegistrationRead::NotTaken(_)),
+                "{state:?}: {read:?}"
+            );
+        }
+        assert!(
+            matches!(
+                read_of_the_receipt(action, &receipt_of(action, ReceiptState::Accepted)),
+                RegistrationRead::Undecided(_)
+            ),
+            "a receipt that says less settles nothing"
+        );
+        assert!(
+            matches!(
+                read_of_the_receipt(action, &receipt_of(other, ReceiptState::Refused)),
+                RegistrationRead::Undecided(_)
+            ),
+            "a refusal recorded for another action is not this one's"
+        );
     }
 
     /// A time later than the start's own is a clock set back: the retry is not delayed by it.

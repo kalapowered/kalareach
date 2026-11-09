@@ -602,7 +602,9 @@ previews it carried is the one the host was told, and the preview key is told; i
 refused it or never admitted it, the row says so and the next look registers again, as it does for
 any refusal. Any other answer leaves the registration unknown, and the row says what the host
 answered. A refusal in answer to the repeat does not settle it, since a host that no longer admits
-this phone refuses a repeat for that reason too, so the person decides. The person's request asks about the earlier registration once more before it
+this phone refuses a repeat for that reason too, so the person decides; neither does an answer the
+phone cannot read as the registration's result, or a receipt for another action, and the request
+stays in memory to be sent again. The person's request asks about the earlier registration once more before it
 registers again, and registers again, under a new action, unless the host says it took the earlier
 one. A request that names another registration than the one the host stands at, or none, is for a
 view the host has left, and sends nothing; the name is compared where the host is claimed, in one
