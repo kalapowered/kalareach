@@ -14,13 +14,13 @@ use std::process::Command;
 
 /// KR-REQ-07.88: the check that holds the register against the upstream advisories reads a range
 /// the way the advisory's source writes it: a bare pre-release with a number is a version and not a
-/// span, a span of two versions is a span whichever end carries a pre-release
+/// span, a span of two versions is read as a span whichever end carries a pre-release
 /// (`7.6.0-7.7.0-preview.3` runs from 7.6.0 to 7.7.0-preview.3 and so reaches the releases the
-/// module accepts), and the words of a pre-release are ordered both by their codes and without
-/// regard to case. The command exits non-zero at the first range it reads wrongly, naming it. This
-/// shows the part of the clause that a change an upstream published, which reaches what the module
-/// accepts, is not passed over without a triage row; the qualification suite reads the rows
-/// themselves.
+/// module accepts) and also as one version where the whole text is one, and the words of a
+/// pre-release are ordered both by their codes and without regard to case. The command exits
+/// non-zero at the first range it reads wrongly, naming it. This shows one part of the clause: a
+/// change an upstream published that reaches what the module accepts does not pass without a
+/// triage row. The qualification suite reads the rows themselves.
 #[test]
 fn the_advisories_check_reads_the_ranges_the_sources_publish() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

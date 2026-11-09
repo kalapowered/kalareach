@@ -208,7 +208,7 @@ def in_range(range_text, version):
     return True
 
 
-SPAN_END = re.compile(r"\s*[0-9][0-9A-Za-z.+\-]*\s*")
+SPAN_END = re.compile(r"\s*v?[0-9][0-9A-Za-z.+\-]*\s*")
 
 
 def span_readings(text, fold=False):
@@ -1290,8 +1290,9 @@ def run_self_test():
         # A span of two versions is a span whichever end carries a pre-release: the hyphen that
         # separates the ends is the one with a number on each side, and a pre-release's own hyphens
         # stay in its end. `7.6.0-7.7.0-preview.3` runs from 7.6.0 to 7.7.0-preview.3. Read as the
-        # pre-release `7.7.0-preview.3` of 7.6.0, which sorts below 7.6.0 and so below every release
-        # the module accepts, it left a range that reaches the accepted releases with no triage row.
+        # pre-release `7.7.0-preview.3` of 7.6.0, which sorts below 7.6.0 and so outside every
+        # interval the module accepts, it left a range that reaches them with no triage row. The
+        # direct rows below put the accepted releases at 7.6.0 up to 7.8.0.
         for text, covers in (
             ("7.6.0-7.7.0-preview.3", True),
             ("7.5.0-7.6.1-preview.1", True),
@@ -1299,9 +1300,13 @@ def run_self_test():
             ("7.5.0-rc.1-7.6.1-preview.1", True),
             ("7.5.0-7.6.1", True),
             ("7.0.0-7.5.0-preview.1", False),
+            ("7.0.0-v7.6.7", True),
+            ("v7.0.0-7.6.7", True),
+            ("7.0.0 - 7.3.5-preview.1", False),
+            ("7.6.0 - 7.7.0-preview.3", True),
         ):
             expect(
-                "the span %s %s the releases accepted" % (text, "reaches" if covers else "misses"),
+                "the span %s %s 7.6.0 up to 7.8.0" % (text, "reaches" if covers else "misses"),
                 reaches(text, accepted_powershell) == covers,
             )
         powershell_route = "/repos/PowerShell/PowerShell/security-advisories"
@@ -1311,8 +1316,11 @@ def run_self_test():
             ("7.5.0-rc.1-7.6.1-preview.1", "2026-10-20T10:00:00Z", True, "a revised range that is a span between two pre-releases"),
             ("7.5.0-7.5.11", "2026-10-20T10:00:00Z", True, "a revised range that is a span of two releases and ends at a fixed release"),
             ("7.5.0-7.5.11-preview.1", "2026-10-20T10:00:00Z", False, "a revised span that ends at a pre-release of the fixed release, which the module refuses"),
-            ("7.5.0-7.5.10-preview.1", "2026-10-20T10:00:00Z", False, "a revised span that covers only releases of a series the module refuses"),
+            ("7.5.0-7.5.10-preview.1", "2026-10-20T10:00:00Z", False, "a revised span of 7.5 releases below the first fixed release of that series"),
             ("7.0.0-7.3.5-preview.1", "2026-10-20T10:00:00Z", False, "a revised span that ends below what the module loads on"),
+            ("7.0.0 - 7.3.5-preview.1", "2026-10-20T10:00:00Z", False, "a revised span with spaces at its hyphen and a pre-release end that ends below what the module loads on"),
+            ("7.6.0 - 7.7.0-preview.3", "2026-10-20T10:00:00Z", True, "a revised span with spaces at its hyphen and a pre-release end that reaches what the module accepts"),
+            ("7.0.0-v7.6.7", "2026-10-20T10:00:00Z", True, "a revised span whose end is written with a leading v"),
             (">= 7.6.7, < 7.6.9", "2026-10-20T10:00:00Z", True, "a revised range that starts inside a series"),
             ("< 7.6.8 || >= 7.0.0, < 7.2.1", "2026-10-20T10:00:00Z", True, "a revised range with an alternative"),
             (">= 7.4.0, < 7.4.15", "2026-10-20T10:00:00Z", False, "a revised range of releases the module refuses"),
