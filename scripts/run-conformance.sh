@@ -206,6 +206,8 @@ PYTHON
 )"
 
     local records=()
+    # The seconds spent in tries at fetching, pauses between them included.
+    local waited=0
     # Each library installed so far, as its identifier and its prefix, one per line: a program
     # built after it names it in its build's variables.
     local prefixes=""
@@ -261,14 +263,21 @@ PYTHON
         fi
         if [ ! -f "$kept" ] || [ "$(digest "$kept")" != "$sha" ]; then
             echo "  $id $version: fetching $url"
-            # Several attempts with a pause between them: a release host that answers a burst
-            # with an error is a passing condition, and recording the release as unavailable over
-            # one would say something untrue about it.
-            if ! curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors --max-time 600 -o "$kept.part" "$url"; then
+            # A release host that answers every request with an error does so for a few minutes
+            # at a time (one night's lasted about five), and recording the release as unavailable
+            # over it would say something untrue about it. So a release is tried again after
+            # pauses that double, which is eight minutes of them in all; and once the fetch has
+            # spent five minutes in such pauses and tries, the releases after that are tried once,
+            # so that a host that stays down does not take the report's time.
+            local retries=9 began=$SECONDS
+            [ "$waited" -ge 300 ] && retries=0
+            if ! curl -fsSL --retry "$retries" --retry-all-errors --max-time 600 -o "$kept.part" "$url"; then
+                waited=$((waited + SECONDS - began))
                 echo "    $url could not be fetched, so $id $version is not installed"
                 records+=("$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$id" "$version" "$role" unavailable "$url" "$sha" "$kind" - "$url could not be fetched")")
                 continue
             fi
+            waited=$((waited + SECONDS - began))
             local got
             got="$(digest "$kept.part")"
             if [ "$got" != "$sha" ]; then

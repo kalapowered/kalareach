@@ -28,7 +28,7 @@ url=
 while [ $# -gt 0 ]; do
     case \"$1\" in
         -o) out=$2; shift ;;
-        --retry|--retry-delay|--max-time) shift ;;
+        --retry|--retry-delay|--retry-max-time|--connect-timeout|--max-time) shift ;;
         -*) ;;
         *) url=$1 ;;
     esac
