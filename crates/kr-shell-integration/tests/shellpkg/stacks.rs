@@ -2554,21 +2554,21 @@ impl Session {
                     moved += 1;
                     let Some(report) = self.next_reader_report(deadline, |_| true) else {
                         return Err(format!(
-                            "the reader moved under every one of {asked} fences in {FENCE:?} and \
-                             reported no reader to ask instead"
+                            "the reader moved under {moved} of {asked} fences in {FENCE:?} \
+                             ({not_drained} others were answered as not drained) and reported no \
+                             reader to ask instead"
                         ));
                     };
                     prompt_generation = report.idle.prompt_generation;
                     reader_revision = report.idle.reader_revision;
                 }
                 None => {
-                    // The last fence is the one the time ran out on; the ones before it were
+                    // The last fence is the one that got no answer; the ones before it were
                     // answered, as not drained or as for a reader that had moved.
                     return Err(format!(
-                        "the last of {asked} fences in {FENCE:?} was not answered in time \
-                         ({not_drained} before it were answered as not drained, {moved} as for a \
-                         reader that had moved), so the reader did not say it had read what was \
-                         typed"
+                        "the last of {asked} fences in {FENCE:?} got no answer ({not_drained} \
+                         before it were answered as not drained, {moved} as for a reader that had \
+                         moved), so the reader did not say it had read what was typed"
                     ));
                 }
                 Some((other, _)) => {
