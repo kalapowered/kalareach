@@ -418,6 +418,10 @@ struct Pending {
     waiting: Mutex<HashMap<u64, Waiter>>,
     closed: AtomicBool,
     transport: Mutex<Option<Transport>>,
+    /// What the client is doing about each identifier it is registering or removing. It is kept
+    /// here, with the waiting set, because it is only about answers this connection can still
+    /// bring: when the connection ends it is emptied with them.
+    churning: Arc<Churning>,
 }
 
 impl Pending {
@@ -490,7 +494,9 @@ impl Pending {
     /// Drops every waiting sender and records that the connection is gone.
     ///
     /// Dropping a sender is what tells its caller the host closed the connection, at once, rather
-    /// than each caller waiting out its own deadline for an answer that cannot arrive.
+    /// than each caller waiting out its own deadline for an answer that cannot arrive. What the
+    /// client knew of its registrations goes with them: no answer will come to act on it, and a
+    /// client over a closed connection refuses every request and cannot be connected again.
     fn close(&self) {
         // The flag is set under the lock an admission takes, so an admission either happens before
         // the connection ended or is refused by it; there is no order in which it happens after.
@@ -503,6 +509,9 @@ impl Pending {
         };
         // Outside the lock: what a waiter holds takes locks of its own when it goes.
         drop(drained);
+        if let Ok(mut churning) = self.churning.lock() {
+            churning.clear();
+        }
         // And the transport goes with them: a reader still waiting on the socket, a writer still
         // sending events, or a socket still half open would be this client carrying on with a
         // connection it has declared over.
@@ -602,8 +611,6 @@ pub struct PluginClient {
     register_deadline: core::time::Duration,
     /// How long an unbind is waited for.
     unbind_deadline: core::time::Duration,
-    /// What this client is doing about the identifiers it is registering or removing.
-    churning: Arc<Churning>,
     next_request: AtomicU64,
     descriptor: HostDescriptor,
     reader_task: tokio::task::JoinHandle<()>,
@@ -700,7 +707,6 @@ impl PluginClient {
             offer_hold,
             register_deadline: REGISTER_DEADLINE,
             unbind_deadline: DEFAULT_DEADLINE,
-            churning: Arc::new(Mutex::new(HashMap::new())),
             next_request: AtomicU64::new(1),
             descriptor,
             reader_task,
@@ -755,7 +761,7 @@ impl PluginClient {
         executable: &str,
         component: &ComponentSource,
     ) -> ServiceResult<Registration> {
-        let registering = Registering::begin(&self.churning, &self.sink, binding_id.get());
+        let registering = Registering::begin(&self.pending.churning, &self.sink, binding_id.get());
         let body = self
             .request_settling(
                 RequestBody::RegisterBinding(Box::new(BindingRegistration {
@@ -870,6 +876,18 @@ impl PluginClient {
     #[must_use]
     pub fn held_notice_bytes(&self) -> u64 {
         self.sink.held_bytes()
+    }
+
+    /// Returns how many identifiers this client holds a record of registrations and removals for,
+    /// for the tests of a crate that drives this client: a client whose connection has ended holds
+    /// none.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn identifiers_in_flight_or_live(&self) -> usize {
+        self.pending
+            .churning
+            .lock()
+            .map_or(0, |churning| churning.len())
     }
 
     /// Takes the connection's writer, as a task in the middle of writing a frame holds it, and
@@ -1041,7 +1059,7 @@ impl PluginClient {
     /// Returns [`ServiceError::Protocol`] for the host's refusal, which is an answer and not a
     /// failure to get one, and [`ServiceError::Unavailable`] when the host is gone.
     pub async fn unbind(&self, binding_id: BindingId) -> ServiceResult<bool> {
-        let removing = Removing::begin(&self.churning, &self.sink, binding_id.get());
+        let removing = Removing::begin(&self.pending.churning, &self.sink, binding_id.get());
         let body = self
             .request_settling(
                 RequestBody::Unbind {

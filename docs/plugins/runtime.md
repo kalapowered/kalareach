@@ -248,7 +248,9 @@ identifier as live or another registration of it is still waiting for its answer
 registration as live from the host's answer that it was registered, and counts none at the answer
 to a removal that no registration overlapped, whatever that answer says, because the host holds
 none then. After a removal that one overlapped it can count more than the host holds, which keeps
-the queue until the next removal that nothing overlapped.
+the queue until the next removal that nothing overlapped. When the connection ends the client drops
+this account with its waiting requests: it refuses every request from then on and cannot be
+connected again.
 
 A binding also holds a bounded number of unanswered calls. A caller whose deadline ran out has
 stopped waiting, but its request is still on the binding's thread until that thread reaches it, and

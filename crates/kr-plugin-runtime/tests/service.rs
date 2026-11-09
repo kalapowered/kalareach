@@ -3607,6 +3607,58 @@ async fn a_hold_that_two_calls_reach_lets_both_of_them_go_when_it_is_released() 
     }
 }
 
+// A client whose connection has ended holds no record of the registrations it had made. What it
+// knows of an identifier is there to act on the answers the host brings, and none will come: the
+// client refuses every request from then on and cannot be connected again, so a record kept for
+// each registration it had counted as live would stay for as long as the client does.
+//
+// The host here is a program of the case's own: it answers one registration and ends the
+// connection when the case says so. The record is there while the connection stands, as a control.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_whose_connection_ended_holds_no_record_of_the_registrations_it_had_made() {
+    let request = components::request("well-behaved", 1);
+    let component = ComponentSource {
+        path: "unused".to_owned(),
+        digest: PayloadDigest::of(b"unused"),
+        bytes: 0,
+    };
+    let (end_sender, end) = tokio::sync::oneshot::channel::<()>();
+    let (client, serving) = scripted_host(move |mut reader, mut writer| async move {
+        let registration: kr_plugin_service::protocol::Request = reader
+            .read_message_without_schema()
+            .await
+            .expect("the registration");
+        writer
+            .write_message(&Frame::Response {
+                reply_to: registration.request_id,
+                body: ResponseBody::Registered {
+                    origin: "compiled".to_owned(),
+                    elapsed_ms: 0,
+                },
+            })
+            .await
+            .expect("the answer is written");
+        end.await.expect("the case ends the connection");
+    })
+    .await;
+
+    register_on(&client, &request, &component).await;
+    assert_eq!(
+        client.identifiers_in_flight_or_live(),
+        1,
+        "the client kept no account of the registration the host answered"
+    );
+    end_sender.send(()).expect("the host program is waiting");
+    serving.await.expect("the host program ended");
+    tokio::time::timeout(HANG_GUARD, async {
+        while client.identifiers_in_flight_or_live() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the client kept its account of a registration after its connection ended");
+}
+
 // A registration is the connection's from the moment the request is read, and not from the moment
 // its component has been read and compiled. An unbind that comes in between is about it: it is
 // answered as an unbind of a binding that exists, and the registration is refused when it gets
