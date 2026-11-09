@@ -223,6 +223,30 @@ impl PrivateTempDir {
 /// How long the removal of a [`PrivateTempDir`] is tried again while it is refused.
 const REMOVAL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// Removes `root` and what is in it. Where `again` is set, a removal that is refused is tried again,
+/// for no longer than `patience`, and `refused` is called with each refusal that another try
+/// follows; the refusal that is left at the end is returned. A directory that is not there is
+/// removed.
+fn remove_tree(
+    root: &Path,
+    again: bool,
+    patience: std::time::Duration,
+    mut refused: impl FnMut(&std::io::Error),
+) -> std::io::Result<()> {
+    let begun = std::time::Instant::now();
+    loop {
+        match std::fs::remove_dir_all(root) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if again && begun.elapsed() < patience => {
+                refused(&error);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 impl Drop for PrivateTempDir {
     /// Removes the directory and what is in it.
     ///
@@ -240,23 +264,13 @@ impl Drop for PrivateTempDir {
         use std::io::Write as _;
 
         let begun = std::time::Instant::now();
-        loop {
-            match std::fs::remove_dir_all(&self.root) {
-                Ok(()) => return,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-                Err(_) if cfg!(windows) && begun.elapsed() < REMOVAL_PATIENCE => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(error) => {
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "{} is not removed {:?} after its removal was first tried: {error}",
-                        self.root.display(),
-                        begun.elapsed()
-                    );
-                    return;
-                }
-            }
+        if let Err(error) = remove_tree(&self.root, cfg!(windows), REMOVAL_PATIENCE, |_| {}) {
+            let _ = writeln!(
+                std::io::stderr(),
+                "{} is not removed {:?} after its removal was first tried: {error}",
+                self.root.display(),
+                begun.elapsed()
+            );
         }
     }
 }
@@ -620,35 +634,63 @@ mod tests {
     }
 
     /// A directory whose removal is refused is removed again, and goes once the file that refused it
-    /// is let go of: a file held open without sharing, as a task that is ending holds one. The
-    /// holder lets go when the removal has reached it, which is when the files that precede it in
-    /// the folder are gone, so that nothing here waits for a time.
+    /// is let go of: a file held open without sharing, as a task that is ending holds one. The file
+    /// is let go of after the first refusal, so that nothing here waits for a time.
     #[cfg(windows)]
     #[test]
     fn a_directory_whose_removal_is_refused_is_removed_when_the_file_is_let_go_of() {
         use std::os::windows::fs::OpenOptionsExt as _;
 
         let place = PrivateTempDir::create();
-        let root = place.path().to_path_buf();
-        let before = root.join("a-file-that-precedes-it");
-        std::fs::write(&before, b"removed first").expect("a file that is removed without trouble");
+        let root = place.path().join("tree");
+        std::fs::create_dir(&root).expect("a tree");
+        let mut held = Some(
+            std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .share_mode(0)
+                .open(root.join("store.db"))
+                .expect("a file held open without sharing"),
+        );
+        let mut refusals = 0_u32;
+
+        let outcome = super::remove_tree(&root, true, Duration::from_secs(60), |_| {
+            refusals += 1;
+            drop(held.take());
+        });
+
+        assert!(outcome.is_ok(), "the tree is removed: {outcome:?}");
+        assert!(
+            refusals >= 1,
+            "the first removal was refused, which is what the case is about"
+        );
+        assert!(!root.exists(), "{} is left", root.display());
+    }
+
+    /// A removal that is not to be tried again returns the refusal it met and leaves the tree: where
+    /// a refusal is a permission, time does not change it.
+    #[cfg(windows)]
+    #[test]
+    fn a_removal_that_is_not_to_be_tried_again_returns_its_refusal() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let place = PrivateTempDir::create();
+        let root = place.path().join("tree");
+        std::fs::create_dir(&root).expect("a tree");
         let held = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
             .share_mode(0)
             .open(root.join("store.db"))
             .expect("a file held open without sharing");
-        let holder = std::thread::spawn(move || {
-            while before.exists() {
-                std::thread::yield_now();
-            }
-            drop(held);
+
+        let outcome = super::remove_tree(&root, false, Duration::from_secs(60), |_| {
+            panic!("a removal that is not tried again is never said to be")
         });
 
-        drop(place);
-
-        holder.join().expect("the holder ended");
-        assert!(!root.exists(), "{} is left", root.display());
+        assert!(outcome.is_err(), "the refusal is returned: {outcome:?}");
+        assert!(root.exists(), "the tree is where it was");
+        drop(held);
     }
 
     /// The address the tests name as unanswered refuses a connection. A machine that answers there
