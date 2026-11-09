@@ -519,7 +519,7 @@ impl Run {
         let value = self
             .candidate_value(client, invited.invitation_id)
             .await
-            .expect("the phone redeemed the invitation");
+            .expect("the phone redeemed no invitation before the wait ended or the run finished");
         self.say(answers.value, &format!("{value}\n"));
         assert!(
             appears(&self.directory.join(answers.approve), STEP).await,
@@ -564,8 +564,8 @@ impl Run {
 
     /// The owner of the second host chooses a bounded offline validity for personal remote access,
     /// with no synchronisation of its authority feed to measure from, so the bound has lapsed as it is
-    /// chosen and no clock is waited on. From then on the host refuses every read of a device that
-    /// reaches it.
+    /// chosen and no clock is waited on. What the run shows of the host after that is its answers to
+    /// the three requests of one control guest.
     ///
     /// The choice is made once the host is serving a connection of the phone: its visit of the inbox
     /// opened one, which may not have read yet. That count is all the host keeps of the phone: it
@@ -840,7 +840,9 @@ impl Run {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        panic!("the host's inbox never held the four kinds: {rules:?}");
+        panic!(
+            "the host's inbox did not hold the four kinds before the wait ended or the run finished: {rules:?}"
+        );
     }
 
     /// The daemon ends, as the host being switched off does, and keeps what it would start from.
@@ -882,7 +884,10 @@ impl Run {
             if read.is_ok() {
                 break;
             }
-            assert!(self.waiting(end), "the daemon never reached the worker");
+            assert!(
+                self.waiting(end),
+                "the daemon did not reach the worker before the wait ended or the run finished"
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         *self.host.write().await = Some(host);
@@ -919,7 +924,7 @@ impl Run {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        panic!("the agent was never sent the draft");
+        panic!("the agent was not sent the draft before the wait ended or the run finished");
     }
 
     /// A session an owner device gave to a second device is to be handed to a third: the host asks
@@ -989,7 +994,7 @@ impl Run {
         let value = self
             .candidate_value(client, invited.invitation_id)
             .await
-            .expect("the second device redeemed the invitation");
+            .expect("the second device had no candidate before the wait ended or the run finished");
         let challenge = calls::request(
             self.environment,
             client,
