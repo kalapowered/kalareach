@@ -31,11 +31,13 @@ import XCTest
 
 final class PairingTests: DeviceTestCase {
     private var directory: String { ProcessInfo.processInfo.environment["KR_PAIRING_DIR"] ?? "" }
-    private let shots = "/tmp/kr-pair-phone"
+    /// Where the screenshots go: the script's own folder for them, which it makes for its account alone.
+    private var shots: String { ProcessInfo.processInfo.environment["KR_PAIRING_SHOTS"] ?? "" }
 
     override func setUp() {
         super.setUp()
         XCTAssertFalse(directory.isEmpty, "KR_PAIRING_DIR names no directory")
+        XCTAssertFalse(shots.isEmpty, "KR_PAIRING_SHOTS names no directory")
         try? FileManager.default.createDirectory(atPath: shots, withIntermediateDirectories: true)
     }
 

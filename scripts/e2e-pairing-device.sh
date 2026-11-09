@@ -520,7 +520,8 @@ run_ios() {
 
     say "driving the application"
     local out="$artefacts/xcodebuild.log" status=0
-    TEST_RUNNER_KR_PAIRING_DIR="$harness" TEST_RUNNER_KR_PAIRING_MARKER="$run_marker" xcodebuild test-without-building -xctestrun "$plan" \
+    TEST_RUNNER_KR_PAIRING_DIR="$harness" TEST_RUNNER_KR_PAIRING_SHOTS="$shots" TEST_RUNNER_KR_PAIRING_MARKER="$run_marker" \
+        xcodebuild test-without-building -xctestrun "$plan" \
         -destination "platform=iOS Simulator,id=$udid" -only-testing:KalaReachUITests/PairingTests \
         >"$out" 2>&1 || status=$?
     grep -E "Test Case .* (passed|failed)|error:|XCTAssert|PAIRING" "$out" | sed 's/^/    /' | tee -a "$log"
