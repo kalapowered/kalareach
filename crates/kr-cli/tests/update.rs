@@ -70,7 +70,8 @@ fn a_copy_that_is_not_the_packed_archive_says_which_of_the_two_differs() {
         matches!(
             held_to(&packed, digest, &copy),
             Err(Unequal::Copy {
-                first_difference: 2_000_000
+                first_difference: 2_000_000,
+                ..
             })
         ),
         "{:?}",
