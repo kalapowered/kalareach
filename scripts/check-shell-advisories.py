@@ -208,31 +208,53 @@ def in_range(range_text, version):
     return True
 
 
+SPAN_END = re.compile(r"\s*[0-9][0-9A-Za-z.+\-]*\s*")
+
+
+def span_readings(text, fold=False):
+    """The ways `text` is a span `a-b` of two versions, as (first, last) pairs of version keys, one
+    for each hyphen that has the start of a version on both sides. Either end may be a pre-release,
+    and a pre-release carries hyphens of its own, so `7.6.0-7.7.0-preview.3` is the span from 7.6.0 to
+    7.7.0-preview.3 and `7.6.0-rc.1-7.7.0` the span from 7.6.0-rc.1 to 7.7.0. A hyphen followed by
+    a word is part of a pre-release and divides nothing. An empty list when no hyphen divides the
+    text so, and None when one does and an end is no version (`2.0.0-2.4.x`), which is a range that
+    cannot be read."""
+    readings = []
+    for cut in re.finditer("-", text):
+        left, right = text[: cut.start()], text[cut.end():]
+        if SPAN_END.fullmatch(left) and SPAN_END.fullmatch(right):
+            first, last = version_key(left, fold), version_key(right, fold)
+            if first is None or last is None:
+                return None
+            readings.append((first, last))
+    return readings
+
+
 def range_intervals(range_text, fold=False):
     """The versions a range covers, as half-open intervals of version keys: `low` is inside, `high`
     is not, and None is no bound. Comparators separated by a comma all hold, alternatives separated
-    by `||` are each their own interval, and `a-b` is the span from a to b. Versions are ordered as
-    `version_key` orders them, with the same `fold`. None when the range cannot be read in full."""
+    by `||` are each their own interval, and `a-b` is the span from a to b, either end a version
+    with or without a pre-release (`span_readings`). Versions are ordered as `version_key` orders
+    them, with the same `fold`. None when the range cannot be read in full."""
     intervals = []
     for alternative in range_text.split("||"):
         low, high = None, None
-        span = re.match(r"\s*([0-9][0-9A-Za-z.+]*)\s*-\s*([0-9][0-9A-Za-z.+]*)\s*$", alternative)
-        if span:
+        spans = span_readings(alternative, fold)
+        if spans is None:
+            return None
+        if spans:
             # `7.7.0-0` is a span from 7.7.0 to 0 and also the version 7.7.0 with the pre-release
             # `0`. A span whose end is below its start covers nothing, so the text is the version;
             # where a text reads both ways it counts both ways, because the safe mistake is a row
-            # too many. A text whose ends are not both versions (`2.0.0-2.4.x`) cannot be read.
-            first = version_key(span.group(1), fold)
-            last = version_key(span.group(2), fold)
-            if first is None or last is None:
-                return None
+            # too many.
             point = version_key(alternative, fold)
-            if first <= last:
-                intervals.append((first, after(last)))
-            elif point is None:
-                return None
+            for first, last in spans:
+                if first <= last:
+                    intervals.append((first, after(last)))
             if point is not None:
                 intervals.append((point, after(point)))
+            elif not any(first <= last for first, last in spans):
+                return None
             continue
         for comparator in alternative.split(","):
             match = re.match(r"\s*(<=|>=|<|>|=)?\s*([0-9][0-9A-Za-z.\-+]*)\s*$", comparator)
@@ -1265,8 +1287,32 @@ def run_self_test():
             and not in_range("3.1.0-3.3.1", "4.9.3")
             and in_range("3.1.0-3.3.1", "3.2"),
         )
+        # A span of two versions is a span whichever end carries a pre-release: the hyphen that
+        # separates the ends is the one with a number on each side, and a pre-release's own hyphens
+        # stay in its end. `7.6.0-7.7.0-preview.3` runs from 7.6.0 to 7.7.0-preview.3. Read as the
+        # pre-release `7.7.0-preview.3` of 7.6.0, which sorts below 7.6.0 and so below every release
+        # the module accepts, it left a range that reaches the accepted releases with no triage row.
+        for text, covers in (
+            ("7.6.0-7.7.0-preview.3", True),
+            ("7.5.0-7.6.1-preview.1", True),
+            ("7.5.0-rc.1-7.6.1", True),
+            ("7.5.0-rc.1-7.6.1-preview.1", True),
+            ("7.5.0-7.6.1", True),
+            ("7.0.0-7.5.0-preview.1", False),
+        ):
+            expect(
+                "the span %s %s the releases accepted" % (text, "reaches" if covers else "misses"),
+                reaches(text, accepted_powershell) == covers,
+            )
         powershell_route = "/repos/PowerShell/PowerShell/security-advisories"
         for text, revised, needs, name in (
+            ("7.6.0-7.7.0-preview.3", "2026-10-20T10:00:00Z", True, "a revised range that is a span from a release to a pre-release"),
+            ("7.5.0-rc.1-7.6.7", "2026-10-20T10:00:00Z", True, "a revised range that is a span from a pre-release to a release"),
+            ("7.5.0-rc.1-7.6.1-preview.1", "2026-10-20T10:00:00Z", True, "a revised range that is a span between two pre-releases"),
+            ("7.5.0-7.5.11", "2026-10-20T10:00:00Z", True, "a revised range that is a span of two releases and ends at a fixed release"),
+            ("7.5.0-7.5.11-preview.1", "2026-10-20T10:00:00Z", False, "a revised span that ends at a pre-release of the fixed release, which the module refuses"),
+            ("7.5.0-7.5.10-preview.1", "2026-10-20T10:00:00Z", False, "a revised span that covers only releases of a series the module refuses"),
+            ("7.0.0-7.3.5-preview.1", "2026-10-20T10:00:00Z", False, "a revised span that ends below what the module loads on"),
             (">= 7.6.7, < 7.6.9", "2026-10-20T10:00:00Z", True, "a revised range that starts inside a series"),
             ("< 7.6.8 || >= 7.0.0, < 7.2.1", "2026-10-20T10:00:00Z", True, "a revised range with an alternative"),
             (">= 7.4.0, < 7.4.15", "2026-10-20T10:00:00Z", False, "a revised range of releases the module refuses"),
@@ -1311,6 +1357,9 @@ def run_self_test():
             ("= 3.0.0-beta1", False, "a revised range of a pre-release of the version the range stops before"),
             (">= 2.3.5-beta1, < 2.3.5", True, "a revised range of previews that ends at a version the module accepts"),
             ("2.0.0-2.4.x", True, "a revised range with an end that is no version"),
+            ("2.3.0-2.3.5-beta1", True, "a revised span from a release to a pre-release that reaches the qualified editor"),
+            ("2.0.0-beta1-2.3.5", True, "a revised span from a pre-release to a release that reaches the qualified editor"),
+            ("2.0.0-2.3.3-beta1", False, "a revised span from a release to a pre-release that ends below the qualified editor"),
         ):
             table[reader_route] = json.dumps(old_advisory("GHSA-old2-aaaa-bbbb", text, "2026-10-20T10:00:00Z")([])).encode()
             outcome = attempt(table, now="2026-11-10")
