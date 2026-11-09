@@ -547,18 +547,28 @@ impl Drop for Probe {
     }
 }
 
-/// What a console is read through when its last lines are on their way as the command ends: a read
-/// that carries `held` is not handed on until `gate` is set, or until the test has let go of it.
+/// What a console is read through when its last lines are on their way as the command ends: the read
+/// that completes `held`, whether it arrives whole in one read or in pieces over several, is not
+/// handed on until `gate` is set, or until the test has let go of it. What came before it is handed
+/// on, so that nothing the console asks for is held back, and the whole of `held` is never in what
+/// the reader has been given while the gate is shut.
 struct HeldBack {
     inner: Box<dyn Read + Send>,
     held: &'static str,
     gate: Arc<AtomicBool>,
+    /// The end of what the reads gave, as long as `held` less one byte: the part of it a later read
+    /// can complete.
+    tail: Vec<u8>,
 }
 
 impl Read for HeldBack {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         let read = self.inner.read(buffer)?;
-        let carries = String::from_utf8_lossy(&buffer[..read]).contains(self.held);
+        let mut joined = std::mem::take(&mut self.tail);
+        joined.extend_from_slice(&buffer[..read]);
+        let held = self.held.as_bytes();
+        let carries = joined.windows(held.len()).any(|window| window == held);
+        self.tail = joined[joined.len().saturating_sub(held.len() - 1)..].to_vec();
         while carries && !self.gate.load(Ordering::SeqCst) && Arc::strong_count(&self.gate) > 1 {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -572,7 +582,9 @@ impl Read for HeldBack {
 ///
 /// `cmd.exe` writes a marker, which the console's reader holds back until the command has been seen
 /// to end. The marker is spelled in the command line so that the line does not hold it. The wait
-/// must then find it.
+/// takes its first look at the console with the marker held back and the command ended, which is
+/// where a wait that ended with the command fails, and only after that look is the marker let
+/// through; the wait must then find it.
 #[test]
 fn a_command_that_ends_is_waited_for_until_the_console_has_shown_what_it_wrote() {
     const MARKER: &str = "kr-last-words";
@@ -593,6 +605,7 @@ fn a_command_that_ends_is_waited_for_until_the_console_has_shown_what_it_wrote()
             inner: pty.master.try_clone_reader().expect("a reader"),
             held: MARKER,
             gate: Arc::clone(&gate),
+            tail: Vec::new(),
         }),
         Arc::clone(&writer),
     );
@@ -613,16 +626,22 @@ fn a_command_that_ends_is_waited_for_until_the_console_has_shown_what_it_wrote()
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(
-        !output.text().contains(MARKER),
-        "the command's last words are held back until it has ended: {:?}",
-        output.text()
-    );
-    gate.store(true, Ordering::SeqCst);
-
+    let first_look = std::cell::Cell::new(true);
     output.waits_until(
         "what the command wrote",
-        |text| text.matches(MARKER).count(),
+        |text| {
+            // The first look is taken with the command ended and the marker held back; the marker is
+            // let through once that look has been counted.
+            let found = text.matches(MARKER).count();
+            if first_look.replace(false) {
+                assert_eq!(
+                    found, 0,
+                    "the command's last words are held back until the wait has looked once: {text:?}"
+                );
+                gate.store(true, Ordering::SeqCst);
+            }
+            found
+        },
         1,
         started,
         || standing_of("the command", &mut child),
