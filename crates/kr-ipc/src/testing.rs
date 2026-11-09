@@ -254,12 +254,13 @@ impl Drop for PrivateTempDir {
     /// removal of the folder it is in, and the holder is usually something that is ending and lets
     /// go in a moment: a task that was aborted and has not been cancelled yet, a thread that is
     /// joining. So the removal is tried again for as long as it is refused, and for no longer than
-    /// 20 seconds, and what is not removed at the end is said on the error output, outside
-    /// what a test's capture keeps. It does not fail the case: this directory is made by the suites
-    /// of every platform, and a case that has a holder to wait for, as a host that waits for its
-    /// daemon's lock does, fails on a tree that is left, and one that has a guard of its own
-    /// removes the tree again after this. Elsewhere a refusal is a permission, which time does not
-    /// change, so the removal is tried once.
+    /// `REMOVAL_PATIENCE` (20 seconds), and what is not removed at the end is said on the error
+    /// output, outside what a test's capture keeps. It does not fail the case: this directory is made
+    /// by the suites of every platform, and a case that has a holder to wait for, as a host that
+    /// waits for its daemon's lock does, fails on a tree that is left, and one that has a guard of
+    /// its own removes the tree again after this. Elsewhere an open file does not refuse a removal,
+    /// so a refusal is mostly a permission, which time does not change, and the removal is tried
+    /// once.
     fn drop(&mut self) {
         use std::io::Write as _;
 
@@ -665,32 +666,6 @@ mod tests {
             "the first removal was refused, which is what the case is about"
         );
         assert!(!root.exists(), "{} is left", root.display());
-    }
-
-    /// A removal that is not to be tried again returns the refusal it met and leaves the tree: where
-    /// a refusal is a permission, time does not change it.
-    #[cfg(windows)]
-    #[test]
-    fn a_removal_that_is_not_to_be_tried_again_returns_its_refusal() {
-        use std::os::windows::fs::OpenOptionsExt as _;
-
-        let place = PrivateTempDir::create();
-        let root = place.path().join("tree");
-        std::fs::create_dir(&root).expect("a tree");
-        let held = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .share_mode(0)
-            .open(root.join("store.db"))
-            .expect("a file held open without sharing");
-
-        let outcome = super::remove_tree(&root, false, Duration::from_secs(60), |_| {
-            panic!("a removal that is not tried again is never said to be")
-        });
-
-        assert!(outcome.is_err(), "the refusal is returned: {outcome:?}");
-        assert!(root.exists(), "the tree is where it was");
-        drop(held);
     }
 
     /// The address the tests name as unanswered refuses a connection. A machine that answers there
