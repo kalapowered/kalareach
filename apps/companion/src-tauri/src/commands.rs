@@ -360,10 +360,16 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
         ],
     ),
     // A phone hands its host the credential its installation was issued, and says it holds the
-    // key the host seals previews to. The page names a host and nothing else.
+    // key the host seals previews to. The page names a host and nothing else. A registration whose
+    // outcome is not known is read before another is made, so these two read the host's record of
+    // it as well.
     (
         "push_enable",
-        &[Method::DevicePushRegister, Method::DevicePreviewKeyUpdate],
+        &[
+            Method::DevicePushRegister,
+            Method::DevicePreviewKeyUpdate,
+            Method::ActionRead,
+        ],
     ),
     (
         "push_previews",
@@ -371,7 +377,11 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
     ),
     (
         "push_refresh",
-        &[Method::DevicePushRegister, Method::DevicePreviewKeyUpdate],
+        &[
+            Method::DevicePushRegister,
+            Method::DevicePreviewKeyUpdate,
+            Method::ActionRead,
+        ],
     ),
     ("owner_confirmations", &[Method::OwnerConfirmationPending]),
     // Settings sync keeps drafts in step host by host and shares the settings' key between the
