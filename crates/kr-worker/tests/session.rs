@@ -2018,28 +2018,35 @@ async fn a_root_shell_that_exits_after_the_session_settles_is_noticed_by_its_own
 async fn a_job_that_ends_before_the_session_does_is_still_in_its_record() {
     // What the observation cadence is for. A closure signals what is still running, so a job that
     // started and finished while the session was live is in the record only because the host had
-    // already seen it, and what makes the host look is the session's own traffic. The shell names
-    // the job and says when it has collected it, so the closure happens after the job is certainly
-    // gone rather than after a guess at how long it would take. It writes a line part way through
-    // as well: a subscriber that hears nothing for long enough stops listening, and the session
-    // this test wants is one that is running something rather than one that has gone quiet.
+    // already seen it, and what makes the host look is the session's own traffic.
+    //
+    // The job is held at a gate until the worker's record of the session names it, so that it is
+    // certainly seen alive however long the host takes to look; a job that ended on a timer could
+    // end unseen on a loaded machine. The shell names the job and then writes a line every moment it
+    // waits, which is the traffic the cadence is made of and keeps the session from going quiet. The
+    // gate is opened once the record names the job, the shell collects the job and says so, and
+    // the closure happens after the job is certainly gone.
     let host = kr_ipc::testing::TempHost::create();
     // The process a record names is the operating system's own identifier. Where the shell's `$!`
     // is a number of its own runtime's, which is so on Windows, the job's own identifier is read
     // from the runtime's table of processes.
     let job_identifier = if cfg!(windows) {
-        "$(cat /proc/$!/winpid)"
+        "$(cat /proc/$job/winpid)"
     } else {
-        "$!"
+        "$job"
     };
-    let config = configuration(
+    let mut config = configuration(
         &host,
         &format!(
-            "sleep 4 & printf 'kr-job %s\\n' \"{job_identifier}\"; sleep 2; \
-             printf 'kr-waiting\\n'; wait; printf 'kr-reaped\\n'; exec cat"
+            "( while [ ! -e kr-go ]; do sleep 0.2; done ) & job=$!; \
+             printf 'kr-job %s\\n' \"{job_identifier}\"; \
+             while [ ! -e kr-go ]; do printf 'kr-waiting\\n'; sleep 0.2; done; \
+             wait $job; printf 'kr-reaped\\n'; exec cat"
         ),
     );
+    config.shell.cwd = host.root().to_string_lossy().into_owned();
     let session_id = config.session_id;
+    let journal = config.journal_path.clone().expect("a journal of its own");
     let mut session = Session::open(config).expect("opens");
     session.launch().expect("launches");
     let attachment_id = AttachmentId::new(kr_ipc::new_uuid());
@@ -2057,13 +2064,29 @@ async fn a_job_that_ends_before_the_session_does_is_still_in_its_record() {
         .expect("starts"),
     );
 
-    let seen = collect(&mut stream, b"kr-reaped").await;
-    let job = marked_number(&seen, b"kr-job ").unwrap_or_else(|| {
+    let named = collect(&mut stream, b"kr-waiting").await;
+    let job = marked_number(&named, b"kr-job ").unwrap_or_else(|| {
         panic!(
             "the shell names the job it started: {}",
-            String::from_utf8_lossy(&seen)
+            String::from_utf8_lossy(&named)
         )
     });
+    let identity = u32::try_from(job)
+        .ok()
+        .and_then(|pid| kr_ipc::identity::process_start_identity(pid).ok())
+        .expect("the job is running, held at its gate");
+    until("the worker's record to name the job", || {
+        kr_worker::journal::Journal::open_read_only(&journal)
+            .ok()?
+            .read_owned(session_id)
+            .ok()??
+            .processes
+            .contains(&identity)
+            .then_some(())
+    })
+    .await;
+    std::fs::write(host.root().join("kr-go"), b"").expect("opens the gate");
+    let seen = collect(&mut stream, b"kr-reaped").await;
     assert!(
         seen.windows(9).any(|window| window == b"kr-reaped"),
         "the shell collected the job before this closes the session: {}",
