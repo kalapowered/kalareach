@@ -4367,6 +4367,19 @@ mod tests {
         .expect("the earlier shape encodes")
     }
 
+    /// A directory for a case that writes and reads the policy's copy, whose access list is its
+    /// owner's alone.
+    ///
+    /// The copy is read back only from a file whose access list names its owner and the accounts
+    /// that already hold the machine, and a file takes its list from the directory it is made in. A
+    /// `tempfile` directory inherits the list of the temporary directory it is under, so on a machine
+    /// whose temporary directory carries an entry for another account the copy is refused, the
+    /// registry's row is read as the policy whatever the copy says, and the cases below that are
+    /// about the copy no longer test it.
+    fn owner_only_directory() -> kr_ipc::testing::PrivateTempDir {
+        kr_ipc::testing::PrivateTempDir::create()
+    }
+
     fn raw_policy(path: &Path) -> Option<Vec<u8>> {
         Connection::open(path)
             .expect("the store opens")
@@ -4448,7 +4461,7 @@ mod tests {
     /// whatever the older row held, and the next write rises past it.
     #[test]
     fn a_registry_put_back_to_an_earlier_state_cannot_bring_an_older_policy_back() {
-        let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let directory = owner_only_directory();
         let path = directory.path().join("registry.db");
         let (earlier, later) = later_policy();
         let store = GrantDirectory::open(&path).expect("the store is created");
@@ -4483,7 +4496,7 @@ mod tests {
     /// earlier release wrote to without raising the sequence is.
     #[test]
     fn a_row_the_copy_has_not_caught_up_with_or_an_earlier_release_wrote_is_the_policy() {
-        let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let directory = owner_only_directory();
         let path = directory.path().join("registry.db");
         let (earlier, later) = later_policy();
         let store = GrantDirectory::open(&path).expect("the store is created");
@@ -4514,7 +4527,7 @@ mod tests {
     /// write replaces the copy.
     #[test]
     fn a_copy_that_cannot_be_read_leaves_the_registrys_row_the_policy() {
-        let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let directory = owner_only_directory();
         let path = directory.path().join("registry.db");
         let (_, later) = later_policy();
         let store = GrantDirectory::open(&path).expect("the store is created");
