@@ -75,7 +75,7 @@ import {
   type Submission
 } from '../../model/receipts'
 import type { Supersession } from '../../model/receipt-reads'
-import { readBeforeQuoting, useReceiptReads } from '../../app/receipts'
+import { draftMark, readBeforeQuoting, useReceiptReads } from '../../app/receipts'
 import { renderMarkdown } from '../../markdown/render'
 import type { TerminalGrid, TerminalRoom, TerminalScreen, TerminalWheel } from '../../host/port'
 import { leftBlankOnPhone, stretchesOf, styleOf } from '../../terminal/cells'
@@ -880,16 +880,12 @@ export function MobileSession({
   // nothing is sent: the person has not seen what it came to. A second press while the read is
   // under way is ignored.
   const reading = useRef(false)
-  // The draft as it stands now, which the press compares with the draft it was made on.
-  const draftNow = useRef(draft)
-  useEffect(() => {
-    draftNow.current = draft
-  })
   const sendAnyway = useCallback(() => {
     if (reading.current) return
     reading.current = true
     const text = draft.text
-    const pressedOn = draft.revision
+    // The window's draft, which the press is compared with after the read.
+    const pressedOn = draftMark(book.draft(sessionId))
     // The screen's opening at the press: the read and the send are made under it, or not at all.
     const opening = openings.tokenOf(sessionId)
     void readBeforeQuoting({
@@ -907,12 +903,12 @@ export function MobileSession({
           return
         }
         if (!openings.isCurrent(sessionId, opening)) {
-          say('This screen was opened again while the earlier prompt was read. Nothing was sent.', 'danger')
+          say('This session was left or opened again while the earlier prompt was read. Nothing was sent.', 'danger')
           return
         }
         // What the person typed while the record was read is not what the press was made on: it
         // stays where it is, and the next press sends it.
-        if (draftNow.current.revision !== pressedOn) {
+        if (draftMark(book.draft(sessionId)) !== pressedOn) {
           say('The message changed while the earlier prompt was read. Nothing was sent.', 'danger')
           return
         }
@@ -921,7 +917,7 @@ export function MobileSession({
       .finally(() => {
         reading.current = false
       })
-  }, [port, receiptReads, sessionId, openings, mine, draft, settleFromRecord, say, send])
+  }, [port, receiptReads, sessionId, openings, mine, draft, book, settleFromRecord, say, send])
   // The connection's words for contact lost. A session whose own link is being taken up again, with
   // the connection to the host still up, says the same, in the same words, and, as the connection's
   // do, nothing before the shell has answered whether the host is in contact.

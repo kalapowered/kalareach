@@ -120,7 +120,7 @@ import {
   type Submission
 } from '../model/receipts'
 import { useBook, useSessionDraft } from '../app/drafts'
-import { readBeforeQuoting, useReceiptReads } from '../app/receipts'
+import { draftMark, readBeforeQuoting, useReceiptReads } from '../app/receipts'
 import { ApprovalRequests } from './Approvals'
 import { KeptAnswers, QuestionRequests } from './Questions'
 
@@ -539,15 +539,12 @@ export function Conversation({
   // and nothing is sent: the person has not seen what it came to. A second press while the read is
   // under way is ignored.
   const reading = useRef(false)
-  // The draft as it stands now, which the press compares with the draft it was made on.
-  const draftNow = useRef(draft)
-  useEffect(() => {
-    draftNow.current = draft
-  })
   const sendAnyway = useCallback(() => {
     if (reading.current) return
     reading.current = true
-    const pressedOn = draft.revision
+    // The window's draft, which a view opened again during the read still shows: it is what the
+    // press is compared with after the read.
+    const pressedOn = draftMark(book.draft(sessionId))
     void readBeforeQuoting({
       port,
       receiptReads,
@@ -564,7 +561,7 @@ export function Conversation({
         }
         // What the person typed while the record was read is not what the press was made on: it
         // stays where it is, and the next press sends it.
-        if (draftNow.current.revision !== pressedOn) {
+        if (draftMark(book.draft(sessionId)) !== pressedOn) {
           say('The message changed while the earlier prompt was read. Nothing was sent.', 'danger')
           return
         }
@@ -573,7 +570,7 @@ export function Conversation({
       .finally(() => {
         reading.current = false
       })
-  }, [port, receiptReads, sessionId, state.submissions, presented.target, draft, settleFromRecord, say, send])
+  }, [port, receiptReads, sessionId, state.submissions, presented.target, book, settleFromRecord, say, send])
 
   /**
    * A dropped or pasted file goes through the transfer service, and the handle it publishes is kept

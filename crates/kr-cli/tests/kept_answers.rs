@@ -2713,7 +2713,7 @@ async fn a_close_of_unknown_outcome_is_sent_again_only_by_the_persons_later_requ
         "it ends again, naming the new action and the request that names it: {shown}"
     );
 
-    // With no live worker there is no earlier close to name.
+    // Where no descriptor is found, the command cannot read an earlier close from a worker.
     std::fs::remove_file(&host.descriptor).expect("the descriptor goes");
     let output = host.kr(&["close", "1", "--after-unknown", &second.to_string()]);
     assert_eq!(output.status.code(), Some(2));

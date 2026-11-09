@@ -2336,9 +2336,10 @@ fn parse_environment(named: Option<&str>) -> Result<Option<EnvironmentId>> {
 /// What `kr close` says when its close ended with an outcome nobody established: the session whose
 /// worker keeps the receipt, and the environment it was found in, or the one the command was given.
 ///
-/// `worker_holds` says that a live worker holds the close, so the person's later request is
-/// `kr close <session> --after-unknown <action>`. A close sent for a session with no live worker has
-/// none: nothing there holds an earlier close for the flag to name.
+/// `worker_holds` says that the command found the session's worker by its descriptor, so the
+/// person's later request is `kr close <session> --after-unknown <action>`. A close sent for a
+/// session whose descriptor was not found names none: the command cannot read an earlier close from
+/// a worker it did not find.
 fn close_unknown(
     session: Shown,
     environment: Option<EnvironmentId>,

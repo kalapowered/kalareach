@@ -595,7 +595,7 @@ describe('on the desktop', () => {
       expect(quotes[1]).toBeUndefined()
     })
 
-    it('reads the earlier record again at once when the host refuses the quote, so the next press quotes what it says now', async () => {
+    it('quotes what the record says now on the next press after the host refused the quote', async () => {
       const refused = Object.assign(new Error('the earlier result has not been shown'), {
         code: 'DRAFT_CONFLICT',
         message: 'the earlier result has not been shown',
@@ -622,18 +622,13 @@ describe('on the desktop', () => {
         { timeout: 3_000 }
       )
       await flush()
-      const before = reads.length
       await person.click(await screen.findByTestId('composer-send-anyway'))
       await waitFor(() => {
         expect(screen.getByTestId('composer-input')).toHaveValue('run the migration')
       })
       expect(quotes[1]).toEqual({ action_id: ACTION, revision: '3' })
-      // The refusal is the host's word that the record is not what was shown, and the page reads it
-      // again at once, besides the read the press made: before anything is pressed again, the record
-      // has been read twice since the first press.
-      await waitFor(() => {
-        expect(reads.length).toBeGreaterThanOrEqual(before + 2)
-      })
+      // The refusal is the host's word that the record is not what was shown: the next press quotes
+      // the revision the record has now.
       await person.click(await screen.findByTestId('composer-send-anyway'))
       await waitFor(() => {
         expect(quotes).toHaveLength(3)
@@ -777,6 +772,37 @@ describe('on the desktop', () => {
         await person.click(await screen.findByTestId('composer-send-anyway'))
         await person.type(screen.getByTestId('composer-input'), ' and more')
         release()
+        await flush()
+        expect(sent).toHaveLength(1)
+        expect(screen.getByTestId('composer-input')).toHaveValue('run the migration and more')
+      })
+
+      it('sends nothing, and keeps what was typed, when the conversation was opened again and edited during the read', async () => {
+        const recorded: Recorded = {
+          state: 'unknown',
+          revision: '3',
+          byAction: { [ANOTHER_ACTION]: 'dispatching' }
+        }
+        const reads: string[] = []
+        const sent: unknown[] = []
+        const { person } = await sentOnce(answers, recorded, reads, sent)
+        await waitFor(
+          () => {
+            expect(reads).toContain(ACTION)
+          },
+          { timeout: 3_000 }
+        )
+        await flush()
+        let letGo: () => void = () => undefined
+        recorded.hold = new Promise<void>((resolve) => {
+          letGo = resolve
+        })
+        await person.click(await screen.findByTestId('composer-send-anyway'))
+        // The person leaves the conversation and comes back to it, and writes more in the new view.
+        await person.click(screen.getByRole('tab', { name: 'Output' }))
+        await person.click(await screen.findByRole('tab', { name: 'Conversation' }))
+        await person.type(await screen.findByTestId('composer-input'), ' and more')
+        letGo()
         await flush()
         expect(sent).toHaveLength(1)
         expect(screen.getByTestId('composer-input')).toHaveValue('run the migration and more')

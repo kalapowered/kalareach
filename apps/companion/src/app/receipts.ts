@@ -17,6 +17,7 @@ import { useEffect, useRef } from 'react'
 import type { Receipt } from '@kalareach/protocol'
 
 import type { HostPort } from '../host/port'
+import type { Draft } from '../model/drafts'
 import {
   supersessionFor,
   type Conversation,
@@ -183,4 +184,14 @@ export async function readBeforeQuoting({
     return { kind: 'settled', localId: earlier.localId, receipt }
   }
   return { kind: 'quote', quote: null }
+}
+
+/**
+ * What a prompt sent from a draft depends on, as one text: the revision, which moves with every edit
+ * of the text, and the files on the draft, which do not move it. A press that reads the earlier
+ * record before it sends takes this at the press and again after the read, and sends nothing when
+ * the two differ: what the person changed meanwhile is theirs, and the next press sends it.
+ */
+export function draftMark(draft: Draft): string {
+  return `${String(draft.revision)}|${draft.attachments.map((each) => each.localId).join(',')}`
 }
