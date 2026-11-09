@@ -315,8 +315,28 @@ impl World {
         report.changed_at_ms.get()
     }
 
+    /// The same daemon after a restart, with a call a device starts over it: the worker is the one
+    /// the first daemon adopted, still holding what it held.
+    async fn restarted(self) -> Self {
+        let Self { adopted, voice, .. } = self;
+        drop(voice);
+        Self::start_over(adopted.restart().await).await
+    }
+
     async fn stop(self) {
         self.adopted.stop().await;
+    }
+}
+
+/// Waits until the host's clock reads later than `moment`.
+async fn until_the_clock_passes(moment: u64) {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    while kr_ipc::now_ms().get() <= moment {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the clock never passed {moment}"
+        );
+        tokio::task::yield_now().await;
     }
 }
 
@@ -811,6 +831,79 @@ async fn nothing_produced_before_privacy_mode_last_changed_is_carried_after_it()
         withheld(&result, kr_controller::voice::BEFORE_PRIVACY_CHANGE),
         Some(2),
         "the entry and the decision from before are counted: {result:?}"
+    );
+    world.stop().await;
+}
+
+/// KR-REQ-15.20 and KR-REQ-24.27: after a restart over a host that has changed privacy mode, the
+/// context carries only what is produced after the daemon's start. The record keeps the moment the
+/// last change was asked for, so what the worker produced between that moment and the start is
+/// kept out and counted with the boundary's reason, whatever the worker still holds, and what it
+/// produces after the start is carried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_keeps_out_what_came_before_the_start_and_carries_what_comes_after() {
+    let world = World::start().await;
+    let agent = world.agent();
+    world.worker().ask("before");
+
+    world.adopted.set_privacy(true).await;
+    world.adopted.set_privacy(false).await;
+    let changed = world.privacy_changed_at().await;
+
+    // What the worker holds after the change and before the restart: an entry stamped before the
+    // change, which a worker that kept its history would still hold, and an entry and a decision
+    // stamped after it. The restart comes later than all of them.
+    world.said(agent, "kept from before the change", changed - 1);
+    world.said(agent, "after the change", changed + 1);
+    world.worker().ask_at("between", changed + 1);
+    until_the_clock_passes(changed + 1).await;
+
+    let world = world.restarted().await;
+    assert_eq!(
+        world.privacy_changed_at().await,
+        changed,
+        "the record keeps the moment the change was asked for, and a restart reads it back as it is"
+    );
+    let before_the_start = world.context().await;
+    assert!(
+        before_the_start.selection.recent_messages.is_empty()
+            && before_the_start.selection.pending_decisions.is_empty(),
+        "{before_the_start:?}"
+    );
+    assert_eq!(
+        withheld(
+            &before_the_start,
+            kr_controller::voice::BEFORE_PRIVACY_CHANGE
+        ),
+        Some(4),
+        "the two entries and the two decisions from before the start are counted: {before_the_start:?}"
+    );
+
+    let later = kr_ipc::now_ms().get() + 5;
+    world.said(agent, "after the start", later);
+    world.worker().ask_at("later", later);
+    let after_the_start = world.context().await;
+    assert_eq!(
+        after_the_start.selection.recent_messages,
+        vec!["message: after the start".to_owned()],
+        "{after_the_start:?}"
+    );
+    assert_eq!(
+        after_the_start.selection.pending_decisions.len(),
+        1,
+        "{after_the_start:?}"
+    );
+    assert!(
+        after_the_start.selection.pending_decisions[0].contains("(later)"),
+        "{after_the_start:?}"
+    );
+    assert_eq!(
+        withheld(
+            &after_the_start,
+            kr_controller::voice::BEFORE_PRIVACY_CHANGE
+        ),
+        Some(4),
+        "what came before the start stays counted: {after_the_start:?}"
     );
     world.stop().await;
 }
