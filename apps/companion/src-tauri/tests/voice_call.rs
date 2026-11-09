@@ -754,11 +754,14 @@ async fn the_call_is_given_the_hosts_default_context_as_its_opening_context_and_
     scene.stop_host().await;
 }
 
-/// Whether a call's warning is the note that the voice service had no such call for the account.
-/// A scene whose call is made over a session the host does not run is also warned that the host
-/// gave it no context, which is not what the scenes that look for this note are about.
-fn no_such_call_note(warning: Option<&str>) -> bool {
-    warning.is_some_and(|warning| warning.contains("no such call"))
+/// What a call made over a session the host does not run is warned of: the host gave it no
+/// context. The scenes that look for another warning, or for none, are not about it.
+const NO_CONTEXT_FROM_THE_HOST: &str =
+    "This call was not given all of the host's context for its session: the host did not give it.";
+
+/// Whether a call has no warning but the one every call over a session the host does not run has.
+fn no_warning_but_the_missing_context(warning: Option<&str>) -> bool {
+    warning.is_none_or(|warning| warning == NO_CONTEXT_FROM_THE_HOST)
 }
 
 /// The `thinking` requests the voice service's control took, in the order it took them.
@@ -924,7 +927,7 @@ async fn a_token_of_another_account_ends_the_call_and_a_warning_stands_before_th
         .state_where("a control that attached", |state| {
             state["running"] == true
                 && state["control"] == "connected"
-                && !no_such_call_note(state["warning"].as_str())
+                && no_warning_but_the_missing_context(state["warning"].as_str())
         })
         .await;
     scene.stop_host().await;
@@ -4672,7 +4675,7 @@ async fn a_record_the_system_refused_to_read_is_taken_up_in_order_with_what_this
         Some(this_call.as_str())
     );
     assert!(
-        !no_such_call_note(locked.warning.as_deref()),
+        no_warning_but_the_missing_context(locked.warning.as_deref()),
         "the file's note is not read yet"
     );
 
@@ -4689,7 +4692,7 @@ async fn a_record_the_system_refused_to_read_is_taken_up_in_order_with_what_this
         "what the file held, then what this launch owes"
     );
     assert!(
-        !no_such_call_note(state.warning.as_deref()),
+        no_warning_but_the_missing_context(state.warning.as_deref()),
         "the control that attached since forgot the note the file held"
     );
     let file = kept_file_where(&directory, |file| {

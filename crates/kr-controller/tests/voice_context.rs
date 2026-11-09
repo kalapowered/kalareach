@@ -728,6 +728,12 @@ fn worker_half_reads(world: &World) -> usize {
 /// context carries none of it and the worker is asked for none; what was retained before is gone
 /// when it is turned off, what happened while it was on is not brought back, and what happens
 /// after is carried. The control is the same read before the change.
+///
+/// The clause about what happened while privacy mode was on shows neither mechanism alone: the
+/// entry is stamped before the moment privacy mode took effect, so the daemon's cutoff would keep
+/// it out, and the worker records none while it is on. The worker's is shown by
+/// `semantic_privacy.rs`, which reads the worker's own history across a cycle, and the cutoff's by
+/// `nothing_produced_before_privacy_mode_last_changed_is_carried_after_it`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_workers_half_follows_privacy_mode() {
     let world = World::start().await;
