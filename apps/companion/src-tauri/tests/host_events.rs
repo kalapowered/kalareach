@@ -145,6 +145,12 @@ mod window {
         // returns 0 whatever code the application exits with, so a failed check would pass.
         let verdict = Arc::new(AtomicI32::new(1));
         let recorded = Arc::clone(&verdict);
+        // The web view keeps its own data in a directory of the check's own, so that the check
+        // writes nothing in the home of the account that runs it, and runs that share a home share
+        // no web view data.
+        let data =
+            Arc::new(std::env::temp_dir().join(format!("kr-host-events-{}", kr_ipc::new_uuid())));
+        let data_for_check = Arc::clone(&data);
         let returned = app.run_return(move |handle, event| {
             if !matches!(event, tauri::RunEvent::Ready) {
                 return;
@@ -156,6 +162,7 @@ mod window {
             let handle = handle.clone();
             let runtime = Arc::clone(&runtime);
             let recorded = Arc::clone(&recorded);
+            let data = Arc::clone(&data_for_check);
             std::thread::spawn(move || {
                 // A call inside the check that never returns is a failed check, not one that waits
                 // for ever: the bound runs from here to the verdict, and the waits inside the check
@@ -174,7 +181,7 @@ mod window {
                 // A failed expectation inside the scripted worker panics this thread; it is a
                 // failed check like any other, and must not leave the window loop running.
                 let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    check(&handle, &runtime, worker)
+                    check(&handle, &runtime, worker, &data)
                 }))
                 .unwrap_or_else(|_| Err("the check panicked".to_owned()));
                 decided.store(true, Ordering::SeqCst);
@@ -202,6 +209,7 @@ mod window {
                 handle.exit(code);
             });
         });
+        let _ = std::fs::remove_dir_all(data.as_path());
         let panics = PANICS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -249,10 +257,11 @@ mod window {
         app: &AppHandle,
         runtime: &tokio::runtime::Runtime,
         mut worker: ScriptedWorker,
+        data_directory: &std::path::Path,
     ) -> Result<(), String> {
         let loads = Arc::new(AtomicUsize::new(0));
         let counting = Arc::clone(&loads);
-        let window =
+        let builder =
             WebviewWindowBuilder::new(app, INTERFACE_WINDOW, WebviewUrl::App("index.html".into()))
                 .title("opening")
                 .inner_size(320.0, 240.0)
@@ -260,9 +269,15 @@ mod window {
                     if payload.event() == tauri::webview::PageLoadEvent::Finished {
                         counting.fetch_add(1, Ordering::SeqCst);
                     }
-                })
-                .build()
-                .map_err(|error| error.to_string())?;
+                });
+        // Only the Linux web view is given a data directory of the check's own: it is the one this
+        // check runs under a virtual display, and the other platforms' web views keep theirs where
+        // their own checks have always run them.
+        #[cfg(target_os = "linux")]
+        let builder = builder.data_directory(data_directory.to_path_buf());
+        #[cfg(not(target_os = "linux"))]
+        let _ = data_directory;
+        let window = builder.build().map_err(|error| error.to_string())?;
         // The listener is registered through the event IPC before the page says so. A failed wait
         // says how far the page got, which tells a page that never loaded from one that loaded and
         // never said it listened.
