@@ -2154,6 +2154,14 @@ async fn a_host_that_is_lost_is_told_to_the_model_and_a_refusal_is_not_its_retur
         })
         .await;
     assert_eq!(instructions(&scene), 1, "told once what this version does");
+    // A call over a session the host does not run was not given its context: the call meets that
+    // problem before the host is lost.
+    let before = scene
+        .state_where("the missing context", |state| {
+            !problem_words(state, "opening_context").is_empty()
+        })
+        .await;
+    let missing = problem_words(&before, "opening_context");
 
     // The connection to the host ends.
     scene
@@ -2185,12 +2193,12 @@ async fn a_host_that_is_lost_is_told_to_the_model_and_a_refusal_is_not_its_retur
         })
         .await;
     assert_eq!(refused["host"], "lost", "a refusal is not a return");
-    // A call over a session the host does not run was not given its context. The host's refusal
-    // is another problem the call met, kept beside that one and not in its place.
+    // The host's refusal is another problem the call met, kept beside the missing context and not
+    // in its place.
     assert_eq!(
         problem_words(&refused, "opening_context"),
-        [NO_CONTEXT_FROM_THE_HOST],
-        "{refused}"
+        missing,
+        "the earlier problem stays as it was: {refused}"
     );
     assert_eq!(refused["running"], true, "the call went on");
     assert_eq!(
