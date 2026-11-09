@@ -2115,9 +2115,19 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
     .collect();
 
     // The controls: the scan finds a key in each form it looks for, wherever the key lies in a
-    // longer value, and reads what the kit file and the code hold.
+    // longer value, and reads what the kit file and the code hold. The bytes and the hexadecimal
+    // forms are made here and not by the scan's own list of forms, so a form dropped from that
+    // list fails here.
     let (_, probe) = &kept[0];
-    for (form, needle) in forms_of(probe) {
+    let lower: String = probe.iter().map(|byte| format!("{byte:02x}")).collect();
+    for (form, needle) in [
+        ("as bytes", probe.clone()),
+        ("in lower-case hexadecimal", lower.clone().into_bytes()),
+        (
+            "in upper-case hexadecimal",
+            lower.to_uppercase().into_bytes(),
+        ),
+    ] {
         let document = [b"{\"a\":\"".as_slice(), &needle, b"\"}"].concat();
         assert!(
             carried_in(&document, probe).is_some(),

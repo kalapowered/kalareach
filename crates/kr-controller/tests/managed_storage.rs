@@ -4294,7 +4294,17 @@ async fn a_generation_the_host_makes_holds_none_of_the_private_keys_the_host_kee
     // longer value, and reads an earlier object of a name another object has.
     let (_, probe) = &kept[0];
     let clean = (String::from("sessions/x.json"), b"{\"a\":1}".to_vec());
-    for (form, needle) in forms_of(probe) {
+    // The bytes and the hexadecimal forms are made here and not by the scan's own list of forms,
+    // so a form dropped from that list fails here.
+    let lower: String = probe.iter().map(|byte| format!("{byte:02x}")).collect();
+    for (form, needle) in [
+        ("as bytes", probe.clone()),
+        ("in lower-case hexadecimal", lower.clone().into_bytes()),
+        (
+            "in upper-case hexadecimal",
+            lower.to_uppercase().into_bytes(),
+        ),
+    ] {
         let document = [b"{\"a\":\"".as_slice(), &needle, b"\"}"].concat();
         assert_eq!(
             carried_keys(
