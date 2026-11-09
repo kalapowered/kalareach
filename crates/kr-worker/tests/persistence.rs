@@ -1174,6 +1174,100 @@ fn a_journal_takes_a_write_while_the_previous_holders_mapping_of_its_index_stand
     std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
 }
 
+/// A process that ends without closing its journal cleanly leaves what it committed in the
+/// journal's write-ahead log, which no checkpoint has moved into the journal's own file, and
+/// leaves the log's index behind. The next process opens the journal and reads every receipt from
+/// that log, while the previous holder's mapping of the index stands where a system keeps it
+/// beyond the holder's locks, and the journal is whole once the hold is let go of.
+///
+/// It runs on every platform. Where SQLite cannot truncate a mapped index it clears the index's
+/// first bytes and recovers the log from its frames, and a recovery that lost a committed frame
+/// fails the reads here. That path is met on Windows, where the held mapping is made by
+/// `held_index` and so is run by the landing workflow's windows job with the rest of this suite;
+/// elsewhere nothing maps an index without a lock, and the open takes the ordinary path: it finds
+/// a log with no live holder and recovers it.
+#[test]
+fn a_journal_reads_every_receipt_its_previous_holder_left_in_its_log_while_the_index_is_held() {
+    use rusqlite::config::DbConfig;
+
+    let path = journal_path("previous-holder-leaves-its-log");
+    let beside = |suffix: &str| {
+        let mut name = path.clone().into_os_string();
+        name.push(suffix);
+        std::path::PathBuf::from(name)
+    };
+    let (log, index) = (beside("-wal"), beside("-shm"));
+    let every_receipt = |journal: &Journal, when: &str| {
+        for action in 1..=3_u8 {
+            let receipt = journal
+                .read(actor(), kr_worker::journal::action_id_from([action; 16]))
+                .unwrap_or_else(|error| panic!("{when}: the receipt of action {action}: {error}"))
+                .unwrap_or_else(|| panic!("{when}: the receipt of action {action} is there"));
+            assert_eq!(
+                receipt.state,
+                ReceiptState::Accepted,
+                "{when}: action {action}"
+            );
+        }
+    };
+
+    // The previous holder takes three receipts while a second connection, which has read once,
+    // holds the store open, so that closing the journal checkpoints nothing. The second
+    // connection then closes without a checkpoint, as a process that was ended would leave it.
+    {
+        let mut journal = Journal::open(&path).expect("opens");
+        let holder = rusqlite::Connection::open(&path).expect("a second connection");
+        holder
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("reads once");
+        for action in 1..=3_u8 {
+            journal
+                .accept(&submission(action, action))
+                .expect("accepts");
+        }
+        drop(journal);
+        holder
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+            .expect("closes without a checkpoint");
+        drop(holder);
+    }
+    assert!(
+        std::fs::metadata(&log).expect("the log is left").len() > 32,
+        "the log holds the committed frames, past its 32-byte header"
+    );
+    assert!(index.exists(), "the previous holder's index is left");
+    // The journal's own file holds none of them: not even its tables, which were made in the log.
+    let file_alone = beside("-file-alone");
+    std::fs::copy(&path, &file_alone).expect("copies the journal's file alone");
+    let objects: i64 = rusqlite::Connection::open(&file_alone)
+        .expect("opens the copy")
+        .query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get(0))
+        .expect("reads the copy");
+    assert_eq!(objects, 0, "every row the journal holds is in its log");
+
+    #[cfg(windows)]
+    let held = held_index::HeldIndex::on(&index);
+    {
+        let next = Journal::open(&path).expect("the next holder opens at once");
+        every_receipt(&next, "the next holder");
+        let reader = Journal::open_read_only(&path).expect("a reader opens at once");
+        every_receipt(&reader, "a reader");
+    }
+    #[cfg(windows)]
+    drop(held);
+
+    let whole = Journal::open(&path).expect("opens once the hold is let go of");
+    every_receipt(&whole, "after the hold");
+    drop(whole);
+    let check: String =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("opens to check")
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("checks");
+    assert_eq!(check, "ok");
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
 // ---------------------------------------------------------------------------------------------
 // KR-REQ-24.30: forward-only migration, one current schema, an explicit importer
 // ---------------------------------------------------------------------------------------------
