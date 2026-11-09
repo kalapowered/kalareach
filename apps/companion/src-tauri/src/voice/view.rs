@@ -118,7 +118,9 @@ impl VoiceCallState {
 
     /// Notes a problem the call met. A problem of the same kind that still stands is the same
     /// problem, and says what is said of it now; one that is over, and every other kind, is kept
-    /// beside it.
+    /// beside it, and none is dropped for the sake of another: the record is the call's, and the
+    /// owner's probe of a host path that was lost is paced, so it grows by at most one problem in
+    /// each pause between probes.
     pub fn meet(&mut self, kind: ProblemKind, words: String) {
         if let Some(standing) = self
             .problems
@@ -127,11 +129,6 @@ impl VoiceCallState {
         {
             standing.words = words;
             return;
-        }
-        if self.problems.len() >= MAX_PROBLEMS
-            && let Some(oldest) = self.problems.iter().position(|each| each.over)
-        {
-            self.problems.remove(oldest);
         }
         self.problems.push(CallProblem {
             kind,
@@ -158,10 +155,6 @@ impl VoiceCallState {
         self.owed.push(owed);
     }
 }
-
-/// The most problems a call's record keeps that are over. A problem that stands is never dropped
-/// to make room.
-const MAX_PROBLEMS: usize = 16;
 
 /// What kind of problem a call met.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -442,6 +435,21 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// A call keeps every problem it met, however many: a host that refuses to vouch for the call and
+    /// answers again, over and over, leaves each refusal that passed in the record.
+    #[test]
+    fn a_call_keeps_every_problem_that_passed_however_many() {
+        let mut state = VoiceCallState::no_call();
+        for index in 0..40 {
+            state.meet(ProblemKind::HostPath, format!("would not vouch, {index}"));
+            state.pass(ProblemKind::HostPath);
+        }
+
+        assert_eq!(state.problems.len(), 40);
+        assert!(state.problems.iter().all(|each| each.over));
+        assert_eq!(state.problems[0].words, "would not vouch, 0");
     }
 
     /// A grant the host may still hold open is told to the person until it ends by itself, however
