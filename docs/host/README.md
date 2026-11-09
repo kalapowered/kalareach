@@ -7557,14 +7557,17 @@ caller whose window has closed, or whose daemon has restarted since, is still to
   identities derived from the actor and the action and are written in one commit in the same file
   as the claim, so an attempt that has ended either wrote the share, which is the answer, or wrote
   nothing, and a repeat is told with `DRAFT_CONFLICT` that nothing was shared under the action,
-  that it is not performed again and that a share under a new action shares again. A claim written
-  before a share's identities were scoped to the actor can sit beside a share under the earlier
-  identities, which this host cannot attribute to the actor, so a repeat that finds one is
-  `OUTCOME_UNKNOWN`. A repeat whose share cannot be looked for is `OUTCOME_UNKNOWN` too, and never
-  "nothing was shared". A share whose store failed while it was written, or whose result could not
-  be kept, is answered to a repeat as the share when its record finds one, and otherwise as not
-  known, until the host restarts, which reads the store as it stands. A revocation writes what it
-  withdrew beside its action's
+  that it is not performed again and that a share under a new action shares again. A `kr share`
+  command whose first reply was lost repeats its request and prints that refusal, and then, as it
+  does for any refusal of a repeat, that this "does not say that nothing was done", and it reads
+  the host's state until the bound of its attempt has passed before it counts the share as not
+  done: the host's words are the exact ones. A claim written before a share's identities were
+  scoped to the actor can sit beside a share under the earlier identities, which this host cannot
+  attribute to the actor, so a repeat that finds one is `OUTCOME_UNKNOWN`. A repeat whose share
+  cannot be looked for is `OUTCOME_UNKNOWN` too, and never "nothing was shared". A share whose
+  store failed while it was written, or whose result could not be kept, is answered to a repeat as
+  the share when its record finds one, and otherwise as not known, until the host restarts, which
+  reads the store as it stands. A revocation writes what it withdrew beside its action's
   claim, in the transaction that withdraws, and is answered from that once nothing is left for it
   to do: for a grant revocation, the grant it names stands revoked; for a device revocation, the
   device's own record stands revoked, its last write, and so does every grant the device holds.
@@ -7585,24 +7588,22 @@ it did, and the caller shares again only if it did nothing. The hold is the runn
 lasts as long as it does, kept in memory and not on disk. A share whose store failed while it was
 written, or whose result could not be kept, holds its subject until the host restarts, and its
 caller is told that what became of it is not known, not that the store was unavailable: its
-transaction may stand after a restart. A `kr share` command that is told this prints that what it
-read of the host "does not say that nothing was done" before the host's words; the host's words are
-the later and the more exact. This is not the rule of the worker above (a new action identifier
-cannot silently take an uncertain outcome's place, for every method a worker serves): the control
-daemon holds a share only in the two states named here.
+transaction may stand after a restart. This is not the rule of the worker above (a new action
+identifier cannot silently take an uncertain outcome's place, for every method a worker serves):
+the control daemon holds a share only in the two states named here.
 
-Nothing else holds a share. After the earlier share has ended, a share under a fresh action is
-admitted, also when the earlier one wrote its share, so a caller that never received the earlier
-answer (its reply was lost, a paired device's wait for the effect ended first and told it that the
-outcome was not known, or the host stopped between the share and the record of its result) and that
-asks again under a new action instead of the same one writes a second share of the same session to
-the same device. That is the limit of what this host enforces, for a share, of the rule that a
-replacement action after an uncertain result is rejected: it is rejected while the earlier share
-runs or is doubtful, and the person's later request that shows the earlier result is the client's.
-A client that does not replace an action by itself is what keeps that from happening: `kr` stops at
-an unknown outcome, and the companion's own attempt gate covers its own attempts. Reading what the
-earlier action did is a repeat of it, which carries the request: no read names a share's claim,
-since no record of one holds the method it was made under.
+Nothing else holds a share. After the earlier share has ended and is not doubtful, a share under a
+fresh action is admitted, also when the earlier one wrote its share, so a caller that never received
+the earlier answer (its reply was lost, a paired device's wait for the effect ended first and told
+it that the outcome was not known, or the host stopped between the share and the record of its
+result) and that asks again under a new action instead of the same one writes a second share of the
+same session to the same device. That is the limit of what this host enforces, for a share, of the
+rule that a replacement action after an uncertain result is rejected: it is rejected while the
+earlier share runs or is doubtful, and the person's later request that shows the earlier result is
+the client's. A client that does not replace an action by itself is what keeps that from happening:
+`kr` stops at an unknown outcome, and the companion's own attempt gate covers its own attempts.
+Reading what the earlier action did is a repeat of it, which carries the request: no read names a
+share's claim, since no record of one holds the method it was made under.
 
 No attempt takes over a claim, however long ago it was written: an attempt that is still running is
 not known to have stopped, and one that stopped may already have reached its effect. So a retry

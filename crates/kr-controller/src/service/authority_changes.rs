@@ -1548,8 +1548,7 @@ impl Controller {
             result => result?,
         };
         // The share is written, so a result that cannot be encoded is not a refusal of it: nothing
-        // is kept for it, a repeat finds what was written, and the subject stays held as it does
-        // for a result that cannot be kept.
+        // is kept for it, and the subject stays held as it does for a result that cannot be kept.
         encode(&shared).map_err(|error| {
             hold.doubt();
             ControllerError::Uncertain {
