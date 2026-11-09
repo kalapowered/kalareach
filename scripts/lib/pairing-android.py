@@ -826,19 +826,33 @@ def paired_host_used(phone: Phone, directory: Path) -> None:
         phone.run("shell", "locksettings", "clear", "--old", SCREEN_LOCK_PIN)
 
 
+# What a host's row says it refused, after the host's name: one title for each request of a visit
+# (the page's `refusalTitle`), and the one for a connection refused before any request.
+REFUSED_TITLES = (
+    "refused to say who it is",
+    "refused to open a session for this device",
+    "refused to show its inbox",
+    "did not take this device",
+)
+# The titles a host under a lapsed bound can have. It admits the connection and refuses the requests
+# alike, so its row names the request of the visit that met the refusal: who the host is over a new
+# connection, and the inbox over one that was open before the bound lapsed.
+LAPSED_TITLES = "refused to say who it is|refused to open a session for this device|refused to show its inbox"
+
+
 def a_host_that_refuses(phone: Phone, directory: Path, port: str) -> None:
-    """A second host, paired by the same scan as a guest, which then refuses the phone its inbox
-    (13.01): the inbox of the host in use says that host refused to show its inbox, in the host's own
-    words and without calling it lost, beside what the host in use holds. Nothing before the refusal
-    says it did, and the host chooses to refuse after. The host keeps only a count of the phone's
-    connections, no request of the phone's, so which request of the phone's it refused is not
-    recorded: the picture of the host's lapsed words on the phone's screen is the evidence of the
-    refusal. A device under a lapsed bound is still admitted, and the host refuses its requests alike:
-    who the host is and the opening of the connection (the first two a connection of the application
-    makes) as much as the inbox read. The application gives a refusal of any request of its visit as
-    the same row, with the host's words. So a control stands beside the screen: another guest of that
-    host, paired as the phone is, is served before the choice, and the host's answer to each of those
-    three requests after it is recorded."""
+    """A second host, paired by the same scan as a guest, which then refuses the phone its requests
+    (13.01): the inbox of the host in use says what that host refused (who it is, the opening of the
+    connection, or its inbox), in the host's own words and without calling it lost, beside what the
+    host in use holds. Nothing before the refusal says it did, and the host chooses to refuse after.
+    The host keeps only a count of the phone's connections, no request of the phone's, so which
+    request of the phone's it refused is not recorded: the row's title names it, and the picture of
+    the host's lapsed words on the phone's screen is the evidence of the refusal. A device under a
+    lapsed bound is still admitted, and the host refuses its requests alike: who the host is and the
+    opening of the connection (the first two a connection of the application makes) as much as the
+    inbox read. The application says which of them the host refused, with the host's words. So a
+    control stands beside the screen: another guest of that host, paired as the phone is, is served
+    before the choice, and the host's answer to each of those three requests after it is recorded."""
     # The picker case took the camera's permission away for good. A person who scans a second host
     # allows it again, in the system's settings.
     camera = "android.permission.CAMERA"
@@ -887,14 +901,16 @@ def a_host_that_refuses(phone: Phone, directory: Path, port: str) -> None:
         phone.give_up(f"the second host named no environment: {environment!r}")
     open_tab(phone, "Attention")
     phone.wait(lambda each: each.startswith("Waiting for you. ") and "An approval is waiting for you" in each, "the first host's rows", 120, nudging=True)
-    if phone.find(lambda each: "refused to show its inbox" in each) is not None:
+    if phone.find(lambda each: any(title in each for title in REFUSED_TITLES)) is not None:
         phone.give_up("the inbox says a host refused it before any host did")
     ask_host(directory, "bound", 180)
     # The row is one node whose text is its parts one after another with nothing between them: its
-    # kind, the host its head names, the title's name and the title's rest (" refused to show its
-    # inbox"), then the host's words. So the host's name stands twice, the second just before the rest
-    # of the title, and a title that names no host or another one does not match.
-    named = rf"environment {environment} on [a-z]+\s*environment {environment} on [a-z]+\s+refused to show its inbox"
+    # kind, the host its head names, the title's name and the title's rest (" refused to say who it
+    # is", " refused to open a session for this device" or " refused to show its inbox", whichever
+    # request of the visit met the refusal), then the host's words. So the host's name stands twice,
+    # the second just before the rest of the title, and a title that names no host or another one does
+    # not match.
+    named = rf"environment {environment} on [a-z]+\s*environment {environment} on [a-z]+\s+(?:{LAPSED_TITLES})"
     refusal = lambda each: re.search(named, each) is not None
     wait_after_touch(phone, refusal, "the inbox to say the second host refused it", 180, at=(0.5, 0.07))
     # Everything is judged on one reading of the screen, so that what it lacks is lacking from a screen

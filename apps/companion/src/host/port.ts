@@ -682,6 +682,13 @@ export interface NumberedSession {
   readonly display_number: string
 }
 
+/**
+ * What a visit asked of a host when the host refused it: the connection itself (the host would not
+ * take this device's connection, or this device could not give it the lease it needs), who the host
+ * is, the session the device's visit runs in, or the inbox.
+ */
+export type RefusedRequest = 'connection' | 'host_info' | 'session_open' | 'attention_read'
+
 /** What one visit to a paired host that is not the one in use found of its inbox. */
 export interface HostInbox {
   /** The host, by the reference the pairing screen lists it under. */
@@ -699,6 +706,8 @@ export interface HostInbox {
   readonly lost_since_ms: number | null
   /** What the host refused with, when it did: the shape of any host failure. */
   readonly refusal: HostError | null
+  /** What the visit asked when the host refused, when it did. */
+  readonly refused_request: RefusedRequest | null
   /** The host's inbox, when it was read. */
   readonly result: AttentionReadResult | null
   /** The host's sessions by number, when its inbox was read. */

@@ -337,16 +337,30 @@ final class PairingTests: DeviceTestCase {
         return found
     }
 
+    /// What a host's refusal row says it refused, after the host's name: one title for each request of
+    /// a visit (the page's `refusalTitle`). A host under a lapsed bound is admitted and refuses its
+    /// requests alike, so its row names the request of the visit that met the refusal: who the host is
+    /// over a new connection, and the inbox over one that was open before the bound lapsed.
+    static let lapsedTitles = [
+        "refused to say who it is",
+        "refused to open a session for this device",
+        "refused to show its inbox",
+    ]
+
+    /// Every title a refusal row can have: the requests' and the one for a connection refused before
+    /// any request. A row with none of these is no refusal.
+    static let refusalTitles = lapsedTitles + ["did not take this device"]
+
     /// The texts of the refusal whose own title says that the host named by `prefix` refused, or nil
     /// when `texts` hold none. The tree gives a row's texts one after another under one element: its
     /// kind, the host its head names, then the title, as one text or as the host's name and the rest of
-    /// it ("refused to show its inbox"), then the host's words. So the title's own name is the text
-    /// before the rest, the head's the one before that, and a title that names no host leaves the kind
-    /// where its name should be. What the row says is its head, its title and the one text after the
-    /// title, as long as they stand under the same element: not what some other row says.
+    /// it (one of `lapsedTitles`), then the host's words. So the title's own name is the text before
+    /// the rest, the head's the one before that, and a title that names no host leaves the kind where
+    /// its name should be. What the row says is its head, its title and the one text after the title,
+    /// as long as they stand under the same element: not what some other row says.
     static func refusalRow(_ prefix: String, in texts: [(label: String, parent: [Int])]) -> [String]? {
-        let rest = "refused to show its inbox"
-        for (at, text) in texts.enumerated() where text.label.hasSuffix(rest) {
+        for (at, text) in texts.enumerated() {
+            guard let rest = lapsedTitles.first(where: { text.label.hasSuffix($0) }) else { continue }
             var first: Int?
             if text.label.trimmingCharacters(in: .whitespaces) == rest {
                 if at > 1, texts[at - 1].parent == text.parent, texts[at - 2].parent == text.parent,
@@ -663,18 +677,19 @@ final class PairingTests: DeviceTestCase {
         say("PAIRING the hand-over is confirmed with Face ID and the session changes hands")
     }
 
-    /// A second host, paired by the same scan as a guest, which then refuses the phone its inbox
+    /// A second host, paired by the same scan as a guest, which then refuses the phone its requests
     /// (13.01). The host in use stays the first. Nothing before the refusal says it happened, and
-    /// the host chooses to refuse after. Then the inbox says that host refused to show it, in the
-    /// host's own words and not as lost contact, beside what the host in use holds. The host keeps
-    /// only a count of the phone's connections, no request of the phone's, so which request of the
-    /// phone's it refused is not recorded: the picture of the host's lapsed words on the phone's
-    /// screen is the evidence of the refusal. A device under a lapsed bound is still admitted, and the
-    /// host refuses its requests alike: who the host is and the opening of the connection (the first
-    /// two a connection of the application makes) as much as the inbox read. The application gives a
-    /// refusal of any request of its visit as the same row, with the host's words. So a control stands
-    /// beside the screen: another guest of that host, paired as the phone is, is served before the
-    /// choice, and the host's answer to each of those three requests after it is recorded.
+    /// the host chooses to refuse after. Then the inbox says what that host refused (who it is, the
+    /// opening of the connection, or its inbox), in the host's own words and not as lost contact,
+    /// beside what the host in use holds. The host keeps only a count of the phone's connections, no
+    /// request of the phone's, so which request of the phone's it refused is not recorded: the row's
+    /// title names it, and the picture of the host's lapsed words on the phone's screen is the
+    /// evidence of the refusal. A device under a lapsed bound is still admitted, and the host refuses
+    /// its requests alike: who the host is and the opening of the connection (the first two a
+    /// connection of the application makes) as much as the inbox read. The application says which of
+    /// them the host refused, with the host's words. So a control stands beside the screen: another
+    /// guest of that host, paired as the phone is, is served before the choice, and the host's answer
+    /// to each of those three requests after it is recorded.
     func testBASecondHostThatRefusesTheInboxIsToldApartFromOneOutOfContact() {
         openHosts()
         begin("second", picture: "second")
@@ -705,9 +720,9 @@ final class PairingTests: DeviceTestCase {
         XCTAssertNotNil(environment.range(of: "^[0-9a-f]{8}$", options: .regularExpression), "the second host named no environment: \(environment)")
         openAttention()
         eventually("the first host's rows", timeout: 120) { hasRow("Waiting for you", "An approval is waiting for you") }
-        XCTAssertFalse(shows("refused to show its inbox"), "the inbox says a host refused it before any host did")
+        XCTAssertFalse(Self.refusalTitles.contains { shows($0) }, "the inbox says a host refused it before any host did")
         askHost("bound", timeout: 180)
-        let refusal = app.staticTexts.matching(NSPredicate(format: "label ENDSWITH 'refused to show its inbox'")).firstMatch
+        let refusal = app.staticTexts.matching(NSPredicate(format: Self.lapsedTitles.map { "label ENDSWITH '\($0)'" }.joined(separator: " OR "))).firstMatch
         // What the refused row says, read from one snapshot of the tree in which its title names the second host.
         var row: [String] = []
         eventually("the inbox to say the second host refused it", timeout: 180) {
