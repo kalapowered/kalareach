@@ -1072,6 +1072,9 @@ struct LinkState {
     /// The method of the requests whose answer is lost: each is sent to the host, which acts on it,
     /// and the connection then fails for the caller as one that ended.
     losing_answer_to: Option<String>,
+    /// The method of the requests whose answer is replaced by a result nothing can read as that
+    /// method's result: the host answers, and the caller is handed something else.
+    garbling_answer_to: Option<String>,
     /// How many requests and mutations of each method were sent to a host, on any connection.
     sent: std::collections::BTreeMap<String, usize>,
     /// The action each mutation sent to a host was sent under, by method, in the order sent.
@@ -1202,6 +1205,14 @@ impl LinkControl {
     /// sent and the host acts on it, and the caller is told the connection ended. Or stops that.
     pub fn lose_the_answer_to(&self, method: Option<kr_protocol::method::Method>) {
         self.state.lock().expect("the record").losing_answer_to =
+            method.map(|method| method.as_str().to_owned());
+    }
+
+    /// Makes the answer to every request of `method`, on any connection to the host, a result that
+    /// is no result of that method: the host answers, and what the caller is handed cannot be read
+    /// as the method's result. Or stops that.
+    pub fn garble_the_answer_to(&self, method: Option<kr_protocol::method::Method>) {
+        self.state.lock().expect("the record").garbling_answer_to =
             method.map(|method| method.as_str().to_owned());
     }
 
@@ -1353,6 +1364,23 @@ impl LinkControl {
         state.losing_answer_to.as_deref() == Some(method)
     }
 
+    /// The request `frame` is, when its answer is to be garbled.
+    fn garbled_request(&self, frame: &ControlFrame) -> Option<kr_protocol::ids::RequestId> {
+        let method = method_of(frame)?;
+        let garbling = self
+            .state
+            .lock()
+            .expect("the record")
+            .garbling_answer_to
+            .as_deref()
+            == Some(method);
+        match frame {
+            ControlFrame::Request(request) if garbling => Some(request.request_id),
+            ControlFrame::Mutation(request) if garbling => Some(request.request_id),
+            _ => None,
+        }
+    }
+
     /// Holds `frame` before it is sent when it is the request the test asked to hold.
     async fn before_sending(&self, frame: &ControlFrame) {
         let method = match frame {
@@ -1467,6 +1495,7 @@ impl ControlledLink {
         Ok(Arc::new(Tapped {
             inner: transport,
             control: Arc::clone(&self.control),
+            garbled: Mutex::new(Vec::new()),
         }))
     }
 }
@@ -1486,6 +1515,9 @@ fn method_of(frame: &ControlFrame) -> Option<&str> {
 struct Tapped {
     inner: Arc<dyn kr_client::transport::ControlTransport>,
     control: Arc<LinkControl>,
+    /// The requests on this connection whose answers are garbled: request identifiers are counted
+    /// for the lifetime of one connection.
+    garbled: Mutex<Vec<kr_protocol::ids::RequestId>>,
 }
 
 impl std::fmt::Debug for LinkControl {
@@ -1531,6 +1563,9 @@ impl kr_client::transport::ControlTransport for Tapped {
                 return Err(kr_client::ClientError::Host(refusal));
             }
             let lost = self.control.sent_and_lost(frame);
+            if let Some(request) = self.control.garbled_request(frame) {
+                self.garbled.lock().expect("the record").push(request);
+            }
             self.inner.send(frame).await?;
             if lost {
                 // The host has the request and acts on it; the caller never hears.
@@ -1545,7 +1580,27 @@ impl kr_client::transport::ControlTransport for Tapped {
     }
 
     fn recv(&self) -> kr_client::transport::TransportFuture<'_, Option<ControlFrame>> {
-        self.inner.recv()
+        Box::pin(async move {
+            let frame = self.inner.recv().await?;
+            Ok(frame.map(|frame| match frame {
+                ControlFrame::Response(mut response)
+                    if self
+                        .garbled
+                        .lock()
+                        .expect("the record")
+                        .contains(&response.request_id) =>
+                {
+                    response.outcome = kr_protocol::envelope::Outcome::Ok(
+                        kr_protocol::envelope::ParamsValue::from_typed(
+                            &"not a result of the method",
+                        )
+                        .expect("a text encodes"),
+                    );
+                    ControlFrame::Response(response)
+                }
+                other => other,
+            }))
+        })
     }
 
     fn revoke_streams(&self) {
