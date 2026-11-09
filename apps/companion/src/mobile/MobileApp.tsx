@@ -145,7 +145,8 @@ export function MobileApp({
   // A look at where notifications stand each time the application is in front, whichever screen it
   // is on: a token the system changed is registered again, a try that stopped for the person is
   // tried again once they have had time to act, and a registration whose outcome nobody knows is
-  // read, never repeated: a new one is made when the person asks for it.
+  // asked about while the application that sent it runs, never repeated; after a restart it is left
+  // to the person, and a new one is made when they ask for it.
   useEffect(() => {
     void port.pushRefresh().catch(() => undefined)
   }, [port, lifecycle.resumed])
