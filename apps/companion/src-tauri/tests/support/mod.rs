@@ -1066,6 +1066,9 @@ struct LinkState {
     /// at once does.
     ending: bool,
     refusing: Option<kr_protocol::error::ErrorCode>,
+    /// The method of the requests the host refuses, on any connection to it, and its refusal: the
+    /// connection is admitted and every other request is answered.
+    refusing_request: Option<(String, kr_protocol::error::ProtocolError)>,
     /// Whether a connection to a host whose grant answers to an organisation is held the moment its
     /// lease has been presented, before anything else is done on it.
     holding_presented: bool,
@@ -1175,6 +1178,19 @@ impl LinkControl {
         self.state.lock().expect("the record").refusing = code;
     }
 
+    /// Makes the host refuse every request of `method`, on any connection to it, with `refusal`, or
+    /// stops that. The connection is admitted and the other requests are answered.
+    pub fn refuse_request(
+        &self,
+        refusal: Option<(
+            kr_protocol::method::Method,
+            kr_protocol::error::ProtocolError,
+        )>,
+    ) {
+        self.state.lock().expect("the record").refusing_request =
+            refusal.map(|(method, refusal)| (method.as_str().to_owned(), refusal));
+    }
+
     /// Holds each connection to a host whose grant answers to an organisation, from now on, the
     /// moment its lease has been presented and before anything else is done on it, until the test
     /// releases them.
@@ -1271,6 +1287,19 @@ impl LinkControl {
                 self.asked_if_ended()
             )
         });
+    }
+
+    /// What the host answers `frame` with when the test made it refuse that request.
+    fn refusal_of(&self, frame: &ControlFrame) -> Option<kr_protocol::error::ProtocolError> {
+        let ControlFrame::Request(request) = frame else {
+            return None;
+        };
+        let state = self.state.lock().expect("the record");
+        state
+            .refusing_request
+            .as_ref()
+            .filter(|(method, _)| method == request.method.as_str())
+            .map(|(_, refusal)| refusal.clone())
     }
 
     /// Holds `frame` before it is sent when it is the request the test asked to hold.
@@ -1438,6 +1467,9 @@ impl kr_client::transport::ControlTransport for Tapped {
     ) -> kr_client::transport::TransportFuture<'a, ()> {
         Box::pin(async move {
             self.control.before_sending(frame).await;
+            if let Some(refusal) = self.control.refusal_of(frame) {
+                return Err(kr_client::ClientError::Host(refusal));
+            }
             self.inner.send(frame).await
         })
     }

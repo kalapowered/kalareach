@@ -665,6 +665,77 @@ async fn a_host_that_refuses_the_visit_is_in_contact_and_listed_as_having_refuse
     second.stop().await;
 }
 
+/// KR-REQ-13.01: a host that refuses a visit is listed with the request it refused, which is what
+/// the page says it refused: that it would not say who it is, would not open the connection, would
+/// not show its inbox, or would not take this device's connection at all. Each carries the host's
+/// own words, whichever request the host refused, and a host that is read again lists none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visit_says_which_request_the_host_refused() {
+    use kr_controller::grants::Refusal;
+
+    let owner = DeviceKeys::generate().expect("keys");
+    let first = Host::start(&owner).await;
+    let second = Host::start(&owner).await;
+    let control = LinkControl::new();
+    let phone = unpaired_phone_controlled(&first, &control);
+    pair(&phone, &first, &owner, &[ActionRight::SessionView]).await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    pair(&phone, &second, &owner, &[ActionRight::SessionView]).await;
+    connection(companion, true).await;
+
+    let lapsed = Refusal::BehindItsFeed.to_protocol_error();
+    let visit = |what: &str| {
+        let visit = companion.call("inbox_hosts", json!({})).expect("a visit");
+        assert_eq!(visit.as_array().map(Vec::len), Some(1), "{what}: {visit}");
+        visit
+    };
+    // Each request, refused with the words a host under a lapsed bound gives all three. A refused
+    // visit keeps no connection, so each of the first three is made over a fresh one.
+    for (method, asked) in [
+        (Method::HostInfo, "host_info"),
+        (Method::SessionOpen, "session_open"),
+        (Method::AttentionRead, "attention_read"),
+    ] {
+        control.refuse_request(Some((method, lapsed.clone())));
+        let refused = visit(asked);
+        assert_eq!(refused[0]["state"], "refused", "{asked}: {refused}");
+        assert_eq!(refused[0]["refused_request"], asked, "{refused}");
+        assert!(
+            refused[0]["refusal"]["message"]
+                .as_str()
+                .is_some_and(|said| said.ends_with(lapsed.message.as_str())),
+            "{asked}: the host's own words: {refused}"
+        );
+        assert!(refused[0]["lost_since_ms"].is_null(), "{asked}: {refused}");
+    }
+
+    // The inbox refused over a connection the host answered on before is the inbox's refusal too.
+    control.refuse_request(None);
+    let read = visit("read");
+    assert_eq!(read[0]["state"], "read", "{read}");
+    assert!(read[0]["refused_request"].is_null(), "{read}");
+    control.refuse_request(Some((Method::AttentionRead, lapsed.clone())));
+    let kept = visit("kept");
+    assert_eq!(kept[0]["state"], "refused", "{kept}");
+    assert_eq!(kept[0]["refused_request"], "attention_read", "{kept}");
+
+    // A host that refuses the connection before any request is told apart from all of them.
+    control.refuse_request(None);
+    control.refuse(Some(kr_protocol::error::ErrorCode::PermissionDenied));
+    let connection_refused = visit("connection");
+    assert_eq!(connection_refused[0]["state"], "refused");
+    assert_eq!(connection_refused[0]["refused_request"], "connection");
+
+    control.refuse(None);
+    let read = visit("read again");
+    assert_eq!(read[0]["state"], "read", "{read}");
+    assert!(read[0]["refused_request"].is_null(), "{read}");
+
+    first.stop().await;
+    second.stop().await;
+}
+
 /// KR-REQ-13.01: a host the phone begins to use, or forgets, while it is being visited is no longer
 /// one of the other hosts: the visit's answer does not report it, whatever the visit found.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

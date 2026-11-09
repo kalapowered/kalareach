@@ -17,7 +17,7 @@ import type { AttentionItem, AttentionReadResult } from '@kalareach/protocol'
 
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, type FakeHostControls } from '../../src/host/fake'
-import type { HostError, HostInbox, HostRow } from '../../src/host/port'
+import type { HostError, HostInbox, HostRow, RefusedRequest } from '../../src/host/port'
 import { MobileApp } from '../../src/mobile/MobileApp'
 
 afterEach(() => {
@@ -82,6 +82,7 @@ function laptopRead(): HostInbox {
     read_at_ms: Date.now(),
     lost_since_ms: null,
     refusal: null,
+    refused_request: null,
     result: inboxOf([
       item({
         key: 'attention.pending_approval|~laptop-1',
@@ -108,13 +109,20 @@ function lostLaptop(sinceMs: number): HostInbox {
     read_at_ms: null,
     lost_since_ms: sinceMs,
     refusal: null,
+    refused_request: null,
     result: null,
     sessions: []
   }
 }
 
-/** What a visit finds of the laptop when it answers and refuses: the host is in contact. */
-function refusingLaptop(refusal: HostError): HostInbox {
+/**
+ * What a visit finds of the laptop when it answers and refuses: the host is in contact. The request
+ * it refused is the inbox's unless the case says another.
+ */
+function refusingLaptop(
+  refusal: HostError,
+  request: RefusedRequest = 'attention_read'
+): HostInbox {
   return {
     reference: LAPTOP.reference,
     name: 'laptop',
@@ -122,6 +130,7 @@ function refusingLaptop(refusal: HostError): HostInbox {
     read_at_ms: null,
     lost_since_ms: null,
     refusal,
+    refused_request: request,
     result: null,
     sessions: []
   }
@@ -225,6 +234,43 @@ describe('the inbox of a phone paired with two hosts', () => {
     // It hides what the host holds under every filter, so it is told under every filter.
     await userEvent.setup().click(screen.getByRole('button', { name: /^Waiting for you \(/ }))
     expect(screen.getByTestId('inbox-refusal')).toBeInTheDocument()
+  })
+
+  // A host under a lapsed bound refuses every request of a visit alike, so the words the host gives
+  // cannot say which request it was. The row says what was refused: the host's identity, the
+  // connection, the session or the inbox, and gives the host's words under it.
+  it('says which request the host refused, with the host’s own words', async () => {
+    const { controls } = start()
+    await waitFor(() => {
+      expect(rowsOf('laptop')).toHaveLength(2)
+    })
+    const lapsed: HostError = {
+      code: 'PERMISSION_DENIED',
+      message: 'this host’s bounded offline-validity policy has lapsed',
+      user_action: 'nothing',
+      retry: 'configuration_change'
+    }
+    const cases: readonly (readonly [RefusedRequest, string])[] = [
+      ['connection', 'laptop did not take this device’s connection'],
+      ['host_info', 'laptop refused to say who it is'],
+      ['session_open', 'laptop refused to open a session for this device'],
+      ['attention_read', 'laptop refused to show its inbox']
+    ]
+    for (const [request, title] of cases) {
+      controls.setInboxHosts([refusingLaptop(lapsed, request)])
+      readNow()
+      await waitFor(() => {
+        expect(screen.getByTestId('inbox-refusal')).toHaveAttribute('data-refused', request)
+      })
+      const refusal = screen.getByTestId('inbox-refusal')
+      expect(within(refusal).getByText(title), request).toBeInTheDocument()
+      // Only the refused request is named: no other title is on the row.
+      for (const [other, otherTitle] of cases) {
+        if (other !== request) expect(refusal, other).not.toHaveTextContent(otherTitle)
+      }
+      expect(refusal, request).toHaveTextContent('offline-validity policy has lapsed')
+      expect(refusal, request).toHaveTextContent('It answered, so contact is not lost')
+    }
   })
 
   it('stops drawing the refusal once the host shows its inbox again', async () => {

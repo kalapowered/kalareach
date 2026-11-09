@@ -5,7 +5,8 @@
  * is never enough: a word, a tone, and the sentence underneath. A host that cannot be reached is
  * drawn as exactly that, is never counted among the failures, and says in so many words that its
  * sessions may still be running. A host that answers and refuses is another thing: it is in contact,
- * it said no, and its row gives the host's words and what the person can do about them.
+ * it said no, and its row says which request of the visit it refused (who it is, the session, the
+ * connection or the inbox) and gives the host's words and what the person can do about them.
  *
  * The host in use is read with the page's own reads; every other host this phone is paired with is
  * visited by native code (`useOtherHosts`), and its rows are named by the host they are from. What
@@ -25,7 +26,13 @@ import type { AttentionReadResult } from '@kalareach/protocol'
 import { Banner, Button, Sheet } from '../../components/ui'
 import { readOnCadence } from '../../app/cadence'
 import { useApp } from '../../app/state'
-import { failureMessage, watch, type HostError, type Watch } from '../../host/port'
+import {
+  failureMessage,
+  watch,
+  type HostError,
+  type RefusedRequest,
+  type Watch
+} from '../../host/port'
 import {
   addCounts,
   ATTENTION_READ_CADENCE_MS,
@@ -38,6 +45,7 @@ import {
   order,
   orderAcrossHosts,
   readWholeInbox,
+  refusalTitle,
   refusalWords,
   type AttentionCounts,
   type AttentionFilter,
@@ -89,9 +97,11 @@ interface Contact {
   readonly rowsReadAtMs: number | null
 }
 
-/** A host that answered and refused to show its inbox, as the inbox draws it. */
+/** A host that answered and refused a request of the visit, as the inbox draws it. */
 interface Refusal {
   readonly host: HostTag
+  /** What the visit asked when the host refused. */
+  readonly request: RefusedRequest | null
   /** What the host refused with. */
   readonly refusal: HostError | null
 }
@@ -265,6 +275,7 @@ export function Inbox({
         .filter((visit) => visit.state === 'refused')
         .map((visit) => ({
           host: { reference: visit.reference, name: visit.name },
+          request: visit.refused_request,
           refusal: visit.refusal
         })),
     [others.hosts]
@@ -398,6 +409,7 @@ export function Inbox({
                 data-tone="muted"
                 data-kind="refused"
                 data-host={each.host.name}
+                data-refused={each.request ?? undefined}
                 data-testid="inbox-refusal"
                 style={{ minBlockSize: target }}
               >
@@ -405,7 +417,7 @@ export function Inbox({
                   <span className="m-row-kind">Refused</span>
                   <span className="m-row-where">{each.host.name}</span>
                 </span>
-                <span className="m-row-title">{each.host.name} refused to show its inbox</span>
+                <span className="m-row-title">{refusalTitle(each.host.name, each.request)}</span>
                 <span className="m-row-detail">{refusalWords(each.refusal)}</span>
               </div>
             </li>

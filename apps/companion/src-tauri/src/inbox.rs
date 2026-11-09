@@ -11,7 +11,10 @@
 //! in time, is out of contact: that says nothing of what its sessions are doing, and the answer
 //! carries only since when contact has been lost, which this device noted itself. A host that
 //! answers and refuses is in contact, and is not that: it is shown as having refused, with the
-//! refusal it sent, and no loss of contact is noted for it. So is a host of a member's device that
+//! request of the visit it refused (the connection, who it is, the opening of its session, or its
+//! inbox) and the refusal it sent, and no loss of contact is noted for it. A host that is out of
+//! its offline-validity bound refuses all of them alike, so the words it gives cannot say which.
+//! So is a host of a member's device that
 //! cannot be given the lease its organisation signs for it, because the device is signed out or is
 //! not a member: the refusal is the reason in words, and the host is asked nothing.
 //!
@@ -35,7 +38,7 @@ use kr_protocol::scalars::{Nullable, U64};
 use kr_protocol::session::{DisplayNumber, SessionListParams, SessionListResult};
 use serde::Serialize;
 
-use crate::connection::{Connection, Unopened};
+use crate::connection::{Asked, Connection, Unopened};
 use crate::device::Device;
 use crate::device::hosts::{UNNAMED_HOST, reference_of};
 use crate::error::CommandError;
@@ -87,6 +90,8 @@ pub struct HostInbox {
     pub lost_since_ms: Option<u64>,
     /// What the host refused with, when it answered and refused.
     pub refusal: Option<CommandError>,
+    /// What the visit asked when the host refused, when it did.
+    pub refused_request: Option<Asked>,
     /// The host's inbox, when it was read.
     pub result: Option<AttentionReadResult>,
     /// The host's sessions by number, when its inbox was read.
@@ -124,16 +129,16 @@ struct Found {
 enum Visited {
     /// The host answered with its inbox.
     Read(Read),
-    /// The host answered and refused.
-    Refused(CommandError),
+    /// The host answered and refused the request named.
+    Refused(Asked, CommandError),
     /// The host could not be reached or did not answer.
     Unreached,
 }
 
 /// Why a read of an inbox ended without it.
 enum Missed {
-    /// The host answered with an error.
-    Refused(CommandError),
+    /// The host answered the request named with an error.
+    Refused(Asked, CommandError),
     /// The host did not answer, or the answer was no reply to the question.
     Unreached,
 }
@@ -141,7 +146,7 @@ enum Missed {
 impl From<Unopened> for Missed {
     fn from(unopened: Unopened) -> Self {
         match unopened {
-            Unopened::Refused(refusal) => Self::Refused(refusal),
+            Unopened::Refused(asked, refusal) => Self::Refused(asked, refusal),
             Unopened::Unreached(_) => Self::Unreached,
         }
     }
@@ -150,7 +155,7 @@ impl From<Unopened> for Missed {
 impl From<Missed> for Visited {
     fn from(missed: Missed) -> Self {
         match missed {
-            Missed::Refused(refusal) => Self::Refused(refusal),
+            Missed::Refused(asked, refusal) => Self::Refused(asked, refusal),
             Missed::Unreached => Self::Unreached,
         }
     }
@@ -265,6 +270,7 @@ impl InboxDesk {
             read_at_ms: None,
             lost_since_ms: None,
             refusal: None,
+            refused_request: None,
             result: None,
             sessions: Vec::new(),
         };
@@ -298,13 +304,14 @@ impl InboxDesk {
                 found.result = Some(result);
                 found.sessions = sessions;
             }
-            Visited::Refused(refusal) => {
+            Visited::Refused(asked, refusal) => {
                 // The host answered, so contact is not lost, and the connection it refused is not
                 // kept: the next visit asks again from the start.
                 entry.connection = None;
                 entry.lost_since_ms = None;
                 found.state = HostInboxState::Refused;
                 found.refusal = Some(refusal);
+                found.refused_request = Some(asked);
             }
             Visited::Unreached => {
                 // The connection that failed, or that the bound cut short, is not kept.
@@ -351,9 +358,9 @@ async fn read_host(
         if connection.ended_by_this_device().is_none() {
             match read {
                 Ok((result, sessions)) => return Visited::Read((connection, result, sessions)),
-                Err(Missed::Refused(refusal)) => {
+                Err(Missed::Refused(asked, refusal)) => {
                     connection.session().close();
-                    return Visited::Refused(refusal);
+                    return Visited::Refused(asked, refusal);
                 }
                 Err(Missed::Unreached) => {}
             }
@@ -367,7 +374,7 @@ async fn read_host(
     let read = read_over(&connection).await;
     if let Some(refusal) = connection.ended_by_this_device() {
         connection.session().close();
-        return Visited::Refused(refusal);
+        return Visited::Refused(Asked::Connection, refusal);
     }
     match read {
         Ok((result, sessions)) => Visited::Read((connection, result, sessions)),
@@ -386,7 +393,7 @@ async fn read_kept(
 ) -> Result<(AttentionReadResult, Vec<NumberedSession>), Missed> {
     present(device, host, connection, Presentation::IfDue).await?;
     match read_over(connection).await {
-        Err(Missed::Refused(refusal)) if lease_is_refused(refusal.code, &refusal.message) => {
+        Err(Missed::Refused(_, refusal)) if lease_is_refused(refusal.code, &refusal.message) => {
             // The lease the host holds ended on its clock before this device's said it was due, or
             // the host lost it: it is presented again at once, whatever the lease is due.
             present(device, host, connection, Presentation::First).await?;
@@ -413,7 +420,7 @@ async fn present(
         .await
         .map_err(|error| match error {
             LinkError::Refused(refusal) | LinkError::Membership(refusal) => {
-                Missed::Refused(CommandError::from(refusal))
+                Missed::Refused(Asked::Connection, CommandError::from(refusal))
             }
             LinkError::Lost(_) | LinkError::Configuration(_) | LinkError::Selection(_) => {
                 Missed::Unreached
@@ -454,7 +461,7 @@ async fn read_over(
         // The host refused its session list: its answer, and the rows say "a session".
         Err(ClientError::Host(_)) => Vec::new(),
         // Anything else is the connection failing, and the inbox read beside it is not published.
-        Err(other) => return Err(Unopened::of_read(other).into()),
+        Err(other) => return Err(Unopened::lost(other).into()),
     };
     Ok((result, sessions))
 }
@@ -483,7 +490,7 @@ async fn pages(session: &kr_client::Session) -> Result<Option<AttentionReadResul
             Err(ClientError::Host(refusal)) if refusal.code == ErrorCode::DraftConflict => {
                 return Ok(None);
             }
-            Err(error) => return Err(Unopened::of_read(error).into()),
+            Err(error) => return Err(Unopened::of_read(Asked::AttentionRead, error).into()),
         };
         let more = page.more;
         let next = page.items.last().map(|item| item.key.clone());

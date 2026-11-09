@@ -215,9 +215,9 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns [`Unopened::Refused`] with the host's refusal when the host answered and refused at
-    /// any step, and [`Unopened::Unreached`] with why when it could not be reached or did not
-    /// answer.
+    /// Returns [`Unopened::Refused`] with the request the host refused and its refusal when the
+    /// host answered and refused at any step, and [`Unopened::Unreached`] with why when it could
+    /// not be reached or did not answer.
     pub async fn visited(
         device: &Arc<Device>,
         host: &PairedHost,
@@ -251,11 +251,15 @@ impl Connection {
             .await
             .map_err(|_| Unopened::unreached("the host did not answer in time"))?
             .map_err(|error| match error {
-                LinkError::Refused(refusal) => Unopened::Refused(CommandError::from(refusal)),
+                LinkError::Refused(refusal) => {
+                    Unopened::Refused(Asked::Connection, CommandError::from(refusal))
+                }
                 // The host was reachable and was not asked for anything: the device could not give
                 // it the lease it needs, or the account it was to be opened under left, and the
                 // words say why.
-                LinkError::Membership(refusal) => Unopened::Refused(CommandError::from(refusal)),
+                LinkError::Membership(refusal) => {
+                    Unopened::Refused(Asked::Connection, CommandError::from(refusal))
+                }
                 other => Unopened::unreached(other.said().into_string()),
             })?;
         // The connection is bound to the account signed in when it was dialled (`crate::bound`): if
@@ -271,7 +275,7 @@ impl Connection {
             )
             .await
             .map_err(|_| Unopened::unreached("the host did not say which environment it is"))?
-            .map_err(Unopened::of_read)?;
+            .map_err(|error| Unopened::of_read(Asked::HostInfo, error))?;
             let rights = open_for_the_host(&session).await?;
             Ok::<_, Unopened>((info, rights))
         }
@@ -281,7 +285,10 @@ impl Connection {
             (Ok(asked), None) => asked,
             (_, Some(refusal)) => {
                 session.close();
-                return Err(Unopened::Refused(CommandError::from(refusal)));
+                return Err(Unopened::Refused(
+                    Asked::Connection,
+                    CommandError::from(refusal),
+                ));
             }
             (Err(failed), None) => {
                 session.close();
@@ -334,15 +341,18 @@ fn opening_refused(refusal: kr_protocol::error::ProtocolError) -> Unopened {
     if refusal.code == ErrorCode::PermissionDenied
         && refusal.message == kr_transport::actor::METHOD_NOT_AVAILABLE
     {
-        return Unopened::Refused(CommandError::stated(
-            refusal.code,
-            format!(
-                "{} If the host is of an earlier build than this application, update it.",
-                refusal.message
+        return Unopened::Refused(
+            Asked::SessionOpen,
+            CommandError::stated(
+                refusal.code,
+                format!(
+                    "{} If the host is of an earlier build than this application, update it.",
+                    refusal.message
+                ),
             ),
-        ));
+        );
     }
-    Unopened::of_read(kr_client::ClientError::Host(refusal))
+    Unopened::of_read(Asked::SessionOpen, kr_client::ClientError::Host(refusal))
 }
 
 /// Opens a paired connection for the host alone, and returns the rights the host decided the open
@@ -368,24 +378,42 @@ async fn open_for_the_host(session: &Session) -> std::result::Result<Vec<ActionR
     .map_err(|_| Unopened::unreached("the host did not open the connection in time"))?
     .map_err(|error| match error {
         kr_client::ClientError::Host(refusal) => opening_refused(refusal),
-        other => Unopened::of_read(other),
+        other => Unopened::of_read(Asked::SessionOpen, other),
     })?;
     match opened {
         SessionOpenResult::InForce { actions, .. } => Ok(actions.iter().copied().collect()),
-        SessionOpenResult::Ended { .. } => Err(Unopened::Refused(CommandError::stated(
-            kr_protocol::error::ErrorCode::PermissionDenied,
-            "the host answered that this connection has ended",
-        ))),
+        SessionOpenResult::Ended { .. } => Err(Unopened::Refused(
+            Asked::SessionOpen,
+            CommandError::stated(
+                kr_protocol::error::ErrorCode::PermissionDenied,
+                "the host answered that this connection has ended",
+            ),
+        )),
     }
+}
+
+/// What a visit asked of a host when the host refused it, which is what the page says it refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Asked {
+    /// Nothing yet: the host refused the connection itself, or this device could not give the host
+    /// the lease its organisation signs for it, or the account the connection was opened under left.
+    Connection,
+    /// `host.info`: who the host is.
+    HostInfo,
+    /// `session.open`: the opening of the connection for the host alone.
+    SessionOpen,
+    /// `attention.read`: the host's inbox.
+    AttentionRead,
 }
 
 /// Why a connection to a paired host was not opened.
 #[derive(Debug)]
 pub enum Unopened {
-    /// The host answered, and refused: it is in contact, and the refusal is its own. Or this device
-    /// could not give the host the lease its organisation signs for it, which a host that holds
-    /// none refuses everything for, and the words are the reason.
-    Refused(CommandError),
+    /// The host answered, and refused the request named: it is in contact, and the refusal is its
+    /// own. Or this device could not give the host the lease its organisation signs for it, which a
+    /// host that holds none refuses everything for, and the words are the reason.
+    Refused(Asked, CommandError),
     /// The host could not be reached, did not answer in time, or failed in a way that is no
     /// refusal of the host's.
     Unreached(CommandError),
@@ -396,21 +424,27 @@ impl Unopened {
         Self::Unreached(CommandError::unavailable(reason))
     }
 
-    /// What a failed read says: a refusal when the host sent an error, and otherwise that the host
-    /// was not reached.
+    /// What a failed read of `asked` says: a refusal of that request when the host sent an error,
+    /// and otherwise that the host was not reached.
     #[must_use]
-    pub fn of_read(error: kr_client::ClientError) -> Self {
+    pub fn of_read(asked: Asked, error: kr_client::ClientError) -> Self {
         match error {
-            kr_client::ClientError::Host(_) => Self::Refused(CommandError::from(error)),
-            _ => Self::Unreached(CommandError::from(error)),
+            kr_client::ClientError::Host(_) => Self::Refused(asked, CommandError::from(error)),
+            other => Self::lost(other),
         }
+    }
+
+    /// A read that failed for a reason that is no answer of the host's: the host was not reached.
+    #[must_use]
+    pub fn lost(error: kr_client::ClientError) -> Self {
+        Self::Unreached(CommandError::from(error))
     }
 
     /// The failure, as a command that needed the connection answers with it.
     #[must_use]
     pub fn into_error(self) -> CommandError {
         match self {
-            Self::Refused(error) | Self::Unreached(error) => error,
+            Self::Refused(_, error) | Self::Unreached(error) => error,
         }
     }
 }
@@ -887,12 +921,17 @@ mod tests {
             ErrorCode::StorageUnavailable,
             "the host cannot read its store",
         ));
-        let Unopened::Refused(refusal) = Unopened::of_read(sent) else {
+        let Unopened::Refused(asked, refusal) = Unopened::of_read(Asked::AttentionRead, sent)
+        else {
             panic!("an error the host sent is its refusal");
         };
+        assert_eq!(asked, Asked::AttentionRead);
         assert_eq!(refusal.code, ErrorCode::StorageUnavailable);
         assert!(matches!(
-            Unopened::of_read(kr_client::ClientError::ConnectionEnded),
+            Unopened::of_read(
+                Asked::AttentionRead,
+                kr_client::ClientError::ConnectionEnded
+            ),
             Unopened::Unreached(_)
         ));
     }
@@ -908,7 +947,8 @@ mod tests {
 
         let hint = "If the host is of an earlier build than this application, update it.";
         let said = |refusal: ProtocolError| match opening_refused(refusal) {
-            Unopened::Refused(error) => error.message,
+            Unopened::Refused(Asked::SessionOpen, error) => error.message,
+            Unopened::Refused(asked, _) => panic!("the opening was refused, not {asked:?}"),
             Unopened::Unreached(_) => panic!("a refusal the host sent"),
         };
 

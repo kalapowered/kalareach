@@ -15,7 +15,7 @@
 
 import type { AttentionItem, AttentionReadResult } from '@kalareach/protocol'
 
-import { failureCode, failureMessage, type HostError } from '../host/port'
+import { failureCode, failureMessage, type HostError, type RefusedRequest } from '../host/port'
 
 /**
  * How long after one read of the inbox the next starts while it is shown.
@@ -265,7 +265,27 @@ export function contactWords(sinceMs: number | null, nowMs: number): string {
 }
 
 /**
- * What the inbox says of a host that answered and refused to show its inbox: the host's own words
+ * What the inbox says a host that answered and refused refused, as the row's title: the request of
+ * the visit it refused, so that a host that would not say who it is is not said to have refused its
+ * inbox. A refusal that names no request is said of the device.
+ */
+export function refusalTitle(host: string, request: RefusedRequest | null): string {
+  switch (request) {
+    case 'connection':
+      return `${host} did not take this device’s connection`
+    case 'host_info':
+      return `${host} refused to say who it is`
+    case 'session_open':
+      return `${host} refused to open a session for this device`
+    case 'attention_read':
+      return `${host} refused to show its inbox`
+    case null:
+      return `${host} refused this device`
+  }
+}
+
+/**
+ * What the inbox says of a host that answered and refused, under the title: the host's own words
  * and what the person can do, then that this is not lost contact and says nothing of its sessions.
  */
 export function refusalWords(refusal: HostError | null): string {
