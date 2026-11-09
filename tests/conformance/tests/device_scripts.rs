@@ -124,6 +124,17 @@ struct Run {
     status: Option<i32>,
     /// Every call to a stand-in, in order, one line each: the program, then its arguments.
     calls: Vec<String>,
+    /// The case's directory, which a case reads for what the script left in it.
+    directory: TempDir,
+}
+
+/// What a machine has beyond the virtual devices its emulator lists and the one that is running.
+#[derive(Default)]
+struct Setup<'a> {
+    /// The virtual device that answers on whatever serial the script gives its emulator once that
+    /// emulator, which stays up until the script that started it has gone or has asked it to stop,
+    /// has booted. The device is not listed before the script starts its own.
+    boots_as: Option<&'a str>,
 }
 
 impl Run {
@@ -364,6 +375,17 @@ fn run(
     running: Option<(&str, &str)>,
     extra: &[(&str, &str)],
 ) -> Run {
+    run_with(script, listed, running, extra, &Setup::default())
+}
+
+/// [`run`] on a machine that is also as `setup` says.
+fn run_with(
+    script: &Script,
+    listed: &[&str],
+    running: Option<(&str, &str)>,
+    extra: &[(&str, &str)],
+    setup: &Setup,
+) -> Run {
     let directory = TempDir::new().expect("a directory");
     let root = directory.path();
     let tree = root.join("tree");
@@ -431,20 +453,33 @@ fn run(
         fs::write(root.join("running.txt"), format!("{serial}\tdevice\n")).expect("a device");
         fs::write(root.join("running-avd.txt"), format!("{name}\n")).expect("a name");
     }
-    if script.waits_for_boot {
+    if script.waits_for_boot || setup.boots_as.is_some() {
         fs::write(root.join("booted"), "").expect("a flag");
     }
-
+    if let Some(name) = setup.boots_as {
+        fs::write(root.join("running-avd.txt"), format!("{name}\n")).expect("a name");
+    }
     // The SDK's two programs. The emulator lists what the machine has and, asked to start a
     // device, only records it. The debug bridge reports the running emulator and its device, and
     // says the boot is complete only where a script waits for that.
+    let stopped = root.join("emulator-stopped");
     stand_in(
         &sdk.join("emulator"),
         "emulator",
         &record,
         &format!(
-            "[ \"$1\" = -list-avds ] && cat \"{}\"\nexit 0",
-            root.join("avds.txt").display()
+            "[ \"$1\" = -list-avds ] && cat \"{}\"\n{}exit 0",
+            root.join("avds.txt").display(),
+            // A device that boots stays up until the script that started it has gone or has asked
+            // it to stop, as the real one does.
+            if setup.boots_as.is_some() {
+                format!(
+                    "[ \"$1\" = -list-avds ] || while [ ! -e \"{}\" ] && kill -0 \"$PPID\" 2>/dev/null; do sleep 0.2; done\n",
+                    stopped.display()
+                )
+            } else {
+                String::new()
+            }
         ),
     );
     stand_in(
@@ -453,6 +488,7 @@ fn run(
         &record,
         &format!(
             "case \"$*\" in\n\
+             *'emu kill'*) : >\"{stopped}\" ;;\n\
              *'emu avd name'*) [ -f \"{running_avd}\" ] && {{ cat \"{running_avd}\"; echo OK; }} ;;\n\
              *getprop*sys.boot_completed*) [ -f \"{booted}\" ] && echo 1 ;;\n\
              *getprop*) echo stand-in ;;\n\
@@ -461,6 +497,7 @@ fn run(
             running_avd = root.join("running-avd.txt").display(),
             booted = root.join("booted").display(),
             running = root.join("running.txt").display(),
+            stopped = stopped.display(),
         ),
     );
 
@@ -573,6 +610,9 @@ fn run(
         .env("ANDROID_HOME", &sdk)
         .env("KR_TEST_ARTIFACTS_DIR", root.join("artefacts"))
         .env("KR_MOBILE_SCREENSHOT_DIR", root.join("scratch"))
+        // A port nothing answers on, so that a machine that has an emulator's controller up does not
+        // refuse the pairing script's cases; the case that wants a taken port names one.
+        .env("KR_PAIRING_GRPC_PORT", free_port().to_string())
         .env("KR_PUSH_SHOTS", root.join("scratch"))
         .env("KR_STANDING_SHOTS", root.join("scratch"))
         .env("KR_TEXT_SIZE_SHOTS", root.join("scratch"))
@@ -599,7 +639,17 @@ fn run(
         output: text,
         status: output.status.code(),
         calls,
+        directory,
     }
+}
+
+/// A port of the loopback interface that nothing answers on.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("a port")
+        .local_addr()
+        .expect("its address")
+        .port()
 }
 
 #[test]
@@ -652,26 +702,137 @@ fn kalareachs_virtual_device_is_the_one_started_whatever_else_is_listed() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
+/// KalaReach's own device is the only one a script starts: the environment may repeat its name, and
+/// a name it gives that is another's, listed or not, is refused by every script before anything is
+/// built or started.
 #[test]
-fn another_virtual_device_made_for_kalareach_is_named_in_the_environment() {
-    let listed = [OTHERS[0], "KalaReach_API_36_Tablet", KALAREACH];
-    let run = run(
-        &SCRIPTS[0],
-        &listed,
-        None,
-        &[("KR_ANDROID_AVD", "KalaReach_API_36_Tablet")],
-    );
-    assert_eq!(run.started(), ["KalaReach_API_36_Tablet"], "{}", run.output);
+fn a_virtual_device_the_environment_names_is_started_only_when_it_is_kalareachs() {
+    let listed = [OTHERS[0], OTHERS[1], KALAREACH, "KalaReach_API_36_Tablet"];
+    let mut problems = Vec::new();
+    for script in &SCRIPTS {
+        for refused in [OTHERS[0], "KalaReach_API_36_Tablet"] {
+            let run = run(script, &listed, None, &[("KR_ANDROID_AVD", refused)]);
+            let mut wrong = Vec::new();
+            if !run.output.contains(refused) {
+                wrong.push(format!("it did not name {refused}"));
+            }
+            if run.status == Some(0) {
+                wrong.push("it ran to its end".to_string());
+            }
+            if !run.started().is_empty() {
+                wrong.push(format!("it started {:?}", run.started()));
+            }
+            if run.called("pnpm android") || run.called("cargo") || run.called("gradlew") {
+                wrong.push("it built before it refused".to_string());
+            }
+            if !wrong.is_empty() {
+                problems.push(format!(
+                    "{} given {refused}: {}\n{}",
+                    script.path,
+                    wrong.join(", "),
+                    run.output
+                ));
+            }
+        }
+        let own = run(script, &listed, None, &[("KR_ANDROID_AVD", KALAREACH)]);
+        if own.started() != [KALAREACH] {
+            problems.push(format!(
+                "{} given {KALAREACH} started {:?}\n{}",
+                script.path,
+                own.started(),
+                own.output
+            ));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
 
-    // A name that is not listed is refused by name, and the default is not put in its place.
-    let run = self::run(
-        &SCRIPTS[0],
-        &listed,
+/// A device that took the emulator's serial before the script's own emulator booted answers the boot
+/// wait too. The pairing script asks the device on its serial for its name, and when that is not
+/// KalaReach's it installs nothing into it, changes nothing in it and does not stop it.
+#[test]
+fn a_device_on_the_pairing_scripts_serial_that_is_not_kalareachs_is_left_alone() {
+    let pairing = pairing_script();
+    let other = run_with(
+        pairing,
+        &[OTHERS[0], KALAREACH],
         None,
-        &[("KR_ANDROID_AVD", "Missing_API_36")],
+        &[],
+        &Setup {
+            boots_as: Some(OTHERS[0]),
+            ..Setup::default()
+        },
     );
-    assert!(run.output.contains("Missing_API_36"), "{}", run.output);
+    assert_eq!(other.status, Some(3), "{}", other.output);
+    assert!(other.output.contains(OTHERS[0]), "{}", other.output);
+    assert_eq!(other.started(), [KALAREACH]);
+    for word in [
+        "install",
+        "uninstall",
+        "reverse",
+        "kill",
+        "locksettings",
+        "pm",
+        "log",
+    ] {
+        assert!(
+            !other.calling_contains("adb", word),
+            "the script went on with another project's device ({word}):\n{}",
+            other.calls.join("\n")
+        );
+    }
+    assert!(
+        !other
+            .calls
+            .iter()
+            .any(|call| call.starts_with("python3") && call.contains("pairing-android.py")),
+        "the camera was moved:\n{}",
+        other.calls.join("\n")
+    );
+
+    // The same machine with KalaReach's device on the serial goes on to install.
+    let own = run_with(
+        pairing,
+        &[OTHERS[0], KALAREACH],
+        None,
+        &[],
+        &Setup {
+            boots_as: Some(KALAREACH),
+            ..Setup::default()
+        },
+    );
+    assert!(
+        own.calling_contains("adb", "install"),
+        "{}\n{}",
+        own.output,
+        own.calls.join("\n")
+    );
+    assert!(own.calling_contains("adb", "kill"), "{}", own.output);
+}
+
+/// The driver moves the emulator's camera through its controller's port of the loopback interface, so
+/// a port that already answers is some other program's and no emulator is started while it does.
+#[test]
+fn the_pairing_script_starts_no_emulator_while_its_controllers_port_is_taken() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+    let port = taken.local_addr().expect("its address").port().to_string();
+    let run = run(
+        pairing_script(),
+        &[KALAREACH],
+        None,
+        &[("KR_PAIRING_GRPC_PORT", &port)],
+    );
+    assert_eq!(run.status, Some(3), "{}", run.output);
+    assert!(run.output.contains(&port), "{}", run.output);
     assert!(run.started().is_empty(), "{:?}", run.started());
+    drop(taken);
+}
+
+fn pairing_script() -> &'static Script {
+    SCRIPTS
+        .iter()
+        .find(|script| script.path == "scripts/e2e-pairing-device.sh")
+        .expect("the pairing script is among the scripts")
 }
 
 #[test]

@@ -95,7 +95,12 @@ screen_lock_pin=1234
 emulator_pid=""
 emulator_serial=""
 emulator_adb=""
-# Whether the phone's logs were searched for an invitation's text and secret, and whether any held one.
+# Whether the device on the serial was shown to be KalaReach's virtual device. Until it is, nothing is
+# installed into it, changed in it or stopped through it, and only this script's own emulator process
+# is ended, by its pid.
+emulator_checked=0
+# Whether the phone's logs were searched for an invitation's text and secret, whether any held one, and
+# the copies of those that did, kept in the output folder for the person to read.
 logs_searched=0
 log_problem=""
 logs_found=0
@@ -116,10 +121,12 @@ plist_saved=""
 say() { printf '== [pairing-device] %s\n' "$*" | tee -a "$log"; }
 
 # Ends what this script started and removes what it made. The host is asked to finish and ended by
-# the pid this script recorded only when it does not; so is the feeder; the emulator is asked to stop
-# through its serial and ended by its pid when it does not, after the application and the tunnel it
-# was given are taken away; the simulator this script made is shut down and deleted, which takes its
-# photo library with it; and the two files of the iOS build are put back as they were.
+# the pid this script recorded only when it does not; so is the feeder; the emulator, once its device
+# was shown to be KalaReach's, is asked to stop through its serial and ended by its pid when it does
+# not, after the application and the tunnel it was given are taken away (an emulator not yet shown to
+# be is ended by its pid alone); the simulator this script made is shut down and deleted, which takes
+# its photo library with it; the two files of the iOS build are put back as they were and their copies
+# removed; and the output folders are left for this account alone.
 finish() {
     touch "$harness/finish" 2>/dev/null
     for pid in "$feeder_pid" "$presence_pid" "$harness_pid"; do
@@ -132,11 +139,15 @@ finish() {
         kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null
     done
     if [ -n "$emulator_pid" ] && kill -0 "$emulator_pid" 2>/dev/null; then
-        # The screen lock the confirmations case set, taken off again.
-        "$emulator_adb" -s "$emulator_serial" shell locksettings clear --old "$screen_lock_pin" >/dev/null 2>&1
-        "$emulator_adb" -s "$emulator_serial" reverse --remove-all >/dev/null 2>&1
-        "$emulator_adb" -s "$emulator_serial" uninstall "$app_id" >/dev/null 2>&1
-        "$emulator_adb" -s "$emulator_serial" emu kill >/dev/null 2>&1
+        if [ "$emulator_checked" = 1 ]; then
+            # The screen lock the confirmations case set, taken off again.
+            "$emulator_adb" -s "$emulator_serial" shell locksettings clear --old "$screen_lock_pin" >/dev/null 2>&1
+            "$emulator_adb" -s "$emulator_serial" reverse --remove-all >/dev/null 2>&1
+            "$emulator_adb" -s "$emulator_serial" uninstall "$app_id" >/dev/null 2>&1
+            "$emulator_adb" -s "$emulator_serial" emu kill >/dev/null 2>&1
+        else
+            kill "$emulator_pid" 2>/dev/null
+        fi
         local stopped=0
         while kill -0 "$emulator_pid" 2>/dev/null && [ "$stopped" -lt 30 ]; do
             sleep 1
@@ -531,6 +542,13 @@ run_android() {
         say "a device is already on $serial, which is left alone"
         return 3
     fi
+    # The driver moves the camera through the emulator's controller on this port of the loopback
+    # interface. Something that already answers there is another emulator's (or another program's), and
+    # the camera the driver moved would be its: nothing is started while the port is taken.
+    if (exec 3<>"/dev/tcp/127.0.0.1/$grpc_port") 2>/dev/null; then
+        say "the port $grpc_port is already taken, so no emulator is started: the camera would be moved through whatever answers there (KR_PAIRING_GRPC_PORT names another port)"
+        return 3
+    fi
     say "starting the emulator $avd"
     # The camera is the virtual scene, whose wall shows the host's picture; its pose is moved over the
     # emulator's controller, which listens on the loopback interface only.
@@ -549,6 +567,16 @@ run_android() {
     done
     # The emulator this script started is the one that answered: its process is still there.
     { [ "$booted" = 1 ] && kill -0 "$emulator_pid" 2>/dev/null; } || { say "the emulator did not come up"; return 3; }
+    # And the device on the serial is KalaReach's virtual device: one that took the serial after the
+    # check that it was free would have answered the boot wait too. Before anything is installed, set or
+    # stopped on it, and before the camera is moved.
+    local reported
+    reported="$(kr_android_device_name "$adb" "$serial")"
+    if [ "$reported" != "$avd" ]; then
+        say "the device on $serial reports ${reported:-no name}, not $avd, so it is left alone: nothing is installed into it, changed in it or stopped through it"
+        return 3
+    fi
+    emulator_checked=1
 
     # The camera starts at its first view of the wall's picture. The emulator's camera is a frame of
     # 1280 by 960 pixels and a host's direct invitation is a dense code, so the driver moves the

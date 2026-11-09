@@ -17,7 +17,7 @@
 #   pnpm -C apps/companion build:harness
 #   bash <lease script> <label> apps/companion/e2e/standing-emulator.sh
 #
-# Environment: KR_ANDROID_AVD names the virtual device (default: KalaReach_API_36_Play);
+# Environment: the virtual device is always KalaReach_API_36_Play, and a KR_ANDROID_AVD that names another is refused;
 # KR_STANDING_SHOTS is where its screenshots go (default /tmp). Every command goes to the one emulator
 # this script starts, named by its own serial: ANDROID_SERIAL is cleared, so a phone that is connected
 # is never touched, and an emulator that was already running is refused, because its settings are not

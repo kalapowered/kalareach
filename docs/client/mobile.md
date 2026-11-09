@@ -465,11 +465,14 @@ Screenshots go to `/tmp`; everything else goes to
 `${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}`. `KR_IOS_DEVICE` chooses the simulator.
 
 Every script that starts an Android emulator takes the virtual device from `scripts/lib/android-avd.sh`:
-`KalaReach_API_36_Play` (API 36 with Google Play, 16 KB pages and a 16 GB data partition), or the one that
-`KR_ANDROID_AVD` names. A script does not fall back to another device. When the emulator does not list
-the device, the script says so by name, starts nothing and reports the platform as not available, and
-`scripts/e2e-mobile.sh` uses an emulator that is already running only when it is that device. Other virtual
-devices on the machine belong to other work, and no script starts, installs into, wipes or changes one.
+`KalaReach_API_36_Play` (API 36 with Google Play, 16 KB pages and a 16 GB data partition) and no other. A
+`KR_ANDROID_AVD` that names another device is refused, and a script does not fall back to another device.
+When the emulator does not list the device, the script says so by name, starts nothing and reports the
+platform as not available, and `scripts/e2e-mobile.sh` uses an emulator that is already running only when it
+is that device. Other virtual devices on the machine belong to other work, and no script starts, installs
+into, wipes or changes one. `scripts/e2e-pairing-device.sh` also asks the device on its serial for its name
+once it has booted, and installs into, changes or stops nothing unless that is the device, and it starts no
+emulator while the port of the emulator's controller is taken, since the driver moves the camera through it.
 
 ## Files and locks on Android
 

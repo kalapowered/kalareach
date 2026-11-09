@@ -19,7 +19,7 @@
 #   pnpm -C apps/companion android --debug --target aarch64
 #   bash <lease script> <label> apps/companion/e2e/android-stores.sh <path of the .apk>
 #
-# Environment: KR_ANDROID_AVD names the virtual device (default: KalaReach_API_36_Play);
+# Environment: the virtual device is always KalaReach_API_36_Play, and a KR_ANDROID_AVD that names another is refused;
 # KR_ANDROID_EMULATOR_PORT is the port the emulator is started on (default 5580). Every command goes
 # to the one emulator this script starts, named by its own serial: ANDROID_SERIAL is cleared, so a
 # phone that is connected is never touched, and an emulator that was already running is refused.
