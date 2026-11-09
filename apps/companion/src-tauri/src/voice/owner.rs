@@ -1371,16 +1371,27 @@ impl Owner {
         }
     }
 
-    /// Settles the opening context as the call ends. What the task reported is taken, and a task
-    /// that has not reported was cut short by the end: nothing it goes on to do is read.
-    fn settle_the_opening(&mut self) {
+    /// Settles the opening context as the call ends. A task that is still running is stopped and
+    /// awaited first, so that what it reported is in the channel and nothing follows it; then what
+    /// was reported is taken, and a task that had not reported was cut short by the end.
+    async fn settle_the_opening(&mut self) {
+        let running = match self.opening.take() {
+            Some(task) => {
+                task.abort();
+                // Cancelled or finished: either way it is over when this returns.
+                let _ = task.await;
+                true
+            }
+            None => false,
+        };
+        let mut reported = false;
         while let Ok(message) = self.internal.try_recv() {
             if let Internal::Opened(opened) = message {
                 self.note_the_opening(&opened);
+                reported = true;
             }
         }
-        if let Some(task) = self.opening.take() {
-            task.abort();
+        if running && !reported {
             self.note_the_opening(&Opened::Cut);
         }
     }
@@ -1544,7 +1555,7 @@ impl Owner {
         let id = self.id;
         // What the opening context came to is in the record before the call is said to have ended,
         // so that a person who reads the end reads it too.
-        self.settle_the_opening();
+        self.settle_the_opening().await;
         self.view(|state| {
             state.running = false;
             state.begin_ending(id);
