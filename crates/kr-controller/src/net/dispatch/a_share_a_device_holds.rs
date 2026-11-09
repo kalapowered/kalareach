@@ -26,7 +26,7 @@ use crate::service::a_close_a_worker_never_answers as fake;
 
 /// A device paired under a grant that sees every session and can only view, so a share is how it
 /// comes to hold anything more.
-fn paired(
+pub(super) fn paired(
     controller: &crate::service::Controller,
     byte: u8,
     sessions: SessionSelector,
@@ -40,7 +40,7 @@ fn paired(
 }
 
 /// A grant issued to `device` over `session_id`, active, carrying `actions` and naming `named`.
-fn share(
+pub(super) fn share(
     world: &fake::Silent,
     device: &crate::service::net::devices::DeviceRecord,
     actions: &[ActionRight],

@@ -151,7 +151,8 @@ pub enum ActionClaim {
 /// What this host holds about one action whose claim an attempt wrote.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ActionRecord {
-    /// The attempt that claimed it is still running in this daemon.
+    /// The attempt that claimed it is still running in this daemon, or ended with its store
+    /// unable to say whether it wrote what it was claimed for ([`ClaimHold::doubt`]).
     ///
     /// A second request under the identifier is told so rather than performing the action again:
     /// two `grant.revoke` calls that both ran would advance the revision twice and fence the host
@@ -201,7 +202,7 @@ struct LiveClaim {
     doubtful: bool,
 }
 
-/// The claims whose attempts are running in this daemon.
+/// The claims whose attempts are running in this daemon, and those that ended doubtful.
 ///
 /// In memory, because it describes this process: a claim written by a daemon that has since
 /// stopped belongs to an attempt that stopped with it.
@@ -220,11 +221,12 @@ impl LiveClaims {
 ///
 /// The hold is what tells a retry that the attempt is still running rather than ended, and it is
 /// released when it is dropped, however the attempt ends: it returned, it failed, its task was
-/// dropped part way through, or it panicked. Its result is recorded under it, so only the attempt
-/// that claimed an action records what the action did. Record before dropping it: a retry that
-/// finds neither a hold nor a result reads the action as unfinished.
+/// dropped part way through, or it panicked. The one exception is a hold marked by
+/// [`Self::doubt`], which stands until this daemon stops. Its result is recorded under it, so only
+/// the attempt that claimed an action records what the action did. Record before dropping it: a
+/// retry that finds neither a hold nor a result reads the action as unfinished.
 #[derive(Debug)]
-#[must_use = "a claim is released when its hold is dropped"]
+#[must_use = "a claim is released when its hold is dropped, unless it was doubted"]
 pub struct ClaimHold {
     live: Arc<LiveClaims>,
     key: ClaimKey,
@@ -234,10 +236,10 @@ impl ClaimHold {
     /// Keeps this attempt's entry for as long as this daemon runs, however the attempt ends.
     ///
     /// For an attempt that ended after it may have written what it was claimed for, and whose
-    /// store could not say whether it did: a share whose transaction failed after it began, or
-    /// whose result could not be kept. Such an attempt is not known to have ended without its
-    /// effect, so it is still read as running, and the subject it holds stays held, until a
-    /// restart reads the store as it stands.
+    /// store could not give a complete record of it: a share whose transaction failed after it
+    /// began, or whose result could not be kept. Such an attempt is not known to have ended
+    /// without its effect, so it is still read as running, and the subject it holds stays held,
+    /// until a restart reads the store as it stands.
     pub fn doubt(&self) {
         if let Some(entry) = self.live.held().get_mut(&self.key) {
             entry.doubtful = true;
@@ -3430,10 +3432,10 @@ fn record_result(
 fn the_share_that_holds_it(earlier: ActionId, doubtful: bool) -> String {
     if doubtful {
         format!(
-            "an earlier share of this session to this device, action {earlier}, ended without \
-             this host knowing whether it was written, because its store failed; the host says \
-             what it did once it restarts, and a new share of this session to this device waits \
-             until then"
+            "an earlier share of this session to this device, action {earlier}, ended after its \
+             store failed, so this host may not hold a complete record of it; ask again under \
+             that action for what it wrote, and a new share of this session to this device waits \
+             until the host restarts"
         )
     } else {
         format!(

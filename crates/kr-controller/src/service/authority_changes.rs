@@ -1531,19 +1531,32 @@ impl Controller {
         drop(registry);
         self.settle_floor();
         // A store that fails once the share is being written, the commit included, has not said
-        // that nothing was written: the transaction may stand after a restart. Any other storage
-        // failure, a worker's own among them, ended an attempt that wrote nothing.
-        if writing.get()
-            && result
-                .as_ref()
-                .is_err_and(|error| error.code() == ErrorCode::StorageUnavailable)
-        {
-            hold.doubt();
-        }
+        // that nothing was written: the transaction may stand after a restart. So the caller is
+        // not told a transient word, which says nothing took effect, and the subject stays held
+        // until a restart. Any other storage failure, one before the transaction began among
+        // them, ended an attempt that wrote nothing.
+        let shared = match result {
+            Err(error) if writing.get() && error.code() == ErrorCode::StorageUnavailable => {
+                hold.doubt();
+                return Err(ControllerError::Uncertain {
+                    detail: format!(
+                        "this host's store failed while the share was written, so it is not known \
+                         whether it was: {error}"
+                    ),
+                });
+            }
+            result => result?,
+        };
         // The share is written, so a result that cannot be encoded is not a refusal of it: nothing
-        // is kept for it, and a repeat finds what was written.
-        encode(&result?).map_err(|error| ControllerError::Uncertain {
-            detail: format!("the share was written and its answer could not be encoded: {error}"),
+        // is kept for it, a repeat finds what was written, and the subject stays held as it does
+        // for a result that cannot be kept.
+        encode(&shared).map_err(|error| {
+            hold.doubt();
+            ControllerError::Uncertain {
+                detail: format!(
+                    "the share was written and its answer could not be encoded: {error}"
+                ),
+            }
         })
     }
 

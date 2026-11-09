@@ -788,9 +788,7 @@ impl SharingService {
 /// before they were scoped to the actor: the digest of the action and the purpose `grant` or
 /// `invitation` alone. See [`SharingService::shared_under_earlier_identities`], which says when to
 /// remove it.
-pub(crate) fn earlier_share_identities(
-    action: kr_protocol::scalars::Uuid,
-) -> (GrantId, InvitationId) {
+fn earlier_share_identities(action: kr_protocol::scalars::Uuid) -> (GrantId, InvitationId) {
     let derived = |purpose: &[u8]| {
         let digest =
             kr_cbor::sha256(&[b"kr-sharing/1".as_slice(), purpose, action.as_bytes()].concat());

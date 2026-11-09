@@ -14,6 +14,7 @@ use std::pin::Pin;
 
 use kr_protocol::envelope::{ControlFrame, MutationRequest, Outcome, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::grant::{GrantExpiry, SessionSelector};
 use kr_protocol::ids::{ActorId, DeviceId, GrantId, InvitationId, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{DurationMs, Nullable, Uuid};
@@ -21,6 +22,7 @@ use kr_protocol::sharing::{
     AuthorityNotice, GrantCreateParams, GrantCreateResult, RoleSelection, SessionRole,
 };
 
+use super::a_share_a_device_holds::{paired as paired_with_no_session, share as held_share};
 use super::a_share_that_names_a_current_decision::{
     Holding, grants_written, holding_grant, holds_question_reads, invitation_written, recipient,
     share, world,
@@ -308,25 +310,49 @@ async fn kr_req_23_24_a_fresh_share_is_refused_while_an_earlier_share_of_its_sub
     assert_eq!(refused(&copied).code(), ErrorCode::DraftConflict);
 }
 
-/// KR-REQ-23.24: the refusal holds a device that delegates as it holds the owner: a share by the
-/// same device actor for the same session and recipient is refused at the claim, before anything of
-/// its delegation is decided, and the device is told the same words.
+/// KR-REQ-23.24: the hold is the same for a paired device that delegates from a share it holds:
+/// while its delegation runs, a delegation of the same session to the same device under a fresh
+/// action is refused at the claim, as its own answer and a copy for its repeat; once the first has
+/// ended, a delegation under a fresh action is admitted and written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_23_24_a_device_that_delegates_is_held_to_its_running_share_too() {
     let (world, _holding) = world(Holding::default(), holds_question_reads()).await;
-    let delegating = paired(&world, 0xd3);
-    let device = ActorId::new(format!("device:{delegating}")).expect("a principal");
-    let first = viewing(&world, world.session_id, recipient(), 0x11);
-    let replacement = viewing(&world, world.session_id, recipient(), 0x12);
+    let delegating = paired_with_no_session(&world.controller, 0xd3, SessionSelector::None);
+    let device = delegating.principal();
+    let acting = AuthorityCaller::Device(delegating.device_id);
+    let rights: Vec<_> = RoleSelection::plain(SessionRole::Owner)
+        .actions()
+        .iter()
+        .copied()
+        .collect();
+    let parent = held_share(&world, &delegating, &rights, &[], true, GrantExpiry::Never);
+    let to = paired(&world, 0xd2);
+    let delegation = |action: u8| {
+        let selection = RoleSelection::plain(SessionRole::Viewer);
+        MutationRequest {
+            params: ParamsValue::from_typed(&GrantCreateParams {
+                session_id: world.session_id,
+                recipient_device_id: to,
+                parent_grant_id: Nullable::some(parent.grant_id),
+                accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
+                selection,
+                lifetime_ms: Nullable::some(DurationMs::new(600_000)),
+                owner_confirmation: Nullable::null(),
+            })
+            .expect("encodes"),
+            ..share(
+                world.environment_id,
+                world.session_id,
+                action,
+                RoleSelection::plain(SessionRole::Viewer),
+            )
+        }
+    };
+    let (first, replacement, afterwards) = (delegation(0x11), delegation(0x12), delegation(0x13));
 
-    let mut running = starting(&world, &device, AuthorityCaller::Owner, &first).await;
-    let mut refusing = starting(
-        &world,
-        &device,
-        AuthorityCaller::Device(delegating),
-        &replacement,
-    )
-    .await;
+    let mut running = starting(&world, &device, acting, &first).await;
+    let mut refusing = starting(&world, &device, acting, &replacement).await;
+    let later = starting(&world, &device, acting, &afterwards).await;
     let registry = world.controller.registry.lock().await;
     assert!(
         until_claimed(&mut running, &world, &device, &first)
@@ -344,8 +370,22 @@ async fn kr_req_23_24_a_device_that_delegates_is_held_to_its_running_share_too()
     let answered = answered.expect("a refusal is answered at the claim");
     assert!(!answered.is_copied());
     assert_eq!(refused(&answered).code(), ErrorCode::DraftConflict);
+
     drop(registry);
-    drop(running);
+    running
+        .await
+        .into_answer()
+        .expect("the device's delegation is written");
+    assert_eq!(grants_written(&world), 2, "the parent and the delegation");
+    later
+        .await
+        .into_answer()
+        .expect("a delegation under a fresh action is admitted once the first has ended");
+    assert_eq!(grants_written(&world), 3);
+
+    let copied = starting(&world, &device, acting, &replacement).await.await;
+    assert!(copied.is_copied(), "the refused action's repeat is a copy");
+    assert_eq!(refused(&copied).code(), ErrorCode::DraftConflict);
 }
 
 /// KR-REQ-23.24: a share is held only while it runs. One that ends by its task being dropped lets
@@ -553,7 +593,11 @@ async fn kr_req_23_24_a_share_whose_store_fails_while_it_is_written_holds_its_su
     let failed = starting(&world, &owner, AuthorityCaller::Owner, &first)
         .await
         .await;
-    assert_eq!(refused(&failed).code(), ErrorCode::StorageUnavailable);
+    assert_eq!(
+        refused(&failed).code(),
+        ErrorCode::OutcomeUnknown,
+        "the caller is not told that nothing took effect, which a transient word says"
+    );
     assert_eq!(grants_written(&world), 0);
 
     let unknown = refusal_in(
@@ -697,4 +741,56 @@ async fn kr_req_23_24_a_share_written_under_earlier_identities_is_not_called_unp
         ErrorCode::OutcomeUnknown,
         "what became of the action is not known: {told:?}"
     );
+}
+
+/// KR-REQ-23.24: a share that is there and cannot be read back is not called unperformed. The grant
+/// is read and its invitation is not, so what the repeat finds says nothing of whether the share was
+/// written: it is told that what became of the action is not known, and once the invitation can be
+/// read it is told the share.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_23_24_a_share_that_cannot_be_read_back_is_not_called_unperformed() {
+    let (world, _holding) = world(Holding::default(), holds_question_reads()).await;
+    let owner = owner();
+    let first = viewing(&world, world.session_id, recipient(), 0x81);
+    starting(&world, &owner, AuthorityCaller::Owner, &first)
+        .await
+        .await
+        .into_answer()
+        .expect("the share is written");
+
+    let registry = beside(&world);
+    registry
+        .execute(
+            "UPDATE authority_receipts SET result = NULL, recorded_at_ms = NULL
+              WHERE actor_id = ?1 AND action_id = ?2",
+            rusqlite::params![owner.as_str(), first.action_id.get().as_bytes().as_slice()],
+        )
+        .expect("the claim never recorded its answer");
+    registry
+        .execute_batch("ALTER TABLE session_invitations RENAME TO session_invitations_aside;")
+        .expect("the invitations cannot be read");
+    let unreadable = refusal_in(
+        world
+            .controller
+            .retained_authority_answer(&owner, &first)
+            .await,
+    );
+    registry
+        .execute_batch("ALTER TABLE session_invitations_aside RENAME TO session_invitations;")
+        .expect("the invitations can be read again");
+    drop(registry);
+    assert_eq!(
+        unreadable.code,
+        ErrorCode::OutcomeUnknown,
+        "a share that cannot be read back is not one that was not made: {unreadable:?}"
+    );
+
+    let (grant_id, _) = kr_protocol::sharing::share_identities(&owner, first.action_id.get());
+    let found = share_in(
+        world
+            .controller
+            .retained_authority_answer(&owner, &first)
+            .await,
+    );
+    assert_eq!(found.grant.grant_id, grant_id);
 }
