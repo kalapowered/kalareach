@@ -1830,9 +1830,11 @@ async fn a_worker_that_cannot_reach_its_controller_says_why_and_ends_whatever_it
 /// KR-REQ-05.08: an idle session that has been asked to run nothing is its worker and its root
 /// shell. The daemon asks its supervisor to start the worker and nothing else: no plugin runtime
 /// or other separately supervised service, lazily or otherwise. And nothing the worker itself
-/// starts beside the shell stays running, whether it is still the worker's child or a short-lived
-/// child of the worker left it running as a process of its own; on Windows what the worker starts
-/// beside the shell is the pseudo-console's host.
+/// starts beside the shell stays running. On a Unix host that is every process the worker started,
+/// whether it is still the worker's child or a short-lived child of the worker left it running as
+/// a process of its own. On Windows the case reads the worker's children by their recorded
+/// parent, which leaves the pseudo-console's host and nothing else, and does not see a process
+/// that a child of the worker left running.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_idle_session_runs_nothing_beside_its_shell() {
     let host = Host::create().recording_launches();
@@ -1920,7 +1922,8 @@ impl BesideTheShell {
     }
 
     /// The processes that run now, by the start identity that tells one from another that came to
-    /// have the same number.
+    /// have the same number. A process the kernel will not describe is not one that has ended, and
+    /// stops the case.
     fn running(&self) -> Vec<kr_protocol::identity::ProcessStartIdentity> {
         let table = processes();
         let mut shell = std::collections::BTreeSet::from([self.root]);
@@ -1944,45 +1947,72 @@ impl BesideTheShell {
                             .get(&pid)
                             .is_some_and(|directory| directory.starts_with(&self.directory)))
             })
-            // A process that has gone since the table was read is one that was not staying.
-            .filter_map(|&(pid, _)| kr_ipc::identity::process_start_identity(pid).ok())
+            .filter_map(|&(pid, _)| match kr_ipc::identity::query_process(pid) {
+                kr_ipc::identity::ProcessQuery::Present(identity) => Some(identity),
+                // It has gone since the table was read: it was not staying.
+                kr_ipc::identity::ProcessQuery::Gone => None,
+                kr_ipc::identity::ProcessQuery::CannotEstablish(error) => {
+                    panic!("what the worker started as process {pid} could not be read: {error}")
+                }
+            })
             .collect()
     }
 }
 
-/// An idle session's worker has started nothing beside the root shell that is running once what it
-/// asks its platform short questions of has ended.
+/// How long a process noted beside the shell is given to end before it is taken for a backend.
 ///
-/// A worker asks its platform short questions, such as whether its desktop is still there, and
-/// each of those is a process that ends at once. A backend is a process that stays. For a second
-/// of idling every process the worker started beside the shell is noted; the case then decides by
-/// whether those processes end, and it waits for them to for as long as the liveness bound, which
-/// only says how long a slow machine is given to end a question. A process that a short-lived
-/// child of the worker left running as a process of its own is noted as the worker's own children
-/// are, and an idle session that ran one fails the case at the bound, naming it.
+/// The worker asks its platform short questions, such as whether its desktop is still there, and
+/// each of those is a process it waits for and ends at its own deadline of two seconds, so a
+/// process that outlives five of those is not one. This only says how long a slow machine is given
+/// to end a question: the case passes as soon as every process it noted has ended.
+#[cfg(unix)]
+const QUESTION_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// An idle session's worker has started nothing beside the root shell that stays running.
 ///
-/// The second of idling, and the polling after it, say how often the table is read: what decides
-/// is whether a noted process is the one that was noted and is still running. A backend the worker
-/// started later than that second after it had reported its session is not looked for.
+/// A backend is a process that stays and a platform question is one that ends, and a process that
+/// is running cannot be told from the other by looking at it once. For a second of idling every
+/// process the worker started beside the shell is noted, by its start identity. The case then waits
+/// for each of them to end, and fails, naming them, when one still runs at [`QUESTION_BOUND`] or
+/// when the kernel will not say whether it does. What is asked of a noted process is whether it
+/// ended, read from the kernel by its identity: it is not looked for again by where it runs, so a
+/// process that gives up its directory after it was noted is still the one that was noted. A
+/// process that a short-lived child of the worker left running as a process of its own is noted as
+/// the worker's own children are.
+///
+/// The second of idling says how often the table is read, and a backend that the worker starts
+/// later than that after it has reported its session is not looked for. Whether a process stays
+/// cannot be known without a bound on how long a question takes, which is why one remains.
 #[cfg(unix)]
 async fn nothing_the_worker_started_beside_the_shell_runs(
     host: &Host,
     created: &SessionCreateResult,
 ) {
     let beside = BesideTheShell::of(host, created);
-    let mut noted = std::collections::BTreeSet::new();
+    let mut noted = Vec::new();
     for _ in 0..10 {
-        noted.extend(beside.running());
+        for identity in beside.running() {
+            if !noted.contains(&identity) {
+                noted.push(identity);
+            }
+        }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     let started = std::time::Instant::now();
     let staying = loop {
-        let now: std::collections::BTreeSet<_> = beside.running().into_iter().collect();
-        let staying: Vec<_> = noted.intersection(&now).collect();
+        let staying: Vec<_> = noted
+            .iter()
+            .filter(|identity| {
+                !matches!(
+                    kr_ipc::identity::process_state(identity),
+                    kr_ipc::identity::ProcessState::Ended
+                )
+            })
+            .collect();
         if staying.is_empty() {
             break None;
         }
-        if started.elapsed() > LIVENESS_DEADLINE {
+        if started.elapsed() > QUESTION_BOUND {
             break Some(format!("{staying:?}"));
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
