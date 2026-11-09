@@ -624,8 +624,10 @@ registration has no known outcome the entry has one more field, `unsettled`: the
 registration was sent under, words that say why it is not settled, the digest of the token it
 proposed, the choice of previews it carried, and the time it was sent. It is written before the
 registration is sent, so that the application ending cannot lose that one was; it is cleared when
-the host's answer settles it (the host took it, or refused it) or `action.read` says which, and it is
-replaced by the new registration's own entry when the person asks for one and it is sent. A host with none has no such field in its
+the host's answer settles it (the host took it, or refused it) or `action.read` says which, and when
+the account the registration was made under is deleted, since the service may have removed it with
+the rest and the person's next request then runs the whole sequence. It is replaced by the new
+registration's own entry when the person asks for one and it is sent. A host with none has no such field in its
 entry, a record without it reads as none, and a release that does not keep it reads the record and
 ignores it. The file holds no token, no key and no credential. A file that cannot be read, damaged or
 written by a build this one does not know, is moved aside as `push/push.unreadable-<time>.json`
