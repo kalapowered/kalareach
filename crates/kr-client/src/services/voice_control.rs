@@ -732,6 +732,13 @@ const START_CONTEXT_HEADER: &str =
 /// The host's selection as the appends that carry it, each at most [`VOICE_CONTEXT_BYTES`] bytes.
 ///
 /// A selection with nothing in it is the header alone.
+///
+/// What this writes around the selection's text is the header, a label and a line break for each
+/// item, and the note that the selection was cut short. The host's cap on a selection counts all
+/// of it: the host's selection reserves `kr_voice::OPENING_FRAMING_BYTES` for the header and the
+/// note and `kr_voice::ITEM_FRAMING_BYTES` for each item's label and line break, so a header, a
+/// label or a note that grows past what is reserved there breaks the cap on what is sent, and the
+/// reservation is raised first.
 #[must_use]
 pub fn call_start_appends(selection: &VoiceContextSelection) -> Vec<String> {
     let mut lines = vec![START_CONTEXT_HEADER.to_owned()];

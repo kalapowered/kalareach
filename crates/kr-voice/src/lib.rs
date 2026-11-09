@@ -80,7 +80,10 @@ pub mod session;
 pub use crate::confirm::{
     ConfirmationLedger, issue_confirmation, sign_confirmation, verify_confirmation,
 };
-pub use crate::context::{SecretPatterns, Selection, select_context, token_bound};
+pub use crate::context::{
+    ITEM_FRAMING_BYTES, OPENING_FRAMING_BYTES, SecretPatterns, Selection, select_context,
+    token_bound,
+};
 pub use crate::delegate::{Coordinator, Proposal, UnclosedCall, narrower_history};
 pub use crate::error::{Result, VoiceError};
 pub use crate::grant::{

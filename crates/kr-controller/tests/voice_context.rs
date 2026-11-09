@@ -435,11 +435,14 @@ async fn the_default_context_carries_both_halves_of_a_session_under_the_devices_
     world.stop().await;
 }
 
-/// KR-REQ-15.20: one cap covers the whole default context. Each half fits eight thousand text
-/// tokens alone and together they do not; the selection keeps whole items to the cap, says what it
-/// dropped, and its count of tokens is exactly what the items it carries cost.
+/// KR-REQ-15.20: one cap covers the whole default context, and it is the cap on what is sent. Each
+/// half fits the cap alone and together they do not; the selection keeps whole items to the cap,
+/// each charged its text and what the client writes around it, says what it dropped, and its count
+/// of tokens is exactly what the text of the items it carries costs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_cap_covers_both_halves_together() {
+    use kr_voice::{ITEM_FRAMING_BYTES, OPENING_FRAMING_BYTES};
+
     let world = World::start().await;
     let agent = world.agent();
     let started = world.started_ms;
@@ -448,6 +451,7 @@ async fn the_cap_covers_both_halves_together() {
     let base = world.context().await;
     let base_tokens = u64::from(base.selection.text_tokens);
     assert!(base_tokens > 0 && base_tokens < 400, "{base:?}");
+    let base_items = texts(&base).iter().filter(|text| !text.is_empty()).count() as u64;
 
     // Twenty messages of four hundred bytes each as the selection renders them: eight thousand
     // between them, which fits alone and does not fit beside the daemon's half.
@@ -458,27 +462,74 @@ async fn the_cap_covers_both_halves_together() {
     let result = world.context().await;
     let selection = &result.selection;
 
-    assert_eq!(selection.recent_messages.len(), 19, "{selection:?}");
+    // What is left of the cap after the daemon's half and the framing the client writes around the
+    // selection, in messages that cost their text and their own framing.
+    let framing = u64::from(ITEM_FRAMING_BYTES);
+    let room = 8_000 - u64::from(OPENING_FRAMING_BYTES) - (base_tokens + base_items * framing);
+    let fits = (room / (400 + framing)) as usize;
+    assert!(fits > 0 && fits < 20, "{fits}");
+
+    assert_eq!(selection.recent_messages.len(), fits, "{selection:?}");
     assert!(
         selection
             .recent_messages
             .iter()
             .enumerate()
             .all(|(i, text)| text.starts_with(&format!("message: {i:02}-"))),
-        "the oldest nineteen are kept, whole: the twentieth did not fit"
+        "the oldest are kept, whole: the next did not fit"
     );
-    assert_eq!(withheld(&result, OVER_CAP), Some(1), "{result:?}");
+    assert_eq!(
+        withheld(&result, OVER_CAP),
+        Some(20 - fits as u64),
+        "{result:?}"
+    );
     assert!(selection.truncated);
     let costed: u64 = texts(&result)
         .iter()
         .map(|text| u64::from(kr_voice::token_bound(text)))
         .sum();
     assert_eq!(costed, u64::from(selection.text_tokens), "{result:?}");
-    assert!(selection.text_tokens <= 8_000, "{result:?}");
     assert_eq!(
         u64::from(selection.text_tokens),
-        base_tokens + 19 * 400,
+        base_tokens + fits as u64 * 400,
         "{result:?}"
+    );
+    world.stop().await;
+}
+
+/// KR-REQ-15.20: what the phone sends as the call's opening context is within the cap. The cap is
+/// on the text the provider receives, which holds a line and a label around every item as well as
+/// the items, so a selection of many short decisions, each costing little as text and a good deal
+/// as a line, goes out in no more than eight thousand bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_selection_at_the_cap_is_sent_within_it() {
+    let world = World::start().await;
+    let agent = world.agent();
+    let started = world.started_ms;
+    for i in 0..30u64 {
+        world.said(agent, &format!("m{i:02}"), started + 1 + i);
+    }
+    world.worker().offer_approvals_at(
+        agent,
+        Arc::new(Upstream::default()),
+        None,
+        TimestampMs::new(started + 100),
+        400,
+    );
+
+    let result = world.context().await;
+    assert!(result.selection.truncated, "{result:?}");
+    assert!(
+        result.selection.pending_decisions.len() > 20,
+        "many short decisions were kept: {result:?}"
+    );
+    let sent: usize = kr_client::services::voice_control::call_start_appends(&result.selection)
+        .iter()
+        .map(String::len)
+        .sum();
+    assert!(
+        sent <= kr_protocol::voice::VOICE_CONTEXT_TOKEN_CAP as usize,
+        "{sent} bytes go out"
     );
     world.stop().await;
 }

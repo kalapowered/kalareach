@@ -49,6 +49,23 @@ pub struct Selection {
     pub withheld: Vec<VoiceWithheld>,
 }
 
+/// What the client writes around a selection when it sends it as the call's opening context, which
+/// the cap counts because the cap is on what goes out: the opening line, the note that a selection
+/// was cut short, and their line breaks. Reserved before any item is taken.
+///
+/// The client's `call_start_appends` writes these, and each of them has to stay within what is
+/// reserved here: a longer opening line or note needs this raised first.
+pub const OPENING_FRAMING_BYTES: u32 = 128;
+
+/// What the client writes around each item of a selection: its label, the colon and space after
+/// it, and the line break. Reserved with the item, so that an item is taken only if its text and
+/// this fit. The longest label is `Selected environment_variables`, which with the rest is 33
+/// bytes.
+///
+/// The client's `call_start_appends` writes these, and each label has to stay within what is
+/// reserved here: a longer label needs this raised first.
+pub const ITEM_FRAMING_BYTES: u32 = 40;
+
 /// The reason an item outside the grant's history bound is reported under.
 const OUTSIDE_BOUND: &str = "outside the grant's history lower bound";
 
@@ -304,7 +321,9 @@ fn is_name_character(character: char) -> bool {
 ///
 /// `grant` is the requesting device's, and is the only scope this selection uses. An item outside
 /// its history lower bound is dropped and counted; a class the person did not select is dropped
-/// and counted; and the cap is applied last, over the whole selection.
+/// and counted; and the cap is applied last, over the whole selection. The cap is on what the
+/// client sends, so each item is charged its text and [`ITEM_FRAMING_BYTES`], and the selection
+/// as a whole [`OPENING_FRAMING_BYTES`]; the count a selection reports is its text alone.
 #[must_use]
 pub fn select_context(
     gathered: &GatheredContext,
@@ -313,7 +332,7 @@ pub fn select_context(
     patterns: &SecretPatterns,
 ) -> Selection {
     let lower_bound = grant.history.lower_bound_ms.0.map(TimestampMs::get);
-    let mut budget = Budget::new(VOICE_CONTEXT_TOKEN_CAP);
+    let mut budget = Budget::new(VOICE_CONTEXT_TOKEN_CAP, OPENING_FRAMING_BYTES);
     let mut outside = 0u64;
     let mut over_cap = 0u64;
     let mut not_selected = 0u64;
@@ -510,30 +529,46 @@ pub fn select_context(
     }
 }
 
-/// The token budget, spent whole item by whole item.
+/// The token budget, spent whole item by whole item. What the client writes around the items is
+/// kept apart from their text: it counts against the cap, and the selection does not report it.
 #[derive(Debug)]
 struct Budget {
     cap: u32,
+    /// The text of the items taken.
     spent: u32,
+    /// What is reserved for the client's own writing: the opening, and each item taken.
+    framing: u32,
 }
 
 impl Budget {
-    const fn new(cap: u32) -> Self {
-        Self { cap, spent: 0 }
+    const fn new(cap: u32, opening: u32) -> Self {
+        Self {
+            cap,
+            spent: 0,
+            framing: opening,
+        }
     }
 
-    /// Takes `tokens` from the budget, or refuses and leaves the budget alone.
+    /// Takes `tokens` and the framing of one item from the budget, or refuses and leaves the
+    /// budget alone.
     fn take(&mut self, tokens: u32) -> bool {
-        let Some(after) = self.spent.checked_add(tokens) else {
+        let Some(after) = self
+            .spent
+            .checked_add(self.framing)
+            .and_then(|used| used.checked_add(tokens))
+            .and_then(|used| used.checked_add(ITEM_FRAMING_BYTES))
+        else {
             return false;
         };
         if after > self.cap {
             return false;
         }
-        self.spent = after;
+        self.spent += tokens;
+        self.framing += ITEM_FRAMING_BYTES;
         true
     }
 
+    /// The text of the items taken.
     const fn spent(&self) -> u32 {
         self.spent
     }
@@ -708,6 +743,50 @@ mod tests {
         assert!(selection.selection.text_tokens <= VOICE_CONTEXT_TOKEN_CAP);
         assert!(selection.selection.truncated);
         assert!(selection.withheld.iter().any(|run| run.reason == OVER_CAP));
+    }
+
+    /// The cap is on what the client sends, so what it writes around each item is charged against
+    /// it with the item: many short items cost far more than their text.
+    #[test]
+    fn the_cap_counts_what_the_client_writes_around_each_item() {
+        let decisions: Vec<_> = (0..400u64)
+            .map(|i| ContextItem::new(format!("q{i}"), 3_000 + i))
+            .collect();
+        let gathered = GatheredContext {
+            pending_decisions: decisions,
+            ..gathered()
+        };
+        let selection = select_context(
+            &gathered,
+            &grant(Some(1_000)),
+            &CanonicalSet::from_iter([]),
+            &SecretPatterns::default(),
+        );
+        let carried = &selection.selection;
+        let items = [
+            &carried.session_description,
+            &carried.working_directory,
+            &carried.active_application,
+        ]
+        .into_iter()
+        .filter(|text| !text.is_empty())
+        .count()
+            + carried.pending_decisions.len()
+            + carried.recent_messages.len()
+            + carried.selected.len();
+        let items = u32::try_from(items).expect("a few hundred items");
+        assert!(selection.selection.truncated);
+        assert!(
+            selection.selection.text_tokens + OPENING_FRAMING_BYTES + items * ITEM_FRAMING_BYTES
+                <= VOICE_CONTEXT_TOKEN_CAP,
+            "{:?}",
+            selection.selection
+        );
+        assert!(
+            selection.selection.pending_decisions.len() < 400 / 2,
+            "the framing took most of the cap: {}",
+            selection.selection.pending_decisions.len()
+        );
     }
 
     #[test]
