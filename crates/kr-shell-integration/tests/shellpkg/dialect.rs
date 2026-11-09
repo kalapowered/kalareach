@@ -75,13 +75,14 @@ pub struct Dialect {
     /// never waits for the person, printing `kr-quiet-set`.
     ///
     /// Zsh binds that character to a command that lists what the empty line completes to, which
-    /// is every command the shell knows, and when there are as many of them as its default
-    /// `LISTMAX` or more it asks "do you wish to see all N possibilities" and waits for a key. A
-    /// key sequence that is waiting for its answer is one the reader rightly reports as still in
-    /// progress: a fence answered at the end of the command, before the redraw that draws the
-    /// question, is drained, and one answered at the key or while the question waits is not until
-    /// someone answers. The character is bound to a command that deletes a character, which asks
-    /// nothing whatever the search path holds.
+    /// is every command the shell knows, and when there are as many of them as its limit for
+    /// listing without asking (a hundred, unless a configuration sets another) or more it asks "do
+    /// you wish to see all N possibilities" and waits for a key. A key sequence that is waiting
+    /// for its answer is one the reader rightly reports as still in progress: a fence answered at
+    /// the end of the command, before the redraw that draws the question, is drained, and one
+    /// answered at the key or while the question waits is not until someone answers. The character
+    /// is bound to a command that deletes a character, which asks nothing whatever the search path
+    /// holds.
     pub quiet_own_key: Option<&'static str>,
     /// Opens a continuation reader, and closes it printing `kr-continuation-ok`.
     pub continuation: Option<(&'static str, &'static str)>,
