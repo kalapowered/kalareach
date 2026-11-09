@@ -598,6 +598,46 @@ async fn kr_req_23_24_a_share_whose_store_fails_while_it_is_written_holds_its_su
     assert_eq!(grants_written(&world), 1);
 }
 
+/// KR-REQ-23.24: a store that fails before a share's transaction begins has written nothing, so
+/// the share holds nothing: a repeat of it is told that nothing was shared, and a share of the
+/// subject under a fresh action is admitted and written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_23_24_a_share_whose_store_fails_before_it_is_written_holds_nothing() {
+    let (world, _holding) = world(Holding::default(), holds_question_reads()).await;
+    let owner = owner();
+    let first = viewing(&world, world.session_id, recipient(), 0x71);
+    let second = viewing(&world, world.session_id, recipient(), 0x72);
+
+    let store = beside(&world);
+    store
+        .execute_batch("ALTER TABLE grants RENAME TO grants_aside;")
+        .expect("the grants cannot be read when the share is compiled");
+    let failed = starting(&world, &owner, AuthorityCaller::Owner, &first)
+        .await
+        .await;
+    store
+        .execute_batch("ALTER TABLE grants_aside RENAME TO grants;")
+        .expect("the grants can be read again");
+    drop(store);
+    assert_eq!(refused(&failed).code(), ErrorCode::StorageUnavailable);
+    assert_eq!(grants_written(&world), 0);
+
+    let told = refusal_in(
+        world
+            .controller
+            .retained_authority_answer(&owner, &first)
+            .await,
+    );
+    assert_eq!(told.code, ErrorCode::DraftConflict, "{told:?}");
+    assert!(told.message.contains("nothing was shared"), "{told:?}");
+    starting(&world, &owner, AuthorityCaller::Owner, &second)
+        .await
+        .await
+        .into_answer()
+        .expect("a share of the subject is admitted: the failed one held nothing");
+    assert_eq!(grants_written(&world), 1);
+}
+
 /// KR-REQ-23.24: a share a build before identities were scoped to the actor wrote is not called
 /// unperformed by its absence under the identities the actor derives now, since the host cannot say
 /// whose it was: a claim that never recorded its answer, beside a share under the earlier
