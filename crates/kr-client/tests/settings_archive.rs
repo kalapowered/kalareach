@@ -757,19 +757,24 @@ fn payload_encodings(payload: &kr_protocol::archive::ManifestPayload) -> Vec<(St
 /// its descriptor, its writer's key identifier, its time and its signature; the descriptor as
 /// canonical bytes; the manifest object decrypted whole, as a `ManifestPayload`, with the signed
 /// manifest and every member key wrap (the sealed keys and the clear context fields of the wraps
-/// among them, so an unused wrap is read too), once as canonical bytes and once as JSON; the
-/// settings member's plaintext; and every request sent to the storage and manifest services, each
+/// among them), once as canonical bytes and once as JSON, with its wraps counted (one for each
+/// member and each recipient of the archive, so none is unused and none is a key sealed in place of
+/// a member's); the settings member's plaintext; and every request sent to the storage and manifest services, each
 /// body, the content beside it and the account token. Each key is looked for as bytes, in
 /// hexadecimal of either case, in either base64 alphabet wherever it lies in a longer value, and as
-/// a list of numbers. The controls are the scan finding a key where one is put, in the sealed key of
-/// an unused wrap and in a clear context field of one, in both encodings of the payload; the
-/// writer's public key in the bundle; the writer's key identifier in the publication; and the
-/// manifest object's ciphertext in the contents sent. Not shown here: the bundle's ciphertext as
-/// the owner's sync service holds it and the stored bytes of the objects, which are read only as
-/// the ciphertext sent (a key sealed inside them is read through the opened bundle and archive); a
-/// key in a binary list of integers, split, reversed or otherwise transformed; the seed of the
-/// recovery kit, which is not an endpoint or a control key; or the other data paths of backup and
-/// recovery material.
+/// a list of numbers. The controls are the scan finding a key where one is put, in each form and
+/// inside a longer base64 value, in the sealed key of a wrap and in a clear context field of one, in
+/// both encodings of the payload; the writer's public key in the bundle; the writer's key
+/// identifier in the publication; and the manifest object's ciphertext in the contents sent. The
+/// producer is given the device's authorisation and stored-envelope keys only, so no assertion
+/// here can fail for the transport seed, the notification preview seed or the preview private key,
+/// which are looked for all the same. Not shown here: the bundle's ciphertext as the owner's sync
+/// service holds it and the stored bytes of the objects, which are read only as the ciphertext sent
+/// (a key sealed inside them is read through the opened bundle and archive); the parts of a request
+/// the stand-in does not keep (its headers other than the token, a query on its path, the
+/// signature block beyond the body); a key in a binary list of integers, split, reversed or
+/// otherwise transformed; the seed of the recovery kit, which is not an endpoint or a control key;
+/// or the other data paths of backup and recovery material.
 #[tokio::test]
 async fn the_settings_archive_holds_none_of_the_private_keys_the_device_keeps() {
     let keys = DeviceKeys::generate().expect("a device's keys");
@@ -884,6 +889,25 @@ async fn the_settings_archive_holds_none_of_the_private_keys_the_device_keeps() 
             "the scan misses a key {form}"
         );
     }
+    for alphabet in ["base64url", "base64"] {
+        for before in 0..3 {
+            let mut longer = vec![0x5a_u8; before];
+            longer.extend_from_slice(probe);
+            longer.extend_from_slice(b"tail");
+            let encoded = kr_protocol::scalars::to_base64url(&longer);
+            let encoded = if alphabet == "base64" {
+                encoded.replace('-', "+").replace('_', "/")
+            } else {
+                encoded
+            };
+            let value = format!("{{\"k\":\"{encoded}\"}}").into_bytes();
+            assert!(
+                carried_in(&value, probe).is_some(),
+                "the scan misses a key inside a longer {alphabet} value that starts {before} \
+                 bytes before it"
+            );
+        }
+    }
     let list = format!(
         "{{\"k\":[\n  {}\n]}}",
         probe
@@ -898,7 +922,30 @@ async fn the_settings_archive_holds_none_of_the_private_keys_the_device_keeps() 
         Some("as a list of numbers")
     );
     let wraps = &payload.member_key_wraps;
-    assert!(!wraps.is_empty(), "the manifest object holds wraps");
+    // No wrap is unused: one for the member and each recipient the descriptor wraps the manifest
+    // key for, and no other.
+    let recipients: Vec<_> = descriptor
+        .manifest_key_wraps
+        .iter()
+        .map(|wrap| wrap.context.recipient_key_id)
+        .collect();
+    assert_eq!(
+        wraps.len(),
+        payload.manifest.manifest.objects.len() * recipients.len(),
+        "the manifest object holds a wrap that is not for a member and a recipient of the archive"
+    );
+    for entry in &payload.manifest.manifest.objects {
+        for recipient in &recipients {
+            let wanted = wraps
+                .iter()
+                .filter(|wrap| {
+                    wrap.context.object_id == entry.object.object_id
+                        && wrap.context.recipient_key_id == *recipient
+                })
+                .count();
+            assert_eq!(wanted, 1, "one wrap for each member and recipient");
+        }
+    }
     let probe_hash: [u8; 32] = probe.as_slice().try_into().expect("a 32-byte seed");
     for (where_, in_the_sealed_key) in [
         ("the sealed key of an unused wrap", true),

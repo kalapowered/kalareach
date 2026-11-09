@@ -4094,8 +4094,9 @@ fn x25519_secret_of(seed: &[u8]) -> Vec<u8> {
 /// It reads, each on its own: the descriptor as the host recorded it when it sealed the generation
 /// (it is not encrypted); the manifest object decrypted whole, as a `ManifestPayload`, with the
 /// signed manifest and every member key wrap (the sealed keys and the clear context fields of the
-/// wraps among them, so an unused wrap is read too), once as the bytes of its canonical encoding and
-/// once as the JSON a client would see; each member's plaintext, so a member that shares a name
+/// wraps among them), once as the bytes of its canonical encoding and once as the JSON a client
+/// would see, with its wraps counted (one for each member and each recipient of the archive, so none
+/// is unused and none is a key sealed in place of a member's); each member's plaintext, so a member that shares a name
 /// with another is read as well; the publication as the service holds it, with its descriptor, its
 /// writer's key identifier, its time and its signature; and every request the daemon sent the
 /// service, each body, the content beside it and the account token. It asserts the service holds no
@@ -4103,14 +4104,15 @@ fn x25519_secret_of(seed: &[u8]) -> Vec<u8> {
 /// one the host recorded. Each key is looked for as bytes, in hexadecimal of either case, in either
 /// base64 alphabet wherever it lies in a longer value, and as a list of numbers. The controls are
 /// the scan finding each form of a seed where one is put, in a member of the same name as another,
-/// in the sealed key of an unused wrap and in a clear context field of one, in both encodings of
-/// the payload; the session's own output in the session's member; the writer's key identifier in the
+/// in the sealed key of a wrap and in a clear context field of one, in both encodings of the
+/// payload; the session's own output in the session's member; the writer's key identifier in the
 /// publication; and the manifest object's ciphertext in the contents the daemon sent, so the scan
 /// reads what was sent. Not shown here: the stored bytes of the objects, which are read only as
-/// the ciphertext the daemon sent (a key sealed inside them is read through the opened archive); a
-/// key in a binary list of integers, split, reversed or otherwise transformed; that a restore
-/// refuses a member under a reserved name or a revoked grant, which the restore cases show; or the
-/// other data paths of backup and recovery material.
+/// the ciphertext the daemon sent (a key sealed inside them is read through the opened archive); the
+/// parts of a request the stand-in does not keep (its headers other than the token, a query on its
+/// path, the signature block beyond the body); a key in a binary list of integers, split, reversed
+/// or otherwise transformed; that a restore refuses a member under a reserved name or a revoked
+/// grant, which the restore cases show; or the other data paths of backup and recovery material.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_generation_the_host_makes_holds_none_of_the_private_keys_the_host_keeps() {
     use kr_crypto::backup::{Material, may_back_up, member_material};
@@ -4313,10 +4315,7 @@ async fn a_generation_the_host_makes_holds_none_of_the_private_keys_the_host_kee
     // The manifest object whole: an unused wrap that holds a key, in its sealed key or in a clear
     // context field, is found in both encodings of the payload.
     let wraps = &generation.payload.member_key_wraps;
-    assert!(
-        wraps.len() >= generation.members.len(),
-        "the manifest object holds a wrap for each member"
-    );
+    assert!(!wraps.is_empty(), "the manifest object holds wraps");
     let probe_hash: [u8; 32] = probe.as_slice().try_into().expect("a 32-byte seed");
     for (where_, in_the_sealed_key) in [
         ("the sealed key of an unused wrap", true),
@@ -4362,6 +4361,35 @@ async fn a_generation_the_host_makes_holds_none_of_the_private_keys_the_host_kee
         carried_in(&publication, rig.writer.key_id().as_bytes()).is_some(),
         "the scan does not read the publication's writer"
     );
+
+    // No wrap is unused: the manifest object holds one wrap for each member and each recipient the
+    // descriptor wraps the manifest key for, and no other, so a wrap sealed to the recovery
+    // recipient that is not the key of a member would make a count or a pair wrong.
+    let recipients: Vec<_> = held_publication
+        .payload
+        .descriptor
+        .manifest_key_wraps
+        .iter()
+        .map(|wrap| wrap.context.recipient_key_id)
+        .collect();
+    let objects = &generation.payload.manifest.manifest.objects;
+    assert_eq!(
+        wraps.len(),
+        objects.len() * recipients.len(),
+        "the manifest object holds a wrap that is not for a member and a recipient of the archive"
+    );
+    for entry in objects {
+        for recipient in &recipients {
+            let wanted = wraps
+                .iter()
+                .filter(|wrap| {
+                    wrap.context.object_id == entry.object.object_id
+                        && wrap.context.recipient_key_id == *recipient
+                })
+                .count();
+            assert_eq!(wanted, 1, "one wrap for each member and recipient");
+        }
+    }
 
     // Every request the daemon sent the service: the document, the content beside it, the token.
     let mut sent = Vec::new();
