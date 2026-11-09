@@ -946,11 +946,14 @@ fn host_private_keys(rig: &Rig) -> Vec<(String, Vec<u8>)> {
 /// against the public key the pair has. Each key is looked for as bytes, in hexadecimal of either
 /// case, in either base64 alphabet wherever it lies in a longer value, and as a list of numbers.
 /// The controls are the scan finding a key in each of those forms where one is put; the kit's seed
-/// line in the terminal's transcript; the host's writer key in the bundle; and the bundle's
-/// ciphertext in the call and in what the daemon sent, so the scan reads what was shown and sent. Not shown here: a key in a binary list of integers, split, reversed or otherwise
-/// transformed; the files of the host, which hold the keys themselves in the secret store; the
-/// daemon's later requests (the backups it makes), which the production case reads; or the other
-/// data paths of backup and recovery material.
+/// line (printed from the kit as parsed) in the terminal's transcript; the host's writer key in the
+/// bundle; and the bundle's ciphertext in the call and in what the daemon sent, so the scan reads
+/// what was shown and sent. Not shown here: a key in a binary list of integers, split, reversed or
+/// otherwise transformed; the files of the host, which hold the keys themselves in the secret
+/// store; the parts of a request the stand-in does not keep (its headers other than the token, a
+/// query on its path, the signature block beyond the body); the daemon's later requests (the
+/// backups it makes), which the production case reads; or the other data paths of backup and
+/// recovery material.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn what_setup_shows_and_sends_holds_none_of_the_private_keys_the_host_keeps() {
     let rig = Rig::start().await;
@@ -1039,8 +1042,16 @@ async fn what_setup_shows_and_sends_holds_none_of_the_private_keys_the_host_keep
         carried_in(&list, probe).as_deref(),
         Some("as a list of numbers")
     );
+    // The seed's printed line is made from the kit as parsed, not cut from the terminal's text.
+    let printed = kr_client::recovery::render_kit(&parsed)
+        .expect("the kit's text")
+        .to_string();
+    let seed_line = printed
+        .lines()
+        .find_map(|line| line.strip_prefix("seed: "))
+        .expect("a seed line");
     assert!(
-        carried_in(&transcript, kit.seed_line().as_bytes()).is_some(),
+        carried_in(&transcript, seed_line.as_bytes()).is_some(),
         "the scan does not read the terminal's transcript"
     );
     let writer = rig
