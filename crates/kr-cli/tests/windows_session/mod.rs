@@ -771,37 +771,47 @@ impl Drop for WorkerHost {
             task.abort();
         }
         drop(self.controller.take());
-        let lock = self.tree.environment().singleton_lock();
-        let environment_id = self.tree.environment_id();
-        let begun = std::time::Instant::now();
-        let problem = loop {
-            match kr_controller::singleton::SingletonLock::hold(&lock, environment_id) {
-                Ok(held) => {
-                    drop(held);
-                    break None;
-                }
-                Err(kr_controller::error::ControllerError::AlreadyRunning { .. })
-                    if begun.elapsed() < LIVENESS_DEADLINE =>
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => break Some(error),
-            }
-        };
         // A case that is already failing is not made to panic twice, and the tree is still let go
         // of below: the fields go after this.
-        if let Some(error) = problem {
-            assert!(
-                std::thread::panicking(),
-                "the daemon still held {} {:?} after the host let go of it: {error}",
-                lock.display(),
-                begun.elapsed()
-            );
+        if let Err(held) = wait_for_the_lock(&self.tree.environment()) {
+            assert!(std::thread::panicking(), "{held}");
         }
     }
 }
 
-/// What the tree's removal left, looked at once the tree has been dropped.
+/// Waits until the lock of `environment`'s daemon can be taken, which is when the daemon value is
+/// gone, and says what it saw when the liveness deadline passes first.
+///
+/// The daemon holds `controller.lock` until the daemon value itself is gone, and that is an open
+/// file that shares nothing. A host that lets go of its daemon calls this before it removes the
+/// tree, so that the removal is not refused for it.
+pub fn wait_for_the_lock(environment: &kr_ipc::paths::EnvironmentPaths) -> Result<(), String> {
+    let lock = environment.singleton_lock();
+    let begun = std::time::Instant::now();
+    loop {
+        match kr_controller::singleton::SingletonLock::hold(&lock, environment.environment_id()) {
+            Ok(held) => {
+                drop(held);
+                return Ok(());
+            }
+            Err(kr_controller::error::ControllerError::AlreadyRunning { .. })
+                if begun.elapsed() < LIVENESS_DEADLINE =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "the daemon still held {} {:?} after it was let go of: {error}",
+                    lock.display(),
+                    begun.elapsed()
+                ));
+            }
+        }
+    }
+}
+
+/// What the tree's removal left, looked at once the tree has been dropped; or the removal itself,
+/// for a tree that nothing else removes.
 ///
 /// The tree's own removal ignores a refusal, so a tree whose removal is refused is left in the
 /// temporary folder with nothing said. This removes what is left, again, for as long as the
@@ -813,7 +823,7 @@ impl Drop for WorkerHost {
 /// and the code, not measured. A case that is failing is left as it is, and so is a tree that was
 /// kept on purpose because something it started could not be shown to have ended: that one is said
 /// by the tree, with a failure of its own.
-struct TreeGone(PathBuf);
+pub struct TreeGone(pub PathBuf);
 
 impl Drop for TreeGone {
     fn drop(&mut self) {

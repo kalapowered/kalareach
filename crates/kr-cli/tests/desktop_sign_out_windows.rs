@@ -35,7 +35,7 @@ mod support;
 mod teardown;
 mod windows_session;
 
-use windows_session::{LIVENESS_DEADLINE, Prepared};
+use windows_session::{LIVENESS_DEADLINE, Prepared, TreeGone, wait_for_the_lock};
 
 /// The switch that says a case may sign the account that runs it out, which is for an account that
 /// is disposable.
@@ -309,12 +309,17 @@ async fn a_desktop_bound_session_is_made_and_the_account_signed_out() {
 }
 
 /// A daemon hosted on a state directory an earlier process left, as the daemon of the account's next
-/// sign-in would be.
+/// sign-in would be. The tree is this daemon's to take away: when this is dropped the daemon is let
+/// go of, its lock is waited for, and the tree is removed again for as long as the removal is
+/// refused, which fails a case that is not failing already when the tree is still there at the
+/// liveness deadline.
 struct Reopened {
     root: PathBuf,
     environment: kr_ipc::paths::EnvironmentPaths,
     serving: Vec<tokio::task::JoinHandle<kr_controller::Result<()>>>,
     controller: Option<Arc<kr_controller::service::Controller>>,
+    /// Last, so that it removes the tree once the daemon is gone.
+    _gone: TreeGone,
 }
 
 impl Reopened {
@@ -372,6 +377,7 @@ impl Reopened {
             tokio::spawn(Arc::clone(&controller).serve_clients(clients)),
         ];
         Self {
+            _gone: TreeGone(root.clone()),
             root,
             environment,
             serving,
@@ -413,11 +419,23 @@ impl Reopened {
 }
 
 impl Drop for Reopened {
+    /// Ends the daemon before the tree goes.
+    ///
+    /// The daemon holds `controller.lock` until the daemon value itself is gone, and that is an open
+    /// file that shares nothing, which the removal of the folder it is in is refused for. So the
+    /// tasks that serve are cancelled, the daemon is let go of, and the lock is waited for; the
+    /// tree is removed after that, by the field that follows. The wait needs another thread of the
+    /// runtime to cancel the aborted tasks, so a case that holds this runs on the multi-thread
+    /// runtime.
     fn drop(&mut self) {
         for task in &self.serving {
             task.abort();
         }
         drop(self.controller.take());
+        // A case that is already failing is not made to panic twice.
+        if let Err(held) = wait_for_the_lock(&self.environment) {
+            assert!(std::thread::panicking(), "{held}");
+        }
     }
 }
 
@@ -461,6 +479,29 @@ impl Drop for RegisteredTask {
     }
 }
 
+/// A daemon hosted on a tree an earlier process left takes the tree with it when it is let go of,
+/// and the tree is not left in the temporary folder.
+///
+/// The daemon holds `controller.lock` until the daemon value itself is gone, and that is an open
+/// file that shares nothing: the removal of the folder it is in is refused for as long as it is
+/// held. The tree is what the case that follows a sign-out is given, made here the way the first
+/// half makes it, and nothing of it is let go of by the process that made it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_hosted_on_a_tree_an_earlier_process_left_takes_the_tree_with_it() {
+    let earlier = kr_ipc::testing::TempHost::create();
+    let tree = earlier.root().to_path_buf();
+    std::mem::forget(earlier);
+
+    let daemon = Reopened::start(tree.clone()).await;
+    assert!(tree.exists(), "the daemon runs on a tree that is there");
+    drop(daemon);
+    assert!(
+        !tree.exists(),
+        "{} is left in the temporary folder",
+        tree.display()
+    );
+}
+
 /// KR-REQ-03.23, the second half: after the sign-out, the session closes with `desktop_lost`.
 ///
 /// Run in the account's next sign-in, by what the half before recorded. The worker and the root
@@ -470,8 +511,8 @@ impl Drop for RegisteredTask {
 /// as a crash of the worker, recorded after the sign-out began. A session made in this login is
 /// the control: it is bound to a different login than the old one, the platform reads it as
 /// present, and the old one still as ended. The control session is closed and its processes shown
-/// ended before the first half's task is deleted and its tree is removed, as far as the system lets
-/// this process remove it.
+/// ended before the daemon is let go of, which waits for its lock and removes the first half's tree,
+/// and the first half's task is deleted after that. A tree that is left fails the case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = follows_a_sign_out!()]
 async fn after_a_sign_out_the_desktop_bound_session_is_closed_with_desktop_lost() {
@@ -620,16 +661,13 @@ async fn after_a_sign_out_the_desktop_bound_session_is_closed_with_desktop_lost(
         }
     }
 
-    // What the first half left in the account's temporary directory goes, the entry with it.
+    // What the first half left in the account's temporary directory goes, the entry with it. The
+    // tree goes with the daemon, which waits for its own lock and removes it again while the
+    // removal is refused, so a tree that is left fails this case, and does not wait for the
+    // removal of the account's profile.
     drop(daemon);
+    assert!(!tree.exists(), "{} is removed", tree.display());
     task.delete().unwrap_or_else(|why| panic!("{why}"));
-    // The tree is in the account's own temporary directory, which the run removes with the
-    // account's profile. A file of it that the daemon of this process still holds, which the
-    // aborted tasks of the daemon may do until this process ends, keeps it until then, and is said
-    // here and not refused.
-    if let Err(error) = std::fs::remove_dir_all(&tree) {
-        eprintln!("{} is not removed yet: {error}", tree.display());
-    }
     std::fs::remove_file(&path).expect("the record is removed");
 }
 
