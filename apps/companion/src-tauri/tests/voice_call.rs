@@ -789,11 +789,12 @@ async fn a_call_whose_opening_context_the_service_refuses_goes_on_and_says_so() 
 
     let started = scene.start().await;
     assert!(started["value"]["outcome"]["started"].is_object());
+    let refused = "the voice service did not take all of it";
     let warned = scene
-        .state_where("the warning that the context was not given", |state| {
+        .state_where("the warning that the service did not take the context", |state| {
             state["warning"]
                 .as_str()
-                .is_some_and(|warning| warning.contains("not given all of the host's context"))
+                .is_some_and(|warning| warning.contains(refused))
         })
         .await;
     assert_eq!(warned["running"], true, "the call went on: {warned}");
@@ -806,6 +807,15 @@ async fn a_call_whose_opening_context_the_service_refuses_goes_on_and_says_so() 
     scene
         .call("voice_stop", json!({ "voiceSessionId": null }))
         .expect("the call ends");
+    // The page reads the warning once the call has ended: it stands then.
+    scene
+        .state_where("the ended call's warning", |state| {
+            state["running"] == false
+                && state["warning"]
+                    .as_str()
+                    .is_some_and(|warning| warning.contains(refused))
+        })
+        .await;
     scene.stop_host().await;
 }
 
