@@ -7267,3 +7267,65 @@ async fn a_confirmation_waiting_for_the_person_is_dropped_when_the_host_is_lost(
     hang_up(&scene);
     scene.stop_host().await;
 }
+
+/// A challenge the owner reads after the path to the host was lost is put to nobody, though the host
+/// is back by then: what was handed over before a loss is not carried on after it. The answer is
+/// held on its way to the owner until the loss has been read and the host is reachable again, which
+/// no timing of the cases could arrange.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_challenge_read_after_the_host_was_lost_is_put_to_nobody() {
+    let mut scene = closing().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    let calls = scene.phone.companion.app.state::<Calls>();
+    calls.hold_the_next_delivery();
+    let end = say_close(&scene, 6_000).await;
+    ask(&scene, "d-1", end - 200).await;
+    // The host has answered with a challenge and the owner has not been told.
+    calls.until_a_delivery_is_held().await;
+
+    scene.link.unreachable(true);
+    lose_the_host(&scene);
+    scene
+        .state_where("the host lost", |state| state["host"] == "lost")
+        .await;
+    scene.link.unreachable(false);
+    scene
+        .state_where("the host back", |state| state["host"] == "reachable")
+        .await;
+    calls.release_the_delivery();
+
+    let row = row_reaching(&scene, "d-1", "cancelled").await;
+
+    assert_eq!(row["cause"], "host_lost", "{row}");
+    assert!(scene.ceremony.asked().is_empty(), "nobody was asked");
+    assert_eq!(at_the_host(&scene), 1, "no signature was sent");
+    assert!(!scene.is_closed().await);
+    hang_up(&scene);
+    scene.stop_host().await;
+}
+
+/// A call that ends while the dialog's lookup of the session's number is still waiting asks nobody:
+/// the person is not asked to confirm what can no longer be sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmation_is_not_asked_once_the_call_has_ended() {
+    let mut scene = closing().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    scene.link.hold_next_request(HostMethod::SessionRead);
+    let end = say_close(&scene, 6_000).await;
+    ask(&scene, "d-1", end - 200).await;
+    // The lookup of the session's number, which the dialog waits for, is held.
+    scene.link.until_request_held().await;
+    hang_up(&scene);
+    scene
+        .state_where("the call ended", |state| state["running"] == false)
+        .await;
+    scene.link.release_request();
+
+    until_the_ceremony_is_handled(&scene, "d-1").await;
+
+    assert!(scene.ceremony.asked().is_empty(), "nobody was asked");
+    assert_eq!(at_the_host(&scene), 1, "no signature was sent");
+    scene.stop_host().await;
+}

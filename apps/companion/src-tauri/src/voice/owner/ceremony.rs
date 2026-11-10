@@ -183,6 +183,8 @@ impl Owner {
             // confirmation is still open and the phone's clock does not say it has run out, and
             // for what is left of it.
             if !still_open.load(Ordering::SeqCst) {
+                #[cfg(any(test, feature = "testing"))]
+                shared.handled.ceremony(&id);
                 return;
             }
             let now = shared.confirmation_now_ms();
