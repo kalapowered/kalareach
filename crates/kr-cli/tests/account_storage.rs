@@ -67,7 +67,8 @@ fn document(voice: Option<&str>, storage: Option<&str>) -> ConfigurationDocument
 /// A host tree, its running daemon, and the file a debug `kr` writes the address it would open to.
 struct Host {
     temp: kr_ipc::testing::TempHost,
-    controller: Arc<Controller>,
+    /// Held so that the daemon runs for as long as the host does.
+    _controller: Arc<Controller>,
     clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
     opened: PathBuf,
 }
@@ -133,7 +134,7 @@ impl Host {
         let opened = temp.root().join("opened-address");
         Self {
             temp,
-            controller,
+            _controller: controller,
             clients,
             opened,
         }

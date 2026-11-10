@@ -40,7 +40,6 @@ const CODE: &str = "the-code";
 #[derive(Clone, Debug)]
 struct Seen {
     path: String,
-    authorization: Option<String>,
     form: BTreeMap<String, String>,
 }
 
@@ -215,7 +214,6 @@ async fn answer(mut stream: TcpStream, record: &Mutex<Vec<Seen>>, state: &Mutex<
             .collect();
     record.lock().expect("what was seen").push(Seen {
         path: path.clone(),
-        authorization: authorization.clone(),
         form: form.clone(),
     });
     let (status, body) = account_answer(state, &path, authorization.as_deref(), &form);
@@ -619,16 +617,12 @@ async fn a_storage_sign_in_is_kept_and_ended_at_the_storage_service_and_leaves_t
     let refresh_token = storage.refresh_token();
     let action = ActionId::new(kr_ipc::new_uuid());
     let mut client = host.client().await;
-    let first: AccountSignedOut = mutate_on(
-        &mut client,
-        &host,
-        Method::AccountStorageSignOut,
-        action.clone(),
-    )
-    .await
-    .expect("the sign-out is answered")
-    .to_typed()
-    .expect("a sign-out answer");
+    let first: AccountSignedOut =
+        mutate_on(&mut client, &host, Method::AccountStorageSignOut, action)
+            .await
+            .expect("the sign-out is answered")
+            .to_typed()
+            .expect("a sign-out answer");
     assert!(first.was_signed_in && first.service_told, "{first:?}");
     assert!(!storage_file.exists(), "the grant is removed");
     assert_eq!(
