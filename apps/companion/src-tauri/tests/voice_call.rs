@@ -6250,6 +6250,38 @@ async fn what_a_delegation_dropped_with_the_host_would_have_read_answers_no_othe
     scene.stop_host().await;
 }
 
+/// A delegation announced while the path to the host is lost is dropped at once, and spends what it
+/// would have read: once the host is back, another delegation announced at the same offset has
+/// nothing to answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_a_delegation_announced_with_the_host_lost_would_have_read_answers_no_other() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    let end = speak(&scene, 6_000, "what is the status");
+    scene.link.unreachable(true);
+    lose_the_host(&scene);
+    scene
+        .state_where("the host lost", |state| state["host"] == "lost")
+        .await;
+    ask(&scene, "d-1", end - 200).await;
+    let dropped = row_reaching(&scene, "d-1", "not_sent").await;
+    assert_eq!(dropped["cause"], "host_lost");
+    scene.link.unreachable(false);
+    scene
+        .state_where("the host back", |state| state["host"] == "reachable")
+        .await;
+
+    ask(&scene, "d-2", end - 200).await;
+
+    let row = row_settled(&scene, "d-2").await;
+    assert_eq!(row["state"], "refused", "{row}");
+    assert_eq!(row["cause"], "empty");
+    assert_eq!(at_the_host(&scene), 0, "nothing reached the host");
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
 /// A set refused because the news was not read up to the marker in time is spent too: another
 /// delegation announced at the same offset, with nothing new said, has nothing to answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
