@@ -99,6 +99,13 @@ impl Rig {
         Self::start_at(Arc::new(serve().await), |_| {}).await
     }
 
+    /// A host whose storage service is one its owner runs: the stand-in is another service than
+    /// the managed account service, as it is for a shipped daemon, and the host is signed in at it
+    /// for storage.
+    async fn start_owner_run() -> Self {
+        Self::start_over(Arc::new(serve().await), |_| {}, true).await
+    }
+
     /// A host that stands before its daemon starts as `prepare` leaves it.
     async fn start_with(prepare: impl FnOnce(&kr_ipc::testing::TempHost)) -> Self {
         Self::start_at(Arc::new(serve().await), prepare).await
@@ -108,6 +115,16 @@ impl Rig {
     async fn start_at(
         served: Arc<Served>,
         prepare: impl FnOnce(&kr_ipc::testing::TempHost),
+    ) -> Self {
+        Self::start_over(served, prepare, false).await
+    }
+
+    /// As [`Self::start_at`], with the daemon given no standing for the stand-in as the managed
+    /// account service when `owner_run`.
+    async fn start_over(
+        served: Arc<Served>,
+        prepare: impl FnOnce(&kr_ipc::testing::TempHost),
+        owner_run: bool,
     ) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
         let work = temp.root().join("w");
@@ -127,7 +144,7 @@ impl Rig {
         let controller = kr_controller::testing::taken_over(|| {
             let secrets = secrets.clone();
             kr_controller::testing::with_account_origin(
-                Some(origin.clone()),
+                (!owner_run).then(|| origin.clone()),
                 Controller::start_on_timer(
                     ControllerSetup {
                         paths: environment.clone(),
@@ -1297,6 +1314,47 @@ async fn setting_up_again_needs_replace_and_a_replacement_changes_the_kit() {
     assert_eq!(rig.recorded_kit().await, Some(second_fingerprint));
     assert!(rig.served.web().bundle(first.locator()).is_some());
     assert!(rig.served.web().bundle(second.locator()).is_some());
+}
+
+/// A host whose storage service is one its owner runs is set up there by the same command: the plan
+/// and the kit name that service, the bundle is written there, and the host's account at that
+/// service, which the command does not name, is the one that carries it. The control is the
+/// managed service, set up as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_whose_storage_is_a_service_its_owner_runs_is_set_up_there_and_the_kit_names_it() {
+    let rig = Rig::start_owner_run().await;
+    let mut window = Window::run(&rig, &["backup", "setup"]);
+    let kit = window.bring_up_the_kit();
+    window.confirm(&kit);
+    let shown = window.wait_for("kr ended 0");
+    assert!(shown.contains("Backups are set up."), "{shown}");
+
+    let parsed = parse_kit(&kit.text).expect("the kit shown is a recovery kit");
+    assert_eq!(
+        parsed.service_origins,
+        [rig.origin().to_owned()],
+        "the kit names the service the owner runs"
+    );
+    assert!(
+        rig.served.web().bundle(kit.locator()).is_some(),
+        "the service the owner runs holds the bundle"
+    );
+    assert_eq!(rig.recorded_kit().await, Some(kit.fingerprint()));
+    assert!(
+        rig.controller
+            .storage_account()
+            .token_scopes_asked()
+            .iter()
+            .any(|scope| scope == "backup.write"),
+        "the host's account at that service carried the setup"
+    );
+    assert!(
+        rig.controller
+            .host_account()
+            .token_scopes_asked()
+            .is_empty(),
+        "the managed account carried none of it"
+    );
 }
 
 /// Ctrl-C at a question ends the command with the terminal as it was found and nothing sent: at the

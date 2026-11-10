@@ -200,8 +200,10 @@ fn lines(report: &AccountReport) -> Vec<Line> {
              right; otherwise the daemon's log says why."
         )),
         (_, Some(SignInUnavailable::NoManagedService)) | (None, None) => lines.push(stdout_line!(
-            "This host names no managed service: set voice.broker_origin, storage.origin or \
-             relay.origin in its configuration document to the managed account service's origin."
+            "This host names no managed service: set voice.broker_origin or relay.origin in its \
+             configuration document to the managed account service's origin to use managed voice \
+             or relay leases. A storage.origin that names a service you run has an account of its \
+             own: `kr account sign-in --storage` signs this host in there."
         )),
     }
     match &report.state {

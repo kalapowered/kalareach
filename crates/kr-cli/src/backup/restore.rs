@@ -870,9 +870,10 @@ async fn explain<P: Privacy>(
         RestoreError::BundleAbsent => CliError::Other(Shown::said(
             "the storage service holds no recovery bundle for this account at that locator. The \
              service may not have accepted this host's sign-in (sign in again with `kr account \
-             sign-in`), this host may be signed in to another account than the one that holds \
-             the backup (`kr account show` says which), or the locator may have been copied \
-             wrongly",
+             sign-in`, or with `kr account sign-in --storage` when storage.origin names a \
+             service you run), this host may be signed in to another account than the one that \
+             holds the backup (`kr account show` says which), or the locator may have been \
+             copied wrongly",
         )),
         RestoreError::SeveralArchives { count, candidates } => {
             let mut lines = vec![shown!(
@@ -930,7 +931,8 @@ async fn explain<P: Privacy>(
                     ErrorCode::PermissionDenied,
                     Shown::said(
                         "the storage service did not accept this host's sign-in; sign this host \
-                         in again with `kr account sign-in`",
+                         in again with `kr account sign-in`, or with `kr account sign-in \
+                         --storage` when storage.origin names a service you run",
                     ),
                 ),
                 None => CliError::Refused(refusal),

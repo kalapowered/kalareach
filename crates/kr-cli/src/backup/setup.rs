@@ -120,6 +120,7 @@ pub async fn run(
         stage: Stage::Asking,
         replacing: None,
         kit: None,
+        storage: false,
     };
 
     // The connection that reads the status is let go of before the dialogue begins: a person can
@@ -133,6 +134,7 @@ pub async fn run(
     };
     let ready = Ready::of(&status, arguments.replace)?;
     dialogue.replacing = ready.replacing.clone();
+    dialogue.storage = ready.storage;
 
     show_the_plan(&ready);
     let go = dialogue
@@ -205,7 +207,7 @@ pub async fn run(
             Ended::Declined(cause) => {
                 report::say(&shown!(
                     "Backups were not set up: {}.",
-                    declined_words(&cause)
+                    declined_words(&cause, dialogue.storage)
                 ));
                 if offers > 0 && mendable(&cause) {
                     offers -= 1;
@@ -251,6 +253,8 @@ struct Dialogue {
     replacing: Option<String>,
     /// The fingerprint of the kit, once it has been shown.
     kit: Option<Shown>,
+    /// Whether the storage service is one the person runs, which has an account of its own.
+    storage: bool,
 }
 
 impl Dialogue {
@@ -347,7 +351,7 @@ impl Dialogue {
                         report::say(&shown!(
                             "The daemon declined the call: {}. An earlier try of this call may \
                              have set backups up under this kit.",
-                            declined_words(&cause)
+                            declined_words(&cause, self.storage)
                         ));
                         return Ok(Ended::Unknown);
                     }
@@ -541,6 +545,9 @@ struct Ready {
     privacy_mode: bool,
     /// The fingerprint of the setup this one replaces.
     replacing: Option<String>,
+    /// Whether the storage service is one the person runs, and not the managed one: the daemon
+    /// reaches it with an account of its own, which `kr account sign-in --storage` signs in.
+    storage: bool,
 }
 
 impl Ready {
@@ -579,14 +586,16 @@ impl Ready {
                 Some(kit_fingerprint.clone())
             }
         };
+        let storage = origin != kr_client::services::account::ACCOUNT_ORIGIN;
         if !matches!(status.sign_in, BackupSignIn::Usable) {
-            return Err(CliError::Usage(sign_in_words(status.sign_in)));
+            return Err(CliError::Usage(sign_in_words(status.sign_in, storage)));
         }
         Ok(Self {
             origin: origin.clone(),
             keys: keys.clone(),
             privacy_mode: status.privacy_mode,
             replacing,
+            storage,
         })
     }
 }
@@ -623,38 +632,50 @@ fn already_set_up(fingerprint: &str, unusable: Option<BackupUnusable>) -> CliErr
     CliError::Usage(words)
 }
 
-/// What a sign-in that cannot carry a backup request says, and what mends it.
-fn sign_in_words(sign_in: BackupSignIn) -> Shown {
-    Shown::said(match sign_in {
-        BackupSignIn::Usable => "this host's sign-in could not be used just now: try again",
-        BackupSignIn::SignedOut => {
-            "this host is signed in to no account: run kr account sign-in, then run this again"
+/// What a sign-in that cannot carry a backup request says, and what mends it. A storage service
+/// the person runs has an account of its own, signed in with `--storage`.
+fn sign_in_words(sign_in: BackupSignIn, storage: bool) -> Shown {
+    let command = if storage {
+        "kr account sign-in --storage"
+    } else {
+        "kr account sign-in"
+    };
+    match sign_in {
+        BackupSignIn::Usable => {
+            Shown::said("this host's sign-in could not be used just now: try again")
         }
-        BackupSignIn::Waiting => {
-            "a sign-in on this host is waiting for your browser: finish it, or run kr account \
-             sign-in again, then run this again"
-        }
-        BackupSignIn::Ended => {
-            "the service ended this host's sign-in: run kr account sign-in, then run this again"
-        }
-        BackupSignIn::WithoutScope => {
-            "this host's sign-in does not allow backups: run kr account sign-in again and allow \
-             them, then run this again"
-        }
-        BackupSignIn::NotRenewed => {
-            "no token could be had from this host's sign-in just now: try again, or run kr \
-             account sign-in"
-        }
-    })
+        BackupSignIn::SignedOut => shown!(
+            "this host is signed in to no account: run {}, then run this again",
+            command
+        ),
+        BackupSignIn::Waiting => shown!(
+            "a sign-in on this host is waiting for your browser: finish it, or run {} again, \
+             then run this again",
+            command
+        ),
+        BackupSignIn::Ended => shown!(
+            "the service ended this host's sign-in: run {}, then run this again",
+            command
+        ),
+        BackupSignIn::WithoutScope => shown!(
+            "this host's sign-in does not allow backups: run {} again and allow them, then run \
+             this again",
+            command
+        ),
+        BackupSignIn::NotRenewed => shown!(
+            "no token could be had from this host's sign-in just now: try again, or run {}",
+            command
+        ),
+    }
 }
 
 /// What a refusal the daemon confirmed says.
-fn declined_words(cause: &BackupEnableCause) -> Shown {
+fn declined_words(cause: &BackupEnableCause, storage: bool) -> Shown {
     match cause {
         BackupEnableCause::NoService {} => {
             Shown::said("this host's configuration selects no storage service")
         }
-        BackupEnableCause::SignIn { sign_in } => sign_in_words(*sign_in),
+        BackupEnableCause::SignIn { sign_in } => sign_in_words(*sign_in, storage),
         BackupEnableCause::AnotherAccount {} => Shown::said(
             "this host was signed in as another account while the setup ran: sign in as the \
              account you began with",
@@ -674,8 +695,13 @@ fn declined_words(cause: &BackupEnableCause) -> Shown {
         BackupEnableCause::NoAllowance {} => {
             Shown::said("the account has no allowance for backup storage")
         }
-        BackupEnableCause::TokenNotAccepted {} => Shown::said(
-            "the service did not accept this host's sign-in for backups: run kr account sign-in",
+        BackupEnableCause::TokenNotAccepted {} => shown!(
+            "the service did not accept this host's sign-in for backups: run {}",
+            if storage {
+                "kr account sign-in --storage"
+            } else {
+                "kr account sign-in"
+            }
         ),
         BackupEnableCause::BundleConflict {} => Shown::said(
             "the service already holds another recovery bundle at this kit's place: run this \
