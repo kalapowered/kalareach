@@ -1885,10 +1885,12 @@ jobs:
   # The companion on an Android phone, as a person gets it: the debug application packaged for the
   # two architectures an emulator and a phone run, the packaged classes and identifiers read back,
   # and then the application started on an emulator, with the native library's own cases run there
-  # beside it. The job above lints Rust and builds nothing, and the unit tests of the phone's
-  # Kotlin run in the nightly report; a library that links but does not load, a plugin the system
-  # cannot instantiate and a page that never opens all pass those. The emulator is the Android SDK's
-  # own, started with the hardware acceleration a hosted Linux runner offers.
+  # beside it. The minified release a store ships is built and read back as well, since only it
+  # shows what the minifier does to the classes that native code finds by name. The job above lints
+  # Rust and builds nothing, and the unit tests of the phone's Kotlin run in the nightly report; a
+  # library that links but does not load, a plugin the system cannot instantiate and a page that
+  # never opens all pass those. The emulator is the Android SDK's own, started with the hardware
+  # acceleration a hosted Linux runner offers.
   #
   # No cache is saved: the repository's caches are at their limit, and a cache saved here would
   # take the room of one every other job restores. The job's time is the cost of that.
@@ -2036,6 +2038,25 @@ jobs:
             "$KR_TEST_ARTIFACTS_DIR/android-app/launch.png" --serial "$serial" || failed=1
           adb -s "$serial" logcat -d -b all > "$KR_TEST_ARTIFACTS_DIR/android-app/logcat.txt" || true
           exit "$failed"
+
+      # The application a store ships is the minified release, and a debug build is not minified, so
+      # nothing above shows what the minifier does to it. A minified build removes or renames a class
+      # that only native code reaches, such as the ones the media library's start-up asks for by name,
+      # and the application then dies the first time a call opens. So the release variant is built as
+      # the store builds it, for both architectures, as a package and as a bundle, and the script
+      # reads both back: every class the native libraries name must be defined in the dex under its
+      # own name, and every native method the dex declares must be bound by a library. The packages
+      # are unsigned and nothing is installed from them. The build only needs Firebase's
+      # configuration to exist, so it is given a file that holds no project of the repository's own.
+      # It runs whatever the emulator step did, so that each answer is read on its own.
+      - name: Build the minified application and read its libraries back
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        env:
+          KR_GOOGLE_SERVICES_JSON: ${{ runner.temp }}/google-services.json
+        run: |
+          printf '%s\n' '{"project_info":{"project_number":"000000000000","project_id":"throwaway-minified-build"},"client":[{"client_info":{"mobilesdk_app_id":"1:000000000000:android:0000000000000000","android_client_info":{"package_name":"to.kala.reach"}},"api_key":[{"current_key":"throwaway-not-a-key"}]}]}' > "$KR_GOOGLE_SERVICES_JSON"
+          pnpm -C apps/companion android --apk --aab --target aarch64 x86_64
 
       # What a cache of this job would hold, which the job saves none of: the target directory, the
       # registries and the package store as the disk report lists them, and Gradle's home.
