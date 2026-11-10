@@ -1799,3 +1799,53 @@ async fn a_chain_spends_no_more_managed_allowance_than_it_inherited() {
         .causal_root_id;
     assert_eq!(budget(wider).max_managed_spend, 50);
 }
+
+/// KR-REQ-09.09: a rearm that finds the chain already past the generation it leaves, because
+/// another copy of it rearmed first, is answered from where the chain stands and says it was
+/// answered from what an earlier submission left, so that the host holds it to the authority check
+/// as it holds any recorded answer. A rearm that makes the chain's next generation answers for
+/// itself.
+#[tokio::test]
+async fn a_rearm_that_finds_the_chain_already_rearmed_says_it_was_answered_from_a_record() {
+    let table = common::every_right(&[test_grant_id(1)]);
+    let service = AutomationService::in_memory(common::host(
+        Arc::new(MockActionRunner::new()),
+        table,
+        Arc::new(ManualClock::new(1_000)),
+    ))
+    .expect("a service");
+    let root = an_exhausted_chain(&service, 63).await;
+    let params = kr_protocol::automation::WorkflowRearmParams {
+        causal_root_id: root,
+        grant_reference: test_grant_id(1),
+        generation: kr_protocol::scalars::U64::new(0),
+    };
+    let rearm = |answered: &std::sync::atomic::AtomicBool, now_ms: u64| {
+        service.rearm(
+            &params,
+            &Submitted {
+                answered: Some(answered),
+                key: &common::fresh_action(Method::WorkflowRearm),
+                admission: &common::admitted,
+                caller_grant: None,
+            },
+            now_ms,
+        )
+    };
+
+    let first = std::sync::atomic::AtomicBool::new(false);
+    let rearmed = rearm(&first, 2_000).expect("the chain is rearmed");
+    assert_eq!(rearmed.result.generation.get(), 1);
+    assert!(
+        !first.load(std::sync::atomic::Ordering::Acquire),
+        "a rearm that is performed answers for itself"
+    );
+
+    let copy = std::sync::atomic::AtomicBool::new(false);
+    let again = rearm(&copy, 3_000).expect("the chain already stands where the rearm leaves it");
+    assert_eq!(again.result.generation.get(), 1);
+    assert!(
+        copy.load(std::sync::atomic::Ordering::Acquire),
+        "a rearm that finds the chain rearmed says that it was answered from a record"
+    );
+}

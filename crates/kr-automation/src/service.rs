@@ -1222,13 +1222,21 @@ impl AutomationService {
                     },
                     started: continued,
                 },
-                Rearm::Already { generation } => Rearmed {
-                    result: WorkflowRearmResult {
-                        causal_root_id: root,
-                        generation: U64::new(generation),
-                    },
-                    started: Vec::new(),
-                },
+                // The chain already stands past the generation this rearm leaves: another copy of
+                // it rearmed first, so this answer is what that copy left, and the host is told
+                // it is a copy.
+                Rearm::Already { generation } => {
+                    if let Some(answered) = submitted.answered {
+                        answered.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    Rearmed {
+                        result: WorkflowRearmResult {
+                            causal_root_id: root,
+                            generation: U64::new(generation),
+                        },
+                        started: Vec::new(),
+                    }
+                }
             })
         })
     }
