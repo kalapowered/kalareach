@@ -115,9 +115,9 @@ pub enum ClientError {
     /// is not on this client's book.
     ///
     /// It is not the host's answer: the host never acted on the request. A caller that bounded the
-    /// send ([`crate::session::Session::send_before`]) learns here that no request left. When part
-    /// of the frame had already gone, the connection was ended with it, so that the host reads a
-    /// frame that stops short.
+    /// send ([`crate::session::Session::send_before`]) learns here that no request left. When the
+    /// transport had begun to write the frame, the connection's stream was ended with it, so that
+    /// the host reads a frame that stops short.
     Withheld,
     /// The connection ended before the request was answered.
     ConnectionEnded,

@@ -48,7 +48,7 @@ const KEEP_MS: u64 = 300_000;
 /// kept for is one the gate cannot read.
 const KEPT_MAX: usize = 4_096;
 
-/// The most delegation identifiers a call remembers having seen.
+/// The most delegation identifiers a call can tell apart: it is tainted by one more.
 const SEEN: usize = 256;
 
 /// Why a call can no longer authorise anything, or why one set cannot.
@@ -84,6 +84,9 @@ pub(super) enum Cause {
     ProviderMuted,
     /// More fragments than the gate can keep.
     TooManyFragments,
+    /// More delegations than the gate can tell apart: an identifier it no longer remembers could be
+    /// announced again as another attempt.
+    TooManyDelegations,
     // What refuses one set and leaves the call as it was.
     /// The set holds the first fragment of the call, or the first after the opening.
     FirstFragment,
@@ -127,6 +130,7 @@ impl Cause {
             Self::Dtx => "dtx",
             Self::ProviderMuted => "provider_muted",
             Self::TooManyFragments => "too_many_fragments",
+            Self::TooManyDelegations => "too_many_delegations",
             Self::FirstFragment => "first_fragment",
             Self::Empty => "empty",
             Self::TooLarge => "too_large",
@@ -159,6 +163,7 @@ impl Cause {
                 | Self::Dtx
                 | Self::ProviderMuted
                 | Self::TooManyFragments
+                | Self::TooManyDelegations
         )
     }
 }
@@ -284,12 +289,25 @@ impl Gate {
             return Told::Nothing;
         }
         self.taint = Some(cause);
+        // A call that can no longer act has no use for what it heard.
+        self.kept.clear();
         Told::Tainted(cause)
     }
 
     /// The owner read news that capture is on.
     pub(super) fn capture_is_on(&mut self) {
         self.opened = true;
+    }
+
+    /// The owner read news that capture is off. After it first opened that is a break, and the call
+    /// is tainted at once, so that nothing waiting to be written is written after it; the capture
+    /// proof is still what a set is vouched for by, and this only ever stops one.
+    pub(super) fn capture_is_off(&mut self) -> Told {
+        if self.opened {
+            self.taint_with(Cause::CaptureBreak)
+        } else {
+            Told::Nothing
+        }
     }
 
     /// News was lost.
@@ -397,9 +415,13 @@ impl Gate {
             self.last_offset
                 .map_or(offset_ms, |last| last.max(offset_ms)),
         );
-        self.seen.push_back((id.clone(), offset_ms));
-        if self.seen.len() > SEEN {
-            self.seen.pop_front();
+        // An identifier is remembered for the life of the call: one forgotten could be announced
+        // again at another offset as another attempt. A call with more delegations than can be
+        // remembered can no longer act.
+        if self.seen.len() >= SEEN {
+            self.taint_with(Cause::TooManyDelegations);
+        } else {
+            self.seen.push_back((id.clone(), offset_ms));
         }
         Told::Delegation { id, offset_ms }
     }
@@ -731,6 +753,54 @@ mod tests {
             gate.provider(said(start, start + 10));
         }
         assert!(gate.kept.is_empty(), "a tainted call keeps nothing");
+    }
+
+    /// A delegation's identifier is remembered for the life of the call: more delegations than the
+    /// gate can tell apart taint it, and an identifier it first saw at one offset is never another
+    /// attempt at a later one.
+    #[test]
+    fn a_delegation_identifier_is_remembered_for_the_life_of_the_call() {
+        let mut gate = open();
+        delegating(&mut gate, "a", 1_000);
+        for index in 0..SEEN {
+            gate.provider(Provider::Delegation {
+                id: format!("x{index}"),
+                offset_ms: 2_000,
+            });
+        }
+        assert_eq!(gate.taint(), Some(Cause::TooManyDelegations));
+        // The first identifier is announced again, at a later offset, with fresh words before it.
+        gate.provider(said(0, 100));
+        gate.provider(said(9_000, 9_200));
+        gate.provider(Provider::Delegation {
+            id: "a".to_owned(),
+            offset_ms: 9_200,
+        });
+        assert_eq!(
+            gate.freeze(9_200, CLEAN, Some(9_200)),
+            Frozen::Refused(Cause::TooManyDelegations)
+        );
+    }
+
+    /// A call that is tainted keeps nothing of what it heard, whether or not more is said.
+    #[test]
+    fn a_tainted_call_keeps_nothing_even_when_nothing_more_is_said() {
+        let mut gate = open();
+        for start in [0, 300, 600] {
+            gate.provider(said(start, start + 200));
+        }
+        assert!(!gate.kept.is_empty());
+        gate.lost();
+        assert!(gate.kept.is_empty());
+    }
+
+    /// Capture going off after it first opened taints the call; before that it says nothing.
+    #[test]
+    fn capture_going_off_after_it_opened_taints_the_call() {
+        let mut gate = Gate::new();
+        assert_eq!(gate.capture_is_off(), Told::Nothing);
+        gate.capture_is_on();
+        assert_eq!(gate.capture_is_off(), Told::Tainted(Cause::CaptureBreak));
     }
 
     /// A set the voice service did not confirm, or that reaches back to what was forgotten, is

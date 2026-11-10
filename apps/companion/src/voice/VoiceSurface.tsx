@@ -898,7 +898,7 @@ const DELEGATION_CAUSES: Readonly<Record<string, string>> = {
  * version does nothing about any, and the row says so.
  */
 function DelegationRow({ delegation }: { readonly delegation: Delegation }): React.ReactElement {
-  const what = DELEGATION_WORDS[delegation.state] ?? 'Not done.'
+  const what = DELEGATION_WORDS[delegation.state] ?? 'It is not known what became of it.'
   const why = delegation.cause === null ? undefined : DELEGATION_CAUSES[delegation.cause]
   return (
     <li className="kr-voice__delegation">

@@ -96,10 +96,11 @@ pub trait ControlTransport: Send + Sync + std::fmt::Debug {
     /// bytes to the connection.
     ///
     /// `false` means the frame was not written whole, and the peer acts on none of it: either none
-    /// of it went and the connection is as it was, or part of it had gone when the answer changed,
-    /// and the connection's control stream was ended so that the peer reads a frame that never
-    /// completes. A failure of a write that was not stopped is the caller's to read as an outcome
-    /// that is not known.
+    /// of it went and the connection is as it was, or the answer changed once the transport had
+    /// begun to write it, and the connection's control stream was ended so that the peer reads a
+    /// frame that never completes. A transport that cannot say whether a byte went when it stops a
+    /// write it has begun ends the stream all the same. A failure of a write that was not stopped
+    /// is the caller's to read as an outcome that is not known.
     ///
     /// The provided method looks once, before it asks the transport to send, which is all a
     /// transport can do whose writer it cannot see into.

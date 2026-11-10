@@ -5355,7 +5355,13 @@ async fn a_status_asked_for_after_a_pause_is_handed_to_the_host_and_performed() 
             .any(|words| words.contains("cannot act")),
         "and not that it cannot act: {instructions:?}"
     );
+    // The request was answered, so the end has nothing to say of one that may have been carried out.
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    let state = scene
+        .state_where("an end", |state| state["ended"].is_object())
+        .await;
+    let words = state["ended"]["words"].as_str().expect("words");
+    assert!(!words.contains("may or may not"), "{words}");
     scene.stop_host().await;
 }
 
@@ -5401,11 +5407,11 @@ async fn the_first_utterance_of_a_call_never_acts() {
     scene.stop_host().await;
 }
 
-/// KR-REQ-15.36 and KR-ACC-014: a change in capture before the set is complete refuses it, by
-/// native code's own record and not by the news: the proof is held while the person mutes, the system interrupts, the route changes,
-/// the system suspends the application or the microphone goes, and the record then shows the
-/// break. The call is tainted for good, so the same command said again after the capture is back
-/// is refused too, for the same cause. The host is sent nothing.
+/// KR-REQ-15.36 and KR-ACC-014: a change in capture before the set is complete refuses it: the
+/// proof is held while the person mutes, the system interrupts, the route changes, the system
+/// suspends the application or the microphone goes, and the call is tainted by the news and by the
+/// record that shows the break. The call is tainted for good, so the same command said again after
+/// the capture is back is refused too, for the same cause. The host is sent nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_capture_change_before_the_set_is_complete_refuses_it_and_every_later_one() {
     for state in [
@@ -5618,6 +5624,61 @@ async fn a_break_after_the_set_was_read_and_before_the_write_stops_the_write() {
     assert_eq!(row["state"], "not_sent", "{row}");
     assert_eq!(row["cause"], "capture_break");
     assert!(kinds_of(&scene.state()).contains(&"spoken_requests".to_owned()));
+    assert_eq!(at_the_host(&scene), 0);
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// A change in capture while the request waits for the connection's turn stops the write: the proof
+/// taken before the send was clean, and the news that capture closed taints the call, however much
+/// time the proof has left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capture_change_while_the_request_waits_for_the_writer_stops_the_write() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    let end = speak(&scene, 6_000, "what is the status");
+    scene.link.hold_next_request(HostMethod::VoiceDelegate);
+    ask(&scene, "d-1", end - 200);
+    scene.link.until_request_held().await;
+    scene.platform.tell(CallEvent::Capture {
+        state: CaptureState::Interrupted,
+    });
+    scene
+        .state_where("the call tainted", |state| {
+            kinds_of(state).contains(&"spoken_requests".to_owned())
+        })
+        .await;
+    scene.link.release_request();
+
+    let row = row_settled(&scene, "d-1").await;
+
+    assert_eq!(row["state"], "not_sent", "{row}");
+    assert_eq!(row["cause"], "capture_break");
+    assert_eq!(at_the_host(&scene), 0, "nothing reached the host");
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// A gap the capture record shows when the proof is taken just before the write, with the recorder
+/// still delivering and no news of it, stops the write: the proof's own fields are read, and not
+/// only how young it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gap_the_record_shows_at_the_write_stops_the_write_whatever_the_news_says() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    scene.platform.hold("capture_proof_at_use");
+    let end = speak(&scene, 6_000, "what is the status");
+    ask(&scene, "d-1", end - 200);
+    until_a_proof_is_asked_at_use(&scene).await;
+    scene.platform.show_a_gap_in_progress();
+    scene.platform.release("capture_proof_at_use");
+
+    let row = row_settled(&scene, "d-1").await;
+
+    assert_eq!(row["state"], "not_sent", "{row}");
+    assert_eq!(row["cause"], "capture_break");
     assert_eq!(at_the_host(&scene), 0);
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
     scene.stop_host().await;

@@ -26,7 +26,7 @@
 //! service's own HTTP route is the fallback once the host has answered. The screen does not wait
 //! for the service.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -427,6 +427,10 @@ pub(super) struct Owner {
     /// What was written to the host and not answered, by delegation, which a later look at the
     /// host asks about again.
     attempts: HashMap<String, Attempt>,
+    /// The delegations whose request was, or may have been, written to the host and has no answer
+    /// that says it was done or not done. Kept apart from the rows the screen shows, which a long
+    /// call lets go of.
+    unsettled: HashSet<String>,
     /// The delegations whose answer was a challenge the host awaits a confirmation for.
     challenged: Vec<String>,
     /// Set when nothing not yet written may be written: the path to the host was lost, or the call
@@ -564,6 +568,7 @@ impl Owner {
             barriers: VecDeque::new(),
             announced: VecDeque::new(),
             attempts: HashMap::new(),
+            unsettled: HashSet::new(),
             challenged: Vec::new(),
             unsent: Arc::new(AtomicBool::new(false)),
             taint_told: false,
@@ -1378,8 +1383,13 @@ impl Owner {
                 None
             }
             Some(Heard::Event(CallEvent::Capture { state })) => {
-                if self.accepting && state == CaptureState::Capturing {
-                    self.gate.capture_is_on();
+                if self.accepting {
+                    if state == CaptureState::Capturing {
+                        self.gate.capture_is_on();
+                    } else {
+                        let told = self.gate.capture_is_off();
+                        self.after_gate(told);
+                    }
                 }
                 self.view(|view| view.capture = capture_word(state));
                 // The change may be the person's own mute from a control of the phone.
@@ -2045,10 +2055,10 @@ impl Owner {
                 stage: Stage::Draining {
                     token: Some(token),
                     record: Some(_),
-                    ..
+                    until,
                 },
                 ..
-            }) if self.barriers.contains(token)
+            }) if self.barriers.contains(token) && Instant::now() < *until
         );
         if !ready {
             return;
@@ -2114,6 +2124,7 @@ impl Owner {
             return;
         };
         self.set_row(id, "asking", None);
+        self.unsettled.insert(id.to_owned());
         let handover = Handover {
             host,
             platform: self.platform(),
@@ -2144,6 +2155,7 @@ impl Owner {
         match delivered {
             Delivered::Result(result) => self.host_answered(id, *result),
             Delivered::Refused => {
+                self.unsettled.remove(id);
                 self.set_row(id, "host_refused", Some("host_answer"));
                 self.tell_delegation(id, DELEGATION_HOST_REFUSED.to_owned());
             }
@@ -2154,10 +2166,12 @@ impl Owner {
                 self.tell_delegation(id, DELEGATION_UNKNOWN.to_owned());
             }
             Delivered::Withheld(why) => {
+                self.unsettled.remove(id);
                 let why = self.gate.taint().unwrap_or(why);
                 self.not_sent(id, why);
             }
             Delivered::Tainted(why) => {
+                self.unsettled.remove(id);
                 self.gate.taint_with(why);
                 self.note_taint();
                 self.not_sent(id, why);
@@ -2183,6 +2197,11 @@ impl Owner {
     /// The host answered, once, with a result.
     fn host_answered(&mut self, id: &str, result: VoiceDelegateResult) {
         let (what, cause, told) = answered_as(&result.outcome);
+        if may_have_been_carried_out(what) {
+            self.unsettled.insert(id.to_owned());
+        } else {
+            self.unsettled.remove(id);
+        }
         self.set_row(id, what, cause);
         if what == "confirmation_required" {
             self.challenged.push(id.to_owned());
@@ -2275,15 +2294,7 @@ impl Owner {
 
     /// Whether a request was written to the host and has no answer: it may have been carried out.
     fn requests_unsettled(&self) -> bool {
-        !self.attempts.is_empty()
-            || self
-                .shared
-                .view
-                .lock()
-                .expect("the view lock is not poisoned")
-                .delegations
-                .iter()
-                .any(|row| may_have_been_carried_out(&row.state))
+        !self.unsettled.is_empty()
     }
 
     /* ------------------------------------------------------------------------------------- */
@@ -2701,9 +2712,6 @@ async fn probe_host(
 
 #[cfg(test)]
 mod tests {
-    /// What the host says of a delegation is what the row and the model are told: a request the host
-    /// only accepted is never told as done, a refusal carries the host's reason, and what the host
-    /// performed is told with its own summary.
     /// A request the host took and did not say it carried out is one the end cannot say nothing was
     /// done for, as one it asked about and was not answered, or has not yet written.
     #[test]
@@ -2724,6 +2732,9 @@ mod tests {
         }
     }
 
+    /// What the host says of a delegation is what the row and the model are told: a request the host
+    /// only accepted is never told as done, a refusal carries the host's reason, and what the host
+    /// performed is told with its own summary.
     #[test]
     fn what_the_host_answers_is_told_as_it_answered() {
         let action_id = ActionId::new(kr_ipc::new_uuid());
