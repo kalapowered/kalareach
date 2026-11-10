@@ -1627,6 +1627,138 @@ async fn an_attachment_whose_connection_is_lost_is_removed_and_nothing_else_is()
     only_the_attachment_that_ended_is_removed(Ending::ProcessKilled).await;
 }
 
+/// The variable that makes this test binary, started in the session's console, ask for the mouse and
+/// print the reports it is given.
+const MOUSE_READER: &str = "KR_ATTACH_MOUSE_READER";
+
+/// The file the application waits for before it asks for the mouse.
+const MOUSE_GATE: &str = "KR_ATTACH_MOUSE_GATE";
+
+/// KR-REQ-08.56: a mouse event at the outer console reaches the session's application, which asked
+/// for mouse reporting, as the virtual-terminal report it asked for, on the path that hands keys on
+/// as records.
+///
+/// The session's root shell starts this test binary, which reads the console's virtual-terminal
+/// input as a terminal application does and, once `kr attach` is attached and a file exists, asks to
+/// be told of clicks in the SGR encoding. The console that `kr attach` runs in is then written a
+/// press and its release at column 10 and row 5, as a terminal that reports the mouse sends them.
+/// The application is told of them as the two reports a terminal would send, at that cell: a
+/// command that kept the mouse for the console, or that handed on nothing for a record that is not
+/// a key, tells it nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mouse_event_at_an_attached_console_reaches_the_application_that_asked_for_the_mouse() {
+    if std::env::var_os(MOUSE_READER).is_some() {
+        mouse_reader_in_the_session();
+        return;
+    }
+
+    let host = WorkerHost::start().await;
+    let (session_id, dimensions) = host
+        .kr_new(&["--shell-mode", "native_compat", "--shell", &command_shell()])
+        .await
+        .session();
+    let environment = host.tree.environment();
+    let mut typist = WorkerTerminal::attach(&environment, session_id, dimensions).await;
+    let gate_directory = tempfile::tempdir().expect("a directory on the internal disk");
+    let gate = gate_directory.path().join("gate");
+    let reader = std::env::current_exe().expect("this test binary");
+    typist
+        .type_line(&format!(
+            "set {MOUSE_READER}=1&& set \"{MOUSE_GATE}={}\"&& \"{}\" --exact \
+             a_mouse_event_at_an_attached_console_reaches_the_application_that_asked_for_the_mouse \
+             --nocapture --test-threads=1",
+            gate.display(),
+            reader.display()
+        ))
+        .await;
+    typist
+        .shown(
+            "kr-mouse-waiting",
+            "the application waits to ask for the mouse",
+        )
+        .await;
+
+    let mut console = Attached::start(&host, &session_id.to_string(), dimensions);
+    console.shows(
+        "the session's screen",
+        |text| text.matches("kr-mouse-waiting").count(),
+        1,
+    );
+    std::fs::write(&gate, b"open").expect("the file the application waits for");
+    console.shows(
+        "the application's request for the mouse",
+        |text| text.matches("kr-mouse-ready").count(),
+        1,
+    );
+    // A press and its release, as a terminal that reports the mouse sends them.
+    console.press(b"\x1b[<0;10;5M");
+    console.press(b"\x1b[<0;10;5m");
+
+    let started = Instant::now();
+    while !typist.text().contains("kr-mouse-end") {
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the mouse event did not reach the application in {:?}: the session shows {:?}; the \
+             outer console shows {:?}",
+            started.elapsed(),
+            typist.text(),
+            console.output.text()
+        );
+        typist.watch(Duration::from_millis(200)).await;
+    }
+    // ESC [ < 0 ; 10 ; 5 M and the same ending in m, as hexadecimal.
+    let told = typist.text();
+    assert!(
+        told.contains("kr-mouse:1b5b3c303b31303b354d1b5b3c303b31303b356d;"),
+        "the application was told of the press and its release at the cell they were at: {told:?}"
+    );
+
+    let _ = console.child.kill();
+    drop(typist);
+    let closed = host
+        .kr(&["--json", "close", &session_id.to_string()], &[])
+        .await;
+    assert!(
+        closed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&closed.stdout)
+    );
+}
+
+/// The session half of the test above: gives the console virtual-terminal input as a terminal
+/// application does, asks for clicks in the SGR encoding once the gate exists, and prints what it was
+/// given as the first two reports, each of which ends in the letter that says whether a button went
+/// down or came up.
+fn mouse_reader_in_the_session() {
+    use kr_cli::platform::ControllingTerminal;
+
+    let gate = PathBuf::from(std::env::var_os(MOUSE_GATE).expect("the file to wait for"));
+    let console = ControllingTerminal::open().expect("this process has a console");
+    let _modes = console
+        .enter_raw_mode()
+        .expect("the console is given virtual-terminal input");
+    println!("kr-mouse-waiting");
+    while !gate.exists() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    print!("\x1b[?1000h\x1b[?1006hkr-mouse-ready");
+    std::io::stdout().flush().expect("flushes the request");
+    let mut input = console.handle();
+    let mut seen = Vec::new();
+    let mut buffer = [0_u8; 256];
+    while seen
+        .iter()
+        .filter(|byte| matches!(**byte, b'M' | b'm'))
+        .count()
+        < 2
+    {
+        let read = input.read(&mut buffer).expect("reads the console's input");
+        assert_ne!(read, 0, "the console's input ended");
+        seen.extend_from_slice(&buffer[..read]);
+    }
+    println!("kr-mouse:{};kr-mouse-end", hex(&seen));
+}
+
 /// `bytes` as lower-case hexadecimal.
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
