@@ -80,7 +80,7 @@ pub enum Tracking {
 /// The three tracking modes are three settings of their own, as the session's screen keeps them,
 /// and what the application asked for is the widest of those that are set. A frame drawn from the
 /// screen writes every mode it tracks, the ones that are off among them, so a mode that is reset
-/// says nothing of the others.
+/// says nothing of the others. A full reset of the terminal (`ESC c`) turns all of them off.
 #[derive(Debug, Default)]
 pub struct MouseReporting {
     clicks: bool,
@@ -161,6 +161,14 @@ impl MouseReporting {
         }
     }
 
+    /// Turns every mode off, as a terminal does at a full reset.
+    fn reset(&mut self) {
+        self.clicks = false;
+        self.drag = false;
+        self.motion = false;
+        self.sgr = false;
+    }
+
     fn step(&mut self, byte: u8) {
         self.scan = match std::mem::take(&mut self.scan) {
             Scan::Ground => {
@@ -173,6 +181,11 @@ impl MouseReporting {
             Scan::Escape => match byte {
                 b'[' => Scan::Control(Control::default()),
                 0x1b => Scan::Escape,
+                // A full reset turns every mode off, the mouse's among them.
+                b'c' => {
+                    self.reset();
+                    Scan::Ground
+                }
                 _ => Scan::Ground,
             },
             Scan::Control(mut control) => match byte {
@@ -536,6 +549,50 @@ mod tests {
         assert_eq!(reporting.encoding(), kr_keys::MouseEncoding::Sgr);
         reporting.observe(b"\x1b[?1000l\x1b[?1002h\x1b[?1003l");
         assert_eq!(reporting.tracking(), Tracking::Drag);
+    }
+
+    /// A full reset of the terminal turns the mouse's modes off, however the write is cut, and what
+    /// only ends in the same letter does not: a control sequence that ends in `c` asks a terminal
+    /// what it is.
+    #[test]
+    fn a_full_reset_turns_the_modes_off_and_a_sequence_ending_in_c_does_not() {
+        let set = b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
+        let reset = b"\x1bc";
+        for cut in 0..=reset.len() {
+            let mut reporting = MouseReporting::default();
+            reporting.observe(set);
+            reporting.observe(&reset[..cut]);
+            reporting.observe(&reset[cut..]);
+            assert_eq!(reporting.tracking(), Tracking::Off, "cut at {cut}");
+            assert_eq!(
+                reporting.encoding(),
+                kr_keys::MouseEncoding::X10,
+                "cut at {cut}"
+            );
+        }
+        // The modes are asked for again after the reset, as an application that reset does.
+        let mut reporting = MouseReporting::default();
+        reporting.observe(set);
+        reporting.observe(b"\x1bc\x1b[?1000h");
+        assert_eq!(reporting.tracking(), Tracking::Clicks);
+        assert_eq!(reporting.encoding(), kr_keys::MouseEncoding::X10);
+        // A reset after an escape, or in the middle of a sequence the escape ends, is a reset.
+        let mut reporting = MouseReporting::default();
+        reporting.observe(set);
+        reporting.observe(b"\x1b[?10\x1bc");
+        assert_eq!(reporting.tracking(), Tracking::Off);
+        // A control sequence that ends in `c` is a question, and changes nothing.
+        for question in [&b"\x1b[c"[..], b"\x1b[>c", b"\x1b[0c", b"\x1b[=c"] {
+            let mut reporting = MouseReporting::default();
+            reporting.observe(set);
+            reporting.observe(question);
+            assert_eq!(reporting.tracking(), Tracking::Motion, "{question:?}");
+            assert_eq!(
+                reporting.encoding(),
+                kr_keys::MouseEncoding::Sgr,
+                "{question:?}"
+            );
+        }
     }
 
     /// What only looks like a mode setting is not one: a question about a mode, a sequence that is
