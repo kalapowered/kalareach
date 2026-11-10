@@ -1268,14 +1268,32 @@ impl RemoteConnection {
                                 &digest,
                                 kr_ipc::now_ms().get(),
                             )
-                        })?;
+                        });
+                    let mut origin = Origin::Fresh;
                     let hold = match claimed {
-                        crate::grants::ActionClaim::Claimed { hold } => hold,
+                        Ok(crate::grants::ActionClaim::Claimed { hold }) => hold,
                         // An earlier attempt under this identifier claimed the action, and may
                         // have renamed the session: what became of it is not known here, and a
-                        // transient word would say nothing took effect.
-                        crate::grants::ActionClaim::Recorded(_) => {
-                            return Err(crate::error::ControllerError::attempt_still_running());
+                        // transient word would say nothing took effect. That is said of another
+                        // attempt's record, so it is a copy, and goes back only under the
+                        // authority this one still has.
+                        Ok(crate::grants::ActionClaim::Recorded(_)) => {
+                            origin.note(Origin::Copied);
+                            let found = crate::error::ControllerError::attempt_still_running();
+                            let told = match controller.check_retained_in_hand(&carried).await {
+                                Ok(()) => found,
+                                Err(lapsed) => {
+                                    origin.note(Origin::Withheld);
+                                    lapsed
+                                }
+                            };
+                            return Given::from_origin(Err(told), origin);
+                        }
+                        Err(error) => {
+                            let told = controller
+                                .conflict_under_authority(&carried, &mut origin, error)
+                                .await;
+                            return Given::from_origin(Err(told), origin);
                         }
                     };
                     let outcome = match mutation.target.session_id.as_ref().copied() {
@@ -1301,9 +1319,15 @@ impl RemoteConnection {
                         );
                     }
                     drop(hold);
-                    outcome
+                    Given::Fresh(outcome)
                 });
-                settled(request_id, self.controller.within_effect_wait(effect).await)
+                noting(
+                    &mut origin,
+                    settled_by_a_service(
+                        request_id,
+                        self.controller.within_effect_wait(effect).await,
+                    ),
+                )
             }
             // A redemption is this daemon's own effect, once per actor's action, for the device
             // that sends it and no other: the invitation names the device that may redeem it. The

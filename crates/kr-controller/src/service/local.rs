@@ -1112,6 +1112,16 @@ impl Controller {
         let spending = match self.spend_the_identifier(actor_id, &mutation, method).await {
             Ok(spending) => spending,
             Err(error) => {
+                // The conflict says that another request spent the identifier, which is another
+                // attempt's word. The search waited for a blocking task, so it goes back only under
+                // the authority this arrival still has, asked with the conflict in hand.
+                let error = if matches!(error, ControllerError::IdConflict { .. })
+                    && let Err(lapsed) = self.check_retained_answer(connection_id, admitted)
+                {
+                    lapsed
+                } else {
+                    error
+                };
                 return DoorReply::Refused(error_reply(
                     mutation.request_id,
                     error.code(),

@@ -555,9 +555,14 @@ async fn a_project_action_whose_claim_is_open_is_not_told_while_a_fence_is_owed(
         admission,
         claiming(&mutation),
     )
-    .await
-    .into_answer()
-    .expect_err("what became of the action is not known");
+    .await;
+    assert!(
+        control.is_copied(),
+        "a claim says that an earlier attempt began the action, so the answer is a copy"
+    );
+    let control = control
+        .into_answer()
+        .expect_err("what became of the action is not known");
     assert_eq!(control.code, ErrorCode::OutcomeUnknown, "{control:?}");
 
     let mutation = cancellation(&temp);
@@ -570,8 +575,8 @@ async fn a_project_action_whose_claim_is_open_is_not_told_while_a_fence_is_owed(
         claiming(&mutation),
     )
     .await
-    .into_answer()
-    .expect_err("a fence this host owes is the answer");
+    .into_withheld()
+    .expect_err("a fence this host owes is the answer, as the refusal of a copy withheld");
     refused_for_a_fence(&refused);
     controller.hold_fence(false);
 }
@@ -1383,6 +1388,37 @@ async fn a_capability_check_another_copy_answered_is_not_given_back_after_a_fenc
         a_late_capability_copy_at_the_record(&controller, &actor_id, &mutation, admission, true)
             .await
             .expect_err("a fence that landed before the record was read stops the answer");
+    refused_for_a_fence(&refused.to_protocol_error());
+}
+
+/// KR-REQ-09.09, the disclosed checks: the answer another copy gave is read back under the start's
+/// hold on the registration, and the hold ends before the cleanup of old answers, which waits for
+/// locks and for storage. A fence can land once it has ended, so the answer is asked once more with
+/// it in hand, after the cleanup. The control: with nothing owed the late copy is given what the
+/// first was told. The fence lands at the pause that check starts with, once the hold is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capability_check_another_copy_answered_is_not_given_back_once_its_hold_has_ended() {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let mutation = capability_request(&temp, None, None);
+    let admission = carried(&controller, connection_id);
+    let first = controller
+        .start_capability_checks(&actor_id, &mutation, admission)
+        .await
+        .expect("the first copy is answered");
+
+    let control = controller
+        .start_capability_checks(&actor_id, &mutation, admission)
+        .await
+        .expect("with nothing owed the late copy is answered from the record");
+    assert_eq!(control, first, "it is given what the first copy was told");
+
+    let refused = answered_after_a_fence_lands_at_the_check(
+        &controller,
+        controller.start_capability_checks(&actor_id, &mutation, admission),
+    )
+    .await
+    .expect_err("a fence that landed once the hold had ended stops the answer");
     refused_for_a_fence(&refused.to_protocol_error());
 }
 

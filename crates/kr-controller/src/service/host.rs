@@ -322,19 +322,23 @@ impl Controller {
             // Another attempt claimed the action for another payload while this one waited, or its
             // record cannot be read (a refusal kept under a code this build cannot read among
             // them): what that says goes back only under the authority this attempt arrived under,
-            // as a recorded answer does. Any other refusal names nothing of another attempt's
-            // record.
+            // as a recorded answer does. The conflict is told the check's refusal in its place. A
+            // record that cannot be read says that an earlier attempt may have carried the action
+            // out, so the caller is told that what became of it is not shown, and not that the
+            // authority is gone, which is a definite word. Any other refusal names nothing of
+            // another attempt's record.
             Err(error) => {
                 if matches!(
                     error,
                     ControllerError::IdConflict { .. } | ControllerError::Uncertain { .. }
                 ) && let Err(lapsed) = self.check_retained_answer(connection_id, admitted)
                 {
-                    return super::error_reply(
-                        mutation.request_id,
-                        lapsed.code(),
-                        lapsed.to_string(),
-                    );
+                    let told = if matches!(error, ControllerError::Uncertain { .. }) {
+                        ControllerError::outcome_not_shown()
+                    } else {
+                        lapsed
+                    };
+                    return super::error_reply(mutation.request_id, told.code(), told.to_string());
                 }
                 super::respond(mutation.request_id, Err(error))
             }

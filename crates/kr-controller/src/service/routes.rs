@@ -397,7 +397,7 @@ impl Controller {
             let outcome = self
                 .pairing_write(caller, method, mutation, admission, retained, guard, life)
                 .await
-                .into_answer();
+                .into_answer_or(|| Err(ControllerError::outcome_not_shown()));
             return respond(mutation.request_id, outcome);
         }
         if crate::transfer::TransferModule::serves(method) {
@@ -522,7 +522,7 @@ impl Controller {
                     carried,
                 )
                 .await
-                .into_answer(),
+                .into_answer_or(|| Err(ControllerError::outcome_not_shown())),
             );
         }
         if crate::catalogue::CatalogueModule::serves(method) {
@@ -557,7 +557,9 @@ impl Controller {
                 mutation.request_id,
                 self.catalogue_write(actor_id, mutation, method, confirmations, admission)
                     .await
-                    .into_answer(),
+                    .into_answer_or(|| {
+                        Err(ControllerError::outcome_not_shown().to_protocol_error())
+                    }),
             );
         }
         if crate::project::ProjectModule::serves(method) {
@@ -579,7 +581,9 @@ impl Controller {
                 // The machine's own socket: the caller holds no grant.
                 self.project_mutation(actor_id, mutation, method, carried, None)
                     .await
-                    .into_answer(),
+                    .into_answer_or(|| {
+                        Err(ControllerError::outcome_not_shown().to_protocol_error())
+                    }),
             );
         }
         if crate::automation::AutomationModule::serves(method) {
@@ -600,7 +604,9 @@ impl Controller {
                 mutation.request_id,
                 self.automation_mutation(actor_id, mutation, method, carried, None)
                     .await
-                    .into_answer(),
+                    .into_answer_or(|| {
+                        Err(ControllerError::outcome_not_shown().to_protocol_error())
+                    }),
             );
             // A run dispatches its nodes and waits for each of them, so the effect and its reply
             // are separated by however long that took, and a revocation can land in the interval.
@@ -618,17 +624,9 @@ impl Controller {
         if crate::attention::AttentionModule::serves(method) {
             // The attention store's actions are the daemon's own, committed with their records
             // inside this daemon's guarded operation, so a revocation that begins while one is
-            // committing finishes after it.
-            if accepted.is_none_or(|accepted| self.clock.now() >= accepted.deadline) {
-                return respond(
-                    mutation.request_id,
-                    Err(ControllerError::WindowExpired {
-                        detail: "the deadline this action was admitted under passed before it \
-                                 could run"
-                            .to_owned(),
-                    }),
-                );
-            }
+            // committing finishes after it. The deadline is not asked here: a receipt outlives the
+            // window that admitted its action (section 9), so the store reads its record first and
+            // asks the deadline where the action begins.
             let Some(admitted_revision) = admitted else {
                 return error_reply(
                     mutation.request_id,
@@ -653,7 +651,13 @@ impl Controller {
                     &carried,
                 )
                 .await
-                .into_answer();
+                .into_answer_or(|| {
+                    error_reply(
+                        mutation.request_id,
+                        ErrorCode::OutcomeUnknown,
+                        ControllerError::outcome_not_shown().to_string(),
+                    )
+                });
             if let Err(error) = self.authorised(connection_id) {
                 return error_reply(
                     mutation.request_id,
@@ -665,19 +669,10 @@ impl Controller {
         }
         if crate::changeset::ChangeSetModule::serves(method) {
             // Everything between the envelope check and this point can wait: for this task to be
-            // scheduled and for a blocking thread. An action whose accepted deadline passed while
-            // it queued does not go on to write, and neither does one whose connection lost its
-            // authority in the meantime.
-            if accepted.is_none_or(|accepted| self.clock.now() >= accepted.deadline) {
-                return respond(
-                    mutation.request_id,
-                    Err(ControllerError::WindowExpired {
-                        detail: "the deadline this action was admitted under passed before it \
-                                 could run"
-                            .to_owned(),
-                    }),
-                );
-            }
+            // scheduled and for a blocking thread. An action whose connection lost its authority in
+            // the meantime does not go on to write. The deadline is not asked here: a receipt
+            // outlives the window that admitted its action (section 9), so the service reads its
+            // record first and asks the deadline where the action begins.
             if let Err(error) = self.authorised(connection_id) {
                 return error_reply(
                     mutation.request_id,
@@ -710,7 +705,13 @@ impl Controller {
                 .changesets
                 .write_frame(actor_id, mutation, method, carried, controller, None)
                 .await
-                .into_answer();
+                .into_answer_or(|| {
+                    error_reply(
+                        mutation.request_id,
+                        ErrorCode::OutcomeUnknown,
+                        ControllerError::outcome_not_shown().to_string(),
+                    )
+                });
             // The effect and its reply are separated by everything a blocking task waits for, and
             // a revocation can land in that interval. What this host must not do is **disclose**
             // an answer under authority that has since been withdrawn, so the check is made again
@@ -766,7 +767,7 @@ impl Controller {
                 Some(_) => self
                     .session_create(actor_id, mutation, carried)
                     .await
-                    .into_answer(),
+                    .into_answer_or(|| Err(ControllerError::outcome_not_shown())),
                 None => Err(ControllerError::WindowExpired {
                     detail: "this action carries no freshness, so it may be answered from what \
                              this host holds and may not start a session"
@@ -814,7 +815,7 @@ impl Controller {
                     carried,
                 )
                 .await
-                .into_answer(),
+                .into_answer_or(|| Err(ControllerError::outcome_not_shown())),
             // The policy an organisation signed, applied under the registry's guard and kept in the
             // store of applied policies: no action is claimed and no answer is kept, since the same
             // policy again is accepted and puts its list in force again.
@@ -951,7 +952,7 @@ impl Controller {
                         },
                     )
                     .await
-                    .into_answer(),
+                    .into_answer_or(|| Err(ControllerError::outcome_not_shown())),
                 None => Err(ControllerError::PermissionDenied {
                     detail: "the authority this connection was admitted under has been \
                              withdrawn; open a new connection"

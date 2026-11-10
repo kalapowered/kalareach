@@ -20,9 +20,10 @@ use kr_protocol::scalars::Nullable;
 use kr_transport::clock::ManualClock;
 
 use super::a_recorded_answer_another_copy_wrote::{
-    attention_answer, cancellation, project_answer_under, setting_quiet_hours,
+    attention_answer, cancellation, changeset_answer, materialisation, project_answer_under,
+    setting_quiet_hours,
 };
-use super::the_fence_at_every_effect::{admitted, carried, daemon, mutation_of};
+use super::the_fence_at_every_effect::{accepted, admitted, carried, daemon, mutation_of, refusal};
 use crate::authority::AdmittedMutation;
 
 /// Passes the window of every admission the cases carry, which standing is a minute.
@@ -239,4 +240,122 @@ async fn a_capability_check_another_copy_answered_is_given_back_after_its_window
             .expect_err("a first start is refused for its window");
         refused_for_its_window(&refused.to_protocol_error());
     }
+}
+
+/// `mutation` as the local door performs it once its own look for a record has found none, under
+/// the deadline `accepted`.
+async fn at_the_local_door(
+    controller: &std::sync::Arc<super::Controller>,
+    connection_id: kr_protocol::ids::ConnectionId,
+    actor_id: &kr_protocol::ids::ActorId,
+    mutation: &MutationRequest,
+    method: Method,
+    accepted: kr_transport::window::AcceptedDeadline,
+) -> kr_protocol::envelope::ControlFrame {
+    controller
+        .write_method(
+            actor_id,
+            mutation,
+            method,
+            connection_id,
+            None,
+            Some(accepted),
+            controller.admitted_revision(connection_id).ok(),
+        )
+        .await
+}
+
+/// KR-REQ-09.09, the local door's attention route: a copy whose window passed after the door's own
+/// look for a record found none is given the record another copy wrote, and not refused for its
+/// window before the store reads it. An action with no record is still refused for its window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_copy_at_the_local_attention_route_is_given_the_record_after_its_window_has_passed() {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+
+    let (temp, controller, clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let admission = carried(&controller, connection_id);
+    let accepted = accepted(&controller);
+    let mutation = setting_quiet_hours(&temp);
+    let first = attention_answer(&controller, &actor_id, &mutation, admission)
+        .await
+        .into_answer()
+        .expect("the window is set");
+
+    the_window_passes(&clock);
+    let late = at_the_local_door(
+        &controller,
+        connection_id,
+        &actor_id,
+        &mutation,
+        Method::AttentionQuietHours,
+        accepted,
+    )
+    .await;
+    let ControlFrame::Response(Response {
+        outcome: Outcome::Ok(given),
+        ..
+    }) = late
+    else {
+        panic!("the late copy is given the record: {late:?}");
+    };
+    assert_eq!(given, first, "it is given what the first copy was told");
+
+    let refused = at_the_local_door(
+        &controller,
+        connection_id,
+        &actor_id,
+        &setting_quiet_hours(&temp),
+        Method::AttentionQuietHours,
+        accepted,
+    )
+    .await;
+    refused_for_its_window(
+        refusal(&refused).expect("an action with no record is refused for its window"),
+    );
+}
+
+/// KR-REQ-09.09, the local door's change-set route: a copy whose window passed after the door's own
+/// look for a record found none is given the record another copy wrote, and not refused for its
+/// window before the service reads it. An action with no record is still refused for its window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_copy_at_the_local_change_set_route_is_given_the_record_after_its_window_has_passed() {
+    let (temp, controller, clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let admission = carried(&controller, connection_id);
+    let accepted = accepted(&controller);
+    let mutation = materialisation(&temp);
+    let first = changeset_answer(&controller, &actor_id, &mutation, admission)
+        .await
+        .into_answer()
+        .expect_err("a version nobody captured is refused, and the refusal is kept");
+
+    the_window_passes(&clock);
+    let late = at_the_local_door(
+        &controller,
+        connection_id,
+        &actor_id,
+        &mutation,
+        Method::ChangesetMaterialize,
+        accepted,
+    )
+    .await;
+    assert_eq!(
+        refusal(&late),
+        Some(&first),
+        "the late copy is given what the first copy was told: {late:?}"
+    );
+
+    let refused = at_the_local_door(
+        &controller,
+        connection_id,
+        &actor_id,
+        &materialisation(&temp),
+        Method::ChangesetMaterialize,
+        accepted,
+    )
+    .await;
+    refused_for_its_window(
+        refusal(&refused).expect("an action with no record is refused for its window"),
+    );
 }

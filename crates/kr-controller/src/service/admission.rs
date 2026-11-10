@@ -574,7 +574,14 @@ impl Controller {
         found: ControllerError,
     ) -> ControllerError {
         match found {
-            ControllerError::IdConflict { .. } => {
+            // The refusal of a share for the subject of one that is still running names that
+            // share's action, which is another attempt's word as the conflict is, and is held to
+            // the check in the same way.
+            ControllerError::IdConflict { .. }
+            | ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::DraftConflict,
+                ..
+            } => {
                 if let Err(lapsed) = self.check_retained_in_hand(carried).await {
                     return lapsed;
                 }

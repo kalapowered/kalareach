@@ -407,11 +407,7 @@ fn may_have_taken_effect(answer: &ControlFrame) -> bool {
 /// takes a definite refusal for the host's word that nothing was done and drops the action, so the
 /// person would be told the action did not happen when it did.
 fn outcome_not_shown() -> ProtocolError {
-    ProtocolError::new(
-        ErrorCode::OutcomeUnknown,
-        "this action may have been carried out, and this host does not report what became of it \
-         in this answer",
-    )
+    crate::error::ControllerError::outcome_not_shown().to_protocol_error()
 }
 
 /// What a device is told when this host refuses, after it holds `answer` to an action, to show it
