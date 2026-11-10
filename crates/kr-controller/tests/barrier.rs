@@ -5400,8 +5400,10 @@ async fn a_spoken_close_the_device_confirmed_is_taken_up_by_the_sessions_real_wo
         );
     };
     let mut signed = params.clone();
-    signed.confirmation =
-        Nullable::some(kr_voice::sign_confirmation(&key, &request).expect("the device signs"));
+    signed.confirmation = Nullable::some(
+        kr_client::services::voice_confirm::sign_voice_confirmation(&key, &request)
+            .expect("the device signs"),
+    );
     let closed: VoiceDelegateResult = coordinator
         .delegate(
             device_id,

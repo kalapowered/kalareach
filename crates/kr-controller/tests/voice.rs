@@ -2936,8 +2936,11 @@ async fn a_challenge_holds_no_claim_so_the_signed_delegation_is_admitted_under_i
     );
 
     params.confirmation = Nullable::some(
-        kr_voice::sign_confirmation(&voice.device.keys().authorisation, &request)
-            .expect("the device signs the challenge"),
+        kr_client::services::voice_confirm::sign_voice_confirmation(
+            &voice.device.keys().authorisation,
+            &request,
+        )
+        .expect("the device signs the challenge"),
     );
     let admitted = voice
         .delegate(action_id, &params)

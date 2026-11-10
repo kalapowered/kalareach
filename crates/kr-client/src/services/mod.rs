@@ -13,7 +13,9 @@
 //! one managed resource a client cannot do without and still use a relay at all. [`voice`] is the
 //! voice broker, because a managed call is created by one request whose exact shape both the host
 //! and the companion have to agree on, and [`voice_control`] is the connection the device that
-//! holds that call's media keeps to the service for as long as the call runs. [`authority`] is the
+//! holds that call's media keeps to the service for as long as the call runs. [`voice_confirm`] is
+//! the signature a paired device makes over the host's challenge to confirm a spoken request on an
+//! unlocked screen, which the host verifies and never makes. [`authority`] is the
 //! durable authority feed, where a remote owner publishes a signed revocation request and the host
 //! that owns the feed acknowledges what it applied. [`mailbox`] is the encrypted mailbox, where a
 //! device leaves a sealed item for a peer that is not connected and the peer reads its own. [`push`] is the push gateway, where an installation registers
@@ -135,6 +137,7 @@ pub mod signed;
 pub mod storage;
 pub mod sync;
 pub mod voice;
+pub mod voice_confirm;
 pub mod voice_control;
 
 use std::future::Future;

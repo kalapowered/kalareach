@@ -133,7 +133,8 @@ impl Call {
     ) -> MutationRequest {
         let mut params: VoiceDelegateParams = mutation.params.to_typed().expect("decodes");
         params.confirmation = Nullable::some(
-            kr_voice::sign_confirmation(&self.key, request).expect("the device signs"),
+            kr_client::services::voice_confirm::sign_voice_confirmation(&self.key, request)
+                .expect("the device signs"),
         );
         MutationRequest {
             params: ParamsValue::from_typed(&params).expect("encodes"),

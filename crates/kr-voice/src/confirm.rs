@@ -12,13 +12,14 @@
 //! identity key — the one that already signs its authority-bearing requests — and never against a
 //! session key, a provider credential or anything a transcript could carry.
 //!
-//! The ceremony that produces the signature is the native client's: device-owner authentication on
-//! an unlocked screen. This module issues the challenge, consumes it exactly once, and checks the
-//! answer.
+//! The ceremony that produces the signature is the paired device's: device-owner authentication on
+//! an unlocked screen, then a signature made by the device's own code (`kr-client`'s
+//! `sign_voice_confirmation`). This module issues the challenge, consumes it exactly once, and
+//! checks the answer. A host never signs a confirmation: a host that could produce one would be a
+//! host whose confirmations prove nothing.
 
 use std::collections::BTreeMap;
 
-use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::sign::{self, SigningTranscript};
 use kr_protocol::ids::{ActionId, ConfirmationId, DeviceId, VoiceSessionId};
 use kr_protocol::scalars::{AuthorisationKey, Digest256, Nonce256, TimestampMs, Uuid};
@@ -58,29 +59,6 @@ pub fn issue_confirmation(
         device_id,
         nonce: Nonce256::from_bytes(nonce),
         expires_at_ms: TimestampMs::new(now_ms.saturating_add(VOICE_CONFIRMATION_LIFETIME_MS)),
-    })
-}
-
-/// Signs a challenge the way a paired device's ceremony does.
-///
-/// Present so a test and a paired device sign the same bytes. A host never calls it: a host that
-/// could produce a confirmation would be a host whose confirmations prove nothing.
-///
-/// # Errors
-///
-/// Returns an encoding error, or a library error when the signature cannot be made.
-pub fn sign_confirmation(
-    key: &AuthorisationKeyPair,
-    request: &VoiceConfirmationRequest,
-) -> Result<VoiceConfirmationProof> {
-    let signature = sign::sign(
-        key,
-        &SigningTranscript::from_canonical_bytes(VOICE_CONFIRM_DOMAIN, request.signing_input()?)?,
-    )?;
-    Ok(VoiceConfirmationProof {
-        request: request.clone(),
-        signer_key_id: key.key_id(),
-        signature,
     })
 }
 
@@ -305,6 +283,8 @@ pub fn plan_digest(plan: &VoiceActionPlan) -> Result<Digest256> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kr_client::services::voice_confirm::sign_voice_confirmation;
+    use kr_crypto::keys::AuthorisationKeyPair;
     use kr_protocol::ids::SessionId;
     use kr_protocol::scalars::Nullable;
     use kr_protocol::voice::VoiceAction;
@@ -335,7 +315,7 @@ mod tests {
         let request = issue_confirmation(&plan, action_id(9), device(0xf0), device(0xf1), 1_000)
             .expect("a challenge");
         ledger.issue(&request);
-        let proof = sign_confirmation(&key, &request).expect("a proof");
+        let proof = sign_voice_confirmation(&key, &request).expect("a proof");
 
         verify_confirmation(
             &mut ledger,
@@ -363,7 +343,7 @@ mod tests {
         // issued refuses it.
         let mut substitute = request.clone();
         substitute.expires_at_ms = TimestampMs::new(request.expires_at_ms.get() + 3_600_000);
-        let proof = sign_confirmation(&key, &substitute).expect("a proof");
+        let proof = sign_voice_confirmation(&key, &substitute).expect("a proof");
 
         let error = verify_confirmation(
             &mut ledger,
@@ -391,7 +371,7 @@ mod tests {
             issue_confirmation(&confirmed, action_id(9), device(0xf0), device(0xf1), 1_000)
                 .expect("a challenge");
         ledger.issue(&request);
-        let proof = sign_confirmation(&key, &request).expect("a proof");
+        let proof = sign_voice_confirmation(&key, &request).expect("a proof");
 
         let other = plan(VoiceAction::ShellInput, 3);
         let error = verify_confirmation(
@@ -430,7 +410,7 @@ mod tests {
         let request = issue_confirmation(&plan, action_id(9), device(0xf0), device(0xf1), 1_000)
             .expect("a challenge");
         ledger.issue(&request);
-        let proof = sign_confirmation(&key, &request).expect("a proof");
+        let proof = sign_voice_confirmation(&key, &request).expect("a proof");
 
         let error = verify_confirmation(
             &mut ledger,
@@ -454,7 +434,7 @@ mod tests {
         let request = issue_confirmation(&plan, action_id(9), device(0xf0), device(0xf1), 1_000)
             .expect("a challenge");
         ledger.issue(&request);
-        let proof = sign_confirmation(&imposter, &request).expect("a proof");
+        let proof = sign_voice_confirmation(&imposter, &request).expect("a proof");
 
         let error = verify_confirmation(
             &mut ledger,
@@ -477,7 +457,7 @@ mod tests {
         let request = issue_confirmation(&plan, action_id(9), device(0xf0), device(0xf1), 1_000)
             .expect("a challenge");
         ledger.issue(&request);
-        let proof = sign_confirmation(&key, &request).expect("a proof");
+        let proof = sign_voice_confirmation(&key, &request).expect("a proof");
 
         let late = request.expires_at_ms.get();
         let error = verify_confirmation(
@@ -502,7 +482,7 @@ mod tests {
         // Issued but never recorded: what a caller that made its own challenge would present.
         let request = issue_confirmation(&plan, action_id(9), device(0xf0), device(0xf1), 1_000)
             .expect("a challenge");
-        let proof = sign_confirmation(&key, &request).expect("a proof");
+        let proof = sign_voice_confirmation(&key, &request).expect("a proof");
 
         let error = verify_confirmation(
             &mut ledger,
