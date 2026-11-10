@@ -87,7 +87,19 @@ interface CallBridge {
      * @throws CallRefused when the call named has ended or is not held.
      */
     fun alive(call: String): HeldCall
+
+    /**
+     * What the call's record of capture shows now. With [barrier], the call also puts a
+     * [CallEvent.Barrier] into its news in the same block of its own thread that reads the record,
+     * behind everything it had waiting before that block, and the answer carries its number.
+     *
+     * @throws CallRefused when the call named has ended or is not held.
+     */
+    fun captureProof(call: String, barrier: Boolean): CaptureProofRead
 }
+
+/** What the call's record of capture showed, and the number of the marker told with it, if one was asked for. */
+data class CaptureProofRead(val proof: VoiceCaptureGate.Proof, val barrier: Long?)
 
 /**
  * The time a call's owner may leave without a sign before the call ends itself.
@@ -311,6 +323,9 @@ sealed interface CallEvent {
 
     /** Some news was dropped here. Never queued as news: it marks a place in the queue. */
     data object Lost : CallEvent
+
+    /** The marker a capture proof asked for, with its number in the call. */
+    data class Barrier(val token: Long) : CallEvent
 }
 
 /**
@@ -391,6 +406,30 @@ object CallWire {
     /** What a command with nothing to report answers. */
     fun nothing(): String = "{}"
 
+    /** What a capture proof is asked for. */
+    class ProofRequest(val call: String, val barrier: Boolean)
+
+    /** Reads the arguments of a capture proof. */
+    fun proofRequest(arguments: String): ProofRequest {
+        val read = JSONObject(arguments)
+        return ProofRequest(text(read, "call"), flag(read, "barrier"))
+    }
+
+    /**
+     * What a capture proof answers: the call's record, and the marker's number when one was told. A
+     * figure that was not seen is null, never zero.
+     */
+    fun proof(call: String, read: CaptureProofRead): String =
+        JSONObject()
+            .put("call", call)
+            .put("state", capture(read.proof.state))
+            .put("opened", read.proof.opened)
+            .put("openings", read.proof.openings)
+            .put("breaks", read.proof.breaks)
+            .put("progressAgeMs", read.proof.progressAgeMs ?: JSONObject.NULL)
+            .put("barrier", read.barrier ?: JSONObject.NULL)
+            .toString()
+
     /** What the call this device holds is doing, as the state command answers. */
     fun held(held: HeldCall): String {
         val state = JSONObject()
@@ -433,6 +472,7 @@ object CallWire {
             is CallEvent.Capture -> frame.put("kind", "capture").put("state", capture(event.state))
             CallEvent.Ended -> frame.put("kind", "ended")
             CallEvent.Lost -> frame.put("kind", "lost")
+            is CallEvent.Barrier -> frame.put("kind", "barrier").put("token", event.token)
         }
         return frame.toString()
     }

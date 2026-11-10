@@ -21,6 +21,7 @@ class VoiceCaptureGateTest {
         val gate = VoiceCaptureGate()
         val permit = gate.permit("voice-session-1", deadlineMs, nowMs)
         assertNotNull("a current answer permits the call", permit)
+        gate.recording(VoiceCaptureGate.Recording.AUDIBLE, nowMs)
         gate.recorder(running = true, nowMs = nowMs)
         return gate to permit!!
     }
@@ -47,6 +48,7 @@ class VoiceCaptureGateTest {
     fun capture_waits_for_the_recorder_and_ends_with_it() {
         val gate = VoiceCaptureGate()
         assertNotNull(gate.permit("voice-session-1", 61_000, 1_000))
+        gate.recording(VoiceCaptureGate.Recording.AUDIBLE, 1_000)
         assertTrue(gate.live(1_000))
         assertFalse("the recorder has not started", gate.captureEnabled(1_000))
         assertEquals(VoiceCaptureState.UNAVAILABLE, gate.displayed(1_000))
@@ -165,6 +167,7 @@ class VoiceCaptureGateTest {
 
         val bounded = VoiceCaptureGate(keptIntervals = 2)
         bounded.permit("s", 100_000, 0)
+        bounded.recording(VoiceCaptureGate.Recording.AUDIBLE, 0)
         bounded.recorder(running = true, nowMs = 0)
         for (start in listOf(10_000L, 20_000L, 30_000L)) {
             bounded.setMutedByPerson(true, start)
@@ -204,5 +207,162 @@ class VoiceCaptureGateTest {
                 }
             }
         }
+    }
+
+    /**
+     * KR-REQ-15.36: the gate counts every opening and every break of capture itself, under its own
+     * lock, so whether capture was unbroken is read from this record and not from news told after
+     * the moment it is about.
+     */
+    @Test
+    fun the_record_counts_every_opening_and_every_break() {
+        val gate = VoiceCaptureGate()
+        assertEquals(VoiceCaptureGate.Proof(VoiceCaptureState.IDLE, false, 0, 0, null), gate.proof(500))
+        gate.permit("voice-session-1", 61_000, 1_000)
+        gate.recording(VoiceCaptureGate.Recording.AUDIBLE, 1_000)
+        assertEquals("a permit alone opens nothing", 0L, gate.proof(1_000).openings)
+        gate.recorder(running = true, nowMs = 1_200)
+        assertEquals(VoiceCaptureGate.Proof(VoiceCaptureState.CAPTURING, true, 1, 0, null), gate.proof(1_200))
+
+        gate.setMutedByPerson(true, 2_000)
+        assertEquals(VoiceCaptureGate.Proof(VoiceCaptureState.MUTED_BY_PERSON, true, 1, 1, null), gate.proof(2_000))
+        gate.setMutedByPerson(true, 2_100)
+        assertEquals("a change that changes nothing is no break", 1L, gate.proof(2_100).breaks)
+        gate.setMutedByPerson(false, 3_000)
+        assertEquals(VoiceCaptureGate.Proof(VoiceCaptureState.CAPTURING, true, 2, 1, null), gate.proof(3_000))
+    }
+
+    /**
+     * KR-REQ-15.36: whatever takes capture off after it opened is one break, whichever way it goes:
+     * the person, the system, the system's silencing, a route, the recorder, a withdrawn permit, the
+     * end and the deadline.
+     */
+    @Test
+    fun every_way_capture_goes_off_after_an_opening_is_one_break() {
+        val closes = listOf<Pair<String, (VoiceCaptureGate) -> Unit>>(
+            "the person's mute" to { it.setMutedByPerson(true, 2_000) },
+            "focus lost" to { it.taken(VoiceCaptureGate.Taken.FOCUS_LOST, 2_000) },
+            "a suspension" to { it.taken(VoiceCaptureGate.Taken.SUSPENDED, 2_000) },
+            "the system silencing the recording" to { it.recording(VoiceCaptureGate.Recording.SILENCED, 2_000) },
+            "the system reporting none" to { it.recording(VoiceCaptureGate.Recording.UNREPORTED, 2_000) },
+            "a route in change" to { it.route(changing = true, inputAvailable = true, nowMs = 2_000) },
+            "a missing input" to { it.route(changing = false, inputAvailable = false, nowMs = 2_000) },
+            "the recorder stopping" to { it.recorder(running = false, nowMs = 2_000) },
+            "a withdrawn permit" to { it.revoke(1, 2_000) },
+            "the end of the call" to { it.stop(2_000) },
+            "the deadline" to { it.captureEnabled(61_000) },
+        )
+        for ((name, close) in closes) {
+            val (gate, _) = permitted()
+            close(gate)
+            val proof = gate.proof(61_000)
+            assertEquals(name, 1L, proof.openings)
+            assertEquals(name, 1L, proof.breaks)
+            assertTrue(name, proof.opened)
+            assertTrue(name, proof.state != VoiceCaptureState.CAPTURING)
+        }
+    }
+
+    /**
+     * KR-REQ-15.36: two buffers from the recorder more than 40 ms apart while capture is on are a
+     * break, whether the call's state changed or not; 40 ms and less are not. A 60 ms gap is one.
+     */
+    @Test
+    fun a_gap_of_more_than_forty_milliseconds_between_two_buffers_is_a_break() {
+        val (gate, _) = permitted(nowMs = 1_000, deadlineMs = 61_000)
+        for (at in 1_010L..1_100L step 10) assertTrue(gate.buffered(at))
+        assertEquals("buffers every 10 ms are no break", 0L, gate.proof(1_100).breaks)
+
+        assertTrue(gate.buffered(1_140))
+        assertEquals("a wait of exactly 40 ms is no break", 0L, gate.proof(1_140).breaks)
+        assertTrue(gate.buffered(1_181))
+        assertEquals("41 ms is one", 1L, gate.proof(1_181).breaks)
+
+        assertTrue(gate.buffered(1_191))
+        assertTrue(gate.buffered(1_251))
+        val proof = gate.proof(1_251)
+        assertEquals("a 60 ms gap is a second break", 2L, proof.breaks)
+        assertEquals("and the state never changed", VoiceCaptureState.CAPTURING, proof.state)
+        assertEquals(1L, proof.openings)
+    }
+
+    /**
+     * KR-REQ-15.36: a buffer is carried only while capture is on, and a wait that spans a closed gate
+     * is no break: nothing was carried then, and the first buffer after an opening is where the
+     * counting starts.
+     */
+    @Test
+    fun a_wait_that_spans_a_closed_gate_is_no_break_and_a_closed_gate_carries_nothing() {
+        val (gate, _) = permitted(nowMs = 1_000, deadlineMs = 61_000)
+        assertTrue(gate.buffered(1_010))
+        gate.setMutedByPerson(true, 1_020)
+        assertFalse("a muted microphone carries nothing", gate.buffered(1_030))
+        gate.setMutedByPerson(false, 1_500)
+        assertTrue(gate.buffered(1_510))
+        val proof = gate.proof(1_510)
+        assertEquals("the mute is the one break", 1L, proof.breaks)
+        assertEquals(2L, proof.openings)
+        assertEquals("only the first buffer after the opening is seen so far", 0L, proof.progressAgeMs)
+    }
+
+    /** KR-REQ-15.36: the proof says how long ago a buffer was last seen, and nothing before one was. */
+    @Test
+    fun the_proof_says_how_long_ago_a_buffer_was_seen() {
+        val (gate, _) = permitted(nowMs = 1_000, deadlineMs = 61_000)
+        assertEquals(null, gate.proof(1_005).progressAgeMs)
+        gate.buffered(1_010)
+        assertEquals(5L, gate.proof(1_015).progressAgeMs)
+        assertEquals("it ages with the clock", 490L, gate.proof(1_500).progressAgeMs)
+        gate.setMutedByPerson(true, 1_600)
+        gate.setMutedByPerson(false, 1_700)
+        assertEquals("a new opening starts with none seen", null, gate.proof(1_700).progressAgeMs)
+    }
+
+    /**
+     * KR-REQ-15.36: a recording the system silences closes the gate and shows the microphone paused
+     * by the system, and a phone that reports nothing of the recording is refused, as is the first
+     * moment of a recorder the system has not reported yet.
+     */
+    @Test
+    fun a_silenced_recording_closes_the_gate_and_shows_the_system_paused_the_microphone() {
+        val gate = VoiceCaptureGate()
+        gate.permit("voice-session-1", 61_000, 1_000)
+        gate.recorder(running = true, nowMs = 1_000)
+        assertFalse("the system has not reported the recording", gate.captureEnabled(1_100))
+        assertEquals(VoiceCaptureState.UNAVAILABLE, gate.displayed(1_100))
+        assertEquals(0L, gate.proof(1_100).openings)
+
+        gate.recording(VoiceCaptureGate.Recording.AUDIBLE, 1_200)
+        assertTrue(gate.captureEnabled(1_200))
+        gate.recording(VoiceCaptureGate.Recording.SILENCED, 1_300)
+        assertFalse(gate.captureEnabled(1_300))
+        assertEquals(VoiceCaptureState.SUSPENDED_BY_SYSTEM, gate.displayed(1_300))
+        assertFalse(gate.buffered(1_310))
+
+        gate.recording(VoiceCaptureGate.Recording.AUDIBLE, 1_400)
+        val proof = gate.proof(1_400)
+        assertEquals(VoiceCaptureState.CAPTURING, proof.state)
+        assertEquals("the silence was one break and the return a second opening", 1L, proof.breaks)
+        assertEquals(2L, proof.openings)
+    }
+
+    /** What the system lists of the recordings, and which of them is this call's. */
+    @Test
+    fun the_recording_of_the_call_is_the_one_from_its_source() {
+        val call = 7
+        assertEquals(VoiceCaptureGate.Recording.UNREPORTED, recordingOf(emptyList(), call))
+        assertEquals(
+            "another application's recording is not this call's",
+            VoiceCaptureGate.Recording.UNREPORTED,
+            recordingOf(listOf(RecordingReport(source = 1, silenced = false)), call),
+        )
+        assertEquals(
+            VoiceCaptureGate.Recording.AUDIBLE,
+            recordingOf(listOf(RecordingReport(1, true), RecordingReport(call, false)), call),
+        )
+        assertEquals(
+            VoiceCaptureGate.Recording.SILENCED,
+            recordingOf(listOf(RecordingReport(call, false), RecordingReport(call, true)), call),
+        )
     }
 }

@@ -125,6 +125,7 @@ class VoiceCallControlTest {
         assertTrue(control.permit("voice-session-1", platform.closesIn(seconds)))
         control.servicePromoted()
         control.recorder(true)
+        control.recording(VoiceCaptureGate.Recording.AUDIBLE)
         return Triple(control, platform, switches)
     }
 
@@ -183,9 +184,60 @@ class VoiceCallControlTest {
         assertEquals(VoiceCaptureState.UNAVAILABLE, control.displayed())
 
         control.recorder(true)
+        assertFalse("the system has not reported the recording yet", switches.microphoneOn)
+        control.recording(VoiceCaptureGate.Recording.AUDIBLE)
         assertTrue(switches.microphoneOn)
         assertEquals(VoiceCaptureState.CAPTURING, control.displayed())
         assertEquals(VoiceCaptureState.CAPTURING, platform.notified.last())
+    }
+
+    /**
+     * KR-REQ-15.36 and KR-ACC-014: a recording the system silences closes the microphone, is shown
+     * as the system pausing it, carries no frame, and is one break in the record; capture comes
+     * back, as a second opening, only when the system reports the recording heard again. This is the
+     * display of the state a phone shows when another application holds the microphone.
+     */
+    @Test
+    fun a_silenced_recording_is_shown_as_paused_by_the_system_and_carries_nothing() {
+        val (control, platform, switches) = running()
+        assertTrue(switches.microphoneOn)
+        assertTrue(control.carries())
+
+        control.recording(VoiceCaptureGate.Recording.SILENCED)
+
+        assertFalse(switches.microphoneOn)
+        assertEquals(VoiceCaptureState.SUSPENDED_BY_SYSTEM, control.displayed())
+        assertEquals(VoiceCaptureState.SUSPENDED_BY_SYSTEM, platform.shown.last())
+        assertEquals(VoiceCaptureState.SUSPENDED_BY_SYSTEM, platform.notified.last())
+        assertFalse("a frame the system silenced is not carried", control.carries())
+        val broken = control.captureProof()
+        assertEquals(1L, broken.openings)
+        assertEquals(1L, broken.breaks)
+        assertEquals(VoiceCaptureState.SUSPENDED_BY_SYSTEM, broken.state)
+
+        control.recording(VoiceCaptureGate.Recording.AUDIBLE)
+        assertTrue(switches.microphoneOn)
+        assertEquals(2L, control.captureProof().openings)
+        assertEquals(1L, control.captureProof().breaks)
+    }
+
+    /** KR-REQ-15.36: a frame from the recorder is carried only while the gate is on, and a gap in them is a break. */
+    @Test
+    fun a_gap_between_frames_is_a_break_in_the_record() {
+        val (control, platform, _) = running()
+        for (step in 1..10) {
+            platform.now += 10
+            assertTrue(control.carries())
+        }
+        assertEquals(0L, control.captureProof().breaks)
+
+        platform.now += 60
+        assertTrue("the frame after the gap is still carried", control.carries())
+
+        val proof = control.captureProof()
+        assertEquals(1L, proof.breaks)
+        assertEquals(VoiceCaptureState.CAPTURING, proof.state)
+        assertEquals(0L, proof.progressAgeMs)
     }
 
     /** KR-REQ-15.34: a refused service undoes focus and ends the call, and nothing reopens it. */

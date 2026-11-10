@@ -128,6 +128,25 @@ class CallWireTest {
     }
 
     @Test
+    fun `a capture proof reads its call and its barrier flag and answers the fixture's record`() {
+        val proofs = cases("callCaptureProof")
+        assertEquals(3, proofs.size)
+        val expected = listOf(
+            Triple("c1", true, CaptureProofRead(VoiceCaptureGate.Proof(VoiceCaptureState.CAPTURING, true, 1, 0, 120), 3)),
+            Triple("c1", false, CaptureProofRead(VoiceCaptureGate.Proof(VoiceCaptureState.MUTED_BY_PERSON, true, 2, 3, null), null)),
+            Triple("c2", true, CaptureProofRead(VoiceCaptureGate.Proof(VoiceCaptureState.UNAVAILABLE, false, 0, 0, null), 1)),
+        )
+        for ((index, case) in proofs.withIndex()) {
+            val asked = CallWire.proofRequest(case.getJSONObject("request").toString())
+            assertEquals(expected[index].first, asked.call)
+            assertEquals(expected[index].second, asked.barrier)
+            same(case.getJSONObject("response"), CallWire.proof(asked.call, expected[index].third))
+        }
+        val unseen = JSONObject(CallWire.proof("c1", expected[1].third))
+        assertTrue("a figure that was not seen is null, never zero", unseen.isNull("progressAgeMs") && unseen.isNull("barrier"))
+    }
+
+    @Test
     fun `each item of news is the fixture's frame`() {
         val news = fixture("events.json")
         val frames = (0 until news.length()).map { news.getJSONObject(it).getJSONObject("frame") }
@@ -149,6 +168,7 @@ class CallWireTest {
             CallEvent.Capture(VoiceCaptureState.IDLE),
             CallEvent.Lost,
             CallEvent.Ended,
+            CallEvent.Barrier(3),
         )
         assertEquals(frames.size, events.size)
         for ((index, event) in events.withIndex()) {
@@ -169,6 +189,7 @@ class CallWireTest {
                     "callPermit" -> CallWire.permit(request)
                     "callAccept" -> CallWire.answer(request)
                     "callOffer", "callStop", "callAlive" -> CallWire.call(request)
+                    "callCaptureProof" -> CallWire.proofRequest(request)
                     else -> error("the fixture names a command ${case.getString("command")}")
                 }
                 false
@@ -191,6 +212,7 @@ class CallWireTest {
             "capture" -> CallEvent.Capture(VoiceCaptureState.CAPTURING)
             "playout" -> CallEvent.Playout
             "ended" -> CallEvent.Ended
+            "barrier" -> CallEvent.Barrier(1)
             else -> error("the fixture names news of a kind $kind")
         }
 
@@ -205,6 +227,7 @@ class CallWireTest {
                     is CallEvent.Capture -> "capture"
                     CallEvent.Playout -> "playout"
                     CallEvent.Ended -> "ended"
+                    is CallEvent.Barrier -> "barrier"
                     CallEvent.Lost -> error("a loss is never queued as news")
                 }
         }
@@ -270,6 +293,24 @@ class CallWireTest {
         later.removeFirst().run()
 
         assertEquals("nothing follows the end", listOf("lost", "ended"), sent.map { JSONObject(it).getString("kind") })
+    }
+
+    @Test
+    fun `a barrier is sent after everything queued before it and a loss before it is told first`() {
+        val sent = mutableListOf<String>()
+        val queue = CallNewsQueue("c1", { sent += it }, limit = 2)
+        val later = ArrayDeque<Runnable>()
+        queue.offer(CallEvent.ProviderEvent(byteArrayOf(1))) { later.addLast(it) }
+        queue.offer(CallEvent.ProviderEvent(byteArrayOf(2))) { later.addLast(it) }
+        queue.offer(CallEvent.Barrier(7)) { later.addLast(it) }
+        queue.offer(CallEvent.ProviderEvent(byteArrayOf(3))) { later.addLast(it) }
+
+        later.removeFirst().run()
+
+        val kinds = sent.map { JSONObject(it).getString("kind") }
+        assertEquals(listOf("lost", "provider_event", "barrier", "lost"), kinds)
+        assertEquals(7, JSONObject(sent[2]).getLong("token"))
+        assertEquals(listOf(1L, 2L, 3L, 4L), sent.map { JSONObject(it).getLong("seq") })
     }
 
     @Test
@@ -371,5 +412,7 @@ class CallWireTest {
         override fun stop(call: String) = Unit
         override fun held() = HeldCall(null, VoiceCaptureState.IDLE, microphoneMuted = false, playing = false)
         override fun alive(call: String) = held()
+        override fun captureProof(call: String, barrier: Boolean) =
+            CaptureProofRead(VoiceCaptureGate.Proof(VoiceCaptureState.IDLE, false, 0, 0, null), null)
     }
 }
