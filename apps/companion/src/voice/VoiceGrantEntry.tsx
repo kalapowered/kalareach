@@ -13,7 +13,9 @@
  * What is shown is bound to the host it was read from: the change is sent for that host's
  * environment, and is not sent when the grant has changed or the host is another by the time the
  * person presses. A press that finds either changed has the screen read what a call would be again,
- * so that what is shown above this entry describes the host and the grant the entry shows.
+ * so that what is shown above this entry describes the host and the grant the entry shows. The
+ * entry takes no change while that read is out, and none after it failed until it is made again:
+ * what is listed above would not be the grant the entry holds.
  *
  * It is offered only while a spoken request can reach the host at all: a person is not asked to
  * allow what cannot happen.
@@ -88,9 +90,10 @@ export function VoiceGrantEntry({
   readonly sessionNames: Readonly<Record<string, string>>
   /**
    * Called once the host has written the new grant, and when the grant or the host is found to
-   * have changed since it was shown, so the screen reads what a call would be again.
+   * have changed since it was shown, so the screen reads what a call would be again. Answers true
+   * once that read has ended and the screen shows it, and false when it failed or was dropped.
    */
-  readonly onChanged: () => void
+  readonly onChanged: () => Promise<boolean>
 }): ReactNode {
   const id = useId()
   const [standing, setStanding] = useState<Standing | null>(null)
@@ -101,16 +104,25 @@ export function VoiceGrantEntry({
   const [result, setResult] = useState<VoiceAllowed | null>(null)
   /** Counts the readings asked for, so that the grant is read again once it changed. */
   const [reading, setReading] = useState(0)
+  /** How many of those readings have ended: the entry's own reading is out while this is behind. */
+  const [read, setRead] = useState(0)
+  const reloading = read !== reading
+  /** Whether the screen could not read what a call would be again, so the list above is not this grant. */
+  const [unread, setUnread] = useState(false)
 
   useEffect(() => {
     let current = true
     readStanding(port).then(
-      (read) => {
-        if (current) setStanding(read)
+      (now) => {
+        if (!current) return
+        setStanding(now)
+        setRead(reading)
       },
       () => {
         // A grant that cannot be read offers nothing.
-        if (current) setStanding(null)
+        if (!current) return
+        setStanding(null)
+        setRead(reading)
       }
     )
     return () => {
@@ -127,8 +139,27 @@ export function VoiceGrantEntry({
   )
   const offeredActions = new Set(standing.offered.map((each) => each.action))
 
+  /**
+   * Has the screen read what a call would be again, and holds the entry until it has. The list above
+   * is the grant this entry holds only once that read has ended and shown it.
+   */
+  const readAbove = async () => {
+    setUnread(!(await onChanged()))
+  }
+
+  /** Reads the screen's list again after a read of it failed. */
+  const readAgain = () => {
+    if (busy) return
+    setBusy(true)
+    void readAbove().finally(() => {
+      setBusy(false)
+    })
+  }
+
+  const held = busy || reloading || unread
+
   const allow = () => {
-    if (busy || !changed || standing.sessions.length === 0) return
+    if (held || !changed || standing.sessions.length === 0) return
     setBusy(true)
     setFailure(null)
     setResult(null)
@@ -141,7 +172,7 @@ export function VoiceGrantEntry({
           setFailure('What voice may do has changed since this was shown. It is shown again: check it, then change it.')
           setReading((count) => count + 1)
           setEdits(new Map())
-          onChanged()
+          await readAbove()
           return
         }
         // Every action of the grant the person did not tick or clear stays as it is.
@@ -162,7 +193,7 @@ export function VoiceGrantEntry({
         // The grant is what the host now says it is, which the screen reads again.
         setEdits(new Map())
         setReading((count) => count + 1)
-        onChanged()
+        await readAbove()
       } catch (error: unknown) {
         setFailure(failureMessage(error))
       } finally {
@@ -190,7 +221,7 @@ export function VoiceGrantEntry({
               <input
                 type="checkbox"
                 checked={permitted(each.action)}
-                disabled={busy}
+                disabled={held}
                 onChange={(event) => {
                   setEdits((before) => new Map(before).set(each.action, event.target.checked))
                 }}
@@ -232,11 +263,28 @@ export function VoiceGrantEntry({
           {failure}
         </p>
       )}
+      {unread ? (
+        <>
+          <p className="kr-voice__refusal" role="status" data-testid="voice-grant-entry-unread">
+            What is listed above could not be read again, so it may not be what is allowed now.
+            Nothing can be changed here until it has been read.
+          </p>
+          <button
+            type="button"
+            className="kr-voice__start"
+            onClick={readAgain}
+            disabled={busy}
+            data-testid="voice-grant-entry-read-again"
+          >
+            Read it again
+          </button>
+        </>
+      ) : null}
       <button
         type="button"
         className="kr-voice__start"
         onClick={allow}
-        disabled={busy || !changed || standing.sessions.length === 0}
+        disabled={held || !changed || standing.sessions.length === 0}
         data-testid="voice-grant-entry-allow"
       >
         {busy ? 'Changing…' : 'Change what voice may do'}

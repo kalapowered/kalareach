@@ -357,6 +357,100 @@ describe('what voice may do', () => {
     expect(screen.getByText(NAVIGATE_SENTENCE)).toBeInTheDocument()
   })
 
+  // The entry takes no second change while the list above is not the grant it holds: when its own
+  // read of the grant ends before the screen's read of what a call would be, its controls wait.
+  it('takes no change until the screen has read what a call would be again', async () => {
+    const { controls, settled } = start((fake) => {
+      fake.speechReachesTheHost(true)
+    })
+    const entry = await screen.findByTestId('voice-grant-entry')
+    await userEvent.click(within(entry).getByRole('checkbox', { name: new RegExp(CLOSE_SENTENCE) }))
+    await settled()
+    const close = () => within(entry).getByRole('checkbox', { name: new RegExp(CLOSE_SENTENCE) })
+
+    const held = controls.hold('voicePrepare')
+    controls.standingVoiceGrant(['navigate'])
+    await userEvent.click(within(entry).getByTestId('voice-grant-entry-allow'))
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+    await act(async () => {
+      held.answer(0)
+      await Promise.resolve()
+    })
+    // The screen's read of what a call would be, and the entry's own read of the grant, are out.
+    await waitFor(() => {
+      expect(held.count).toBe(3)
+    })
+    // The entry's own read ends first.
+    await act(async () => {
+      held.answer(2)
+      await Promise.resolve()
+    })
+
+    expect(close()).toBeDisabled()
+    expect(within(entry).getByTestId('voice-grant-entry-allow')).toBeDisabled()
+    expect(screen.getByText(STATUS_SENTENCE)).toBeInTheDocument()
+
+    await act(async () => {
+      held.release()
+      await Promise.resolve()
+    })
+    await waitFor(() => {
+      expect(close()).toBeEnabled()
+    })
+    expect(screen.queryByText(STATUS_SENTENCE)).toBeNull()
+    expect(controls.voiceAllows).toHaveLength(0)
+  })
+
+  // When the screen could not read what a call would be again, the entry says so in its own words,
+  // takes no change, and offers the read again.
+  it('says so, and offers the read again, when the screen could not read what a call would be', async () => {
+    const { port, controls } = fakeHost()
+    controls.speechReachesTheHost(true)
+    // The second read after the press is the screen's own, and it fails.
+    let afterPress = -1
+    const failing: HostPort = {
+      ...port,
+      voicePrepare: (params) => {
+        if (afterPress >= 0) {
+          afterPress += 1
+          if (afterPress === 2) return Promise.reject(new Error('The host could not be read.'))
+        }
+        return port.voicePrepare(params)
+      }
+    }
+    render(
+      <AppProvider port={failing}>
+        <VoiceRoute surface="ios" />
+      </AppProvider>
+    )
+    const entry = await screen.findByTestId('voice-grant-entry')
+    const close = () => within(entry).getByRole('checkbox', { name: new RegExp(CLOSE_SENTENCE) })
+    await userEvent.click(close())
+
+    afterPress = 0
+    controls.standingVoiceGrant(['navigate'])
+    await userEvent.click(within(entry).getByTestId('voice-grant-entry-allow'))
+
+    expect(await screen.findByTestId('voice-grant-entry-unread')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(close()).toBeDisabled()
+    })
+    expect(within(entry).getByTestId('voice-grant-entry-allow')).toBeDisabled()
+    expect(controls.voiceAllows).toHaveLength(0)
+
+    afterPress = -1
+    await userEvent.click(within(entry).getByTestId('voice-grant-entry-read-again'))
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('voice-grant-entry-unread')).toBeNull()
+    })
+    expect(close()).toBeEnabled()
+    expect(screen.queryByText(STATUS_SENTENCE)).toBeNull()
+    expect(screen.getByText(NAVIGATE_SENTENCE)).toBeInTheDocument()
+  })
+
   // Section 9: a replacement ends the calls under the grant it replaces, and a withdrawal is not
   // complete until its barrier holds: the sessions the host has still to confirm are named.
   it('says what the host could not carry and which sessions it has still to confirm', async () => {
