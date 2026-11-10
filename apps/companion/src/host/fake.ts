@@ -719,6 +719,8 @@ export interface FakeHostControls {
    * refused, as the host refuses it.
    */
   changeVoiceScope(): void
+  /** Sets what the standing voice grant permits, and the sessions it covers when they are given. */
+  standingVoiceGrant(actions: readonly VoiceAction[], sessions?: readonly string[]): void
   /**
    * Makes a spoken request reach the host or not, as the device's build decides. With it, the
    * scope the person is shown offers the actions they may add to the default grant.
@@ -1366,6 +1368,8 @@ export function fakeHost(
   let speechReachesHost = false
   /** What the standing grant permits, which a preparation states and an allowance replaces. */
   let voiceStanding: VoiceAction[] = VOICE_SCOPE.statement.actions.map((action) => action)
+  /** The sessions the standing grant covers, which a preparation answers with those it was asked about. */
+  let voiceStandingSessions: string[] = [...VOICE_SCOPE.session_ids]
   let voiceAllowFailure: string | null = null
   let voiceHeldBack: readonly VoiceAction[] = []
   let voiceAllowUnconfirmed = false
@@ -2682,7 +2686,10 @@ export function fakeHost(
       return Promise.resolve({
         ...VOICE_SCOPE,
         statement: statementOf(voiceStanding),
-        session_ids: sessions.length > 0 ? sessions : [...VOICE_SCOPE.session_ids],
+        session_ids:
+          sessions.length > 0
+            ? sessions.filter((session) => voiceStandingSessions.includes(session))
+            : [...voiceStandingSessions],
         prepared: preparedFor(voice),
         selected: VOICE_EXCLUDED_CLASSES.filter((each) => selected.includes(each)),
         managed:
@@ -2703,6 +2710,12 @@ export function fakeHost(
       }),
     voiceAllow: (request) => {
       requireConnection()
+      if (request.environmentId !== undefined && request.environmentId !== hostEnvironment) {
+        refuse(
+          'PERMISSION_DENIED',
+          'this was shown for another host than the one this application is connected to now: read it again before changing it'
+        )
+      }
       voiceAllows.push(request)
       if (voiceAllowFailure !== null) {
         const message = voiceAllowFailure
@@ -2723,6 +2736,7 @@ export function fakeHost(
       const notHeld = asked.filter((action) => voiceHeldBack.includes(action))
       voiceHeldBack = []
       voiceStanding = actions
+      voiceStandingSessions = [...request.sessionIds]
       voice.scope += 1
       const unreadableFence = allowFenceUnreadable
       allowFenceUnreadable = false
@@ -3671,6 +3685,10 @@ export function fakeHost(
     },
     speechReachesTheHost(reaches) {
       speechReachesHost = reaches
+    },
+    standingVoiceGrant(actions, sessions) {
+      voiceStanding = [...actions]
+      if (sessions !== undefined) voiceStandingSessions = [...sessions]
     },
     changeVoiceRate(version, minorUnitsPerSecond) {
       voice.rate = { ...voice.rate, version, minor_units_per_second: minorUnitsPerSecond }
