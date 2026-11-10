@@ -2669,7 +2669,18 @@ fn asking_again() -> Timings {
 /// the service, one opening of the call here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_start_whose_answer_is_lost_continues_under_the_answer_a_repeat_brings() {
-    let mut scene = scene_with(asking_again(), Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    let timings = Timings {
+        // The first question comes at once; the later ones leave the host time to make the call,
+        // which the case cannot see, so that a question asked before the host has an answer is
+        // asked again.
+        repeat_delays: [
+            Duration::from_millis(20),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        ],
+        ..asking_again()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
 
     let started = scene.start().await;
 
@@ -6196,7 +6207,13 @@ async fn a_fragment_that_arrives_before_capture_opened_taints_the_call() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reply_lost_after_the_host_acted_is_asked_about_again_and_reads_performed() {
     let timings = Timings {
-        repeat_delays: [Duration::from_millis(20); 3],
+        // The first question comes at once; the later ones leave the host time to finish, which the
+        // case cannot see, so that a question asked before the host has a result is asked again.
+        repeat_delays: [
+            Duration::from_millis(20),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        ],
         host_within: Duration::from_secs(5),
         ..delegating_timings()
     };
@@ -6204,18 +6221,11 @@ async fn a_reply_lost_after_the_host_acted_is_asked_about_again_and_reads_perfor
     calling(&scene).await;
     chatter(&scene).await;
     let end = speak(&scene, 6_000, "what is the status");
+    // The answer to the first request of the method is lost, and no other answer is.
     scene
         .link
-        .lose_the_answer_to(Some(HostMethod::VoiceDelegate));
+        .lose_only_the_answer_after(0, HostMethod::VoiceDelegate);
     ask(&scene, "d-1", end - 200).await;
-    tokio::time::timeout(WATCHDOG, async {
-        while at_the_host(&scene) < 1 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the request reaches the host");
-    scene.link.lose_the_answer_to(None);
 
     let row = row_reaching(&scene, "d-1", "performed").await;
 
@@ -7130,8 +7140,10 @@ async fn a_signed_request_whose_answer_is_lost_is_asked_about_again_and_reads_pe
     scene.link.hold_next_request(HostMethod::VoiceDelegate);
     scene.ceremony.release();
     scene.link.until_request_held().await;
-    scene.link.release_request();
+    // The question's hold is armed before the signed request goes: the question can come only after
+    // the signed request's answer is lost, which is after it is let go.
     scene.link.hold_next_request(HostMethod::VoiceDelegate);
+    scene.link.release_request();
     scene.link.until_request_held().await;
     scene.until_closed().await;
     scene.link.release_request();
@@ -7314,7 +7326,13 @@ async fn a_challenge_read_after_the_host_was_lost_is_put_to_nobody() {
 /// stop, so the call is ending and not yet ended while the lookup is let go.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_confirmation_is_not_asked_once_the_call_is_ending() {
-    let mut scene = closing().await;
+    let timings = Timings {
+        // Native code is held at its stop for as long as the case waits: the call is not to give up
+        // on it and end meanwhile.
+        local_within: Duration::from_secs(600),
+        ..delegating_timings()
+    };
+    let mut scene = closing_with(timings).await;
     calling(&scene).await;
     chatter(&scene).await;
     scene.link.hold_next_request(HostMethod::SessionRead);
