@@ -678,6 +678,12 @@ mod unix {
             &self.handle
         }
 
+        /// What this terminal declares itself to be: the terminfo name its environment gives it.
+        #[must_use]
+        pub fn profile(&self) -> Option<String> {
+            std::env::var("TERM").ok()
+        }
+
         /// A name for this terminal that no other terminal shares while it exists.
         ///
         /// The device and the session that owns it. A pseudo-terminal's path is reused by the

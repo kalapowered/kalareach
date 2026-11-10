@@ -454,6 +454,22 @@ mod console {
             Probe::unasked(context)
         }
 
+        /// What this console declares itself to be.
+        ///
+        /// The terminfo name its environment gives it, when there is one: a person who sets `TERM`
+        /// has said what their terminal is. A console sets none, and an attachment that declares
+        /// nothing is refused the input lease, so a console names itself. The declaration is made
+        /// only here, where this command has read the console's input and output modes and will put
+        /// them back, and it claims no more than the keys this command reads can produce: console
+        /// key records, which the session spells in the ordinary encoding.
+        #[must_use]
+        pub fn profile(&self) -> Option<String> {
+            std::env::var("TERM")
+                .ok()
+                .filter(|term| !term.is_empty())
+                .or_else(|| Some(kr_term::win32::CONSOLE_PROFILE.to_owned()))
+        }
+
         /// A name for this console that no other console shares while it exists.
         ///
         /// The console host has no device path and no session identifier of the kind a terminal

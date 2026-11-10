@@ -402,6 +402,9 @@ pub struct Attachment {
 /// Implicit acquisition is available here because this is the local operating-system path: the
 /// worker authenticated the caller by peer credentials. A network client cannot assert that.
 ///
+/// `declaration` is the terminal's own statement of what it is, which `--no-probe` withholds by
+/// passing none.
+///
 /// # Errors
 ///
 /// Returns the host's refusal, or a transport failure.
@@ -410,7 +413,7 @@ pub async fn attach(
     attaching: &Attaching,
     dimensions: Dimensions,
     claim_geometry: bool,
-    probe: bool,
+    declaration: Option<&str>,
 ) -> Result<Attachment> {
     let mut requested = CanonicalSet::new();
     requested.insert(AttachmentCapability::ObserveTerminal);
@@ -426,7 +429,7 @@ pub async fn attach(
         // The terminal's own declaration of what it is. `--no-probe` withholds it, and the session
         // uses the conservative profile instead of one this terminal has not been asked to
         // confirm.
-        terminal_profile_id: Nullable(probe.then(|| std::env::var("TERM").ok()).flatten()),
+        terminal_profile_id: Nullable(declaration.map(str::to_owned)),
         requested,
     };
     let result: SessionAttachResult =

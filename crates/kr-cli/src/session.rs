@@ -1708,7 +1708,7 @@ where
     // What this terminal declares itself to be decides which questions may be asked of it, because
     // section 8 requires every question asked to be answered. A terminal the profile cannot require
     // anything of beyond the terminator is asked only that.
-    let declared = std::env::var("TERM").ok();
+    let declared = terminal.profile();
     // Whether a probe has already gone out on this terminal, which is a fact about the terminal
     // rather than about this process: a second `kr attach` in a window where one failed is looking
     // at the same input stream, and a late reply from the first is still coming to it.
@@ -1767,8 +1767,14 @@ where
     // terminal that did not claim it would be shown a projection of somebody else's size, which is
     // exactly what a lone attachment does not need. `--take-geometry` goes further and takes the
     // claim from whoever holds it.
-    let attachment: Attachment =
-        crate::attach::attach(&mut client, &attaching, dimensions, true, !options.no_probe).await?;
+    let attachment: Attachment = crate::attach::attach(
+        &mut client,
+        &attaching,
+        dimensions,
+        true,
+        declared.as_deref().filter(|_| !options.no_probe),
+    )
+    .await?;
     // The transfer's own answer is what the loop starts from. Starting from the attach result
     // instead would leave it quoting an epoch the transfer has already moved, and believing
     // somebody else still owns the size it has just taken.
