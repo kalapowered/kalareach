@@ -757,13 +757,26 @@ async function assertStopIsNotCancel(page: Page, base: string, target: Target): 
   const where = `${target.surface}/${target.engineName}`
   await prove('KR-REQ-15.22', where, [
     opening(page, base, target),
-    hostEndsItsTurn(page),
     pressing(page, 'Start voice session'),
     heading(page, 'Voice session'),
     pressing(page, 'Stop the voice'),
     markedPressed(page, 'Stop the voice'),
     captureReads(page, 'Microphone on'),
     callOnScreen(page, true),
+    inOwnSection(page, 'Cancel the current turn', 'Cancel what the agent is doing'),
+    hostAgentIsOnATurn(page, true),
+    canPress(page, ['Cancel the current turn'])
+  ])
+}
+
+/** While the host's agent is on no turn the screen offers no cancellation, and says why. */
+async function assertNoTurnToCancel(page: Page, base: string, target: Target): Promise<void> {
+  const where = `${target.surface}/${target.engineName}`
+  await prove('KR-REQ-15.22', where, [
+    opening(page, base, target),
+    hostEndsItsTurn(page),
+    pressing(page, 'Start voice session'),
+    heading(page, 'Voice session'),
     inOwnSection(page, 'Cancel the current turn', 'Cancel what the agent is doing'),
     cannotPress(page, 'Cancel the current turn'),
     shows(page, 'has not said which turn the agent is on')
@@ -819,6 +832,7 @@ async function assertTarget(base: string, target: Target): Promise<void> {
     await assertBrokerFailure(page, base, target)
     await assertStopIsNotCancel(page, base, target)
     await assertCancelNamesTheTurn(page, base, target)
+    await assertNoTurnToCancel(page, base, target)
     await assertTargetSize(page, base, target)
   } finally {
     await browser.close()
