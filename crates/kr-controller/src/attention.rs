@@ -264,8 +264,9 @@ impl Caller {
 
     /// How much of a session's content this caller is served.
     ///
-    /// A paired device is served the host's own words and no session text: a grant's history
-    /// scope is not yet something the store can narrow a record's text to.
+    /// The owner is served the text of every item and change. A paired device is served the
+    /// host's own words and no item or change text, whatever its grant's history reaches: the
+    /// history bound decides which items and changes it is shown, and never releases their text.
     #[must_use]
     pub const fn content(&self) -> Content {
         match self {
