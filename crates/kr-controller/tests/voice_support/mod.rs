@@ -137,67 +137,6 @@ pub struct StandIn {
     state: Arc<Mutex<State>>,
     /// The task that accepts connections, until a test closes the port.
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// What keeps the port the service's for as long as the service lives, while it is closed too.
-    _anchor: Option<Anchor>,
-}
-
-/// A connection the service made to its own port and kept, so that the port stays the service's
-/// while nothing listens on it.
-///
-/// The accepted end of the connection is bound to the port. While it lives, a connection made to
-/// the port finds no listener and is refused outright, as one to a closed port is; no program that
-/// asks the system for any port is given this one, and the system makes no connection from it (on
-/// macOS a socket that listens on the wildcard address of both families can still be given it,
-/// which no Rust code of this workspace does; the anchor is held on the IPv4 loopback address).
-/// What else it keeps off the port depends on the system. On Linux a program that binds the port
-/// by number is refused as well, unless it sets `SO_REUSEPORT` as the service's own listeners do.
-/// On macOS one that binds it by number with `SO_REUSEADDR` or `SO_REUSEPORT` is not. Where there
-/// is no `set_reuseport` (Windows) the service holds nothing, as below.
-#[cfg(unix)]
-struct Anchor {
-    _made: TcpStream,
-    _accepted: TcpStream,
-}
-
-/// Where a listener cannot share a port with a connection that holds it, the service holds
-/// nothing and a closed port is a free one.
-#[cfg(not(unix))]
-type Anchor = ();
-
-/// A listener on `address` that can share the port with an `Anchor`.
-///
-/// It sets `SO_REUSEPORT` and not `SO_REUSEADDR`, which is what std's and tokio's own `bind` set on
-/// unix: with `SO_REUSEADDR` the connection that holds the port would let a program that binds it
-/// by number share it on Linux too, and a listener made by those would be refused beside the
-/// anchor there.
-fn listen_on(address: std::net::SocketAddr) -> std::io::Result<TcpListener> {
-    let socket = tokio::net::TcpSocket::new_v4()?;
-    #[cfg(unix)]
-    socket.set_reuseport(true)?;
-    socket.bind(address)?;
-    socket.listen(1024)
-}
-
-/// The anchor of the port `listener` listens on, made before anything else is accepted from it.
-#[cfg(unix)]
-async fn anchor_of(listener: &TcpListener) -> Option<Anchor> {
-    let address = listener.local_addr().expect("an address");
-    let made = TcpStream::connect(address)
-        .await
-        .expect("the service reaches its own port");
-    let (accepted, _) = listener
-        .accept()
-        .await
-        .expect("the service takes its own connection");
-    Some(Anchor {
-        _made: made,
-        _accepted: accepted,
-    })
-}
-
-#[cfg(not(unix))]
-async fn anchor_of(_listener: &TcpListener) -> Option<Anchor> {
-    None
 }
 
 impl Drop for StandIn {
@@ -260,10 +199,10 @@ impl AsyncWrite for Prefixed {
 impl StandIn {
     /// Starts the service on a free loopback port.
     pub async fn start() -> Self {
-        let listener =
-            listen_on("127.0.0.1:0".parse().expect("a loopback address")).expect("a loopback port");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
         let address = listener.local_addr().expect("an address");
-        let anchor = anchor_of(&listener).await;
         let origin = format!("http://{address}");
         let route = Arc::new(ControlRoute::detached(origin.clone(), None));
         let state = Arc::new(Mutex::new(State {
@@ -291,7 +230,6 @@ impl StandIn {
             route,
             state,
             task: Mutex::new(Some(task)),
-            _anchor: anchor,
         }
     }
 
@@ -401,17 +339,46 @@ impl StandIn {
     /// made to it was never carried out. [`Self::go_down`] is the other way down: the service takes
     /// the connection and ends it, so a request may have been carried out.
     ///
-    /// The service keeps hold of its port meanwhile (see `Anchor`), so that what refuses the
-    /// connection is the closed port, and not a program that was given the port in the meantime.
+    /// Returns once the port refuses a connection, so that the next request made to it is refused
+    /// and never taken.
     pub async fn refuse_connections(&self) {
         let task = self.task.lock().expect("the stand-in's task").take();
         if let Some(task) = task {
             task.abort();
-            // The listener is dropped when the aborted task is, which is waited for here so that
-            // the very next connection is refused.
+            // The listener is dropped when the aborted task is, which is waited for here. That
+            // closes this process's copy of its socket, and no other.
             let _ = task.await;
         }
         self.route.drop_sockets();
+        self.until_refused().await;
+    }
+
+    /// Returns once a connection to the port is refused.
+    ///
+    /// A socket goes on listening until the last copy of it is closed, and a process that is being
+    /// started in this one holds a copy of every socket the program has open, from the fork until
+    /// the new program replaces it, which on a busy machine is longer than the close. Until then
+    /// the port takes a connection and nothing accepts it: a request made to it is written, and
+    /// ended when the last copy goes, which says nothing of whether it was carried out. It is a
+    /// condition to wait for, and the wait ends when the port refuses; the minute it is given only
+    /// ends a hang.
+    async fn until_refused(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                match TcpStream::connect(self.address).await {
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => return,
+                    Err(error) => panic!("the stand-in's port cannot be reached: {error}"),
+                    Ok(taken) => {
+                        drop(taken);
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("the stand-in's port still took connections a minute after it was closed")
+        });
     }
 
     /// Brings the service back after [`Self::go_down`] or [`Self::refuse_connections`], on the port
@@ -421,7 +388,8 @@ impl StandIn {
         if self.task.lock().expect("the stand-in's task").is_some() {
             return;
         }
-        let listener = listen_on(self.address)
+        let listener = TcpListener::bind(self.address)
+            .await
             .unwrap_or_else(|error| panic!("the stand-in's port was not free again: {error}"));
         let task = accepting(listener, Arc::clone(&self.route), Arc::clone(&self.state));
         *self.task.lock().expect("the stand-in's task") = Some(task);
