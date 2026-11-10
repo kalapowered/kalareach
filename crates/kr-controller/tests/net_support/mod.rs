@@ -146,7 +146,9 @@ pub fn loopback() -> EndpointConfig {
 /// Returns once a datagram socket can be bound to `address`. A daemon that stood on an address and
 /// was shut down does not free it at once: the endpoint closes its sockets only when the last handle
 /// on it is dropped, and the tasks the shutdown ended drop theirs when the runtime next runs them.
-/// A daemon started on that address before then fails to bind it.
+/// A daemon started on that address before then fails to bind it. Another program can bind the
+/// address after this returns: a daemon that then cannot bind it is started again
+/// ([`Host::start_on`]).
 ///
 /// # Panics
 ///
@@ -168,6 +170,39 @@ async fn until_the_address_is_free(address: std::net::SocketAddr) {
             Err(error) => panic!("the daemon's address {address} cannot be bound: {error}"),
         }
     }
+}
+
+/// How many times a daemon is started on an address it was given, and has to have, when the address
+/// is held by another program each time.
+const BIND_TRIES: u32 = 5;
+
+/// Lets a stopped daemon go. Each connection's task holds the daemon, and the daemon holds its
+/// environment's lock until the last of them ends. A suite closes its clients before it restarts.
+///
+/// # Panics
+///
+/// Panics when the daemon is still held ten seconds later.
+async fn let_go(controller: Arc<Controller>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while Arc::strong_count(&controller) > 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stopped daemon is still held in {} places",
+            Arc::strong_count(&controller) - 1
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(controller);
+}
+
+/// Whether the daemon did not join the network because it could not bind the address a suite gave
+/// it, which only a port a device holds can be: a port the system chooses cannot be refused.
+fn address_was_held(settings: &NetworkSettings, error: &impl std::fmt::Display) -> bool {
+    settings
+        .endpoint
+        .bind_addr
+        .is_some_and(|address| address.port() != 0)
+        && error.to_string().contains("could not be bound")
 }
 
 /// One daemon, its local endpoint and its network, with a temporary environment of its own.
@@ -916,18 +951,7 @@ impl Host {
         clients.abort();
         let _ = clients.await;
         network.shutdown().await;
-        // Each connection's task holds the daemon, and the daemon holds its environment's lock
-        // until the last of them ends. A suite closes its clients before it restarts.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while Arc::strong_count(&controller) > 1 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the stopped daemon is still held in {} places",
-                Arc::strong_count(&controller) - 1
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        drop(controller);
+        let_go(controller).await;
         Stopped {
             temp,
             room,
@@ -944,8 +968,31 @@ impl Host {
 
     /// Starts a daemon on the network over an environment tree that may already hold records,
     /// offering codes through `room`, with its network built from `settings`.
+    ///
+    /// A daemon that is given an address a device holds cannot take another, and the address is
+    /// free only until another program binds it. When the daemon cannot bind it, it is started
+    /// again once the address can be bound, for as many as [`BIND_TRIES`] starts in all.
     #[allow(clippy::too_many_arguments)]
     async fn start_on(
+        temp: kr_ipc::testing::TempHost,
+        room: room::TestRoom,
+        settings: NetworkSettings,
+        account_at: AccountAt,
+        secrets: Arc<MemoryStore>,
+        clocks: Clocks,
+        boot: Option<BootIdentity>,
+        waits: Waits,
+    ) -> Self {
+        Self::start_on_trying(
+            BIND_TRIES, temp, room, settings, account_at, secrets, clocks, boot, waits,
+        )
+        .await
+    }
+
+    /// One start of [`Self::start_on`], with `tries` starts left, this one included.
+    #[allow(clippy::too_many_arguments)]
+    async fn start_on_trying(
+        tries: u32,
         temp: kr_ipc::testing::TempHost,
         room: room::TestRoom,
         settings: NetworkSettings,
@@ -1053,7 +1100,7 @@ impl Host {
         let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
         // The endpoint configuration is this suite's own, so the network is registered here rather
         // than from the environment. The device keys live in memory and go with it.
-        let network = net::register(
+        let joined = net::register(
             &controller,
             NetworkSetup {
                 settings: settings.clone(),
@@ -1074,8 +1121,31 @@ impl Host {
                 rendezvous: Some(Arc::new(room.clone())),
             },
         )
-        .await
-        .expect("the daemon joins the network");
+        .await;
+        let network = match joined {
+            Ok(network) => network,
+            // A daemon joins the network once, so the one that could not bind its address is let go
+            // and another is started over the same tree, as a restart does, when the address can
+            // be bound again.
+            Err(error) if tries > 1 && address_was_held(&settings, &error) => {
+                clients.abort();
+                let _ = clients.await;
+                let_go(controller).await;
+                return Box::pin(Self::start_on_trying(
+                    tries - 1,
+                    temp,
+                    room,
+                    settings,
+                    account_at,
+                    secrets,
+                    clocks,
+                    boot,
+                    waits,
+                ))
+                .await;
+            }
+            Err(error) => panic!("the daemon joins the network: {error}"),
+        };
         Self {
             temp,
             controller,
