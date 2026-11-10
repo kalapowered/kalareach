@@ -522,10 +522,21 @@ impl Probe {
     /// Starts the test `name` of this binary with `marker` set, which makes it run its console
     /// half, and `environment` as well.
     fn start_marked(name: &str, marker: &str, environment: &[(&str, String)]) -> Self {
+        Self::start_in(name, marker, environment, 24, 100)
+    }
+
+    /// As [`Self::start_marked`], in a console of `rows` and `columns`.
+    fn start_in(
+        name: &str,
+        marker: &str,
+        environment: &[(&str, String)],
+        rows: u16,
+        columns: u16,
+    ) -> Self {
         let pty = native_pty_system()
             .openpty(PtySize {
-                rows: 24,
-                cols: 100,
+                rows,
+                cols: columns,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -1874,7 +1885,9 @@ async fn the_console_an_attachment_ran_in_is_given_the_mouse_while_the_applicati
         )
         .await;
 
-    let mut probe = Probe::start_marked(
+    // At the session's size, so that the session is not resized for it and the typist goes on
+    // seeing what the session writes.
+    let mut probe = Probe::start_in(
         NAME,
         MOUSE_MODE_PROBE,
         &[
@@ -1889,6 +1902,8 @@ async fn the_console_an_attachment_ran_in_is_given_the_mouse_while_the_applicati
             ("KR_PROBE_SESSION", session_id.to_string()),
             ("KR_PROBE_KR", kr().display().to_string()),
         ],
+        u16::try_from(dimensions.rows.get()).expect("a console's rows"),
+        u16::try_from(dimensions.columns.get()).expect("a console's columns"),
     );
     probe.waits_for("kr-probe:inside:");
     // The command draws the session's screen in the console, so it is attached to the session once
