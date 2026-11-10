@@ -167,6 +167,9 @@ pub enum ProblemKind {
     HostPath,
     /// The last call found that the voice service has no such call for this account.
     NoSuchCall,
+    /// The call can no longer hand a spoken request to the host: what was said may not all have
+    /// been heard and read.
+    SpokenRequests,
 }
 
 /// A problem a call met, in words for a person.
@@ -366,10 +369,20 @@ pub struct DelegationRow {
     /// Where in the call it happened, in milliseconds from its start, when the voice service said:
     /// a delegation listed when the control attached carries no offset.
     pub offset_ms: Option<u64>,
-    /// What became of it: always `not_done` in this version, which acts on no spoken request.
+    /// What became of it. `not_done` for every delegation while this version acts on no spoken
+    /// request. A call that hands spoken requests to the host, which only a case or the debug
+    /// build's probe makes, also says `collecting` (the fragments said before it are still being
+    /// read), `asking` (the host has the request and has not answered), `refused` (this device
+    /// would not hand it over, for `cause`), `not_sent` (nothing was written to the host, for
+    /// `cause`), `performed`, `admitted` (the host took it and what became of it is not
+    /// established), `confirmation_required`, `host_refused` (the host said no, for `cause`) and
+    /// `unknown` (the request may have been written and no answer came).
     pub state: String,
-    /// Whether the model was told so.
+    /// Whether the model was told what became of it.
     pub told: bool,
+    /// Why, for the states that name a cause. Absent while this version acts on nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
 }
 
 #[cfg(test)]

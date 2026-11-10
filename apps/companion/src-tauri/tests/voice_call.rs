@@ -86,7 +86,9 @@ use kr_protocol::scalars::Nullable;
 use net_support::Host;
 use serde_json::json;
 use support::call::{OFFER, ScriptedCalls};
-use support::{Companion, NoOwner, Phone, StubIntake, WATCHDOG, pair, pair_under, parts};
+use support::{
+    Companion, LinkControl, NoOwner, Phone, StubIntake, WATCHDOG, govern, pair, pair_under, parts,
+};
 use tauri::Manager as _;
 use tokio::sync::watch;
 use voice_support::StandIn;
@@ -231,6 +233,8 @@ struct Scene {
     session: String,
     /// The workers of the sessions the host really runs, when the scene was made over some.
     workers: Vec<net_support::worker::Worker>,
+    /// What the phone's connections to the host carried, and the test's hold on them.
+    link: Arc<LinkControl>,
 }
 
 impl Scene {
@@ -469,9 +473,12 @@ async fn scene_replacing(
     let secrets: Arc<dyn kr_crypto::store::SecretStore> = Arc::new(MemoryStore::new());
     let room: Arc<dyn kr_client::pairing::candidate::CandidateRoom> = Arc::new(host.room.clone());
     let paste = StubIntake::holding("", false);
+    let link = LinkControl::new();
+    let mut governed = parts(Arc::clone(&secrets), Arc::clone(&room));
+    govern(&mut governed, &link);
     let companion = Companion::start_with_voice(
         data.path(),
-        parts(Arc::clone(&secrets), Arc::clone(&room)),
+        governed,
         Arc::new(NoOwner),
         Arc::clone(&paste) as Arc<dyn companion_tauri::pairing::IntakePlatform>,
         calls,
@@ -502,6 +509,7 @@ async fn scene_replacing(
         service,
         session,
         workers,
+        link,
     };
     tokio::time::timeout(WATCHDOG, async {
         loop {
@@ -5091,5 +5099,870 @@ async fn a_named_stop_after_the_unlock_settles_the_entry_the_file_held() {
     })
     .await;
     assert!(relaunched.state(None).owed.is_empty());
+    scene.stop_host().await;
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/* Spoken delegations                                                                             */
+/* ---------------------------------------------------------------------------------------------- */
+//
+// With the constant off, which is what every shipped build holds, a delegation the provider
+// announces is answered to the model that nothing was done and nothing reaches the host. A case
+// turns the acceptance on for its own calls through the setter that exists only in test and debug
+// builds. Each negative case asserts the cause the row shows and that the host was sent no
+// `voice.delegate`; each is read beside the positive case that shows the same call handing a
+// request over when nothing is wrong.
+
+use kr_protocol::method::Method as HostMethod;
+
+/// Timings of a call that hands spoken delegations to the host: a wait for what was said before a
+/// delegation that the voice service's announcement, which comes on another path, is read within,
+/// and a capture proof that stays young long enough that a loaded machine does not age it.
+fn delegating_timings() -> Timings {
+    Timings {
+        delegation_wait: Duration::from_millis(400),
+        proof_age: Duration::from_secs(10),
+        ..quick()
+    }
+}
+
+/// A scene over `sessions` real sessions whose calls hand spoken delegations to the host.
+async fn delegating_with(timings: Timings, sessions: u64) -> Scene {
+    let scene = scene_built(
+        timings,
+        Some(phone_grant(PHONE_TOKEN, 3600)),
+        None,
+        HttpDeadlines::default(),
+        sessions,
+    )
+    .await;
+    scene
+        .phone
+        .companion
+        .app
+        .state::<Calls>()
+        .accept_host_delegations(true);
+    scene
+}
+
+async fn delegating() -> Scene {
+    delegating_with(delegating_timings(), 1).await
+}
+
+/// Starts the call, waits for its control, and has native code show the recorder delivering.
+async fn calling(scene: &Scene) {
+    scene.start().await;
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    scene.platform.show_progress_age(Some(10));
+}
+
+fn fragment(start_ms: u64, end_ms: u64, text: &str) -> serde_json::Value {
+    json!({
+        "type": "session.input_transcript.delta",
+        "event_id": format!("event_{start_ms}"),
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "delta": text,
+    })
+}
+
+fn delegation_event(id: &str, offset_ms: u64) -> serde_json::Value {
+    json!({
+        "type": "session.delegation.created",
+        "event_id": format!("event_{id}"),
+        "offset_ms": offset_ms,
+        "delegation": { "id": id, "type": "delegation", "target": "client" },
+    })
+}
+
+/// The provider's transcript of `words` said from `start_ms`, one fragment of 200 ms for each
+/// word, with no silence between them. Returns where the last word ends.
+fn speak(scene: &Scene, start_ms: u64, words: &str) -> u64 {
+    let mut at = start_ms;
+    for word in words.split_whitespace() {
+        scene
+            .platform
+            .tell_provider(&fragment(at, at + 200, &format!(" {word}")));
+        at += 200;
+    }
+    at
+}
+
+/// A first sentence that comes to nothing: the model delegates it, and it is refused as the first
+/// of the call, which spends it. What is said after it is not the first of the call.
+async fn chatter(scene: &Scene) {
+    speak(scene, 0, "hello there");
+    ask(scene, "d-0", 200);
+    let row = row_reaching(scene, "d-0", "refused").await;
+    assert_eq!(row["cause"], "first_fragment");
+}
+
+/// The delegation the model creates when the last of `words` was said, announced by the voice
+/// service first and by the provider's data channel after it.
+fn ask(scene: &Scene, id: &str, offset_ms: u64) {
+    scene.stand_in.control().announce(id, offset_ms);
+    scene
+        .platform
+        .tell_provider(&delegation_event(id, offset_ms));
+}
+
+fn row_of(state: &serde_json::Value, id: &str) -> Option<serde_json::Value> {
+    state["delegations"]
+        .as_array()?
+        .iter()
+        .find(|row| row["delegation_id"] == id)
+        .cloned()
+}
+
+/// Waits until the row of the delegation `id` is in the state `wanted`, and returns it.
+async fn row_reaching(scene: &Scene, id: &str, wanted: &str) -> serde_json::Value {
+    let state = scene
+        .state_where(&format!("{id} {wanted}"), |state| {
+            row_of(state, id).is_some_and(|row| row["state"] == wanted)
+        })
+        .await;
+    row_of(&state, id).expect("the row")
+}
+
+/// What the host was sent of `voice.delegate`.
+fn at_the_host(scene: &Scene) -> usize {
+    scene.link.sent(HostMethod::VoiceDelegate)
+}
+
+/// Waits until the call has asked native code for a capture proof with a marker.
+async fn until_the_proof_is_asked(scene: &Scene) {
+    tokio::time::timeout(WATCHDOG, async {
+        while !scene
+            .platform
+            .commands()
+            .iter()
+            .any(|command| command == "capture_proof:barrier")
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the call asks native code for a capture proof");
+}
+
+/// What the model was told of the delegation `id`, in the order it was told.
+fn told_of(scene: &Scene, id: &str) -> Vec<String> {
+    scene
+        .stand_in
+        .control()
+        .report()
+        .sent
+        .iter()
+        .filter(|sent| sent.delegation.as_deref() == Some(id))
+        .filter_map(|sent| sent.content.clone())
+        .collect()
+}
+
+/// What the call's problems say, by kind.
+fn kinds_of(state: &serde_json::Value) -> Vec<String> {
+    problems_of(state)
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect()
+}
+
+/// A call over a real session, a first sentence said and a status asked for after a pause: the
+/// host is sent one `voice.delegate`, reads the session, and the model is told what it reports.
+/// With nothing wrong this is what every negative case below is read beside. The model is told on
+/// attaching that the phone can ask the computer, not that it cannot; the voice service's own
+/// announcement of the delegation says nothing of what was done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_status_asked_for_after_a_pause_is_handed_to_the_host_and_performed() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    let end = speak(&scene, 6_000, "what is the status");
+    ask(&scene, "d-1", end - 200);
+
+    let row = row_reaching(&scene, "d-1", "performed").await;
+
+    assert_eq!(row["offset_ms"], end - 200);
+    assert_eq!(at_the_host(&scene), 1, "the host was sent the one request");
+    scene
+        .state_where("the model told", |state| {
+            row_of(state, "d-1").is_some_and(|row| row["told"] == true)
+        })
+        .await;
+    let told = told_of(&scene, "d-1");
+    assert_eq!(told.len(), 1, "told once, and not that nothing was done");
+    assert!(!told[0].contains("Nothing was done"), "{told:?}");
+    let instructions: Vec<String> = scene
+        .stand_in
+        .control()
+        .report()
+        .sent
+        .iter()
+        .filter(|sent| sent.command == "instructions")
+        .filter_map(|sent| sent.content.clone())
+        .collect();
+    assert!(
+        instructions.iter().any(|words| words.contains("can ask")),
+        "the attach words say the phone can ask: {instructions:?}"
+    );
+    assert!(
+        !instructions
+            .iter()
+            .any(|words| words.contains("cannot act")),
+        "and not that it cannot act: {instructions:?}"
+    );
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// A second request said after the first, past the exclusion gap, is a set of its own: the first's
+/// fragments were used and are not in it, so the host reads each as the one request it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_utterance_after_the_first_is_a_set_of_its_own() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    let first = speak(&scene, 6_000, "what is the status");
+    ask(&scene, "d-1", first - 200);
+    row_reaching(&scene, "d-1", "performed").await;
+
+    let second = speak(&scene, 12_000, "status");
+    ask(&scene, "d-2", second - 200);
+
+    row_reaching(&scene, "d-2", "performed").await;
+    assert_eq!(at_the_host(&scene), 2);
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// The first thing a person says in a call never acts: the device cannot hear what was said before
+/// capture first opened, and a person can say "do not" before it. The host is sent nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_utterance_of_a_call_never_acts() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    let end = speak(&scene, 0, "what is the status");
+    ask(&scene, "d-1", end - 200);
+
+    let row = row_reaching(&scene, "d-1", "refused").await;
+
+    assert_eq!(row["cause"], "first_fragment");
+    assert_eq!(at_the_host(&scene), 0);
+    let state = scene.state();
+    assert!(
+        !kinds_of(&state).contains(&"spoken_requests".to_owned()),
+        "a refused set leaves the call as it was: {state}"
+    );
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// KR-REQ-15.36 and KR-ACC-014: a change in capture before the set is complete refuses it, by
+/// native code's own record and not by the news: the proof is held while the person mutes, the system interrupts, the route changes,
+/// the system suspends the application or the microphone goes, and the record then shows the
+/// break. The call is tainted for good, so the same command said again after the capture is back
+/// is refused too, for the same cause. The host is sent nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capture_change_before_the_set_is_complete_refuses_it_and_every_later_one() {
+    for state in [
+        CaptureState::MutedByPerson,
+        CaptureState::Interrupted,
+        CaptureState::RouteChanging,
+        CaptureState::SuspendedBySystem,
+        CaptureState::Unavailable,
+    ] {
+        let mut scene = delegating().await;
+        calling(&scene).await;
+        chatter(&scene).await;
+        scene.platform.hold("capture_proof");
+        let end = speak(&scene, 6_000, "what is the status");
+        ask(&scene, "d-1", end - 200);
+        until_the_proof_is_asked(&scene).await;
+        scene.platform.tell(CallEvent::Capture { state });
+        scene.platform.release("capture_proof");
+
+        let row = row_reaching(&scene, "d-1", "refused").await;
+
+        assert_eq!(row["cause"], "capture_break", "{state:?}");
+        // The microphone is back, and what was said now is as clear as it can be.
+        scene.platform.tell(CallEvent::Capture {
+            state: CaptureState::Capturing,
+        });
+        let again = speak(&scene, 12_000, "status");
+        ask(&scene, "d-2", again - 200);
+        let later = row_reaching(&scene, "d-2", "refused").await;
+        assert_eq!(later["cause"], "capture_break", "{state:?}");
+        assert_eq!(at_the_host(&scene), 0, "{state:?}");
+        assert!(kinds_of(&scene.state()).contains(&"spoken_requests".to_owned()));
+        let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+        scene.stop_host().await;
+    }
+}
+
+/// News lost while the proof is held is read before the marker, whatever it was: the call is
+/// tainted and the set refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn news_lost_behind_the_completion_refuses_the_set() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    scene.platform.hold("capture_proof");
+    let end = speak(&scene, 6_000, "what is the status");
+    ask(&scene, "d-1", end - 200);
+    until_the_proof_is_asked(&scene).await;
+    scene.platform.lose_some_news();
+    scene.platform.release("capture_proof");
+
+    let row = row_reaching(&scene, "d-1", "refused").await;
+
+    assert_eq!(row["cause"], "lost_news");
+    assert_eq!(at_the_host(&scene), 0);
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// What the provider sent before the deadline and the owner had not yet read is read before the
+/// set is frozen: the last word of the request, told while the proof is held, is in the set and
+/// the host reads the whole of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn events_pending_at_the_deadline_are_in_the_set() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    scene.platform.hold("capture_proof");
+    let end = speak(&scene, 6_000, "what is the");
+    ask(&scene, "d-1", end);
+    until_the_proof_is_asked(&scene).await;
+    scene
+        .platform
+        .tell_provider(&fragment(end, end + 200, " status"));
+    scene.platform.release("capture_proof");
+
+    let row = row_reaching(&scene, "d-1", "performed").await;
+
+    assert_eq!(row["state"], "performed");
+    assert_eq!(at_the_host(&scene), 1);
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// A provider answer that turns discontinuous transmission on can hold back quiet speech while
+/// capture is on: the call vouches for nothing it says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_that_turns_discontinuous_transmission_on_refuses_every_delegation() {
+    let mut scene = delegating().await;
+    scene.platform.answer_with_dtx(true);
+    calling(&scene).await;
+    speak(&scene, 0, "hello there");
+    let end = speak(&scene, 6_000, "what is the status");
+    ask(&scene, "d-1", end - 200);
+
+    let row = row_reaching(&scene, "d-1", "refused").await;
+
+    assert_eq!(row["cause"], "dtx");
+    assert_eq!(at_the_host(&scene), 0);
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// What the call cannot read of its data channel taints it, by the kind of what it could not read:
+/// a message that is not an event, and a time that is a fraction, below zero or beyond a call's
+/// longest length. The text of a message is never what tells.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_the_call_cannot_read_of_its_data_channel_taints_it() {
+    let unreadable: [(&str, Vec<u8>); 5] = [
+        ("unreadable_event", b"not json at all".to_vec()),
+        (
+            "fragment_time",
+            br#"{"type":"session.input_transcript.delta","event_id":"e","start_ms":1000.5,"end_ms":1200,"delta":" do"}"#.to_vec(),
+        ),
+        (
+            "fragment_time",
+            br#"{"type":"session.input_transcript.delta","event_id":"e","start_ms":-1,"end_ms":1200,"delta":" do"}"#.to_vec(),
+        ),
+        (
+            "fragment_time",
+            br#"{"type":"session.input_transcript.delta","event_id":"e","start_ms":1000,"end_ms":86400001,"delta":" do"}"#.to_vec(),
+        ),
+        (
+            "fragment_text",
+            br#"{"type":"session.input_transcript.delta","event_id":"e","start_ms":1000,"end_ms":1200,"delta":""}"#.to_vec(),
+        ),
+    ];
+    for (cause, bytes) in unreadable {
+        let mut scene = delegating().await;
+        calling(&scene).await;
+        chatter(&scene).await;
+        scene.platform.tell_provider_bytes(bytes);
+        let end = speak(&scene, 6_000, "what is the status");
+        ask(&scene, "d-1", end - 200);
+
+        let row = row_reaching(&scene, "d-1", "refused").await;
+
+        assert_eq!(row["cause"], cause);
+        assert_eq!(at_the_host(&scene), 0, "{cause}");
+        let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+        scene.stop_host().await;
+    }
+}
+
+/// Fragments whose intervals overlap, and fragments that run backwards, taint the call: the stream
+/// is not one the gate can read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fragments_that_overlap_or_run_backwards_taint_the_call() {
+    for (cause, early, late) in [
+        ("overlap", (6_000, 6_400), (6_200, 6_600)),
+        ("fragment_order", (6_000, 6_200), (5_000, 5_200)),
+    ] {
+        let mut scene = delegating().await;
+        calling(&scene).await;
+        chatter(&scene).await;
+        scene
+            .platform
+            .tell_provider(&fragment(early.0, early.1, " what"));
+        scene
+            .platform
+            .tell_provider(&fragment(late.0, late.1, " status"));
+        ask(&scene, "d-1", 6_600);
+
+        let row = row_reaching(&scene, "d-1", "refused").await;
+
+        assert_eq!(row["cause"], cause);
+        assert_eq!(at_the_host(&scene), 0, "{cause}");
+        let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+        scene.stop_host().await;
+    }
+}
+
+/// A fragment that belongs to a request and arrives after the request was read taints the call and
+/// is told. What the host did about the request stands: the earlier outcome is kept, and nothing
+/// more is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fragment_that_arrives_after_its_set_was_read_taints_the_call() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    let end = speak(&scene, 6_000, "what is the status");
+    ask(&scene, "d-1", end);
+    row_reaching(&scene, "d-1", "performed").await;
+
+    scene
+        .platform
+        .tell_provider(&fragment(end, end + 200, " not"));
+
+    let state = scene
+        .state_where("the call tainted", |state| {
+            kinds_of(state).contains(&"spoken_requests".to_owned())
+        })
+        .await;
+    assert_eq!(
+        row_of(&state, "d-1").expect("the row")["state"],
+        "performed"
+    );
+    assert_eq!(at_the_host(&scene), 1, "the earlier request, and no other");
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// A delegation the voice service did not announce at the same offset is not vouched for: it is
+/// refused when the service announced another offset, and when it announced none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delegation_the_voice_service_does_not_announce_as_the_provider_did_is_refused() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    let end = speak(&scene, 6_000, "what is the status");
+    scene.stand_in.control().announce("d-1", end + 1_000);
+    scene
+        .platform
+        .tell_provider(&delegation_event("d-1", end - 200));
+    let row = row_reaching(&scene, "d-1", "refused").await;
+    assert_eq!(row["cause"], "broker_disagrees");
+
+    let again = speak(&scene, 12_000, "status");
+    scene
+        .platform
+        .tell_provider(&delegation_event("d-2", again - 200));
+    let silent = row_reaching(&scene, "d-2", "refused").await;
+    assert_eq!(silent["cause"], "broker_disagrees");
+    assert_eq!(at_the_host(&scene), 0);
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// A proof that shows no sign of the recorder's progress, or one too old, is not one a request is
+/// written on: nothing is written, and the same words can be said again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proof_that_is_not_young_is_not_written_on() {
+    let timings = Timings {
+        proof_age: Duration::from_millis(500),
+        ..delegating_timings()
+    };
+    for age in [None, Some(500)] {
+        let mut scene = delegating_with(timings, 1).await;
+        calling(&scene).await;
+        scene.platform.show_progress_age(age);
+        chatter(&scene).await;
+        let end = speak(&scene, 6_000, "what is the status");
+        ask(&scene, "d-1", end - 200);
+
+        let row = row_reaching(&scene, "d-1", "not_sent").await;
+
+        assert_eq!(row["cause"], "stale_proof", "{age:?}");
+        assert_eq!(at_the_host(&scene), 0, "{age:?}");
+        // The call is not tainted by it: the recorder shows again, and the same words are heard.
+        scene.platform.show_progress_age(Some(10));
+        let again = speak(&scene, 12_000, "what is the status");
+        ask(&scene, "d-2", again - 200);
+        row_reaching(&scene, "d-2", "performed").await;
+        assert_eq!(at_the_host(&scene), 1);
+        let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+        scene.stop_host().await;
+    }
+}
+
+/// The age of a proof is bounded where the request is written, not where it is asked for: a
+/// writer that is held past the bound writes nothing, and the host is sent nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_whose_proof_ran_out_while_the_writer_was_held_is_never_written() {
+    let timings = Timings {
+        proof_age: Duration::from_millis(300),
+        ..delegating_timings()
+    };
+    let mut scene = delegating_with(timings, 1).await;
+    calling(&scene).await;
+    scene.platform.show_progress_age(Some(0));
+    chatter(&scene).await;
+    let end = speak(&scene, 6_000, "what is the status");
+    scene.link.hold_next_request(HostMethod::VoiceDelegate);
+    ask(&scene, "d-1", end - 200);
+    scene.link.until_request_held().await;
+    // The proof is as old as the bound by the time the writer is let go, whatever else runs.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    scene.link.release_request();
+
+    let row = row_reaching(&scene, "d-1", "not_sent").await;
+
+    assert_eq!(row["cause"], "stale_proof");
+    assert_eq!(at_the_host(&scene), 0, "nothing reached the host");
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// An identifier the provider announces twice is one delegation and not two attempts, and a
+/// delegation below an earlier one's offset taints the call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delegation_announced_twice_is_one_attempt_and_one_below_an_earlier_offset_taints() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    let end = speak(&scene, 6_000, "what is the status");
+    ask(&scene, "d-1", end - 200);
+    scene
+        .platform
+        .tell_provider(&delegation_event("d-1", end - 200));
+    row_reaching(&scene, "d-1", "performed").await;
+    assert_eq!(at_the_host(&scene), 1);
+
+    let again = speak(&scene, 12_000, "status");
+    scene.stand_in.control().announce("d-2", 3_000);
+    scene
+        .platform
+        .tell_provider(&delegation_event("d-2", 3_000));
+    let row = row_reaching(&scene, "d-2", "refused").await;
+    assert_eq!(row["cause"], "delegation_order");
+    let _ = again;
+    assert_eq!(
+        scene.state()["delegations"].as_array().map(Vec::len),
+        Some(3),
+        "the first sentence's, the status's, and the one below: the repeat is no row"
+    );
+    assert_eq!(at_the_host(&scene), 1, "the earlier request, and no other");
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// The provider's own mute, after capture opened, taints the call: the provider hears nothing, and
+/// the device's record of the microphone stays clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_providers_mute_after_the_opening_taints_the_call() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    scene.platform.tell_provider(&json!({
+        "type": "session.input_audio.muted",
+        "event_id": "event_m",
+    }));
+    let end = speak(&scene, 6_000, "what is the status");
+    ask(&scene, "d-1", end - 200);
+
+    let row = row_reaching(&scene, "d-1", "refused").await;
+
+    assert_eq!(row["cause"], "provider_muted");
+    assert_eq!(at_the_host(&scene), 0);
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// A fragment that arrives before capture first opened taints the call: nothing is carried before
+/// it, so such a fragment is not what a person said into this call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fragment_that_arrives_before_capture_opened_taints_the_call() {
+    let mut scene = delegating().await;
+    scene.platform.hold("permit");
+    let starting = scene.phone.companion.start_call("voice_start", {
+        let prepared = scene.prepared().await;
+        scene.start_request(&prepared)
+    });
+    tokio::time::timeout(WATCHDOG, async {
+        while !scene
+            .platform
+            .commands()
+            .iter()
+            .any(|command| command == "permit")
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the call is permitted");
+    scene.platform.tell_provider(&fragment(0, 200, " hello"));
+    scene.platform.release("permit");
+    starting
+        .await
+        .expect("the start returns")
+        .expect("a call starts");
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    scene.platform.show_progress_age(Some(10));
+    let end = speak(&scene, 6_000, "what is the status");
+    ask(&scene, "d-1", end - 200);
+
+    let row = row_reaching(&scene, "d-1", "refused").await;
+
+    assert_eq!(row["cause"], "before_opening");
+    assert_eq!(at_the_host(&scene), 0);
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// A reply lost after the host acted: the request is asked about again with the whole request as
+/// it was composed, on another connection, under the same action, and the host answers from its
+/// record with the result. The row says unknown meanwhile, and performed after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reply_lost_after_the_host_acted_is_asked_about_again_and_reads_performed() {
+    let timings = Timings {
+        repeat_delays: [Duration::from_millis(20); 3],
+        host_within: Duration::from_secs(5),
+        ..delegating_timings()
+    };
+    let mut scene = delegating_with(timings, 1).await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    let end = speak(&scene, 6_000, "what is the status");
+    scene
+        .link
+        .lose_the_answer_to(Some(HostMethod::VoiceDelegate));
+    ask(&scene, "d-1", end - 200);
+    tokio::time::timeout(WATCHDOG, async {
+        while at_the_host(&scene) < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the request reaches the host");
+    scene.link.lose_the_answer_to(None);
+
+    let row = row_reaching(&scene, "d-1", "performed").await;
+
+    assert_eq!(row["state"], "performed");
+    let actions = scene.link.sent_actions(HostMethod::VoiceDelegate);
+    assert!(actions.len() >= 2, "the host was asked again: {actions:?}");
+    assert!(
+        actions.iter().all(|action| *action == actions[0]),
+        "under one action: {actions:?}"
+    );
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// A request written to a host that cannot then be reached stays unknown, and says so to the
+/// person and to the model, and the end of the call never says nothing was done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_written_before_the_host_was_lost_stays_unknown_and_the_end_says_so() {
+    let timings = Timings {
+        repeat_delays: [Duration::from_millis(20); 3],
+        host_within: Duration::from_secs(2),
+        ..delegating_timings()
+    };
+    let mut scene = delegating_with(timings, 1).await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    let end = speak(&scene, 6_000, "what is the status");
+    scene
+        .link
+        .lose_the_answer_to(Some(HostMethod::VoiceDelegate));
+    scene.link.unreachable(true);
+    ask(&scene, "d-1", end - 200);
+
+    let row = row_reaching(&scene, "d-1", "unknown").await;
+
+    assert!(row["cause"].is_null(), "{row}");
+    scene
+        .state_where("the model told it is not known", |state| {
+            row_of(state, "d-1").is_some_and(|row| row["told"] == true)
+        })
+        .await;
+    assert!(
+        told_of(&scene, "d-1")[0].contains("not known"),
+        "{:?}",
+        told_of(&scene, "d-1")
+    );
+    let ended = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    let _ = ended;
+    let state = scene
+        .state_where("an end", |state| state["ended"].is_object())
+        .await;
+    let words = state["ended"]["words"].as_str().expect("words");
+    assert!(words.contains("may or may not"), "{words}");
+    assert!(!words.contains("nothing was done"), "{words}");
+    scene.stop_host().await;
+}
+
+/// The application's connection to the host ends.
+fn lose_the_host(scene: &Scene) {
+    scene
+        .phone
+        .companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .connection()
+        .expect("a connection")
+        .session()
+        .close();
+}
+
+/// A delegation still waiting for native code's news to be read up to its marker when the path to
+/// the host is lost is discarded and refused as not sent: nothing from before the loss is handed
+/// over later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delegation_waiting_when_the_host_is_lost_is_discarded() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    scene.platform.hold("capture_proof");
+    let end = speak(&scene, 6_000, "what is the status");
+    ask(&scene, "d-1", end - 200);
+    until_the_proof_is_asked(&scene).await;
+    lose_the_host(&scene);
+    scene
+        .state_where("the host lost", |state| state["host"] == "lost")
+        .await;
+    scene.platform.release("capture_proof");
+
+    let row = row_reaching(&scene, "d-1", "not_sent").await;
+
+    assert_eq!(row["cause"], "host_lost");
+    assert_eq!(at_the_host(&scene), 0);
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// A request composed and not yet written when the path to the host is lost is not written: it is
+/// refused as not sent, and the host is sent nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_composed_and_not_written_when_the_host_is_lost_is_not_written() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    scene.platform.hold("capture_proof_at_use");
+    let end = speak(&scene, 6_000, "what is the status");
+    ask(&scene, "d-1", end - 200);
+    tokio::time::timeout(WATCHDOG, async {
+        while !scene
+            .platform
+            .commands()
+            .iter()
+            .any(|command| command == "capture_proof")
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the request is composed and its proof asked for");
+    lose_the_host(&scene);
+    scene
+        .state_where("the host lost", |state| state["host"] == "lost")
+        .await;
+    scene.platform.release("capture_proof_at_use");
+
+    let row = row_reaching(&scene, "d-1", "not_sent").await;
+
+    assert_eq!(row["cause"], "host_lost");
+    assert_eq!(at_the_host(&scene), 0);
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// With the constant off, which is every shipped build, transcript and delegation events on the
+/// data channel tell the person and the model nothing, show no row and reach no host: only the
+/// voice service's own delegation frame is answered, with the words it always had, and the model
+/// is told on attaching that the phone cannot act.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_the_constant_off_the_data_channel_tells_nothing_and_reaches_no_host() {
+    let mut scene = scene().await;
+    calling(&scene).await;
+    speak(&scene, 0, "hello there");
+    let end = speak(&scene, 6_000, "what is the status");
+    scene
+        .platform
+        .tell_provider(&delegation_event("d-1", end - 200));
+    scene.platform.tell_provider(&json!({
+        "type": "session.input_audio.muted",
+        "event_id": "event_m",
+    }));
+    scene.stand_in.control().announce("d-9", 1_200);
+
+    let row = row_reaching(&scene, "d-9", "not_done").await;
+    scene
+        .state_where("the service's delegation answered", |state| {
+            row_of(state, "d-9").is_some_and(|row| row["told"] == true)
+        })
+        .await;
+
+    assert!(row["cause"].is_null(), "{row}");
+    let state = scene.state();
+    assert_eq!(
+        state["delegations"].as_array().map(Vec::len),
+        Some(1),
+        "the data channel's delegation shows no row: {state}"
+    );
+    assert!(no_problem_but_the_missing_context(&state), "{state}");
+    assert!(told_of(&scene, "d-1").is_empty());
+    assert_eq!(told_of(&scene, "d-9").len(), 1);
+    assert_eq!(at_the_host(&scene), 0);
+    assert_eq!(scene.platform.count("capture_proof:barrier"), 0);
+    let instructions: Vec<String> = scene
+        .stand_in
+        .control()
+        .report()
+        .sent
+        .iter()
+        .filter(|sent| sent.command == "instructions")
+        .filter_map(|sent| sent.content.clone())
+        .collect();
+    assert!(
+        instructions
+            .iter()
+            .any(|words| words.contains("cannot act")),
+        "{instructions:?}"
+    );
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
     scene.stop_host().await;
 }

@@ -26,15 +26,16 @@
 //! service's own HTTP route is the fallback once the host has answered. The screen does not wait
 //! for the service.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use companion_platform::call::{
-    CallEvent, CallEvents, CallFailure, CallId, CallPlatform, CaptureState, ConnectionState,
-    FailureKind, Heard, Held, Mute,
+    CallEvent, CallEvents, CallFailure, CallId, CallPlatform, CaptureProof, CaptureState,
+    ConnectionState, FailureKind, Heard, Held, Mute,
 };
 use kr_client::ClientError;
 use kr_client::Session;
@@ -51,15 +52,21 @@ use kr_protocol::ids::{ActionId, VoiceSessionId};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, U64};
 use kr_protocol::voice::{
-    VoiceContextParams, VoiceSessionDescriptor, VoiceStartOutcome, VoiceStartParams,
-    VoiceStartResult,
+    FragmentText, TranscriptFragment, VoiceContextParams, VoiceDelegateParams, VoiceDelegateResult,
+    VoiceDelegationId, VoiceDelegationOutcome, VoiceSessionDescriptor, VoiceStartOutcome,
+    VoiceStartParams, VoiceStartResult,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use super::advice::MuteAdvice;
 use super::cause::Cause;
-use super::host::{CallHost, HostReach, Pairing, has_ended, revoke};
+use super::delegation::{Cause as Why, Frozen, Gate, Record, Told};
+use super::host::{
+    CallHost, Delivered, Exchange, Handover, HostReach, Pairing, ask_again, hand_over, has_ended,
+    revoke,
+};
+use super::provider;
 use super::view::{DelegationRow, EndedView, HostEnd, OwedView, ProblemKind, VoiceCallState};
 use super::{Closed, Cmd, NoteKey, ServiceCall, Shared, StartRequest, Started, now_ms};
 use crate::commands::{MUTATION_TTL, NoPreconditions};
@@ -69,6 +76,60 @@ use crate::error::{CommandError, Result};
 const HOST_ACTIONS_UNAVAILABLE: &str = "In this version the phone cannot act on the person's \
     computer. If the person asks for something to be done there, say that nothing can be done \
     from this call. Do not say or imply that anything was done.";
+
+/// What the model is told, once, as the call is attached, when spoken requests may reach the host.
+const HOST_ACTIONS_AVAILABLE: &str = "The phone can ask the person's computer to read some things \
+    when the person says so clearly. What you are told about each such request is all that is \
+    known of it: do not say or imply that anything was done that you were not told was done.";
+
+/// What the model is told of a spoken request this device would not hand to the host.
+const DELEGATION_REFUSED: &str = "Nothing was done on the person's computer: what was said could \
+    not be used as a request. Say so, and ask the person to say it again.";
+
+/// What the model is told of a spoken request that was not written to the host.
+const DELEGATION_NOT_SENT: &str = "Nothing was done on the person's computer: the request was not \
+    sent. Say so, and ask the person to say it again.";
+
+/// What the model is told of a request that may have been written to the host.
+const DELEGATION_UNKNOWN: &str = "It is not known whether this was done on the person's \
+    computer. Do not say it was done and do not say it was not. Say that it is not known.";
+
+/// What the model is told of a request the host took and did not say it carried out.
+const DELEGATION_ADMITTED: &str = "The person's computer accepted the request. Whether it was \
+    carried out is not known. Do not say it was done.";
+
+/// What the model is told of a request that needs the person's confirmation on the phone.
+const DELEGATION_CONFIRMATION: &str = "This needs the person's confirmation on the phone's unlocked \
+    screen, which this version cannot ask for yet. Nothing was done. Say so.";
+
+/// What the model is told of a request the host refused.
+const DELEGATION_HOST_REFUSED: &str = "The person's computer refused the request. Nothing was \
+    done. Say so.";
+
+/// What the model is told of a request that more speech then showed was not complete.
+const DELEGATION_LATE: &str = "More was said that belongs to this request after it was read, so \
+    the request is not carried out. Say so, and ask the person to say it again.";
+
+/// What the model is told, once, when the call can no longer hand a spoken request to the host.
+const SPEECH_TAINTED: &str = "This call can no longer act on what the person says: part of it \
+    may not have been heard or recorded here. Nothing is done on the person's computer from this \
+    call. Say so if asked.";
+
+/// What a person is told, once, of the same.
+const SPEECH_TAINTED_PERSON: &str = "This call can no longer act on spoken requests: part of what \
+    was said may not have been heard or read. Nothing more is asked of the computer by voice in \
+    this call.";
+
+/// What leads a result the host performed, which is then the host's own bounded summary.
+const DELEGATION_PERFORMED: &str = "The person's computer read it. Say what it reports:";
+
+/// What an end says of requests that may have been written and not answered.
+const REQUESTS_UNSETTLED: &str = "A request you spoke may or may not have been carried out: look \
+    at the session list.";
+
+/// What the model is told when the host is back and spoken requests may reach it: it does not say
+/// that nothing was done, since a request written before the loss may have been.
+const HOST_BACK_ACCEPTING: &str = "The phone is in contact with the person's computer again.";
 
 /// What the model is told of a delegation: nothing was done.
 const NOTHING_WAS_DONE: &str = "Nothing was done on the person's computer: this version does not \
@@ -97,6 +158,18 @@ enum Internal {
     Alive(std::result::Result<Held, CallFailure>),
     /// What the host path came to: back on this connection, or what the host said.
     Probed(Probe),
+    /// What native code's capture proof said, when the delegation `id` asked for it with a marker.
+    Proof {
+        id: String,
+        result: std::result::Result<CaptureProof, CallFailure>,
+    },
+    /// What came of handing the delegation `id` to the host.
+    Delivered { id: String, exchange: Box<Exchange> },
+    /// What the host answered when asked again about the delegation `id`, if it did.
+    Asked {
+        id: String,
+        result: Option<Box<VoiceDelegateResult>>,
+    },
     /// Whether the model was told a delegation was not acted on.
     Told { delegation_id: String, told: bool },
     /// What came of giving the call the host's default context.
@@ -337,6 +410,64 @@ pub(super) struct Owner {
     /// The task that gives the call the host's context, from the moment it starts until its
     /// outcome is taken: one that is still here when the call ends was cut short by the end.
     opening: Option<tokio::task::JoinHandle<()>>,
+    /// Whether this call hands spoken delegations to the host: fixed as the call begins.
+    accepting: bool,
+    /// What the provider's data channel said, and whether it lets a request through.
+    gate: Gate,
+    /// The delegations the provider announced, in order, that are waiting for their time or for
+    /// native code's news to be read up to a marker.
+    collections: VecDeque<Collection>,
+    /// When the first of them is next due.
+    collection_due: Pin<Box<tokio::time::Sleep>>,
+    /// The markers read in the news, newest last.
+    barriers: VecDeque<u64>,
+    /// What the voice service announced of each delegation: the offset when it said, and none when
+    /// it only listed the identifier.
+    announced: VecDeque<(String, Option<u64>)>,
+    /// What was written to the host and not answered, by delegation, which a later look at the
+    /// host asks about again.
+    attempts: HashMap<String, Attempt>,
+    /// The delegations whose answer was a challenge the host awaits a confirmation for.
+    challenged: Vec<String>,
+    /// Set when nothing not yet written may be written: the path to the host was lost, or the call
+    /// can no longer hand a request over. A fresh one is made when the host is back.
+    unsent: Arc<AtomicBool>,
+    /// Whether the person and the model were told the call is tainted.
+    taint_told: bool,
+}
+
+/// A delegation waiting for what was said before it to be read.
+struct Collection {
+    id: String,
+    offset_ms: u64,
+    /// When it is due, while it waits.
+    due: Instant,
+    stage: Stage,
+}
+
+/// Where a collection is.
+enum Stage {
+    /// It waits for the fragments said before it to arrive.
+    Waiting,
+    /// A capture proof with a marker was asked, and the news is read up to the marker.
+    Draining {
+        /// The marker the proof answered, when it has.
+        token: Option<u64>,
+        /// What the proof's record showed, when it has.
+        record: Option<Record>,
+        /// When the set is refused as not drained.
+        until: Instant,
+    },
+}
+
+/// A request written to the host whose answer did not come.
+struct Attempt {
+    /// The connection that wrote it.
+    session: Arc<Session>,
+    /// The request as it was composed.
+    composed: ComposedMutation,
+    /// Whether the host is being asked about it now.
+    asking: bool,
 }
 
 /// Waits for the next news of the call, or for ever when there is no call.
@@ -380,6 +511,7 @@ impl Owner {
         let (internal_tx, internal) = mpsc::unbounded_channel();
         let account = tokens.subscribe();
         let timings = shared.timings;
+        let accepting = shared.accepts_host_delegations();
         Self {
             id,
             shared,
@@ -417,6 +549,16 @@ impl Owner {
             probing: false,
             probe_after: None,
             opening: None,
+            accepting,
+            gate: Gate::new(),
+            collections: VecDeque::new(),
+            collection_due: far_future(),
+            barriers: VecDeque::new(),
+            announced: VecDeque::new(),
+            attempts: HashMap::new(),
+            challenged: Vec::new(),
+            unsent: Arc::new(AtomicBool::new(false)),
+            taint_told: false,
         }
     }
 
@@ -870,7 +1012,14 @@ impl Owner {
                 .await
         };
         match accepted {
-            Ok(Ok(_)) => {}
+            Ok(Ok(answered)) => {
+                // The provider's encoder can hold back quiet speech while capture is on: a call
+                // whose answer says so cannot vouch for what it did not hear.
+                if self.accepting && answered.uses_dtx {
+                    self.gate.dtx();
+                    self.note_taint();
+                }
+            }
             Ok(Err(failure)) => {
                 return self
                     .abandon(Cause::Step(format!(
@@ -1132,6 +1281,10 @@ impl Owner {
                 news = next_news(&mut self.control_events) => self.on_news(news),
                 internal = self.internal.recv() => self.on_internal(internal),
                 _ = tick.tick() => self.on_tick(),
+                () = &mut self.collection_due, if !self.collections.is_empty() => {
+                    self.on_collection_due();
+                    None
+                }
                 () = &mut self.deadline => Some(Cause::Deadline),
                 changed = self.account.changed() => self.on_account(changed.is_ok()),
                 () = &mut self.host_closed => self.on_host_closed(),
@@ -1211,6 +1364,9 @@ impl Owner {
                 None
             }
             Some(Heard::Event(CallEvent::Capture { state })) => {
+                if self.accepting && state == CaptureState::Capturing {
+                    self.gate.capture_is_on();
+                }
                 self.view(|view| view.capture = capture_word(state));
                 // The change may be the person's own mute from a control of the phone.
                 if let Some(advice) = &self.advice {
@@ -1226,14 +1382,33 @@ impl Owner {
                 });
                 None
             }
-            // A barrier marks a place in the news for whoever asked for a capture proof, and the
-            // owner asks for none: it says nothing of the call.
-            Some(Heard::Event(
-                CallEvent::ProviderEvent { .. } | CallEvent::Lost | CallEvent::Barrier { .. },
-            )) => None,
+            // What the provider's data channel said reaches the gate when spoken requests may reach
+            // the host, and is not read at all otherwise.
+            Some(Heard::Event(CallEvent::ProviderEvent { bytes })) => {
+                if self.accepting {
+                    let told = self.gate.provider(provider::read(&bytes));
+                    self.after_gate(told);
+                }
+                None
+            }
+            // A barrier marks a place in the news for whoever asked for a capture proof. It says
+            // nothing of the call.
+            Some(Heard::Event(CallEvent::Barrier { token })) => {
+                if self.accepting {
+                    self.barrier_read(token);
+                }
+                None
+            }
+            Some(Heard::Event(CallEvent::Lost)) => None,
             // News was lost, and what was lost can be the end of the call: ask native code what
             // it holds rather than carry on as if nothing had been missed.
-            Some(Heard::Lost) => self.verify_native().await,
+            Some(Heard::Lost) => {
+                if self.accepting {
+                    let told = self.gate.lost();
+                    self.after_gate(told);
+                }
+                self.verify_native().await
+            }
         }
     }
 
@@ -1284,8 +1459,20 @@ impl Owner {
                 self.shared.clear_note();
                 if !self.attached_before {
                     self.attached_before = true;
-                    self.tell_model(VoiceCommand::Instructions, None, HOST_ACTIONS_UNAVAILABLE);
+                    self.tell_model(
+                        VoiceCommand::Instructions,
+                        None,
+                        if self.accepting {
+                            HOST_ACTIONS_AVAILABLE
+                        } else {
+                            HOST_ACTIONS_UNAVAILABLE
+                        },
+                    );
                     self.give_the_host_context();
+                    // A call that was tainted before its control attached tells the model now.
+                    if self.taint_told {
+                        self.tell_model(VoiceCommand::Instructions, None, SPEECH_TAINTED);
+                    }
                 }
                 for delegation_id in delegations {
                     self.answer_delegation(delegation_id, None);
@@ -1308,6 +1495,12 @@ impl Owner {
     /// Says to the model, once for each delegation, that nothing was done about it, and keeps a
     /// row the screen shows.
     fn answer_delegation(&mut self, delegation_id: String, offset_ms: Option<u64>) {
+        // The voice service's announcement only says which delegations it knows, and where: the
+        // answer to the person and to the model is what the data channel's delegation comes to.
+        if self.accepting {
+            self.announce(delegation_id, offset_ms);
+            return;
+        }
         if self.answered.contains(&delegation_id) {
             return;
         }
@@ -1321,6 +1514,7 @@ impl Owner {
                 offset_ms,
                 state: "not_done".to_owned(),
                 told: false,
+                cause: None,
             });
             if state.delegations.len() > ANSWERED {
                 state.delegations.remove(0);
@@ -1461,6 +1655,18 @@ impl Owner {
                 self.note_the_opening(&opened);
                 None
             }
+            Internal::Proof { id, result } => {
+                self.on_proof(&id, result);
+                None
+            }
+            Internal::Delivered { id, exchange } => {
+                self.on_delivered(&id, *exchange);
+                None
+            }
+            Internal::Asked { id, result } => {
+                self.on_asked(&id, result.map(|boxed| *boxed));
+                None
+            }
             Internal::Probed(probe) => {
                 match probe {
                     Probe::Back(session) => {
@@ -1498,7 +1704,15 @@ impl Owner {
             state.host = "reachable".to_owned();
             state.pass(ProblemKind::HostPath);
         });
-        self.tell_model(VoiceCommand::Instructions, None, HOST_BACK);
+        if self.accepting {
+            // What was not written before the loss stays unwritten; what may have been is asked
+            // about again, now that there is a connection to ask on.
+            self.unsent = Arc::new(AtomicBool::new(self.gate.taint().is_some()));
+            self.tell_model(VoiceCommand::Instructions, None, HOST_BACK_ACCEPTING);
+            self.ask_after_attempts();
+        } else {
+            self.tell_model(VoiceCommand::Instructions, None, HOST_BACK);
+        }
     }
 
     fn on_host_closed(&mut self) -> Option<Cause> {
@@ -1507,6 +1721,9 @@ impl Owner {
             self.host_lost = true;
             self.view(|state| state.host = "lost".to_owned());
             self.tell_model(VoiceCommand::Instructions, None, HOST_LOST);
+            if self.accepting {
+                self.host_path_lost();
+            }
         }
         None
     }
@@ -1543,6 +1760,505 @@ impl Owner {
             });
         }
         None
+    }
+
+    /* ------------------------------------------------------------------------------------- */
+    /* Spoken delegations                                                                    */
+    /* ------------------------------------------------------------------------------------- */
+
+    /// Acts on what the gate made of one message of the provider's data channel.
+    fn after_gate(&mut self, told: Told) {
+        self.note_taint();
+        match told {
+            Told::Delegation { id, offset_ms } => self.begin_collection(id, offset_ms),
+            Told::Late => self.cancel_challenges(),
+            Told::Nothing | Told::Tainted(_) => {}
+        }
+    }
+
+    /// Ends what the call can still hand to the host, once the gate says it is tainted: each
+    /// delegation still waiting is refused for the cause, nothing not yet written is written, and
+    /// the person and the model are told once.
+    fn note_taint(&mut self) {
+        let Some(why) = self.gate.taint() else {
+            return;
+        };
+        self.unsent.store(true, Ordering::SeqCst);
+        let waiting: Vec<Collection> = self.collections.drain(..).collect();
+        for collection in waiting {
+            self.refuse(&collection.id, why);
+        }
+        self.arm_collection();
+        if self.taint_told {
+            return;
+        }
+        self.taint_told = true;
+        self.view(|state| {
+            state.meet(
+                ProblemKind::SpokenRequests,
+                SPEECH_TAINTED_PERSON.to_owned(),
+            )
+        });
+        self.tell_model(VoiceCommand::Instructions, None, SPEECH_TAINTED);
+    }
+
+    /// Changes the row of the delegation `id`: what became of it, and why.
+    fn set_row(&self, id: &str, what: &str, cause: Option<&str>) {
+        let (id, what, cause) = (id.to_owned(), what.to_owned(), cause.map(str::to_owned));
+        self.view(|state| {
+            if let Some(row) = state
+                .delegations
+                .iter_mut()
+                .find(|row| row.delegation_id == id)
+            {
+                row.state = what;
+                row.cause = cause;
+                row.told = false;
+            }
+        });
+    }
+
+    /// Tells the model what became of the delegation `id`, by a request of its own.
+    fn tell_delegation(&self, id: &str, text: String) {
+        let Some(control) = self.control.clone() else {
+            return;
+        };
+        let (id, internal) = (id.to_owned(), self.internal_tx.clone());
+        tokio::spawn(async move {
+            let told = control
+                .send(VoiceCommand::Commentary, Some(&id), Some(&text))
+                .await
+                .is_ok();
+            let _ = internal.send(Internal::Told {
+                delegation_id: id,
+                told,
+            });
+        });
+    }
+
+    /// This device would not hand the delegation `id` to the host, for `why`.
+    fn refuse(&self, id: &str, why: Why) {
+        self.set_row(id, "refused", Some(why.word()));
+        self.tell_delegation(
+            id,
+            if why.taints() {
+                SPEECH_TAINTED
+            } else {
+                DELEGATION_REFUSED
+            }
+            .to_owned(),
+        );
+    }
+
+    /// Nothing of the delegation `id` was written to the host, for `why`.
+    fn not_sent(&self, id: &str, why: Why) {
+        self.set_row(id, "not_sent", Some(why.word()));
+        self.tell_delegation(
+            id,
+            if why.taints() {
+                SPEECH_TAINTED
+            } else {
+                DELEGATION_NOT_SENT
+            }
+            .to_owned(),
+        );
+    }
+
+    /// The voice service says it announced the delegation `id`, at `offset_ms` when it said where.
+    fn announce(&mut self, id: String, offset_ms: Option<u64>) {
+        if let Some(known) = self.announced.iter_mut().find(|(known, _)| *known == id) {
+            // A list that names no offset never takes one away.
+            if offset_ms.is_some() {
+                known.1 = offset_ms;
+            }
+            return;
+        }
+        self.announced.push_back((id, offset_ms));
+        if self.announced.len() > ANSWERED {
+            self.announced.pop_front();
+        }
+    }
+
+    /// The offset the voice service announced the delegation `id` at, when it did.
+    fn announced_offset(&self, id: &str) -> Option<u64> {
+        self.announced
+            .iter()
+            .find(|(known, _)| known == id)
+            .and_then(|(_, offset)| *offset)
+    }
+
+    /// The provider announced a delegation on its data channel: a row for it, and the wait for what
+    /// was said before it to arrive.
+    fn begin_collection(&mut self, id: String, offset_ms: u64) {
+        let shown = id.clone();
+        self.view(|state| {
+            state.delegations.push(DelegationRow {
+                delegation_id: shown,
+                offset_ms: Some(offset_ms),
+                state: "collecting".to_owned(),
+                told: false,
+                cause: None,
+            });
+            if state.delegations.len() > ANSWERED {
+                state.delegations.remove(0);
+            }
+        });
+        if let Some(why) = self.gate.taint() {
+            self.refuse(&id, why);
+            return;
+        }
+        if self.host_lost {
+            self.not_sent(&id, Why::HostLost);
+            return;
+        }
+        let due = Instant::now() + self.shared.timings.delegation_wait;
+        self.collections.push_back(Collection {
+            id,
+            offset_ms,
+            due,
+            stage: Stage::Waiting,
+        });
+        self.arm_collection();
+    }
+
+    /// Sets the timer to the moment the first collection needs the owner next.
+    fn arm_collection(&mut self) {
+        let next = self
+            .collections
+            .front()
+            .map(|collection| match collection.stage {
+                Stage::Waiting => collection.due,
+                Stage::Draining { until, .. } => until,
+            });
+        self.collection_due.as_mut().reset(
+            next.unwrap_or_else(|| Instant::now() + Duration::from_secs(60 * 60 * 24 * 365)),
+        );
+    }
+
+    /// The first collection's time has come: it asks native code for a capture proof with a marker,
+    /// or, when it has been waiting for the marker too long, is refused as not drained.
+    fn on_collection_due(&mut self) {
+        let (platform, internal, drain) = (
+            self.platform(),
+            self.internal_tx.clone(),
+            self.shared.timings.drain_within,
+        );
+        let call = self.call.clone();
+        let Some(head) = self.collections.front_mut() else {
+            return;
+        };
+        let now = Instant::now();
+        match head.stage {
+            Stage::Waiting if now >= head.due => {
+                head.stage = Stage::Draining {
+                    token: None,
+                    record: None,
+                    until: now + drain,
+                };
+                if let Some(call) = call {
+                    let id = head.id.clone();
+                    tokio::spawn(async move {
+                        let result = platform.capture_proof(&call, true).await;
+                        let _ = internal.send(Internal::Proof { id, result });
+                    });
+                }
+            }
+            Stage::Draining { until, .. } if now >= until => {
+                if let Some(late) = self.collections.pop_front() {
+                    self.refuse(&late.id, Why::NotDrained);
+                }
+            }
+            _ => {}
+        }
+        self.arm_collection();
+    }
+
+    /// Native code answered the proof the first collection asked for.
+    fn on_proof(&mut self, id: &str, result: std::result::Result<CaptureProof, CallFailure>) {
+        let Some(position) = self.collections.iter().position(|collection| {
+            collection.id == id && matches!(collection.stage, Stage::Draining { .. })
+        }) else {
+            return;
+        };
+        match result {
+            Ok(proof) if Some(&proof.call) == self.call.as_ref() && proof.barrier.is_some() => {
+                if let Stage::Draining { token, record, .. } = &mut self.collections[position].stage
+                {
+                    *token = proof.barrier;
+                    *record = Some(Record {
+                        openings: proof.openings,
+                        breaks: proof.breaks,
+                        capturing: proof.state == CaptureState::Capturing,
+                    });
+                }
+                self.try_finish();
+            }
+            _ => {
+                if let Some(collection) = self.collections.remove(position) {
+                    self.refuse(&collection.id, Why::NoProof);
+                }
+                self.arm_collection();
+            }
+        }
+    }
+
+    /// The news was read up to the marker `token`.
+    fn barrier_read(&mut self, token: u64) {
+        self.barriers.push_back(token);
+        if self.barriers.len() > 16 {
+            self.barriers.pop_front();
+        }
+        self.try_finish();
+    }
+
+    /// Freezes the first collection's set once its proof's record and the news up to its marker are
+    /// both in hand: everything native code had told before the proof was read has been read.
+    fn try_finish(&mut self) {
+        let ready = matches!(
+            self.collections.front(),
+            Some(Collection {
+                stage: Stage::Draining {
+                    token: Some(token),
+                    record: Some(_),
+                    ..
+                },
+                ..
+            }) if self.barriers.contains(token)
+        );
+        if !ready {
+            return;
+        }
+        if let Some(Collection {
+            id,
+            offset_ms,
+            stage:
+                Stage::Draining {
+                    record: Some(record),
+                    ..
+                },
+            ..
+        }) = self.collections.pop_front()
+        {
+            self.finish(&id, offset_ms, record);
+        }
+        self.arm_collection();
+    }
+
+    /// Freezes the set of the delegation `id`, and hands it to the host or refuses it.
+    fn finish(&mut self, id: &str, offset_ms: u64, record: Record) {
+        let announced = self.announced_offset(id);
+        let frozen = self.gate.freeze(offset_ms, record, announced);
+        self.note_taint();
+        match frozen {
+            Frozen::Refused(why) => self.refuse(id, why),
+            Frozen::Set(fragments) => self.hand_over(id, offset_ms, &fragments),
+        }
+    }
+
+    /// Hands a frozen set to the host on a task of its own, so that nothing waits for it.
+    fn hand_over(&mut self, id: &str, offset_ms: u64, fragments: &[provider::Fragment]) {
+        let (Some(host), Some(descriptor), Some(call)) = (
+            self.host.clone(),
+            self.descriptor.clone(),
+            self.call.clone(),
+        ) else {
+            self.not_sent(id, Why::NotComposed);
+            return;
+        };
+        let built: Option<VoiceDelegateParams> = (|| {
+            let fragments = fragments
+                .iter()
+                .map(|fragment| {
+                    Some(TranscriptFragment {
+                        start_ms: U64::new(fragment.start_ms),
+                        end_ms: U64::new(fragment.end_ms),
+                        text: FragmentText::new(fragment.text.clone()).ok()?,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(VoiceDelegateParams {
+                voice_session_id: descriptor.voice_session_id,
+                delegation_id: VoiceDelegationId::new(id).ok()?,
+                offset_ms: U64::new(offset_ms),
+                fragments,
+                confirmation: Nullable::null(),
+            })
+        })();
+        let Some(params) = built.filter(|params| params.check_fragments().is_ok()) else {
+            self.refuse(id, Why::TooLarge);
+            return;
+        };
+        self.set_row(id, "asking", None);
+        let handover = Handover {
+            host,
+            platform: self.platform(),
+            call,
+            params,
+            age_bound: self.shared.timings.proof_age,
+            within: self.shared.timings.host_within,
+            lost: Arc::clone(&self.unsent),
+        };
+        let (internal, id) = (self.internal_tx.clone(), id.to_owned());
+        tokio::spawn(async move {
+            let exchange = hand_over(handover).await;
+            let _ = internal.send(Internal::Delivered {
+                id,
+                exchange: Box::new(exchange),
+            });
+        });
+    }
+
+    /// What came of handing the delegation `id` to the host.
+    fn on_delivered(&mut self, id: &str, exchange: Exchange) {
+        let Exchange {
+            session,
+            composed,
+            delivered,
+            ..
+        } = exchange;
+        match delivered {
+            Delivered::Result(result) => self.host_answered(id, *result),
+            Delivered::Refused => {
+                self.set_row(id, "host_refused", Some("host_answer"));
+                self.tell_delegation(id, DELEGATION_HOST_REFUSED.to_owned());
+            }
+            // A receipt shows that the host holds the action and never what became of it, so it is
+            // no decision: the person and the model are told it is not known.
+            Delivered::Receipt => {
+                self.set_row(id, "unknown", Some("receipt"));
+                self.tell_delegation(id, DELEGATION_UNKNOWN.to_owned());
+            }
+            Delivered::Withheld(why) => {
+                let why = self.gate.taint().unwrap_or(why);
+                self.not_sent(id, why);
+            }
+            Delivered::Tainted(why) => {
+                self.gate.taint_with(why);
+                self.note_taint();
+                self.not_sent(id, why);
+            }
+            Delivered::Unknown => {
+                self.set_row(id, "unknown", None);
+                self.tell_delegation(id, DELEGATION_UNKNOWN.to_owned());
+                if let Some(composed) = composed {
+                    self.attempts.insert(
+                        id.to_owned(),
+                        Attempt {
+                            session,
+                            composed,
+                            asking: false,
+                        },
+                    );
+                    self.ask_about(id);
+                }
+            }
+        }
+    }
+
+    /// The host answered, once, with a result.
+    fn host_answered(&mut self, id: &str, result: VoiceDelegateResult) {
+        let (what, cause, told) = answered_as(&result.outcome);
+        self.set_row(id, what, cause);
+        if what == "confirmation_required" {
+            self.challenged.push(id.to_owned());
+        }
+        self.tell_delegation(id, told);
+    }
+
+    /// Asks the host what became of the delegation `id`, on a task of its own, with the request
+    /// as it was composed and on a connection other than the one that wrote it.
+    fn ask_about(&mut self, id: &str) {
+        let Some(host) = self.host.clone() else {
+            return;
+        };
+        let Some(attempt) = self.attempts.get_mut(id) else {
+            return;
+        };
+        if attempt.asking {
+            return;
+        }
+        attempt.asking = true;
+        let mut host = host;
+        host.session = Arc::clone(&attempt.session);
+        let composed = attempt.composed.clone();
+        let (reach, internal, id) = (
+            Arc::clone(&self.reach),
+            self.internal_tx.clone(),
+            id.to_owned(),
+        );
+        let (delays, within) = (
+            self.shared.timings.repeat_delays,
+            self.shared.timings.host_within,
+        );
+        tokio::spawn(async move {
+            let result = ask_again(reach, host, composed, delays, within).await;
+            let _ = internal.send(Internal::Asked {
+                id,
+                result: result.map(Box::new),
+            });
+        });
+    }
+
+    /// What the host said when asked again, if it said anything: a result settles the delegation,
+    /// and anything less leaves it unknown.
+    fn on_asked(&mut self, id: &str, result: Option<VoiceDelegateResult>) {
+        match result {
+            Some(result) => {
+                self.attempts.remove(id);
+                self.host_answered(id, result);
+            }
+            None => {
+                if let Some(attempt) = self.attempts.get_mut(id) {
+                    attempt.asking = false;
+                }
+            }
+        }
+    }
+
+    /// The host is reached again: what was written and not answered is asked about once more.
+    fn ask_after_attempts(&mut self) {
+        let waiting: Vec<String> = self
+            .attempts
+            .iter()
+            .filter(|(_, attempt)| !attempt.asking)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in waiting {
+            self.ask_about(&id);
+        }
+    }
+
+    /// The path to the host is lost: what was not written is not written, and what was stays
+    /// unknown, since the host goes on with a request after its connection ends.
+    fn host_path_lost(&mut self) {
+        self.unsent.store(true, Ordering::SeqCst);
+        let waiting: Vec<Collection> = self.collections.drain(..).collect();
+        for collection in waiting {
+            self.not_sent(&collection.id, Why::HostLost);
+        }
+        self.arm_collection();
+    }
+
+    /// A fragment that belongs to a request arrived after it was read: a challenge the host awaits
+    /// a confirmation for is not one to answer.
+    fn cancel_challenges(&mut self) {
+        for id in std::mem::take(&mut self.challenged) {
+            self.set_row(&id, "refused", Some(Why::LateFragment.word()));
+            self.tell_delegation(&id, DELEGATION_LATE.to_owned());
+        }
+    }
+
+    /// Whether a request was written to the host and has no answer: it may have been carried out.
+    fn requests_unsettled(&self) -> bool {
+        !self.attempts.is_empty()
+            || self
+                .shared
+                .view
+                .lock()
+                .expect("the view lock is not poisoned")
+                .delegations
+                .iter()
+                .any(|row| row.state == "asking" || row.state == "unknown")
     }
 
     /* ------------------------------------------------------------------------------------- */
@@ -1632,6 +2348,10 @@ impl Owner {
         };
 
         let needs_broker = self.descriptor.is_some();
+        // A request written to the host and not answered may have been carried out, and the aftermath
+        // never says nothing was done.
+        let unsettled = self.accepting && self.requests_unsettled();
+        self.unsent.store(true, Ordering::SeqCst);
         self.view(|state| {
             state.running = false;
             state.session = None;
@@ -1640,7 +2360,11 @@ impl Owner {
             state.ended = Some(EndedView {
                 owner: id,
                 cause: cause.word().to_owned(),
-                words: cause.words(),
+                words: if unsettled {
+                    format!("{} {REQUESTS_UNSETTLED}", cause.words())
+                } else {
+                    cause.words()
+                },
                 closed_locally,
                 host: host_end.clone(),
                 broker: if needs_broker {
@@ -1758,6 +2482,32 @@ impl Owner {
             return "closed_over_http";
         }
         "not_confirmed"
+    }
+}
+
+/// What the host's result says of a delegation: the state its row takes, the cause when the host
+/// gave one, and what the model is told. A request the host only accepted is told as accepted and
+/// never as done: an acknowledgement proves admission, not execution.
+fn answered_as(outcome: &VoiceDelegationOutcome) -> (&'static str, Option<&'static str>, String) {
+    match outcome {
+        VoiceDelegationOutcome::Performed { summary, .. } => (
+            "performed",
+            None,
+            format!("{DELEGATION_PERFORMED} {summary}"),
+        ),
+        VoiceDelegationOutcome::Admitted { .. } => {
+            ("admitted", None, DELEGATION_ADMITTED.to_owned())
+        }
+        VoiceDelegationOutcome::ConfirmationRequired { .. } => (
+            "confirmation_required",
+            None,
+            DELEGATION_CONFIRMATION.to_owned(),
+        ),
+        VoiceDelegationOutcome::Refused { reason, .. } => (
+            "host_refused",
+            Some(reason.as_str()),
+            DELEGATION_HOST_REFUSED.to_owned(),
+        ),
     }
 }
 
@@ -1918,6 +2668,35 @@ async fn probe_host(
 
 #[cfg(test)]
 mod tests {
+    /// What the host says of a delegation is what the row and the model are told: a request the host
+    /// only accepted is never told as done, a refusal carries the host's reason, and what the host
+    /// performed is told with its own summary.
+    #[test]
+    fn what_the_host_answers_is_told_as_it_answered() {
+        let action_id = ActionId::new(kr_ipc::new_uuid());
+        let (state, cause, told) = answered_as(&VoiceDelegationOutcome::Admitted {
+            action_id,
+            note: "accepted".to_owned(),
+        });
+        assert_eq!((state, cause), ("admitted", None));
+        assert!(told.contains("not known"), "{told}");
+        assert!(!told.starts_with(DELEGATION_PERFORMED), "{told}");
+
+        let (state, _, told) = answered_as(&VoiceDelegationOutcome::Performed {
+            action_id,
+            summary: "session one is running".to_owned(),
+        });
+        assert_eq!(state, "performed");
+        assert!(told.starts_with(DELEGATION_PERFORMED), "{told}");
+        assert!(told.ends_with("session one is running"), "{told}");
+
+        let (state, cause, _) = answered_as(&VoiceDelegationOutcome::Refused {
+            reason: kr_protocol::voice::VoiceRefusal::NotUnderstood,
+            message: "not read".to_owned(),
+        });
+        assert_eq!((state, cause), ("host_refused", Some("not_understood")));
+    }
+
     use super::*;
 
     /// The closing time this device holds a call to is the host's, held down to what was asked

@@ -192,7 +192,9 @@ impl ScriptedCalls {
         self.inner().held_cannot_be_read = true;
     }
 
-    /// Holds `step` (`open`, `offer`, `accept`, `permit`, `held`, `capture_proof` or `stop`): the command is given and counted, and
+    /// Holds `step` (`open`, `offer`, `accept`, `permit`, `held`, `capture_proof` (the proof that
+    /// completes a set, with a marker), `capture_proof_at_use` (the proof taken just before a send) or
+    /// `stop`): the command is given and counted, and
     /// does not return until [`Self::release`] lets it.
     pub fn hold(&self, step: &'static str) {
         self.inner().held_steps.push(step);
@@ -299,6 +301,16 @@ impl ScriptedCalls {
             inner.capture
         };
         self.tell(CallEvent::Capture { state });
+    }
+
+    /// The provider says something on its events channel: `event` as JSON, as the bytes arrive.
+    pub fn tell_provider(&self, event: &serde_json::Value) {
+        self.tell_provider_bytes(serde_json::to_vec(event).expect("an event encodes"));
+    }
+
+    /// The provider says something on its events channel, as these bytes.
+    pub fn tell_provider_bytes(&self, bytes: Vec<u8>) {
+        self.tell(CallEvent::ProviderEvent { bytes });
     }
 
     /// News that skips a number: what the reader is told as news that was lost.
@@ -525,7 +537,13 @@ impl CallPlatform for ScriptedCalls {
             } else {
                 "capture_proof".to_owned()
             });
-            self.gate("capture_proof").await;
+            // The proof taken just before a send is held apart from the one that completes a set.
+            self.gate(if barrier {
+                "capture_proof"
+            } else {
+                "capture_proof_at_use"
+            })
+            .await;
             // The record is read and the marker put in the news in one step, as on a phone, and the
             // call is the one named when it is.
             let mut inner = self.inner();

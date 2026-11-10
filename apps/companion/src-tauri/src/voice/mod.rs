@@ -17,10 +17,19 @@
 
 mod advice;
 mod cause;
+mod delegation;
 mod host;
 mod kept;
 mod owner;
+mod provider;
 mod view;
+
+/// Whether a spoken delegation the provider announces on its data channel may be handed to the
+/// host. It is off: this version acts on nothing a person says, and each delegation is answered
+/// to the model by a fixed sentence that nothing was done. A case, and the debug build's probe,
+/// turn it on for one [`Calls`] through a setter that exists only in those builds, so a release
+/// build holds this constant and nothing that can change it.
+const ACCEPT_HOST_DELEGATIONS: bool = false;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -62,8 +71,17 @@ pub struct Timings {
     pub token_within: Duration,
     /// How long the voice service's own route is given to close a call.
     pub close_within: Duration,
-    /// The waits before each repeat of a start whose answer was lost.
+    /// The waits before each repeat of a start whose answer was lost, or of a delegation's.
     pub repeat_delays: [Duration; 3],
+    /// How long a delegation waits after the provider announced it for what was said before it to
+    /// arrive. A parameter of the cases, not a safety bound.
+    pub delegation_wait: Duration,
+    /// How long native code's news is read for the marker of a capture proof before the set is
+    /// refused as not drained.
+    pub drain_within: Duration,
+    /// How old a capture proof may be at the moment a delegation is written to the host. A
+    /// parameter of the cases, not a safety bound.
+    pub proof_age: Duration,
 }
 
 impl Default for Timings {
@@ -81,6 +99,9 @@ impl Default for Timings {
                 Duration::from_secs(8),
                 Duration::from_secs(30),
             ],
+            delegation_wait: Duration::from_secs(3),
+            drain_within: Duration::from_secs(5),
+            proof_age: Duration::from_millis(500),
         }
     }
 }
@@ -296,9 +317,25 @@ pub(crate) struct Shared {
     /// reached while the call runs cannot ask to stop the call that is running. The end of the call
     /// replaces it with what the end owes, and it is cleared only by the owner that opened it.
     standing: Mutex<Option<(u64, OwedView)>>,
+    /// Whether spoken delegations are handed to the host: a case's choice, where a case can make one.
+    #[cfg(any(test, feature = "testing", debug_assertions))]
+    accept: std::sync::atomic::AtomicBool,
 }
 
 impl Shared {
+    /// Whether a spoken delegation may be handed to the host, read as a call begins.
+    #[cfg(any(test, feature = "testing", debug_assertions))]
+    pub(crate) fn accepts_host_delegations(&self) -> bool {
+        self.accept.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether a spoken delegation may be handed to the host, read as a call begins.
+    #[cfg(not(any(test, feature = "testing", debug_assertions)))]
+    #[allow(clippy::unused_self)]
+    pub(crate) const fn accepts_host_delegations(&self) -> bool {
+        ACCEPT_HOST_DELEGATIONS
+    }
+
     /// Frees the slot `owner` holds, so another call can be started. The slot of another owner is
     /// left as it is: an owner that is still finalising a call must not free the next one's.
     pub(crate) fn release(&self, owner: u64) {
@@ -924,7 +961,20 @@ impl Calls {
                 note_changed: std::sync::atomic::AtomicBool::new(false),
                 keeping: Mutex::new(()),
                 standing: Mutex::new(None),
+                #[cfg(any(test, feature = "testing", debug_assertions))]
+                accept: std::sync::atomic::AtomicBool::new(ACCEPT_HOST_DELEGATIONS),
             })),
+        }
+    }
+
+    /// Lets the calls this makes from now on hand spoken delegations to the host, or stops it. For
+    /// cases and the debug build's probe only: a release build compiles no way to say so.
+    #[cfg(any(test, feature = "testing", debug_assertions))]
+    pub fn accept_host_delegations(&self, accept: bool) {
+        if let Some(shared) = &self.shared {
+            shared
+                .accept
+                .store(accept, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
