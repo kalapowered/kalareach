@@ -16,7 +16,7 @@ mod support;
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::FutureExt as _;
@@ -903,12 +903,28 @@ async fn revoking_a_stream_ends_a_write_the_device_does_not_read() {
     harness.finish().await;
 }
 
+/// Reads one whole frame from a stream a device holds, and returns its payload's length.
+async fn whole_frame(recv: &mut RecvStream) -> usize {
+    let mut prefix = [0u8; 4];
+    awaited("a frame's length", recv.read_exact(&mut prefix))
+        .await
+        .expect("a frame's length");
+    let length = u32::from_be_bytes(prefix) as usize;
+    let mut payload = vec![0u8; length];
+    awaited("a frame's payload", recv.read_exact(&mut payload))
+        .await
+        .expect("a frame's payload");
+    length
+}
+
 /// A frame is not written past the moment its stream is revoked. A write hands a frame to the
-/// stream in attempts, and the stream's revoked state is asked in the same poll as each of them, so
-/// a revocation that arrives between two attempts, which a race against the revocation cannot
-/// tell from one that arrives just after the write, ends the write there: here the host's check
-/// revokes the stream while it admits the first attempt, with the stream still writable, and the
-/// second attempt is not made.
+/// stream in attempts, a length and then the payload, and the stream's revoked state is asked at
+/// each of them, in the same poll, so a revocation that arrives between two attempts of one poll,
+/// which a race against the revocation cannot tell from one that arrives just after the write,
+/// ends the write there. Here the host's check revokes the stream while it admits the first
+/// attempt, with the stream still writable: its check is not asked again, the second attempt is
+/// not made, the write fails as a revoked stream's does and the device reads a reset, never the
+/// frame. The same write with no revocation arrives whole.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_frame_is_not_written_once_the_stream_is_revoked() {
     let mut harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::Forward).await;
@@ -918,10 +934,26 @@ async fn a_frame_is_not_written_once_the_stream_is_revoked() {
     let handle = stream.handle();
     let (reader, mut writer) = stream.split();
 
+    // The control: with nothing revoked the frame arrives whole.
+    let written = writer
+        .write_message_while(&blob(100), &admit_always)
+        .await
+        .expect("a write that nothing ends");
+    assert!(
+        written,
+        "a frame nothing refused was reported as not written"
+    );
+    assert!(whole_frame(&mut recv).await >= 100);
+
+    let asked = AtomicUsize::new(0);
     let revoke_at_the_first_attempt = |attempt: &mut dyn FnMut()| {
-        attempt();
-        handle.revoke();
-        true
+        if asked.fetch_add(1, Ordering::SeqCst) == 0 {
+            attempt();
+            handle.revoke();
+            true
+        } else {
+            false
+        }
     };
     let outcome = writer
         .write_message_while(&blob(100), &revoke_at_the_first_attempt)
@@ -930,6 +962,11 @@ async fn a_frame_is_not_written_once_the_stream_is_revoked() {
         matches!(outcome, Err(TransportError::ControlLost)),
         "a write that was revoked part way did not fail as a revoked stream's does: {outcome:?}"
     );
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        1,
+        "the host's check was asked again after the stream was revoked"
+    );
     assert!(reader.is_revoked());
     drop((reader, writer));
     let (code, received) = reset_after_bytes(&mut recv).await;
@@ -937,6 +974,46 @@ async fn a_frame_is_not_written_once_the_stream_is_revoked() {
     assert!(
         received <= kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN,
         "{received} bytes reached the device, so part of the frame went after the revocation"
+    );
+
+    harness.finish().await;
+}
+
+/// A revocation that lands while the host's check is running stops the attempt it was running for.
+/// The check may wait for a lock before it hands bytes over, and the stream's revoked state is
+/// asked again inside the attempt, once the check holds what it holds: here the check revokes the
+/// stream and then makes the attempt for the payload, which is not made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revocation_while_the_hosts_check_runs_stops_the_attempt() {
+    let mut harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::Forward).await;
+    let header = attachment_header(harness.authorised.connection_id, 1);
+    let (_send, mut recv) = harness.raw(&header).await;
+    let stream = harness.next().await;
+    let handle = stream.handle();
+    let (reader, mut writer) = stream.split();
+
+    let asked = AtomicUsize::new(0);
+    let revoke_before_the_second_attempt = |attempt: &mut dyn FnMut()| {
+        if asked.fetch_add(1, Ordering::SeqCst) == 1 {
+            handle.revoke();
+        }
+        attempt();
+        true
+    };
+    let outcome = writer
+        .write_message_while(&blob(100), &revoke_before_the_second_attempt)
+        .await;
+    assert!(
+        matches!(outcome, Err(TransportError::ControlLost)),
+        "a write whose stream was revoked as its attempt began did not fail as one: {outcome:?}"
+    );
+    assert!(reader.is_revoked());
+    drop((reader, writer));
+    let (code, received) = reset_after_bytes(&mut recv).await;
+    assert_eq!(code, u64::from(STREAM_REVOKED));
+    assert!(
+        received <= kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN,
+        "{received} bytes reached the device, so the payload went after the revocation"
     );
 
     harness.finish().await;
@@ -1050,7 +1127,7 @@ async fn a_second_stream_waits_until_the_connection_is_authorised() {
     harness.finish().await;
 }
 
-/// KR-REQ-23.19: a host that takes no data streams leaves its connections at room for one stream.
+/// A host that takes no data streams leaves its connections at room for one stream.
 /// A second stream the device opens finds no credit: the host has been told the device is blocked,
 /// reports that it granted nothing, and the open ends only with the connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1092,19 +1169,28 @@ async fn a_host_that_takes_no_data_streams_leaves_a_device_one_stream() {
 
 /// A host opens no stream to a device: a client's endpoint allows none, so a stream the host tries
 /// to open finds no credit, and a client that waits to accept one waits for the end of the
-/// connection.
+/// connection. The device has been told the host is blocked, so a packet has crossed since its
+/// accept began, and the accept is still waiting and the host's open still has no credit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_opens_no_stream_to_a_device() {
     let harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::Forward).await;
 
+    let device = Arc::clone(&harness.device);
+    let connection = harness.connection.clone();
+    let accepting = tokio::spawn(async move { device.accept(&connection).await.map(|_| ()) });
     let mut from_the_host = Box::pin(harness.host_connection.open_bi());
     assert!(
         futures::poll!(&mut from_the_host).is_pending(),
         "a device's endpoint had room for a stream the host opens"
     );
-    let device = Arc::clone(&harness.device);
-    let connection = harness.connection.clone();
-    let accepting = tokio::spawn(async move { device.accept(&connection).await.map(|_| ()) });
+    awaited("the device being told the host is blocked", async {
+        while harness.connection.stats().frame_rx.streams_blocked_bidi == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(!accepting.is_finished(), "a device's accept ended at once");
+    assert!(futures::poll!(&mut from_the_host).is_pending());
     harness.host_connection.close(0u32.into(), b"done");
     let accepted = awaited("the device's accept ending with the connection", accepting)
         .await
