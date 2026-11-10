@@ -464,10 +464,8 @@ mod console {
         /// key records, which the session spells in the ordinary encoding.
         #[must_use]
         pub fn profile(&self) -> Option<String> {
-            std::env::var("TERM")
-                .ok()
-                .filter(|term| !term.is_empty())
-                .or_else(|| Some(kr_term::win32::CONSOLE_PROFILE.to_owned()))
+            let term = std::env::var("TERM").ok();
+            Some(kr_term::win32::console_declaration(term.as_deref()).to_owned())
         }
 
         /// A name for this console that no other console shares while it exists.

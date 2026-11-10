@@ -91,6 +91,17 @@ pub const MODE_RESET: &[u8] = b"\x1b[?9001l";
 /// session's stream.
 pub const CONSOLE_PROFILE: &str = "windows-console";
 
+/// What a Windows console declares itself to be, given the `TERM` its environment has, if any.
+///
+/// A person who sets `TERM` has said what their terminal is, and that is the declaration. A `TERM`
+/// that is empty names nothing, so a console that has none, or an empty one, declares
+/// [`CONSOLE_PROFILE`].
+#[must_use]
+pub fn console_declaration(term: Option<&str>) -> &str {
+    term.filter(|term| !term.is_empty())
+        .unwrap_or(CONSOLE_PROFILE)
+}
+
 /// One console key record, exactly as the console reported it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyRecord {
@@ -431,6 +442,18 @@ impl Fidelity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A console that names a terminal declares that terminal, and one that names none, or names
+    /// nothing, declares the console's own profile.
+    #[test]
+    fn a_console_declares_the_terminal_its_environment_names_and_otherwise_itself() {
+        assert_eq!(
+            console_declaration(Some("xterm-256color")),
+            "xterm-256color"
+        );
+        assert_eq!(console_declaration(None), CONSOLE_PROFILE);
+        assert_eq!(console_declaration(Some("")), CONSOLE_PROFILE);
+    }
 
     /// KR-REQ-08.52, the part about the final underscore: a record is written as
     /// `CSI Vk;Sc;Uc;Kd;Cs;Rc_` with all six fields (`\x1b[65;30;97;1;0;1_`), ending in an
