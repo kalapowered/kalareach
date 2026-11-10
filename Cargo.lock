@@ -4780,12 +4780,15 @@ dependencies = [
 name = "kr-e2e-agents"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "base64 0.23.1",
+ "jiff",
  "kr-cbor",
  "kr-client",
  "kr-controller",
  "kr-e2e-m1b",
  "kr-ipc",
+ "kr-plugin-catalogue",
  "kr-plugin-sdk",
  "kr-protocol",
  "kr-worker",
@@ -4796,6 +4799,8 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml_edit 0.25.15+spec-1.1.0",
+ "tough",
+ "url",
 ]
 
 [[package]]
