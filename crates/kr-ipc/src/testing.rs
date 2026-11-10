@@ -231,9 +231,19 @@ const REMOVAL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(45)
 /// `patience`, which is no time at all when it is zero; the refusal that is left at the end is
 /// returned. A directory that is not there is removed.
 fn remove_tree(root: &Path, patience: std::time::Duration) -> std::io::Result<()> {
+    remove_tree_by(root, patience, |root: &Path| std::fs::remove_dir_all(root))
+}
+
+/// [`remove_tree`] with the removal of the directory given, so that a case can see each time it is
+/// refused.
+fn remove_tree_by(
+    root: &Path,
+    patience: std::time::Duration,
+    mut remove: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let begun = std::time::Instant::now();
     loop {
-        match std::fs::remove_dir_all(root) {
+        match remove(root) {
             Ok(()) => return Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(_) if begun.elapsed() < patience => {
@@ -268,7 +278,8 @@ impl Drop for PrivateTempDir {
             std::time::Duration::ZERO
         };
         if let Err(error) = remove_tree(&self.root, patience) {
-            // The thread of a case is named for the case, so this names the case that left the tree.
+            // The thread of a case is named for the case, so this names the case that left the
+            // tree.
             let thread = std::thread::current();
             let _ = writeln!(
                 std::io::stderr(),
@@ -639,42 +650,43 @@ mod tests {
         );
     }
 
-    /// A private directory that is dropped while a file in it is held open without sharing, as a task
-    /// that is ending holds one, is removed once the file is let go of. The holder lets go when the
-    /// first removal has taken the file that sorts before the held one, so nothing here waits for a
-    /// time: the removal tried again is the one that finds the folder free.
+    /// The removal of a private directory that is refused at a file held open without sharing, as a
+    /// task that is ending holds one, is tried again, and succeeds once the file is let go of. The
+    /// holder lets go of the file when the first removal is refused, which the case sees in the
+    /// removal it gives, so nothing here waits for a time: the removal tried again is the one that
+    /// finds the folder free.
     #[cfg(windows)]
     #[test]
-    fn a_private_directory_dropped_while_a_file_in_it_is_held_is_removed_when_the_file_is_let_go_of()
-     {
+    fn a_removal_refused_at_a_file_that_is_held_is_tried_again_once_the_file_is_let_go_of() {
         use std::os::windows::fs::OpenOptionsExt as _;
 
         let directory = PrivateTempDir::create();
         let root = directory.path().to_path_buf();
         std::fs::write(root.join("a-plain"), b"goes at the first removal").expect("a plain file");
-        let held = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .share_mode(0)
-            .open(root.join("store.db"))
-            .expect("a file held open without sharing");
-        let plain = root.join("a-plain");
-        let holder = std::thread::spawn(move || {
-            // The first removal took the plain file and was refused at the held one.
-            let begun = std::time::Instant::now();
-            while plain.exists() {
-                assert!(
-                    begun.elapsed() < Duration::from_secs(60),
-                    "the first removal did not take the plain file in a minute"
-                );
-                std::thread::sleep(Duration::from_millis(5));
+        let mut held = Some(
+            std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .share_mode(0)
+                .open(root.join("store.db"))
+                .expect("a file held open without sharing"),
+        );
+        let mut refusals = 0;
+
+        let removed = super::remove_tree_by(&root, Duration::from_secs(60), |root| {
+            let removal = std::fs::remove_dir_all(root);
+            if removal.is_err() {
+                refusals += 1;
+                held = None;
             }
-            drop(held);
+            removal
         });
 
-        drop(directory);
-
-        holder.join().expect("the holder let go of the file");
+        removed.expect("the removal that was tried again succeeds");
+        assert_eq!(
+            refusals, 1,
+            "the removal was refused once, and then tried again"
+        );
         assert!(!root.exists(), "{} is left", root.display());
     }
 
