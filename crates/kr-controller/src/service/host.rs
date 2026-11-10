@@ -64,10 +64,12 @@ impl Controller {
         // the agent's files is read. The authority itself is asked where an answer the host
         // holds goes back and where the dispatch marker is written, below.
         self.authorised(carried.connection_id)?;
-        // What the host kept of the action, a refusal as much as a result, goes back only under
-        // the authority this attempt arrived under, asked with it in hand: a record that another
-        // copy wrote while this one waited is found after the door's own look, and a fence owed
-        // or a registration replaced since then stops it, as it does at that look.
+        // What the host holds of the action goes back only under the authority this attempt
+        // arrived under, asked with it in hand. That is a result, the conflict a reused identifier
+        // meets, an outcome that was never recorded, or a record that cannot be read: the
+        // installation record keeps no refusal. A record that another copy wrote while this one
+        // waited is found after the door's own look, and a fence owed or a registration replaced
+        // since then stops it, as it does at that look.
         if let Some(kept) = installer
             .retained(actor_id, mutation.action_id, &digest)
             .transpose()
