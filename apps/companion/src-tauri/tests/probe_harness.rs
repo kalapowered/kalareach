@@ -10,6 +10,7 @@
 //! | --- | --- |
 //! | A call is followed from the invitation to its end, and every check reads it as healthy | `a_call_is_followed_from_the_invitation_to_the_end_native_code_tells` |
 //! | A call the person ends is not read as one native code ended | `a_call_the_person_ends_fails_the_check_that_reads_native_codes_end` |
+//! | Each leg of the connected run is played against the real gate and a real host's session, and the host is sent exactly the requests the leg expects | `the_positive_leg_...` and the cases after it |
 
 // The probe is in debug builds only, so a release build of this crate's tests has nothing to run.
 #![cfg(debug_assertions)]
@@ -25,7 +26,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use companion_platform::call::{CallEvent, Media};
-use companion_tauri::probe::harness::{Harness, Mode, call_check};
+use companion_tauri::probe::delegating::{Driver, DriverFuture, Leg};
+use companion_tauri::probe::harness::{Harness, Mode, call_check, call_check_with};
 use companion_tauri::voice::{Calls, Kept, Timings};
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::MemoryStore;
@@ -34,9 +36,10 @@ use kr_protocol::invitation::{InviteEntry, InviteGrantKind};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Nullable;
 use net_support::pairing::{self as calls, Signer};
+use net_support::worker::{Adopted, Worker};
 use net_support::{Host, proposal};
 use support::call::ScriptedCalls;
-use support::{Companion, NoOwner, StubIntake, WATCHDOG, parts};
+use support::{Companion, LinkControl, NoOwner, StubIntake, WATCHDOG, govern, parts};
 use voice_support::StandIn;
 
 /// The token the phone's account holds, which the stand-in's control accepts.
@@ -58,6 +61,10 @@ enum Moves {
 struct Scene {
     host: Host,
     owner: DeviceKeys,
+    /// The real sessions the host holds, which a run of spoken requests reads.
+    workers: Vec<Worker>,
+    /// The connections the phone makes to the host, which count what it sends.
+    link: Arc<LinkControl>,
     stand_in: StandIn,
     platform: Arc<ScriptedCalls>,
     companion: Companion,
@@ -79,13 +86,31 @@ struct Scene {
 }
 
 async fn scene() -> Scene {
+    scene_over(
+        0,
+        Timings {
+            tick: Duration::from_millis(100),
+            ..Timings::default()
+        },
+    )
+    .await
+}
+
+/// A host that holds `sessions` real sessions, a stand-in voice service and a phone with `timings`.
+async fn scene_over(sessions: u64, timings: Timings) -> Scene {
     let stand_in = StandIn::start().await;
     stand_in.accept_control_token(TOKEN);
-    let owner = DeviceKeys::generate().expect("owner keys");
     let mut document = ConfigurationDocument::empty();
     document.revision = 1;
     document.voice.broker_origin = Nullable::some(stand_in.origin().to_owned());
-    let host = Host::start_with_document(&owner, &document).await;
+    let (host, owner, workers) = if sessions == 0 {
+        let owner = DeviceKeys::generate().expect("owner keys");
+        let host = Host::start_with_document(&owner, &document).await;
+        (host, owner, Vec::new())
+    } else {
+        let adopted = Adopted::start_with_document(sessions, &document).await;
+        (adopted.host, adopted.owner, adopted.workers)
+    };
     host.controller()
         .host_account()
         .keep_for_test(stand_in.host_grant())
@@ -97,21 +122,26 @@ async fn scene() -> Scene {
         invitation: String::new(),
         mode: Mode::NativeFailure,
         media_seconds: 60,
+        leg: Leg::Positive,
+        session_ids: workers
+            .iter()
+            .map(|worker| worker.session_id.to_string())
+            .collect(),
     };
     let platform = ScriptedCalls::new();
     let data = tempfile::tempdir().expect("a directory");
     let calls = Calls::on_phone(
         Arc::clone(&platform) as Arc<dyn companion_platform::call::CallPlatform>,
         harness.service().expect("the stand-in's service"),
-        Timings {
-            tick: Duration::from_millis(100),
-            ..Timings::default()
-        },
+        timings,
         Kept::at(data.path()),
     );
+    let link = LinkControl::new();
+    let mut governed = parts(Arc::new(MemoryStore::new()), Arc::new(host.room.clone()));
+    govern(&mut governed, &link);
     let companion = Companion::start_with_voice(
         data.path(),
-        parts(Arc::new(MemoryStore::new()), Arc::new(host.room.clone())),
+        governed,
         Arc::new(NoOwner),
         StubIntake::holding("", false),
         calls,
@@ -120,6 +150,8 @@ async fn scene() -> Scene {
     Scene {
         host,
         owner,
+        workers,
+        link,
         stand_in,
         platform,
         companion,
@@ -143,17 +175,26 @@ impl Scene {
             invitation: invitation.to_owned(),
             mode,
             media_seconds: 3,
+            leg: Leg::Positive,
+            session_ids: self.harness.session_ids.clone(),
         }
     }
 
     /// A direct invitation to the host, as the device run's host issues one.
     async fn invitation(&self) -> (String, kr_protocol::ids::InvitationId) {
         let mut client = self.host.client().await;
+        // Paired with the history of a session from its start where the run reads one, as the
+        // device run's host issues it.
+        let mut proposed = proposal(&[ActionRight::SessionView, ActionRight::AgentPrompt]);
+        if !self.workers.is_empty() {
+            proposed.history.lower_bound_ms =
+                Nullable::some(kr_protocol::scalars::TimestampMs::new(0));
+        }
         let invited = calls::invite_direct(
             self.host.environment_id,
             &mut client,
             InviteGrantKind::SessionInvitation,
-            &proposal(&[ActionRight::SessionView, ActionRight::AgentPrompt]),
+            &proposed,
             &Signer::OwnerDevice(&self.owner),
         )
         .await
@@ -622,4 +663,357 @@ async fn audio_that_played_with_no_news_of_it_fails_the_figure_check() {
         failed(&checks)
     );
     scene.host.stop().await;
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/* The legs of the connected run                                                                  */
+/* ---------------------------------------------------------------------------------------------- */
+//
+// The device run plays each leg through the peer in the application and the stand-in voice service
+// on the machine. Here the same legs are played against the same gate and a real host's session,
+// with native code scripted: the provider's data channel is the scripted platform's, the service's
+// announcements the stand-in's, the drop hook a gap in what native code's record shows. What a leg
+// asserts of the host is read at the phone's connection to it, where each `voice.delegate` is
+// counted, and what the model was told is read at the stand-in's control.
+
+/// Timings of a call that hands spoken requests to the host: a wait for what was said before a
+/// delegation that the announcement and the data channel both come inside, a proof that stays young
+/// long enough that a loaded machine does not age it, and the watchdog for what is held.
+fn delegating_timings() -> Timings {
+    Timings {
+        tick: Duration::from_millis(100),
+        delegation_wait: Duration::from_millis(500),
+        proof_age: Duration::from_secs(10),
+        drain_within: WATCHDOG,
+        host_within: WATCHDOG,
+        ..Timings::default()
+    }
+}
+
+/// The provider's data channel, the voice service's announcements and the recorder's drop, played
+/// through the scripted platform and the stand-in. The device run plays them through the peer.
+struct Scripted<'a> {
+    platform: Arc<ScriptedCalls>,
+    stand_in: &'a StandIn,
+    drops: std::sync::atomic::AtomicU64,
+    /// Whether native code's record shows a gap from the moment the leg starts.
+    gap_from_the_start: bool,
+}
+
+impl Driver for Scripted<'_> {
+    fn provider<'a>(&'a self, bytes: &'a [u8]) -> DriverFuture<'a, ()> {
+        Box::pin(async move {
+            self.platform.tell_provider_bytes(bytes.to_vec());
+            Ok(())
+        })
+    }
+
+    fn announce<'a>(&'a self, id: &'a str, offset_ms: u64) -> DriverFuture<'a, ()> {
+        Box::pin(async move {
+            self.stand_in.control().announce(id, offset_ms);
+            Ok(())
+        })
+    }
+
+    fn drop_recorder(&self, _milliseconds: u64) -> DriverFuture<'_, ()> {
+        Box::pin(async move {
+            self.platform.show_a_gap_in_progress();
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+
+    fn drops_made(&self) -> DriverFuture<'_, u64> {
+        Box::pin(async move { Ok(self.drops.load(Ordering::SeqCst)) })
+    }
+
+    fn after_a_mute(&self, muted: bool) -> DriverFuture<'_, ()> {
+        Box::pin(async move {
+            // Native code tells the news of a mute, and the recorder's progress starts afresh once
+            // the microphone is back, as a device's does.
+            let state = if muted {
+                companion_platform::call::CaptureState::MutedByPerson
+            } else {
+                companion_platform::call::CaptureState::Capturing
+            };
+            self.platform.tell(CallEvent::Capture { state });
+            if !muted {
+                self.platform.show_progress_age(Some(10));
+            }
+            Ok(())
+        })
+    }
+
+    fn events_open(&self) -> DriverFuture<'_, bool> {
+        Box::pin(async move {
+            // Asked once the call runs: native code's record then shows the recorder delivering, as
+            // a device's does, and a gap from the start where the case wants one.
+            self.platform.show_progress_age(Some(10));
+            if self.gap_from_the_start {
+                self.platform.show_a_gap_in_progress();
+            }
+            Ok(true)
+        })
+    }
+}
+
+/// What `scene.platform` shows before the leg starts.
+#[derive(Clone, Copy, Default)]
+struct Before {
+    /// The answer turns discontinuous transmission on.
+    dtx: bool,
+    /// Native code's record shows a gap from the start, which makes the gate refuse every set.
+    gap: bool,
+}
+
+/// Plays one leg of the connected run on a call over one real session, and gives the scene and the
+/// checks.
+async fn play(leg: Leg, before: Before) -> (Scene, Vec<companion_tauri::probe::Check>) {
+    let scene = scene_over(1, delegating_timings()).await;
+    if before.dtx {
+        scene.platform.answer_with_dtx(true);
+    }
+    let (text, invitation) = scene.invitation().await;
+    let mut report = scene.reporting();
+    let mut run = scene.harness_for(&text, Mode::Delegating);
+    run.leg = leg;
+    let checks = {
+        let driver = Scripted {
+            platform: Arc::clone(&scene.platform),
+            stand_in: &scene.stand_in,
+            drops: std::sync::atomic::AtomicU64::new(0),
+            gap_from_the_start: before.gap,
+        };
+        let (checks, ()) = tokio::join!(
+            call_check_with(
+                scene.companion.app.handle(),
+                &*scene.platform,
+                &run,
+                Ok(&driver),
+                &mut report,
+            ),
+            scene.approve(invitation),
+        );
+        checks
+    };
+    (scene, checks)
+}
+
+/// Stops the host and the workers it ran over.
+async fn stop(scene: Scene) {
+    let Scene { host, workers, .. } = scene;
+    host.stop().await;
+    for worker in workers {
+        worker.stop().await;
+    }
+}
+
+/// The attach words the model was told: the instructions the control carried that name no
+/// delegation.
+fn attach_words(scene: &Scene) -> Vec<String> {
+    scene
+        .stand_in
+        .control()
+        .report()
+        .sent
+        .iter()
+        .filter(|sent| sent.command == "instructions" && sent.delegation.is_none())
+        .filter_map(|sent| sent.content.clone())
+        .collect()
+}
+
+/// What the model was told of the delegation `id`.
+fn told_of(scene: &Scene, id: &str) -> Vec<String> {
+    scene
+        .stand_in
+        .control()
+        .report()
+        .sent
+        .iter()
+        .filter(|sent| sent.delegation.as_deref() == Some(id))
+        .filter_map(|sent| sent.content.clone())
+        .collect()
+}
+
+/// How many `voice.delegate` the phone sent the host.
+fn at_the_host(scene: &Scene) -> usize {
+    scene.link.sent(kr_protocol::method::Method::VoiceDelegate)
+}
+
+/// What every leg shows: every check it made passed, and the host was sent `at_the_host` requests.
+fn assert_leg(scene: &Scene, checks: &[companion_tauri::probe::Check], at_the_host_is: usize) {
+    assert!(
+        failed(checks).is_empty(),
+        "{:#?}\nall the checks: {:#?}\nwhat the control refused: {:?}\nwhat it carried: {:?}",
+        failed(checks),
+        checks
+            .iter()
+            .map(companion_tauri::probe::Check::line)
+            .collect::<Vec<_>>(),
+        scene.stand_in.control().report().refusals,
+        scene
+            .stand_in
+            .control()
+            .report()
+            .sent
+            .iter()
+            .map(|sent| format!(
+                "{} {:?} {}",
+                sent.command,
+                sent.delegation,
+                sent.content
+                    .as_deref()
+                    .unwrap_or("")
+                    .chars()
+                    .take(30)
+                    .collect::<String>()
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        at_the_host(scene),
+        at_the_host_is,
+        "the host was sent that many requests: {:#?}",
+        checks.iter().map(|check| check.line()).collect::<Vec<_>>()
+    );
+}
+
+/// The shipped configuration: a delegation the service announces is answered that nothing was done,
+/// what the data channel says changes nothing, and the host is sent nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_production_leg_answers_nothing_was_done_and_reaches_no_host() {
+    let (scene, checks) = play(Leg::Production, Before::default()).await;
+
+    assert_leg(&scene, &checks, 0);
+    let attach = attach_words(&scene);
+    assert!(
+        attach.iter().any(|words| words.contains("cannot act")),
+        "{attach:?}"
+    );
+    assert!(!attach.iter().any(|words| words.contains("can ask")));
+    stop(scene).await;
+}
+
+/// No break and not the first utterance: the host is sent one request and performs it, and the
+/// model is told the attach words for the constant on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_positive_leg_hands_a_status_to_the_host_and_tells_the_model_what_it_reports() {
+    let (scene, checks) = play(Leg::Positive, Before::default()).await;
+
+    assert_leg(&scene, &checks, 1);
+    let attach = attach_words(&scene);
+    assert!(
+        attach.iter().any(|words| words.contains("can ask")),
+        "{attach:?}"
+    );
+    assert!(!attach.iter().any(|words| words.contains("cannot act")));
+    assert!(
+        told_of(&scene, "d-1")
+            .iter()
+            .any(|words| words.starts_with("The person's computer read it.")),
+        "{:?}",
+        told_of(&scene, "d-1")
+    );
+    stop(scene).await;
+}
+
+/// A call whose record of capture shows a gap from the start is one the gate refuses for good, so the
+/// first sentence is refused for the gap and not as the first of the call, and the positive leg
+/// fails on it: a leg that cannot fail would show nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_whose_capture_shows_a_gap_fails_the_positive_leg() {
+    let (scene, checks) = play(
+        Leg::Positive,
+        Before {
+            gap: true,
+            ..Before::default()
+        },
+    )
+    .await;
+
+    assert_eq!(
+        measured_failures(&checks),
+        ["the first utterance is refused"],
+        "{:#?}",
+        failed(&checks)
+    );
+    assert_eq!(at_the_host(&scene), 0);
+    stop(scene).await;
+}
+
+/// The command is the first thing said in the call: refused, with nothing at the host; the same
+/// command said after it is performed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_utterance_leg_refuses_the_first_command_and_performs_the_second() {
+    let (scene, checks) = play(Leg::FirstUtterance, Before::default()).await;
+
+    assert_leg(&scene, &checks, 1);
+    stop(scene).await;
+}
+
+/// A mute and an unmute between two parts of a command refuse it, and every later command, after a
+/// read that was performed: the host is sent the one request of the control and no other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_mute_leg_refuses_the_command_and_every_later_one() {
+    let (scene, checks) = play(Leg::Mute, Before::default()).await;
+
+    assert_leg(&scene, &checks, 1);
+    stop(scene).await;
+}
+
+/// A gap in what the recorder hands the call refuses the next command, which native code tells no
+/// news of: its record shows it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_gap_leg_refuses_the_command_after_a_drop_in_the_recorder() {
+    let (scene, checks) = play(Leg::Gap, Before::default()).await;
+
+    assert_leg(&scene, &checks, 1);
+    stop(scene).await;
+}
+
+/// An answer that turns discontinuous transmission on refuses every command of the call, and the
+/// host is sent nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_dtx_leg_refuses_the_command_of_a_call_that_may_hold_back_quiet_speech() {
+    let (scene, checks) = play(
+        Leg::Dtx,
+        Before {
+            dtx: true,
+            ..Before::default()
+        },
+    )
+    .await;
+
+    assert_leg(&scene, &checks, 0);
+    stop(scene).await;
+}
+
+/// A message on the data channel that is not an event refuses the next command, after a read that
+/// was performed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_malformed_leg_refuses_the_command_after_a_message_that_is_not_an_event() {
+    let (scene, checks) = play(Leg::Malformed, Before::default()).await;
+
+    assert_leg(&scene, &checks, 1);
+    stop(scene).await;
+}
+
+/// A fragment that belongs to a request and arrives after the request was read taints the call: the
+/// read that was performed stands, the call is told, and the next command is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_late_fragment_leg_keeps_the_earlier_read_and_refuses_the_next_command() {
+    let (scene, checks) = play(Leg::LateFragment, Before::default()).await;
+
+    assert_leg(&scene, &checks, 1);
+    stop(scene).await;
+}
+
+/// A delegation the voice service does not announce at the provider's offset is refused and does not
+/// taint the call: the commands before and after it are performed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_broker_leg_refuses_the_delegation_the_service_does_not_vouch_for() {
+    let (scene, checks) = play(Leg::BrokerDisagrees, Before::default()).await;
+
+    assert_leg(&scene, &checks, 2);
+    stop(scene).await;
 }

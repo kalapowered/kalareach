@@ -660,6 +660,31 @@ async fn serve(mut stream: TcpStream, route: &ControlRoute, state: &Arc<Mutex<St
         .unwrap_or("")
         .to_owned();
     let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+    // A device run's cue: the application plays the provider's data channel, and tells the service,
+    // with the token its control accepts, which delegation to announce on the control socket. It is
+    // not a request the service records, and nothing but that token reaches it.
+    if path == "/harness/announce" {
+        let mine = authorization
+            .as_deref()
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|token| {
+                state
+                    .lock()
+                    .expect("the stand-in's state")
+                    .tokens
+                    .iter()
+                    .any(|(each, kind)| each == token && *kind == Disposition::Mine)
+            });
+        let answer = match (mine, parsed["id"].as_str(), parsed["offsetMs"].as_u64()) {
+            (true, Some(id), Some(offset_ms)) => {
+                route.announce(id, offset_ms);
+                response(200, b"{}")
+            }
+            _ => response(400, b"{}"),
+        };
+        let _ = stream.write_all(&answer).await;
+        return;
+    }
     let fault: Option<CloseFault>;
     let (allowed, answering) = {
         let mut state = state.lock().expect("the stand-in's state");

@@ -25,6 +25,12 @@
 //! which shares the machine's network, and `10.0.2.2` for an emulator. `KR_HARNESS_SECONDS`
 //! bounds the whole run. It is for the machines a simulator or an emulator runs on, which are Unix.
 //!
+//! A run of spoken requests (`KR_HARNESS_SESSIONS`, how many real sessions the host holds, which
+//! `ready.json` names) has the host adopt that many sessions, so that a status can be read, and
+//! `KR_HARNESS_LEG` names the leg: `dtx` has the peer answer the call's offer with an answer that
+//! turns discontinuous transmission on. The report then also holds what the voice service's control
+//! was told to carry to the model, and what the host's session workers were sent, in order.
+//!
 //! A run that names the phone's audio peer (`KR_HARNESS_AUDIO_PORT`, the loopback port on this
 //! machine that reaches it, and `KR_HARNESS_AUDIO_TOKEN`) has the voice service ask the peer for
 //! each call's answer, so that the call connects and carries audio, and has this suite read what
@@ -297,6 +303,18 @@ async fn a_phone_is_paired_and_runs_a_call_against_a_real_host() {
     let end = Instant::now() + Duration::from_secs(seconds);
     let left = || end.saturating_duration_since(Instant::now());
 
+    let sessions: u64 = std::env::var("KR_HARNESS_SESSIONS")
+        .ok()
+        .and_then(|sessions| sessions.parse().ok())
+        .unwrap_or(0);
+    // The answer path the peer is asked for: the leg that has the answer turn discontinuous
+    // transmission on asks for it.
+    let answer_path = if std::env::var("KR_HARNESS_LEG").as_deref() == Ok("dtx") {
+        "/answer?dtx=1"
+    } else {
+        "/answer"
+    };
+
     let began = Instant::now();
     let window = record::Window::open_without_speed();
     let stand_in = StandIn::start().await;
@@ -315,7 +333,7 @@ async fn a_phone_is_paired_and_runs_a_call_against_a_real_host() {
                             .push(("offer relayed".to_owned(), began.elapsed().as_secs()));
                     }
                     match peer
-                        .ask("POST", "/answer", &offer, Duration::from_secs(45))
+                        .ask("POST", answer_path, &offer, Duration::from_secs(45))
                         .await
                     {
                         Ok((200, answer)) => {
@@ -346,8 +364,18 @@ async fn a_phone_is_paired_and_runs_a_call_against_a_real_host() {
         }),
     }
     stand_in.accept_control_token(TOKEN);
-    let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start_with_document(&owner, &document_naming(stand_in.origin())).await;
+    let (host, owner, workers) = if sessions == 0 {
+        let owner = DeviceKeys::generate().expect("owner keys");
+        let host = Host::start_with_document(&owner, &document_naming(stand_in.origin())).await;
+        (host, owner, Vec::new())
+    } else {
+        let adopted = net_support::worker::Adopted::start_with_document(
+            sessions,
+            &document_naming(stand_in.origin()),
+        )
+        .await;
+        (adopted.host, adopted.owner, adopted.workers)
+    };
     host.controller()
         .host_account()
         .keep_for_test(stand_in.host_grant())
@@ -355,7 +383,15 @@ async fn a_phone_is_paired_and_runs_a_call_against_a_real_host() {
 
     write_private(
         &directory.join("ready.json"),
-        &serde_json::json!({ "origin": stand_in.origin(), "token": TOKEN }).to_string(),
+        &serde_json::json!({
+            "origin": stand_in.origin(),
+            "token": TOKEN,
+            "session_ids": workers
+                .iter()
+                .map(|worker| worker.session_id.to_string())
+                .collect::<Vec<_>>(),
+        })
+        .to_string(),
     );
     assert!(
         appears(&directory.join("go"), INVITATION_WAIT.min(left())).await,
@@ -365,11 +401,17 @@ async fn a_phone_is_paired_and_runs_a_call_against_a_real_host() {
     // The invitation lives for minutes, so it is issued only now, with the phone installed.
     let mut client = host.client().await;
     let signer = Signer::OwnerDevice(&owner);
+    // Paired with the history of a session from its start where the run reads one: what a call is
+    // told of a session is decided against the history the pairing reaches, and none reaches nothing.
+    let mut proposed = proposal(&[ActionRight::SessionView, ActionRight::AgentPrompt]);
+    if sessions > 0 {
+        proposed.history.lower_bound_ms = Nullable::some(kr_protocol::scalars::TimestampMs::new(0));
+    }
     let invited = calls::invite_direct(
         host.environment_id,
         &mut client,
         InviteGrantKind::SessionInvitation,
-        &proposal(&[ActionRight::SessionView, ActionRight::AgentPrompt]),
+        &proposed,
         &signer,
     )
     .await
@@ -463,6 +505,28 @@ async fn a_phone_is_paired_and_runs_a_call_against_a_real_host() {
             .filter_map(|frame| frame["command"].as_str().map(str::to_owned))
             .collect::<Vec<_>>(),
         "token": TOKEN,
+        // What the control carried on to the model, whatever it was about: the attach words and the
+        // sentence each delegation was answered with, by the delegation's identifier.
+        "control_sent": control
+            .sent
+            .iter()
+            .map(|sent| serde_json::json!({
+                "id": sent.id,
+                "command": sent.command,
+                "delegation": sent.delegation,
+                "content": sent.content,
+            }))
+            .collect::<Vec<_>>(),
+        // What the host's session workers were sent, in order, by method.
+        "worker_received": workers
+            .iter()
+            .map(|worker| worker
+                .service
+                .received()
+                .iter()
+                .map(|(method, _)| method.as_str().to_owned())
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
         "went_down": went_down,
         // When each request reached the voice service, for reading a run's delays against the
         // phone's own log.
@@ -484,6 +548,9 @@ async fn a_phone_is_paired_and_runs_a_call_against_a_real_host() {
     });
     write_private(&directory.join("report.json"), &report.to_string());
     host.stop().await;
+    for worker in workers {
+        worker.stop().await;
+    }
 }
 
 #[cfg(test)]

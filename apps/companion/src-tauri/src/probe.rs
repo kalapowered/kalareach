@@ -69,6 +69,7 @@ impl Check {
 }
 
 mod answer;
+pub mod delegating;
 pub mod harness;
 #[cfg(mobile)]
 pub mod notifications;

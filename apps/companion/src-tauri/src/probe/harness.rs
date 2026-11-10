@@ -8,7 +8,7 @@
 //! makes the offer, the daemon creates the call at the stand-in, native code applies the answer
 //! and is permitted, and the control attaches.
 //!
-//! A run is in one of two modes. By default the answer leads nowhere, so the connection fails,
+//! A run is in one of three modes. By default the answer leads nowhere, so the connection fails,
 //! native code ends the call, and the checks read the end: the device stopped the media, the
 //! daemon revoked the grant and the stand-in was told the call was over. In the outage mode the
 //! answer is a peer's in this same application, so the call connects and carries audio: the checks
@@ -17,6 +17,9 @@
 //! silence and a stop that does not wait for the service) and read the end, in which the service's
 //! closure is reported as not confirmed. A direction whose audio the machine cannot measure, as a
 //! simulator with no microphone cannot for the send direction, is reported as not measured.
+//!
+//! In the delegating mode the call hands spoken requests to a real host, and the probe plays the
+//! person and the provider through the peer and the stand-in ([`delegating`]): one call is one leg.
 //!
 //! The request holds an invitation's secret and an account token for a stand-in, both thrown away
 //! with the run, and is read once and removed.
@@ -38,6 +41,7 @@ use serde_json::{Value, json};
 use tauri::{AppHandle, Manager as _, Runtime};
 use tokio::sync::watch;
 
+use super::delegating::{self, Driver, Leg, PeerDriver};
 use super::{Check, Checks};
 use crate::account::carrier::{Boxed, Carrier, Ending, Plan, Unavailable};
 use crate::account::{Account, AccountSlot};
@@ -98,6 +102,9 @@ pub enum Mode {
     NativeFailure,
     /// The answer is a peer's: the call carries audio and then the voice service goes away.
     Outage,
+    /// The answer is a peer's, the call hands spoken requests to the host, and the probe plays one
+    /// leg of what the gate does with them.
+    Delegating,
 }
 
 /// What a harness run is given: where the stand-in voice service is, the token its control accepts
@@ -117,6 +124,13 @@ pub struct Harness {
     /// How many seconds a connected call is given to show its audio, in the outage mode.
     #[serde(default = "media_seconds")]
     pub media_seconds: u64,
+    /// Which leg the delegating mode plays.
+    #[serde(default)]
+    pub leg: Leg,
+    /// The sessions the host holds for the run, which the delegating mode's call is allowed to
+    /// reach. Empty where the run reads no session.
+    #[serde(default)]
+    pub session_ids: Vec<String>,
 }
 
 const fn media_seconds() -> u64 {
@@ -256,7 +270,7 @@ fn now_ms() -> u128 {
 }
 
 /// Looks until `look` finds something or `within` passes.
-async fn until<T, Fut: Future<Output = Option<T>>>(
+pub(super) async fn until<T, Fut: Future<Output = Option<T>>>(
     within: Duration,
     mut look: impl FnMut() -> Fut,
 ) -> Option<T> {
@@ -273,7 +287,7 @@ async fn until<T, Fut: Future<Output = Option<T>>>(
 }
 
 /// The state of the call this device holds, as the page reads it.
-async fn call_state<R: Runtime>(app: &AppHandle<R>) -> Value {
+pub(super) async fn call_state<R: Runtime>(app: &AppHandle<R>) -> Value {
     match commands::voice_call_state(app.state(), app.state(), app.state()).await {
         Ok(state) => serde_json::to_value(state).unwrap_or(Value::Null),
         Err(_) => Value::Null,
@@ -359,8 +373,15 @@ pub(super) async fn connect<R: Runtime>(app: &AppHandle<R>, checks: &mut Checks<
 
 /// Allows voice for a session, reads what a call would be and starts one, the way the page does.
 /// The call's voice session is returned when the host made it.
-async fn start<R: Runtime>(app: &AppHandle<R>, checks: &mut Checks<'_>) -> Option<String> {
-    let session = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()).to_string();
+async fn start<R: Runtime>(
+    app: &AppHandle<R>,
+    session_ids: &[String],
+    checks: &mut Checks<'_>,
+) -> Option<String> {
+    let session = session_ids
+        .first()
+        .cloned()
+        .unwrap_or_else(|| kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()).to_string());
     let allowed = commands::voice_allow(
         app.state(),
         Subject::default(),
@@ -931,14 +952,60 @@ pub async fn call_check<R: Runtime>(
     harness: &Harness,
     report: &mut (dyn FnMut(&Check) + Send),
 ) -> Vec<Check> {
+    let driver = match harness.mode {
+        Mode::Delegating => app
+            .path()
+            .app_data_dir()
+            .map_err(|error| error.to_string())
+            .and_then(|data| PeerDriver::from_files(&data, harness)),
+        Mode::NativeFailure | Mode::Outage => Err("this mode plays no leg".to_owned()),
+    };
+    call_check_with(
+        app,
+        platform,
+        harness,
+        driver
+            .as_ref()
+            .map(|driver| driver as &dyn Driver)
+            .map_err(String::as_str),
+        report,
+    )
+    .await
+}
+
+/// As [`call_check`], with the driver a delegating run plays its leg through, or why there is none.
+pub async fn call_check_with<R: Runtime>(
+    app: &AppHandle<R>,
+    platform: &dyn CallPlatform,
+    harness: &Harness,
+    driver: Result<&dyn Driver, &str>,
+    report: &mut (dyn FnMut(&Check) + Send),
+) -> Vec<Check> {
     let (invitation, mode) = (harness.invitation.as_str(), harness.mode);
     let mut checks = Checks {
         all: Vec::new(),
         report,
     };
+    if mode == Mode::Delegating {
+        // The shipped configuration answers every delegation that nothing was done; every other leg
+        // is the gate's, which only a debug build can switch on, for the calls made from now on.
+        let session = delegating::session_of(harness);
+        checks.push(Check::found(
+            "the host named a session to read",
+            session.is_ok(),
+            session.as_ref().err().copied().unwrap_or_default(),
+        ));
+        if session.is_err() {
+            return checks.all;
+        }
+        if harness.leg != Leg::Production {
+            app.state::<crate::voice::Calls>()
+                .accept_host_delegations(true);
+        }
+    }
     if pair(app, invitation, &mut checks).await
         && connect(app, &mut checks).await
-        && let Some(voice_session_id) = start(app, &mut checks).await
+        && let Some(voice_session_id) = start(app, &harness.session_ids, &mut checks).await
     {
         match mode {
             Mode::NativeFailure => end(app, platform, &voice_session_id, &mut checks).await,
@@ -946,7 +1013,139 @@ pub async fn call_check<R: Runtime>(
                 let media = Duration::from_secs(harness.media_seconds);
                 outage(app, platform, &voice_session_id, media, &mut checks).await;
             }
+            Mode::Delegating => {
+                delegating_call(
+                    app,
+                    platform,
+                    &voice_session_id,
+                    harness.leg,
+                    driver,
+                    &mut checks,
+                )
+                .await;
+            }
         }
     }
     checks.all
+}
+
+/// Runs a call that hands spoken requests to the host: it is read running, one leg is played, and
+/// the person ends it, with the voice service up, and the end is read.
+async fn delegating_call<R: Runtime>(
+    app: &AppHandle<R>,
+    platform: &dyn CallPlatform,
+    voice_session_id: &str,
+    leg: Leg,
+    driver: Result<&dyn Driver, &str>,
+    checks: &mut Checks<'_>,
+) {
+    let trace = Trace::new();
+    let looked = &trace;
+    let running = until(RUN_WITHIN, || async move {
+        let state = call_state(app).await;
+        looked.see(&state);
+        (state["running"] == true && state["control"] == "connected").then_some(state)
+    })
+    .await;
+    let runs = running
+        .as_ref()
+        .is_some_and(|state| state["session"]["voice_session_id"] == voice_session_id);
+    checks.push(Check::found(
+        "the call runs with its control attached",
+        runs,
+        trace.text(),
+    ));
+    if !runs {
+        return;
+    }
+    match platform.held().await {
+        Ok(held) => checks.push(Check::found(
+            "native code holds the call",
+            held.call.is_some(),
+            format!(
+                "capture {:?}, muted {}",
+                held.capture, held.microphone_muted
+            ),
+        )),
+        Err(failure) => checks.push(Check::found(
+            "native code holds the call",
+            false,
+            failure.message,
+        )),
+    }
+    match driver {
+        Ok(driver) => delegating::run(app, platform, driver, leg, checks).await,
+        Err(why) => checks.push(Check::found("the peer's files are read", false, why)),
+    }
+
+    // The person ends the call with the voice service up, as in a call that ran its course.
+    let stopped = commands::voice_stop(app.clone(), app.state(), None).await;
+    checks.push(Check::found(
+        "the person ends the call",
+        stopped.is_ok(),
+        stopped
+            .as_ref()
+            .err()
+            .map_or_else(String::new, |error| format!("{error:?}")),
+    ));
+    let ended = until(END_WITHIN, || async {
+        let state = call_state(app).await;
+        (state["running"] == false && state["ended"].is_object()).then_some(state)
+    })
+    .await;
+    let Some(ended) = ended else {
+        checks.push(Check::found(
+            "the media stopped on this device",
+            false,
+            "the call never showed its end",
+        ));
+        return;
+    };
+    checks.push(Check::found(
+        "the media stopped on this device",
+        ended["ended"]["closed_locally"] == true,
+        format!("closed_locally {}", ended["ended"]["closed_locally"]),
+    ));
+    checks.push(Check::found(
+        "the host revoked the grant",
+        ended["ended"]["host"]["kind"] == "revoked",
+        format!("host {}", ended["ended"]["host"]["kind"]),
+    ));
+    let finalised = until(FINALISED_WITHIN, || async {
+        let state = call_state(app).await;
+        let broker = state["ended"]["broker"]
+            .as_str()
+            .unwrap_or("pending")
+            .to_owned();
+        (broker != "pending").then_some(broker)
+    })
+    .await;
+    checks.push(Check::found(
+        "the voice service was told the call is over",
+        finalised
+            .as_deref()
+            .is_some_and(|broker| broker.starts_with("closed")),
+        format!(
+            "service {}",
+            finalised.as_deref().unwrap_or("still pending")
+        ),
+    ));
+    let words = ended["ended"]["words"].as_str().unwrap_or_default();
+    checks.push(Check::found(
+        "the end names no request that may have been carried out",
+        !words.contains("may or may not"),
+        words,
+    ));
+    match platform.held().await {
+        Ok(held) => checks.push(Check::found(
+            "nothing held after the end",
+            held.call.is_none(),
+            format!("{held:?}"),
+        )),
+        Err(failure) => checks.push(Check::found(
+            "nothing held after the end",
+            false,
+            failure.message,
+        )),
+    }
 }
