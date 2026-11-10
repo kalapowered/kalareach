@@ -429,6 +429,10 @@ async fn a_receipt_another_copy_kept_before_a_delegations_claim_goes_back_only_t
                 .into_answer()
                 .expect_err("a device that is no longer paired is given nothing");
             assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+            assert!(
+                refused.to_string().contains("no longer paired"),
+                "the refusal is the pairing's: {refused}"
+            );
         } else {
             assert!(late.is_copied(), "the late copy read the other's receipt");
             assert_eq!(

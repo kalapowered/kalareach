@@ -1271,7 +1271,7 @@ async fn a_stop_that_meets_the_other_copys_record_where_it_claims(
 /// authority it arrived under, asked with the record in hand. The control: with nothing owed the
 /// late copy is given the answer the other recorded, as one read from the record. While this host
 /// owes a fence it could not raise, or once the registration the late copy arrived on is gone, the
-/// record is not given back, and the stop is not performed again.
+/// record is not given back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stop_recorded_by_another_copy_before_its_claim_is_given_back_only_under_its_authority() {
     // The control.
