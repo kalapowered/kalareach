@@ -382,9 +382,9 @@ async fn a_delegations_receipt_goes_back_only_to_a_device_that_is_still_paired()
 /// The control: with the device paired, the late copy is given the receipt as one read from the
 /// record.
 ///
-/// Not shown here: a read of the session the delegation named (the receipt kept here is an admitted
-/// one, which is given back as kept and reads no session), and the voice grant's expiry or
-/// narrowing.
+/// Not shown here: a device whose grant has run out, which the pairing check refuses as it refuses
+/// a revoked one, and the new read of a session that the receipt of a performed read is given back
+/// through (the receipt kept here is an admitted one, which is given back as kept).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_receipt_another_copy_kept_before_a_delegations_claim_goes_back_only_to_a_paired_device()
 {

@@ -1272,9 +1272,9 @@ async fn a_stop_that_meets_the_other_copys_record_where_it_claims(
 /// other recorded, as one read from the record. While this host owes a fence it could not raise, or
 /// once the registration the late copy arrived on is gone, the record is not given back.
 ///
-/// Not shown here: whether that authority is asked before or after the claim reads the record. The
-/// fence is raised and the registration removed while the late copy is held before its claim, so
-/// either order gives these answers.
+/// Not shown here: whether that authority is asked before or after the claim reads the record. A
+/// fence becomes owed and the registration is removed while the late copy is held before its claim,
+/// so either order gives these answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stop_recorded_by_another_copy_before_its_claim_is_given_back_only_under_its_authority() {
     // The control.
