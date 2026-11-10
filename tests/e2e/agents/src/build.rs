@@ -930,16 +930,29 @@ pub struct Account {
     pub steers: bool,
     /// The dialog the agent raises before it runs a shell command.
     pub approval: Approval,
-    /// The arguments that resume a saved conversation, with `{conversation}` for its identifier.
+    /// The arguments that resume a saved conversation as the agent's ordinary resume command does,
+    /// with `{conversation}` for its identifier. The second-process part starts a second process
+    /// with them on a conversation another process holds, and records whether the agent refuses,
+    /// continues the conversation or starts one of its own from it.
     pub resume: Vec<String>,
-    /// Whether those arguments start a new conversation from the saved one rather than continue
-    /// it, because the agent lets no second process write a conversation another writes: then two
-    /// processes on one conversation's identifier are not what the part shows, and it says so.
+    /// Texts the agent shows when it refuses to resume a conversation another process holds: its
+    /// start then reaches no composer. A start that reaches none and shows none of these is not
+    /// taken for a refusal, unless the shell's prompt is back below the typed command.
     #[serde(default)]
-    pub resume_forks: bool,
+    pub resume_refused: Vec<String>,
+    /// The arguments that start a conversation of its own from a saved one, with `{conversation}`
+    /// for the saved one's identifier, where the agent has such a command: the part of its own
+    /// that shows two executions from one saved history. Empty where it has none.
+    #[serde(default)]
+    pub fork: Vec<String>,
     /// How an image is given at the composer: `paste`, its absolute path as a terminal pastes it,
     /// or a template with `{path}`.
     pub image: String,
+    /// What marks the line of a conversation file that records an image given to the agent, whose
+    /// bytes it holds as base64 text after `base64,`: the part reads the image the agent received
+    /// from it. Without one, what the agent received is not read from its record.
+    #[serde(default)]
+    pub image_line: Option<String>,
 }
 
 /// One press of the interrupt key, unless the build list says more.

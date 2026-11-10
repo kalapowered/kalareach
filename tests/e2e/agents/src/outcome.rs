@@ -27,9 +27,12 @@ pub const FAILURE_CODES: &str = "failure_codes";
 pub enum Failure {
     /// A paired device's `upload.begin` was refused with this code of the protocol.
     UploadRefused(String),
-    /// A paired device's `upload.begin` was accepted, and the image given was not the one it
+    /// A paired device's transfer was accepted, and the image given was not the one it
     /// transferred.
     UploadTransferredAnotherImage,
+    /// The image was transferred by the host's own owner on this machine and not by a paired
+    /// device, so the part did not show the device's own transfer.
+    UploadNotByADevice,
     /// The host did not detect a manual launch as section 12 requires, for `cause` (one of
     /// [`crate::detect::Undetected::CAUSES`]) with `announced` live instances announced. `session`
     /// names the launch where a part has two.
@@ -41,8 +44,8 @@ pub enum Failure {
         /// How many live instances the host announced.
         announced: usize,
     },
-    /// The agent forks a saved conversation for a second process, so two executions on one
-    /// conversation's identifier were not shown.
+    /// The agent's ordinary resume command started a conversation of its own from the saved one
+    /// for the second process, so two executions on one conversation's identifier were not shown.
     ResumeForks,
     /// The reply reached the device before the agent recorded the prompt, or whether it had could
     /// not be told, so no moment between them was shown.
@@ -75,6 +78,7 @@ impl Failure {
             Self::UploadTransferredAnotherImage => {
                 json!({ "code": "upload_transferred_another_image" })
             }
+            Self::UploadNotByADevice => json!({ "code": "upload_not_by_a_device" }),
             Self::LaunchNotDetected {
                 session,
                 cause,

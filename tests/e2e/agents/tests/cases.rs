@@ -42,7 +42,7 @@ use kr_e2e_agents::keys;
 use kr_e2e_agents::mirror::{self, Mirroring};
 use kr_e2e_agents::network::{Policy, Proxy};
 use kr_e2e_agents::observe::{
-    AGENT_READS, Answer, TYPED_PROMPT, answer, capability_states, invoke, live_bindings, target_of,
+    AGENT_READS, Answer, TYPED_PROMPT, capability_states, invoke, live_bindings, target_of,
     typed_actions,
 };
 use kr_e2e_agents::outcome::{Failure, Outcome};
@@ -51,12 +51,13 @@ use kr_e2e_agents::provenance::{
     beneath_parent, exported_clear,
 };
 use kr_e2e_agents::stage::{
-    AgentProcess, Context, Installation, Installed, Keyboard, Owner, PROMPT, Replacement, Session,
-    closed_port, default_keychain_of_a_session, events_snapshot, free_port, inode_of, install,
-    kill_daemon, launch, mapped_files, names_a_session_exports, open_session, place_forwarder,
-    prepare_home, runtime, session_variables, text_image,
+    AgentProcess, Context, Installation, Installed, Keyboard, Owner, PROMPT, Refused, Replacement,
+    Session, closed_port, default_keychain_of_a_session, events_snapshot, free_port, inode_of,
+    install, kill_daemon, launch, launch_or_refusal, mapped_files, names_a_session_exports,
+    open_session, place_forwarder, prepare_home, runtime, session_variables, text_image,
 };
 use kr_e2e_agents::stub::RequestStub;
+use kr_e2e_agents::transfer::{self, Caller, Transfer};
 use kr_e2e_agents::{BUILD_VARIABLE, REQUIRE_VARIABLE, RESULT_VARIABLE};
 use kr_e2e_m1b::LIVENESS;
 use kr_e2e_m1b::ceremony;
@@ -70,7 +71,7 @@ use kr_ipc::identity::{ProcessState, process_state};
 use kr_protocol::agent::AgentSubject;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::identity::ProcessStartIdentity;
-use kr_protocol::ids::{InputLeaseEpoch, InputSequence};
+use kr_protocol::ids::{BuildId, InputLeaseEpoch, InputSequence};
 use kr_protocol::input::{InputContent, InputWriteParams};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Bytes;
@@ -3369,6 +3370,26 @@ fn start_agent_as(
     extra: &[String],
     ready: &str,
 ) -> Agent {
+    start_agent_or_refusal(stage, variables, what, extra, ready, None).unwrap_or_else(
+        |refused: Box<(Session, Refused)>| {
+            panic!(
+                "{what}: the agent was refused where it was expected to start: {}",
+                refused.1
+            )
+        },
+    )
+}
+
+/// [`start_agent_as`], where a refusal of the agent to run is an answer (`refusal` is `Some`, with
+/// the texts it shows): the session the agent was started in comes back with what refused it.
+fn start_agent_or_refusal(
+    stage: &Stage<'_, '_>,
+    variables: &[(String, String)],
+    what: &str,
+    extra: &[String],
+    ready: &str,
+    refusal: Option<&[String]>,
+) -> Result<Agent, Box<(Session, Refused)>> {
     let port = free_port();
     let server = stage.build.server.as_ref().map(|server| {
         let session = open_session(
@@ -3448,21 +3469,25 @@ fn start_agent_as(
         }
         line
     };
-    let processes = launch(
+    let processes = match launch_or_refusal(
         stage.run,
         &session,
         (&line, ready, &stage.build.command),
+        refusal,
         stage.provenance,
         &Expected::pinned(stage.build),
         &|| guards_hold(stage),
-    );
+    ) {
+        Ok(processes) => processes,
+        Err(refused) => return Err(Box::new((session, refused))),
+    };
     register_for_guards(stage, &processes);
-    Agent {
+    Ok(Agent {
         session,
         processes,
         server,
         port,
-    }
+    })
 }
 
 /// Gives the watcher of the person's files the processes a launch found, which it ends at a change.
@@ -3829,10 +3854,32 @@ impl Logged {
         extra: &[String],
         ready: Option<&str>,
     ) -> Self {
+        Self::start_with(stage, variables, what, part, extra, ready, None).unwrap_or_else(
+            |refused: Box<(Session, Refused)>| {
+                panic!(
+                    "{what}: the agent was refused where it was expected to start: {}",
+                    refused.1
+                )
+            },
+        )
+    }
+
+    /// [`Logged::start`], where a refusal of the agent to run is an answer (`refusal` is `Some`,
+    /// with the texts it shows): its session comes back with what refused it, to be ended with the
+    /// part's.
+    fn start_with(
+        stage: &Stage<'_, '_>,
+        variables: &[(String, String)],
+        what: &str,
+        part: &'static str,
+        extra: &[String],
+        ready: Option<&str>,
+        refusal: Option<&[String]>,
+    ) -> Result<Self, Box<(Session, Refused)>> {
         login_holds(stage, variables);
         keychain_readable_in_a_session(stage, variables);
-        let mut logged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Self::reach_composer(stage, variables, what, part, extra, ready)
+        let reached = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Self::reach_composer(stage, variables, what, part, extra, ready, refusal)
         }))
         .unwrap_or_else(|panic| {
             // A session that ran something other than the build, whose exported names refuse or
@@ -3857,6 +3904,7 @@ impl Logged {
                 kept_panic_text(&said)
             )
         });
+        let mut logged = reached?;
         // The composer's own screen says so where the agent found no login, before any turn.
         let account = stage.login.expect("a part with a login").account();
         let rows = logged.screen.view.rows();
@@ -3873,10 +3921,10 @@ impl Logged {
         // A launch that resumes a saved conversation runs none of the checks: an earlier launch of
         // the part showed the same sandbox, proxy and files, and a shell line typed now would go
         // into the conversation the part resumes.
-        let resumes = account
-            .resume
-            .first()
-            .is_some_and(|word| extra.first() == Some(word));
+        let resumes = [&account.resume, &account.fork]
+            .into_iter()
+            .filter_map(|words| words.first())
+            .any(|word| extra.first() == Some(word));
         if resumes {
             if stage
                 .login
@@ -3931,7 +3979,7 @@ impl Logged {
             "the part stops once the agent is up and the checks before its first turn have passed, \
              as the build list asks: no turn was started"
         );
-        logged
+        Ok(logged)
     }
 
     /// [`Logged::start`] without its checks.
@@ -3942,7 +3990,8 @@ impl Logged {
         part: &'static str,
         extra: &[String],
         ready: Option<&str>,
-    ) -> Self {
+        refusal: Option<&[String]>,
+    ) -> Result<Self, Box<(Session, Refused)>> {
         let account = stage.login.expect("a part with a login").account();
         let mut arguments = account.arguments.clone();
         arguments.extend(switches_of(stage));
@@ -3950,7 +3999,7 @@ impl Logged {
         let first = ready.unwrap_or(&account.ready).to_owned();
         // The last look before the agent starts.
         guards_hold(stage);
-        let agent = start_agent_as(stage, variables, what, &arguments, &first);
+        let agent = start_agent_or_refusal(stage, variables, what, &arguments, &first, refusal)?;
         let mut screen = watch(stage, &agent.session, &first);
         let mut keyboard = keyboard(stage, &agent.session);
         if ready.is_none() {
@@ -3972,13 +4021,13 @@ impl Logged {
             &account.composer,
             "the composer waits for a prompt",
         );
-        Self {
+        Ok(Self {
             agent,
             screen,
             keyboard,
             part,
             turns: 0,
-        }
+        })
     }
 
     /// Types `text` through the device's keyboard, which holds the lease.
@@ -4889,28 +4938,44 @@ fn conversation_lines(
     found
 }
 
-/// Sends the device's own `upload.begin` for `bytes`, the first step of a transfer, and returns
-/// what the host answered.
-fn device_upload(stage: &Stage<'_, '_>, session: &Session, bytes: &[u8]) -> Answer {
-    let params = kr_protocol::transfer::UploadBeginParams {
-        environment_id: session.remote.environment_id(),
-        session_id: Nullable::some(session.session_id),
-        device_id: Nullable::null(),
-        declared_byte_len: kr_protocol::scalars::U64::new(u64::try_from(bytes.len()).unwrap_or(0)),
-        declared_digest: kr_protocol::scalars::Digest256::from_bytes(kr_cbor::sha256(bytes)),
-        declared_media_type: "image/png".to_owned(),
-        original_file_name: "colour.png".to_owned(),
-    };
-    let sent = stage.runtime.block_on(
-        session
-            .remote
-            .mutate::<_, kr_protocol::transfer::UploadBeginResult>(
-                Method::UploadBegin,
-                kr_e2e_m1b::view::session_target(&session.remote, session.session_id),
-                &params,
-            ),
-    );
-    answer(Method::UploadBegin.as_str().to_owned(), sent)
+/// Transfers `bytes` as `caller` does, with the client library's upload driver: the device begins
+/// the upload, sends the bytes on the route the host serves, and finishes it. Where the chunks
+/// travel is [`transfer::chunk_route`], the one place that changes when the client library has a
+/// route for a paired device.
+fn device_transfer(
+    stage: &Stage<'_, '_>,
+    session: &Session,
+    caller: Caller,
+    bytes: &[u8],
+) -> Transfer {
+    let environment = stage.host.environment();
+    let build = BuildId::new("kr-e2e-agents/transfer").expect("a build identifier");
+    let route = transfer::chunk_route(environment, build.clone()).expect("an addressable route");
+    let target = kr_e2e_m1b::view::session_target(&session.remote, session.session_id);
+    let subject = transfer::image_subject(environment, session.session_id, "colour.png");
+    stage.runtime.block_on(async {
+        match caller {
+            Caller::Device => {
+                transfer::send_image(
+                    session.remote.session(),
+                    &route,
+                    &target,
+                    subject,
+                    bytes.to_vec(),
+                )
+                .await
+            }
+            Caller::LocalOwner => {
+                let local = transfer::local_session(environment, build)
+                    .await
+                    .unwrap_or_else(|why| panic!("the host's own owner connects locally: {why}"));
+                let sent =
+                    transfer::send_image(&local, &route, &target, subject, bytes.to_vec()).await;
+                local.close();
+                sent
+            }
+        }
+    })
 }
 
 /// The account a part with a login records: its kind, where it is kept and whose home the agent
@@ -5995,8 +6060,9 @@ sed '$d' "$out.err.all" >"$out.err"
 /// input, made from a second session on the same host, leave the host's state unchanged: the
 /// agent's session and the forging session announce no instance or resource, no binding holds the
 /// package, the typed actions stay refused, and the agent goes on. The forwarder, Claude Code's
-/// being the one this host serves, answers every forged hook neutrally within its bound, and its
-/// channel declares nothing. The control is a second device with a view-only grant: knowing the
+/// being the one this host serves, answers every forged hook neutrally within its bound, after
+/// one run of it from the forging session that is not timed (the system's first assessment of a
+/// file run under the host), and its channel declares nothing. The control is a second device with a view-only grant: knowing the
 /// session's identifier gives it no input, where the owner device's grant does.
 #[test]
 fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged() {
@@ -6137,6 +6203,36 @@ fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged
             "absent" => Some("could not be reached"),
             _ => Some("closed the connection without admitting this bridge"),
         };
+        // The forwarder's first run beneath the host is not timed. The system assesses a file the
+        // first time a process under the host's daemon runs it, and the run waits for that before
+        // the file starts (about half a second, with no work of the file's own: the run used no
+        // processor time in it); the copy `place_forwarder` started once ran in the test's own
+        // process tree, which that does not reach, so it paid nothing for this session's. One probe of
+        // the kind the timed ones are, run from the forging session, pays it here, and every probe
+        // after it is the forwarder's own answer. Its answer is checked as theirs are.
+        let warm_up_name = "hook-warm-up";
+        let warm_up = probe(
+            stage,
+            &forging,
+            &forgeries,
+            &Probe {
+                name: warm_up_name.to_owned(),
+                registration: None,
+                surface: "hook",
+                input: format!("{}\n", hook_events[0].1),
+                claim: &target,
+            },
+        );
+        assert_eq!(
+            warm_up["exit"], 0,
+            "the forwarder exits 0 for {warm_up_name}: {warm_up}"
+        );
+        assert_eq!(
+            warm_up["stdout"].as_str().map(str::trim),
+            Some("{}"),
+            "the forwarder answers exactly {{}} for {warm_up_name}: {warm_up}"
+        );
+        unchanged(stage, "the forwarder's first run, which is not timed");
         let mut probes = Vec::new();
         for (registration_name, registration) in &registrations {
             let stopped_at = stage_of(registration_name);
@@ -6227,7 +6323,14 @@ fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged
             probes.push(result);
             unchanged(stage, &format!("the forged channel {name}"));
         }
-        steps.push(json!({ "forgery": "registrations and hook input, through Claude Code's forwarder", "probes": probes }));
+        steps.push(json!({
+            "forgery": "registrations and hook input, through Claude Code's forwarder",
+            "warm_up": {
+                "what": "one run of the forwarder from the forging session before the timed ones, whose time is not held to the bound: the system assesses a file the first time a process under the host's daemon runs it",
+                "probe": warm_up,
+            },
+            "probes": probes
+        }));
 
         // The control: a device with a view-only grant knows the session's identifier and is
         // refused input, where the owner device's grant admits it.
@@ -6454,9 +6557,15 @@ fn a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer() {
 /// attachment path the connector declares, the manual terminal path: the device's own transfer
 /// first, then the image's path given at the composer in the agent's own syntax with a question only
 /// the image answers, answered beside the part's code in upper case, which only the model writes;
-/// and the local terminal shows the same execution. A paired device cannot
-/// upload on this host, so the part records failed with that refusal; everything else it checks
-/// still fails it where it does not hold, and is kept as evidence.
+/// and the local terminal shows the same execution.
+///
+/// The transfer is the device's own, driven by the client library's upload driver on the route the
+/// host serves: the device begins the upload, sends the image's bytes, finishes it, and the image
+/// the agent is given is the file the host published for it. The part passes only when the image
+/// the agent received, read from the agent's own record, is the one the device transferred. Where the
+/// host serves a device no such transfer, the part records the refusal of the step by name and
+/// stays failed for that one reason; everything else it checks still fails it where it does not
+/// hold, and is kept as evidence.
 #[test]
 fn a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_shows_the_same_execution() {
     const TEST: &str = "a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_shows_the_same_execution";
@@ -6467,16 +6576,29 @@ fn a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_shows_the
         let shown = detect(stage, &logged.agent.session);
         let detected = check_detected(&launched(stage, &logged.agent), &shown);
         // The device's own transfer, which the manual path starts from.
-        let upload = device_upload(stage, &logged.agent.session, COLOUR_PNG);
+        let caller = transfer::caller_from_environment();
+        let sent = device_transfer(stage, &logged.agent.session, caller, COLOUR_PNG);
+        let sent_digest = transfer::hex_of(&kr_cbor::sha256(COLOUR_PNG));
         // A prompt from the device, answered.
         let (question, sum) = sum_question();
         logged.submit(stage, &question, "a prompt from the device");
         let _ = logged.answered(stage, &sum, "the agent answers the device's prompt");
         let _ = logged.wait_idle(stage, "the agent is back at its composer");
-        // The image, by the agent's own syntax, with a question only the image answers.
+        // The image, by the agent's own syntax, with a question only the image answers: the file the
+        // host published for the device's transfer, where there is one, and else a copy of the
+        // part's own that the part stays failed for not having transferred.
         let mark = stage.mark.to_owned();
-        let file = stage.run.work().join(format!("{mark}.png"));
-        std::fs::write(&file, COLOUR_PNG).expect("writes the image");
+        let staged = match &sent {
+            Transfer::Sent(handle) => {
+                transfer::staged_file(stage.host.environment(), &handle.transfer_id)
+            }
+            Transfer::Refused { .. } | Transfer::Failed { .. } => None,
+        };
+        let file = staged.clone().unwrap_or_else(|| {
+            let copy = stage.run.work().join(format!("{mark}.png"));
+            std::fs::write(&copy, COLOUR_PNG).expect("writes the image");
+            copy
+        });
         logged.type_text(stage, &image_input(account, &file));
         std::thread::sleep(Duration::from_millis(500));
         let upper = mark.to_uppercase();
@@ -6527,11 +6649,29 @@ fn a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_shows_the
         let (offered, _) = surface(stage, &logged.agent.session, &after);
         check_observation_only(&offered)
             .unwrap_or_else(|why| panic!("only observation and the terminal: {why}"));
+        // What the agent received, read from its own record: the digests of the images it holds.
+        let recorded = account.image_line.as_deref().map(|marker| {
+            let conversations = conversation_roots(stage);
+            conversation_of(
+                &conversations,
+                &mark,
+                &account.prompt_line,
+                stage.conversations_before,
+            )
+            .map(|conversation| transfer::images_recorded(&conversation, marker))
+        });
+        let staged_digest = staged.as_deref().and_then(transfer::digest_of);
         let evidence = json!({
             "account": account_evidence(stage, logged.turns),
             "detection": shown.detection.evidence(),
             "detected": detected_evidence(&detected),
-            "device_upload": upload.evidence(),
+            "transfer": sent.evidence(caller),
+            "received": {
+                "from_the_transfer": staged.is_some(),
+                "staged_digest_is_the_sent": staged_digest.as_deref() == Some(sent_digest.as_str()),
+                "record_marker": account.image_line,
+                "images_in_the_record": recorded.as_ref().and_then(Option::as_ref).map(Vec::len),
+            },
             "prompt": { "question": question, "answer": sum },
             // What the screens showed is said by the marks looked for; the rows, which could show
             // anything of the person's, are in the part's log.
@@ -6541,19 +6681,74 @@ fn a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_shows_the
         });
         let mut failures = Vec::new();
         let mut codes = Vec::new();
-        if let Some(code) = &upload.refused {
-            failures.push(format!(
-                "a paired device's upload.begin is refused on this host ({code}), so the image is \
-                 not the device's transfer"
-            ));
-            codes.push(Failure::UploadRefused(code.clone()));
-        } else {
-            failures.push(
-                "a paired device's upload.begin was accepted, and the image given was not the one \
-                 it transferred"
-                    .to_owned(),
-            );
-            codes.push(Failure::UploadTransferredAnotherImage);
+        match &sent {
+            Transfer::Refused { step, code } => {
+                failures.push(format!(
+                    "a paired device's {} is refused on this host ({code}), so the image is not \
+                     the device's transfer",
+                    step.method()
+                ));
+                codes.push(Failure::UploadRefused(code.clone()));
+            }
+            Transfer::Failed { step, error } => {
+                failures.push(format!(
+                    "a paired device's {} failed with no code of the host's ({error}), so the image \
+                     is not the device's transfer",
+                    step.method()
+                ));
+                codes.push(Failure::UploadTransferredAnotherImage);
+            }
+            Transfer::Sent(handle) => {
+                let mut wrong = Vec::new();
+                if transfer::hex_of(handle.content_digest.as_bytes()) != sent_digest
+                    || handle.byte_len.get() != COLOUR_PNG.len() as u64
+                {
+                    wrong.push("the host published an attachment that is not the image sent");
+                }
+                if staged_digest.as_deref() != Some(sent_digest.as_str()) {
+                    wrong.push(
+                        "the host's staging area holds no file with the sent image's bytes for \
+                         the transfer, so the agent was given another",
+                    );
+                }
+                match recorded.as_ref() {
+                    None => wrong.push(
+                        "the build list names no marker for an image in the agent's record, so \
+                         the image the agent received was not read",
+                    ),
+                    Some(None) => {
+                        wrong.push("the agent's record of the image prompt was not found")
+                    }
+                    Some(Some(images)) => {
+                        if images.is_empty() {
+                            wrong.push("the agent's record holds no image");
+                        } else if images
+                            .iter()
+                            .any(|digest| digest.as_deref() != Some(sent_digest.as_str()))
+                        {
+                            wrong.push(
+                                "an image the agent's record holds is not the one the device \
+                                 transferred",
+                            );
+                        }
+                    }
+                }
+                if !wrong.is_empty() {
+                    failures.push(format!(
+                        "a paired device's transfer was published, and the image the agent \
+                         received was not shown to be the one it transferred: {}",
+                        wrong.join("; ")
+                    ));
+                    codes.push(Failure::UploadTransferredAnotherImage);
+                }
+                if caller != Caller::Device {
+                    failures.push(format!(
+                        "the image was transferred by the {}, not by a paired device",
+                        caller.word()
+                    ));
+                    codes.push(Failure::UploadNotByADevice);
+                }
+            }
         }
         if let Err(undetected) = &detected {
             failures.push(format!(
@@ -6565,8 +6760,11 @@ fn a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_shows_the
                 announced: undetected.announced,
             });
         }
-        let outcome =
-            Outcome::failed("1", TEST, &failures.join("; "), evidence).with_failures(&codes);
+        let outcome = if failures.is_empty() {
+            Outcome::passed("1", TEST, evidence)
+        } else {
+            Outcome::failed("1", TEST, &failures.join("; "), evidence).with_failures(&codes)
+        };
         Ending {
             outcome,
             sessions: logged.agent.sessions(),
@@ -8251,214 +8449,353 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
     });
 }
 
+/// How the agent met a second process on a saved conversation another process holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Second {
+    /// It would not run: its start reached no composer, and the screen or its end says so.
+    Refused,
+    /// It continued the saved conversation: the second process's question is in the file the first
+    /// one wrote, which two processes write now.
+    Merged,
+    /// It started a conversation of its own from the saved one: the question is in another file.
+    Forked,
+}
+
+impl Second {
+    /// The word the record names it by.
+    const fn word(self) -> &'static str {
+        match self {
+            Self::Refused => "refused",
+            Self::Merged => "merged",
+            Self::Forked => "forked",
+        }
+    }
+}
+
 /// KR-REQ-12.32, case 7, part 7: with the person's login, session A holds a conversation with a
-/// marker, and session B resumes the same saved conversation with the agent's resume command and
-/// answers from it. The host keeps them apart as two live executions: it detects each launch as
-/// its own instance, marked input to one never reaches the other, and A's binding revision stays as
-/// it was. The record names the conversation and each execution's processes. The control breaks
-/// the property: B's marker typed into A's session, and the isolation check fails on it.
+/// marker, and session B starts the agent's ordinary resume command on the same saved conversation.
+/// The record names what the agent did: refused to run a second process on it, continued the
+/// conversation both write now (merged), or started a conversation of its own from it (forked, which
+/// is not what the part is about and fails it). Where the agent runs a second process on the
+/// conversation, the host keeps the two apart as two live executions: it detects each launch as its
+/// own instance, marked input to one never reaches the other, and A's binding revision stays as it
+/// was; where the agent refuses, the host shows no instance for the refused start and A as it was.
+/// The record names the conversation and each execution's processes. The control breaks the
+/// property: B's marker typed into A's session, and the isolation check fails on it.
 #[test]
 fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merged() {
     const TEST: &str =
         "a_second_process_on_the_same_saved_conversation_is_another_execution_not_merged";
     on_account_stage("7", TEST, |stage| {
         let account = stage.login.expect("a part with a login").account();
-        let (_installation, _setup, variables) = prepare_login(stage);
-        let conversations = conversation_roots(stage);
-        let mut first = Logged::start(stage, &variables, "session A", "7", &[], None);
-        let shown_first = detect(stage, &first.agent.session);
-        let mark = stage.mark.to_owned();
-        let (question, sum) = sum_question();
-        first.submit(
-            stage,
-            &format!("Remember the code {mark}. {question}"),
-            "a conversation to resume",
-        );
-        let _ = first.answered(stage, &sum, "session A is answered");
-        let _ = first.wait_idle(stage, "session A is back at its composer");
-        let conversation = conversation_of(
-            &conversations,
-            &mark,
-            &account.prompt_line,
-            stage.conversations_before,
+        let command = account.resume.clone();
+        second_process(stage, "7", TEST, &command, false)
+    });
+}
+
+/// KR-REQ-12.32, case 7, part 7f: as part 7, with the agent's own command that starts a
+/// conversation of its own from a saved one (its `fork`). Session B answers from the saved
+/// conversation's history under an identifier of its own, in a file of its own, and the host keeps
+/// the two apart as two live executions as part 7 requires. A part for an agent whose build list
+/// names no such command is not run.
+#[test]
+fn a_forked_conversation_is_another_execution_with_a_conversation_of_its_own() {
+    const TEST: &str = "a_forked_conversation_is_another_execution_with_a_conversation_of_its_own";
+    on_account_stage("7f", TEST, |stage| {
+        let account = stage.login.expect("a part with a login").account();
+        if account.fork.is_empty() {
+            return Ending::new(
+                Outcome::not_run(
+                    "7f",
+                    TEST,
+                    "the build list names no command of the agent's that starts a conversation of \
+                     its own from a saved one",
+                    json!({}),
+                ),
+                Vec::new(),
+            );
+        }
+        let command = account.fork.clone();
+        second_process(stage, "7f", TEST, &command, true)
+    });
+}
+
+/// Runs part 7 or part 7f: session A holds a conversation, session B is started with `command` on
+/// it, and what the agent did and what the host showed are recorded. `forks` is whether the part
+/// is the one for the agent's fork command, which passes only when the agent forked.
+fn second_process(
+    stage: &Stage<'_, '_>,
+    part: &'static str,
+    test: &str,
+    command: &[String],
+    forks: bool,
+) -> Ending {
+    let account = stage.login.expect("a part with a login").account();
+    let (_installation, _setup, variables) = prepare_login(stage);
+    let conversations = conversation_roots(stage);
+    let mut first = Logged::start(stage, &variables, "session A", part, &[], None);
+    let shown_first = detect(stage, &first.agent.session);
+    let mark = stage.mark.to_owned();
+    let (question, sum) = sum_question();
+    first.submit(
+        stage,
+        &format!("Remember the code {mark}. {question}"),
+        "a conversation to resume",
+    );
+    let _ = first.answered(stage, &sum, "session A is answered");
+    let _ = first.wait_idle(stage, "session A is back at its composer");
+    let conversation_file = conversation_of(
+        &conversations,
+        &mark,
+        &account.prompt_line,
+        stage.conversations_before,
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "one conversation under {} holds the code",
+            listed(&conversations)
         )
-        .map(|file| conversation_id_of(account, &file))
-        .unwrap_or_else(|| {
-            panic!(
-                "one conversation under {} holds the code",
-                listed(&conversations)
+    });
+    let conversation = conversation_id_of(account, &conversation_file);
+    let resume: Vec<String> = command
+        .iter()
+        .map(|word| word.replace("{conversation}", &conversation))
+        .collect();
+    let started = Logged::start_with(
+        stage,
+        &variables,
+        "session B",
+        part,
+        &resume,
+        Some(&account.composer),
+        Some(&account.resume_refused),
+    );
+    let mut failures = Vec::new();
+    let mut codes = Vec::new();
+    let (mut second, observed) = match started {
+        Err(refusal) => {
+            let (session, refused) = *refusal;
+            // The agent would not run a second process on the conversation: the host shows no
+            // instance for the refused start, and session A as it was.
+            let seen = shown_in_log(stage, "session B's refused start", &refused.rows, "");
+            let first_after = shown_now(stage, &first.agent.session);
+            check_unchanged(Held::of(&shown_first), &first_after).unwrap_or_else(|why| {
+                panic!("session A's instance and revision are as they were: {why}")
+            });
+            check_unchanged(None, &shown_now(stage, &session)).unwrap_or_else(|why| {
+                panic!("the refused start announces no instance of its own: {why}")
+            });
+            let evidence = json!({
+                "account": account_evidence(stage, first.turns),
+                "conversation": conversation,
+                "session_a": { "detection": shown_first.detection.evidence(), "owners": owners_of(&first) },
+                "session_b": { "resumed_with": resume, "same_conversation": !forks },
+                "resume": { "outcome": Second::Refused.word(), "shown": refused.shown, "screen_seen": seen },
+                "control": { "what": "session B's marker typed into session A", "breaks_property": true, "not_run": "no second execution ran" },
+            });
+            if forks {
+                failures.push(
+                    "the agent refused to start a conversation of its own from the saved one, so \
+                     two executions from one saved history were not shown"
+                        .to_owned(),
+                );
+            }
+            let mut sessions = first.agent.sessions();
+            sessions.push(session);
+            let result = if failures.is_empty() {
+                Outcome::passed(part, test, evidence)
+            } else {
+                Outcome::failed(part, test, &failures.join("; "), evidence).with_failures(&codes)
+            };
+            return Ending {
+                outcome: result,
+                sessions,
+                replacement: None,
+                windows: Vec::new(),
+            };
+        }
+        Ok(mut second) => {
+            let shown_second = detect(stage, &second.agent.session);
+            second.submit(
+                stage,
+                RESUMED_QUESTION,
+                "the resumed conversation's question",
+            );
+            let upper = mark.to_uppercase();
+            let _ = second.answered(
+                stage,
+                &upper,
+                "session B answers from the saved conversation",
+            );
+            // Where session B's question was written says whether the agent continued session A's
+            // conversation or started one of its own from it.
+            settled_line(
+                stage,
+                &conversation_file,
+                &[RESUMED_QUESTION_WORDS, &account.prompt_line],
+            );
+            let in_a = first_line_with(
+                &conversation_file,
+                None,
+                &[RESUMED_QUESTION_WORDS, &account.prompt_line],
             )
-        });
-        let resume: Vec<String> = account
-            .resume
-            .iter()
-            .map(|word| word.replace("{conversation}", &conversation))
-            .collect();
-        let mut second = Logged::start(
-            stage,
-            &variables,
-            "session B",
-            "7",
-            &resume,
-            Some(&account.composer),
-        );
-        let shown_second = detect(stage, &second.agent.session);
-        second.submit(
-            stage,
-            RESUMED_QUESTION,
-            "the resumed conversation's question",
-        );
-        let upper = mark.to_uppercase();
-        let _ = second.answered(
-            stage,
-            &upper,
-            "session B answers from the saved conversation",
-        );
-        // Where the resume continues the saved conversation, session B's question is written into
-        // the same conversation session A saved: two executions on one conversation.
-        let b_wrote_into_a = (!account.resume_forks).then(|| {
-            let file = conversation_of(
+            .is_some();
+            let others: Vec<PathBuf> = conversation_lines(
                 &conversations,
-                &mark,
+                RESUMED_QUESTION_WORDS,
                 &account.prompt_line,
                 stage.conversations_before,
-            );
-            file.is_some_and(|file| {
-                settled_line(
-                    stage,
-                    &file,
-                    &[RESUMED_QUESTION_WORDS, &account.prompt_line],
-                );
-                first_line_with(&file, None, &[RESUMED_QUESTION_WORDS, &account.prompt_line])
-                    .is_some()
-            })
-        });
-        // Two executions, each detected on its own, kept apart.
-        let detected_first = check_detected(&launched(stage, &first.agent), &shown_first);
-        let detected_second = check_detected(&launched(stage, &second.agent), &shown_second);
-        if let (Ok(a), Ok(b)) = (&detected_first, &detected_second) {
-            assert_ne!(
-                a.instance, b.instance,
-                "the two executions are two instances"
-            );
+            )
+            .into_iter()
+            .map(|(file, _)| file)
+            .filter(|file| *file != conversation_file)
+            .collect();
+            let found = if in_a {
+                Some(Second::Merged)
+            } else if others.is_empty() {
+                None
+            } else {
+                Some(Second::Forked)
+            };
+            let forked_id = others.first().map(|file| conversation_id_of(account, file));
+            (second, (shown_second, found, forked_id))
         }
-        let first_after = shown_now(stage, &first.agent.session);
-        check_unchanged(Held::of(&shown_first), &first_after).unwrap_or_else(|why| {
-            panic!("session A's instance and revision are as they were: {why}")
-        });
-        let mark_a = format!("only-a-{mark}");
-        let mark_b = format!("only-b-{mark}");
-        first.type_text(stage, &mark_a);
-        second.type_text(stage, &mark_b);
-        let rows_a = screen_showing(&first, stage, &mark_a);
-        let rows_b = screen_showing(&second, stage, &mark_b);
-        let isolated = |rows_a: &[String], rows_b: &[String]| {
-            rows_a.iter().any(|row| row.contains(&mark_a))
-                && rows_b.iter().any(|row| row.contains(&mark_b))
-                && !rows_a.iter().any(|row| row.contains(&mark_b))
-                && !rows_b.iter().any(|row| row.contains(&mark_a))
-        };
-        assert!(
-            isolated(&rows_a, &rows_b),
-            "input marked for each session reaches that session alone; session A's screen:\n{}\nsession B's screen:\n{}",
-            rows_a.join("\n"),
-            rows_b.join("\n")
+    };
+    let (shown_second, found, forked_id) = observed;
+    // Two executions, each detected on its own, kept apart.
+    let detected_first = check_detected(&launched(stage, &first.agent), &shown_first);
+    let detected_second = check_detected(&launched(stage, &second.agent), &shown_second);
+    if let (Ok(a), Ok(b)) = (&detected_first, &detected_second) {
+        assert_ne!(
+            a.instance, b.instance,
+            "the two executions are two instances"
         );
-        // The control: B's marker typed into A's session, and the check fails on it.
-        first.type_text(stage, &format!(" {mark_b}"));
-        let control_rows = screen_showing(&first, stage, &mark_b);
-        let control = isolated(&control_rows, &rows_b);
-        assert!(
-            !control && control_rows.iter().any(|row| row.contains(&mark_b)),
-            "the isolation check fails once B's marker is in A's session; session A's screen then:\n{}",
-            control_rows.join("\n")
-        );
-        first.type_text(stage, &account.clear);
-        second.type_text(stage, &account.clear);
-        let owners = |logged: &Logged| {
-            logged
-                .agent
-                .every_process()
-                .iter()
-                .map(|process| json!({ "pid": process.identity.pid.get(), "command": process.command }))
-                .collect::<Vec<_>>()
-        };
-        // Each execution's live processes are its own: none is the other's.
-        let identities = |logged: &Logged| {
-            logged
-                .agent
-                .every_process()
-                .into_iter()
-                .map(|process| process.identity.clone())
-                .collect::<std::collections::BTreeSet<_>>()
-        };
-        let (owners_a, owners_b) = (identities(&first), identities(&second));
-        assert!(
-            !owners_a.is_empty() && !owners_b.is_empty() && owners_a.is_disjoint(&owners_b),
-            "sessions A and B run on processes of their own: A {owners_a:?}, B {owners_b:?}"
-        );
-        let evidence = json!({
-            "account": account_evidence(stage, first.turns + second.turns),
-            "conversation": conversation,
-            "session_a": { "detection": shown_first.detection.evidence(), "detected": detected_evidence(&detected_first), "owners": owners(&first) },
-            "session_b": { "detection": shown_second.detection.evidence(), "detected": detected_evidence(&detected_second), "owners": owners(&second), "resumed_with": resume, "same_conversation": !account.resume_forks, "wrote_into_a_conversation": b_wrote_into_a },
-            "control": { "what": "session B's marker typed into session A", "breaks_property": true, "isolated": control },
-        });
-        // Where the agent forks a saved conversation for a second process, the part shows two
-        // executions from one saved history, not two on one conversation's identifier.
-        let mut failures = Vec::new();
-        let mut codes = Vec::new();
-        if let (Ok(_), Ok(_)) = (&detected_first, &detected_second) {
-        } else {
-            for (session, detected) in [("A", &detected_first), ("B", &detected_second)] {
-                if let Err(undetected) = detected {
-                    codes.push(Failure::LaunchNotDetected {
-                        session: Some(session),
-                        cause: undetected.cause,
-                        announced: undetected.announced,
-                    });
-                }
+    }
+    let first_after = shown_now(stage, &first.agent.session);
+    check_unchanged(Held::of(&shown_first), &first_after)
+        .unwrap_or_else(|why| panic!("session A's instance and revision are as they were: {why}"));
+    let mark_a = format!("only-a-{mark}");
+    let mark_b = format!("only-b-{mark}");
+    first.type_text(stage, &mark_a);
+    second.type_text(stage, &mark_b);
+    let rows_a = screen_showing(&first, stage, &mark_a);
+    let rows_b = screen_showing(&second, stage, &mark_b);
+    let isolated = |rows_a: &[String], rows_b: &[String]| {
+        rows_a.iter().any(|row| row.contains(&mark_a))
+            && rows_b.iter().any(|row| row.contains(&mark_b))
+            && !rows_a.iter().any(|row| row.contains(&mark_b))
+            && !rows_b.iter().any(|row| row.contains(&mark_a))
+    };
+    assert!(
+        isolated(&rows_a, &rows_b),
+        "input marked for each session reaches that session alone; session A's screen:\n{}\nsession B's screen:\n{}",
+        rows_a.join("\n"),
+        rows_b.join("\n")
+    );
+    // The control: B's marker typed into A's session, and the check fails on it.
+    first.type_text(stage, &format!(" {mark_b}"));
+    let control_rows = screen_showing(&first, stage, &mark_b);
+    let control = isolated(&control_rows, &rows_b);
+    assert!(
+        !control && control_rows.iter().any(|row| row.contains(&mark_b)),
+        "the isolation check fails once B's marker is in A's session; session A's screen then:\n{}",
+        control_rows.join("\n")
+    );
+    first.type_text(stage, &account.clear);
+    second.type_text(stage, &account.clear);
+    // Each execution's live processes are its own: none is the other's.
+    let identities = |logged: &Logged| {
+        logged
+            .agent
+            .every_process()
+            .into_iter()
+            .map(|process| process.identity.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let (owners_a, owners_b) = (identities(&first), identities(&second));
+    assert!(
+        !owners_a.is_empty() && !owners_b.is_empty() && owners_a.is_disjoint(&owners_b),
+        "sessions A and B run on processes of their own: A {owners_a:?}, B {owners_b:?}"
+    );
+    let evidence = json!({
+        "account": account_evidence(stage, first.turns + second.turns),
+        "conversation": conversation,
+        "session_a": { "detection": shown_first.detection.evidence(), "detected": detected_evidence(&detected_first), "owners": owners_of(&first) },
+        "session_b": { "detection": shown_second.detection.evidence(), "detected": detected_evidence(&detected_second), "owners": owners_of(&second), "resumed_with": resume, "same_conversation": found == Some(Second::Merged), "wrote_into_a_conversation": found == Some(Second::Merged) },
+        "resume": { "outcome": found.map(Second::word), "forked_conversation": forked_id },
+        "control": { "what": "session B's marker typed into session A", "breaks_property": true, "isolated": control },
+    });
+    if let (Ok(_), Ok(_)) = (&detected_first, &detected_second) {
+    } else {
+        for (session, detected) in [("A", &detected_first), ("B", &detected_second)] {
+            if let Err(undetected) = detected {
+                codes.push(Failure::LaunchNotDetected {
+                    session: Some(session),
+                    cause: undetected.cause,
+                    announced: undetected.announced,
+                });
             }
-            failures.push(format!(
-                "the host did not detect each launch as section 12 requires: A {}, B {}",
-                detected_first
-                    .as_ref()
-                    .map_or_else(ToString::to_string, |_| "detected".to_owned()),
-                detected_second
-                    .as_ref()
-                    .map_or_else(ToString::to_string, |_| "detected".to_owned())
-            ));
         }
-        if b_wrote_into_a == Some(false) {
+        failures.push(format!(
+            "the host did not detect each launch as section 12 requires: A {}, B {}",
+            detected_first
+                .as_ref()
+                .map_or_else(ToString::to_string, |_| "detected".to_owned()),
+            detected_second
+                .as_ref()
+                .map_or_else(ToString::to_string, |_| "detected".to_owned())
+        ));
+    }
+    match (found, forks) {
+        (None, _) => {
             failures.push(
-                "session B's question is not in the conversation session A saved, so the resume \
-                 did not continue it"
+                "session B's question is in no conversation the part can read, so what the agent \
+                 did with the saved conversation was not shown"
                     .to_owned(),
             );
+            codes.push(Failure::PartFailed);
         }
-        if account.resume_forks {
+        (Some(Second::Forked), false) => {
             failures.push(
-                "the agent lets no second process write a conversation another process writes, so \
-                 session B forked the saved conversation under a new identifier: two executions on \
-                 one conversation's identifier were not shown"
+                "the agent's resume command started a conversation of its own from the saved one \
+                 for session B: two executions on one conversation's identifier were not shown"
                     .to_owned(),
             );
             codes.push(Failure::ResumeForks);
         }
-        let outcome = if failures.is_empty() {
-            Outcome::passed("7", TEST, evidence)
-        } else {
-            Outcome::failed("7", TEST, &failures.join("; "), evidence).with_failures(&codes)
-        };
-        let mut sessions = first.agent.sessions();
-        sessions.extend(second.agent.sessions());
-        Ending {
-            outcome,
-            sessions,
-            replacement: None,
-            windows: Vec::new(),
+        (Some(Second::Merged), true) => {
+            failures.push(
+                "the agent's fork command continued the saved conversation instead of starting \
+                 one of its own, so two executions from one saved history were not shown"
+                    .to_owned(),
+            );
+            codes.push(Failure::PartFailed);
         }
-    });
+        _ => {}
+    }
+    let outcome = if failures.is_empty() {
+        Outcome::passed(part, test, evidence)
+    } else {
+        Outcome::failed(part, test, &failures.join("; "), evidence).with_failures(&codes)
+    };
+    let mut sessions = first.agent.sessions();
+    sessions.extend(second.agent.sessions());
+    Ending {
+        outcome,
+        sessions,
+        replacement: None,
+        windows: Vec::new(),
+    }
+}
+
+/// Each live process of an execution, by number and command, for the record.
+fn owners_of(logged: &Logged) -> Vec<serde_json::Value> {
+    logged
+        .agent
+        .every_process()
+        .iter()
+        .map(|process| json!({ "pid": process.identity.pid.get(), "command": process.command }))
+        .collect()
 }
 
 /// On macOS, a session a person starts with their own home keeps their own default keychain, the

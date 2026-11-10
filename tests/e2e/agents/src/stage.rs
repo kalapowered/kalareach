@@ -86,6 +86,11 @@ pub fn runtime() -> tokio::runtime::Runtime {
 /// Copies `kr-hook` beside the host's other binaries in the run's directory, and starts it once
 /// where nothing is timed.
 ///
+/// That start is in the test's own process tree. It pays the cost of a file's first start there,
+/// but not what the system asks of the first run of a file under the host's own daemon, about half
+/// a second of waiting with no work of the file's own: a part that times the forwarder from a
+/// session of the host runs it once there first, where nothing is timed.
+///
 /// # Panics
 ///
 /// Panics when this build has no `kr-hook`: a part that went on without it would report nothing
@@ -951,11 +956,61 @@ pub struct AgentProcess {
 pub fn launch(
     run: &Run,
     session: &Session,
-    (line, ready, command): (&str, &str, &str),
+    start: (&str, &str, &str),
     provenance: &Provenance,
     expected: &Expected,
     between: &dyn Fn(),
 ) -> Vec<AgentProcess> {
+    match launch_or_refusal(run, session, start, None, provenance, expected, between) {
+        Ok(processes) => processes,
+        Err(refused) => panic!(
+            "the agent was refused where a launch was expected to reach its first screen: {refused}"
+        ),
+    }
+}
+
+/// An agent's start that reached no first screen because the agent refused to run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refused {
+    /// The text of those the caller named that the screen showed, or none where the shell's prompt
+    /// came back below the typed command instead.
+    pub shown: Option<String>,
+    /// The screen when it was seen.
+    pub rows: Vec<String>,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.shown {
+            Some(text) => write!(formatter, "the agent's screen shows {text:?}")?,
+            None => formatter.write_str("the shell's prompt came back below the typed command")?,
+        }
+        write!(formatter, ", and the screen is:\n{}", self.rows.join("\n"))
+    }
+}
+
+/// [`launch`], where the caller says what a refusal looks like: `refusal` names the texts the
+/// agent shows when it will not run (`Some`, however many), and a start that shows one of them, or
+/// ends so that the shell's prompt comes back below the typed command, before it shows `ready`, is
+/// returned as [`Refused`] and not a panic. A start that shows neither within [`LIVENESS`] still
+/// panics: nothing says the agent refused.
+///
+/// # Errors
+///
+/// Returns [`Refused`] as above.
+///
+/// # Panics
+///
+/// As [`launch`] does, for everything but a refusal.
+pub fn launch_or_refusal(
+    run: &Run,
+    session: &Session,
+    (line, ready, command): (&str, &str, &str),
+    refusal: Option<&[String]>,
+    provenance: &Provenance,
+    expected: &Expected,
+    between: &dyn Fn(),
+) -> std::result::Result<Vec<AgentProcess>, Refused> {
     assert!(
         !session
             .window
@@ -1005,7 +1060,22 @@ pub fn launch(
             between();
             let rows = session.window.screen();
             if rows.iter().any(|row| row.contains(ready)) {
-                return rows;
+                return Ok(rows);
+            }
+            if let Some(texts) = refusal {
+                let shown = texts
+                    .iter()
+                    .find(|text| rows.iter().any(|row| row.contains(text.as_str())));
+                let prompt_back = {
+                    let since = session.window.collected().since(typed_at);
+                    String::from_utf8_lossy(&since).contains(PROMPT.trim_end())
+                };
+                if shown.is_some() || prompt_back {
+                    return Err(Refused {
+                        shown: shown.cloned(),
+                        rows,
+                    });
+                }
             }
             assert!(
                 waited.elapsed() < LIVENESS,
@@ -1016,6 +1086,11 @@ pub fn launch(
             std::thread::sleep(Duration::from_millis(50));
         }
     }));
+    let drawn = match drawn {
+        Ok(Ok(rows)) => Ok(rows),
+        Ok(Err(refused)) => return Err(refused),
+        Err(panic) => Err(panic),
+    };
     if let Err(panic) = drawn {
         // What the program wrote since its command was typed says why it did not draw, where
         // the screen it left no longer does.
@@ -1046,7 +1121,7 @@ pub fn launch(
             provenance
                 .verify_launch(&found, session.root_shell.pid.get(), expected, line)
                 .unwrap_or_else(|why| panic!("{why}"));
-            return found;
+            return Ok(found);
         }
         assert!(
             started.elapsed() < LIVENESS,
