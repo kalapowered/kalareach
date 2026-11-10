@@ -31,17 +31,24 @@ export function uleb(value) {
  * `constants` are strings the code carries that are no class's name, which sit in the string table
  * and nowhere else.
  *
- * `methods` gives a defined class its declared methods, `{ 'a.b.C': [{ name, native, static }] }`: a
- * static one goes in the class's list of direct methods and any other in its virtual methods, and a
- * native one carries the native access flag. The method table lists them in the opposite order to
- * the classes, so that a reader that took a method's place in a class for its place in the file
- * would answer wrongly.
+ * `methods` gives a defined class its declared methods, `{ 'a.b.C': [{ name, native, static, params }] }`:
+ * a static one goes in the class's list of direct methods and any other in its virtual methods, a
+ * native one carries the native access flag, and `params` are its argument types as descriptors
+ * (`['I', 'Ljava/lang/String;']`). The method table lists them in the opposite order to the classes,
+ * so that a reader that took a method's place in a class for its place in the file would answer
+ * wrongly. `fields` gives a class that many static and instance fields, `{ 'a.b.C': [1, 2] }`, which
+ * come before its methods in its data and which a reader has to step over.
  */
-export function dex({ defined = [], referenced = [], constants = [], methods = {} } = {}) {
+export function dex({ defined = [], referenced = [], constants = [], methods = {}, fields = {} } = {}) {
   const descriptorOf = (name) => `L${name.replaceAll('.', '/')};`
   // Every class the file names. The superclass every real class has comes first, and the merely
   // mentioned ones next, so a class_defs index is never the type index it holds.
   const types = ['java.lang.Object', ...referenced, ...defined].map(descriptorOf)
+  // The primitive types that the methods' prototypes name: a return type, and each argument type.
+  const declared = Object.values(methods).flat()
+  const primitives =
+    declared.length === 0 ? [] : ['V', ...new Set(declared.flatMap((method) => method.params ?? []))]
+  types.push(...primitives.filter((descriptor) => !types.includes(descriptor)))
   // A real string table holds method and field names as well as class names. Enough of them come
   // first here that a descriptor's string index is never its type index, and the descriptors
   // behind them run in the opposite order to the type table.
@@ -65,10 +72,18 @@ export function dex({ defined = [], referenced = [], constants = [], methods = {
   // place in the class table would put them.
   const methodTable = []
   const methodIndexOf = new Map()
+  const protos = []
   for (const name of [...defined].reverse()) {
     for (const method of methods[name] ?? []) {
+      const params = method.params ?? []
+      let proto = protos.findIndex((each) => each.join('|') === params.join('|'))
+      if (proto < 0) proto = protos.push(params) - 1
       methodIndexOf.set(method, methodTable.length)
-      methodTable.push({ type: types.indexOf(descriptorOf(name)), name: strings.indexOf(method.name) })
+      methodTable.push({
+        type: types.indexOf(descriptorOf(name)),
+        proto,
+        name: strings.indexOf(method.name)
+      })
     }
   }
 
@@ -76,13 +91,16 @@ export function dex({ defined = [], referenced = [], constants = [], methods = {
   header.write('dex\n035\0', 0, 'latin1')
   const stringIdsAt = 112
   const typeIdsAt = stringIdsAt + strings.length * 4
-  const methodIdsAt = typeIdsAt + types.length * 4
+  const protoIdsAt = typeIdsAt + types.length * 4
+  const methodIdsAt = protoIdsAt + protos.length * 12
   const classDefsAt = methodIdsAt + methodTable.length * 8
   const dataAt = classDefsAt + definedTypeIndex.length * 32
   header.writeUInt32LE(strings.length, 0x38)
   header.writeUInt32LE(stringIdsAt, 0x3c)
   header.writeUInt32LE(types.length, 0x40)
   header.writeUInt32LE(typeIdsAt, 0x44)
+  header.writeUInt32LE(protos.length, 0x48)
+  header.writeUInt32LE(protoIdsAt, 0x4c)
   header.writeUInt32LE(methodTable.length, 0x58)
   header.writeUInt32LE(methodIdsAt, 0x5c)
   header.writeUInt32LE(definedTypeIndex.length, 0x60)
@@ -100,17 +118,31 @@ export function dex({ defined = [], referenced = [], constants = [], methods = {
     at += item.length
   })
   typeStringIndex.forEach((stringIndex, index) => typeIds.writeUInt32LE(stringIndex, index * 4))
+  // The prototypes: a return type of void, and the argument types as a list in the data.
+  const protoIds = Buffer.alloc(protos.length * 12)
+  protos.forEach((params, index) => {
+    protoIds.writeUInt32LE(types.indexOf('V'), index * 12 + 4)
+    if (params.length === 0) return
+    const list = Buffer.alloc(4 + params.length * 2)
+    list.writeUInt32LE(params.length, 0)
+    params.forEach((descriptor, each) => list.writeUInt16LE(types.indexOf(descriptor), 4 + each * 2))
+    protoIds.writeUInt32LE(at, index * 12 + 8)
+    data.push(list)
+    at += list.length
+  })
   const methodIds = Buffer.alloc(methodTable.length * 8)
   methodTable.forEach((entry, index) => {
     methodIds.writeUInt16LE(entry.type, index * 8)
+    methodIds.writeUInt16LE(entry.proto, index * 8 + 2)
     methodIds.writeUInt32LE(entry.name, index * 8 + 4)
   })
   definedTypeIndex.forEach((typeIndex, index) => {
     classDefs.writeUInt32LE(typeIndex, index * 32)
     const own = methods[defined[index]] ?? []
-    if (own.length === 0) return
-    // A class's data item: the four counts, then each list of methods in ascending table order, as
-    // the difference from the one before. There are no fields.
+    const [staticFields, instanceFields] = fields[defined[index]] ?? [0, 0]
+    if (own.length === 0 && staticFields + instanceFields === 0) return
+    // A class's data item: the four counts, then the fields, then each list of methods in ascending
+    // table order, as the difference from the one before.
     const list = (declared) =>
       declared
         .map((method) => ({ method, index: methodIndexOf.get(method) }))
@@ -121,11 +153,13 @@ export function dex({ defined = [], referenced = [], constants = [], methods = {
         })
     const direct = own.filter((method) => method.static)
     const virtual = own.filter((method) => !method.static)
+    const fieldEntries = Array.from({ length: staticFields + instanceFields }, () => [uleb(1), uleb(0x19)])
     const item = Buffer.concat([
-      uleb(0),
-      uleb(0),
+      uleb(staticFields),
+      uleb(instanceFields),
       uleb(direct.length),
       uleb(virtual.length),
+      ...fieldEntries.flat(),
       ...list(direct),
       ...list(virtual)
     ])
@@ -133,7 +167,7 @@ export function dex({ defined = [], referenced = [], constants = [], methods = {
     data.push(item)
     at += item.length
   })
-  return Buffer.concat([header, stringIds, typeIds, methodIds, classDefs, ...data])
+  return Buffer.concat([header, stringIds, typeIds, protoIds, methodIds, classDefs, ...data])
 }
 
 /**
@@ -142,9 +176,19 @@ export function dex({ defined = [], referenced = [], constants = [], methods = {
  *
  * It has what the reader of dynamic symbols looks at -- the ELF header, a dynamic symbol table with
  * its string table and the section headers that find them -- and no code. `wide` is a 64-bit
- * library, as the ABIs the application ships are, and not wide a 32-bit one.
+ * library, as the ABIs the application ships are, and not wide a 32-bit one. `locals` and `hidden`
+ * name defined symbols that are local and that are hidden, which no other library can find, and
+ * `headers: false` leaves the section headers out.
  */
-export function elf({ exports = [], imports = [], blobs = [], wide = true } = {}) {
+export function elf({
+  exports = [],
+  imports = [],
+  locals = [],
+  hidden = [],
+  blobs = [],
+  wide = true,
+  headers = true
+} = {}) {
   const sectionNames = ['', '.dynstr', '.dynsym', '.shstrtab']
   const text = (names) => {
     const offsets = new Map()
@@ -159,23 +203,23 @@ export function elf({ exports = [], imports = [], blobs = [], wide = true } = {}
     }
     return { offsets, bytes: Buffer.concat(parts) }
   }
-  const dynstr = text([...imports, ...exports])
+  const dynstr = text([...imports, ...exports, ...locals, ...hidden])
   const shstr = text(sectionNames)
   const symbolSize = wide ? 24 : 16
-  const dynsym = Buffer.alloc((1 + imports.length + exports.length) * symbolSize)
-  ;[...imports.map((name) => [name, 0]), ...exports.map((name) => [name, 1])].forEach(
-    ([name, section], index) => {
-      const at = (index + 1) * symbolSize
-      dynsym.writeUInt32LE(dynstr.offsets.get(name), at)
-      if (wide) {
-        dynsym.writeUInt8(0x12, at + 4)
-        dynsym.writeUInt16LE(section, at + 6)
-      } else {
-        dynsym.writeUInt8(0x12, at + 12)
-        dynsym.writeUInt16LE(section, at + 14)
-      }
-    }
-  )
+  const symbols = [
+    ...imports.map((name) => [name, 0, 0x12, 0]),
+    ...exports.map((name) => [name, 1, 0x12, 0]),
+    ...locals.map((name) => [name, 1, 0x02, 0]),
+    ...hidden.map((name) => [name, 1, 0x12, 2])
+  ]
+  const dynsym = Buffer.alloc((1 + symbols.length) * symbolSize)
+  symbols.forEach(([name, section, info, other], index) => {
+    const at = (index + 1) * symbolSize
+    dynsym.writeUInt32LE(dynstr.offsets.get(name), at)
+    dynsym.writeUInt8(info, at + (wide ? 4 : 12))
+    dynsym.writeUInt8(other, at + (wide ? 5 : 13))
+    dynsym.writeUInt16LE(section, at + (wide ? 6 : 14))
+  })
   const headerSize = wide ? 64 : 52
   const sectionSize = wide ? 64 : 40
   const body = Buffer.concat(blobs)
@@ -191,15 +235,16 @@ export function elf({ exports = [], imports = [], blobs = [], wide = true } = {}
   header.writeUInt16LE(3, 0x10)
   header.writeUInt16LE(wide ? 183 : 40, 0x12)
   header.writeUInt32LE(1, 0x14)
+  const shown = headers ? sectionNames.length : 0
   if (wide) {
-    header.writeBigUInt64LE(BigInt(tableAt), 0x28)
+    header.writeBigUInt64LE(BigInt(headers ? tableAt : 0), 0x28)
     header.writeUInt16LE(sectionSize, 0x3a)
-    header.writeUInt16LE(sectionNames.length, 0x3c)
+    header.writeUInt16LE(shown, 0x3c)
     header.writeUInt16LE(3, 0x3e)
   } else {
-    header.writeUInt32LE(tableAt, 0x20)
+    header.writeUInt32LE(headers ? tableAt : 0, 0x20)
     header.writeUInt16LE(sectionSize, 0x2e)
-    header.writeUInt16LE(sectionNames.length, 0x30)
+    header.writeUInt16LE(shown, 0x30)
     header.writeUInt16LE(3, 0x32)
   }
   const sections = Buffer.alloc(sectionNames.length * sectionSize)
