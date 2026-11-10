@@ -1272,9 +1272,16 @@ async fn a_stop_that_meets_the_other_copys_record_where_it_claims(
 /// other recorded, as one read from the record. While this host owes a fence it could not raise, or
 /// once the registration the late copy arrived on is gone, the record is not given back.
 ///
+/// KR-REQ-23.24, the rules of its first two sentences at that race: the authority the late copy
+/// arrived under is checked before the other copy's record is returned, so with a fence owed or the
+/// registration withdrawn the record is not given back; a duplicate still under that authority is
+/// given the retained record as a copy.
+///
 /// Not shown here: whether that authority is asked before or after the claim reads the record. A
 /// fence becomes owed and the registration is removed while the late copy is held before its claim,
-/// so either order gives these answers.
+/// so either order gives these answers. Not shown for 23.24: a device revoked in the pairing
+/// records (the registration is removed directly), a record that carries content, and the sentence
+/// on an uncertain result and a new action identifier.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stop_recorded_by_another_copy_before_its_claim_is_given_back_only_under_its_authority() {
     // The control.

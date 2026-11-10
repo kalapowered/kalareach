@@ -382,9 +382,16 @@ async fn a_delegations_receipt_goes_back_only_to_a_device_that_is_still_paired()
 /// The control: with the device paired, the late copy is given the receipt as one read from the
 /// record.
 ///
+/// KR-REQ-23.24, the rules of its first two sentences at that race: the device's pairing, its
+/// current authority, is checked before the other copy's receipt is returned, so a device revoked
+/// after that copy kept it is given nothing; a duplicate from a device that is still paired is
+/// given the retained receipt, read from the record as a copy.
+///
 /// Not shown here: a device whose grant expiry is on record, which the pairing check refuses as it
 /// refuses a revoked one, and the new read of a session that the receipt of a performed read is
-/// given back through (the receipt kept here is an admitted one, which is given back as kept).
+/// given back through (the receipt kept here is an admitted one, which is given back as kept). Not
+/// shown for 23.24: a receipt that carries content, and the sentence on an uncertain result and a
+/// new action identifier.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_receipt_another_copy_kept_before_a_delegations_claim_goes_back_only_to_a_paired_device()
 {
