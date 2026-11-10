@@ -18,6 +18,8 @@ name = "integration"
 # The host, the paired device, the terminal windows and the process record: the cross-boundary
 # checkpoint's own harness, used as a library.
 kr-e2e-m1b = { path = "../m1b" }
+# The base64 text an agent's record holds an image as.
+base64.workspace = true
 # The SHA-256 of a mapped image.
 kr-cbor.workspace = true
 kr-client = { workspace = true, features = ["terminal"] }

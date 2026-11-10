@@ -4780,6 +4780,7 @@ dependencies = [
 name = "kr-e2e-agents"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "kr-cbor",
  "kr-client",
  "kr-controller",
