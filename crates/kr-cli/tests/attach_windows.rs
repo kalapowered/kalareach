@@ -1966,13 +1966,15 @@ fn mouse_asker_in_the_session() {
             std::thread::sleep(Duration::from_millis(20));
         }
     };
-    print!("kr-asker-waiting\r\n");
+    // Each marker begins a row of its own, so that the console, which may be narrower than the line
+    // the test runner has begun, does not break it across two.
+    print!("\r\nkr-asker-waiting\r\n");
     std::io::stdout().flush().expect("flushes the first word");
     wait_for("ask");
-    print!("\x1b[?1000hkr-asker-asking\r\n");
+    print!("\x1b[?1000h\r\nkr-asker-asking\r\n");
     std::io::stdout().flush().expect("flushes the request");
     wait_for("stop");
-    print!("\x1b[?1000lkr-asker-stopped\r\n");
+    print!("\x1b[?1000l\r\nkr-asker-stopped\r\n");
     std::io::stdout()
         .flush()
         .expect("flushes the end of the request");
