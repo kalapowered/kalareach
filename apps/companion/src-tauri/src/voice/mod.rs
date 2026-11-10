@@ -84,6 +84,9 @@ pub struct Timings {
     /// How old a capture proof may be at the moment a delegation is written to the host. A
     /// parameter of the cases, not a safety bound.
     pub proof_age: Duration,
+    /// How long the number of the session a confirmation is for is waited for, so the dialog can
+    /// name it. A courtesy: the confirmation does not depend on it, and a parameter of the cases.
+    pub session_name_within: Duration,
 }
 
 impl Default for Timings {
@@ -104,6 +107,7 @@ impl Default for Timings {
             delegation_wait: Duration::from_secs(3),
             drain_within: Duration::from_secs(5),
             proof_age: Duration::from_millis(500),
+            session_name_within: Duration::from_secs(3),
         }
     }
 }
@@ -347,6 +351,8 @@ struct Handled {
     /// The delegations whose confirmation asked for a capture proof after its ceremony and whose
     /// answer the owner has acted on.
     seals: Mutex<Vec<String>>,
+    /// The delegations whose ceremony's answer the owner has read, acted on or dropped.
+    ceremonies: Mutex<Vec<String>>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -363,6 +369,14 @@ impl Handled {
     /// for after its ceremony.
     fn seal(&self, id: &str) {
         self.seals
+            .lock()
+            .expect("the record is not poisoned")
+            .push(id.to_owned());
+    }
+
+    /// The owner read the answer of the ceremony the confirmation of the delegation `id` asked for.
+    fn ceremony(&self, id: &str) {
+        self.ceremonies
             .lock()
             .expect("the record is not poisoned")
             .push(id.to_owned());
@@ -1111,6 +1125,23 @@ impl Calls {
             shared
                 .handled
                 .seals
+                .lock()
+                .expect("the record is not poisoned")
+                .iter()
+                .any(|known| known == id)
+        })
+    }
+
+    /// Whether an owner has read the answer of the ceremony the confirmation of the delegation `id`
+    /// asked for, and acted on it or dropped it as the answer of a confirmation that is over. For
+    /// cases that say nothing was signed after a late answer.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn has_handled_ceremony(&self, id: &str) -> bool {
+        self.shared.as_ref().is_some_and(|shared| {
+            shared
+                .handled
+                .ceremonies
                 .lock()
                 .expect("the record is not poisoned")
                 .iter()

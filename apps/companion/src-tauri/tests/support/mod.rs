@@ -1760,6 +1760,26 @@ impl std::fmt::Debug for LinkControl {
 }
 
 impl Tapped {
+    /// Carries `frame` to the host.
+    async fn carry(&self, frame: &ControlFrame) -> kr_client::Result<()> {
+        if let Some(refusal) = self.control.refusal_of(frame) {
+            return Err(kr_client::ClientError::Host(refusal));
+        }
+        let lost = self.control.sent_and_lost(frame);
+        if let Some(request) = self.control.garbled_request(frame) {
+            self.garbled.lock().expect("the record").push(request);
+        }
+        if let Some(receipted) = self.control.receipted_request(frame) {
+            self.receipted.lock().expect("the record").push(receipted);
+        }
+        self.inner.send(frame).await?;
+        if lost {
+            // The host has the request and acts on it; the caller never hears.
+            return Err(kr_client::ClientError::ConnectionEnded);
+        }
+        Ok(())
+    }
+
     /// Carries `frame` to the host unless the time has run out or the caller no longer wants it.
     async fn carry_before(
         &self,
@@ -1823,23 +1843,12 @@ impl kr_client::transport::ControlTransport for Tapped {
         frame: &'a ControlFrame,
     ) -> kr_client::transport::TransportFuture<'a, ()> {
         Box::pin(async move {
-            let _held = self.control.before_sending(frame).await;
-            if let Some(refusal) = self.control.refusal_of(frame) {
-                return Err(kr_client::ClientError::Host(refusal));
+            let held = self.control.before_sending(frame).await;
+            let outcome = self.carry(frame).await;
+            if held {
+                self.control.held_request_passed();
             }
-            let lost = self.control.sent_and_lost(frame);
-            if let Some(request) = self.control.garbled_request(frame) {
-                self.garbled.lock().expect("the record").push(request);
-            }
-            if let Some(receipted) = self.control.receipted_request(frame) {
-                self.receipted.lock().expect("the record").push(receipted);
-            }
-            self.inner.send(frame).await?;
-            if lost {
-                // The host has the request and acts on it; the caller never hears.
-                return Err(kr_client::ClientError::ConnectionEnded);
-            }
-            Ok(())
+            outcome
         })
     }
 
