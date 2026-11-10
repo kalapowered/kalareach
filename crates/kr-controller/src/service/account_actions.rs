@@ -1,5 +1,5 @@
-//! The host's own sign-in to the managed account service: its two methods and the account the
-//! daemon builds at start.
+//! The host's own sign-ins to account services: the two methods of the managed account's, and the
+//! accounts the daemon builds at start.
 
 use std::sync::Arc;
 
@@ -7,7 +7,7 @@ use kr_protocol::envelope::ParamsValue;
 use kr_protocol::host_account::{AccountSignInParams, AccountSignOutParams, AccountStatusParams};
 use kr_protocol::service::GatewayOrigin;
 
-use crate::account::Service;
+use crate::account::{HostAccount, Service};
 use crate::config::Outbound;
 use crate::error::{ControllerError, Result};
 
@@ -27,34 +27,81 @@ fn account_origin() -> String {
         .unwrap_or_else(|| kr_client::services::account::ACCOUNT_ORIGIN.to_owned())
 }
 
+/// Whether a plain-HTTP origin may hold an account: only in a build for tests, whose suites stand
+/// the services they run against at a loopback origin. No shipped build presents an account token
+/// over plain HTTP.
+const PLAIN_HTTP_PERMITTED: bool = cfg!(any(test, feature = "testing"));
+
+/// Refuses a storage origin that would be sent an account token over plain HTTP, unless
+/// `plain_http_permitted`.
+///
+/// A proxy carries every request in absolute form, loopback ones included, so a plain-HTTP origin
+/// with `network.proxy_url` would send the sign-in code, the verifier, the refresh token and each
+/// bearer token across the proxy in clear text; with no proxy, another local user can take a
+/// loopback port while the person's own service is down.
+///
+/// # Errors
+///
+/// Returns [`ControllerError::NotConfigured`] naming `storage.origin`.
+fn refuse_plain_http(origin: &GatewayOrigin, plain_http_permitted: bool) -> Result<()> {
+    if origin.as_str().starts_with("http://") && !plain_http_permitted {
+        return Err(ControllerError::NotConfigured(format!(
+            "{} in this host's configuration document ({}) names {origin}, which is not served \
+             over https: this host presents its account token to a storage service it does not \
+             run itself only over https",
+            kr_protocol::hostinfo::configuration::STORAGE_ORIGIN.key,
+            kr_protocol::hostinfo::configuration::FILE_NAME,
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses two accounts whose grants would be kept under one name in the secret store.
+///
+/// A scope is named by a truncated digest of the origin, and a revocation that waits to be sent
+/// holds a grant identifier and a refresh token and no issuer, so a storage origin chosen to share
+/// the managed account's name would read the managed queue and send live managed refresh tokens to
+/// the storage service.
+///
+/// # Errors
+///
+/// Returns [`ControllerError::NotConfigured`] naming `storage.origin`.
+fn refuse_equal_scopes(managed: &str, storage: &str) -> Result<()> {
+    if managed == storage {
+        return Err(ControllerError::NotConfigured(format!(
+            "{} in this host's configuration document ({}) names a service whose sign-in would be \
+             kept under the same name as the managed account's: name the service by another \
+             origin",
+            kr_protocol::hostinfo::configuration::STORAGE_ORIGIN.key,
+            kr_protocol::hostinfo::configuration::FILE_NAME,
+        )));
+    }
+    Ok(())
+}
+
 impl Controller {
-    /// The host's own sign-in to the managed account service, through the proxy the configuration
-    /// document selects.
+    /// The host's managed account, through the proxy the configuration document selects.
     ///
     /// The account service is the one the browser signs in at, and a code is redeemable only
     /// there, so every request of the sign-in goes there and the voice broker and the storage
     /// service are each presented a token only when they are that service. A host whose broker is
-    /// another service, or none, and that selects no storage service signs in and presents nowhere,
-    /// but still reaches the account service for what it holds: the grant it was signed in with
-    /// while its broker was the managed one can be seen, revoked and signed out. What stands in
-    /// the way is said on standard error, as for the voice broker.
+    /// another service, or none, and that selects no storage service of the managed origin signs in
+    /// and presents nowhere, but still reaches the account service for what it holds: the grant it
+    /// was signed in with while its broker was the managed one can be seen, revoked and signed
+    /// out. What stands in the way is said on standard error, as for the voice broker.
     ///
     /// The sign-in asks for the scope of each service the host presents it to: voice where the
-    /// broker is the account service, backup storage where the document selects a storage
-    /// service, and the right to bill relay traffic where the relay lease service is the account
-    /// service. The account that pays for the leases is the one the host is signed in as.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ControllerError::NotConfigured`] naming `storage.origin` when the document
-    /// selects a storage service that is not the account service, because the host would present
-    /// its account token to a service that did not issue it.
+    /// broker is the account service, backup storage where the document selects the managed
+    /// storage service, and the right to bill relay traffic where the relay lease service is the
+    /// account service. The account that pays for the leases is the one the host is signed in as.
+    /// A storage service the person runs is reached with an account of its own
+    /// ([`Self::build_storage_account`]).
     pub(super) fn build_host_account(
         started: &crate::config::Started,
         store: Arc<dyn kr_crypto::store::SecretStore>,
         environment_id: kr_protocol::ids::EnvironmentId,
         runtime_root: &std::path::Path,
-    ) -> Result<crate::account::HostAccount> {
+    ) -> HostAccount {
         use kr_protocol::host_account::SignInUnavailable;
 
         let unusable = |reason: &dyn std::fmt::Display| {
@@ -62,24 +109,14 @@ impl Controller {
             SignInUnavailable::NotUsable
         };
         let origin = account_origin();
-        let storage = started.storage.origin();
-        if let Some(storage) = storage
-            && storage != origin
-        {
-            return Err(ControllerError::NotConfigured(format!(
-                "{} in this host's configuration document ({}) is not the managed account service, \
-                 and this host presents its account token to no other service: select {origin}",
-                kr_protocol::hostinfo::configuration::STORAGE_ORIGIN.key,
-                kr_protocol::hostinfo::configuration::FILE_NAME,
-            )));
-        }
         let broker = started.voice.broker_origin();
+        let managed_storage = started.storage.origin() == Some(origin.as_str());
         let relay_is_account_service = started.relay.origin() == Some(origin.as_str());
         let mut scopes = Vec::new();
         if broker == Some(origin.as_str()) {
             scopes.push(kr_client::services::voice::VOICE_SCOPE);
         }
-        if storage.is_some() {
+        if managed_storage {
             scopes.push(kr_client::services::account::BACKUP_WRITE_SCOPE);
         }
         if relay_is_account_service {
@@ -92,12 +129,12 @@ impl Controller {
         let refused = if closed {
             Some(SignInUnavailable::NotUsable)
         } else {
-            match (broker, storage) {
-                (_, Some(_)) => None,
-                (_, None) if relay_is_account_service => None,
-                (None, None) => Some(SignInUnavailable::NoManagedService),
-                (Some(broker), None) if broker == origin => None,
-                (Some(_), None) => Some(SignInUnavailable::BrokerIsAnotherService),
+            match (broker, managed_storage) {
+                (_, true) => None,
+                (_, false) if relay_is_account_service => None,
+                (None, false) => Some(SignInUnavailable::NoManagedService),
+                (Some(broker), false) if broker == origin => None,
+                (Some(_), false) => Some(SignInUnavailable::BrokerIsAnotherService),
             }
         };
         let service = GatewayOrigin::new(&origin)
@@ -113,19 +150,73 @@ impl Controller {
                 }
                 Err(error) => Err(unusable(&error)),
             });
-        Ok(crate::account::HostAccount::new(
+        HostAccount::new(store, environment_id, runtime_root, service, refused)
+    }
+
+    /// The account of the storage service the person runs, when the host's `storage.origin` names
+    /// a service that is not the managed one, and none when it names the managed one or none.
+    ///
+    /// The account asks for `backup.write` and hands out that scope and no other. It is built
+    /// after the two rules that keep it from sending an account token where none should go: the
+    /// storage origin is served over https in a shipped build, and its scope in the secret store
+    /// has a name of its own, because building it starts settling what that scope holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::NotConfigured`] naming `storage.origin` when it is not usable or
+    /// breaks one of the two rules.
+    pub(super) fn build_storage_account(
+        started: &crate::config::Started,
+        managed: &HostAccount,
+        store: Arc<dyn kr_crypto::store::SecretStore>,
+        environment_id: kr_protocol::ids::EnvironmentId,
+    ) -> Result<Option<HostAccount>> {
+        use kr_protocol::host_account::SignInUnavailable;
+
+        let managed_origin = account_origin();
+        let Some(storage) = started
+            .storage
+            .origin()
+            .filter(|storage| *storage != managed_origin)
+        else {
+            return Ok(None);
+        };
+        let storage = super::clients::selected_origin(
+            &kr_protocol::hostinfo::configuration::STORAGE_ORIGIN,
+            storage,
+        )?;
+        refuse_plain_http(&storage, PLAIN_HTTP_PERMITTED)?;
+        refuse_equal_scopes(
+            &crate::account::scope_of(environment_id, &managed_origin),
+            &crate::account::scope_of(environment_id, storage.as_str()),
+        )?;
+        let route = Self::outbound_of(started)?;
+        let refused = matches!(&route, Outbound::Closed(_)).then_some(SignInUnavailable::NotUsable);
+        let service = Service::at_origin(
+            &storage,
+            vec![kr_client::services::account::BACKUP_WRITE_SCOPE],
+            route,
+        );
+        Ok(Some(HostAccount::for_storage(
+            managed,
             store,
             environment_id,
-            runtime_root,
-            service,
+            Ok(service),
             refused,
-        ))
+        )))
     }
 
     /// This host's own sign-in to the managed account service.
     #[must_use]
     pub fn host_account(&self) -> &Arc<crate::account::HostAccount> {
         &self.account
+    }
+
+    /// The account that serves this host's storage service: the managed account when the storage
+    /// service is the managed one, and the account of the service the person runs otherwise.
+    #[must_use]
+    pub fn storage_account(&self) -> &Arc<crate::account::HostAccount> {
+        self.storage_account.as_ref().unwrap_or(&self.account)
     }
 
     /// Answers `account.sign_in`: starts the sign-in and says when the daemon stops waiting for
@@ -168,5 +259,47 @@ impl Controller {
         let _: AccountStatusParams = parse(params)?;
         ParamsValue::from_typed(&self.account.report())
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_protocol::service::GatewayOrigin;
+
+    use super::{refuse_equal_scopes, refuse_plain_http};
+
+    fn origin(text: &str) -> GatewayOrigin {
+        GatewayOrigin::new(text).expect("an origin")
+    }
+
+    /// A storage origin that is served over plain HTTP is refused where plain HTTP is not
+    /// permitted, whether or not the document names a proxy, and the refusal names the key. The
+    /// rule takes the permission as an argument because this crate's own tests always run with it:
+    /// the program a person runs is shown to refuse by the shipped-build case of the daemon's
+    /// storage account suite.
+    #[test]
+    fn a_plain_http_storage_origin_is_refused_where_plain_http_is_not_permitted() {
+        let loopback = origin("http://127.0.0.1:8787");
+        let refusal = refuse_plain_http(&loopback, false).expect_err("a refusal");
+        assert!(refusal.to_string().contains("storage.origin"), "{refusal}");
+        assert!(refuse_plain_http(&loopback, true).is_ok());
+    }
+
+    /// The same origin over https is the one a shipped build presents an account token to.
+    #[test]
+    fn an_https_storage_origin_is_admitted_whether_or_not_plain_http_is_permitted() {
+        let owner = origin("https://owner.example");
+        assert!(refuse_plain_http(&owner, false).is_ok());
+        assert!(refuse_plain_http(&owner, true).is_ok());
+    }
+
+    /// Two accounts whose grants would be kept under one name in the secret store are refused, and
+    /// the refusal names the key. Two names that differ are not.
+    #[test]
+    fn a_storage_account_whose_scope_has_the_managed_accounts_name_is_refused() {
+        let refusal = refuse_equal_scopes("env/host-account/aa", "env/host-account/aa")
+            .expect_err("a refusal");
+        assert!(refusal.to_string().contains("storage.origin"), "{refusal}");
+        assert!(refuse_equal_scopes("env/host-account/aa", "env/host-account/bb").is_ok());
     }
 }

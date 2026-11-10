@@ -765,8 +765,13 @@ pub struct Controller {
     voice: std::sync::OnceLock<Arc<crate::voice::VoiceModule>>,
     /// How long the voice service waits on a session's worker.
     voice_budgets: std::sync::Mutex<voice_actions::VoiceBudgets>,
-    /// This host's own sign-in to the managed account service, which managed voice presents.
+    /// This host's own sign-in to the managed account service, which managed voice, the relay lease
+    /// service and managed storage present.
     account: Arc<crate::account::HostAccount>,
+    /// This host's own sign-in to the storage service the person runs, when `storage.origin` names
+    /// a service that is not the managed one. It is given to the storage clients and to nothing
+    /// else.
+    storage_account: Option<Arc<crate::account::HostAccount>>,
     /// The environment's privacy record: privacy mode's generation, what each session still owes,
     /// and the root that drives the backup service, delivery and the descriptions through it.
     pub(crate) privacy: Arc<crate::privacy::EnvironmentPrivacy>,

@@ -38,11 +38,15 @@ pub(super) struct StorageParts<'a> {
     pub writer: &'a AuthorisationKeyPair,
     /// The record of the account the backups belong to, which the account's token is held to.
     pub binding: Arc<Binding>,
+    /// The account that serves the storage service: the managed account for managed storage, and
+    /// the account of the service the person runs otherwise.
+    pub account: &'a Arc<HostAccount>,
 }
 
 /// What the daemon's clients are built from.
 pub(super) struct ClientParts<'a> {
-    /// The host's own sign-in to the managed account service.
+    /// The host's own sign-in to the managed account service, which the voice broker and the
+    /// account login the doctor reads are given.
     pub account: &'a Arc<HostAccount>,
     /// The key the host signs the relay lease service's requests with.
     pub host_key: &'a AuthorisationKeyPair,
@@ -86,7 +90,7 @@ impl Controller {
         let mut clients = ServiceClients::none();
         clients.account = parts.account.account_service();
         if let Some(storage) = &parts.storage {
-            let tokens = parts
+            let tokens = storage
                 .account
                 .bound_tokens_for(storage.origin.as_str(), Arc::clone(&storage.binding));
             let held = crate::backup::runtime::managed_clients(
@@ -148,6 +152,69 @@ impl Controller {
         crate::voice::VoiceModule::managed_provider(origin, transport, account.tokens_for(origin))
             .inspect_err(|error| origin_unusable(error))
             .ok()
+    }
+
+    /// The service clients this daemon holds, for a suite that calls them as the daemon's own code
+    /// does and reads what each presents.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn service_clients(&self) -> &ServiceClients {
+        &self.clients
+    }
+
+    /// What `kr doctor` says of the account at the storage service the person runs, when this host
+    /// has one: whether it is signed in there, and that it is not the managed account, which voice
+    /// and the relay lease service use. A host whose storage is managed has no such account and
+    /// gets no line.
+    pub(super) fn storage_account_check(&self) -> Option<DoctorCheck> {
+        use kr_protocol::host_account::AccountState;
+
+        let account = self.storage_account.as_ref()?;
+        let (status, detail, remedy) = match account.report().state {
+            AccountState::SignedIn { scopes, .. }
+                if scopes
+                    .iter()
+                    .any(|scope| scope == kr_client::services::account::BACKUP_WRITE_SCOPE) =>
+            {
+                (
+                    DoctorStatus::Ok,
+                    "this host is signed in at the storage service you run, for backup storage \
+                     and nothing else",
+                    None,
+                )
+            }
+            AccountState::SignedIn { .. } => (
+                DoctorStatus::Warning,
+                "this host is signed in at the storage service you run, and the sign-in lacks \
+                 the backup.write scope",
+                Some("Sign this host in again with `kr account sign-in --storage`."),
+            ),
+            AccountState::WaitingForBrowser { .. } | AccountState::Finishing => (
+                DoctorStatus::Warning,
+                "a sign-in at the storage service you run is waiting to finish",
+                Some("Finish the sign-in at the address `kr account sign-in --storage` printed."),
+            ),
+            AccountState::Ended => (
+                DoctorStatus::Warning,
+                "the storage service you run ended this host's sign-in",
+                Some("Sign this host in again with `kr account sign-in --storage`."),
+            ),
+            AccountState::SignedOut => (
+                DoctorStatus::Warning,
+                "no account is signed in at the storage service you run",
+                Some("Sign this host in with `kr account sign-in --storage`."),
+            ),
+        };
+        Some(DoctorCheck::new(
+            "storage-account",
+            "This host's account at its storage service",
+            status,
+            Sentence::new().stated(detail).stated(
+                ". It is a different account from the managed one that voice and relay leases \
+                 use, and it hands out backup.write to nothing but the storage clients.",
+            ),
+            remedy,
+        ))
     }
 
     /// What `kr doctor` says of the managed services: which of the four a host can hold this

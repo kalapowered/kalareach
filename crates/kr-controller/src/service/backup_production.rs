@@ -362,7 +362,7 @@ impl Controller {
         let backup = Arc::clone(&self.backup);
         let facts = {
             let backup = Arc::clone(&backup);
-            let account = Arc::clone(self.host_account());
+            let account = Arc::clone(self.storage_account());
             let origin = production.origin.clone();
             tokio::task::spawn_blocking(move || {
                 Ok::<_, ControllerError>((
@@ -840,10 +840,13 @@ impl Controller {
                     "the account signed in, or the service selected, is not the one the backups \
                      were set up for",
                 ),
-                Some(
+                Some(if self.storage_account().is_storage() {
+                    "Sign in as that account with `kr account sign-in --storage`, or run `kr \
+                     backup setup --replace`."
+                } else {
                     "Sign in as that account with `kr account sign-in`, or run `kr backup setup \
-                     --replace`.",
-                ),
+                     --replace`."
+                }),
             ),
             Some(Held::Keys) => (
                 DoctorStatus::Warning,

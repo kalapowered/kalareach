@@ -2207,6 +2207,17 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
     },
     IgnoredRun {
         package: "kr-controller",
+        target: "--test storage_account",
+        cases: &[
+            "a_shipped_controller_refuses_a_plain_http_storage_origin_before_it_sends_anything",
+        ],
+        runs: Runs::Command {
+            file: "scripts/shipped-controller-gate.sh",
+            line: "KR_SHIPPED_CONTROLLER=\"$target/debug/kr-controller\" cargo test --locked -p kr-controller --test storage_account -- --ignored --exact a_shipped_controller_refuses_a_plain_http_storage_origin_before_it_sends_anything --nocapture",
+        },
+    },
+    IgnoredRun {
+        package: "kr-controller",
         target: "--test descriptions",
         cases: &[],
         runs: Runs::ByHand {

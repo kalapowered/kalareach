@@ -162,21 +162,37 @@ impl TokenState {
         }
     }
 
-    /// What a person does about it: the sign-in is the one thing that mends each.
-    const fn remedy(self) -> &'static str {
-        match self {
-            Self::Absent => "Sign this host in with `kr account sign-in`.",
-            Self::SigningIn => "Finish the sign-in at the address `kr account sign-in` printed.",
-            Self::Ended => "Sign this host in again with `kr account sign-in`.",
-            Self::WithoutScope => {
+    /// What a person does about it: the sign-in is the one thing that mends each. The storage
+    /// service a person runs has an account of its own, which `--storage` signs in.
+    const fn remedy(self, storage: bool) -> &'static str {
+        match (self, storage) {
+            (Self::Absent, false) => "Sign this host in with `kr account sign-in`.",
+            (Self::Absent, true) => "Sign this host in with `kr account sign-in --storage`.",
+            (Self::SigningIn, false) => {
+                "Finish the sign-in at the address `kr account sign-in` printed."
+            }
+            (Self::SigningIn, true) => {
+                "Finish the sign-in at the address `kr account sign-in --storage` printed."
+            }
+            (Self::Ended, false) => "Sign this host in again with `kr account sign-in`.",
+            (Self::Ended, true) => "Sign this host in again with `kr account sign-in --storage`.",
+            (Self::WithoutScope, false) => {
                 "Sign this host in again with `kr account sign-in`, which asks for backup \
                  storage because storage.origin is set."
             }
-            Self::NotRenewed => {
+            (Self::WithoutScope, true) => {
+                "Sign this host in again with `kr account sign-in --storage`, which asks for \
+                 backup storage because storage.origin is set."
+            }
+            (Self::NotRenewed, false) => {
                 "This host asks again by itself. Check that the account service is reachable, or \
                  sign this host in again with `kr account sign-in`."
             }
-            Self::Usable => "",
+            (Self::NotRenewed, true) => {
+                "This host asks again by itself. Check that the storage service is reachable, or \
+                 sign this host in again with `kr account sign-in --storage`."
+            }
+            (Self::Usable, _) => "",
         }
     }
 }
@@ -882,6 +898,8 @@ impl BackupRuntime {
                 self.wake();
             }
         }
+        // A storage service the person runs has an account of its own, which the advice names.
+        let storage = self.shared.sign_in.is_storage();
         let other_account = !usable && self.shared.signed_in_as_another();
         let state = if usable {
             TokenState::Usable
@@ -971,13 +989,17 @@ impl BackupRuntime {
         let remedy = if well {
             None
         } else if other_account {
-            Some(
+            Some(if storage {
+                "Sign this host in as the account its backups belong to with `kr account \
+                 sign-in --storage`, or run `kr backup setup --replace` to back up the account \
+                 it is signed in as."
+            } else {
                 "Sign this host in as the account its backups belong to with `kr account \
                  sign-in`, or run `kr backup setup --replace` to back up the account it is \
-                 signed in as.",
-            )
+                 signed in as."
+            })
         } else if state != TokenState::Usable {
-            Some(state.remedy())
+            Some(state.remedy(storage))
         } else if backup_off {
             Some("Turn backup storage on for the account.")
         } else {
@@ -1001,7 +1023,11 @@ impl BackupRuntime {
         };
         DoctorCheck::new(
             "managed-storage",
-            "This host reaches its managed storage service",
+            if storage {
+                "This host reaches its storage service"
+            } else {
+                "This host reaches its managed storage service"
+            },
             if well {
                 DoctorStatus::Ok
             } else {

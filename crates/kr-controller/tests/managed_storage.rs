@@ -52,7 +52,7 @@ use kr_protocol::backup_setup::{
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::host_account::{
-    AccountReport, AccountSignInParams, AccountState, AccountStatusParams,
+    AccountReport, AccountSignInParams, AccountState, AccountStatusParams, SignInUnavailable,
 };
 use kr_protocol::hostinfo::{DoctorStatus, HostDoctorResult};
 use kr_protocol::ids::{
@@ -143,6 +143,9 @@ struct Arrangement {
     /// How the service meets the daemon's first question about backup storage, when it does not
     /// simply answer it.
     first_status: Option<Moment>,
+    /// Whether the service is one its owner runs, which is not the managed account service: the
+    /// daemon is given no standing for it as the account service, as a shipped daemon is not.
+    owner_run: bool,
 }
 
 impl Arrangement {
@@ -152,6 +155,13 @@ impl Arrangement {
         backup_on: true,
         selects_the_service: true,
         first_status: None,
+        owner_run: false,
+    };
+
+    /// The service is one the owner runs.
+    const OWNER_RUN: Self = Self {
+        owner_run: true,
+        ..Self::NORMAL
     };
 }
 
@@ -234,7 +244,7 @@ impl Rig {
         }
         sign_in(&host, arrangement.token, served.origin()).await;
         let (controller, client_endpoint, serving) =
-            start_daemon_on(&host, Arc::clone(&timer), clocks).await;
+            start_daemon_on(&host, Arc::clone(&timer), clocks, arrangement.owner_run).await;
         let writer = daemon_writer(&host);
         let rig = Self {
             host,
@@ -790,20 +800,27 @@ async fn start_daemon(
     kr_ipc::paths::Endpoint,
     Vec<tokio::task::JoinHandle<kr_controller::Result<()>>>,
 ) {
-    start_daemon_on(host, timer, Clocks::system()).await
+    start_daemon_on(host, timer, Clocks::system(), false).await
 }
 
-/// As [`start_daemon`], on the clocks given.
+/// As [`start_daemon`], on the clocks given, over a service the owner runs when `owner_run`: the
+/// daemon is then given no account service of the stand-in's origin, as a shipped daemon is not.
 async fn start_daemon_on(
     host: &kr_ipc::testing::TempHost,
     timer: Arc<HeldTimer>,
     clocks: Clocks,
+    owner_run: bool,
 ) -> (
     Arc<Controller>,
     kr_ipc::paths::Endpoint,
     Vec<tokio::task::JoinHandle<kr_controller::Result<()>>>,
 ) {
-    let controller = try_start_controller_on(host, timer, selected_origin_of(host), clocks)
+    let account_at = if owner_run {
+        None
+    } else {
+        selected_origin_of(host)
+    };
+    let controller = try_start_controller_on(host, timer, account_at, clocks)
         .await
         .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
     let endpoint = host
@@ -2390,23 +2407,6 @@ async fn a_sign_in_asks_for_the_scope_of_each_service_the_host_presents_its_acco
             "{case}"
         );
     }
-}
-
-/// A host whose document selects a storage service that is not the account service does not start,
-/// and says which key: its account token would go to a service that did not issue it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_host_that_selects_a_storage_service_other_than_the_account_service_does_not_start() {
-    let host = kr_ipc::testing::TempHost::create();
-    let served = serve().await;
-    write_document(&host, Some(served.origin()));
-    let error = try_start_controller(
-        &host,
-        HeldTimer::held(),
-        Some("https://elsewhere.example".to_owned()),
-    )
-    .await
-    .expect_err("the daemon refuses to start");
-    assert!(error.to_string().contains("storage.origin"), "{error}");
 }
 
 /// The account token goes to the account service and to no other: a call to a service at another
@@ -9492,4 +9492,299 @@ fn first_object_ids(rig: &Rig) -> Vec<BackupObjectId> {
         .iter()
         .map(|object| object.object_id)
         .collect()
+}
+
+// ---------------------------------------------------------------------------------------------
+// A storage service the owner runs.
+// ---------------------------------------------------------------------------------------------
+
+/// A host whose document selects a storage service at an `https` origin that is not the managed
+/// account service starts, with an account of its own for that service beside the managed one. The
+/// daemon here is given no standing for any origin as the account service, so the origin is
+/// another service's, as it is for a shipped daemon.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_selects_a_storage_service_its_owner_runs_starts_with_an_account_of_its_own() {
+    let host = kr_ipc::testing::TempHost::create();
+    write_document(&host, Some("https://owner.example"));
+    let controller = try_start_controller(&host, HeldTimer::held(), None)
+        .await
+        .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
+
+    assert!(
+        !Arc::ptr_eq(controller.storage_account(), controller.host_account()),
+        "the storage service has an account of its own"
+    );
+    let storage = controller.storage_account().report();
+    assert_eq!(
+        storage.service.0.as_deref(),
+        Some("https://owner.example"),
+        "it is the account at the service the document names"
+    );
+    assert_eq!(storage.state, AccountState::SignedOut);
+    assert_eq!(
+        controller.host_account().report().unavailable.0,
+        Some(SignInUnavailable::NoManagedService),
+        "the managed account is none the host presents: it names no managed service"
+    );
+}
+
+/// A host whose storage service is one its owner runs, signed in there for storage, is set up there
+/// and backs up there: the owner's setup writes the bundle, enrols the writer and turns storage on
+/// at that service, the setup is recorded for it, and the carrier uploads a generation and publishes
+/// it. Every request carries the account that service issued, the managed account is asked for
+/// nothing, and the daemon is given no standing for the service as the account service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_whose_storage_is_one_its_owner_runs_is_set_up_there_and_backs_up_there() {
+    let timer = HeldTimer::held();
+    let mut closed = None;
+    let rig = Rig::start_on(
+        Arrangement {
+            enrolled: false,
+            backup_on: false,
+            ..Arrangement::OWNER_RUN
+        },
+        Arc::clone(&timer),
+        Clocks::system(),
+        |host| closed = Some(closed_session(host, b"a line\r\n", 9_000)),
+    )
+    .await;
+    let session = closed.expect("a closed session");
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+
+    let made = rig.prepared_setup(archive_id(), false);
+    let result = rig.enable(&made.params).await;
+    assert!(
+        matches!(result, BackupEnableResult::Enabled { .. }),
+        "{result:?}"
+    );
+    let row = rig
+        .controller
+        .backup()
+        .setup()
+        .expect("a read")
+        .expect("a setup");
+    assert_eq!(
+        row.record.origin,
+        rig.origin(),
+        "the setup is recorded for the service the owner runs"
+    );
+    rig.until("the first generation is published", |rig| rig.published(1))
+        .await;
+    let kit = kr_client::recovery::parse_kit(&made.kit).expect("the kit");
+    let seed = kr_crypto::kdf::RecoverySeed::from_kit(&kit).expect("the seed");
+    let recipient = seed.recipient().expect("the recipient");
+    let members = opened_members_as(
+        &rig,
+        1,
+        &kr_crypto::backup::ArchiveReader::Recovery(&recipient),
+    );
+    assert!(members.contains_key(&format!("sessions/{session}.json")));
+
+    assert!(
+        rig.controller
+            .storage_account()
+            .token_scopes_asked()
+            .iter()
+            .any(|scope| scope == "backup.write"),
+        "the account of the storage service was asked"
+    );
+    assert!(
+        rig.controller
+            .host_account()
+            .token_scopes_asked()
+            .is_empty(),
+        "the managed account was asked for nothing"
+    );
+    assert!(
+        web.arrived()
+            .iter()
+            .all(|request| request.token.as_deref().is_none_or(|token| token == TOKEN)),
+        "only the token of the host's sign-in at the service left the host"
+    );
+}
+
+/// A doctor read of the daemon at `endpoint`.
+async fn doctor_at(endpoint: &kr_ipc::paths::Endpoint) -> HostDoctorResult {
+    let mut client = LocalClient::connect(endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    client
+        .request(Method::HostDoctor, &())
+        .await
+        .expect("the call reaches the daemon")
+        .expect("host.doctor is served on the local socket")
+        .to_typed()
+        .expect("a result of the declared shape")
+}
+
+/// Serves `controller`'s local socket until the returned task is aborted.
+fn serve_locally(
+    host: &kr_ipc::testing::TempHost,
+    controller: &Arc<Controller>,
+) -> (
+    kr_ipc::paths::Endpoint,
+    tokio::task::JoinHandle<kr_controller::Result<()>>,
+) {
+    let endpoint = host
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let serving = tokio::spawn(
+        Arc::clone(controller)
+            .serve_clients(Listener::bind(&endpoint).expect("binds the client endpoint")),
+    );
+    (endpoint, serving)
+}
+
+/// Storage that moves between the managed service and one the owner runs. Moved to the owner's
+/// service, the managed account stays the host's account for managed voice, the setup recorded at
+/// the managed service reads as unusable for the account, the producer holds back, and setting
+/// backups up again there makes a setup recorded for the new service. Moved back, the grant for the
+/// service the owner runs is presented to nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn storage_that_moves_between_the_managed_service_and_one_the_owner_runs_leaves_each_account_with_its_own()
+ {
+    // Managed storage, with its setup recorded for the account signed in there.
+    let rig = Rig::start(Arrangement::NORMAL, HeldTimer::held()).await;
+    rig.set_up();
+    let (host, managed, timer) = rig.stop().await;
+
+    // The owner moves storage to a service they run. The broker stays at the managed service, and
+    // the host is signed in at the new service with a token that service issued and the managed
+    // service does not know.
+    const OWNER_TOKEN: &str = "the-owner-run-token";
+    let owner = serve().await;
+    owner.web().set_backup(true);
+    owner.web().issue_grant_token(
+        OWNER_TOKEN,
+        ACCOUNT,
+        "owner-grant",
+        &["openid", "backup.write"],
+    );
+    write_document_selecting(&host, Some(owner.origin()), Some(managed.origin()));
+    keep_sign_in(
+        &host,
+        owner.origin(),
+        OWNER_TOKEN,
+        &["openid", "backup.write"],
+        3600,
+    )
+    .await;
+    let controller =
+        try_start_controller(&host, Arc::clone(&timer), Some(managed.origin().to_owned()))
+            .await
+            .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
+    let (endpoint, serving) = serve_locally(&host, &controller);
+
+    // The managed grant is still presented to managed voice, and the grant for the owner's service
+    // is not.
+    let voice = controller
+        .service_clients()
+        .managed_inference
+        .clone()
+        .expect("the managed voice client");
+    let _ = voice.metadata().await;
+    let presented: Vec<_> = managed
+        .web()
+        .arrived()
+        .into_iter()
+        .filter_map(|request| request.token)
+        .collect();
+    assert!(
+        presented.iter().any(|token| token == TOKEN),
+        "the managed token went to managed voice: {presented:?}"
+    );
+    assert!(
+        presented.iter().all(|token| token != OWNER_TOKEN),
+        "the owner's token went to no managed request: {presented:?}"
+    );
+
+    // The setup was made for the managed service, so the host holds back and says so.
+    let status = status_at(&endpoint).await;
+    assert_eq!(status.service.0.as_deref(), Some(owner.origin()));
+    assert!(
+        matches!(
+            status.setup,
+            BackupSetupState::Committed { unusable, .. }
+                if unusable.0 == Some(BackupUnusable::Account)
+        ),
+        "{:?}",
+        status.setup
+    );
+    let held_back = doctor_at(&endpoint)
+        .await
+        .checks
+        .into_iter()
+        .find(|check| check.id() == "backup-production")
+        .expect("the producer's check");
+    assert_eq!(held_back.status, DoctorStatus::Warning);
+    assert!(
+        held_back
+            .detail()
+            .contains("is not the one the backups were set up for"),
+        "{}",
+        held_back.detail()
+    );
+
+    // Setting backups up again at the owner's service records a setup for it.
+    let writer = daemon_writer(&host);
+    let producer = daemon_producer(&host);
+    let made = kr_client::recovery::prepare_setup(&kr_client::recovery::SetupInputs {
+        origin: owner.origin(),
+        archive_id: archive_two(),
+        writer: (writer.key_id(), *writer.public()),
+        producer: (producer.key_id(), *producer.public()),
+        enabled_at_ms: kr_ipc::now_ms(),
+        replace: true,
+    })
+    .expect("a setup is prepared");
+    let result = enable_at(&endpoint, host.environment_id(), &made.params).await;
+    assert!(
+        matches!(result, BackupEnableResult::Enabled { .. }),
+        "{result:?}"
+    );
+    let row = controller
+        .backup()
+        .setup()
+        .expect("a read")
+        .expect("a setup");
+    assert_eq!(row.record.origin, owner.origin());
+    assert!(
+        owner
+            .web()
+            .bundle(&made.params.bundle_locator.to_string())
+            .is_some(),
+        "the bundle is at the owner's service"
+    );
+    assert!(
+        managed
+            .web()
+            .bundle(&made.params.bundle_locator.to_string())
+            .is_none(),
+        "and not at the managed service"
+    );
+
+    // Back to the managed service: the grant for the owner's service is presented to nothing.
+    serving.abort();
+    let _ = serving.await;
+    drop(controller);
+    let before = owner.web().arrived().len();
+    write_document_selecting(&host, Some(managed.origin()), Some(managed.origin()));
+    let (controller, _, _serving) = start_daemon(&host, timer).await;
+    assert!(
+        Arc::ptr_eq(controller.storage_account(), controller.host_account()),
+        "managed storage is served by the managed account"
+    );
+    controller.backup().signals().work.notify_one();
+    let mut passes = controller.backup_runtime().expect("a carrier").passes();
+    within("a pass of the carrier", async {
+        passes.changed().await.expect("the carrier is running");
+    })
+    .await;
+    assert_eq!(
+        owner.web().arrived().len(),
+        before,
+        "nothing reached the service the owner ran after storage moved off it"
+    );
 }

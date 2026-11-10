@@ -1,43 +1,66 @@
-//! The host's own sign-in to the managed account service.
+//! The host's own sign-ins to account services.
 //!
-//! Managed voice spends an account's balance and managed storage keeps an account's backups, so the
-//! host presents an account token of its own to both. The daemon alone holds the sign-in: the grant
-//! lives in the host's secret store under [`SignedInAccount`], whose refresh token rotates on every
-//! use, so a second holder would end it. A person starts the sign-in at this machine (`kr account
-//! sign-in`); the daemon listens on the loopback address the desktop client is registered with, the
-//! person's browser comes back to it, and the daemon exchanges the answer and keeps the grant.
+//! Managed voice spends an account's balance, managed relay leases are billed to an account and
+//! backup storage keeps an account's backups, so the host presents an account token of its own to
+//! each. The daemon alone holds a sign-in: the grant lives in the host's secret store under
+//! [`SignedInAccount`], whose refresh token rotates on every use, so a second holder would end it.
+//! A person starts the sign-in at this machine (`kr account sign-in`); the daemon listens on the
+//! loopback address the desktop client is registered with, the person's browser comes back to it,
+//! and the daemon exchanges the answer and keeps the grant.
+//!
+//! # Two accounts, one for each role
+//!
+//! A host holds the managed account, for managed voice, the relay lease service and push, and,
+//! when its `storage.origin` names a service the person runs, a second account of its own at that
+//! service, for storage and for nothing else. Each is a [`HostAccount`] with its own grant in its
+//! own scope of the secret store, its own transport, its own sign-in and sign-out. A client is
+//! given the account of its role when it is built: the voice client, the relay payer and the call
+//! watch are given the managed account and never the storage one, and the storage clients are
+//! given the account of the storage service. The storage account also hands out one scope,
+//! `backup.write`, on every path that hands a token out, whatever its grant holds, so a service
+//! the person runs that grants it `voice` or `relay.lease` as well gets neither token from this
+//! host.
 //!
 //! # One service, by construction
 //!
 //! The browser signs in at the account service, and the code it brings back is redeemable there and
-//! nowhere else, so the exchange, every refresh and every revocation go to that one service. The
-//! host's configuration names a voice broker and may select a storage service; the host presents a
-//! token to each only when it is that service, and signs in when it presents to one. A host that
-//! selects no storage service and whose broker is another service, or none, signs in nowhere and
-//! presents nothing.
+//! nowhere else, so the exchange, every refresh and every revocation go to that one service. An
+//! account is built from one origin ([`Service::at_origin`]): the client of the service, the
+//! transport that reaches it and the name its grant is kept under all come from that origin, so no
+//! account is paired with another origin's service.
+//!
+//! The managed host's configuration names a voice broker and may select a storage service; the
+//! host presents a token to each only when it is that service, and signs in when it presents to
+//! one. A host that selects no storage service of the managed origin and whose broker is another
+//! service, or none, signs in nowhere and presents nothing.
 //!
 //! What the store holds is kept in a scope named by the service. A grant, and a revocation that
 //! waits to be sent, can therefore be read only through the service that issued them, and a host
 //! never sends a token to a service that did not issue it. A host that is moved off the managed
 //! broker still reaches the account service for what it holds: it can see the grant, send the
 //! revocations that wait and sign out, because those requests go to the service that issued the
-//! grant whatever the broker is. Two checks keep a token from the wrong service: a token source is
-//! made for the origin of the service it serves ([`HostAccount::tokens_for`]) and hands out nothing
-//! unless that origin is the account service's, and the daemon does not start when the storage
-//! service it selects is not the account service.
+//! grant whatever the broker is. A token source is made for the origin of the service it serves
+//! ([`HostAccount::tokens_for`]) and hands out nothing unless that origin is its account's.
 //!
 //! The grant is refreshed when a call, the storage carrier or `kr doctor` needs a token and the one
 //! held is about to end, never before, so a host that does none of them spends no refresh token.
 //!
+//! # One waiting sign-in
+//!
+//! Both accounts sign in through the one loopback address the desktop client is registered with,
+//! so a host has one waiting sign-in between them. A sign-in that starts ends a waiting one of
+//! either account, which then reads superseded; a grant that is held is never ended by it.
+//!
 //! # The account never changes under a call
 //!
 //! A call closes under the account it started under, and a start or a close asks for a token of its
-//! own. Signing in or out is refused while a call is open, which includes a start that is waiting on
-//! the broker and a close that is not finished (the coordinator counts both). The commit of a
-//! sign-in and the removal of a sign-out then raise a gate that makes every token request wait while
-//! they run: a start that begins after the check waits for the change to end and takes the token of
-//! the account the change leaves, or is refused when none is left, and one that began before it was
-//! counted by the check. No call can hold a token of the old account across the change.
+//! own. Signing in or out of the managed account is refused while a call is open, which includes a
+//! start that is waiting on the broker and a close that is not finished (the coordinator counts
+//! both). The commit of a sign-in and the removal of a sign-out then raise a gate that makes every
+//! token request wait while they run: a start that begins after the check waits for the change to
+//! end and takes the token of the account the change leaves, or is refused when none is left, and
+//! one that began before it was counted by the check. No call can hold a token of the old account
+//! across the change. No call is made under the storage account, so it has no calls to wait for.
 //!
 //! A call whose device went silent does not hold the account for good. Before a request is refused
 //! for a call, the calls that are over are ended: one past its own deadline, and one the managed
@@ -52,9 +75,9 @@ use std::time::Duration;
 
 use kr_client::services::account::{
     AccountHttp, AccountService, AccountStatus, AccountTokenSource, Answer, AnswerFault,
-    AuthorisationGrant, AuthorisationRequest, Client, Commit, Exchanged, IdentityRead,
-    ManagedAccountService, PendingAuthorisation, RELAY_LEASE_SCOPE, Redirect, SignedInAccount,
-    TokenOfAccount,
+    AuthorisationGrant, AuthorisationRequest, BACKUP_WRITE_SCOPE, Client, Commit, Exchanged,
+    IdentityRead, ManagedAccountService, PendingAuthorisation, RELAY_LEASE_SCOPE, Redirect,
+    SignedInAccount, TokenOfAccount,
 };
 use kr_client::services::{AccountToken, HttpDeadlines, ServiceFuture};
 use kr_crypto::store::SecretStore;
@@ -182,10 +205,33 @@ struct State {
     last: Option<AccountAttempt>,
 }
 
-/// The attempt that is waiting: how to end it, and the task to wait for.
+/// The attempt that is waiting: whose it is, how to end it, and the task to wait for.
 struct Running {
+    owner: std::sync::Weak<Inner>,
     cancel: watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
+}
+
+impl Running {
+    /// Whether this is an attempt of `account`.
+    fn is_of(&self, account: &Arc<Inner>) -> bool {
+        std::sync::Weak::ptr_eq(&self.owner, &Arc::downgrade(account))
+    }
+
+    /// Ends the attempt, and waits until its task has finished.
+    async fn end(self) {
+        let _ = self.cancel.send(true);
+        let _ = self.task.await;
+    }
+}
+
+/// What the host's two accounts share. Both sign in through the one loopback address the desktop
+/// client is registered with, so the sign-in that waits for the browser is one, whichever account
+/// it is of.
+struct Accounts {
+    running: tokio::sync::Mutex<Option<Running>>,
+    /// The origin of the storage service the person runs, once the host has an account at it.
+    storage_origin: std::sync::OnceLock<String>,
 }
 
 /// The managed calls on this host, as the account needs to know them.
@@ -213,7 +259,15 @@ struct Inner {
     /// The refusal of a closed outbound route, which a refusal for `NotUsable` then carries.
     closed: Option<String>,
     state: Mutex<State>,
-    running: tokio::sync::Mutex<Option<Running>>,
+    /// What this host's two accounts share.
+    accounts: Arc<Accounts>,
+    /// The one scope this account hands out, for the storage account, whatever its grant holds.
+    /// The managed account hands out every scope its grant holds that a client asks for.
+    only: Option<&'static str>,
+    /// The scope of each request for a token this account has been asked for, a refused one
+    /// included, for a test that shows which clients ask which account.
+    #[cfg(feature = "testing")]
+    token_requests: Mutex<Vec<String>>,
     /// Settled once, before the first token is handed out: a grant whose own revocation was queued
     /// when an earlier run stopped is removed, and every revocation the service has not
     /// acknowledged is sent again.
@@ -262,10 +316,10 @@ impl PartialEq for GrantMark {
 }
 
 impl HostAccount {
-    /// The sign-in of one environment, kept in `store`, at `service` where this host can reach the
-    /// account service, or why it cannot. `refused` is why this host neither signs in nor presents
-    /// its account, when it does not: it selects no storage service and its voice broker is not the
-    /// account service.
+    /// The managed account of one environment, kept in `store`, at `service` where this host can
+    /// reach the account service, or why it cannot. `refused` is why this host neither signs in nor
+    /// presents its account, when it does not: it selects no storage service of the managed origin
+    /// and its voice broker is not the account service.
     ///
     /// Removes the account token file an earlier version of this host imported, under
     /// `runtime_root`, once, and starts settling what an earlier run left.
@@ -287,20 +341,62 @@ impl HostAccount {
                 "kr-controller: could not remove the account token this host had imported: {error}"
             ),
         }
+        let accounts = Arc::new(Accounts {
+            running: tokio::sync::Mutex::new(None),
+            storage_origin: std::sync::OnceLock::new(),
+        });
+        Self::build(store, environment_id, service, refused, accounts, None)
+    }
+
+    /// The account of the storage service a person runs, beside the managed account `managed`,
+    /// kept in `store` in a scope of its own.
+    ///
+    /// It asks for `backup.write` when a person signs in, and hands out that scope and no other,
+    /// whatever its grant holds. A sign-in of either account ends a waiting sign-in of the other,
+    /// because the two share the one address a browser comes back to.
+    ///
+    /// Starts settling what an earlier run left in its scope at once, so a caller checks what must
+    /// hold before this account exists first.
+    #[must_use]
+    pub fn for_storage(
+        managed: &Self,
+        store: Arc<dyn SecretStore>,
+        environment_id: EnvironmentId,
+        service: std::result::Result<Service, SignInUnavailable>,
+        refused: Option<SignInUnavailable>,
+    ) -> Self {
+        let accounts = Arc::clone(&managed.inner.accounts);
+        if let Ok(service) = &service {
+            let _ = accounts.storage_origin.set(service.origin.clone());
+        }
+        Self::build(
+            store,
+            environment_id,
+            service,
+            refused,
+            accounts,
+            Some(BACKUP_WRITE_SCOPE),
+        )
+    }
+
+    fn build(
+        store: Arc<dyn SecretStore>,
+        environment_id: EnvironmentId,
+        service: std::result::Result<Service, SignInUnavailable>,
+        refused: Option<SignInUnavailable>,
+        accounts: Arc<Accounts>,
+        only: Option<&'static str>,
+    ) -> Self {
         let (held, unavailable, closed) = match service {
             Ok(service) => {
                 // Everything kept for the sign-in lives under the service that issued it.
-                let scope = format!(
-                    "{environment_id}/host-account/{}",
-                    named_by(&service.origin)
-                );
                 let signed_in = SignedInAccount::at_origin(
                     &service.origin,
                     Arc::clone(&service.account),
                     store,
                     Client::Desktop,
                 )
-                .in_scope(scope);
+                .in_scope(scope_of(environment_id, &service.origin));
                 (
                     Some(Held {
                         origin: service.origin,
@@ -320,7 +416,10 @@ impl HostAccount {
                 unavailable,
                 closed,
                 state: Mutex::new(State::default()),
-                running: tokio::sync::Mutex::new(None),
+                accounts,
+                only,
+                #[cfg(feature = "testing")]
+                token_requests: Mutex::new(Vec::new()),
                 recovered: tokio::sync::OnceCell::new(),
                 calls: std::sync::OnceLock::new(),
                 changing: tokio::sync::watch::channel(false).0,
@@ -343,6 +442,22 @@ impl HostAccount {
             });
         }
         account
+    }
+
+    /// The command a person signs this account in with.
+    #[must_use]
+    pub fn sign_in_command(&self) -> &'static str {
+        if self.inner.only.is_some() {
+            "kr account sign-in --storage"
+        } else {
+            "kr account sign-in"
+        }
+    }
+
+    /// Whether this is the account of a storage service the person runs, beside the managed one.
+    #[must_use]
+    pub fn is_storage(&self) -> bool {
+        self.inner.only.is_some()
     }
 
     /// The account service client, when a sign-in can start at it.
@@ -376,6 +491,18 @@ impl HostAccount {
     #[cfg(feature = "testing")]
     pub fn listen_on(&self, address: std::net::SocketAddr) {
         *self.inner.loopback.lock().expect("the test address") = Some(address);
+    }
+
+    /// The scope of each request for a token this account has been asked for, in order, whether it
+    /// handed one out or refused, for a test that shows which clients ask which account.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn token_scopes_asked(&self) -> Vec<String> {
+        self.inner
+            .token_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// How many requests for a token are waiting for a change of the account to end, for a test that
@@ -493,6 +620,8 @@ impl HostAccount {
         origin: &str,
         renew: bool,
     ) -> kr_client::Result<TokenOfAccount> {
+        self.inner.counted(RELAY_LEASE_SCOPE);
+        self.inner.allows(RELAY_LEASE_SCOPE)?;
         let tokens = HostTokens {
             inner: Arc::clone(&self.inner),
             origin: origin.to_owned(),
@@ -578,8 +707,8 @@ impl HostAccount {
         }
     }
 
-    /// Starts a sign-in: ends the one that is waiting, listens for the browser's answer and
-    /// returns when the daemon is ready for it. The address the person opens is in
+    /// Starts a sign-in: ends the one that is waiting, whichever account it is of, listens for the
+    /// browser's answer and returns when the daemon is ready for it. The address the person opens is in
     /// [`Self::report`].
     ///
     /// # Errors
@@ -591,11 +720,15 @@ impl HostAccount {
         if self.inner.a_call_is_open_after_settling().await {
             return Err(Inner::call_is_open());
         }
-        let mut running = self.inner.running.lock().await;
+        let mut running = self.inner.accounts.running.lock().await;
+        // The sign-in that waits is one for both accounts: it is this account's or the other's, and
+        // one that is finishing has spent its code and is not ended by either.
+        if let Some(older) = running.as_ref().and_then(|older| older.owner.upgrade()) {
+            older.not_finishing()?;
+        }
         self.inner.not_finishing()?;
         if let Some(older) = running.take() {
-            let _ = older.cancel.send(true);
-            let _ = older.task.await;
+            older.end().await;
         }
         let listener = match self.listener().await {
             Ok(listener) => listener,
@@ -643,7 +776,11 @@ impl HostAccount {
         let task = tokio::spawn(async move {
             inner.attempt(listener, pending, cancelled).await;
         });
-        *running = Some(Running { cancel, task });
+        *running = Some(Running {
+            owner: Arc::downgrade(&self.inner),
+            cancel,
+            task,
+        });
         Ok(AccountSignInStarted {
             expires_at_ms: TimestampMs::new(expires_at_ms),
         })
@@ -665,11 +802,15 @@ impl HostAccount {
         if self.inner.a_call_is_open_after_settling().await {
             return Err(Inner::call_is_open());
         }
-        let mut running = self.inner.running.lock().await;
+        let mut running = self.inner.accounts.running.lock().await;
         self.inner.not_finishing()?;
-        if let Some(older) = running.take() {
-            let _ = older.cancel.send(true);
-            let _ = older.task.await;
+        // Only this account's waiting sign-in ends with its sign-out.
+        if running
+            .as_ref()
+            .is_some_and(|older| older.is_of(&self.inner))
+            && let Some(older) = running.take()
+        {
+            older.end().await;
         }
         self.inner
             .recover()
@@ -762,6 +903,11 @@ fn named_by(origin: &str) -> String {
         .collect()
 }
 
+/// The scope of the secret store that holds the sign-in at the account service at `origin`.
+pub(crate) fn scope_of(environment_id: EnvironmentId, origin: &str) -> String {
+    format!("{environment_id}/host-account/{}", named_by(origin))
+}
+
 /// The account being changed: a request for a token waits while this is held.
 struct Change<'a> {
     inner: &'a Inner,
@@ -795,6 +941,32 @@ impl Inner {
                 |left| left.checked_sub(1),
             )
             .is_ok()
+    }
+
+    /// Notes a request for a token for `scope`, for a test.
+    fn counted(&self, scope: &str) {
+        #[cfg(feature = "testing")]
+        self.token_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(scope.to_owned());
+        #[cfg(not(feature = "testing"))]
+        let _ = scope;
+    }
+
+    /// Whether this account hands out a token for `scope`. The storage account hands out its one
+    /// scope, whatever its grant holds, and this is read by every path that hands a token out.
+    fn allows(&self, scope: &str) -> kr_client::Result<()> {
+        match self.only {
+            Some(only) if only != scope => Err(kr_client::ClientError::refusal(
+                ErrorCode::PermissionDenied,
+                kr_client::shown::Shown::said(
+                    "this host's storage account hands out the backup.write scope and no other, \
+                     so it presents no token for what this call is for",
+                ),
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// Where the grant stands when no attempt is running.
@@ -850,27 +1022,38 @@ impl Inner {
     }
 
     fn not_configured(&self, reason: SignInUnavailable) -> ControllerError {
-        ControllerError::NotConfigured(match (reason, &self.closed) {
-            (SignInUnavailable::NotUsable, Some(closed)) => format!(
-                "{closed}; this host reaches the managed account service again when its daemon \
-                 starts over a document it can use"
+        // A host whose storage service is one the person runs has an account for it, which this
+        // account's refusals do not speak for, and its `storage.origin` is not the line to change
+        // to reach the managed services: that would move its backups.
+        let storage = self.accounts.storage_origin.get();
+        ControllerError::NotConfigured(match (reason, &self.closed, storage) {
+            (SignInUnavailable::NotUsable, Some(closed), _) => format!(
+                "{closed}; this host reaches the account service again when its daemon starts \
+                 over a document it can use"
             ),
-            (SignInUnavailable::BrokerIsAnotherService, _) => {
-                "this host's voice.broker_origin names another service than the managed \
-                 account service it signs in at, so there is nothing to sign in to"
-                    .to_owned()
-            }
-            (SignInUnavailable::NotUsable, None) => {
-                "this host cannot reach the managed account service the way its \
-                 configuration says: see the daemon's log"
-                    .to_owned()
-            }
-            (SignInUnavailable::NoManagedService, _) => {
-                "this host names no managed service: set voice.broker_origin, storage.origin or \
-                 relay.origin in its configuration document to the managed account service's \
-                 origin"
-                    .to_owned()
-            }
+            (SignInUnavailable::NotUsable, None, _) => "this host cannot reach the account \
+                 service the way its configuration says: see the daemon's log"
+                .to_owned(),
+            (SignInUnavailable::BrokerIsAnotherService, _, None) => "this host's \
+                 voice.broker_origin names another service than the managed account service it \
+                 signs in at, so there is nothing to sign in to"
+                .to_owned(),
+            (SignInUnavailable::BrokerIsAnotherService, _, Some(origin)) => format!(
+                "this host's voice.broker_origin names another service than the managed account \
+                 service it signs in at, so there is nothing to sign in to; its storage.origin \
+                 names {origin}, a service you run, and `kr account sign-in --storage` signs this \
+                 host in there"
+            ),
+            (SignInUnavailable::NoManagedService, _, None) => "this host names no managed \
+                 service: set voice.broker_origin, storage.origin or relay.origin in its \
+                 configuration document to the managed account service's origin"
+                .to_owned(),
+            (SignInUnavailable::NoManagedService, _, Some(origin)) => format!(
+                "this host names no managed service. Its storage.origin names {origin}, a service \
+                 you run, and `kr account sign-in --storage` signs this host in there. To use \
+                 managed voice or relay leases, set voice.broker_origin or relay.origin to the \
+                 managed account service's origin"
+            ),
         })
     }
 
@@ -1177,6 +1360,8 @@ impl HostTokens {
 impl AccountTokenSource for HostTokens {
     fn token<'a>(&'a self, scope: &'a str) -> ServiceFuture<'a, AccountToken> {
         Box::pin(async move {
+            self.inner.counted(scope);
+            self.inner.allows(scope)?;
             let held = self.presented().await?;
             let binding = match &self.held_to {
                 HeldTo::Nothing => return held.signed_in.token(scope).await,

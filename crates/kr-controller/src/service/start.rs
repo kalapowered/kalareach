@@ -798,14 +798,25 @@ impl Controller {
             ),
         );
         // The host's own sign-in to the managed account service lives in the same store, in a
-        // scope of its own. Everything this host presents an account token for, the voice broker
-        // and the storage service, goes through it.
+        // scope of its own. What this host presents an account token for at the managed service,
+        // the voice broker, the relay lease service and managed storage, goes through it. A storage
+        // service the person runs is reached with an account of its own, in a scope of its own,
+        // which is never given to voice or the relay lease service.
         let account = Arc::new(Self::build_host_account(
             &started,
             Arc::clone(&secret_store),
             setup.environment_id,
             setup.paths.runtime_root(),
-        )?);
+        ));
+        let storage_account = Self::build_storage_account(
+            &started,
+            &account,
+            Arc::clone(&secret_store),
+            setup.environment_id,
+        )?
+        .map(Arc::new);
+        // The account that serves the storage service: the managed one for managed storage.
+        let storage_role = storage_account.as_ref().unwrap_or(&account);
         // The managed storage service this host uploads its backups to, when its configuration
         // document selects one, and the writer key only this host holds that its uploads are
         // signed with, made the first time one is needed and loaded after that.
@@ -848,6 +859,7 @@ impl Controller {
                         origin,
                         writer,
                         binding: backup.binding(),
+                        account: storage_role,
                     }
                 }),
                 release_gate: release_matrix
@@ -873,7 +885,7 @@ impl Controller {
                     &clients,
                     writer.clone(),
                     &origin,
-                    Arc::clone(&account),
+                    Arc::clone(storage_role),
                     Arc::clone(&timer),
                 )?;
                 // A restore's reads of the same service go through the same proxy and answer to
@@ -1109,7 +1121,7 @@ impl Controller {
                     &origin,
                     proxy.as_ref(),
                     &writer,
-                    Arc::clone(&account),
+                    Arc::clone(storage_role),
                     Arc::clone(&quiet),
                     privacy.state(),
                 )?);
@@ -1119,7 +1131,7 @@ impl Controller {
                     writer,
                     owner_key,
                     producer_key,
-                    Arc::clone(&account),
+                    Arc::clone(storage_role),
                     Arc::clone(&backup),
                     quiet,
                 ));
@@ -1165,6 +1177,7 @@ impl Controller {
             )),
             started,
             account,
+            storage_account,
             rights_ceiling,
             debts: Arc::new(std::sync::Mutex::new(Debts::default())),
             debt_pass: Arc::new(tokio::sync::Notify::new()),
