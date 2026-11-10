@@ -1050,6 +1050,9 @@ fn spell_probe_in_the_console() {
                 }
             }
             TerminalInput::Bytes(bytes) => println!("kr-probe:early:{}", hex(&bytes)),
+            TerminalInput::Mouse(_) => {
+                panic!("the reader handed on a mouse record, which no application asked for")
+            }
         }
     }
     reading
@@ -1068,6 +1071,9 @@ fn spell_probe_in_the_console() {
                     println!("kr-probe:key:{}:{}", key.virtual_key, key.unicode);
                 }
             }
+            TerminalInput::Mouse(_) => {
+                panic!("the reader handed on a mouse record, which no application asked for")
+            }
         }
     }
     println!("kr-probe:bytes:{}", hex(&spelled));
@@ -1082,6 +1088,9 @@ fn spell_probe_in_the_console() {
                     println!("kr-probe:key:{}:{}", key.virtual_key, key.unicode);
                 }
             }
+            TerminalInput::Mouse(_) => {
+                panic!("the reader handed on a mouse record, which no application asked for")
+            }
         }
     }
     println!("kr-probe:alone:{}", hex(&alone));
@@ -1095,6 +1104,9 @@ fn spell_probe_in_the_console() {
                 for key in keys {
                     println!("kr-probe:key:{}:{}", key.virtual_key, key.unicode);
                 }
+            }
+            TerminalInput::Mouse(_) => {
+                panic!("the reader handed on a mouse record, which no application asked for")
             }
         }
     }
@@ -1181,6 +1193,9 @@ fn paste_probe_in_the_console() {
                 }
             }
             TerminalInput::Bytes(bytes) => println!("kr-probe:early:{}", hex(&bytes)),
+            TerminalInput::Mouse(_) => {
+                panic!("the reader handed on a mouse record, which no application asked for")
+            }
         }
     }
     let text = String::from_utf8_lossy(&spelled);

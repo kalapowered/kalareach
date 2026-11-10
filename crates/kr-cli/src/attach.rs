@@ -793,6 +793,16 @@ pub enum Woken {
     Asked,
 }
 
+/// What one read of a console's records found, in the order it was reported.
+#[cfg(any(not(unix), test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ConsoleRead {
+    /// A run of key records.
+    Keys(Vec<kr_term::win32::KeyRecord>),
+    /// A mouse record.
+    Mouse(crate::mouse::MouseRecord),
+}
+
 /// A console, as the thread that reads it needs it.
 #[cfg(any(not(unix), test))]
 pub(crate) trait ConsoleInput {
@@ -801,8 +811,9 @@ pub(crate) trait ConsoleInput {
     /// says the request has waited long enough.
     fn wait(&mut self, requests_first: bool) -> Result<Woken>;
 
-    /// Reads the key records the console has, as the runs they came in.
-    fn keys(&mut self) -> Result<Vec<Vec<kr_term::win32::KeyRecord>>>;
+    /// Reads the records the console has, in the order it reported them: the key records as the
+    /// runs they came in, and each mouse record on its own.
+    fn records(&mut self) -> Result<Vec<ConsoleRead>>;
 
     /// Hands over the first half of a character that was waiting for its second half, if there is
     /// one, with the records that came after it, so that they are counted with the records the
@@ -1065,13 +1076,16 @@ fn read_console(
                 Err(_) => break,
             },
             Ok(Woken::Console) => {
-                let Ok(runs) = console.keys() else {
+                let Ok(reads) = console.records() else {
                     break;
                 };
-                // Each run goes through the outlet, so that none is lost without being kept.
+                // Each read goes through the outlet, so that none is lost without being kept.
                 let mut open = true;
-                for keys in runs {
-                    open &= outlet.send(TerminalInput::Keys(keys));
+                for read in reads {
+                    open &= outlet.send(match read {
+                        ConsoleRead::Keys(keys) => TerminalInput::Keys(keys),
+                        ConsoleRead::Mouse(record) => TerminalInput::Mouse(record),
+                    });
                 }
                 if !open {
                     break;
@@ -1192,6 +1206,10 @@ pub enum TerminalInput {
     /// A run of key records, in the order the console reported them, for the session to spell as
     /// its terminal asked for. Only a Windows console reports keys this way.
     Keys(Vec<kr_term::win32::KeyRecord>),
+    /// A mouse record, which the console reports only while it has been asked for the mouse. It is
+    /// spelled as the report the session's application asked for, and is sent as bytes. Only a
+    /// Windows console reports the mouse this way.
+    Mouse(crate::mouse::MouseRecord),
 }
 
 impl std::fmt::Debug for TerminalInput {
@@ -1206,6 +1224,7 @@ impl std::fmt::Debug for TerminalInput {
                 .debug_struct("Keys")
                 .field("count", &keys.len())
                 .finish(),
+            Self::Mouse(_) => formatter.debug_struct("Mouse").finish_non_exhaustive(),
         }
     }
 }
@@ -1307,7 +1326,8 @@ fn read_until_woken(
 /// Section 8 puts a Windows console on a different footing from a terminal emulator: what it
 /// reports is a record with a virtual key, a scan code, one UTF-16 code unit, whether the key went
 /// down or came up, the modifier state and a repeat count, and the session spells it as its
-/// terminal asked for. A record that is not a key is not read as input.
+/// terminal asked for. A mouse record is handed on as a read of its own kind, and a record that is
+/// neither a key nor the mouse's is not read as input.
 ///
 /// Once `switch` has the console spell its keys itself, the thread reads the text the console
 /// spells instead, with `ReadConsoleW`, and hands it on as UTF-8.
@@ -1372,15 +1392,17 @@ impl ConsoleInput for WindowsConsole {
         self.reader.wait(&self.stop, &self.asked, requests_first)
     }
 
-    fn keys(&mut self) -> Result<Vec<Vec<kr_term::win32::KeyRecord>>> {
-        use crate::windows::records::ReadEvent;
+    fn records(&mut self) -> Result<Vec<ConsoleRead>> {
+        use crate::windows::records::{ConsoleEvent, ReadEvent};
 
         Ok(self
             .reader
             .read_events()?
             .into_iter()
             .filter_map(|event| match event {
-                ReadEvent::Keys(keys) => Some(keys),
+                ReadEvent::Keys(keys) => Some(ConsoleRead::Keys(keys)),
+                ReadEvent::Console(ConsoleEvent::Mouse(record)) => Some(ConsoleRead::Mouse(record)),
+                // A resize and a focus change are not input to the session.
                 ReadEvent::Console(_) => None,
             })
             .collect())
@@ -1699,8 +1721,8 @@ mod reader {
     use tokio::sync::mpsc::UnboundedReceiver;
 
     use super::{
-        ConsoleInput, InputSwitch, READS_BEFORE_A_REQUEST, ReaderStop, Stopped, TerminalInput,
-        Wakes, Woken, key_can_make_text, start_reader, utf8_of_console_text,
+        ConsoleInput, ConsoleRead, InputSwitch, READS_BEFORE_A_REQUEST, ReaderStop, Stopped,
+        TerminalInput, Wakes, Woken, key_can_make_text, start_reader, utf8_of_console_text,
     };
     use crate::error::{CliError, Result};
 
@@ -1725,7 +1747,7 @@ mod reader {
 
     /// Where the thread is held, and the two ends of the holding.
     struct Pause {
-        /// The call it is held at: `"wait"`, `"keys"`, `"bytes"` or `"held"`, after the call has
+        /// The call it is held at: `"wait"`, `"records"`, `"bytes"` or `"held"`, after the call has
         /// done what it does and before it returns.
         at: &'static str,
         /// Told when the thread is there.
@@ -1774,10 +1796,16 @@ mod reader {
             Ok(woken)
         }
 
-        fn keys(&mut self) -> Result<Vec<Vec<KeyRecord>>> {
-            self.steps.lock().expect("steps").push("keys");
-            let read = self.keys.pop_front().unwrap_or_default();
-            self.paused_at("keys");
+        fn records(&mut self) -> Result<Vec<ConsoleRead>> {
+            self.steps.lock().expect("steps").push("records");
+            let read = self
+                .keys
+                .pop_front()
+                .unwrap_or_default()
+                .into_iter()
+                .map(ConsoleRead::Keys)
+                .collect();
+            self.paused_at("records");
             Ok(read)
         }
 
@@ -2047,7 +2075,7 @@ mod reader {
         let asked = steps.iter().position(|step| *step == "ask").expect("asked");
         assert_eq!(
             steps[..asked],
-            ["keys", "keys"],
+            ["records", "records"],
             "the records the console held are read before it is asked"
         );
         assert!(
@@ -2125,7 +2153,7 @@ mod reader {
         assert_eq!(
             steps[..asked]
                 .iter()
-                .filter(|step| **step == "keys")
+                .filter(|step| **step == "records")
                 .count(),
             usize::try_from(READS_BEFORE_A_REQUEST).expect("a small number"),
             "the request was heard after that many reads of the console in a row, with input \
@@ -2194,7 +2222,7 @@ mod reader {
         run.release.send(()).expect("the reader is held");
         let (handed, steps) = run.handed_on_until_it_ends();
         assert!(
-            !steps.contains(&"keys"),
+            !steps.contains(&"records"),
             "the console was read after the stop: {steps:?}"
         );
         assert!(handed.is_empty(), "something was handed on: {handed:?}");
@@ -2205,7 +2233,7 @@ mod reader {
     #[test]
     fn a_reader_held_before_a_send_when_the_stop_is_made_sends_nothing() {
         let down = key(u16::from(b'A'), u16::from(b'a'), true);
-        let mut run = Run::paused("keys", vec![vec![vec![down]]], Vec::new());
+        let mut run = Run::paused("records", vec![vec![vec![down]]], Vec::new());
         run.has_input();
         run.held.recv().expect("the reader is held after its read");
         let stopped = run.stops();
@@ -2223,7 +2251,7 @@ mod reader {
     #[test]
     fn a_reader_that_ends_within_the_wait_leaves_what_it_read_and_did_not_send() {
         let down = key(u16::from(b'A'), u16::from(b'a'), true);
-        let mut run = Run::paused("keys", vec![vec![vec![down]]], Vec::new());
+        let mut run = Run::paused("records", vec![vec![vec![down]]], Vec::new());
         run.has_input();
         run.held.recv().expect("the reader is held after its read");
         let stop = run.stop.take().expect("the stop is made once");
@@ -2371,7 +2399,7 @@ mod reader {
     #[test]
     fn a_stop_that_asked_to_cancel_a_read_says_so() {
         let down = key(u16::from(b'A'), u16::from(b'a'), true);
-        let mut run = Run::paused("keys", vec![vec![vec![down]]], Vec::new());
+        let mut run = Run::paused("records", vec![vec![vec![down]]], Vec::new());
         run.finds_a_read
             .store(true, std::sync::atomic::Ordering::SeqCst);
         run.has_input();
@@ -2394,7 +2422,7 @@ mod reader {
     #[test]
     fn a_stop_that_found_no_read_to_cancel_does_not_say_a_cancel_was_asked() {
         let down = key(u16::from(b'A'), u16::from(b'a'), true);
-        let mut run = Run::paused("keys", vec![vec![vec![down]]], Vec::new());
+        let mut run = Run::paused("records", vec![vec![vec![down]]], Vec::new());
         run.has_input();
         run.held.recv().expect("the reader is held after its read");
         let stop = run.stop.take().expect("the stop is made once");

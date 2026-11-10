@@ -45,6 +45,7 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::attach::Woken;
 use crate::error::{CliError, Result};
+use crate::mouse::MouseRecord;
 
 /// How many records one read asks the console for.
 ///
@@ -247,13 +248,13 @@ impl RecordReader {
                     // SAFETY: the console reported this record as a mouse event, which is the
                     // field of the union that is then live.
                     let mouse = unsafe { record.Event.MouseEvent };
-                    ConsoleEvent::Mouse {
+                    ConsoleEvent::Mouse(MouseRecord {
                         column: mouse.dwMousePosition.X,
                         row: mouse.dwMousePosition.Y,
                         buttons: mouse.dwButtonState,
                         control_keys: mouse.dwControlKeyState,
                         flags: mouse.dwEventFlags,
-                    }
+                    })
                 }
                 WINDOW_BUFFER_SIZE_EVENT => {
                     // SAFETY: as above, for the resize arm of the union.
@@ -450,18 +451,7 @@ pub enum ConsoleEvent {
         rows: i16,
     },
     /// A mouse event, with the fields the console reported.
-    Mouse {
-        /// The column the pointer is over.
-        column: i16,
-        /// The row the pointer is over.
-        row: i16,
-        /// Which buttons are down.
-        buttons: u32,
-        /// The control-key state, as [`kr_term::win32::control_keys`] names its bits.
-        control_keys: u32,
-        /// Whether this was a move, a double click, or a wheel.
-        flags: u32,
-    },
+    Mouse(MouseRecord),
     /// A record this command does not act on: a focus change or a menu event.
     Other {
         /// The event type the console reported.
@@ -474,9 +464,9 @@ pub enum ConsoleEvent {
 /// `ENABLE_VIRTUAL_TERMINAL_INPUT` is deliberately absent: it is the console translating records
 /// into VT sequences, which is the translation this path exists to avoid. Line input, echo and
 /// the console's own handling of Ctrl-C are absent as well: every key, the interrupt among them,
-/// is a record to hand on to the session. Mouse and window-size records are not asked for, since
-/// nothing here dispatches them: the console keeps the mouse for selecting text, as it does for any
-/// command that does not ask for it.
+/// is a record to hand on to the session. Mouse and window-size records are not asked for here:
+/// the console keeps the mouse for selecting text, as it does for any command that does not ask for
+/// it, until the session's application asks to be told of the mouse ([`mouse_input_mode`]).
 #[must_use]
 pub const fn record_input_mode(saved: u32) -> u32 {
     use windows_sys::Win32::System::Console::{
@@ -491,6 +481,28 @@ pub const fn record_input_mode(saved: u32) -> u32 {
             | ENABLE_VIRTUAL_TERMINAL_INPUT
             | ENABLE_MOUSE_INPUT
             | ENABLE_WINDOW_INPUT)
+}
+
+/// The console input mode `current` becomes when the session's application starts or stops asking
+/// to be told of the mouse.
+///
+/// While it asks, the console reports the mouse as records and no longer uses it to select text,
+/// which takes the flag that says the extended flags are set as well as the removal of quick edit.
+/// When it stops, the console has the mouse again: quick edit comes back if `saved`, the mode the
+/// console had before the attachment, had it on. Nothing else of `current` changes, so a console that
+/// has been asked to spell its keys itself goes on spelling them.
+#[must_use]
+pub const fn mouse_input_mode(current: u32, saved: u32, asked: bool) -> u32 {
+    use windows_sys::Win32::System::Console::{
+        ENABLE_EXTENDED_FLAGS, ENABLE_MOUSE_INPUT, ENABLE_QUICK_EDIT_MODE,
+    };
+
+    if asked {
+        (current | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS) & !ENABLE_QUICK_EDIT_MODE
+    } else {
+        (current & !(ENABLE_MOUSE_INPUT | ENABLE_QUICK_EDIT_MODE))
+            | (saved & ENABLE_QUICK_EDIT_MODE)
+    }
 }
 
 #[cfg(test)]
@@ -519,12 +531,58 @@ mod tests {
         assert_eq!(
             mode & (ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT),
             0,
-            "nothing here dispatches a mouse or a window-size record, so none is asked for"
+            "no mouse or window-size record is asked for until the application asks for the mouse"
         );
         assert_eq!(
             mode & ENABLE_PROCESSED_INPUT,
             0,
             "the interrupt key is input to forward rather than an event for this process"
+        );
+    }
+
+    #[test]
+    fn the_mouse_is_the_applications_while_it_asks_and_the_consoles_after() {
+        use windows_sys::Win32::System::Console::{
+            ENABLE_EXTENDED_FLAGS, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
+        };
+
+        let saved = ENABLE_QUICK_EDIT_MODE | ENABLE_EXTENDED_FLAGS | ENABLE_MOUSE_INPUT;
+        let attached = record_input_mode(saved);
+        assert_eq!(
+            attached & ENABLE_MOUSE_INPUT,
+            0,
+            "the console keeps the mouse at first"
+        );
+        assert_ne!(attached & ENABLE_QUICK_EDIT_MODE, 0);
+
+        let asked = mouse_input_mode(attached, saved, true);
+        assert_ne!(asked & ENABLE_MOUSE_INPUT, 0, "the records are asked for");
+        assert_eq!(
+            asked & ENABLE_QUICK_EDIT_MODE,
+            0,
+            "and the console selects no text"
+        );
+        assert_ne!(
+            asked & ENABLE_EXTENDED_FLAGS,
+            0,
+            "which it is told with the extended flags"
+        );
+
+        assert_eq!(
+            mouse_input_mode(asked, saved, false),
+            attached,
+            "the mouse goes back to the console as it was"
+        );
+        // A console that spells its keys itself keeps doing so across both changes.
+        let spelling = attached | ENABLE_VIRTUAL_TERMINAL_INPUT;
+        let back = mouse_input_mode(mouse_input_mode(spelling, saved, true), saved, false);
+        assert_eq!(back, spelling);
+        // A console that had quick edit off is not given it.
+        let without = saved & !ENABLE_QUICK_EDIT_MODE;
+        let off = record_input_mode(without);
+        assert_eq!(
+            mouse_input_mode(mouse_input_mode(off, without, true), without, false),
+            off
         );
     }
 }

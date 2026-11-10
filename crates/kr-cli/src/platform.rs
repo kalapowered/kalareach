@@ -155,6 +155,9 @@ mod console {
     pub struct ControllingTerminal {
         input: File,
         output: File,
+        /// Whether the console had quick edit on when the application first asked for the mouse,
+        /// which the console is given back with the mouse.
+        quick_edit_was_on: std::sync::atomic::AtomicBool,
     }
 
     impl ControllingTerminal {
@@ -174,7 +177,11 @@ mod console {
                 .write(true)
                 .open("CONOUT$")
                 .map_err(|_| CliError::NotATerminal)?;
-            Ok(Self { input, output })
+            Ok(Self {
+                input,
+                output,
+                quick_edit_was_on: std::sync::atomic::AtomicBool::new(false),
+            })
         }
 
         /// Returns the console's input handle, which is the one bytes are read from. Nothing is
@@ -208,6 +215,21 @@ mod console {
         ///
         /// Returns an error when the console will not answer.
         pub fn size(&self) -> Result<TerminalSize> {
+            let info = self.buffer_info("read the console's size: the console did not answer")?;
+            let columns = info.srWindow.Right.saturating_sub(info.srWindow.Left) + 1;
+            let rows = info.srWindow.Bottom.saturating_sub(info.srWindow.Top) + 1;
+            Ok(TerminalSize {
+                columns: u16::try_from(columns).unwrap_or(80),
+                rows: u16::try_from(rows).unwrap_or(24),
+            })
+        }
+
+        /// What the console says of its screen buffer and its window, or `failure` when it says
+        /// nothing.
+        fn buffer_info(
+            &self,
+            failure: &'static str,
+        ) -> Result<windows_sys::Win32::System::Console::CONSOLE_SCREEN_BUFFER_INFO> {
             use std::os::windows::io::AsRawHandle as _;
 
             let mut info = windows_sys::Win32::System::Console::CONSOLE_SCREEN_BUFFER_INFO {
@@ -222,21 +244,57 @@ mod console {
                 },
                 dwMaximumWindowSize: windows_sys::Win32::System::Console::COORD { X: 0, Y: 0 },
             };
-            let ok = unsafe_free_get_console_screen_buffer_info(
+            if unsafe_free_get_console_screen_buffer_info(
                 self.output.as_raw_handle(),
                 &raw mut info,
-            );
-            if !ok {
-                return Err(CliError::Terminal(Shown::said(
-                    "read the console's size: the console did not answer",
-                )));
+            ) {
+                Ok(info)
+            } else {
+                Err(CliError::Terminal(Shown::said(failure)))
             }
-            let columns = info.srWindow.Right.saturating_sub(info.srWindow.Left) + 1;
-            let rows = info.srWindow.Bottom.saturating_sub(info.srWindow.Top) + 1;
-            Ok(TerminalSize {
-                columns: u16::try_from(columns).unwrap_or(80),
-                rows: u16::try_from(rows).unwrap_or(24),
-            })
+        }
+
+        /// Where the console's window begins in its screen buffer, as a column and a row.
+        ///
+        /// A mouse record's position is counted in the screen buffer, and what an application is
+        /// told is counted in the window.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the console will not answer.
+        pub fn window_origin(&self) -> Result<(i16, i16)> {
+            let info =
+                self.buffer_info("read where the console's window is: the console did not answer")?;
+            Ok((info.srWindow.Left, info.srWindow.Top))
+        }
+
+        /// Gives the mouse to the session's application while it asks to be told of it, and back to
+        /// the console, which selects text with it, when it stops asking.
+        ///
+        /// The mode is changed from the one the console has now, so a console that has been asked
+        /// to spell its keys itself goes on spelling them, and quick edit comes back only if the
+        /// console had it when the mouse was first asked for.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the console's input mode cannot be read or set.
+        pub fn report_mouse(&self, asked: bool) -> Result<()> {
+            use std::sync::atomic::Ordering::SeqCst;
+            use windows_sys::Win32::System::Console::ENABLE_QUICK_EDIT_MODE;
+
+            let current = console_mode(&self.input)?;
+            if asked && current & ENABLE_QUICK_EDIT_MODE != 0 {
+                self.quick_edit_was_on.store(true, SeqCst);
+            }
+            let saved = if self.quick_edit_was_on.load(SeqCst) {
+                ENABLE_QUICK_EDIT_MODE
+            } else {
+                0
+            };
+            set_console_mode(
+                &self.input,
+                crate::windows::records::mouse_input_mode(current, saved, asked),
+            )
         }
 
         /// Throws away what has been typed and not yet read.

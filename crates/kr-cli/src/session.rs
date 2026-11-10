@@ -2169,6 +2169,72 @@ fn resizes_not_owed(
         .collect()
 }
 
+/// What an attachment does about its console's mouse.
+///
+/// A Windows console reports the mouse as records, and only once it has been asked to. The
+/// application in the session asks to be told of the mouse by what it writes, so this learns of
+/// that from the output, has the console report the mouse while the application asks and gives it
+/// back to the console when it stops, and spells the records the console reports as the reports the
+/// application asked for. On other platforms the terminal sends the reports itself, and this does
+/// nothing of the kind.
+#[derive(Debug, Default)]
+struct ConsoleMouse {
+    reporting: crate::mouse::MouseReporting,
+    speller: crate::mouse::MouseSpeller,
+    /// Whether the console has been asked to report the mouse.
+    given: bool,
+}
+
+impl ConsoleMouse {
+    /// Reads output that is about to be shown on the console, and gives the mouse to the
+    /// application or back to the console as what it asked for changes. `may_type` says whether this terminal
+    /// may send input to the session, which is what the mouse would be.
+    fn shown(&mut self, output: &[u8], terminal: &ControllingTerminal, may_type: bool) {
+        self.reporting.observe(output);
+        let asked = may_type && self.reporting.tracking() != crate::mouse::Tracking::Off;
+        // A console that will not change its mode keeps the mouse as it is, and is asked again at
+        // the next change.
+        if asked != self.given && report_mouse(terminal, asked) {
+            self.given = asked;
+        }
+    }
+
+    /// The bytes that tell the application of `record`, or none.
+    fn spelled(
+        &mut self,
+        record: crate::mouse::MouseRecord,
+        terminal: &ControllingTerminal,
+    ) -> Vec<u8> {
+        self.speller
+            .spell(record, &self.reporting, window_origin(terminal))
+    }
+}
+
+/// Has the console report its mouse, or gives the mouse back to it, and says whether the console
+/// took the change.
+#[cfg(not(unix))]
+fn report_mouse(terminal: &ControllingTerminal, asked: bool) -> bool {
+    terminal.report_mouse(asked).is_ok()
+}
+
+/// A terminal emulator sends the mouse reports itself.
+#[cfg(unix)]
+const fn report_mouse(_terminal: &ControllingTerminal, _asked: bool) -> bool {
+    true
+}
+
+/// Where the console's window begins in its screen buffer, which a mouse record's position is
+/// counted from; the buffer's own origin when the console does not say.
+#[cfg(not(unix))]
+fn window_origin(terminal: &ControllingTerminal) -> (i16, i16) {
+    terminal.window_origin().unwrap_or((0, 0))
+}
+
+#[cfg(unix)]
+const fn window_origin(_terminal: &ControllingTerminal) -> (i16, i16) {
+    (0, 0)
+}
+
 /// Runs the attachment's input, output and connection in one loop.
 ///
 /// `fallback` is what the loop learns of a refusal of its console keys; the caller says it once the
@@ -2218,6 +2284,9 @@ async fn drive(
     // moment a report it is part way through stops waiting for the rest of itself.
     let mut pointers = PointerReports::default();
     let mut pointer_deadline: Option<tokio::time::Instant> = None;
+    // Whether the application has asked to be told of the mouse, which a Windows console reports as
+    // records only while it has.
+    let mut console_mouse = ConsoleMouse::default();
     // Whether the last screen this terminal was given is above the live page. It is what this
     // terminal is *displaying*, which a reset does not change: between a reset and the last page
     // of the screen that follows it, the rows on the person's terminal are still the old ones.
@@ -2414,6 +2483,14 @@ async fn drive(
                             if !display.holds_screen() {
                                 showing_history = false;
                             }
+                            // The console is given the mouse before it is shown that the
+                            // application asked for it, so that nothing it is shown can be
+                            // answered by a mouse the console still kept.
+                            console_mouse.shown(
+                                event.bytes.as_slice(),
+                                terminal,
+                                epoch.is_some(),
+                            );
                             let mut handle = output.as_ref();
                             if handle.write_all(event.bytes.as_slice()).is_err() {
                                 return AttachOutcome::Disconnected;
@@ -2486,6 +2563,7 @@ async fn drive(
                                 window.return_to_live();
                             }
                             if !drawn.bytes.is_empty() {
+                                console_mouse.shown(&drawn.bytes, terminal, epoch.is_some());
                                 let mut handle = output.as_ref();
                                 if handle.write_all(&drawn.bytes).is_err() {
                                     return AttachOutcome::Disconnected;
@@ -2858,11 +2936,23 @@ async fn drive(
                     undelivered |= match &read {
                         TerminalInput::Bytes(_) => true,
                         TerminalInput::Keys(keys) => presses(keys),
+                        // A pointer moving over the window is not something typed.
+                        TerminalInput::Mouse(_) => false,
                     };
                     continue;
                 }
                 let bytes = match read {
                     TerminalInput::Bytes(bytes) => bytes,
+                    // A console reports the mouse as records, and the mouse is a virtual-terminal
+                    // operation in this protocol: the application that asked to be told of it is
+                    // sent the report it asked for, as bytes, and goes on from here like any other.
+                    TerminalInput::Mouse(record) => {
+                        let report = console_mouse.spelled(record, terminal);
+                        if report.is_empty() {
+                            continue;
+                        }
+                        report
+                    }
                     // A console reports keys as records. There is no paste delimiter or pointer
                     // report in them to watch for, because those are bytes, and the records go to
                     // the session as they are.

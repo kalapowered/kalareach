@@ -418,8 +418,20 @@ are the window's. The release of a key this attachment did not see go down, the 
 the command among them, is not sent, unless it is an Alt coming up with a character composed on the
 numeric keypad, which is the person's text and is sent. Every other record is the session's. A key
 is told by its virtual key, its scan code and whether it is an enhanced key, so the left and right
-Shift are two keys and each one's release is sent. The command does not ask the console for mouse or
-window-size records, so the console keeps the mouse for selecting text.
+Shift are two keys and each one's release is sent. The command does not ask the console for window-size
+records.
+
+The mouse is a virtual-terminal operation on this path too, not a record the session spells. The
+command learns that the application asked for mouse reporting from what the session writes, DEC mode
+1000, 1002 or 1003 for presses and the wheel, a move with a button held, or every move, and mode 1006
+for the SGR encoding. Only while the application asks, it asks the console for mouse records, which
+takes the mouse from the console's text selection, and it gives the mouse back when the application
+stops asking and when the attachment ends. Each record the console then reports is sent to the
+application as the report it asked for, as input bytes at the cell the pointer is over, counted from
+the console's window: a press or release of each button, the wheel a notch at a time, a move with a
+button held in mode 1002 and a move with none in mode 1003. A position the original encoding has no
+room for (beyond column or row 223, with mode 1006 off) is not reported as another cell. Before the
+application asks, and for what it did not ask for, the console keeps the mouse and nothing is sent.
 
 Bracketed paste is the one piece of context the command keeps, and it keeps it by watching the
 bytes as they go past rather than by holding any of them: a start delimiter opens a paste and an

@@ -1372,6 +1372,9 @@ pub enum MouseAction {
     Release(MouseButton),
     /// The pointer moved with a button held.
     Drag(MouseButton),
+    /// The pointer moved with no button held, which only an application that asked for every
+    /// movement is told of.
+    Motion,
     /// The wheel turned. It is a wheel event in the stream, never an arrow key.
     Wheel(WheelDirection),
 }
@@ -1445,6 +1448,7 @@ pub fn mouse(event: MouseEvent, encoding: MouseEncoding) -> Result<Vec<u8>, Unsu
             let code = modifiers(match event.action {
                 MouseAction::Press(held) | MouseAction::Release(held) => button(held),
                 MouseAction::Drag(held) => button(held) + 32,
+                MouseAction::Motion => 35,
                 MouseAction::Wheel(WheelDirection::Up) => 64,
                 MouseAction::Wheel(WheelDirection::Down) => 65,
             });
@@ -1468,6 +1472,7 @@ pub fn mouse(event: MouseEvent, encoding: MouseEncoding) -> Result<Vec<u8>, Unsu
                 MouseAction::Release(_) => 3,
                 MouseAction::Press(held) => button(held),
                 MouseAction::Drag(held) => button(held) + 32,
+                MouseAction::Motion => 35,
                 MouseAction::Wheel(WheelDirection::Up) => 64,
                 MouseAction::Wheel(WheelDirection::Down) => 65,
             });
@@ -3090,6 +3095,34 @@ mod tests {
                 "{encoding:?}"
             );
         }
+    }
+
+    /// A move with no button held is the report a drag makes with the button code of no button, in
+    /// both encodings, and it keeps the modifier bits.
+    #[test]
+    fn a_move_with_no_button_held_is_reported_with_the_code_of_no_button() {
+        let moved = MouseEvent {
+            action: MouseAction::Motion,
+            column: 9,
+            row: 4,
+            modifiers: Modifiers::NONE,
+        };
+        assert_eq!(
+            mouse(moved, MouseEncoding::Sgr).expect("encodes"),
+            b"\x1b[<35;10;5M".to_vec()
+        );
+        assert_eq!(
+            mouse(moved, MouseEncoding::X10).expect("encodes"),
+            vec![0x1b, b'[', b'M', 67, 42, 37]
+        );
+        let with_control = MouseEvent {
+            modifiers: Modifiers::control(),
+            ..moved
+        };
+        assert_eq!(
+            mouse(with_control, MouseEncoding::Sgr).expect("encodes"),
+            b"\x1b[<51;10;5M".to_vec()
+        );
     }
 
     /// KR-REQ-08.58: focus events are two sequences and nothing else.
