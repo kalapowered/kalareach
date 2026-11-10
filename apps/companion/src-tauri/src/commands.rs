@@ -2423,6 +2423,11 @@ struct VoiceAllow {
     session_ids: Vec<String>,
     /// The actions to permit. Absent takes the default scope of section 15 paragraph 13.
     actions: Option<Vec<kr_protocol::voice::VoiceAction>>,
+    /// The environment of the host the page read what it shows from. When it is named, the grant is
+    /// sent only if this application is connected to that host now: a change made for what one host
+    /// showed is never applied to another.
+    #[serde(default)]
+    environment_id: Option<String>,
 }
 
 /// What allowing voice came to: the sentences the grant states, what it could not carry, and what
@@ -2495,6 +2500,16 @@ pub async fn voice_allow(
     // One connection's identity, environment and session, so the grant cannot name a device of one
     // host and be sent to another.
     let (device_id, environment_id, session) = state.paired_snapshot()?;
+    if allowed
+        .environment_id
+        .as_deref()
+        .is_some_and(|shown| shown != environment_id.to_string())
+    {
+        return Err(CommandError::refused(
+            "this was shown for another host than the one this application is connected to now: \
+             read it again before changing it",
+        ));
+    }
     let typed = kr_protocol::voice::VoiceGrantParams {
         device_id,
         session_ids: session_ids.into_iter().collect(),

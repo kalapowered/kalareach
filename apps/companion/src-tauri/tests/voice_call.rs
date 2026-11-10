@@ -7353,6 +7353,9 @@ async fn a_confirmation_is_not_asked_once_the_call_is_ending() {
     })
     .await
     .expect("native code was asked to stop");
+    // What was asked of the person is over with the call: the record says so, and not that it waits.
+    let row = row_reaching(&scene, "d-1", "cancelled").await;
+    assert_eq!(row["cause"], "call_ended", "{row}");
     scene.link.release_request();
 
     until_the_ceremony_is_handled(&scene, "d-1").await;
@@ -7365,5 +7368,75 @@ async fn a_confirmation_is_not_asked_once_the_call_is_ending() {
         .await
         .expect("the stop ran")
         .expect("the call ends");
+    scene.stop_host().await;
+}
+
+/// A change of what voice may do that was shown for one host is sent only to that host: the command
+/// that replaces the grant is given the environment of the host the page read what it shows from,
+/// and refuses when the phone is connected to another now. Nothing reaches the host that was
+/// refused for; the same change, named for the host in use, is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_shown_for_another_host_is_not_sent_to_this_one() {
+    let mut scene = closing().await;
+    let before = scene.link.sent(HostMethod::VoiceGrant);
+    let change = |environment: String| {
+        json!({
+            "subject": {},
+            "params": {
+                "session_ids": [scene.session],
+                "actions": ["navigate", "status"],
+                "environment_id": environment,
+            }
+        })
+    };
+
+    let refused = scene
+        .call(
+            "voice_allow",
+            change(kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()).to_string()),
+        )
+        .expect_err("a change shown for another host is refused");
+
+    assert_eq!(refused["code"], "PERMISSION_DENIED", "{refused}");
+    assert_eq!(
+        scene.link.sent(HostMethod::VoiceGrant),
+        before,
+        "nothing was sent to this host"
+    );
+    scene
+        .call(
+            "voice_allow",
+            change(scene.host().environment_id.to_string()),
+        )
+        .expect("the change shown for this host is sent");
+    assert_eq!(scene.link.sent(HostMethod::VoiceGrant), before + 1);
+    scene.stop_host().await;
+}
+
+/// A confirmation whose session the host does not name to the phone in time asks nobody: the person
+/// is not asked to confirm a target they cannot tell. The lookup of the session's number is held, so
+/// that it cannot answer in time, and the row says the session could not be named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_the_phone_cannot_name_in_time_is_not_asked_about() {
+    let timings = Timings {
+        session_name_within: Duration::from_millis(100),
+        ..delegating_timings()
+    };
+    let mut scene = closing_with(timings).await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    scene.link.hold_next_request(HostMethod::SessionRead);
+    let end = say_close(&scene, 6_000).await;
+    ask(&scene, "d-1", end - 200).await;
+    scene.link.until_request_held().await;
+
+    let row = row_reaching(&scene, "d-1", "cancelled").await;
+
+    assert_eq!(row["cause"], "session_not_named", "{row}");
+    assert!(scene.ceremony.asked().is_empty(), "nobody was asked");
+    assert_eq!(at_the_host(&scene), 1, "no signature was sent");
+    assert!(!scene.is_closed().await);
+    scene.link.release_request();
+    hang_up(&scene);
     scene.stop_host().await;
 }

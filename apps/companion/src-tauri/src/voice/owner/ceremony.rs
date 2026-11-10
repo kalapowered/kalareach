@@ -36,8 +36,8 @@ use tokio::time::Instant;
 use super::{
     DELEGATION_CHALLENGE_MISMATCH, DELEGATION_CONFIRMATION, DELEGATION_CONFIRMATION_DROPPED,
     DELEGATION_CONFIRMATION_EXPIRED, DELEGATION_HOST_REFUSED, DELEGATION_LATE,
-    DELEGATION_NO_CEREMONY, DELEGATION_NOT_CONFIRMED, Handover, Internal, Owner, Record,
-    SPEECH_TAINTED, Why, hand_over,
+    DELEGATION_NO_CEREMONY, DELEGATION_NOT_CONFIRMED, DELEGATION_SESSION_NOT_NAMED, Handover,
+    Internal, Owner, Record, SPEECH_TAINTED, Why, hand_over,
 };
 use crate::voice::confirm::{Challenge, Known, reason};
 
@@ -78,6 +78,7 @@ fn dropped_words(why: Why) -> &'static str {
         Why::NoCeremony => DELEGATION_NO_CEREMONY,
         Why::ChallengeMismatch => DELEGATION_CHALLENGE_MISMATCH,
         Why::ConfirmationExpired => DELEGATION_CONFIRMATION_EXPIRED,
+        Why::SessionNotNamed => DELEGATION_SESSION_NOT_NAMED,
         why if why.taints() => SPEECH_TAINTED,
         _ => DELEGATION_CONFIRMATION_DROPPED,
     }
@@ -187,6 +188,12 @@ impl Owner {
                 shared.handled.ceremony(&id);
                 return;
             }
+            // A person is not asked to confirm what they cannot tell the target of: the dialog
+            // names the session by the number the host gives it, and without one nobody is asked.
+            let Some(number) = number else {
+                let _ = internal.send(Internal::Unnamed { id, generation });
+                return;
+            };
             let now = shared.confirmation_now_ms();
             let outcome = if now >= expires {
                 CeremonyOutcome::NotConfirmed
@@ -204,6 +211,15 @@ impl Owner {
                 outcome,
             });
         });
+    }
+
+    /// The session the confirmation is for could not be named to the person in time.
+    pub(in crate::voice) fn on_unnamed(&mut self, id: &str, generation: u64) {
+        if !self.is_current(id, generation) {
+            return;
+        }
+        self.confirming.remove(id);
+        self.cancel_row(id, Why::SessionNotNamed);
     }
 
     /// What the person's ceremony came to.

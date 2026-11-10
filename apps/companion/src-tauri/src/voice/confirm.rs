@@ -145,19 +145,15 @@ impl Challenge {
 }
 
 /// What the platform's own dialog is told to print: what is being confirmed, of which session, and
-/// at which host.
-pub(super) fn reason(
-    action: VoiceAction,
-    session_number: Option<u64>,
-    host: Option<&str>,
-) -> String {
+/// at which host. The session is always named by its number: a confirmation of a target the person
+/// cannot tell is not asked for.
+pub(super) fn reason(action: VoiceAction, session_number: u64, host: Option<&str>) -> String {
     let what = match action {
         VoiceAction::CloseSession => "Close".to_owned(),
         other => format!("Confirm {}", other.as_str().replace('_', " ")),
     };
-    let session = session_number.map_or_else(
-        || "a session".to_owned(),
-        |number| format!("session {number}"),
-    );
-    format!("{what} {session} on {}", host.unwrap_or("your computer"))
+    format!(
+        "{what} session {session_number} on {}",
+        host.unwrap_or("your computer")
+    )
 }

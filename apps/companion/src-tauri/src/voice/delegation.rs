@@ -120,6 +120,11 @@ pub(super) enum Cause {
     NoCeremony,
     /// This device's own clock says the challenge has run out.
     ConfirmationExpired,
+    /// The session the confirmation is for could not be named to the person in time, so nobody was
+    /// asked: a confirmation the person cannot tell the target of is not asked for.
+    SessionNotNamed,
+    /// The call ended while the person was being asked, or before they were.
+    CallEnded,
 }
 
 impl Cause {
@@ -156,6 +161,8 @@ impl Cause {
             Self::NotConfirmed => "not_confirmed",
             Self::NoCeremony => "no_ceremony",
             Self::ConfirmationExpired => "confirmation_expired",
+            Self::SessionNotNamed => "session_not_named",
+            Self::CallEnded => "call_ended",
         }
     }
 
