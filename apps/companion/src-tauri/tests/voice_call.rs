@@ -5119,12 +5119,17 @@ use kr_protocol::method::Method as HostMethod;
 /// before a delegation, and a capture proof that stays young long enough that a loaded machine does
 /// not age it. No case depends on how long the wait is. The voice service's announcement comes on
 /// another path than the provider's data channel, so a case sends the provider's delegation only
-/// once the owner has read the announcement, and a case that has to hold a delegation's proof or
-/// the news behind its marker holds them with the stand-in's own holds, which it releases itself.
+/// once the owner has read the announcement, and a case that has to hold a delegation's proof, the
+/// news behind its marker or a write holds them with the stand-in's own holds, which it releases
+/// itself. The deadline for reading the news up to a marker, and the time the host is given to
+/// answer a write, are the watchdog's, so that no held step runs against a deadline of the call's
+/// own: a case whose subject is one of them sets its own.
 fn delegating_timings() -> Timings {
     Timings {
         delegation_wait: Duration::from_millis(20),
         proof_age: Duration::from_secs(10),
+        drain_within: WATCHDOG,
+        host_within: WATCHDOG,
         ..quick()
     }
 }
@@ -5527,12 +5532,10 @@ async fn news_lost_in_an_earlier_queue_is_read_before_the_marker_and_refuses_the
     scene.stop_host().await;
 }
 
-/// A marker that was never read in time refuses the set as not drained, and the marker that comes
-/// later, from the proof that was abandoned, stands for no other set: the next request waits for
-/// its own marker, which comes behind the word that waits with it. A set frozen at the abandoned
-/// proof's marker would lack the word.
+/// A marker that was never read in time refuses the set as not drained. The deadline is the
+/// subject, so this case keeps its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_marker_that_never_came_refuses_the_set_and_a_late_one_stands_for_no_other() {
+async fn a_marker_that_never_came_refuses_the_set() {
     let timings = Timings {
         drain_within: Duration::from_secs(2),
         ..delegating_timings()
@@ -5547,10 +5550,42 @@ async fn a_marker_that_never_came_refuses_the_set_and_a_late_one_stands_for_no_o
     until_proofs_are_asked(&scene, 2).await;
     scene.platform.hold_news();
     scene.platform.release("capture_proof");
+
     let not_drained = row_settled(&scene, "d-1").await;
+
     assert_eq!(not_drained["state"], "refused", "{not_drained}");
     assert_eq!(not_drained["cause"], "not_drained");
     assert_eq!(at_the_host(&scene), 0);
+    scene.platform.release_news();
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// The marker that comes late, from a proof whose delegation was dropped, stands for no other set:
+/// the next request waits for its own marker, which comes behind the word that waits with it. A set
+/// frozen at the abandoned proof's marker would lack the word. The delegation is dropped by the
+/// loss of the host while its marker waits, so that no deadline runs against the held steps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_marker_from_an_abandoned_proof_stands_for_no_other_set() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    // A delegation with nothing said for it: its proof is answered, its marker is held behind the
+    // news, and the path to the host is lost before the marker is read.
+    scene.platform.hold("capture_proof");
+    ask(&scene, "d-1", 5_000).await;
+    until_proofs_are_asked(&scene, 2).await;
+    scene.platform.hold_news();
+    scene.platform.release("capture_proof");
+    until_proof_handled(&scene, "d-1").await;
+    scene.link.unreachable(true);
+    lose_the_host(&scene);
+    let dropped = row_reaching(&scene, "d-1", "not_sent").await;
+    assert_eq!(dropped["cause"], "host_lost");
+    scene.link.unreachable(false);
+    scene
+        .state_where("the host back", |state| state["host"] == "reachable")
+        .await;
     // The marker of the abandoned proof arrives late.
     scene.platform.release_news();
 
