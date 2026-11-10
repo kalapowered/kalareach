@@ -147,17 +147,31 @@ impl ConsoleOutput {
             }
             assert!(
                 !complete,
-                "{what}: the console showed all it will, and not {times} time(s) of it: {text:?}"
+                "{what}: the console showed all it will, and not {times} time(s) of it; the end of \
+                 what it showed: {:?}",
+                end_of(&text)
             );
             assert!(
                 started.elapsed() < LIVENESS_DEADLINE,
-                "{what}: waited {:?} for the console to show it {times} time(s) while {}: {text:?}",
+                "{what}: waited {:?} for the console to show it {times} time(s) while {}; the end of \
+                 what it showed: {:?}",
                 started.elapsed(),
-                command()
+                command(),
+                end_of(&text)
             );
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+}
+
+/// The last part of what a console showed, for the words of a failure: the latest output is at the
+/// end, and a whole screen's drawing before it says nothing.
+fn end_of(text: &str) -> &str {
+    let mut start = text.len().saturating_sub(700);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
 }
 
 /// How a command that writes to a console stands, for the words of a failure.
@@ -1700,6 +1714,14 @@ async fn a_mouse_event_at_an_attached_console_reaches_the_application_that_asked
         1,
     );
     std::fs::write(&gate, b"open").expect("the file the application waits for");
+    typist
+        .shown(
+            "kr-mouse-ready",
+            "the application asked for the mouse and said so",
+        )
+        .await;
+    // The command gives the console the mouse before it shows what the application wrote, so a
+    // console that shows this has been asked for the mouse.
     console.shows(
         "the application's request for the mouse",
         |text| text.matches("kr-mouse-ready").count(),
@@ -1714,10 +1736,10 @@ async fn a_mouse_event_at_an_attached_console_reaches_the_application_that_asked
         assert!(
             started.elapsed() < LIVENESS_DEADLINE,
             "the mouse event did not reach the application in {:?}: the session shows {:?}; the \
-             outer console shows {:?}",
+             end of what the outer console shows: {:?}",
             started.elapsed(),
             typist.text(),
-            console.output.text()
+            end_of(&console.output.text())
         );
         typist.watch(Duration::from_millis(200)).await;
     }
