@@ -121,15 +121,22 @@ fn a_packed_archive_in(directory: &Path) -> (PathBuf, Vec<u8>, [u8; 32], usize) 
     (packed, bytes, digest, 1_500_000)
 }
 
-/// Makes the copies of a packed archive a case gives, in order: each `Some(position)` is a copy that
-/// differs from the archive at that byte, and `None` is a copy that is the archive. A copy is made
-/// the way the suite makes one, and damaged after it is made.
-fn copies_that_differ_at(
-    positions: &[Option<usize>],
-    made: &mut usize,
-) -> impl FnMut(&Path, &Path) {
+/// How a copy a case is given differs from the packed archive.
+#[derive(Clone, Copy)]
+enum Damage {
+    /// It is the archive.
+    None,
+    /// The byte at this position is not the archive's.
+    Byte(usize),
+    /// It ends at this length.
+    Cut(usize),
+}
+
+/// Makes the copies of a packed archive a case gives, in order, each damaged as `damages` says. A
+/// copy is made the way the suite makes one, and damaged after it is made.
+fn copies_made_as(damages: &[Damage], made: &mut usize) -> impl FnMut(&Path, &Path) {
     move |packed, copy| {
-        let position = positions[*made];
+        let damage = damages[*made];
         if *made > 0 {
             assert!(
                 !copy.exists(),
@@ -138,10 +145,20 @@ fn copies_that_differ_at(
         }
         *made += 1;
         copy_by_writing(packed, copy);
-        if let Some(position) = position {
-            let mut bytes = std::fs::read(copy).expect("the copy");
-            bytes[position] ^= 0xff;
-            std::fs::write(copy, bytes).expect("the copy is damaged");
+        match damage {
+            Damage::None => {}
+            Damage::Byte(position) => {
+                let mut bytes = std::fs::read(copy).expect("the copy");
+                bytes[position] ^= 0xff;
+                std::fs::write(copy, bytes).expect("the copy is damaged");
+            }
+            Damage::Cut(length) => {
+                std::fs::File::options()
+                    .write(true)
+                    .open(copy)
+                    .and_then(|file| file.set_len(length as u64))
+                    .expect("the copy is cut short");
+            }
         }
     }
 }
@@ -173,7 +190,7 @@ fn a_copy_that_reads_wrong_is_made_again_and_the_case_goes_on_after_one_line() {
         &packed,
         digest,
         &copy,
-        &mut copies_that_differ_at(&[Some(at), None], &mut made),
+        &mut copies_made_as(&[Damage::Byte(at), Damage::None], &mut made),
         &mut held_to,
         &mut said,
     );
@@ -196,15 +213,41 @@ fn a_copy_that_reads_wrong_is_made_again_and_the_case_goes_on_after_one_line() {
         assert!(said.contains(&fact), "{fact} is in {said}");
     }
 
+    // A first copy that is cut short says its own length and the archive's, which differ, and where
+    // it ends as the first difference.
+    std::fs::remove_file(&copy).expect("the copy goes");
+    let cut = 2_000_000;
+    let cut_digest: [u8; 32] = sha2::Sha256::digest(&bytes[..cut]).into();
+    let (mut made, mut said) = (0, Vec::new());
+    let outcome = copy_held_to(
+        &packed,
+        digest,
+        &copy,
+        &mut copies_made_as(&[Damage::Cut(cut), Damage::None], &mut made),
+        &mut held_to,
+        &mut said,
+    );
+    assert_eq!(outcome, Ok(()));
+    assert_eq!(made, 2);
+    let said = String::from_utf8(said).expect("text");
+    for fact in [
+        format!("byte {cut}"),
+        format!("the copy is {cut} bytes"),
+        format!("({} bytes)", bytes.len()),
+        hex_of(&cut_digest),
+    ] {
+        assert!(said.contains(&fact), "{fact} is in {said}");
+    }
+
     // A copy that read as other bytes once and as the archive when it was read again is made again
-    // as a copy that differs is.
+    // as a copy that differs is, and the line gives the digest of that first read.
     std::fs::remove_file(&copy).expect("the copy goes");
     let (mut made, mut judged, mut said) = (0, 0, Vec::new());
     let outcome = copy_held_to(
         &packed,
         digest,
         &copy,
-        &mut copies_that_differ_at(&[None, None], &mut made),
+        &mut copies_made_as(&[Damage::None, Damage::None], &mut made),
         &mut |packed: &Path, digest, copy: &Path| {
             judged += 1;
             if judged == 1 {
@@ -217,11 +260,44 @@ fn a_copy_that_reads_wrong_is_made_again_and_the_case_goes_on_after_one_line() {
     );
     assert_eq!(outcome, Ok(()));
     assert_eq!(made, 2);
-    assert!(
-        String::from_utf8(said)
-            .expect("text")
-            .starts_with(COPY_MADE_AGAIN)
+    let said = String::from_utf8(said).expect("text");
+    assert!(said.starts_with(COPY_MADE_AGAIN), "{said}");
+    assert!(said.contains(&hex_of(&[7; 32])), "{said}");
+}
+
+/// A line that says a copy is made again that cannot be written is a failure, and no copy is made
+/// again: the incident would not be counted, and the failure names the first copy.
+#[test]
+fn a_copy_that_would_be_made_again_with_no_line_written_fails_naming_the_first_copy() {
+    /// A report that refuses every write.
+    struct Refusing;
+
+    impl std::io::Write for Refusing {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("no room for the line"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let directory = tempfile::tempdir().expect("a directory");
+    let (packed, _, digest, at) = a_packed_archive_in(directory.path());
+    let copy = directory.path().join("copy.tar.gz");
+    let mut made = 0;
+    let outcome = copy_held_to(
+        &packed,
+        digest,
+        &copy,
+        &mut copies_made_as(&[Damage::Byte(at), Damage::None], &mut made),
+        &mut held_to,
+        &mut Refusing,
     );
+    let failure = outcome.expect_err("a line that is not written fails");
+    assert!(failure.contains("no room for the line"), "{failure}");
+    assert!(failure.contains(&format!("byte {at}")), "{failure}");
+    assert_eq!(made, 1, "no second copy is made");
 }
 
 /// A copy made again that reads wrong too fails the case, and the failure names both copies: where
@@ -247,7 +323,7 @@ fn two_copies_that_read_wrong_fail_naming_both() {
         &packed,
         digest,
         &copy,
-        &mut copies_that_differ_at(&[Some(at), Some(later)], &mut made),
+        &mut copies_made_as(&[Damage::Byte(at), Damage::Byte(later)], &mut made),
         &mut held_to,
         &mut said,
     );
@@ -279,7 +355,7 @@ fn a_packed_archive_that_changed_fails_at_once_without_a_second_copy() {
         &packed,
         digest,
         &copy,
-        &mut copies_that_differ_at(&[None, None], &mut made),
+        &mut copies_made_as(&[Damage::None, Damage::None], &mut made),
         &mut held_to,
         &mut said,
     );
@@ -298,7 +374,7 @@ fn a_packed_archive_that_changed_fails_at_once_without_a_second_copy() {
         &packed,
         digest,
         &copy,
-        &mut copies_that_differ_at(&[None, None], &mut made),
+        &mut copies_made_as(&[Damage::None, Damage::None], &mut made),
         &mut |_: &Path, _, _: &Path| {
             Err(Unequal::PackedReadsDifferently {
                 first: [1; 32],
@@ -308,7 +384,10 @@ fn a_packed_archive_that_changed_fails_at_once_without_a_second_copy() {
         },
         &mut said,
     );
-    assert!(outcome.is_err());
+    let failure = outcome.expect_err("a packed archive that reads differently fails");
+    for fact in [hex_of(&[1; 32]), hex_of(&[2; 32]), hex_of(&digest)] {
+        assert!(failure.contains(&fact), "{fact} is in {failure}");
+    }
     assert_eq!(made, 1, "no second copy is made");
     assert!(said.is_empty());
 }

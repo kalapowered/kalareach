@@ -952,12 +952,16 @@ impl Assembled {
     /// the packed archive's blocks or a copy made inside the kernel, so a copy that does not read as
     /// the archive can be made again from the same file. It is removed and made once more, once, and
     /// the case goes on when the copy made again is right, after one line on standard error that
-    /// begins "update-harness: a copy of the packed archive read wrong and was made again" and gives
-    /// where the first copy first differed, the lengths and the digests, so that every such copy can
-    /// be counted in a job's log. A second copy that reads wrong fails the case, naming both. A
-    /// packed archive that no longer reads as it did when it was packed fails at once, with no second
-    /// copy. None of this covers a wrong read of an archive after the comparison, while the command
-    /// under test unpacks it: that is still a failure of the unpacking.
+    /// begins "update-harness: a copy of the packed archive read wrong and was made again" and says
+    /// how the first copy differed, so that every such copy can be counted in a job's log: where it
+    /// first differed and the lengths and digests, or, for a copy that read as other bytes once and
+    /// as the archive when it was read again, the digest of that first read. A second copy that
+    /// reads wrong fails the case, naming both. A packed archive that no longer reads as it did when
+    /// it was packed fails at once, with no second copy. Every copy reads the whole packed archive,
+    /// so a wrong read of the packed archive is named as the packed archive's own difference, and
+    /// fails each case that copies it while that read is kept. None of this covers a wrong read of
+    /// an archive after the comparison, while the command under test unpacks it: that is still a
+    /// failure of the unpacking.
     fn archive(&self, archive: &Path) {
         self.archive_signed(archive, &keys().targets);
     }
@@ -1033,10 +1037,11 @@ type Held<'a> = dyn FnMut(&Path, [u8; 32], &Path) -> Result<(), Unequal> + 'a;
 /// packed: `make` makes the copy and `held` holds it to `digest`.
 ///
 /// A copy that reads wrong (the copy differs, or it read as other bytes once and as the archive
-/// when it was read again) is removed and made once more. The line [`COPY_MADE_AGAIN`] begins goes
-/// to `report` first, with how the copy differed, and the copy made again is held as the first was.
-/// A second copy that reads wrong fails, and the failure names both. A packed archive that is not
-/// what it was packed as is not a fault of the copy: it fails at once, with no second copy.
+/// when it was read again) is made once more. A line that begins with [`COPY_MADE_AGAIN`] and says
+/// how the copy differed goes to `report` first, and a report that cannot be written fails, so that
+/// no copy made again goes uncounted. The copy is then removed, made again and held as the first
+/// was. A second copy that reads wrong fails, and the failure names both. A packed archive that is
+/// not what it was packed as is not a fault of the copy: it fails at once, with no second copy.
 fn copy_held_to(
     packed: &Path,
     digest: [u8; 32],
@@ -1051,21 +1056,37 @@ fn copy_held_to(
         Err(first @ (Unequal::Copy { .. } | Unequal::ReadsDifferently { .. })) => first,
         Err(unequal) => {
             return Err(format!(
-                "the copy at {} is not the archive packed at {}: {unequal}",
+                "the copy at {} is not the archive packed at {}, which read as {} when it was \
+                 packed: {unequal}",
                 copy.display(),
-                packed.display()
+                packed.display(),
+                hex_of(&digest)
             ));
         }
     };
-    std::fs::remove_file(copy).expect("the copy that read wrong goes");
-    // A write that fails is no reason to stop the case: the line is for the person reading the log.
-    let _ = writeln!(
+    writeln!(
         report,
         "{COPY_MADE_AGAIN}: the copy at {} is not the archive packed at {}, which reads as {}: {first}",
         copy.display(),
         packed.display(),
         hex_of(&digest)
-    );
+    )
+    .map_err(|error| {
+        format!(
+            "the copy at {} is not the archive packed at {}, and the line that says it is made \
+             again is not written ({error}): {first}",
+            copy.display(),
+            packed.display()
+        )
+    })?;
+    std::fs::remove_file(copy).map_err(|error| {
+        format!(
+            "the copy at {} is not the archive packed at {}, and it is not removed to be made \
+             again ({error}): {first}",
+            copy.display(),
+            packed.display()
+        )
+    })?;
     make(packed, copy);
     held(packed, digest, copy).map_err(|second| {
         format!(
