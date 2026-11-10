@@ -57,7 +57,8 @@
 # native code's record of capture before it says anything, and a break it did not make (the gate's
 # gap between two recorder buffers fires when a loaded machine stalls the emulator at the call's
 # start) ends that attempt, which the script keeps under its own name and plays again on a new call,
-# up to `KR_LEG_ATTEMPTS` (three) in all. A leg that breaks by itself on every attempt fails.
+# up to `KR_LEG_ATTEMPTS` (three attempts in all), when that break is the only thing that failed in
+# it. A leg that breaks by itself on every attempt fails.
 #
 # `delegating` with no leg runs them all, one after another, with one build and one device. The
 # simulator has no recorder, so a run with the peer's file naming a synthetic recorder gives the call
@@ -531,17 +532,17 @@ note_verdict() { # <leg> <status> [<attempts>]
     esac
 }
 
-# Plays one run of a leg, and plays it again on a new call, up to `KR_LEG_ATTEMPTS` (three) in all, when
-# every check its result failed names the call's own recorder as having broken by itself: a break in a
-# part of the leg that is not about one, which a phone's recorder can make when the device is busy with
-# its own start (the emulator on a loaded machine does). The leg's subject was never reached then, so
-# the attempt counts for nothing and is kept under its own name with the failed checks it lists, and
-# the leg's verdict is its last attempt's. A result that has any other failed check (the revocation of
-# the grant, the end of the call, a refusal with the wrong cause) fails at once, so that a later clean
-# attempt never hides it, and a leg whose recorder breaks by itself on every attempt fails, saying that
-# a call which never begins without a break is a finding and not the load of the machine.
+# Plays one run of a leg, and plays it again on a new call, up to `KR_LEG_ATTEMPTS` (three attempts in
+# all), when the only thing that failed in it is the call's own recorder having broken by itself (see
+# `leg_is_replayable`): a break the leg did not make, which a phone's recorder can make when the device
+# is busy with its own start (the emulator on a loaded machine does). The attempt counts for nothing,
+# is kept under its own name with the failed checks it lists, and the leg's verdict is its last
+# attempt's. An attempt in which anything else failed (the revocation of the grant, the end of the
+# call, what the host was told on attaching, a result that never says done) fails the leg at once, so
+# that a later clean attempt never hides it. A leg whose recorder breaks by itself on every attempt
+# fails, and says so.
 play_leg() { # <leg> <runner> <runner arguments...>
-    local each=$1 runner=$2 rc attempt=1 attempts="${KR_LEG_ATTEMPTS:-3}" failed marked
+    local each=$1 runner=$2 rc attempt=1 attempts="${KR_LEG_ATTEMPTS:-3}" kept
     shift 2
     while :; do
         begin_run "$each"
@@ -549,15 +550,15 @@ play_leg() { # <leg> <runner> <runner arguments...>
         "$runner" "$@" || rc=$?
         end_run
         [ "$rc" != 0 ] || break
-        failed=$(grep -c ' ok=0 detail=' "$artefacts/$result_name" 2>/dev/null)
-        marked=$(grep -c ' ok=0 detail=.*the recorder broke by itself' "$artefacts/$result_name" 2>/dev/null)
-        { [ "${marked:-0}" -gt 0 ] && [ "${failed:-0}" = "$marked" ]; } || break
+        leg_is_replayable "$artefacts/$result_name" "$log" || break
         say "== leg ${each:-the call} attempt $attempt of $attempts: $(grep -h ' ok=0 detail=' "$artefacts/$result_name" | cut -c1-200 | tr '\n' ' ')"
         if [ "$attempt" -ge "$attempts" ]; then
-            say "== leg ${each:-the call}: the recorder broke by itself on all $attempts attempts, which is a finding about the call and not the load of the machine"
+            say "== leg ${each:-the call}: the recorder broke by itself on all $attempts attempts, so the leg fails"
             break
         fi
-        mv "$artefacts" "$artefacts-attempt-$attempt" || break
+        kept="$artefacts-attempt-$attempt"
+        [ ! -e "$kept" ] || kept="$kept-$run"
+        mv "$artefacts" "$kept" || break
         attempt=$((attempt + 1))
     done
     note_verdict "$each" "$rc" "$attempt"

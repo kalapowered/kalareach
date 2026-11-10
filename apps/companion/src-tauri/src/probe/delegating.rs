@@ -831,16 +831,22 @@ async fn mute<R: Runtime>(play: &Play<'_, R>, checks: &mut Checks<'_>) -> Result
     play.driver.after_a_mute(true).await?;
     let shown = play.mute_is_held().await;
     // Where the recorder is known to stop with the muted track, native code says so once it has seen
-    // it stop, and the unmute is made after that, never before: a track that waited for the recorder
-    // would never be turned on again, which a person who stays muted for a while meets and one who
-    // unmutes at once does not. The leg fails where that is never said.
-    let stopped =
-        !play.driver.recorder_stops_with_the_mute() || play.capture_is("unavailable").await;
+    // it stop, and the unmute is made after that: a track that waited for the recorder would never be
+    // turned on again, which a person who stays muted for a while meets and one who unmutes at once
+    // does not. The check fails where that is never said, and says "not waited on" where the recorder
+    // is not known to stop.
+    let waits = play.driver.recorder_stops_with_the_mute();
+    let seen = waits && play.capture_is("unavailable").await;
+    let stop = match (waits, seen) {
+        (false, _) => "not waited on",
+        (true, true) => "seen",
+        (true, false) => "never seen",
+    };
     checks.push(Check::found(
         "the person mutes between two parts of a command",
-        muted.is_ok() && shown.is_some() && stopped,
+        muted.is_ok() && shown.is_some() && (!waits || seen),
         format!(
-            "mute ok {} held {shown:?} recorder stopped {stopped}",
+            "mute ok {} held {shown:?} recorder stop {stop}",
             muted.is_ok()
         ),
     ));

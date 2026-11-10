@@ -55,3 +55,19 @@ judge_voice_call_result() {
     fi
     say "every check of the application passed"
 }
+
+# Whether a leg's attempt may be played again on a new call: its result is complete (it says done), every
+# check it failed names the call's own recorder as having broken by itself, and no host check failed
+# but the ones an early stop of the leg always fails (what the model was told of a delegation, and of a
+# call that can no longer act). Anything else failed in the attempt is not the recorder's, and a later
+# clean attempt must not hide it.
+leg_is_replayable() { # <result file> <run log>
+    local result=$1 runlog=$2 failed marked independent
+    grep -q '^done=1$' "$result" 2>/dev/null || return 1
+    failed=$(grep -c ' ok=0 detail=' "$result" 2>/dev/null)
+    marked=$(grep -c ' ok=0 detail=.*the recorder broke by itself' "$result" 2>/dev/null)
+    { [ "${marked:-0}" -gt 0 ] && [ "${failed:-0}" = "$marked" ]; } || return 1
+    independent=$(grep -h ' host check=.* ok=0 ' "$runlog" 2>/dev/null |
+        grep -c -v -E 'host check=the model was (told what became of|told once that the call can no longer act|never told the call can no longer act)')
+    [ "${independent:-0}" = 0 ]
+}

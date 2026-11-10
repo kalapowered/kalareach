@@ -204,5 +204,31 @@ for leg in mute gap dtx malformed late_fragment; do
     judge_delegating "tainted-silent-$leg" "$leg" 2
 done
 
+# An attempt of a leg is played again only when the recorder's own break is the only thing that failed
+# in it: a complete result whose every failed check names the break, and no host check failed but the
+# ones an early stop always fails. Anything else fails the leg at once.
+replay_result="$dir/replay-result.txt"
+replay_log="$dir/replay-run.log"
+broke="check=the recorder delivered without a break before the leg began ok=0 detail=openings 1 breaks 2; the recorder broke by itself"
+told="== [voice-call-device] host check=the model was told what became of d-1 ok=0 detail=told nothing, expected performed"
+attach="== [voice-call-device] host check=the model was told on attaching what the phone can do ok=0 detail=can-ask words 0, cannot-act words 1"
+replay_case() { # <name> <expected status> <result lines, one per argument after the log line>
+    local name=$1 want=$2 hostline=$3 status=0
+    shift 3
+    printf '%s\n' "$@" >"$replay_result"
+    printf '%s\n' "== [voice-call-device] host check=the service created one call ok=1 detail=1" ${hostline:+"$hostline"} >"$replay_log"
+    leg_is_replayable "$replay_result" "$replay_log" || status=$?
+    if [ "$status" != "$want" ]; then
+        echo "FAILED: the replay case $name decided $status, expected $want"
+        failed=1
+    fi
+}
+replay_case "the recorder's break alone" 0 "$told" "check=open ok=1 detail=fine" "$broke" "done=1"
+replay_case "a break and a failed revocation" 1 "$told" "$broke" "check=the host revoked the grant ok=0 detail=host revoked" "done=1"
+replay_case "a break and a result that never says done" 1 "$told" "check=open ok=1 detail=fine" "$broke"
+replay_case "a break and a wrong word told on attaching" 1 "$attach" "$broke" "done=1"
+replay_case "a failure that is not a break" 1 "" "check=open ok=0 detail=nothing" "done=1"
+replay_case "no failure" 1 "" "check=open ok=1 detail=fine" "done=1"
+
 [ "$failed" = 0 ] && echo "the judges decide every case as they should"
 exit "$failed"
