@@ -14,18 +14,27 @@
 //! - Without `KR_AGENTS_GATEWAY_BUILD` the agent is the application stand-in
 //!   (`tests/support/codex-stand-in`) placed as `codex`. A case runs offline and spends no turn.
 //! - With it, naming a build list entry as the agents harness reads it, the agent is that entry's
-//!   pinned native executable, typed with the entry's switches in a home of the run's own, with the
-//!   entry's configuration directory and its login variable. The model answers, so each prompt a
-//!   case sends is charged to the turn ledger (`KR_AGENTS_TURNS`) before it is typed or sent; the
+//!   pinned native executable, in a home of the run's own, with the entry's configuration directory
+//!   and its login variable. The command integration serves a launch that types the command alone,
+//!   or `resume` or `fork` and a saved thread, and no launch that types an option, so the line
+//!   typed is never more than that and the entry's arguments and switches are keys of the
+//!   `config.toml` of the run's own configuration directory instead
+//!   (`build::Account::configuration_with_switches`). Before a case sends any prompt, the host must
+//!   announce the instance as served through a gateway. The model answers, so each prompt a case
+//!   sends is charged to the turn ledger (`KR_AGENTS_TURNS`) before it is typed or sent; the
 //!   login's value arrives on the descriptor `KR_AGENTS_KEY_FD` names and the values of the other
 //!   keys the harness's shell holds on the one `KR_AGENTS_SCAN_FD` names, exactly as for the
-//!   qualification cases, and the run's directory is searched for all of them when the case ends
-//!   (`KR_AGENTS_KEY_SCAN` names the file the search is recorded in). One case runs in each process:
-//!   the pipes empty when they are read.
+//!   qualification cases, and one case runs in each process: the pipes empty when they are read.
 //!
-//! Each case shows one assumption of the package's table that a stand-in cannot show of the pinned
-//! release, and where the real agent's answer differs from the table's reading a case fails and
-//! says what it saw:
+//! On a real route every case, whatever became of it, ends the same way (`held`): what the run
+//! started is ended, the run's directory is searched for the keys and removed, and the search and
+//! the removal are recorded (`KR_AGENTS_KEY_SCAN` names the file); the person's own Codex files are
+//! looked at again by their metadata alone and none may have changed; the agent's own record is
+//! counted for the turns it ran, and one the ledger was not charged for is charged and stops the
+//! case; and no panic message prints a piece of a held key.
+//!
+//! Each case shows one assumption of the package's table, and where the real agent's answer differs
+//! from the table's reading it fails and says what it saw:
 //!
 //! 1. The server's word that a request was answered reaches the terminal through the gateway, and
 //!    the terminal closes its prompt on it, when a device answers an approval the terminal holds.
@@ -33,10 +42,22 @@
 //! 3. The binding's thread changes where the terminal starts, resumes or forks one and nowhere else.
 //! 4. A whole session names no method the package's table does not list: the binding is never
 //!    suspended.
-//! 5. A device's prompt over a running turn is refused, and nothing reaches the server.
+//! 5. A device's prompt over a running turn is refused, and nothing reaches the agent.
 //!
-//! With a real agent a case spends one turn, and none that is not charged: the whole set is five.
-//! Each case appends its outcome to the file `KR_AGENTS_RESULT` names, where one is named.
+//! What each route shows. The stand-in route proves the driver and the host and gateway side of
+//! each case, which the cross-boundary checkpoint's own gateway file covers too; no assertion on
+//! it shows an assumption about the pinned release. A real run shows an assumption as far as the
+//! host's record of the binding, the terminal's screen and the agent's own record show it. Case 4
+//! reads the binding at every step and at every poll, and the host keeps no cumulative record of
+//! the methods a session named, so a suspension that a later selection cleared between two polls
+//! is not seen. Case 5 shows the host's refusal, which is made before any `turn/start` is sent, so
+//! the pinned server is never sent that frame, and that the agent's own record holds the
+//! terminal's prompt and not the device's; the stand-in route's count of the requests its server
+//! received is the only upstream record, and a real run has none.
+//!
+//! With a real agent a case spends one turn and case 5 a second, which it charges before the
+//! device's prompt that the host must refuse: six in all, and none that is not charged. Each case
+//! appends its outcome to the file `KR_AGENTS_RESULT` names, where one is named.
 //!
 //! ```text
 //! KR_AGENTS_GATEWAY_BUILD=<entry> KR_AGENTS_TURNS=<ledger> KR_AGENTS_RESULT=<file> \
@@ -48,14 +69,19 @@
 
 #![cfg(unix)]
 
+use std::io::Read as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kr_e2e_agents::RESULT_VARIABLE;
-use kr_e2e_agents::account::{self, Ledger};
-use kr_e2e_agents::build::{self, Account, Build};
-use kr_e2e_agents::keys;
+use kr_e2e_agents::account::Ledger;
+use kr_e2e_agents::build::{self, Account, Build, InstallSwitch};
+use kr_e2e_agents::held::{
+    Absent, CONFIG_DIRECTORY, HeldKeys, ISOLATION_UNPROVEN, MetaGuard, PROXY_VARIABLES, RunScan,
+    Stop, absent_paths, conversations_root, kept_panic_text, panic_text, turns_recorded,
+};
 use kr_e2e_agents::outcome::Outcome;
 use kr_e2e_agents::stage::{Installation, closed_port, session_variables};
 use kr_e2e_m1b::device::{Device, PairedHost, Remote, RequestError};
@@ -119,6 +145,24 @@ const ACCEPT: &str = "accept";
 /// The decision a device gives to end the turn that waits on an approval.
 const DECLINE: &str = "decline-and-stop";
 
+/// The person's own Codex files whose metadata a real run is held to leave as it found it: the
+/// login, the settings, the instructions and hooks the agent would load, and the files it appends
+/// to when it is used. Nothing of them is read.
+const PERSON_FILES: [&str; 8] = [
+    ".codex/auth.json",
+    ".codex/config.toml",
+    ".codex/AGENTS.md",
+    ".codex/hooks.json",
+    ".codex/.credentials.json",
+    ".codex/history.jsonl",
+    ".codex/session_index.jsonl",
+    ".codex/log/codex-tui.log",
+];
+
+/// The person's own Codex directory, recorded and not held: the person's own programs add and
+/// remove entries in it.
+const PERSON_DIRECTORIES: [&str; 1] = [".codex"];
+
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -146,18 +190,28 @@ fn mark() -> String {
     )
 }
 
-/// A question whose answer, a number of at least 1000, is not in the question.
-fn sum_question() -> (String, String) {
+/// A question whose answer, a number of at least 1000, is in none of `avoid`, the texts a case
+/// types or its screen shows, and not in the question.
+fn fresh_question(avoid: &[&str]) -> (String, String) {
     loop {
         let bytes = *kr_ipc::new_uuid().as_bytes();
         let first = 500 + u64::from(bytes[0]) + u64::from(bytes[1]);
         let second = 500 + u64::from(bytes[2]) + u64::from(bytes[3]);
         let sum = (first + second).to_string();
         let question = format!("What is {first} plus {second}? Reply with only the number.");
-        if !question.contains(&sum) {
+        if !question.contains(&sum) && avoid.iter().all(|text| !text.contains(&sum)) {
             return (question, sum);
         }
     }
+}
+
+/// The words typed at the shell to start the agent: its command, and `extra` after it. Never an
+/// option: the command integration serves a launch that types none.
+fn launch_words(command: &str, extra: &[&str]) -> Vec<String> {
+    std::iter::once(command)
+        .chain(extra.iter().copied())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The agent a run is given.
@@ -168,15 +222,14 @@ enum Route {
     Real(Box<Real>),
 }
 
-/// A real agent: the entry, its turn ledger and the keys the run's files are searched for.
+/// A real agent: the entry, its turn ledger, the keys the run's files are searched for, and the
+/// person's own files as they stood before anything started.
 struct Real {
     build: Build,
     account: Account,
     ledger: Ledger,
-    /// The login's variable and value, where the entry's login is a variable.
-    key: Option<(String, String)>,
-    /// The values of the other keys the harness's shell holds.
-    others: Vec<String>,
+    held: HeldKeys,
+    person: MetaGuard,
 }
 
 impl Route {
@@ -184,8 +237,9 @@ impl Route {
     ///
     /// # Panics
     ///
-    /// Panics when the entry names no login, or its values cannot be read.
-    fn from_environment() -> Self {
+    /// Panics when the entry names no login, its values cannot be read, or the person's files
+    /// cannot be looked at.
+    fn from_environment(case: &str) -> Self {
         let Some(path) = std::env::var_os(BUILD_VARIABLE)
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
@@ -196,24 +250,16 @@ impl Route {
         let account = build.account.clone().unwrap_or_else(|| {
             panic!("{BUILD_VARIABLE} names an entry with no login, which no case may start")
         });
-        let key = account.variable.as_ref().map(|name| {
-            let value = account::key_from_descriptor().unwrap_or_else(|why| {
-                panic!("the case carries {name}, and the harness gave no value for it: {why}")
-            });
-            (name.clone(), value)
-        });
-        let others: Vec<String> = keys::scan_values_from_descriptor()
-            .unwrap_or_else(|why| panic!("the harness gave no values of the keys it holds: {why}"))
-            .into_iter()
-            .filter(|value| key.as_ref().is_none_or(|(_, own)| own != value))
-            .collect();
+        let held = HeldKeys::read(&format!("gateway case {case}"), &account);
         let ledger = Ledger::from_environment(&account.budget, account.turns);
+        let home = PathBuf::from(std::env::var_os("HOME").expect("the person's home in HOME"));
+        let person = MetaGuard::take(&home, &PERSON_FILES, &PERSON_DIRECTORIES);
         Self::Real(Box::new(Real {
             build,
             account,
             ledger,
-            key,
-            others,
+            held,
+            person,
         }))
     }
 }
@@ -221,101 +267,113 @@ impl Route {
 impl Real {
     /// The run's directory for the agent's configuration and conversations.
     fn config(run: &Run) -> PathBuf {
-        run.root().join("agent-config")
+        run.root().join(CONFIG_DIRECTORY)
     }
 
-    /// The line typed at the shell to start the agent: the command, the entry's arguments and
-    /// switches, and `extra` after them.
-    fn typed(&self, run: &Run, extra: &[&str]) -> String {
+    /// The line typed at the shell to start the agent: the command, and `extra` after it.
+    fn typed(&self, extra: &[&str]) -> String {
+        launch_words(&self.build.command, extra)
+            .iter()
+            .map(|word| build::quote(word))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The run's directory and the working directory the entry's `{run}` and `{work}` stand for.
+    fn places(run: &Run) -> (String, String) {
         let work = std::fs::canonicalize(run.work())
             .unwrap_or_else(|error| {
                 panic!("the working directory as the system resolves it: {error}")
             })
             .display()
             .to_string();
-        let root = run.root().display().to_string();
-        let mut words: Vec<String> = self.account.arguments.clone();
-        words.extend(
-            self.account
-                .switches
-                .iter()
-                .map(|switch| switch.replace("{run}", &root).replace("{work}", &work)),
-        );
-        words.extend(extra.iter().map(|word| (*word).to_owned()));
-        let mut line = self.build.command.clone();
-        for word in words {
-            line.push(' ');
-            line.push_str(&build::quote(&word));
-        }
-        line
+        (run.root().display().to_string(), work)
     }
 
-    /// The environment a session of the run is created with: the harness's own for a session, the
-    /// entry's variables, its configuration directory and its login, and none of the variables the
-    /// entry clears but the ones it sets itself.
+    /// The environment a session of the run is created with: the harness's own for a session, with
+    /// no proxy variable, since the agent reaches its provider on loopback, the entry's variables,
+    /// its configuration directory with the entry's arguments and switches written as the keys of
+    /// its `config.toml`, and its login, and none of the variables the entry clears but the ones it
+    /// sets itself.
     fn variables(&self, host: &Host<'_>, shell: &shells::ManagedShell) -> Vec<(String, String)> {
         let mut variables = session_variables(host, shell, &self.build.environment, closed_port());
+        variables.retain(|(name, _)| !PROXY_VARIABLES.contains(&name.as_str()));
         for name in ["USER", "LOGNAME"] {
             if let Ok(value) = std::env::var(name) {
                 variables.push((name.to_owned(), value));
             }
         }
-        if let Some((name, value)) = &self.key {
+        if let Some((name, value)) = &self.held.key {
             variables.push((name.clone(), value.clone()));
         }
         for (name, value) in &self.account.variables {
             variables.retain(|(existing, _)| existing != name);
             variables.push((name.clone(), value.clone()));
         }
-        if let Some(config) = &self.account.config_directory {
-            let directory = Self::config(host.run());
-            if !directory.is_dir() {
-                kr_ipc::paths::create_private_tree(host.run().root(), &directory)
-                    .expect("the run's configuration directory");
-            }
-            for (relative, content) in &config.files {
-                let path = directory.join(relative);
-                assert!(
-                    path.starts_with(&directory) && !relative.contains(".."),
-                    "a configuration file stays in its directory: {relative}"
-                );
-                std::fs::write(&path, content).expect("writes the configuration file");
-            }
-            variables.retain(|(existing, _)| existing != &config.variable);
-            variables.push((config.variable.clone(), directory.display().to_string()));
+        let config = self.account.config_directory.as_ref().expect(
+            "the entry gives the agent no configuration directory of the run's own, and its \
+             switches have nowhere to go",
+        );
+        let directory = Self::config(host.run());
+        if !directory.is_dir() {
+            kr_ipc::paths::create_private_tree(host.run().root(), &directory)
+                .expect("the run's configuration directory");
         }
+        let (root, work) = Self::places(host.run());
+        let files = self
+            .account
+            .configuration_with_switches("config.toml", &root, &work)
+            .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+        for (relative, content) in &files {
+            let path = directory.join(relative);
+            assert!(
+                path.starts_with(&directory) && !relative.contains(".."),
+                "a configuration file stays in its directory: {relative}"
+            );
+            std::fs::write(&path, content).expect("writes the configuration file");
+        }
+        variables.retain(|(existing, _)| existing != &config.variable);
+        variables.push((config.variable.clone(), directory.display().to_string()));
         let _ = self.build.without_provider_keys(&mut variables);
         variables
     }
 
-    /// Fails the case when a file the entry says would load the person's own settings, hooks or
-    /// servers into the agent exists before it starts.
-    fn checks_absent(&self, run: &Run) {
-        let config = Self::config(run).display().to_string();
-        let work = run.work().display().to_string();
-        let home = run.home().display().to_string();
-        let user = std::process::Command::new("/usr/bin/id")
-            .arg("-un")
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-            .filter(|name| !name.is_empty())
-            .expect("the account name the system has");
-        for path in &self.account.absent {
-            if path.contains("{ancestors}") || path.contains("{person}") {
-                continue;
+    /// Fails the case when the agent would not have its updates and installs switched off: the
+    /// entry must give it each switch, and the switches that are options reach it as keys of its
+    /// file.
+    fn checks_installs_off(&self, run: &Run) {
+        self.build
+            .installs_are_off()
+            .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+        let (root, work) = Self::places(run);
+        let keys = self
+            .account
+            .switches_as_keys(&root, &work)
+            .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+        for switch in &self.account.installs_off {
+            if let InstallSwitch::Argument { text } = switch {
+                let given = text
+                    .split_once('=')
+                    .is_some_and(|(key, value)| keys.contains(&(key.to_owned(), value.to_owned())));
+                assert!(
+                    given,
+                    "{ISOLATION_UNPROVEN} {text:?} switches the agent's updates and installs off, \
+                     and no key of its configuration file says so"
+                );
             }
-            let path = PathBuf::from(
-                path.replace("{config}", &config)
-                    .replace("{work}", &work)
-                    .replace("{home}", &home)
-                    .replace("{user}", &user),
-            );
+        }
+    }
+
+    /// Fails the case when a file the entry says would load the person's own settings, hooks or
+    /// servers into the agent exists before it starts: every path of the entry's list, with every
+    /// template filled in.
+    fn checks_absent(&self, run: &Run) {
+        let person = PathBuf::from(std::env::var_os("HOME").expect("the person's home in HOME"));
+        for path in absent_paths(&self.account, run, &run.home(), &person, Absent::All) {
             assert!(
                 !path.exists(),
-                "{} exists, which would load the person's own settings, hooks or servers into the \
-                 agent, or which it would remove",
+                "{ISOLATION_UNPROVEN} {} exists, which would load the person's own settings, hooks \
+                 or servers into the agent, or which it would remove",
                 path.display()
             );
         }
@@ -329,46 +387,38 @@ impl Real {
             .unwrap_or_else(|why| panic!("{why}"));
     }
 
-    /// Searches the run's directory for the login's value and for the other keys' values, and
-    /// records where they were found, never what they were.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the search was incomplete or found one.
-    fn searched(&self, run: &Run, case: &str) {
-        let mut values: Vec<&[u8]> = self.others.iter().map(String::as_bytes).collect();
-        if let Some((_, value)) = &self.key {
-            values.push(value.as_bytes());
-        }
-        if values.is_empty() {
-            return;
-        }
-        let scan = account::files_holding_any(run.root(), &values);
-        let variable = self.key.as_ref().map_or("", |(name, _)| name.as_str());
-        account::record_key_scan(case, variable, &scan, 0, false);
-        assert!(
-            scan.complete() && scan.held_by.is_empty(),
-            "the run's directory holds a key's value or could not be searched whole: {} file(s) \
-             hold one, {} entries were not read",
-            scan.held_by.len(),
-            scan.unread.len()
-        );
-    }
-
     /// The text of every file under the agent's conversation directory.
-    fn conversations(run: &Run) -> String {
+    ///
+    /// # Errors
+    ///
+    /// Returns the entry of the record that could not be read: a record that is not whole shows
+    /// nothing.
+    fn conversations(&self, run: &Run) -> Result<String, String> {
         let mut text = String::new();
-        let mut pending = vec![Self::config(run).join("sessions")];
+        let mut pending = vec![conversations_root(&self.account, &Self::config(run))];
         while let Some(path) = pending.pop() {
-            if path.is_dir() {
-                if let Ok(entries) = std::fs::read_dir(&path) {
-                    pending.extend(entries.flatten().map(|entry| entry.path()));
+            let metadata = match std::fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("{}: {error}", path.display())),
+            };
+            if metadata.is_dir() {
+                let entries = std::fs::read_dir(&path)
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+                for entry in entries {
+                    pending.push(
+                        entry
+                            .map_err(|error| format!("{}: {error}", path.display()))?
+                            .path(),
+                    );
                 }
-            } else if let Ok(bytes) = std::fs::read(&path) {
+            } else {
+                let bytes =
+                    std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
                 text.push_str(&String::from_utf8_lossy(&bytes));
             }
         }
-        text
+        Ok(text)
     }
 }
 
@@ -386,7 +436,7 @@ struct Context {
 
 impl Context {
     /// Makes the run and places the agent, or says why the case cannot run here.
-    fn start(leg: &str) -> Option<Self> {
+    fn start(leg: &str, case: &str) -> Option<Self> {
         let shell = match shells::managed_zsh() {
             Ok(shell) => shell,
             Err(why) if shells::required() => panic!("the {leg} leg's managed shell: {why}"),
@@ -395,7 +445,7 @@ impl Context {
                 return None;
             }
         };
-        let route = Route::from_environment();
+        let route = Route::from_environment(case);
         let run = Run::start(leg);
         run.place_built("kr-hook", &run.binary("kr-hook"), &["--version"]);
         let (executable, bin) = match &route {
@@ -407,6 +457,7 @@ impl Context {
                 (tools.join("codex"), tools)
             }
             Route::Real(real) => {
+                real.checks_installs_off(&run);
                 let pinned = real.build.pinned_file();
                 let bytes = std::fs::read(&pinned).unwrap_or_else(|error| {
                     panic!("the pinned build {}: {error}", pinned.display())
@@ -488,6 +539,20 @@ impl Context {
             }
             Route::Real(real) => real.variables(host, &self.shell),
         }
+    }
+
+    /// `variables` without the login's variable: the login is the agent's session's, and no step of
+    /// the host's needs it.
+    fn without_login(&self, variables: &[(String, String)]) -> Vec<(String, String)> {
+        let login = match &self.route {
+            Route::Real(real) => real.held.key.as_ref().map(|(name, _)| name.as_str()),
+            Route::StandIn => None,
+        };
+        variables
+            .iter()
+            .filter(|(name, _)| Some(name.as_str()) != login)
+            .cloned()
+            .collect()
     }
 
     /// Pairs a device with the host as its first owner.
@@ -763,8 +828,11 @@ impl Person {
         let home = ctx.run.home();
         let variables = ctx.variables(host);
         std::fs::write(home.join(".zshrc"), ZSHRC).expect("writes the startup file");
+        // The login is the agent's session's alone: `kr shell install` is not given it.
         let mut install = host.command(&["shell", "install", "--json"]);
-        install.env_clear().envs(variables.iter().cloned());
+        install
+            .env_clear()
+            .envs(ctx.without_login(&variables).iter().cloned());
         let installed = kr_e2e_m1b::run::output_within(install, LIVENESS)
             .unwrap_or_else(|why| panic!("kr shell install: {why}"));
         assert!(
@@ -827,6 +895,25 @@ impl Person {
             assert!(
                 started.elapsed() < LIVENESS,
                 "{why}: the screen still shows {needle:?} after {LIVENESS:?}:\n{}",
+                rows.join("\n")
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Waits until the agent's composer waits for a prompt: the screen shows `composer` and not
+    /// `busy`, which it shows while a turn runs.
+    fn waits_for_the_composer(&self, composer: &str, busy: &str, why: &str) {
+        let started = Instant::now();
+        loop {
+            let rows = self.window.screen();
+            let shows = |needle: &str| rows.iter().any(|row| row.contains(needle));
+            if shows(composer) && !shows(busy) {
+                return;
+            }
+            assert!(
+                started.elapsed() < LIVENESS,
+                "{why}: the composer does not wait for a prompt after {LIVENESS:?}; the screen is:\n{}",
                 rows.join("\n")
             );
             std::thread::sleep(Duration::from_millis(100));
@@ -896,7 +983,9 @@ impl Person {
     }
 
     /// Types `text`, which holds `mark`, at an agent's composer, waits until the screen shows the
-    /// mark, and submits it after a moment, so that the line end arrives on its own.
+    /// mark, and submits it after a moment, so that the line end arrives on its own and is not
+    /// taken for a character of the text. A slash command is typed this way too, its own text as
+    /// the mark.
     fn composes(&self, text: &str, mark: &str) {
         self.window.type_text(text.as_bytes());
         let _ = self
@@ -904,6 +993,37 @@ impl Person {
             .wait_for_screen(mark, "the typed prompt is on the screen");
         std::thread::sleep(Duration::from_millis(300));
         self.window.type_text(b"\r");
+    }
+
+    /// A question whose answer is on the screen now and in none of `avoid`, so that the answer's
+    /// appearing is the agent's.
+    fn asks(&self, avoid: &[&str]) -> (String, String) {
+        loop {
+            let (question, sum) = fresh_question(avoid);
+            if !self.window.screen().iter().any(|row| row.contains(&sum)) {
+                return (question, sum);
+            }
+        }
+    }
+
+    /// Waits for the agent's approval dialog, read once more for up to a second where it does not
+    /// yet ask for `command` alone, and returns its rows only where it asks to run `command` and
+    /// nothing else.
+    fn dialog_names(&self, account: &Account, command: &str) -> Vec<String> {
+        let mut rows = self.sees(&account.approval.shows, "the agent asks for approval");
+        let settling = Instant::now();
+        loop {
+            match account.approval.names_only(&rows, command) {
+                Ok(()) => return rows,
+                Err(_) if settling.elapsed() < Duration::from_secs(1) => {
+                    std::thread::sleep(Duration::from_millis(200));
+                    rows = self.window.screen();
+                }
+                Err(what) => {
+                    panic!("the agent asks for something other than the case's command: {what}")
+                }
+            }
+        }
     }
 
     /// Exports the stand-in's variables for the next command: its variants, the file that releases
@@ -922,6 +1042,53 @@ impl Person {
             "export KR_STAND_IN_COMMAND='{}'",
             command(&ctx.bin)
         ));
+    }
+}
+
+/// A named pipe in the run's own directory: a command that writes to it waits there until the case
+/// reads, so the case holds a turn open for as long as it needs, and reads what the command wrote.
+struct Fifo(PathBuf);
+
+impl Fifo {
+    /// Makes the pipe at `path`.
+    fn made_at(path: PathBuf) -> Self {
+        let made = std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&path)
+            .status()
+            .expect("mkfifo starts");
+        assert!(made.success(), "mkfifo {} exited {made}", path.display());
+        Self(path)
+    }
+
+    /// Opens the pipe for reading without waiting for a writer, which lets a command blocked on
+    /// opening it for writing go on, and reads until a line arrives or `within` has passed.
+    fn line(&self, within: Duration) -> Option<String> {
+        let flags = i32::try_from(rustix::fs::OFlags::NONBLOCK.bits()).expect("a flag");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags)
+            .open(&self.0)
+            .ok()?;
+        let started = Instant::now();
+        let mut text = Vec::new();
+        loop {
+            let mut buffer = [0_u8; 256];
+            match file.read(&mut buffer) {
+                Ok(count) if count > 0 => {
+                    text.extend_from_slice(&buffer[..count]);
+                    if text.contains(&b'\n') {
+                        return Some(String::from_utf8_lossy(&text).trim().to_owned());
+                    }
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return None,
+            }
+            if started.elapsed() >= within {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -1018,9 +1185,10 @@ impl<'a> Session<'a> {
         self.person.session_id
     }
 
-    /// Types the agent's command with `extra` words after its switches, waits until the terminal
-    /// is up behind the gateway, and returns the live instance the host announces for it, other
-    /// than `not`.
+    /// Types the agent's command, alone or with `extra` words after it (`resume` and a thread),
+    /// waits until the terminal is up, and returns the live instance the host announces for it,
+    /// other than `not`, once the host says that a gateway serves it: a launch that ran as typed,
+    /// with no gateway, is found here, before any prompt is sent or charged.
     fn starts_the_agent(
         &self,
         extra: &[&str],
@@ -1035,16 +1203,20 @@ impl<'a> Session<'a> {
                 );
             }
             Route::Real(real) => {
-                real.checks_absent(&self.ctx.run);
-                let line = real.typed(&self.ctx.run, extra);
+                // The files that would load the person's own settings are known absent before the
+                // agent's first start, as they are before any part's.
+                if not.is_none() {
+                    real.checks_absent(&self.ctx.run);
+                }
                 let _ = self.person.types_until_it_shows(
-                    &line,
+                    &real.typed(extra),
                     &real.account.composer,
-                    "the agent reaches its composer through the gateway",
+                    "the agent reaches its composer",
                 );
             }
         }
-        self.ctx
+        let instance = self
+            .ctx
             .instances_until(&self.remote, self.session_id(), "the instance", |read| {
                 read.agent_instances
                     .instances
@@ -1056,7 +1228,34 @@ impl<'a> Session<'a> {
             .iter()
             .map(|instance| instance.application_instance_id)
             .find(|id| Some(*id) != not)
-            .expect("an instance")
+            .expect("an instance");
+        self.gateway_serves(instance);
+        instance
+    }
+
+    /// Fails the case unless the host announces `instance` as served through a gateway, with no
+    /// reason for running the line as typed.
+    fn gateway_serves(&self, instance: ApplicationInstanceId) {
+        let read = self.ctx.instances(&self.remote, self.session_id());
+        let summary = read
+            .agent_instances
+            .instances
+            .iter()
+            .find(|summary| summary.application_instance_id == instance)
+            .expect("the instance is still announced");
+        assert!(
+            summary.mode.uses_gateway() && summary.bypass.0.is_none(),
+            "the launch was not served through a gateway: the host announces the mode {:?} and, for \
+             running the line as typed, {:?}",
+            summary.mode,
+            summary.bypass.0
+        );
+        let binding = self.ctx.binding(&self.remote, self.session_id(), instance);
+        assert!(
+            binding.mode.uses_gateway(),
+            "the binding is not a gateway's: its mode is {:?}",
+            binding.mode
+        );
     }
 
     fn binding_until(
@@ -1067,6 +1266,24 @@ impl<'a> Session<'a> {
     ) -> AgentBindingState {
         self.ctx
             .binding_until(&self.remote, self.session_id(), instance, why, holds)
+    }
+
+    /// Reads the binding until `holds` is true of it, and fails at once on any read, the last one
+    /// not excepted, that finds rich work suspended.
+    fn binding_unsuspended_until(
+        &self,
+        instance: ApplicationInstanceId,
+        why: &str,
+        holds: impl Fn(&AgentBindingState) -> bool,
+    ) -> AgentBindingState {
+        self.binding_until(instance, why, |binding| {
+            assert!(
+                unsuspended(binding),
+                "{why}: rich work is suspended: {:?}",
+                binding.suspension_reason.0
+            );
+            holds(binding)
+        })
     }
 
     /// The approval the host holds, once its interpretation is verified under the package's
@@ -1083,28 +1300,151 @@ impl<'a> Session<'a> {
         );
         read.agent_resources.resources[0].clone()
     }
+}
 
-    /// Ends the case: closes the host, searches the run's directory for the keys of a real agent,
-    /// and records the outcome.
-    fn ends(self, case: &str, test: &str, evidence: serde_json::Value) {
-        let Self { ctx, host, .. } = self;
-        ctx.close(&host);
-        let turns = match &ctx.route {
-            Route::StandIn => 0,
-            Route::Real(real) => {
-                real.searched(&ctx.run, case);
-                real.ledger.charged_here()
+/// What a case does on a real route that the stand-in route does not: the work that every outcome
+/// of a case, a panic included, is followed by.
+///
+/// What the run started is ended, the person's own files are looked at again by their metadata,
+/// the agent's record is counted for turns the ledger was not charged for, the run's directory is
+/// searched for the keys and removed, and the outcome is appended. A case that failed is recorded
+/// as failed and its failure goes on, as it came.
+fn ends(ctx: Context, case: &str, test: &str, result: std::thread::Result<serde_json::Value>) {
+    let Context {
+        run,
+        route,
+        runtime,
+        ..
+    } = ctx;
+    drop(runtime);
+    let root = run.root().to_path_buf();
+    // Nothing the run started may still write when its directory is searched: after a case that
+    // stopped part way, everything is ended first and the run's check made.
+    let writers_ended = if result.is_ok() {
+        true
+    } else {
+        run.end_everything();
+        run.remove_loaded_jobs();
+        run.nothing_running().is_ok()
+    };
+    let mut stops: Vec<Stop> = Vec::new();
+    let mut evidence = serde_json::json!({
+        "route": if matches!(route, Route::StandIn) { "the application stand-in" } else { "the pinned build" },
+    });
+    let mut scan = None;
+    let mut secrets: Vec<String> = Vec::new();
+    evidence["turns"] = serde_json::json!({ "charged": 0 });
+    if let Route::Real(real) = &route {
+        let (guard_stops, guard_evidence) = real.person.compare();
+        stops.extend(guard_stops);
+        evidence["person_files"] = guard_evidence;
+        let charged = real.ledger.charged_here();
+        let recorded = turns_recorded(
+            &real.account,
+            &conversations_root(&real.account, &run.root().join(CONFIG_DIRECTORY)),
+        );
+        match &recorded {
+            Ok(found) if *found > charged => {
+                let surplus = found - charged;
+                let said = real
+                    .ledger
+                    .charge_found(
+                        case,
+                        "a turn in the agent's record that the case did not charge",
+                        surplus,
+                    )
+                    .map_or_else(
+                        |why| format!("the ledger could not be written: {why}"),
+                        |total| format!("the ledger now says {total} spent"),
+                    );
+                stops.push((
+                    "uncharged_turns",
+                    format!(
+                        "the agent's record holds {found} turn(s) against {charged} charged; \
+                         {surplus} charged now ({said})"
+                    ),
+                ));
             }
-        };
-        let evidence = serde_json::json!({
-            "route": if matches!(ctx.route, Route::StandIn) { "the application stand-in" } else { "the pinned build" },
-            "turns": turns,
-            "shows": evidence,
+            Ok(_) => {}
+            Err(why) => stops.push((
+                "uncharged_turns",
+                format!("the turns in the agent's record could not be counted: {why}"),
+            )),
+        }
+        evidence["turns"] = serde_json::json!({
+            "charged": charged,
+            "in_the_agents_record": recorded.as_ref().ok(),
         });
-        if let Some(path) = std::env::var_os(RESULT_VARIABLE).filter(|value| !value.is_empty()) {
-            Outcome::passed(case, test, evidence).append(Path::new(&path));
+        scan = Some(RunScan::of(&root, &real.held));
+        secrets = real.held.values();
+    }
+    // The run is dropped before its directory goes, so its own end does not say it keeps one.
+    drop(run);
+    if let Some(scan) = scan {
+        let (scan_stops, scan_evidence) = scan.finish(&root, case, writers_ended);
+        stops.extend(scan_stops);
+        evidence["keys"] = scan_evidence;
+    }
+    let path = std::env::var_os(RESULT_VARIABLE)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let record = |outcome: Outcome| {
+        if let Some(path) = &path {
+            outcome.without(&secrets).append(path);
+        }
+    };
+    let stopped: Vec<String> = stops
+        .iter()
+        .map(|(class, why)| format!("{class}: {why}"))
+        .collect();
+    match result {
+        Ok(shows) if stops.is_empty() => {
+            evidence["shows"] = shows;
+            record(Outcome::passed(case, test, evidence));
+        }
+        Ok(shows) => {
+            evidence["shows"] = shows;
+            record(Outcome::failed(case, test, &stopped.join("; "), evidence));
+            panic!(
+                "the case showed what it was to, and then: {}",
+                stopped.join("; ")
+            );
+        }
+        Err(panic) => {
+            let said = kept_panic_text(&panic_text(&*panic));
+            let reason = if stopped.is_empty() {
+                said
+            } else {
+                format!("{said}; {}", stopped.join("; "))
+            };
+            record(Outcome::failed(case, test, &reason, evidence));
+            for line in &stopped {
+                eprintln!("{line}");
+            }
+            std::panic::resume_unwind(panic);
         }
     }
+}
+
+/// Runs one case: a host, a paired device and a person in a managed shell, `body` on them, the
+/// host's close, and whatever follows every outcome of a case ([`ends`]).
+fn run_case(
+    leg: &str,
+    case: &str,
+    test: &str,
+    variants: &str,
+    body: impl FnOnce(&Context, &Session<'_>) -> serde_json::Value,
+) {
+    let Some(ctx) = Context::start(leg, case) else {
+        return;
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let session = Session::open(&ctx, variants);
+        let shows = body(&ctx, &session);
+        ctx.close(&session.host);
+        shows
+    }));
+    ends(ctx, case, test, result);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1115,104 +1455,127 @@ impl<'a> Session<'a> {
 /// (`serverRequest/resolved`) reaches the terminal through the gateway, which is the only
 /// connection both writers use, and that the terminal closes its prompt on it: a paired device
 /// answers the approval of a command the terminal holds, the host's resource resolves, the
-/// terminal's prompt goes, and the command runs once.
+/// terminal's prompt goes while the turn still runs, and the command runs once.
 #[test]
 fn gateway_a_device_answers_an_approval_and_the_terminal_closes_its_prompt() {
     const TEST: &str = "gateway_a_device_answers_an_approval_and_the_terminal_closes_its_prompt";
-    let Some(ctx) = Context::start("gateway-approval") else {
-        return;
-    };
-    let session = Session::open(
-        &ctx,
+    run_case(
+        "gateway-approval",
+        "gateway-1",
+        TEST,
         "answer-when-released,keep-reading,ping-when-released,stay",
+        |ctx, session| {
+            let instance = session.starts_the_agent(&[], None);
+            match &ctx.route {
+                Route::StandIn => {
+                    let binding = session.binding_until(
+                        instance,
+                        "the stream names the thread and the turn",
+                        |binding| names(binding, "thread-1", Some("turn-1")),
+                    );
+                    let pending = session.interpreted_approval();
+                    assert_eq!(pending.state, PendingState::Pending);
+                    let answered = ctx
+                        .answers(
+                            &session.remote,
+                            session.session_id(),
+                            instance,
+                            &binding,
+                            pending.resource_id,
+                            ACCEPT,
+                        )
+                        .expect("the device's answer is carried");
+                    assert_eq!(answered.state, PendingState::Resolved);
+                    let _ = session.person.sees(
+                        "TUI: serverRequest/resolved",
+                        "the terminal reads the server's word that the request was answered",
+                    );
+                    let answers = received_lines(ctx)
+                        .iter()
+                        .filter(|line| line.starts_with("response "))
+                        .count();
+                    assert_eq!(answers, 1, "the server received one answer");
+                    serde_json::json!({ "answers_the_server_received": answers })
+                }
+                Route::Real(real) => {
+                    // The command writes to a pipe, so it waits to be read: the turn stays open
+                    // until the case reads, whatever the terminal does with its prompt meanwhile.
+                    let mark = mark();
+                    let pipe = Fifo::made_at(ctx.run.work().join("f"));
+                    let command = format!("echo {mark} > {}", ctx.run.work().join("f").display());
+                    assert!(
+                        real.account
+                            .approval
+                            .command_line
+                            .as_deref()
+                            .unwrap_or("")
+                            .len()
+                            + command.len()
+                            + 8
+                            <= usize::from(kr_e2e_m1b::window::COLUMNS),
+                        "the case's command, {} characters, would not fit on one line of the \
+                         agent's dialog",
+                        command.len()
+                    );
+                    real.charge("gateway-1", "an approval-gated command");
+                    session.person.composes(
+                        &format!(
+                            "({mark}) Use your shell tool to run exactly this command and nothing \
+                             else: {command}"
+                        ),
+                        &mark,
+                    );
+                    // The device answers only a dialog that asks to run the case's command and
+                    // nothing else: an accepted request runs outside the read-only sandbox.
+                    let _ = session.person.dialog_names(&real.account, &command);
+                    let binding = session.binding_until(
+                        instance,
+                        "the stream names the thread and the running turn",
+                        |binding| {
+                            binding.thread_id.0.is_some()
+                                && binding.turn_id.0.is_some()
+                                && unsuspended(binding)
+                        },
+                    );
+                    let pending = session.interpreted_approval();
+                    assert_eq!(pending.state, PendingState::Pending);
+                    let answered = ctx
+                        .answers(
+                            &session.remote,
+                            session.session_id(),
+                            instance,
+                            &binding,
+                            pending.resource_id,
+                            ACCEPT,
+                        )
+                        .expect("the device's answer is carried");
+                    assert_eq!(answered.state, PendingState::Resolved);
+                    session.person.stops_seeing(
+                        &real.account.approval.shows,
+                        "the terminal closes its prompt once the server says the request was answered",
+                    );
+                    // The command is still waiting for the pipe to be read, so the turn is open:
+                    // the prompt closed on the server's word and not on the turn's end.
+                    let open = ctx.binding(&session.remote, session.session_id(), instance);
+                    assert!(
+                        open.turn_id.0.is_some(),
+                        "the turn ended with the dialog's closing, so the closing is not shown to be \
+                         the server's word: {open:?}"
+                    );
+                    let written = pipe.line(LIVENESS);
+                    assert_eq!(
+                        written.as_deref(),
+                        Some(mark.as_str()),
+                        "the command ran once and wrote its marker"
+                    );
+                    let _ = session.binding_until(instance, "the turn ends", |binding| {
+                        binding.turn_id.0.is_none() && unsuspended(binding)
+                    });
+                    serde_json::json!({ "command_ran": 1, "turn_open_after_the_prompt_closed": true })
+                }
+            }
+        },
     );
-    let instance = session.starts_the_agent(&[], None);
-    let shows = match &ctx.route {
-        Route::StandIn => {
-            let binding = session.binding_until(
-                instance,
-                "the stream names the thread and the turn",
-                |binding| names(binding, "thread-1", Some("turn-1")),
-            );
-            let pending = session.interpreted_approval();
-            assert_eq!(pending.state, PendingState::Pending);
-            let answered = ctx
-                .answers(
-                    &session.remote,
-                    session.session_id(),
-                    instance,
-                    &binding,
-                    pending.resource_id,
-                    ACCEPT,
-                )
-                .expect("the device's answer is carried");
-            assert_eq!(answered.state, PendingState::Resolved);
-            let _ = session.person.sees(
-                "TUI: serverRequest/resolved",
-                "the terminal reads the server's word that the request was answered",
-            );
-            let answers = received_lines(&ctx)
-                .iter()
-                .filter(|line| line.starts_with("response "))
-                .count();
-            assert_eq!(answers, 1, "the server received one answer");
-            serde_json::json!({ "answers_the_server_received": answers })
-        }
-        Route::Real(real) => {
-            let mark = mark();
-            let log = ctx.run.work().join("approved");
-            let command = format!("echo {mark} >> {}", log.display());
-            real.charge("gateway-1", "an approval-gated command");
-            session.person.composes(
-                &format!(
-                    "({mark}) Use your shell tool to run exactly this command and nothing else: \
-                     {command}"
-                ),
-                &mark,
-            );
-            let _ = session.person.sees(
-                &real.account.approval.shows,
-                "the agent asks for approval of the command",
-            );
-            let binding = session.binding_until(
-                instance,
-                "the stream names the thread and the running turn",
-                |binding| {
-                    binding.thread_id.0.is_some()
-                        && binding.turn_id.0.is_some()
-                        && unsuspended(binding)
-                },
-            );
-            let pending = session.interpreted_approval();
-            assert_eq!(pending.state, PendingState::Pending);
-            let answered = ctx
-                .answers(
-                    &session.remote,
-                    session.session_id(),
-                    instance,
-                    &binding,
-                    pending.resource_id,
-                    ACCEPT,
-                )
-                .expect("the device's answer is carried");
-            assert_eq!(answered.state, PendingState::Resolved);
-            session.person.stops_seeing(
-                &real.account.approval.shows,
-                "the terminal closes its prompt once the server says the request was answered",
-            );
-            let _ = session.binding_until(instance, "the turn ends", |binding| {
-                binding.turn_id.0.is_none() && unsuspended(binding)
-            });
-            let ran = std::fs::read_to_string(&log)
-                .unwrap_or_default()
-                .lines()
-                .filter(|line| line.trim() == mark)
-                .count();
-            assert_eq!(ran, 1, "the command ran once");
-            serde_json::json!({ "command_ran": ran })
-        }
-    };
-    session.ends("gateway-1", TEST, shows);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1225,67 +1588,73 @@ fn gateway_a_device_answers_an_approval_and_the_terminal_closes_its_prompt() {
 #[test]
 fn gateway_the_terminal_shows_a_turn_the_host_started() {
     const TEST: &str = "gateway_the_terminal_shows_a_turn_the_host_started";
-    let Some(ctx) = Context::start("gateway-host-turn") else {
-        return;
-    };
-    let session = Session::open(&ctx, "answer-when-released,keep-reading,stay");
-    let instance = session.starts_the_agent(&[], None);
-    let shows = match &ctx.route {
-        Route::StandIn => {
-            let _ = session.binding_until(instance, "the stream names the turn", |binding| {
-                names(binding, "thread-1", Some("turn-1"))
-            });
-            std::fs::write(release_of(&ctx), b"go").expect("the release");
-            let idle = session.binding_until(instance, "the turn ends", |binding| {
-                names(binding, "thread-1", None)
-            });
-            let from = session.person.window.mark();
-            let started = ctx
-                .prompts(
-                    &session.remote,
-                    session.session_id(),
-                    instance,
-                    &idle,
-                    "run it again",
-                )
-                .expect("the device's prompt is carried");
-            assert!(started.turn_id.0.is_some(), "the host started a turn");
-            let _ = session.person.window.wait_for(
-                from,
-                b"TUI: turn/started",
-                "the terminal shows the turn the host started",
-            );
-            serde_json::json!({ "turn_started_by_the_host": true })
-        }
-        Route::Real(real) => {
-            let idle = session.binding_until(
-                instance,
-                "the stream names a thread and no turn",
-                |binding| {
-                    binding.thread_id.0.is_some()
-                        && binding.turn_id.0.is_none()
-                        && unsuspended(binding)
-                },
-            );
-            let (question, sum) = sum_question();
-            real.charge("gateway-2", "a prompt from a device");
-            let started = ctx
-                .prompts(
-                    &session.remote,
-                    session.session_id(),
-                    instance,
-                    &idle,
-                    &format!("({}) {question}", mark()),
-                )
-                .expect("the device's prompt is carried");
-            assert!(started.turn_id.0.is_some(), "the host started a turn");
-            let _ = session
-                .person
-                .sees(&sum, "the terminal shows the turn the host started");
-            serde_json::json!({ "turn_started_by_the_host": true })
-        }
-    };
-    session.ends("gateway-2", TEST, shows);
+    run_case(
+        "gateway-host-turn",
+        "gateway-2",
+        TEST,
+        "answer-when-released,keep-reading,stay",
+        |ctx, session| {
+            let instance = session.starts_the_agent(&[], None);
+            match &ctx.route {
+                Route::StandIn => {
+                    let _ =
+                        session.binding_until(instance, "the stream names the turn", |binding| {
+                            names(binding, "thread-1", Some("turn-1"))
+                        });
+                    std::fs::write(release_of(ctx), b"go").expect("the release");
+                    let idle = session.binding_until(instance, "the turn ends", |binding| {
+                        names(binding, "thread-1", None)
+                    });
+                    let from = session.person.window.mark();
+                    let started = ctx
+                        .prompts(
+                            &session.remote,
+                            session.session_id(),
+                            instance,
+                            &idle,
+                            "run it again",
+                        )
+                        .expect("the device's prompt is carried");
+                    assert!(started.turn_id.0.is_some(), "the host started a turn");
+                    let _ = session.person.window.wait_for(
+                        from,
+                        b"TUI: turn/started",
+                        "the terminal shows the turn the host started",
+                    );
+                    serde_json::json!({ "turn_started_by_the_host": true })
+                }
+                Route::Real(real) => {
+                    let idle = session.binding_until(
+                        instance,
+                        "the stream names a thread and no turn",
+                        |binding| {
+                            binding.thread_id.0.is_some()
+                                && binding.turn_id.0.is_none()
+                                && unsuspended(binding)
+                        },
+                    );
+                    let marked = mark();
+                    let root = ctx.run.root().display().to_string();
+                    let (question, sum) = session.person.asks(&[&marked, &root]);
+                    real.charge("gateway-2", "a prompt from a device");
+                    let started = ctx
+                        .prompts(
+                            &session.remote,
+                            session.session_id(),
+                            instance,
+                            &idle,
+                            &format!("({marked}) {question}"),
+                        )
+                        .expect("the device's prompt is carried");
+                    assert!(started.turn_id.0.is_some(), "the host started a turn");
+                    let _ = session
+                        .person
+                        .sees(&sum, "the terminal shows the turn the host started");
+                    serde_json::json!({ "turn_started_by_the_host": true })
+                }
+            }
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1300,93 +1669,153 @@ fn gateway_the_terminal_shows_a_turn_the_host_started() {
 #[test]
 fn gateway_the_binding_changes_its_thread_only_where_the_terminal_starts_resumes_or_forks_one() {
     const TEST: &str = "gateway_the_binding_changes_its_thread_only_where_the_terminal_starts_resumes_or_forks_one";
-    let Some(ctx) = Context::start("gateway-thread") else {
-        return;
-    };
-    let session = Session::open(&ctx, "answer-when-released,keep-reading,stay");
-    let instance = session.starts_the_agent(&[], None);
-    let shows = match &ctx.route {
-        Route::StandIn => {
-            let started =
-                session.binding_until(instance, "the stream names the thread", |binding| {
-                    names(binding, "thread-1", Some("turn-1"))
-                });
-            std::fs::write(release_of(&ctx), b"go").expect("the release");
-            let idle = session.binding_until(instance, "the turn ends", |binding| {
-                names(binding, "thread-1", None)
-            });
-            assert_eq!(
-                idle.binding_revision, started.binding_revision,
-                "a turn and its end leave the binding's revision as the thread's start made it"
-            );
-            serde_json::json!({ "revision_unchanged_through_a_turn": true })
-        }
-        Route::Real(real) => {
-            let (question, sum) = sum_question();
-            real.charge("gateway-3", "a turn in the first thread");
-            let marked = mark();
-            session
-                .person
-                .composes(&format!("({marked}) {question}"), &marked);
-            let _ = session.person.sees(&sum, "the agent answers");
-            let first = session.binding_until(instance, "the turn ends", |binding| {
-                binding.thread_id.0.is_some() && binding.turn_id.0.is_none() && unsuspended(binding)
-            });
-            let first_thread = thread_of(&first).expect("a thread");
+    run_case(
+        "gateway-thread",
+        "gateway-3",
+        TEST,
+        "answer-when-released,keep-reading,stay",
+        |ctx, session| {
+            let instance = session.starts_the_agent(&[], None);
+            match &ctx.route {
+                Route::StandIn => {
+                    let started =
+                        session.binding_until(instance, "the stream names the thread", |binding| {
+                            names(binding, "thread-1", Some("turn-1"))
+                        });
+                    std::fs::write(release_of(ctx), b"go").expect("the release");
+                    let idle = session.binding_until(instance, "the turn ends", |binding| {
+                        names(binding, "thread-1", None)
+                    });
+                    assert_eq!(
+                        idle.binding_revision, started.binding_revision,
+                        "a turn and its end leave the binding's revision as the thread's start made it"
+                    );
+                    serde_json::json!({ "revision_unchanged_through_a_turn": true })
+                }
+                Route::Real(real) => {
+                    let account = &real.account;
+                    // The thread and the revision the terminal's start selected, before any prompt.
+                    let before = session.binding_until(
+                        instance,
+                        "the stream names a thread and no turn",
+                        |binding| {
+                            binding.thread_id.0.is_some()
+                                && binding.turn_id.0.is_none()
+                                && unsuspended(binding)
+                        },
+                    );
+                    let first_thread = thread_of(&before).expect("a thread");
+                    let marked = mark();
+                    let root = ctx.run.root().display().to_string();
+                    let (question, sum) = session.person.asks(&[&marked, &root]);
+                    real.charge("gateway-3", "a turn in the first thread");
+                    session
+                        .person
+                        .composes(&format!("({marked}) {question}"), &marked);
+                    let _ = session.person.sees(&sum, "the agent answers");
+                    let first = session.binding_until(instance, "the turn ends", |binding| {
+                        binding.thread_id.0.is_some()
+                            && binding.turn_id.0.is_none()
+                            && unsuspended(binding)
+                    });
+                    assert_eq!(
+                        (thread_of(&first), first.binding_revision),
+                        (Some(first_thread.clone()), before.binding_revision),
+                        "a turn leaves the binding's thread and revision as the terminal's start \
+                         made them"
+                    );
 
-            // A command that selects nothing changes nothing.
-            session.person.window.type_text(b"/pwd\r");
-            let _ = session
-                .person
-                .sees("Current working directory:", "the command answers");
-            let after_pwd = ctx.binding(&session.remote, session.session_id(), instance);
-            assert_eq!(
-                (thread_of(&after_pwd), after_pwd.binding_revision),
-                (Some(first_thread.clone()), first.binding_revision),
-                "a command that selects no thread leaves the binding as it was"
-            );
+                    // A command that selects nothing changes nothing.
+                    session.person.waits_for_the_composer(
+                        &account.composer,
+                        &account.busy,
+                        "the composer waits before the command",
+                    );
+                    session
+                        .person
+                        .composes(&account.slash.input, &account.slash.input);
+                    let _ = session
+                        .person
+                        .sees(&account.slash.shows, "the command answers");
+                    let after_command =
+                        ctx.binding(&session.remote, session.session_id(), instance);
+                    assert_eq!(
+                        (thread_of(&after_command), after_command.binding_revision),
+                        (Some(first_thread.clone()), first.binding_revision),
+                        "a command that selects no thread leaves the binding as it was"
+                    );
+                    if !account.dismiss.is_empty() {
+                        session.person.window.type_text(account.dismiss.as_bytes());
+                    }
 
-            // A fork selects another thread, and a new conversation another.
-            session.person.window.type_text(b"/fork\r");
-            let forked =
-                session.binding_until(instance, "the terminal forks the thread", |binding| {
-                    thread_of(binding).is_some_and(|thread| thread != first_thread)
-                        && unsuspended(binding)
-                });
-            let fork_thread = thread_of(&forked).expect("a thread");
-            session.person.window.type_text(b"/new\r");
-            let fresh =
-                session.binding_until(instance, "the terminal starts a new thread", |binding| {
-                    thread_of(binding).is_some_and(|thread| thread != fork_thread)
-                        && unsuspended(binding)
-                });
-            assert!(
-                fresh.binding_revision != forked.binding_revision
-                    && forked.binding_revision != first.binding_revision,
-                "each selection advanced the binding's revision"
-            );
+                    // A fork selects another thread, and a new conversation another.
+                    session.person.waits_for_the_composer(
+                        &account.composer,
+                        &account.busy,
+                        "the composer waits before the fork",
+                    );
+                    session.person.composes("/fork", "/fork");
+                    let forked = session.binding_until(
+                        instance,
+                        "the terminal forks the thread",
+                        |binding| {
+                            thread_of(binding).is_some_and(|thread| thread != first_thread)
+                                && unsuspended(binding)
+                        },
+                    );
+                    let fork_thread = thread_of(&forked).expect("a thread");
+                    session.person.waits_for_the_composer(
+                        &account.composer,
+                        &account.busy,
+                        "the composer waits before the new conversation",
+                    );
+                    session.person.composes("/new", "/new");
+                    let fresh = session.binding_until(
+                        instance,
+                        "the terminal starts a new thread",
+                        |binding| {
+                            thread_of(binding).is_some_and(|thread| thread != fork_thread)
+                                && unsuspended(binding)
+                        },
+                    );
+                    assert!(
+                        fresh.binding_revision != forked.binding_revision
+                            && forked.binding_revision != first.binding_revision,
+                        "each selection advanced the binding's revision"
+                    );
 
-            // A launch that resumes the first thread names it.
-            session.person.window.type_text(b"/quit\r");
-            let _ = ctx.instances_until(
-                &session.remote,
-                session.session_id(),
-                "the first launch has ended",
-                |read| read.agent_instances.instances.is_empty(),
-            );
-            let resumed = session.starts_the_agent(&["resume", &first_thread], Some(instance));
-            let named = session.binding_until(resumed, "the resumed thread is named", |binding| {
-                thread_of(binding).as_deref() == Some(first_thread.as_str()) && unsuspended(binding)
-            });
-            serde_json::json!({
-                "changed_by_a_command_that_selects_nothing": false,
-                "changed_by_a_fork": true,
-                "changed_by_a_new_conversation": true,
-                "named_by_a_resuming_launch": thread_of(&named) == Some(first_thread),
-            })
-        }
-    };
-    session.ends("gateway-3", TEST, shows);
+                    // A launch that resumes the first thread names it.
+                    session.person.waits_for_the_composer(
+                        &account.composer,
+                        &account.busy,
+                        "the composer waits before the quit",
+                    );
+                    session.person.composes("/quit", "/quit");
+                    let _ = ctx.instances_until(
+                        &session.remote,
+                        session.session_id(),
+                        "the first launch has ended",
+                        |read| read.agent_instances.instances.is_empty(),
+                    );
+                    let resumed =
+                        session.starts_the_agent(&["resume", &first_thread], Some(instance));
+                    let named =
+                        session.binding_until(resumed, "the resumed thread is named", |binding| {
+                            thread_of(binding).as_deref() == Some(first_thread.as_str())
+                                && unsuspended(binding)
+                        });
+                    serde_json::json!({
+                        "changed_by_a_turn": false,
+                        "revision_unchanged_through_a_turn": true,
+                        "changed_by_a_command_that_selects_nothing": false,
+                        "changed_by_a_fork": true,
+                        "changed_by_a_new_conversation": true,
+                        "named_by_a_resuming_launch": thread_of(&named) == Some(first_thread),
+                    })
+                }
+            }
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1394,51 +1823,73 @@ fn gateway_the_binding_changes_its_thread_only_where_the_terminal_starts_resumes
 // ---------------------------------------------------------------------------------------------
 
 /// The package's table assumes that its list of stable method names is complete for a 0.155.1
-/// session: after a turn and a slash command the binding is not suspended, which the host does
-/// only when a frame names a method the table does not list.
+/// session: the binding is not suspended at any step of a turn and a slash command, which the host
+/// does only when a frame names a method the table does not list. The binding is read at every
+/// step and at every poll between them. The host keeps no cumulative record of the methods a
+/// session named, and clears such a suspension at a later valid selection, so a suspension that
+/// came and went between two polls is not seen.
 #[test]
 fn gateway_a_whole_session_names_no_method_the_table_does_not_list() {
     const TEST: &str = "gateway_a_whole_session_names_no_method_the_table_does_not_list";
-    let Some(ctx) = Context::start("gateway-listed") else {
-        return;
-    };
-    let session = Session::open(&ctx, "answer-when-released,keep-reading,stay");
-    let instance = session.starts_the_agent(&[], None);
-    let binding = match &ctx.route {
-        Route::StandIn => {
-            let _ = session.binding_until(instance, "the stream names the turn", |binding| {
-                names(binding, "thread-1", Some("turn-1"))
-            });
-            std::fs::write(release_of(&ctx), b"go").expect("the release");
-            session.binding_until(instance, "the turn ends", |binding| {
-                names(binding, "thread-1", None)
-            })
-        }
-        Route::Real(real) => {
-            let (question, sum) = sum_question();
-            real.charge("gateway-4", "a turn");
-            let marked = mark();
-            session
-                .person
-                .composes(&format!("({marked}) {question}"), &marked);
-            let _ = session.person.sees(&sum, "the agent answers");
-            session.person.window.type_text(b"/pwd\r");
-            let _ = session
-                .person
-                .sees("Current working directory:", "the command answers");
-            session.binding_until(instance, "the turn ends", |binding| {
-                binding.thread_id.0.is_some() && binding.turn_id.0.is_none() && unsuspended(binding)
-            })
-        }
-    };
-    assert!(
-        unsuspended(&binding),
-        "rich work is not suspended after the whole session: {binding:?}"
-    );
-    session.ends(
+    run_case(
+        "gateway-listed",
         "gateway-4",
         TEST,
-        serde_json::json!({ "suspended": binding.rich_mutations_suspended }),
+        "answer-when-released,keep-reading,stay",
+        |ctx, session| {
+            let instance = session.starts_the_agent(&[], None);
+            let binding = match &ctx.route {
+                Route::StandIn => {
+                    let _ =
+                        session.binding_until(instance, "the stream names the turn", |binding| {
+                            names(binding, "thread-1", Some("turn-1"))
+                        });
+                    std::fs::write(release_of(ctx), b"go").expect("the release");
+                    session.binding_until(instance, "the turn ends", |binding| {
+                        names(binding, "thread-1", None)
+                    })
+                }
+                Route::Real(real) => {
+                    let account = &real.account;
+                    let _ = session.binding_unsuspended_until(
+                        instance,
+                        "the agent is up with a thread",
+                        |binding| binding.thread_id.0.is_some(),
+                    );
+                    let marked = mark();
+                    let root = ctx.run.root().display().to_string();
+                    let (question, sum) = session.person.asks(&[&marked, &root]);
+                    real.charge("gateway-4", "a turn");
+                    session
+                        .person
+                        .composes(&format!("({marked}) {question}"), &marked);
+                    let _ = session.person.sees(&sum, "the agent answers");
+                    let _ =
+                        session.binding_unsuspended_until(instance, "the turn ends", |binding| {
+                            binding.thread_id.0.is_some() && binding.turn_id.0.is_none()
+                        });
+                    session.person.waits_for_the_composer(
+                        &account.composer,
+                        &account.busy,
+                        "the composer waits before the command",
+                    );
+                    session
+                        .person
+                        .composes(&account.slash.input, &account.slash.input);
+                    let _ = session
+                        .person
+                        .sees(&account.slash.shows, "the command answers");
+                    session.binding_unsuspended_until(instance, "the command is done", |binding| {
+                        binding.thread_id.0.is_some() && binding.turn_id.0.is_none()
+                    })
+                }
+            };
+            assert!(
+                unsuspended(&binding),
+                "rich work is not suspended after the whole session: {binding:?}"
+            );
+            serde_json::json!({ "suspended": binding.rich_mutations_suspended })
+        },
     );
 }
 
@@ -1447,98 +1898,158 @@ fn gateway_a_whole_session_names_no_method_the_table_does_not_list() {
 // ---------------------------------------------------------------------------------------------
 
 /// The package's table assumes that `turn/start` over a running turn is not a queue: a device's
-/// prompt while a turn runs is refused as a conflict with it, and nothing reaches the server.
+/// prompt while a turn runs is refused as a conflict with it, and nothing reaches the agent. The
+/// host refuses before any `turn/start` is sent, so the case shows the host's refusal and that the
+/// agent's own record holds the terminal's prompt and not the device's.
 #[test]
 fn gateway_a_device_prompt_over_a_running_turn_is_refused_and_reaches_nothing() {
     const TEST: &str = "gateway_a_device_prompt_over_a_running_turn_is_refused_and_reaches_nothing";
-    let Some(ctx) = Context::start("gateway-running") else {
-        return;
-    };
-    let session = Session::open(&ctx, "answer-when-released,keep-reading,stay");
-    let instance = session.starts_the_agent(&[], None);
-    let shows = match &ctx.route {
-        Route::StandIn => {
-            let running = session.binding_until(instance, "the stream names the turn", |binding| {
-                names(binding, "thread-1", Some("turn-1"))
-            });
-            let refused = ctx
-                .prompts(
-                    &session.remote,
-                    session.session_id(),
-                    instance,
-                    &running,
-                    "now",
-                )
-                .expect_err("a prompt over a running turn");
-            assert_eq!(
-                refused.refusal(),
-                Some(ErrorCode::DraftConflict),
-                "{refused}"
-            );
-            assert_eq!(
-                requests_of(&ctx, "turn/start"),
-                1,
-                "only the terminal's own turn reached the server"
-            );
-            serde_json::json!({ "refused_as": "DraftConflict", "turn_starts_at_the_server": 1 })
-        }
-        Route::Real(real) => {
-            // The turn waits on an approval, which keeps it running for as long as the case needs.
-            let mark = mark();
-            real.charge("gateway-5", "a turn that waits on an approval");
-            session.person.composes(
-                &format!(
-                    "({mark}) Use your shell tool to run exactly this command and nothing else: \
-                     sleep 30"
-                ),
-                &mark,
-            );
-            let _ = session.person.sees(
-                &real.account.approval.shows,
-                "the agent asks for approval of the command",
-            );
-            let running =
-                session.binding_until(instance, "the stream names the running turn", |binding| {
-                    binding.thread_id.0.is_some()
-                        && binding.turn_id.0.is_some()
-                        && unsuspended(binding)
-                });
-            let device = format!("{} the device's own prompt", crate::mark());
-            let refused = ctx
-                .prompts(
-                    &session.remote,
-                    session.session_id(),
-                    instance,
-                    &running,
-                    &device,
-                )
-                .expect_err("a prompt over a running turn");
-            assert_eq!(
-                refused.refusal(),
-                Some(ErrorCode::DraftConflict),
-                "{refused}"
-            );
-            let held = session.interpreted_approval();
-            let _ = ctx
-                .answers(
-                    &session.remote,
-                    session.session_id(),
-                    instance,
-                    &running,
-                    held.resource_id,
-                    DECLINE,
-                )
-                .expect("the device ends the turn");
-            let _ = session.binding_until(instance, "the turn ends", |binding| {
-                binding.turn_id.0.is_none() && unsuspended(binding)
-            });
-            let recorded = Real::conversations(&ctx.run);
-            assert!(
-                recorded.contains(&mark) && !recorded.contains(&device),
-                "the agent's record holds the terminal's prompt and not the device's"
-            );
-            serde_json::json!({ "refused_as": "DraftConflict", "device_prompt_in_the_agents_record": false })
-        }
-    };
-    session.ends("gateway-5", TEST, shows);
+    run_case(
+        "gateway-running",
+        "gateway-5",
+        TEST,
+        "answer-when-released,keep-reading,stay",
+        |ctx, session| {
+            let instance = session.starts_the_agent(&[], None);
+            match &ctx.route {
+                Route::StandIn => {
+                    let running =
+                        session.binding_until(instance, "the stream names the turn", |binding| {
+                            names(binding, "thread-1", Some("turn-1"))
+                        });
+                    let refused = ctx
+                        .prompts(
+                            &session.remote,
+                            session.session_id(),
+                            instance,
+                            &running,
+                            "now",
+                        )
+                        .expect_err("a prompt over a running turn");
+                    assert_eq!(
+                        refused.refusal(),
+                        Some(ErrorCode::DraftConflict),
+                        "{refused}"
+                    );
+                    assert_eq!(
+                        requests_of(ctx, "turn/start"),
+                        1,
+                        "only the terminal's own turn reached the server"
+                    );
+                    serde_json::json!({ "refused_as": "DraftConflict", "turn_starts_at_the_server": 1 })
+                }
+                Route::Real(real) => {
+                    // The turn waits on the approval of a write, which keeps it running for as long
+                    // as the case needs, and the device declines it at the end.
+                    let mark = mark();
+                    let log = ctx.run.work().join("a");
+                    let command = format!("echo {mark} >> {}", log.display());
+                    real.charge("gateway-5", "a turn that waits on an approval");
+                    session.person.composes(
+                        &format!(
+                            "({mark}) Use your shell tool to run exactly this command and nothing \
+                             else: {command}"
+                        ),
+                        &mark,
+                    );
+                    let _ = session.person.sees(
+                        &real.account.approval.shows,
+                        "the agent asks for approval of the command",
+                    );
+                    let running = session.binding_until(
+                        instance,
+                        "the stream names the running turn",
+                        |binding| {
+                            binding.thread_id.0.is_some()
+                                && binding.turn_id.0.is_some()
+                                && unsuspended(binding)
+                        },
+                    );
+                    let held = session.interpreted_approval();
+                    // Charged before it is sent: where the host did not refuse it, the agent would
+                    // take it as a prompt of its own.
+                    real.charge("gateway-5", "a device prompt over a running turn");
+                    let device = format!("{} the device's own prompt", crate::mark());
+                    let refused = ctx
+                        .prompts(
+                            &session.remote,
+                            session.session_id(),
+                            instance,
+                            &running,
+                            &device,
+                        )
+                        .expect_err("a prompt over a running turn");
+                    assert_eq!(
+                        refused.refusal(),
+                        Some(ErrorCode::DraftConflict),
+                        "{refused}"
+                    );
+                    let still = session.interpreted_approval();
+                    assert_eq!(
+                        (still.resource_id, still.state),
+                        (held.resource_id, PendingState::Pending),
+                        "the refused prompt leaves the terminal's approval as it was"
+                    );
+                    let _ = ctx
+                        .answers(
+                            &session.remote,
+                            session.session_id(),
+                            instance,
+                            &running,
+                            held.resource_id,
+                            DECLINE,
+                        )
+                        .expect("the device ends the turn");
+                    let _ = session.binding_until(instance, "the turn ends", |binding| {
+                        binding.turn_id.0.is_none() && unsuspended(binding)
+                    });
+                    let recorded = real
+                        .conversations(&ctx.run)
+                        .unwrap_or_else(|why| panic!("the agent's record is not whole: {why}"));
+                    assert!(
+                        recorded.contains(&mark) && !recorded.contains(&device),
+                        "the agent's record holds the terminal's prompt and not the device's"
+                    );
+                    assert!(!log.exists(), "the command the device declined did not run");
+                    serde_json::json!({ "refused_as": "DraftConflict", "device_prompt_in_the_agents_record": false })
+                }
+            }
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The launch the real route types.
+// ---------------------------------------------------------------------------------------------
+
+/// The package's integration serves the launches the real route types, and no launch that types an
+/// option: a launch that is not served runs as typed, with no gateway.
+#[test]
+fn the_launches_the_real_route_types_are_ones_the_command_integration_serves() {
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(released_codex().join("plugin.json")).expect("the package's manifest"),
+    )
+    .expect("a manifest");
+    let backend: kr_plugin_sdk::integration::IntegrationBackend =
+        serde_json::from_value(manifest["command_integration"]["backend"].clone())
+            .expect("the integration's backend");
+    let thread = "0199a213-81c0-7800-8aa1-bbab2a035a53";
+    for extra in [&[][..], &["resume", thread][..], &["fork", thread][..]] {
+        assert_eq!(
+            backend.refuses(&launch_words("codex", extra)),
+            None,
+            "{extra:?}"
+        );
+    }
+    let resume = launch_words("codex", &["resume", thread]);
+    assert_eq!(backend.saved_conversation(&resume), Some(thread));
+    // The entry's own options are what the integration refuses, which is why they are keys of the
+    // run's configuration file instead.
+    for options in [
+        &["-a", "on-request"][..],
+        &["-c", "approval_policy=\"on-request\""][..],
+    ] {
+        let words = launch_words("codex", options);
+        assert!(backend.refuses(&words).is_some(), "{words:?}");
+    }
 }
