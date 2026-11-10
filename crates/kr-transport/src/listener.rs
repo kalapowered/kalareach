@@ -498,20 +498,33 @@ impl ConnectionTasks {
         }
     }
 
-    /// Ends every task and every one that would be spawned from now on, and hands back the set, so
-    /// that a caller that can wait learns when each task has been dropped.
+    /// Ends every task and every one that would be spawned from now on, and says whether this call
+    /// was the one that ended them.
     ///
     /// Each task is cancelled at its next turn on the runtime, where it drops what it holds: a
     /// connection that was authorised closes with the code a lost control stream gives, a
     /// connection still in its handshake or its pairing exchange closes as it is dropped.
-    fn end(&self) -> tokio::task::JoinSet<()> {
+    fn end(&self) -> bool {
         let mut serving = self
             .serving
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first = !serving.ended;
         serving.ended = true;
         serving.tasks.abort_all();
-        std::mem::take(&mut serving.tasks)
+        first
+    }
+
+    /// Takes the tasks that were ended, so that a caller that can wait learns when each has been
+    /// dropped. A second caller finds none and has nothing to wait for.
+    fn take_ended(&self) -> tokio::task::JoinSet<()> {
+        std::mem::take(
+            &mut self
+                .serving
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .tasks,
+        )
     }
 }
 
@@ -520,7 +533,8 @@ impl ConnectionTasks {
 ///
 /// The endpoint is closed after the tasks have gone because a task's own close, with the code a lost
 /// control stream gives, has then been made before the endpoint closes what is left with none.
-async fn wind_down(endpoint: Endpoint, mut ended: tokio::task::JoinSet<()>) {
+async fn wind_down(endpoint: Endpoint, connections: Arc<ConnectionTasks>) {
+    let mut ended = connections.take_ended();
     while ended.join_next().await.is_some() {}
     endpoint.close().await;
 }
@@ -531,6 +545,9 @@ pub struct NetworkListener {
     endpoint: Endpoint,
     accept_loop: JoinHandle<()>,
     connections: Arc<ConnectionTasks>,
+    /// The task that closes the endpoint once the connections have ended, when
+    /// [`Self::end_connections`] started one, which [`Self::shutdown`] then waits for.
+    winding_down: std::sync::Mutex<Option<JoinHandle<()>>>,
     windows: Arc<ActionWindowIssuer>,
 }
 
@@ -553,10 +570,44 @@ impl NetworkListener {
         &self.windows
     }
 
+    /// Stops accepting and ends every connection being served, without waiting for either, and
+    /// closes the endpoint on a task of its own once they have gone.
+    ///
+    /// A host that is being stopped calls this to stop holding itself: each connection's task holds
+    /// the host handler for as long as its peer keeps the connection open. Each task is cancelled at
+    /// its next turn on the runtime, not before, and its peer sees the connection close. The
+    /// listener stays in place, so a [`Self::shutdown`] after this still waits for the endpoint's
+    /// close.
+    pub fn end_connections(&self) {
+        self.accept_loop.abort();
+        if self.connections.end()
+            && !self.endpoint.is_closed()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let winding = runtime.spawn(wind_down(
+                self.endpoint.clone(),
+                Arc::clone(&self.connections),
+            ));
+            *self
+                .winding_down
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(winding);
+        }
+    }
+
     /// Stops accepting, ends every connection being served and closes the endpoint.
     pub async fn shutdown(self) {
         self.accept_loop.abort();
-        wind_down(self.endpoint.clone(), self.connections.end()).await;
+        self.connections.end();
+        let winding = self
+            .winding_down
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(winding) = winding {
+            let _ = winding.await;
+        }
+        wind_down(self.endpoint.clone(), Arc::clone(&self.connections)).await;
     }
 }
 
@@ -570,13 +621,7 @@ impl Drop for NetworkListener {
         // either way. Every task is cancelled at its next turn on the runtime, not before, and the
         // endpoint is closed on a task of its own once they have gone: an endpoint dropped without
         // being closed sends its peers nothing, and each would wait for its connection to time out.
-        self.accept_loop.abort();
-        let ended = self.connections.end();
-        if !self.endpoint.is_closed()
-            && let Ok(runtime) = tokio::runtime::Handle::try_current()
-        {
-            runtime.spawn(wind_down(self.endpoint.clone(), ended));
-        }
+        self.end_connections();
     }
 }
 
@@ -647,6 +692,7 @@ pub async fn register_with_clock<H: HostHandler>(
         endpoint,
         accept_loop,
         connections,
+        winding_down: std::sync::Mutex::new(None),
         windows,
     })
 }

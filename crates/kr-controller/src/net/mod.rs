@@ -315,17 +315,19 @@ impl NetworkGuard {
     /// Stops accepting and ends every connection being served, without waiting for either.
     ///
     /// The connections' tasks hold this host, and the daemon with it, for as long as their peers
-    /// keep them open, and the daemon owns this guard: the listener is what ends them, so letting
-    /// it go is how the daemon, when it is stopped, stops holding itself. They end at the next turn
-    /// of the runtime, and each device sees its connection close. A listener shut down with
-    /// [`Network::shutdown`] has already done this and has nothing left to let go of.
+    /// keep them open, and the daemon owns this guard: the listener is what ends them, so asking it
+    /// to is how the daemon, when it is stopped, stops holding itself. They end at the next turn of
+    /// the runtime, and each device sees its connection close. The listener stays in place, so a
+    /// [`Network::shutdown`] after this still waits for the endpoint's close.
     pub(crate) fn end_connections(&self) {
-        drop(
-            self.listener
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take(),
-        );
+        if let Some(listener) = self
+            .listener
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            listener.end_connections();
+        }
     }
 
     fn stop_tasks(&self) {
