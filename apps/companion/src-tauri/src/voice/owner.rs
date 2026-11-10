@@ -124,6 +124,10 @@ const DELEGATION_CHALLENGE_MISMATCH: &str = "Nothing was done: what the computer
 const DELEGATION_CONFIRMATION_EXPIRED: &str = "Nothing was done: this phone's clock says the \
     confirmation ran out. Say so, and ask the person to say it again.";
 
+/// What the model is told when the session a confirmation is for could not be named to the person.
+const DELEGATION_SESSION_NOT_NAMED: &str = "Nothing was done: this phone could not name the session \
+    to the person in time, so the person was not asked. Say so, and ask the person to say it again.";
+
 /// What the model is told when the confirmation was dropped before it was sent.
 const DELEGATION_CONFIRMATION_DROPPED: &str = "Nothing was done: the confirmation was not sent. Say \
     so, and ask the person to say it again.";
@@ -197,6 +201,9 @@ enum Internal {
         generation: u64,
         outcome: CeremonyOutcome,
     },
+    /// The session the confirmation `generation` of the delegation `id` is for could not be named
+    /// to the person in time, so the ceremony was not started.
+    Unnamed { id: String, generation: u64 },
     /// What native code's capture proof said, when the confirmation `generation` of the delegation
     /// `id` asked for it with a marker after the ceremony.
     SealProof {
@@ -1791,6 +1798,12 @@ impl Owner {
                 self.shared.handled.ceremony(&id);
                 None
             }
+            Internal::Unnamed { id, generation } => {
+                self.on_unnamed(&id, generation);
+                #[cfg(any(test, feature = "testing"))]
+                self.shared.handled.ceremony(&id);
+                None
+            }
             Internal::SealProof {
                 id,
                 generation,
@@ -2456,8 +2469,13 @@ impl Owner {
         // confirm what can no longer be sent.
         self.unsent.store(true, Ordering::SeqCst);
         self.tainted.store(true, Ordering::SeqCst);
+        // What was asked of the person is over with the call: the record does not say it still
+        // waits for them.
         self.sealing.clear();
-        self.confirming.clear();
+        let open: Vec<String> = self.confirming.drain().map(|(id, _)| id).collect();
+        for id in open {
+            self.set_row(&id, "cancelled", Some(Why::CallEnded.word()));
+        }
         // What the opening context came to is in the record before the call is said to have ended,
         // so that a person who reads the end reads it too.
         self.settle_the_opening().await;
