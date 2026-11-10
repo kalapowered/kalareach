@@ -269,9 +269,12 @@ clock decides whether a confirmation has run out; the phone's only stops it aski
 what its own clock says is over, and the person is told so ("this phone's clock says the
 confirmation ran out").
 
-The person is asked through the platform's ceremony, which names the session and the host. The
-dialog is put up only while the confirmation is still open and the phone's clock does not say it has
-run out, and it stays for what is left of it. While they are asked the call goes on, and anything
+The person is asked through the platform's ceremony, which names the session by the number the host
+gives it, and the host. The phone holds no name for a session outside the host's answer, so when
+that answer does not come within the lookup's bound, or is a refusal, nobody is asked: the row
+reads "session not named" and the model is told so. The dialog is put up only while the
+confirmation is still open and the phone's clock does not say it has run out, and it stays for what
+is left of it. While they are asked the call goes on, and anything
 that taints it, or a loss of the path to the host, drops the confirmation at once, as does the end
 of the call. What was handed over before a loss is not carried on after it: a challenge that
 reaches the phone after the path to the host was lost is put to nobody, whether or not the host is
@@ -305,9 +308,13 @@ row shows, and the call is tainted where the cause is one that taints.
 
 A person who already allowed voice has no other way to say that a spoken close is welcome, so the
 idle voice screen offers "What voice may do" while a spoken request can reach the host at all. It
-reads what the host says the standing grant permits, shows the close in the protocol's own sentence
-(off unless the grant already permits it), and allowing sends the call's sessions and the default
-actions, with the close if it was chosen, as a replacement grant. The host's answer says what the
+reads what the host says the standing grant permits and the sessions it covers, whichever session
+the screen was opened for, shows the close in the protocol's own sentence (off unless the grant
+already permits it), and changes only that: allowing sends the grant's other actions and its
+sessions as they stand, with the close ticked or cleared, as a replacement grant. What is shown is
+bound to the host it was read from. The change names that host's environment, and is not sent when
+the grant has changed, or the application is connected to another host, by the time the person
+presses; the command refuses it as well. The host's answer says what the
 phone's own access could not carry and which sessions' workers have still to confirm the fence the
 replacement owed, because a replacement ends the calls that ran under the grant it replaces. With
 the constant off the entry is not offered.
