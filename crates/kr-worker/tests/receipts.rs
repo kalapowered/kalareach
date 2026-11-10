@@ -4825,8 +4825,8 @@ fn recovery_rejects_an_accepted_intent_and_frees_what_it_held() {
     assert_eq!(rejected.reason.as_ref(), Some(&RejectionReason::Expired));
 }
 
-/// KR-REQ-09.22, KR-REQ-23.46: a caller holding the outstanding limit can still cancel and still
-/// stop the session, because those are what release the capacity the limit counts.
+/// KR-REQ-23.46: a caller holding the outstanding limit can still cancel and still stop the
+/// session, because those are what release the capacity the limit counts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_limit_never_stops_a_caller_getting_back_under_it() {
     let host = host().await;
@@ -5558,8 +5558,8 @@ async fn a_forwarded_retry_is_answered_after_its_deadline_and_never_first_admitt
     assert_eq!(error.code, ErrorCode::PermissionDenied);
 }
 
-/// KR-REQ-09.22: a connection that offers to hold no outstanding mutation is refused at the
-/// handshake rather than read as one that holds one.
+/// A connection that offers to hold no outstanding mutation is refused at the handshake rather
+/// than read as one that holds one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_connection_that_admits_no_mutation_is_refused_at_the_handshake() {
     let host = host().await;

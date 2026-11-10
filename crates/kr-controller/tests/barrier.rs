@@ -1324,8 +1324,8 @@ async fn a_mutation_whose_registration_is_withdrawn_during_the_lock_wait_is_refu
     );
 }
 
-/// KR-REQ-09.22: a connection that offers to hold no outstanding mutation is refused at this
-/// daemon's handshake, as it is at a worker's.
+/// A connection that offers to hold no outstanding mutation is refused at this daemon's handshake,
+/// as it is at a worker's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_connection_that_admits_no_mutation_is_refused_by_the_daemon() {
     let daemon = daemon_host().await;
