@@ -77,7 +77,11 @@ fn snapshot() -> Snapshot {
             account::find(CHECKOUT).is_some(),
             account::find(CONNECT).is_some(),
         ],
-        service: manager.open(SERVICE).unwrap().is_some(),
+        // A service that is deleted but still listed because a handle to it is open is gone.
+        service: manager
+            .open(SERVICE)
+            .unwrap()
+            .is_some_and(|service| !service.marked_for_deletion().unwrap()),
         program_dir: paths.program.exists(),
         data_dir: paths.data.exists(),
         hidden,
@@ -222,6 +226,8 @@ fn installation_lays_down_and_removal_restores() {
         sids.push(sid);
     }
     let manager = service::manager().unwrap();
+    // This handle stays open through the removal, as a services console's would: the removal must
+    // finish although the service manager keeps the deleted service listed until the handle closes.
     let broker = manager.open(SERVICE).unwrap().expect("the service exists");
     let (start, path) = broker.configuration().unwrap();
     assert_eq!(start, 2, "the service starts with Windows");
