@@ -188,8 +188,10 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
+      # `kr-cli`'s upgrade suite is two test targets that build only with its feature, so the lint
+      # asks for it: nothing else keeps them clean.
       - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --features kr-cli/upgrade-suite -- -D warnings
 
       # The step grows with the tests. It has taken 99 to 107 minutes when it passed, and twice it
       # ran to its limit of 110 minutes without finishing. A test that waits for something that
@@ -615,10 +617,11 @@ jobs:
         run: cargo clean --locked --package libsodium-sys-stable
 
       # Everything the workspace compiles for this target, including the test targets: a test that
-      # only builds on Unix is a Windows failure, and this is where it is caught.
+      # only builds on Unix is a Windows failure, and this is where it is caught. `kr-cli`'s upgrade
+      # suite builds only with its feature, so the lint asks for it here too.
       - name: Compile the workspace and its tests
         if: ${{ matrix.part == 'first' }}
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --features kr-cli/upgrade-suite -- -D warnings
 
       # The build script has just checked both archives, so what a later run restores is what was
       # signed, whatever the tests below find. Only the default branch saves them, as with the
