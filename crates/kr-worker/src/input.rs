@@ -139,6 +139,12 @@ pub const KEYBOARD_PROTOCOLS: &[TerminalKeyboard] = &[
     TerminalKeyboard::new("tmux-256color", 0, 0),
     // GNU screen implements neither.
     TerminalKeyboard::new("screen-256color", 0, 0),
+    // A Windows console, which is not a terminal either: its keys reach the host as console key
+    // records, and the host spells them in the ordinary encoding, or sends the records as they are
+    // where the backend asked for them. It supplies no enhanced protocol, so it claims the ordinary
+    // encoding and nothing more. It is no qualified terminal either: nothing has been established
+    // about how a console draws this stream.
+    TerminalKeyboard::new(kr_term::win32::CONSOLE_PROFILE, 0, 0),
     // The companion's raw terminal view, which is not a terminal: it builds each key through the
     // client's shared encoder from what its platform reports of the key, so it produces
     // `modifyOtherKeys` and the Kitty protocol's disambiguation and event types. Not every key as

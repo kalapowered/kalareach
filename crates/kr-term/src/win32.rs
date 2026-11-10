@@ -82,6 +82,15 @@ pub const MODE_SET: &[u8] = b"\x1b[?9001h";
 /// The sequence that disables it.
 pub const MODE_RESET: &[u8] = b"\x1b[?9001l";
 
+/// The terminal profile a Windows console declares when its environment names no terminal.
+///
+/// A console sets no `TERM`, and the host lets no attachment hold the input lease that has not said
+/// what it is. This is what the attach client says: that its keys are console key records, which
+/// the worker spells in the ordinary terminal encoding (or in the records themselves, where the
+/// backend asked for them), and that nothing has been established about how the console draws the
+/// session's stream.
+pub const CONSOLE_PROFILE: &str = "windows-console";
+
 /// One console key record, exactly as the console reported it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyRecord {

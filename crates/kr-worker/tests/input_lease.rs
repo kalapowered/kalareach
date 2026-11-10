@@ -270,6 +270,55 @@ async fn a_modifier_encoding_is_compared_at_the_level_the_application_asked_for(
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
+/// KR-REQ-08.60: a Windows console, which declares a profile of its own, takes the keys while the
+/// application reads the ordinary encoding and is refused them under either enhanced protocol,
+/// because the host spells the console's key records in the ordinary encoding and in no other.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_windows_console_takes_the_keys_under_the_ordinary_encoding_and_under_no_other() {
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, "sleep 120");
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+
+    let console = attach(
+        &mut session,
+        &terminal(session_id, Some(kr_term::win32::CONSOLE_PROFILE)),
+    );
+    session
+        .acquire_input(console, connection(), None)
+        .expect("the ordinary encoding is within reach of a console's key records");
+
+    for (name, negotiation, ordinary) in [
+        ("modifyOtherKeys", &b"\x1b[>4;1m"[..], &b"\x1b[>4;0m"[..]),
+        ("the Kitty protocol", b"\x1b[=1;1u", b"\x1b[=0;1u"),
+    ] {
+        negotiates(&mut session, negotiation);
+        let refused = session
+            .acquire_input(console, connection(), None)
+            .expect_err(name);
+        assert_eq!(
+            refused.to_protocol_error().code,
+            ErrorCode::InputIncompatible,
+            "{name} cannot be spelled from key records"
+        );
+        // The application leaves it, and the console takes the keys again.
+        negotiates(&mut session, ordinary);
+        session
+            .acquire_input(console, connection(), None)
+            .unwrap_or_else(|error| panic!("{name}, once the application has left it: {error:?}"));
+    }
+
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
+    runtime.close(ClosureReason::CloseRequested).1.release();
+}
+
 // ---------------------------------------------------------------------------------------------
 // KR-REQ-08.61: a mid-session mode change re-evaluates every controller, both directions.
 // ---------------------------------------------------------------------------------------------
