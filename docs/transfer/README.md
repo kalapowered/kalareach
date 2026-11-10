@@ -117,16 +117,17 @@ paired device's actor is that device, and a local caller's actor is the operatin
 could change it per request would give itself another allowance.
 
 A paired device's open drafts are bounded as well, at 64 for each device. A draft is open until a
-prompt sends it to a session, which is how a device ends one, or the session it targets closes,
-and a draft no longer open takes no place. `draft.create` counts the device's open drafts and
+prompt sends it to a session, which is how a device frees its place, or the session it targets
+closes, and a draft no longer open takes no place. `draft.create` counts the device's open drafts and
 writes the new one in one transaction under the journal's write lock, so two creates that each find
 one place left cannot both take it, and it asks the host's admission again before it counts, so a
 device whose authority has gone is never told how many it holds. Past the bound the refusal is
-`QUOTA_EXCEEDED`, with the bound in its message. A refused create leaves no draft and no record in
-the service, and the door keeps the refusal as that action's outcome, as it does any other refusal
-of the service, so a device that has freed a place asks again under a new action. The person at this
-machine is held to no bound, and nothing a device sends changes it: the number is a constant of
-the host that an owner cannot change.
+`QUOTA_EXCEEDED`, with the bound in its message. A refused create leaves no draft, and the service
+writes no record of it. The host keeps the refusal in the transfer journal as that action's outcome,
+as it does any other refusal of the service, so the same action asked again is given the same
+refusal even when a place is free, and a device that has freed a place takes a new action for its
+new attempt. The person at this machine is held to no bound, and nothing a device sends changes it:
+the number is a constant of the host that an owner cannot change.
 
 A device cannot end a draft itself, because this level has no method that discards one. Sent and
 orphaned drafts stay in the journal, and each `draft.update` adds a row to the journal's events,

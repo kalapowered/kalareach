@@ -916,6 +916,23 @@ async fn every_write_the_method_table_admits_for_a_device_is_served_or_refused_b
         reached.is_empty(),
         "writes forwarded to a worker whose table does not list them: {reached:?}"
     );
+    // The worker's table lists `input.write`, as a request. Sent as a mutation it is refused here,
+    // and no worker is asked.
+    let raw_input_forwarded = recorded
+        .lock()
+        .expect("the worker's record")
+        .iter()
+        .any(|frame| {
+            matches!(
+                frame,
+                ControlFrame::Mutation(mutation)
+                    if mutation.method.method() == Some(Method::InputWrite)
+            )
+        });
+    assert!(
+        !raw_input_forwarded,
+        "raw input sent as a mutation reached a worker"
+    );
     world.serving.abort();
 }
 
