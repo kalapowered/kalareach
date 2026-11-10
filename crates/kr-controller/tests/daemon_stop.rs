@@ -25,12 +25,12 @@ use kr_protocol::envelope::ParamsValue;
 use kr_protocol::hostinfo::HostDoctorResult;
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
-use net_support::Host;
+use net_support::{Device, Host};
 
 /// How long a condition the daemon is expected to reach is given before the case calls it
-/// unreached. A bound on a hang, never a measure of how long letting go takes. It is shorter than
-/// the time a connection nobody closed takes to time out (thirty seconds), so a peer that was
-/// never told its connection is closed does not pass for one that was.
+/// unreached. A bound on a hang, never a measure of how long letting go takes: whether a device was
+/// told its connection is closed is read from the code of the close, and a connection that timed
+/// out instead carries another.
 const LIVENESS: Duration = Duration::from_secs(15);
 
 fn typed<T: kr_protocol::wire::WireMessage>(value: &ParamsValue) -> T {
@@ -56,13 +56,26 @@ async fn until_closed(local: &mut kr_ipc::client::LocalClient) {
 
 /// A daemon whose owner stops it lets go of its controller and its pairing service at once,
 /// though a paired device and a local client are still connected; each of them sees its
-/// connection close, and each was answered as usual while the daemon ran.
+/// connection close, the device with the code a lost control stream gives, and each was answered as
+/// usual while the daemon ran.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stopped_daemon_lets_go_of_its_controller_and_its_pairing_service() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
-    let (_device, session) =
-        net_support::paired_device(&host, &owner, &[ActionRight::SessionView]).await;
+    // One device with two connections: a session that reads, and the connection itself, kept so
+    // that the cause of its close can be read.
+    let device = Device::create().await;
+    let record = net_support::pair_with(
+        &host,
+        &device,
+        &owner,
+        net_support::proposal(&[ActionRight::SessionView]),
+    )
+    .await;
+    let session = net_support::connect(&host, &device, &record).await;
+    let (held, _authorised) = net_support::paired_dial(&host, &device, &record)
+        .dial_held()
+        .await;
     let mut local = host.client().await;
 
     // While the daemon runs, each door answers as it always did.
@@ -87,16 +100,25 @@ async fn a_stopped_daemon_lets_go_of_its_controller_and_its_pairing_service() {
 
     host.dropped().await;
 
-    let (device_closed, client_closed, controller_let_go, pairing_let_go) = tokio::join!(
+    let (told, session_closed, client_closed, controller_let_go, pairing_let_go) = tokio::join!(
+        async { tokio::time::timeout(LIVENESS, held.closed()).await.ok() },
         reached(session.closed()),
         reached(until_closed(&mut local)),
         reached(until_let_go(&controller)),
         reached(until_let_go(&pairing)),
     );
     assert!(
-        device_closed && client_closed && controller_let_go && pairing_let_go,
-        "after the stop, within the bound: the device's connection closed: {device_closed}; \
-         the local client's connection closed: {client_closed}; the controller was let go: \
+        session_closed && client_closed && controller_let_go && pairing_let_go,
+        "after the stop, within the bound: the device's session closed: {session_closed}; the \
+         local client's connection closed: {client_closed}; the controller was let go: \
          {controller_let_go}; the pairing service was let go: {pairing_let_go}"
+    );
+    assert!(
+        matches!(
+            told,
+            Some(iroh::endpoint::ConnectionError::ApplicationClosed(ref close))
+                if close.error_code == kr_transport::listener::CONTROL_LOST.into()
+        ),
+        "the device was closed as a lost control stream is: {told:?}"
     );
 }

@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use futures::FutureExt as _;
+use iroh::Endpoint;
 use iroh::endpoint::presets;
 use kr_crypto::connect::PairedPeer;
 use kr_protocol::envelope::{ControlEvent, ControlFrame};
@@ -206,8 +208,13 @@ async fn a_registered_host_serves_an_authorised_connection_and_ends_it_cleanly()
 /// The handle the case keeps is weak, and it waits on what the listener's tasks do (the peer's
 /// close, the handle's release), never a length of time: a task is cancelled at the runtime's next
 /// turn, so the case gives the runtime its turns until the condition holds. The bound only stops a
-/// hang.
-async fn a_listener_that_goes(let_go: impl FnOnce(NetworkListener)) {
+/// hang; whether the peer was told is read from the code of its close.
+///
+/// `let_go` ends the listener as the case chooses, and may give back a handle on the endpoint that
+/// the case kept, which must then have been closed too: a listener's own handles are no proof that
+/// the endpoint was closed, because the endpoint closes by itself, ungracefully, when the last one
+/// goes.
+async fn a_listener_that_goes(let_go: impl FnOnce(NetworkListener) -> Option<Endpoint>) {
     let (host, client) = paired_pair().await;
     let handler = Arc::new(TestHandler::new(client.record));
     let held = Arc::downgrade(&handler);
@@ -223,23 +230,24 @@ async fn a_listener_that_goes(let_go: impl FnOnce(NetworkListener)) {
         .await
         .expect("an authorised connection");
 
-    // Shorter than the thirty seconds a connection nobody closed takes to time out, so a peer that
-    // was never told its connection is closed does not pass for one that was.
     let ended = tokio::time::timeout(Duration::from_secs(15), async {
         while handler.served.load(Ordering::Acquire) == 0 {
             tokio::task::yield_now().await;
         }
         // From here only the listener's tasks hold the handler.
         drop(handler);
-        let_go(listener);
+        let kept = let_go(listener);
         let closed = connection.closed().await;
         while held.upgrade().is_some() {
             tokio::task::yield_now().await;
         }
+        if let Some(endpoint) = kept {
+            endpoint.closed().await;
+        }
         closed
     })
     .await
-    .expect("the connection closed and the handler was let go");
+    .expect("the connection closed, the handler was let go and the endpoint was closed");
     assert!(
         matches!(
             ended,
@@ -252,7 +260,11 @@ async fn a_listener_that_goes(let_go: impl FnOnce(NetworkListener)) {
 
 #[tokio::test]
 async fn a_listener_that_goes_ends_the_connections_it_serves() {
-    a_listener_that_goes(drop).await;
+    a_listener_that_goes(|listener| {
+        drop(listener);
+        None
+    })
+    .await;
 }
 
 /// The same when the listener is dropped on a thread that is not the runtime's, which a host that
@@ -264,6 +276,25 @@ async fn a_listener_dropped_outside_the_runtime_ends_the_connections_it_serves_a
         std::thread::spawn(move || drop(listener))
             .join()
             .expect("the listener is dropped");
+        None
+    })
+    .await;
+}
+
+/// The same when a shutdown is cancelled while it waits: the close of the endpoint does not depend
+/// on the shutdown being awaited to its end, so a host that gives up on it, or whose future is
+/// dropped with its runtime's task, still has the endpoint closed and each peer told. The case
+/// keeps a handle on the endpoint, which an unclosed endpoint would leave open for ever.
+#[tokio::test]
+async fn a_shutdown_that_is_cancelled_still_closes_the_endpoint_and_tells_its_peers() {
+    a_listener_that_goes(|listener| {
+        let endpoint = listener.endpoint().clone();
+        // Polled once, up to the first thing it waits for, and then dropped.
+        assert!(
+            listener.shutdown().now_or_never().is_none(),
+            "the shutdown waits for the connections it ended"
+        );
+        Some(endpoint)
     })
     .await;
 }

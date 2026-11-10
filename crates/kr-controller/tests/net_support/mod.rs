@@ -1773,6 +1773,33 @@ impl PairedDial {
     pub async fn dial(&self) -> NetworkTransport {
         self.try_dial().await.expect("the paired device connects")
     }
+
+    /// One connection of the device's to the host, authorised as the device, kept as the
+    /// connection itself and its handshake's result, for a suite that reads why it closed.
+    pub async fn dial_held(
+        &self,
+    ) -> (
+        iroh::endpoint::Connection,
+        kr_transport::handshake::AuthorisedConnection,
+    ) {
+        let connection = pairing::until_answered(
+            || {
+                kr_transport::endpoint::connect(
+                    &self.endpoint,
+                    self.addr.clone(),
+                    kr_protocol::hello::ALPN,
+                )
+            },
+            pairing::transport_error_gave_up_unanswered,
+        )
+        .await
+        .expect("the host is reachable");
+        let authorised =
+            kr_transport::handshake::connect(&connection, &self.identity, &self.host_record)
+                .await
+                .expect("the paired device is authorised");
+        (connection, authorised)
+    }
 }
 
 /// How `device`, paired as `record`, dials `host`.
