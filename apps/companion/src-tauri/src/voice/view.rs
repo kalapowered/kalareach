@@ -375,8 +375,9 @@ pub struct DelegationRow {
     /// read), `asking` (the host has the request and has not answered), `refused` (this device
     /// would not hand it over, for `cause`), `not_sent` (nothing was written to the host, for
     /// `cause`), `performed`, `admitted` (the host took it and what became of it is not
-    /// established), `confirmation_required`, `host_refused` (the host said no, for `cause`) and
-    /// `unknown` (the request may have been written and no answer came).
+    /// established), `confirmation_required`, `cancelled` (a challenge the host awaited an answer
+    /// to was dropped, for `cause`), `host_refused` (the host said no, for `cause`) and `unknown`
+    /// (the request may have been written and no answer came).
     pub state: String,
     /// Whether the model was told what became of it.
     pub told: bool,

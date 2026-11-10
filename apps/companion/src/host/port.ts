@@ -1191,7 +1191,7 @@ export interface VoiceDelegationRow {
    * What became of it. `not_done` for every delegation while this version acts on no spoken
    * request. A call that hands spoken requests to the host, which only a test or the debug build's
    * probe makes, also says `collecting`, `asking`, `refused`, `not_sent`, `performed`, `admitted`,
-   * `confirmation_required`, `host_refused` and `unknown`.
+   * `confirmation_required`, `cancelled`, `host_refused` and `unknown`.
    */
   readonly state: string
   /** Whether the model was told what became of it. */

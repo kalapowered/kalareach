@@ -168,18 +168,20 @@ Whenever capture is in any state other than `capturing`, the UI displays:
 
 ## Spoken delegations
 
-This version hands no spoken delegation to the host. The provider announces a delegation on its
-data channel and on the voice service's control socket; each one is answered to the model by a
-fixed sentence that nothing was done, the screen shows a row that says so, and the transcript and
-delegation events on the data channel are not read at all. A constant in the call's owner holds
-this, and the code that would act otherwise is switched on only by a setter compiled in test and
-debug builds. A release build compiles neither the setter nor any caller of it.
+This version hands no spoken delegation to the host. A delegation is announced twice, by the
+provider on its data channel and by the voice service on the call's control socket; each one the
+service announces is answered to the model by a fixed sentence that nothing was done, the screen
+shows a row that says so, and the transcript and delegation events on the data channel are not read
+at all. A constant in the call's owner holds this, and the code that would act otherwise is switched
+on only by a setter compiled in test and debug builds. A release build compiles neither the setter
+nor any caller of it.
 
 Switched on, the call's owner decides each delegation itself, from the provider's data channel
 alone. The voice service's announcement only has to agree with it, at the same identifier and the
-same offset. The owner reads `session.input_transcript.delta` (a fragment of what the caller said,
-with the interval of the call's timeline it covers) and `session.delegation.created` (the
-delegation's identifier and offset). Neither carries authority. The owner collects the fragments
+same offset, and to be read within the wait after the delegation. The owner reads
+`session.input_transcript.delta` (a fragment of what the caller said, with the interval of the
+call's timeline it covers) and `session.delegation.created` (the delegation's identifier and
+offset). Neither carries authority. The owner collects the fragments
 for a wait after the delegation, asks native code for a capture proof that also puts a marker into
 the call's news, reads the news up to that marker, and only then decides:
 
@@ -194,7 +196,9 @@ the call's news, reads the news up to that marker, and only then decides:
   mute, an interruption, a route change, a suspension, a recorder gap or a silenced recording);
   an answer that turns discontinuous transmission on; and the provider's own acknowledgement of a
   mute after capture opened. A call that starts muted and whose provider acknowledges the mute
-  after the microphone first opens is tainted by it for the rest of the call.
+  after the microphone first opens is tainted by it for the rest of the call. So does a flow of
+  more fragments than the gate keeps (4,096 within five minutes); a call that is tainted keeps none
+  of what it hears.
 - **The first fragment.** The device cannot hear what was said before capture first opened, and a
   person can say "do not" before it. A set that holds the first fragment the call delivered, or
   the first one that arrived after the opening, never authorises: the first thing a person says in
@@ -204,7 +208,10 @@ the call's news, reads the news up to that marker, and only then decides:
   seconds before it, that no earlier set used, in the order they arrived; at most 16 fragments and
   2,048 bytes, otherwise the set is refused and never cut. A fragment outside the set that
   overlaps its span taints the call, and one that ends within 2 seconds before the set's first
-  fragment refuses the set, since it may be the first half of the same instruction.
+  fragment refuses the set, since it may be the first half of the same instruction. The gate keeps
+  what was said in the last five minutes; a delegation whose reach goes back to a fragment it
+  forgot, which could be one of those, is refused as too old. A set that is refused is spent all
+  the same: what it held answers no later delegation.
 
 The 30 seconds, the 2 seconds, the wait after a delegation, the 40 ms and 100 ms capture-gap
 thresholds and the 500 ms age of a proof are parameters of the device's reading, not safety bounds,
@@ -224,11 +231,16 @@ asserts them:
 A request is composed once, as a whole, and kept: the host answers an exact repeat from its record
 and refuses a request recomposed under a later action window as another request under the same
 identifier. Before the request is written, a fresh capture proof is taken, and it is used only
-while its age plus the time to the write is within the bound, checked once the connection holds
-the right to write: a write that waits past the bound writes nothing. A request that was written
-and not answered stays unknown, and is asked about again by repeat on another connection; when the
-host is lost, a request not yet written is discarded and one that was is not known to have been
-carried out. A call that ends with such a request open says so, and never says nothing was done.
+while its age plus the time to the write is within the bound, and while the call can still hand a
+request over. Both are checked once the connection holds the right to write and before every write
+to the socket: a write that waits past the bound writes nothing, and a request the connection has
+taken only part of when the bound runs out is cut off and the connection ends with it, so that the
+host reads a request that stops short and acts on none of it. A request that was written and not
+answered stays unknown, and is asked about again by repeat on another connection; when the host is
+lost, a request not yet written is discarded and one that was is not known to have been carried
+out. A call that ends with such a request open says so, and never says nothing was done. Neither
+does the record that a call that may act leaves for the next launch, nor the end of a call whose
+owner failed: neither can know what was written.
 
 ## What a call's media has carried
 

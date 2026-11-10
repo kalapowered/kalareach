@@ -733,7 +733,9 @@ describe('while a call is running', () => {
           delegations: [
             { delegationId: 'd-1', offsetMs: 1000, state: 'refused', cause: 'first_fragment', told: true },
             { delegationId: 'd-2', offsetMs: 2000, state: 'unknown', cause: null, told: true },
-            { delegationId: 'd-3', offsetMs: 3000, state: 'performed', cause: null, told: false }
+            { delegationId: 'd-3', offsetMs: 3000, state: 'performed', cause: null, told: false },
+            { delegationId: 'd-4', offsetMs: 4000, state: 'asking', cause: null, told: false },
+            { delegationId: 'd-5', offsetMs: 5000, state: 'cancelled', cause: 'late_fragment', told: true }
           ]
         })}
         currentTurn={null}
@@ -747,6 +749,11 @@ describe('while a call is running', () => {
     ).toBeInTheDocument()
     expect(screen.getByText(/It is not known whether the computer did it\./)).toBeInTheDocument()
     expect(screen.getByText(/Done by the computer\. The voice has not been told yet\./)).toBeInTheDocument()
+    // A request that is being prepared is not said to have been sent, and one the host awaited a
+    // confirmation for that was then dropped says it was sent and is not done.
+    expect(screen.getByText(/Asking the computer, which has not answered\./)).toBeInTheDocument()
+    expect(screen.queryByText(/Sent to the computer/)).not.toBeInTheDocument()
+    expect(screen.getByText(/Not done\. It was sent, and then dropped\./)).toBeInTheDocument()
     expect(screen.queryByText(NOT_ACTED_ON_WORDS)).not.toBeInTheDocument()
   })
 

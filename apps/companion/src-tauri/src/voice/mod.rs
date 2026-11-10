@@ -812,8 +812,16 @@ impl Shared {
                     view.ended = Some(EndedView {
                         owner,
                         cause: "owner_failed".to_owned(),
-                        words: "This device's call stopped working, so the call was ended."
-                            .to_owned(),
+                        // A call that may have acted cannot say that nothing was done: what the
+                        // owner had written to the host went with the owner.
+                        words: if self.accepts_host_delegations() {
+                            format!(
+                                "This device's call stopped working, so the call was ended. {}",
+                                owner::REQUESTS_UNSETTLED
+                            )
+                        } else {
+                            "This device's call stopped working, so the call was ended.".to_owned()
+                        },
                         closed_locally,
                         host: host_end.clone(),
                         // A word that owes nothing is final at once; the one that owes a notice
