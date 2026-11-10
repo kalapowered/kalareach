@@ -181,6 +181,11 @@ export function dex({ defined = [], referenced = [], constants = [], methods = {
  * `weak` ones that are weak, which it can. `headers: false` leaves the section headers out,
  * `dynamic: false` makes the symbol table an ordinary one, and `stringsLink` is the section the
  * symbol table names as its strings (1 is the string table, 3 the table of section names).
+ *
+ * The rest make the tables wrong in one way each: `entsize` is the entry size the symbol table's
+ * header gives (its own, by default), `tail` bytes follow the last symbol and are counted in the
+ * table's size, `nameBeyond` puts the first exported symbol's name past the end of the string table,
+ * and `unterminated` cuts the NUL off the end of the string table's last name.
  */
 export function elf({
   exports = [],
@@ -192,7 +197,11 @@ export function elf({
   wide = true,
   headers = true,
   dynamic = true,
-  stringsLink = 1
+  stringsLink = 1,
+  entsize = null,
+  tail = Buffer.alloc(0),
+  nameBeyond = false,
+  unterminated = false
 } = {}) {
   const sectionNames = ['', '.dynstr', '.dynsym', '.shstrtab']
   const text = (names) => {
@@ -208,7 +217,9 @@ export function elf({
     }
     return { offsets, bytes: Buffer.concat(parts) }
   }
-  const dynstr = text([...imports, ...exports, ...locals, ...hidden, ...weak])
+  const names = text([...imports, ...exports, ...locals, ...hidden, ...weak])
+  // The string table as the file carries it: the last name loses its NUL when a case asks.
+  const dynstr = { offsets: names.offsets, bytes: unterminated ? names.bytes.subarray(0, -1) : names.bytes }
   const shstr = text(sectionNames)
   const symbolSize = wide ? 24 : 16
   const symbols = [
@@ -218,10 +229,11 @@ export function elf({
     ...hidden.map((name) => [name, 1, 0x12, 2]),
     ...weak.map((name) => [name, 1, 0x22, 0])
   ]
-  const dynsym = Buffer.alloc((1 + symbols.length) * symbolSize)
+  const dynsym = Buffer.concat([Buffer.alloc((1 + symbols.length) * symbolSize), tail])
   symbols.forEach(([name, section, info, other], index) => {
     const at = (index + 1) * symbolSize
-    dynsym.writeUInt32LE(dynstr.offsets.get(name), at)
+    const beyond = nameBeyond && name === exports[0]
+    dynsym.writeUInt32LE(beyond ? dynstr.bytes.length + 100 : dynstr.offsets.get(name), at)
     dynsym.writeUInt8(info, at + (wide ? 4 : 12))
     dynsym.writeUInt8(other, at + (wide ? 5 : 13))
     dynsym.writeUInt16LE(section, at + (wide ? 6 : 14))
@@ -254,7 +266,7 @@ export function elf({
     header.writeUInt16LE(3, 0x32)
   }
   const sections = Buffer.alloc(sectionNames.length * sectionSize)
-  const put = (index, name, type, offset, size, link) => {
+  const put = (index, name, type, offset, size, link, each = 0) => {
     const at = index * sectionSize
     sections.writeUInt32LE(shstr.offsets.get(name), at)
     sections.writeUInt32LE(type, at + 4)
@@ -262,14 +274,16 @@ export function elf({
       sections.writeBigUInt64LE(BigInt(offset), at + 0x18)
       sections.writeBigUInt64LE(BigInt(size), at + 0x20)
       sections.writeUInt32LE(link, at + 0x28)
+      sections.writeBigUInt64LE(BigInt(each), at + 0x38)
     } else {
       sections.writeUInt32LE(offset, at + 0x10)
       sections.writeUInt32LE(size, at + 0x14)
       sections.writeUInt32LE(link, at + 0x18)
+      sections.writeUInt32LE(each, at + 0x24)
     }
   }
   put(1, '.dynstr', 3, dynstrAt, dynstr.bytes.length, 0)
-  put(2, '.dynsym', dynamic ? 11 : 2, dynsymAt, dynsym.length, stringsLink)
+  put(2, '.dynsym', dynamic ? 11 : 2, dynsymAt, dynsym.length, stringsLink, entsize ?? symbolSize)
   put(3, '.shstrtab', 3, shstrAt, shstr.bytes.length, 0)
   return Buffer.concat([header, body, dynstr.bytes, dynsym, shstr.bytes, sections])
 }

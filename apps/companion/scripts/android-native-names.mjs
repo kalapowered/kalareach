@@ -86,12 +86,16 @@ function u64(bytes, at) {
 /**
  * The names of the symbols a shared library defines for others to find, from its dynamic symbol
  * table: defined, global or weak, and not hidden, which is what the runtime can bind a method to.
- * Refuses a file it cannot read, and one that gives no way to find its symbols, by name and not by
- * answering that it exports nothing: an answer of nothing would excuse every class it is bound to.
+ * Refuses a file it cannot read in full, and one that gives no way to find its symbols, by name and
+ * not by answering that it exports nothing: an answer of nothing would excuse every class it is
+ * bound to. That covers a header or a table that the file is too short for, a symbol table whose
+ * entries are not the size this reads or do not fill it, and a symbol whose name is not a string
+ * that ends inside the string table.
  */
 function exportedSymbols(bytes) {
-  if (bytes.length < 52 || bytes.readUInt32BE(0) !== 0x7f454c46) throw new Error('not an ELF library')
+  if (bytes.length < 4 || bytes.readUInt32BE(0) !== 0x7f454c46) throw new Error('not an ELF library')
   const wide = bytes[4] === 2
+  if (bytes.length < (wide ? 64 : 52)) throw new Error('an ELF library cut short within its header')
   if ((bytes[4] !== 1 && bytes[4] !== 2) || bytes[5] !== 1) {
     throw new Error('an ELF library of a layout this does not read')
   }
@@ -109,13 +113,15 @@ function exportedSymbols(bytes) {
           type: bytes.readUInt32LE(at + 4),
           offset: u64(bytes, at + 0x18),
           size: u64(bytes, at + 0x20),
-          link: bytes.readUInt32LE(at + 0x28)
+          link: bytes.readUInt32LE(at + 0x28),
+          entsize: u64(bytes, at + 0x38)
         }
       : {
           type: bytes.readUInt32LE(at + 4),
           offset: bytes.readUInt32LE(at + 0x10),
           size: bytes.readUInt32LE(at + 0x14),
-          link: bytes.readUInt32LE(at + 0x18)
+          link: bytes.readUInt32LE(at + 0x18),
+          entsize: bytes.readUInt32LE(at + 0x24)
         }
   }
   const symbolSize = wide ? 24 : 16
@@ -134,15 +140,28 @@ function exportedSymbols(bytes) {
     if (strings.type !== SHT_STRTAB || symbols.link === bytes.readUInt16LE(wide ? 0x3e : 0x32)) {
       throw new Error('an ELF library whose dynamic symbols name no dynamic string table')
     }
-    for (let at = symbols.offset; at + symbolSize <= symbols.offset + symbols.size; at += symbolSize) {
+    // The table is a whole number of entries of the size this reads, as its header says.
+    if (symbols.entsize !== symbolSize) {
+      throw new Error('an ELF library whose dynamic symbols are not in entries of the size it reads')
+    }
+    if (symbols.size % symbolSize !== 0) {
+      throw new Error('an ELF library whose dynamic symbol table does not divide into entries')
+    }
+    const stringsEnd = strings.offset + strings.size
+    for (let at = symbols.offset; at < symbols.offset + symbols.size; at += symbolSize) {
+      // Every symbol's name is a string inside the table, ended there, whether or not the symbol is
+      // one this keeps: an entry whose name runs out of the table is a table that cannot be trusted.
+      const start = strings.offset + bytes.readUInt32LE(at)
+      if (start >= stringsEnd) throw new Error('an ELF library with a symbol whose name is not within its string table')
+      const length = bytes.subarray(start, stringsEnd).indexOf(0)
+      if (length < 0) throw new Error('an ELF library with a symbol name that has no end within its string table')
       const shndx = bytes.readUInt16LE(at + (wide ? 6 : 14))
       if (shndx === SHN_UNDEF) continue
       const binding = bytes[at + (wide ? 4 : 12)] >> 4
       const visibility = bytes[at + (wide ? 5 : 13)] & 3
       // Local symbols cannot be found by name, and hidden and internal ones are not exported.
       if ((binding !== STB_GLOBAL && binding !== STB_WEAK) || visibility === 1 || visibility === 2) continue
-      const start = strings.offset + bytes.readUInt32LE(at)
-      names.push(bytes.subarray(start, bytes.indexOf(0, start)).toString('latin1'))
+      names.push(bytes.toString('latin1', start, start + length))
     }
   }
   if (!read) throw new Error('an ELF library with no dynamic symbol table')

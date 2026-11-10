@@ -824,6 +824,64 @@ expectNames(
   ],
   `refused: ${MEDIA}: an ELF library whose section headers are not within the file`
 )
+// A symbol table that cannot be read as it stands is refused, never read as one that exports less:
+// an entry that is skipped, or a name that runs into other bytes, would excuse the class it is for.
+const refusedLibrary = (what, name, bytes, why) =>
+  expectNames(what, name, [application(), library(bytes)], `refused: ${MEDIA}: ${why}`)
+refusedLibrary(
+  'a symbol table whose header gives no entry size is refused',
+  'libraries-no-entsize.apk',
+  mediaLibrary({ entsize: 0 }),
+  'an ELF library whose dynamic symbols are not in entries of the size it reads'
+)
+refusedLibrary(
+  'a 64-bit symbol table with 32-bit entries is refused',
+  'libraries-entsize-wide.apk',
+  mediaLibrary({ entsize: 16 }),
+  'an ELF library whose dynamic symbols are not in entries of the size it reads'
+)
+refusedLibrary(
+  'a 32-bit symbol table with 64-bit entries is refused',
+  'libraries-entsize-narrow.apk',
+  mediaLibrary({ wide: false, entsize: 24 }),
+  'an ELF library whose dynamic symbols are not in entries of the size it reads'
+)
+refusedLibrary(
+  'a symbol table that ends in part of an entry is refused, not read without it',
+  'libraries-partial-entry.apk',
+  mediaLibrary({ tail: Buffer.alloc(8) }),
+  'an ELF library whose dynamic symbol table does not divide into entries'
+)
+refusedLibrary(
+  'a symbol whose name is past the end of its string table is refused, not read as an empty name',
+  'libraries-name-beyond.apk',
+  mediaLibrary({ nameBeyond: true }),
+  'an ELF library with a symbol whose name is not within its string table'
+)
+refusedLibrary(
+  'a name with no NUL inside its string table is refused, not ended by whatever follows the table',
+  'libraries-name-unterminated.apk',
+  mediaLibrary({ unterminated: true }),
+  'an ELF library with a symbol name that has no end within its string table'
+)
+refusedLibrary(
+  'a 64-bit library shorter than its header is refused by name',
+  'libraries-short-header.apk',
+  mediaLibrary().subarray(0, 60),
+  'an ELF library cut short within its header'
+)
+refusedLibrary(
+  'a library with its magic and little else is refused by name',
+  'libraries-magic-only.apk',
+  mediaLibrary().subarray(0, 8),
+  'an ELF library cut short within its header'
+)
+refusedLibrary(
+  'a 32-bit library shorter than its header is refused by name',
+  'libraries-short-header-narrow.apk',
+  mediaLibrary({ wide: false }).subarray(0, 50),
+  'an ELF library cut short within its header'
+)
 expectNames(
   'a bundle holds each ABI to its own libraries',
   'libraries-two-abis.aab',
