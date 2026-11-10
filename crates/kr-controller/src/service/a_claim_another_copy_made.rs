@@ -154,7 +154,8 @@ async fn an_authority_changes_conflict_is_not_told_after_a_fence_lands() {
 /// claims its action: another attempt claimed the identifier for another request, and what that says
 /// goes back only under the authority this attempt arrived under. The control: with nothing owed the
 /// conflict is told. While this host owes a fence it is refused for the fence.
-/// The fence is set before the call: the door's own function asks the check, with no pause before it, so the case shows that the check runs, not when.
+/// The fence is set before the call: the door's own function asks the check, with no pause before
+/// it, so the case shows that the check runs, not when.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_privacy_changes_conflict_is_not_told_while_a_fence_is_owed() {
     let (temp, controller, _clock) = daemon().await;
@@ -197,7 +198,8 @@ async fn a_privacy_changes_conflict_is_not_told_while_a_fence_is_owed() {
 /// record of its action: another attempt recorded the identifier for another request, and what that
 /// says goes back only under the authority this attempt arrived under. The control: with nothing
 /// owed the conflict is told. While this host owes a fence it is refused for the fence.
-/// The fence is set before the call: the transfer service's admission asks the check on a thread that blocks, where no pause stops it, so the case shows that the check runs, not when.
+/// The fence is set before the call: the transfer service's admission asks the check on a thread
+/// that blocks, where no pause stops it, so the case shows that the check runs, not when.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_transfers_conflict_is_not_told_while_a_fence_is_owed() {
     let (temp, controller, _clock) = daemon().await;
