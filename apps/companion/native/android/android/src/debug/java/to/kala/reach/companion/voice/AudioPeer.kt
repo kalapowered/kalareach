@@ -30,11 +30,14 @@ import kotlin.math.sin
  * sends and receives audio, so that the call's media is measured by what each end receives.
  *
  * A script puts `kr-probe/peer.json` in the application's data directory, naming a loopback port
- * and a token. The peer serves two routes on that port, and only to a request that carries the
+ * and a token. The peer serves four routes on that port, and only to a request that carries the
  * token. `POST /answer` takes the call's offer and answers with the peer's own answer, marked as
  * the provider's is (an ICE-lite agent), and the stand-in voice service on the machine the
- * emulator runs beside relays it as the provider's. `GET /figures` says what the peer received and
- * sent.
+ * emulator runs beside relays it as the provider's; with `?dtx=1` the answer also turns Opus
+ * discontinuous transmission on. `GET /figures` says what the peer received and sent.
+ * `POST /events` writes its body, as text, to the call's `oai-events` channel as the provider
+ * would, and `POST /drop?ms=N` has the call's recorder wait N milliseconds before it hands on its
+ * next buffer (the device run's drop hook, [DropHook]).
  *
  * The peer's audio is its own: a second factory whose audio device records nothing from the
  * hardware, makes a tone for its microphone and counts what it is played. It shares nothing with
@@ -108,11 +111,16 @@ internal class AudioPeer private constructor(context: Context, private val token
     @Volatile
     private var connection: PeerConnection? = null
 
+    /** The channel the call made for the provider's events, once the connection has carried it. */
+    @Volatile
+    private var events: DataChannel? = null
+    private val eventsSent = AtomicLong()
+
     @Volatile
     private var addressFound = CountDownLatch(1)
 
     /** Applies [offer] and answers it, with the candidates found by the first, marked ICE-lite. */
-    private fun answer(offer: String): String {
+    private fun answer(offer: String, dtx: Boolean): String {
         val found = CountDownLatch(1)
         addressFound = found
         val made = factory.createPeerConnection(
@@ -122,7 +130,9 @@ internal class AudioPeer private constructor(context: Context, private val token
             },
             object : PeerConnection.Observer {
                 override fun onIceCandidate(candidate: IceCandidate) = found.countDown()
-                override fun onDataChannel(channel: DataChannel) {}
+                override fun onDataChannel(channel: DataChannel) {
+                    events = channel
+                }
                 override fun onSignalingChange(state: PeerConnection.SignalingState) {}
                 override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {}
                 override fun onIceConnectionReceivingChange(receiving: Boolean) {}
@@ -149,7 +159,35 @@ internal class AudioPeer private constructor(context: Context, private val token
         set { made.setLocalDescription(it, answer) }
         // A peer that finds no address answers with what it has after this long.
         found.await(DESCRIPTION_SECONDS, TimeUnit.SECONDS)
-        return asIceLite(made.localDescription?.description ?: answer.description)
+        val sdp = asIceLite(made.localDescription?.description ?: answer.description)
+        return if (dtx) withDtx(sdp) else sdp
+    }
+
+    /**
+     * The answer with Opus discontinuous transmission turned on (`usedtx=1`), as an answer that
+     * asks for it reads. The peer's own connection runs as it was answered; only what the call is
+     * told changes.
+     */
+    private fun withDtx(sdp: String): String {
+        val lines = sdp.split("\r\n").toMutableList()
+        val rtpmap = Regex("^a=rtpmap:(\\d+) opus/")
+        val payload = lines.firstNotNullOfOrNull { rtpmap.find(it)?.groupValues?.get(1) } ?: return sdp
+        val fmtp = lines.indexOfFirst { it.startsWith("a=fmtp:$payload ") }
+        if (fmtp >= 0) {
+            if (!lines[fmtp].contains("usedtx=")) lines[fmtp] = lines[fmtp] + ";usedtx=1"
+        } else {
+            lines.add(lines.indexOfFirst { rtpmap.containsMatchIn(it) } + 1, "a=fmtp:$payload usedtx=1")
+        }
+        return lines.joinToString("\r\n")
+    }
+
+    /** Writes [bytes] to the call's events channel as one text message, and says whether it was written. */
+    private fun send(bytes: ByteArray): Boolean {
+        val channel = events ?: return false
+        if (channel.state() != DataChannel.State.OPEN) return false
+        val written = channel.send(DataChannel.Buffer(java.nio.ByteBuffer.wrap(bytes), false))
+        if (written) eventsSent.incrementAndGet()
+        return written
     }
 
     /**
@@ -210,6 +248,9 @@ internal class AudioPeer private constructor(context: Context, private val token
             .put("recorderStarted", tonesMade.get() > 0)
             .put("recordedFrames", tonesMade.get())
             .put("playedFrames", played.get())
+            .put("eventsOpen", events?.state() == DataChannel.State.OPEN)
+            .put("eventsSent", eventsSent.get())
+            .put("dropsDone", DropHook.stalls())
             .put("errors", org.json.JSONArray(errors.toList()))
         val open = connection
         if (open != null) {
@@ -264,16 +305,31 @@ internal class AudioPeer private constructor(context: Context, private val token
                 if (count < 0) return
                 read += count
             }
+            val target = first.getOrElse(1) { "" }
+            val path = target.substringBefore('?')
+            val query = target.substringAfter('?', "").split('&').filter { '=' in it }
+                .associate { it.substringBefore('=') to it.substringAfter('=') }
             val (status, text) = when {
                 headers["x-peer-token"] != token -> 401 to ""
-                first.size >= 2 && first[0] == "POST" && first[1] == "/answer" ->
+                first.size >= 2 && first[0] == "POST" && path == "/answer" ->
                     try {
-                        200 to answer(String(body, Charsets.UTF_8))
+                        200 to answer(String(body, Charsets.UTF_8), query["dtx"] == "1")
                     } catch (failure: Exception) {
                         errors.add("answer: ${failure.message}")
                         500 to (failure.message ?: "")
                     }
-                first.size >= 2 && first[0] == "GET" && first[1] == "/figures" -> 200 to figures()
+                first.size >= 2 && first[0] == "GET" && path == "/figures" -> 200 to figures()
+                first.size >= 2 && first[0] == "POST" && path == "/events" ->
+                    if (send(body)) 200 to "sent" else 409 to "the events channel is not open"
+                first.size >= 2 && first[0] == "POST" && path == "/drop" -> {
+                    val wait = query["ms"]?.toLongOrNull()
+                    if (wait != null && wait in 1..MAX_DROP_MS) {
+                        DropHook.arm(wait)
+                        200 to "armed"
+                    } else {
+                        400 to "ms is a whole number of milliseconds up to $MAX_DROP_MS"
+                    }
+                }
                 else -> 404 to ""
             }
             val bytes = text.toByteArray(Charsets.UTF_8)
@@ -292,6 +348,7 @@ internal class AudioPeer private constructor(context: Context, private val token
         private const val TONE_PEAK = 9_000.0
         private const val DESCRIPTION_SECONDS = 30L
         private const val MAX_BODY_BYTES = 262_144
+        private const val MAX_DROP_MS = 2_000L
 
         private var started = false
 

@@ -201,7 +201,9 @@ class VoiceCall private constructor(
             }
             .setAudioBufferCallback { buffer, _, _, _, bytesRead, captureTimeNs ->
                 // On the audio thread, for every frame, before it reaches the encoder. Answered
-                // from the gate alone, so no switch is set from here.
+                // from the gate alone, so no switch is set from here. A debug build's device run may
+                // have the recorder wait here first, which is a gap in what the call is handed.
+                DropHook.beforeBuffer()
                 if (!control.carries()) {
                     for (index in 0 until minOf(bytesRead, buffer.capacity())) buffer.put(index, 0)
                 }

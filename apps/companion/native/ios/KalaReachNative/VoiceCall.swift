@@ -69,6 +69,17 @@ public final class VoiceCall: NSObject {
     /// Shared across calls, because building one is expensive and it holds the audio device.
     private static let factory: RTCPeerConnectionFactory = {
         RTCInitializeSSL()
+        #if DEBUG
+        // A device run on a simulator, which has no recorder, may give the call a recording device
+        // of its own that makes a tone; the drop hook acts on it.
+        if let device = AudioPeer.deviceForTheCall() {
+            return RTCPeerConnectionFactory(
+                encoderFactory: RTCDefaultVideoEncoderFactory(),
+                decoderFactory: RTCDefaultVideoDecoderFactory(),
+                audioDevice: device
+            )
+        }
+        #endif
         return RTCPeerConnectionFactory(
             encoderFactory: RTCDefaultVideoEncoderFactory(),
             decoderFactory: RTCDefaultVideoDecoderFactory()

@@ -3,15 +3,23 @@
 //  sends and receives audio, so that the call's media is measured by what each end receives.
 //
 //  A script puts `kr-probe/peer.json` in the application's data directory, naming a loopback port
-//  and a token. The peer serves two routes on that port, and only to a request that carries the
+//  and a token. The peer serves four routes on that port, and only to a request that carries the
 //  token. `POST /answer` takes the call's offer and answers with the peer's own answer, marked as
 //  the provider's is (an ICE-lite agent), and the stand-in voice service on the machine the
-//  application runs beside relays it as the provider's. `GET /figures` says what the peer received
-//  and sent, and what the system's lock screen holds for the call.
+//  application runs beside relays it as the provider's; with `?dtx=1` the answer also turns Opus
+//  discontinuous transmission on. `GET /figures` says what the peer received and sent, and what
+//  the system's lock screen holds for the call. `POST /events` writes its body, as text, to the
+//  call's `oai-events` channel as the provider would, and `POST /drop?ms=N` takes N milliseconds
+//  of audio out of the call's recorder (the device run's drop hook).
 //
 //  The peer's audio is its own: a second factory with an audio device that makes a tone for its
 //  microphone and takes what it is played, and opens neither the audio session nor the
 //  microphone. It shares nothing with the call's factory and its audio unit.
+//
+//  When the peer file also says `"recorder": "synthetic"`, the call's own factory is given a device
+//  of the same kind, because a simulator has no recorder: the call then records a tone at the pace
+//  of real audio, opens no microphone of the machine, and is the one the drop hook acts on. Without
+//  it, and in a release build, the call has the system's audio device.
 //
 //  Compiled into debug builds only. A release build has no peer and reads no file.
 //
@@ -26,6 +34,14 @@ import WebRTC
 final class SyntheticAudioDevice: NSObject, RTCAudioDevice {
     private static let rate = 48_000
     private static let frames = 480
+
+    /// Whether the device run's drop hook acts on this device's recorder: the call's, not the peer's.
+    private let honoursDrops: Bool
+
+    init(honoursDrops: Bool = false) {
+        self.honoursDrops = honoursDrops
+        super.init()
+    }
 
     var deviceInputSampleRate: Double { Double(Self.rate) }
     var inputIOBufferDuration: TimeInterval { 0.01 }
@@ -127,13 +143,19 @@ final class SyntheticAudioDevice: NSObject, RTCAudioDevice {
     /// long as the device runs.
     private func loop() {
         var phase = 0.0
+        var silentUntil = Date.distantPast
         var tone = [Int16](repeating: 0, count: Self.frames)
         var drain = [Int16](repeating: 0, count: Self.frames)
         let step = 2 * Double.pi * 440 / Double(Self.rate)
         while !Thread.current.isCancelled {
             let (delegate, recording, playing) = locked { (self.delegate, self.recording, self.playing) }
             guard let delegate else { break }
-            if recording {
+            if recording, honoursDrops, let dropped = DeviceRunDrop.take() {
+                // The recorder delivers nothing for this long: audio the call never gets. What is
+                // played out goes on.
+                silentUntil = Date().addingTimeInterval(dropped)
+            }
+            if recording, Date() >= silentUntil {
                 for index in 0..<Self.frames {
                     tone[index] = Int16(sin(phase) * 9_000)
                     phase += step
@@ -184,10 +206,42 @@ final class SyntheticAudioDevice: NSObject, RTCAudioDevice {
     }
 }
 
-/// The peer: a peer connection with an audio device of its own, and the two routes.
+/// The device run's drop hook: a length of time the call's recorder is to deliver nothing for.
+/// Armed by the peer's `/drop` route, taken by the call's recording device, counted when taken.
+enum DeviceRunDrop {
+    private static let lock = NSLock()
+    private static var pending: TimeInterval?
+    private static var done = 0
+
+    static func arm(milliseconds: Int) {
+        lock.lock()
+        pending = Double(milliseconds) / 1_000
+        lock.unlock()
+    }
+
+    /// The length to deliver nothing for, once; nil when no drop is armed.
+    static func take() -> TimeInterval? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let length = pending else { return nil }
+        pending = nil
+        done += 1
+        return length
+    }
+
+    static var drops: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return done
+    }
+}
+
+/// The peer: a peer connection with an audio device of its own, and the routes.
 final class AudioPeer: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable {
     /// Kept alive for the life of the process.
     private static var running: AudioPeer?
+    /// Whether the peer file asked for the call's recorder to be the synthetic device.
+    private static var syntheticRecorder = false
 
     private let device = SyntheticAudioDevice()
     private let factory: RTCPeerConnectionFactory
@@ -197,6 +251,15 @@ final class AudioPeer: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable 
     private var waiting: CheckedContinuation<Void, Never>?
     private var addressFound = false
     private var server: PeerServer?
+    /// The channel the call made for the provider's events, once the connection carries it.
+    private var events: RTCDataChannel?
+    private var eventsSent = 0
+
+    /// The audio device the call's own factory is given when the run asked for a synthetic recorder:
+    /// a tone and no hardware, with the drop hook acting on it. Nil otherwise.
+    static func deviceForTheCall() -> SyntheticAudioDevice? {
+        running != nil && syntheticRecorder ? SyntheticAudioDevice(honoursDrops: true) : nil
+    }
 
     /// Starts the peer when the run asked for one: `kr-probe/peer.json` holds a port and a token.
     static func startIfRequested() {
@@ -216,6 +279,7 @@ final class AudioPeer: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable 
             return
         }
         peer.server = server
+        syntheticRecorder = (object["recorder"] as? String) == "synthetic"
         running = peer
     }
 
@@ -230,17 +294,36 @@ final class AudioPeer: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable 
     }
 
     private func handle(_ request: PeerRequest) async -> PeerResponse {
-        switch (request.method, request.path) {
+        let parts = request.path.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
+        let path = String(parts.first ?? "")
+        var query: [String: String] = [:]
+        if parts.count == 2 {
+            for pair in parts[1].split(separator: "&") {
+                let kv = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+                if kv.count == 2 { query[String(kv[0])] = String(kv[1]) }
+            }
+        }
+        switch (request.method, path) {
         case ("POST", "/answer"):
             let offer = String(decoding: request.body, as: UTF8.self)
             do {
-                return PeerResponse(status: 200, body: Data(try await answer(offer).utf8))
+                return PeerResponse(status: 200, body: Data(try await answer(offer, dtx: query["dtx"] == "1").utf8))
             } catch {
                 return PeerResponse(status: 500, body: Data("\(error)".utf8))
             }
         case ("GET", "/figures"):
             let text = (try? JSONSerialization.data(withJSONObject: await figures(), options: [.sortedKeys])) ?? Data("{}".utf8)
             return PeerResponse(status: 200, body: text)
+        case ("POST", "/events"):
+            return send(request.body)
+                ? PeerResponse(status: 200, body: Data("sent".utf8))
+                : PeerResponse(status: 409, body: Data("the events channel is not open".utf8))
+        case ("POST", "/drop"):
+            guard let text = query["ms"], let milliseconds = Int(text), (1...2_000).contains(milliseconds) else {
+                return PeerResponse(status: 400, body: Data("ms is a whole number of milliseconds up to 2000".utf8))
+            }
+            DeviceRunDrop.arm(milliseconds: milliseconds)
+            return PeerResponse(status: 200, body: Data("armed".utf8))
         default:
             return PeerResponse(status: 404, body: Data())
         }
@@ -248,7 +331,7 @@ final class AudioPeer: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable 
 
     /// Applies `offer` and answers it, with the candidates this peer has found by its first,
     /// marked as the provider's answer is.
-    func answer(_ offer: String) async throws -> String {
+    func answer(_ offer: String, dtx: Bool = false) async throws -> String {
         let configuration = RTCConfiguration()
         configuration.sdpSemantics = .unifiedPlan
         configuration.continualGatheringPolicy = .gatherContinually
@@ -271,7 +354,40 @@ final class AudioPeer: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable 
                 DispatchQueue.global().asyncAfter(deadline: .now() + 30) { [weak self] in self?.foundAnAddress() }
             }
         }
-        return Self.asIceLite(made.localDescription?.sdp ?? answer.sdp)
+        let sdp = Self.asIceLite(made.localDescription?.sdp ?? answer.sdp)
+        return dtx ? Self.withDtx(sdp) : sdp
+    }
+
+    /// The answer with Opus discontinuous transmission turned on (`usedtx=1`), as an answer that
+    /// asks for it reads. The peer's own connection runs as it was answered; only what the call is
+    /// told changes.
+    static func withDtx(_ sdp: String) -> String {
+        var lines = sdp.components(separatedBy: "\r\n")
+        guard
+            let map = lines.firstIndex(where: { $0.hasPrefix("a=rtpmap:") && $0.contains(" opus/") }),
+            let payload = lines[map].dropFirst("a=rtpmap:".count).split(separator: " ").first
+        else { return sdp }
+        if let index = lines.firstIndex(where: { $0.hasPrefix("a=fmtp:\(payload) ") }) {
+            if !lines[index].contains("usedtx=") { lines[index] += ";usedtx=1" }
+        } else {
+            lines.insert("a=fmtp:\(payload) usedtx=1", at: map + 1)
+        }
+        return lines.joined(separator: "\r\n")
+    }
+
+    /// Writes `body` to the call's events channel as one text message, and says whether it was written.
+    private func send(_ body: Data) -> Bool {
+        lock.lock()
+        let channel = events
+        lock.unlock()
+        guard let channel, channel.readyState == .open else { return false }
+        let written = channel.sendData(RTCDataBuffer(data: body, isBinary: false))
+        if written {
+            lock.lock()
+            eventsSent += 1
+            lock.unlock()
+        }
+        return written
     }
 
     /// The answer as the provider's reads: an ICE-lite agent answers the checks it is sent. The peer
@@ -335,6 +451,11 @@ final class AudioPeer: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable 
                 }
             }
         }
+        lock.lock()
+        out["eventsOpen"] = events?.readyState == .open
+        out["eventsSent"] = eventsSent
+        lock.unlock()
+        out["dropsDone"] = DeviceRunDrop.drops
         let reading = SystemRemoteControls.reading()
         out["lockScreen"] = [
             "pauseOffered": reading.pauseOffered,
@@ -357,7 +478,11 @@ final class AudioPeer: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable 
     func peerConnection(_: RTCPeerConnection, didChange _: RTCIceConnectionState) {}
     func peerConnection(_: RTCPeerConnection, didChange _: RTCIceGatheringState) {}
     func peerConnection(_: RTCPeerConnection, didRemove _: [RTCIceCandidate]) {}
-    func peerConnection(_: RTCPeerConnection, didOpen _: RTCDataChannel) {}
+    func peerConnection(_: RTCPeerConnection, didOpen channel: RTCDataChannel) {
+        lock.lock()
+        events = channel
+        lock.unlock()
+    }
 }
 
 private enum PeerError: Error { case noConnection }
