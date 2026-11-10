@@ -836,7 +836,9 @@ function CallScreen({
 
       <section className="kr-voice__panel" aria-label="Delegations">
         <h2>What the voice has asked for</h2>
-        <p className="kr-voice__note">{NOT_ACTED_ON_WORDS}</p>
+        {call.delegations.every((delegation) => delegation.state === 'not_done') && (
+          <p className="kr-voice__note">{NOT_ACTED_ON_WORDS}</p>
+        )}
         {call.delegations.length === 0 ? (
           <p className="kr-voice__note">Nothing yet.</p>
         ) : (
@@ -863,8 +865,40 @@ const REQUEST_WORDS: Readonly<Record<ContextRequest['outcome'], string>> = {
   refused: 'Refused'
 }
 
-/** One delegation the voice announced: this version did nothing about it, and the row says so. */
+/** What a delegation's state is called where a person reads it, before whether the voice was told. */
+const DELEGATION_WORDS: Readonly<Record<string, string>> = {
+  not_done: 'Not done.',
+  collecting: 'Reading what was said.',
+  asking: 'Sent to the computer, which has not answered.',
+  refused: 'Not sent. What was said could not be used as a request.',
+  not_sent: 'Not done. Nothing was sent to the computer.',
+  performed: 'Done by the computer.',
+  admitted: 'Taken by the computer. Whether it was carried out is not known.',
+  confirmation_required: 'Not done. It needs a confirmation on this phone, unlocked.',
+  host_refused: 'Not done. The computer refused it.',
+  unknown: 'It is not known whether the computer did it.'
+}
+
+/** Why a delegation was not sent or not done, in words, for the causes a person can act on. */
+const DELEGATION_CAUSES: Readonly<Record<string, string>> = {
+  first_fragment: 'The first thing said in a call never acts. Say it again.',
+  capture_break: 'The microphone was interrupted. This call can no longer act on speech.',
+  lost_news: 'Part of what was said may have been lost. This call can no longer act on speech.',
+  unreadable_event: 'Part of what was said could not be read. This call can no longer act on speech.',
+  late_fragment: 'More was said after it was read. This call can no longer act on speech.',
+  provider_muted: 'The voice was muted. This call can no longer act on speech.',
+  stale_proof: 'The microphone could not be shown to be working. Say it again.',
+  host_lost: 'The computer was out of reach.',
+  broker_disagrees: 'The voice service did not confirm it. Say it again.'
+}
+
+/**
+ * One delegation the voice announced, and what became of it. With the shipped configuration this
+ * version does nothing about any, and the row says so.
+ */
 function DelegationRow({ delegation }: { readonly delegation: Delegation }): React.ReactElement {
+  const what = DELEGATION_WORDS[delegation.state] ?? 'Not done.'
+  const why = delegation.cause === null ? undefined : DELEGATION_CAUSES[delegation.cause]
   return (
     <li className="kr-voice__delegation">
       <span className="kr-voice__kind">
@@ -873,9 +907,14 @@ function DelegationRow({ delegation }: { readonly delegation: Delegation }): Rea
           : `Asked ${(delegation.offsetMs / 1000).toFixed(1)} seconds in`}
       </span>
       <span className="kr-voice__summary">
-        {delegation.told
-          ? 'Not done. The voice was told so.'
-          : 'Not done. The voice has not been told yet.'}
+        {delegation.state === 'not_done' || delegation.state === 'collecting'
+          ? delegation.told
+            ? `${what} The voice was told so.`
+            : `${what} The voice has not been told yet.`
+          : delegation.told
+            ? `${what} The voice was told.`
+            : `${what} The voice has not been told yet.`}
+        {why !== undefined && ` ${why}`}
       </span>
     </li>
   )

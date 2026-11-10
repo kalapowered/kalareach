@@ -280,6 +280,23 @@ describe('what the device reports of its call', () => {
   // The call is the application's, so the screen takes its microphone, its speaker, the voice
   // service, the host the call belongs to and the delegations from the device's report, whoever
   // started the call.
+  // A call that hands spoken requests to the host reports what became of each, and why.
+  it('keeps the state and the cause of each delegation the device reports', () => {
+    const reported = callAsReported(
+      call(),
+      callState({
+        delegations: [
+          { delegation_id: 'd-1', offset_ms: 1200, state: 'refused', told: true, cause: 'first_fragment' },
+          { delegation_id: 'd-2', offset_ms: 2400, state: 'performed', told: false }
+        ]
+      })
+    )
+    expect(reported.delegations).toEqual([
+      { delegationId: 'd-1', offsetMs: 1200, state: 'refused', cause: 'first_fragment', told: true },
+      { delegationId: 'd-2', offsetMs: 2400, state: 'performed', cause: null, told: false }
+    ])
+  })
+
   it('takes every fact of a held call from the device\'s report', () => {
     const reported = callAsReported(
       call(),
@@ -295,7 +312,9 @@ describe('what the device reports of its call', () => {
     expect(reported.playing).toBe(false)
     expect(reported.brokerReachable).toBe(false)
     expect(reported.callHost).toBe('lost')
-    expect(reported.delegations).toEqual([{ delegationId: 'd-1', offsetMs: 1200, told: true }])
+    expect(reported.delegations).toEqual([
+      { delegationId: 'd-1', offsetMs: 1200, state: 'not_done', cause: null, told: true }
+    ])
     expect(reported.voiceSessionId).toBe('vs-1')
   })
 

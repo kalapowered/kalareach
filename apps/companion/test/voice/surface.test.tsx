@@ -7,7 +7,12 @@ import {
   type CurrentTurn,
   type VoiceSurfaceActions
 } from '../../src/voice/VoiceSurface'
-import { CONTEXT_OUTCOMES, type ProviderChoice, type RunningCall } from '../../src/voice/model'
+import {
+  CONTEXT_OUTCOMES,
+  NOT_ACTED_ON_WORDS,
+  type ProviderChoice,
+  type RunningCall
+} from '../../src/voice/model'
 
 /** What the host says an append acknowledgement does not establish. */
 const ADMISSION_MEANS =
@@ -698,7 +703,9 @@ describe('while a call is running', () => {
           choice={choice()}
           call={call({
             requests: [{ id: 'r-1', command: 'commentary', outcome }],
-            delegations: [{ delegationId: 'd-1', offsetMs: 1200, told: true }]
+            delegations: [
+              { delegationId: 'd-1', offsetMs: 1200, state: 'not_done', cause: null, told: true }
+            ]
           })}
           currentTurn={null}
           busy={false}
@@ -715,6 +722,34 @@ describe('while a call is running', () => {
     }
   )
 
+  // A call that hands spoken requests to the host says what became of each: a request that was not
+  // sent says why, one that was written and not answered says it is not known, and the words that
+  // this version acts on nothing are not shown beside rows that say otherwise.
+  it('says what became of each delegation, and why a request was not sent', () => {
+    render(
+      <VoiceSurface
+        choice={choice()}
+        call={call({
+          delegations: [
+            { delegationId: 'd-1', offsetMs: 1000, state: 'refused', cause: 'first_fragment', told: true },
+            { delegationId: 'd-2', offsetMs: 2000, state: 'unknown', cause: null, told: true },
+            { delegationId: 'd-3', offsetMs: 3000, state: 'performed', cause: null, told: false }
+          ]
+        })}
+        currentTurn={null}
+        busy={false}
+        notice={null}
+        actions={actions()}
+      />
+    )
+    expect(
+      screen.getByText(/Not sent\. What was said could not be used as a request\..*first thing said/)
+    ).toBeInTheDocument()
+    expect(screen.getByText(/It is not known whether the computer did it\./)).toBeInTheDocument()
+    expect(screen.getByText(/Done by the computer\. The voice has not been told yet\./)).toBeInTheDocument()
+    expect(screen.queryByText(NOT_ACTED_ON_WORDS)).not.toBeInTheDocument()
+  })
+
   // A delegation the voice service listed when the control attached has no offset, and is not said
   // to have been asked at the start of the call.
   it('does not place a delegation in the call when the service gave no offset', () => {
@@ -723,8 +758,8 @@ describe('while a call is running', () => {
         choice={choice()}
         call={call({
           delegations: [
-            { delegationId: 'd-0', offsetMs: null, told: true },
-            { delegationId: 'd-1', offsetMs: 1200, told: true }
+            { delegationId: 'd-0', offsetMs: null, state: 'not_done', cause: null, told: true },
+            { delegationId: 'd-1', offsetMs: 1200, state: 'not_done', cause: null, told: true }
           ]
         })}
         currentTurn={null}
