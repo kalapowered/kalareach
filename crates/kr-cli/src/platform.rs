@@ -155,9 +155,9 @@ mod console {
     pub struct ControllingTerminal {
         input: File,
         output: File,
-        /// Whether the console had quick edit on when the application first asked for the mouse,
-        /// which the console is given back with the mouse.
-        quick_edit_was_on: std::sync::atomic::AtomicBool,
+        /// The console's input mode when the attachment began, which the console is given back
+        /// with the mouse: whether it had quick edit on, and whether it reported its private flags.
+        attached_input: std::sync::atomic::AtomicU32,
     }
 
     impl ControllingTerminal {
@@ -180,7 +180,7 @@ mod console {
             Ok(Self {
                 input,
                 output,
-                quick_edit_was_on: std::sync::atomic::AtomicBool::new(false),
+                attached_input: std::sync::atomic::AtomicU32::new(0),
             })
         }
 
@@ -273,27 +273,19 @@ mod console {
         ///
         /// The mode is changed from the one the console has now, so a console that has been asked
         /// to spell its keys itself goes on spelling them, and quick edit comes back only if the
-        /// console had it when the mouse was first asked for.
+        /// console had it when the attachment began. A console that reported none of its private
+        /// flags then is given none: only the mouse flag is set, and cleared again.
         ///
         /// # Errors
         ///
         /// Returns an error when the console's input mode cannot be read or set.
         pub fn report_mouse(&self, asked: bool) -> Result<()> {
             use std::sync::atomic::Ordering::SeqCst;
-            use windows_sys::Win32::System::Console::ENABLE_QUICK_EDIT_MODE;
 
             let current = console_mode(&self.input)?;
-            if asked && current & ENABLE_QUICK_EDIT_MODE != 0 {
-                self.quick_edit_was_on.store(true, SeqCst);
-            }
-            let saved = if self.quick_edit_was_on.load(SeqCst) {
-                ENABLE_QUICK_EDIT_MODE
-            } else {
-                0
-            };
             set_console_mode(
                 &self.input,
-                crate::windows::records::mouse_input_mode(current, saved, asked),
+                crate::mouse::mouse_input_mode(current, self.attached_input.load(SeqCst), asked),
             )
         }
 
@@ -364,7 +356,7 @@ mod console {
         ///
         /// As [`Self::enter_raw_mode`].
         pub fn enter_record_mode(&self) -> Result<SavedModes> {
-            self.enter_mode(crate::windows::records::record_input_mode)
+            self.enter_mode(crate::mouse::record_input_mode)
         }
 
         /// Sets the input mode `input` makes of the one the console has and the output mode a
@@ -375,6 +367,8 @@ mod console {
             };
 
             let saved = self.modes()?;
+            self.attached_input
+                .store(saved.input, std::sync::atomic::Ordering::SeqCst);
             let raw_output =
                 saved.output | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
             set_console_mode(&self.input, input(saved.input))?;

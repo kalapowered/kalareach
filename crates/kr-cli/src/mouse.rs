@@ -373,11 +373,100 @@ const fn first_of(state: u32) -> Option<MouseButton> {
     }
 }
 
+/// The console handles Ctrl-C itself, and does not hand it on as a key.
+const ENABLE_PROCESSED_INPUT: u32 = 0x1;
+/// A read of the console waits for a whole line.
+const ENABLE_LINE_INPUT: u32 = 0x2;
+/// The console shows what is typed.
+const ENABLE_ECHO_INPUT: u32 = 0x4;
+/// The console reports a change of its window's size as a record.
+const ENABLE_WINDOW_INPUT: u32 = 0x8;
+/// The console reports the mouse as records.
+const ENABLE_MOUSE_INPUT: u32 = 0x10;
+/// The console uses the mouse to select text, a private flag of the console.
+const ENABLE_QUICK_EDIT_MODE: u32 = 0x40;
+/// A mode that has it sets the private flags as it states them, and a mode that has not leaves
+/// them as they are.
+const ENABLE_EXTENDED_FLAGS: u32 = 0x80;
+/// The console spells the keys itself, as the sequences a terminal sends.
+const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x200;
+
+// The values above are the system's, written out so that the arithmetic below is code on every
+// platform and its cases run wherever the tests do. The Windows build holds them to the system's.
+#[cfg(windows)]
+const _: () = {
+    use windows_sys::Win32::System::Console as system;
+
+    assert!(ENABLE_PROCESSED_INPUT == system::ENABLE_PROCESSED_INPUT);
+    assert!(ENABLE_LINE_INPUT == system::ENABLE_LINE_INPUT);
+    assert!(ENABLE_ECHO_INPUT == system::ENABLE_ECHO_INPUT);
+    assert!(ENABLE_WINDOW_INPUT == system::ENABLE_WINDOW_INPUT);
+    assert!(ENABLE_MOUSE_INPUT == system::ENABLE_MOUSE_INPUT);
+    assert!(ENABLE_QUICK_EDIT_MODE == system::ENABLE_QUICK_EDIT_MODE);
+    assert!(ENABLE_EXTENDED_FLAGS == system::ENABLE_EXTENDED_FLAGS);
+    assert!(ENABLE_VIRTUAL_TERMINAL_INPUT == system::ENABLE_VIRTUAL_TERMINAL_INPUT);
+};
+
+/// The console input mode a record reader needs, made from `saved`, the mode the console had.
+///
+/// `ENABLE_VIRTUAL_TERMINAL_INPUT` is deliberately absent: it is the console translating records
+/// into VT sequences, which is the translation this path exists to avoid. Line input, echo and
+/// the console's own handling of Ctrl-C are absent as well: every key, the interrupt among them,
+/// is a record to hand on to the session. Mouse and window-size records are not asked for here:
+/// the console keeps the mouse for selecting text, as it does for any command that does not ask for
+/// it, until the session's application asks to be told of the mouse ([`mouse_input_mode`]). No
+/// private flag is written: the mode has those of `saved` as they were.
+#[must_use]
+pub const fn record_input_mode(saved: u32) -> u32 {
+    saved
+        & !(ENABLE_LINE_INPUT
+            | ENABLE_ECHO_INPUT
+            | ENABLE_PROCESSED_INPUT
+            | ENABLE_VIRTUAL_TERMINAL_INPUT
+            | ENABLE_MOUSE_INPUT
+            | ENABLE_WINDOW_INPUT)
+}
+
+/// The console input mode `current` becomes when the session's application starts or stops asking
+/// to be told of the mouse. `attached` is the mode the console had when the attachment began.
+///
+/// While it asks, the console reports the mouse as records. A console that reports its private
+/// flags has `ENABLE_EXTENDED_FLAGS` in `attached`, and it no longer uses the mouse to select text
+/// once the extended flags are set and quick edit is removed. When the application stops, the
+/// console has the mouse again: quick edit comes back if `attached` had it on. Nothing else of
+/// `current` changes, so a console that has been asked to spell its keys itself goes on spelling
+/// them.
+///
+/// A console whose mode had no `ENABLE_EXTENDED_FLAGS` reports none of its private flags, whatever
+/// they are, and a mode that sets the extended flags sets each of them as that mode states it: the
+/// attachment would turn off insert mode and auto position, and quick edit it never learned was on,
+/// and the restored mode, which has no extended flags, could not turn them on again. So on such a
+/// console no private flag is written at any step: asking sets `ENABLE_MOUSE_INPUT` alone and
+/// stopping clears it. The console then reports the mouse as records only while quick edit is off.
+#[must_use]
+pub const fn mouse_input_mode(current: u32, attached: u32, asked: bool) -> u32 {
+    if attached & ENABLE_EXTENDED_FLAGS == 0 {
+        return if asked {
+            current | ENABLE_MOUSE_INPUT
+        } else {
+            current & !ENABLE_MOUSE_INPUT
+        };
+    }
+    if asked {
+        (current | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS) & !ENABLE_QUICK_EDIT_MODE
+    } else {
+        (current & !(ENABLE_MOUSE_INPUT | ENABLE_QUICK_EDIT_MODE))
+            | (attached & ENABLE_QUICK_EDIT_MODE)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        LEFT, MIDDLE, MOUSE_MOVED, MOUSE_WHEELED, MouseRecord, MouseReporting, MouseSpeller, RIGHT,
-        Tracking,
+        ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT,
+        ENABLE_PROCESSED_INPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT, LEFT,
+        MIDDLE, MOUSE_MOVED, MOUSE_WHEELED, MouseRecord, MouseReporting, MouseSpeller, RIGHT,
+        Tracking, mouse_input_mode, record_input_mode,
     };
 
     /// A record at `column` and `row` with the buttons and flags the console reported it with.
@@ -649,5 +738,89 @@ mod tests {
             b"\x1b[<0;301;3M".to_vec(),
             "which the SGR encoding has"
         );
+    }
+
+    /// Typing inserts before the text that is there, a private flag of the console.
+    const ENABLE_INSERT_MODE: u32 = 0x20;
+    /// The cursor goes where typing continues, a private flag of the console.
+    const ENABLE_AUTO_POSITION: u32 = 0x100;
+
+    #[cfg(windows)]
+    const _: () = {
+        use windows_sys::Win32::System::Console as system;
+
+        assert!(ENABLE_INSERT_MODE == system::ENABLE_INSERT_MODE);
+        assert!(ENABLE_AUTO_POSITION == system::ENABLE_AUTO_POSITION);
+    };
+
+    /// The flags of the console's input mode that are private: set only through the extended flags,
+    /// and reported only by a console that reports those.
+    const PRIVATE_FLAGS: u32 =
+        ENABLE_INSERT_MODE | ENABLE_QUICK_EDIT_MODE | ENABLE_EXTENDED_FLAGS | ENABLE_AUTO_POSITION;
+
+    /// The modes an attachment writes to a console, in order: when it begins, when the application
+    /// asks for the mouse, when it stops, and the console's own mode put back at the end.
+    fn written(attached: u32, spelling: bool) -> [u32; 4] {
+        let begun = record_input_mode(attached)
+            | if spelling {
+                ENABLE_VIRTUAL_TERMINAL_INPUT
+            } else {
+                0
+            };
+        let asked = mouse_input_mode(begun, attached, true);
+        let stopped = mouse_input_mode(asked, attached, false);
+        [begun, asked, stopped, attached]
+    }
+
+    /// A console that reports its private flags (the native console's mode was 0x1f7) is given the
+    /// mouse by removing quick edit under the extended flags, and gets quick edit back.
+    #[test]
+    fn a_console_that_reports_its_private_flags_has_quick_edit_taken_while_the_mouse_is_asked_for()
+    {
+        let attached = 0x1f7;
+        assert_eq!(
+            written(attached, false),
+            [0x1e0, 0x1b0, 0x1e0, 0x1f7],
+            "begun, asked, stopped and put back"
+        );
+        // Quick edit that was off is not turned on, and the keys the console spells stay spelled.
+        let without = attached & !ENABLE_QUICK_EDIT_MODE;
+        assert_eq!(written(without, false), [0x1a0, 0x1b0, 0x1a0, 0x1b7]);
+        assert_eq!(
+            written(attached, true),
+            [0x3e0, 0x3b0, 0x3e0, 0x1f7],
+            "the console that spells its keys goes on spelling them"
+        );
+    }
+
+    /// A console whose mode has no extended flags reports none of its private flags, and the
+    /// attachment writes none of them: asking sets the mouse flag alone, whatever the console
+    /// holds that it did not report.
+    #[test]
+    fn a_console_that_reports_no_private_flag_is_given_no_private_flag_at_any_step() {
+        let attached = ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT;
+        assert_eq!(written(attached, false), [0, 0x10, 0, 0x7]);
+        assert_eq!(
+            written(attached, true),
+            [0x200, 0x210, 0x200, 0x7],
+            "the console that spells its keys goes on spelling them"
+        );
+        for (spelling, steps) in [
+            (false, written(attached, false)),
+            (true, written(attached, true)),
+        ] {
+            for (step, mode) in steps.into_iter().enumerate() {
+                assert_eq!(
+                    mode & PRIVATE_FLAGS,
+                    0,
+                    "step {step}, spelling {spelling}: a private flag is written"
+                );
+            }
+        }
+        // Flags the console holds without having reported them are neither set nor cleared.
+        let held = ENABLE_QUICK_EDIT_MODE | ENABLE_INSERT_MODE | ENABLE_AUTO_POSITION;
+        let asked = mouse_input_mode(held, attached, true);
+        assert_eq!(asked, held | ENABLE_MOUSE_INPUT);
+        assert_eq!(mouse_input_mode(asked, attached, false), held);
     }
 }
