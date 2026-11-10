@@ -480,6 +480,23 @@ impl Host {
         self
     }
 
+    /// Makes this environment's record of the processes its daemon and workers create, which the
+    /// product writes to wherever a test has made one, before the daemon starts.
+    #[cfg(unix)]
+    fn recording_creations(self) -> Self {
+        kr_ipc::testing::created::begin(self.paths().state_dir())
+            .expect("makes the record of what is created");
+        self
+    }
+
+    /// Everything the daemon and its workers have created for this environment, in the order each
+    /// wrote it.
+    #[cfg(unix)]
+    fn creations(&self) -> Vec<kr_ipc::testing::created::Created> {
+        kr_ipc::testing::created::read(self.paths().state_dir())
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
     /// The supervisor the daemon starts workers through: `inner`, and with the environment marked
     /// where the host asks for it.
     fn with_the_marking(&self, inner: Box<dyn WorkerSupervisor>) -> Box<dyn WorkerSupervisor> {
@@ -1828,21 +1845,33 @@ async fn a_worker_that_cannot_reach_its_controller_says_why_and_ends_whatever_it
 }
 
 /// KR-REQ-05.08: an idle session that has been asked to run nothing is its worker and its root
-/// shell. The daemon asks its supervisor to start the worker and nothing else: no plugin runtime
-/// or other separately supervised service, lazily or otherwise. And nothing the worker itself
-/// starts beside the shell stays running. On Linux that is every process the worker started: the
-/// worker adopts each orphan, so one that a short-lived child of the worker left running as a
-/// process of its own is its child. On macOS the case reads the worker's children, and finds what
-/// a short-lived child left running by the directory the worker gave it or the variable in its
-/// environment, so it does not see what a backend server starts and leaves, nor a program that
-/// clears both. On Windows the case reads the worker's children by their recorded parent, which
-/// leaves the pseudo-console's host and nothing else, and does not see a process that a child of
-/// the worker left running.
+/// shell, and no backend, Wasm instance or model is created for it. This case shows the part of
+/// the sentence that a creation shows, on a Unix host:
+///
+/// - The daemon asks its supervisor to start the worker and nothing else: no plugin runtime or
+///   other separately supervised service, which is the one process that runs a Wasm instance,
+///   lazily or otherwise.
+/// - Every process the worker and the daemon created for the environment is in a record that each
+///   place that creates one writes before it does (a root shell, a backend server, a backend's
+///   probe, a platform question, a desktop check, the description process, which is the one
+///   process that loads a model). The record is read once the worker has ended, when nothing more
+///   can be added, and holds the root shell and platform questions asked by the program and the
+///   arguments the platform's own list names, and nothing else. Nothing in it depends on when a
+///   process ran or on its name alone.
+/// - A process table read beside the session is the backstop for a creation the record does not
+///   hold: the part of the sentence about a Wasm instance or a model is shown by what neither the
+///   worker nor the daemon links (`trusted_core.rs`), and a creation by a place that does not
+///   write the record is shown only as far as that read reaches, which is what a process leaves
+///   in its parent, its directory or its environment while it runs.
+///
+/// On Windows the case reads the worker's children by their recorded parent, which leaves the
+/// pseudo-console's host and nothing else, and does not see a process that a child of the worker
+/// left running, nor a creation: the record is not written there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_idle_session_runs_nothing_beside_its_shell() {
     let host = Host::create().recording_launches();
     #[cfg(unix)]
-    let host = host.marking_workers();
+    let host = host.marking_workers().recording_creations();
     let _controller = host.start().await;
     let mut client = host.client().await;
     let created = create(&mut client, &host).await;
@@ -1866,7 +1895,96 @@ async fn an_idle_session_runs_nothing_beside_its_shell() {
         .is_none(),
         "no plugin runtime was published for a session that asked for none"
     );
+    #[cfg(unix)]
+    let worker = worker_of(&host, created.session.session_id);
     close(&mut client, &host, created.session.session_id).await;
+    // The worker has created all it will once it has ended, so the record is read then and not
+    // before.
+    #[cfg(unix)]
+    {
+        until("the worker to end", || {
+            (kr_ipc::identity::process_state(&worker) == kr_ipc::identity::ProcessState::Ended)
+                .then_some(())
+        })
+        .await;
+        only_the_root_shell_and_platform_questions_were_created(
+            &host.creations(),
+            u32::try_from(worker.pid.get()).expect("a process identifier"),
+        );
+    }
+}
+
+/// What a daemon and its worker created for an idle session, from the record they wrote: the root
+/// shell, once, and questions to the platform, and nothing else.
+///
+/// A question is told from another process that has the same program by its arguments. What is
+/// written under any other name is a creation the session has no use for: a backend, a probe of
+/// one, a check of the desktop or the description process.
+#[cfg(unix)]
+fn only_the_root_shell_and_platform_questions_were_created(
+    created: &[kr_ipc::testing::created::Created],
+    worker: u32,
+) {
+    let strangers: Vec<_> = created
+        .iter()
+        .filter(|made| {
+            !(made.by == worker
+                && (made.what == "shell"
+                    || (made.what == "question"
+                        && is_a_platform_question(&made.program, &made.arguments))))
+        })
+        .collect();
+    assert!(
+        strangers.is_empty(),
+        "an idle session's worker and daemon created more than its root shell and the questions \
+         the worker asks its platform: {strangers:?} of {created:?}"
+    );
+    assert_eq!(
+        created.iter().filter(|made| made.what == "shell").count(),
+        1,
+        "the worker created the root shell once: {created:?}"
+    );
+}
+
+/// Whether `program` run with `arguments` is a question an idle worker asks its platform, whether
+/// its desktop is still there and which process leads its login session. One list for each
+/// platform, as the platform module's own calls make them; the worker waits for each question and
+/// ends it at a deadline of its own, and a program added there that runs at idle is added here.
+#[cfg(target_os = "macos")]
+fn is_a_platform_question(program: &str, arguments: &[String]) -> bool {
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    match (program, arguments.as_slice()) {
+        ("/bin/launchctl", ["print", domain]) => {
+            *domain == format!("gui/{}", rustix::process::getuid().as_raw())
+        }
+        ("/usr/sbin/ioreg", ["-n", "Root", "-d1", "-k", "CGSSessionScreenIsLocked"]) => true,
+        _ => false,
+    }
+}
+
+/// See the list for macOS above.
+#[cfg(target_os = "linux")]
+fn is_a_platform_question(program: &str, arguments: &[String]) -> bool {
+    const LOGIN_PROPERTIES: [&str; 9] = [
+        "--property=Type",
+        "--property=Class",
+        "--property=State",
+        "--property=Remote",
+        "--property=LockedHint",
+        "--property=Active",
+        "--property=Leader",
+        "--property=Desktop",
+        "--property=Name",
+    ];
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    match (program, arguments.as_slice()) {
+        ("loginctl", ["show-user", user, "--property=Display"]) => {
+            *user == rustix::process::getuid().as_raw().to_string()
+        }
+        ("loginctl", ["show-session", _, "--property=Leader"]) => true,
+        ("loginctl", ["show-session", _, properties @ ..]) => properties == LOGIN_PROPERTIES,
+        _ => false,
+    }
 }
 
 /// What the worker started that is running now beside the root shell, on a Unix host: a process
@@ -1962,30 +2080,45 @@ impl BesideTheShell {
     }
 }
 
-/// The programs an idle worker runs to ask its platform a short question: whether its desktop is
-/// still there, and which process leads its login session. Each is a process the worker waits for
-/// and ends at a deadline of its own, and it is the only kind of process the worker starts beside
-/// the root shell of a session that was asked to run nothing. The worker's desktop module names
-/// them where it runs them.
+/// The program and the arguments a running process was started with, as `ps` prints them, or
+/// nothing when `identity` is no longer the process that holds its number. A question's arguments
+/// hold no space, so the printed line is split where it has one.
 #[cfg(unix)]
-const PLATFORM_QUESTIONS: [&str; 3] = ["launchctl", "ioreg", "loginctl"];
+fn command_of(
+    identity: &kr_protocol::identity::ProcessStartIdentity,
+) -> Option<(String, Vec<String>)> {
+    let output = std::process::Command::new("ps")
+        .args(["-ww", "-o", "args=", "-p", &identity.pid.get().to_string()])
+        .output()
+        .expect("runs ps");
+    let printed = String::from_utf8_lossy(&output.stdout);
+    let mut words = printed.split_whitespace().map(str::to_owned);
+    // `ps` prints nothing, and fails, for a process that has gone.
+    let program = words.next()?;
+    // What it printed is about the noted process only if that is still the one that runs.
+    (kr_ipc::identity::process_state(identity) == kr_ipc::identity::ProcessState::Running)
+        .then(|| (program, words.collect()))
+}
 
-/// An idle session's worker has started nothing beside the root shell that is not a question it
-/// asks its platform, and every question it asked has ended.
+/// The backstop of the record: a process table read beside an idle session finds nothing the
+/// worker started that is not a question it asks its platform, and every question it asked has
+/// ended. The record decides the case; this finds a creation by a place that does not write it,
+/// as far as the table shows one.
 ///
 /// For a second of idling every process the worker started beside the shell is noted, by its start
-/// identity, and its program is read. A process that runs any other program fails the case at once,
-/// naming it: a backend is not told from a question by how long it lives, which no case can control,
-/// but by what it runs. Each question noted is then waited for until it ends, which the kernel says
-/// by the identity: a process the kernel will not describe has not ended, and the wait fails,
-/// naming it, only at the liveness bound, which is there so that a question that never ends fails
-/// the case and not so that anything is passed or failed by how long it took. Nothing noted is
-/// looked for again by where it runs, so a process that gives up its directory after it was
-/// noted is still the one that was noted. A process that a short-lived child of the worker left
-/// running as a process of its own is noted as the worker's own children are.
+/// identity, and the program and arguments it runs are read. A process that runs any other command
+/// than a question fails the case at once, naming it. Each question noted is then waited for
+/// until it ends, which the kernel says by the identity: a process the kernel will not describe has
+/// not ended, and the wait fails, naming it, only at the liveness bound, which is there so that a
+/// question that never ends fails the case and not so that anything is passed or failed by how
+/// long it took. Nothing noted is looked for again by where it runs, so a process that gives up
+/// its directory after it was noted is still the one that was noted. A process that a short-lived
+/// child of the worker left running as a process of its own is noted as the worker's own children
+/// are.
 ///
-/// The second of idling says how often the table is read, and a process that the worker starts
-/// later than that after it has reported its session is not looked for.
+/// The second of idling says how often the table is read. A process that is gone before it is
+/// read, or that the worker starts later than that after it has reported its session, is not
+/// seen here, and is the record's to show.
 #[cfg(unix)]
 async fn nothing_the_worker_started_beside_the_shell_runs(
     host: &Host,
@@ -2001,16 +2134,19 @@ async fn nothing_the_worker_started_beside_the_shell_runs(
                 continue;
             }
             match read_process(&identity) {
-                ProcessReading::Running(facts) => {
-                    let program = facts.name.unwrap_or_default();
+                ProcessReading::Running(_) => {
+                    // Gone since it was read: it was not staying.
+                    let Some((program, arguments)) = command_of(&identity) else {
+                        continue;
+                    };
                     assert!(
-                        PLATFORM_QUESTIONS.contains(&program.as_str()),
-                        "the worker started {program:?} beside its shell, which is no question it \
-                         asks its platform: {identity:?}"
+                        is_a_platform_question(&program, &arguments),
+                        "the worker started {program:?} {arguments:?} beside its shell, which is \
+                         no question it asks its platform: {identity:?}"
                     );
                     noted.push(identity);
                 }
-                // It ended while it was read: it was a question.
+                // It ended while it was read: it was not staying.
                 ProcessReading::Ended => {}
                 ProcessReading::Unknown { detail } => {
                     panic!("what the worker started as {identity:?} could not be read: {detail}")
