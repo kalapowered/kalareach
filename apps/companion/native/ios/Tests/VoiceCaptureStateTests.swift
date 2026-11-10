@@ -35,52 +35,6 @@ final class VoiceCaptureStateTests: XCTestCase {
             XCTAssertEqual(display, display.trimmingCharacters(in: .whitespacesAndNewlines))
         }
     }
-
-    /// KR-REQ-15.36, KR-ACC-014: unreceived speech authorises nothing, whatever muted the
-    /// microphone. The person's own mute is included deliberately.
-    func testUnreceivedSpeechAuthorisesNothing() {
-        for state: VoiceCaptureState in [
-            .mutedByPerson, .interrupted, .routeChanging, .suspendedBySystem, .unavailable, .idle,
-        ] {
-            let gate = VoiceAuthorityGate(capture: state, holdsUnlockedScreenConfirmation: true)
-            XCTAssertEqual(
-                gate.refusal(needsConfirmation: false),
-                .speechNotHeard(state),
-                "\(state.rawValue) must refuse even an action needing no confirmation"
-            )
-            XCTAssertEqual(
-                gate.refusal(needsConfirmation: true),
-                .speechNotHeard(state),
-                "a held confirmation does not make unheard speech heard"
-            )
-        }
-    }
-
-    /// KR-REQ-15.13, the need for a confirmation: the five unlocked-screen classes need the
-    /// confirmation, and an open microphone is not a substitute for it. The gate takes the
-    /// confirmation as held or not held, so the signature over the action hash is not shown here:
-    /// the ceremony tests show it.
-    func testAnUnlockedScreenActionNeedsItsConfirmation() {
-        let withoutIt = VoiceAuthorityGate(capture: .capturing)
-        XCTAssertEqual(
-            withoutIt.refusal(needsConfirmation: true),
-            .needsUnlockedScreenConfirmation
-        )
-        XCTAssertNil(withoutIt.refusal(needsConfirmation: false))
-
-        let withIt = VoiceAuthorityGate(capture: .capturing, holdsUnlockedScreenConfirmation: true)
-        XCTAssertNil(withIt.refusal(needsConfirmation: true))
-    }
-
-    /// The refusal says what is true rather than naming a fault, and names what would change it.
-    func testARefusalExplainsItself() {
-        let muted = VoiceAuthorityRefusal.speechNotHeard(.mutedByPerson)
-        XCTAssertTrue(muted.message.contains("Microphone muted"))
-        XCTAssertTrue(muted.message.contains("authorise"))
-
-        let needed = VoiceAuthorityRefusal.needsUnlockedScreenConfirmation
-        XCTAssertTrue(needed.message.contains("unlocked screen"))
-    }
 }
 
 /// Whether the microphone may carry speech, and what the person is told about it.

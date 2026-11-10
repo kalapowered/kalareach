@@ -57,58 +57,6 @@ public enum VoiceCaptureState: String, Equatable, Sendable {
     }
 }
 
-/// Why a spoken instruction was not allowed to become an action.
-public enum VoiceAuthorityRefusal: Equatable, Sendable {
-    /// The microphone was not carrying speech when the words were supposed to have been said.
-    case speechNotHeard(VoiceCaptureState)
-    /// The action needs a confirmation taken on the unlocked screen, and there is none.
-    case needsUnlockedScreenConfirmation
-
-    /// What a person is told.
-    public var message: String {
-        switch self {
-        case let .speechNotHeard(state):
-            return "\(state.display). Nothing spoken while the microphone was not carrying your "
-                + "voice can authorise an action."
-        case .needsUnlockedScreenConfirmation:
-            return "This needs your confirmation on the unlocked screen of this device."
-        }
-    }
-}
-
-/// The one gate a spoken instruction passes before it can become a host action.
-///
-/// It is deliberately not a method on a view model. §15 ¶8 says a model statement that the user
-/// confirmed an operation is not a native-screen confirmation, and the provider is inside the trust
-/// boundary for interpreting speech, so the question "could this person have been heard?" has to be
-/// answered from the device's own record of its microphone rather than from anything that arrived
-/// over the call.
-public struct VoiceAuthorityGate: Sendable {
-    /// The microphone's state, as the audio session last reported it.
-    public var capture: VoiceCaptureState
-    /// Whether the call holds a confirmation signed on this device's unlocked screen.
-    public var holdsUnlockedScreenConfirmation: Bool
-
-    public init(capture: VoiceCaptureState, holdsUnlockedScreenConfirmation: Bool = false) {
-        self.capture = capture
-        self.holdsUnlockedScreenConfirmation = holdsUnlockedScreenConfirmation
-    }
-
-    /// Whether a delegation the provider announced may be submitted to the host.
-    ///
-    /// - Parameter needsConfirmation: true for the five action classes of §15 ¶13.
-    /// - Returns: nil when it may, or the refusal when it may not.
-    public func refusal(needsConfirmation: Bool) -> VoiceAuthorityRefusal? {
-        guard capture.speechCouldHaveBeenHeard else {
-            return .speechNotHeard(capture)
-        }
-        if needsConfirmation && !holdsUnlockedScreenConfirmation {
-            return .needsUnlockedScreenConfirmation
-        }
-        return nil
-    }
-}
-
 /// Whether the microphone may carry the person's voice, decided in one place.
 ///
 /// Section 15 ¶21 and ¶22 ask for two things at once: a call the person started keeps its
