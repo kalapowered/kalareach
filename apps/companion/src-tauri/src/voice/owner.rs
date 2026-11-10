@@ -1526,7 +1526,11 @@ impl Owner {
         // The voice service's announcement only says which delegations it knows, and where: the
         // answer to the person and to the model is what the data channel's delegation comes to.
         if self.accepting {
+            #[cfg(any(test, feature = "testing"))]
+            let read = delegation_id.clone();
             self.announce(delegation_id, offset_ms);
+            #[cfg(any(test, feature = "testing"))]
+            self.shared.handled.announcement(read, offset_ms);
             return;
         }
         if self.answered.contains(&delegation_id) {
@@ -1685,6 +1689,8 @@ impl Owner {
             }
             Internal::Proof { id, result } => {
                 self.on_proof(&id, result);
+                #[cfg(any(test, feature = "testing"))]
+                self.shared.handled.proof(&id);
                 None
             }
             Internal::Delivered { id, exchange } => {

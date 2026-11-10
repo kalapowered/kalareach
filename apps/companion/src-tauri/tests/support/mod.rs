@@ -1050,6 +1050,10 @@ pub struct LinkControl {
     /// Told when a request is held before it is sent, and when it is let go.
     request_arrived: tokio::sync::Notify,
     request_released: tokio::sync::Notify,
+    /// How many held requests have been let go and have since been carried or withheld, and told
+    /// each time.
+    requests_passed: std::sync::atomic::AtomicUsize,
+    request_passes: tokio::sync::Notify,
     /// How many times a connection was asked whether this device ended it, and told each time.
     ended_asked: std::sync::atomic::AtomicUsize,
     ended_asks: tokio::sync::Notify,
@@ -1308,6 +1312,29 @@ impl LinkControl {
         self.request_released.notify_waiters();
     }
 
+    /// Waits until a request that was held, and let go, has been carried to the host or withheld by
+    /// the transport it waited in. A case that says nothing reached the host says it after this,
+    /// when whatever the request was going to do has been done.
+    pub async fn until_the_held_request_has_passed(&self) {
+        tokio::time::timeout(WATCHDOG, async {
+            loop {
+                let passed = self.request_passes.notified();
+                tokio::pin!(passed);
+                passed.as_mut().enable();
+                if self
+                    .requests_passed
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    > 0
+                {
+                    return;
+                }
+                passed.await;
+            }
+        })
+        .await
+        .expect("the held request was carried or withheld");
+    }
+
     /// How many times a connection has been asked whether this device ended it.
     pub fn asked_if_ended(&self) -> usize {
         self.ended_asked.load(std::sync::atomic::Ordering::SeqCst)
@@ -1381,17 +1408,18 @@ impl LinkControl {
         }
     }
 
-    /// Holds `frame` before it is sent when it is the request the test asked to hold.
-    async fn before_sending(&self, frame: &ControlFrame) {
+    /// Holds `frame` before it is sent when it is the request the test asked to hold, and says
+    /// whether it did.
+    async fn before_sending(&self, frame: &ControlFrame) -> bool {
         let method = match frame {
             ControlFrame::Request(request) => request.method.as_str(),
             ControlFrame::Mutation(request) => request.method.as_str(),
-            _ => return,
+            _ => return false,
         };
         {
             let mut state = self.state.lock().expect("the record");
             if state.holding_request.as_deref() != Some(method) {
-                return;
+                return false;
             }
             state.holding_request = None;
             state.request_held = true;
@@ -1402,10 +1430,17 @@ impl LinkControl {
             tokio::pin!(released);
             released.as_mut().enable();
             if !self.state.lock().expect("the record").request_held {
-                return;
+                return true;
             }
             released.await;
         }
+    }
+
+    /// A request that was held has been carried to the host or withheld.
+    fn held_request_passed(&self) {
+        self.requests_passed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.request_passes.notify_waiters();
     }
 
     /// Makes a connection go on whatever the host says of the lease it is given: a host that needs
@@ -1526,6 +1561,35 @@ impl std::fmt::Debug for LinkControl {
     }
 }
 
+impl Tapped {
+    /// Carries `frame` to the host unless the time has run out or the caller no longer wants it.
+    async fn carry_before(
+        &self,
+        frame: &ControlFrame,
+        not_after: tokio::time::Instant,
+        wanted: &(dyn Fn() -> bool + Send + Sync),
+    ) -> kr_client::Result<bool> {
+        if tokio::time::Instant::now() > not_after || !wanted() {
+            return Ok(false);
+        }
+        if let Some(refusal) = self.control.refusal_of(frame) {
+            return Err(kr_client::ClientError::Host(refusal));
+        }
+        let lost = self.control.sent_and_lost(frame);
+        if let Some(request) = self.control.garbled_request(frame) {
+            self.garbled.lock().expect("the record").push(request);
+        }
+        if !self.inner.send_before(frame, not_after, wanted).await? {
+            return Ok(false);
+        }
+        if lost {
+            // The host has the request and acts on it; the caller never hears.
+            return Err(kr_client::ClientError::ConnectionEnded);
+        }
+        Ok(true)
+    }
+}
+
 impl kr_client::transport::ControlTransport for Tapped {
     fn connection_id(&self) -> kr_protocol::ids::ConnectionId {
         self.inner.connection_id()
@@ -1558,7 +1622,7 @@ impl kr_client::transport::ControlTransport for Tapped {
         frame: &'a ControlFrame,
     ) -> kr_client::transport::TransportFuture<'a, ()> {
         Box::pin(async move {
-            self.control.before_sending(frame).await;
+            let _held = self.control.before_sending(frame).await;
             if let Some(refusal) = self.control.refusal_of(frame) {
                 return Err(kr_client::ClientError::Host(refusal));
             }
@@ -1584,25 +1648,12 @@ impl kr_client::transport::ControlTransport for Tapped {
         Box::pin(async move {
             // A request the test holds waits here, where a transport waits for its writer, and the
             // time and what the caller wants are looked at once it is let go.
-            self.control.before_sending(frame).await;
-            if tokio::time::Instant::now() > not_after || !wanted() {
-                return Ok(false);
+            let held = self.control.before_sending(frame).await;
+            let outcome = self.carry_before(frame, not_after, wanted).await;
+            if held {
+                self.control.held_request_passed();
             }
-            if let Some(refusal) = self.control.refusal_of(frame) {
-                return Err(kr_client::ClientError::Host(refusal));
-            }
-            let lost = self.control.sent_and_lost(frame);
-            if let Some(request) = self.control.garbled_request(frame) {
-                self.garbled.lock().expect("the record").push(request);
-            }
-            if !self.inner.send_before(frame, not_after, wanted).await? {
-                return Ok(false);
-            }
-            if lost {
-                // The host has the request and acts on it; the caller never hears.
-                return Err(kr_client::ClientError::ConnectionEnded);
-            }
-            Ok(true)
+            outcome
         })
     }
 

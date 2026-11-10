@@ -5115,15 +5115,15 @@ async fn a_named_stop_after_the_unlock_settles_the_entry_the_file_held() {
 
 use kr_protocol::method::Method as HostMethod;
 
-/// Timings of a call that hands spoken delegations to the host: a wait for what was said before a
-/// delegation that the voice service's announcement, which comes on another path than the
-/// provider's data channel, is read within, and a capture proof that stays young long enough that a
-/// loaded machine does not age it. Nothing a case asserts depends on how long the wait is, only on
-/// the announcement being read inside it: the wait is long enough that a machine that is busy
-/// reads a message that was told first before one that was told after it.
+/// Timings of a call that hands spoken delegations to the host: a short wait for what was said
+/// before a delegation, and a capture proof that stays young long enough that a loaded machine does
+/// not age it. No case depends on how long the wait is. The voice service's announcement comes on
+/// another path than the provider's data channel, so a case sends the provider's delegation only
+/// once the owner has read the announcement, and a case that has to hold a delegation's proof or
+/// the news behind its marker holds them with the stand-in's own holds, which it releases itself.
 fn delegating_timings() -> Timings {
     Timings {
-        delegation_wait: Duration::from_millis(1_500),
+        delegation_wait: Duration::from_millis(20),
         proof_age: Duration::from_secs(10),
         ..quick()
     }
@@ -5199,18 +5199,46 @@ fn speak(scene: &Scene, start_ms: u64, words: &str) -> u64 {
 /// of the call, which spends it. What is said after it is not the first of the call.
 async fn chatter(scene: &Scene) {
     speak(scene, 0, "hello there");
-    ask(scene, "d-0", 200);
+    ask(scene, "d-0", 200).await;
     let row = row_reaching(scene, "d-0", "refused").await;
     assert_eq!(row["cause"], "first_fragment");
 }
 
 /// The delegation the model creates when the last of `words` was said, announced by the voice
-/// service first and by the provider's data channel after it.
-fn ask(scene: &Scene, id: &str, offset_ms: u64) {
+/// service first and by the provider's data channel after it: the two come on paths that nothing
+/// orders, so the provider's is told once the owner has read the voice service's.
+async fn ask(scene: &Scene, id: &str, offset_ms: u64) {
     scene.stand_in.control().announce(id, offset_ms);
+    until_announced(scene, id, offset_ms).await;
     scene
         .platform
         .tell_provider(&delegation_event(id, offset_ms));
+}
+
+/// Waits until the owner has read the voice service's announcement of the delegation `id`.
+async fn until_announced(scene: &Scene, id: &str, offset_ms: u64) {
+    let calls = scene.phone.companion.app.state::<Calls>();
+    tokio::time::timeout(WATCHDOG, async {
+        while !calls.has_read_announcement(id, offset_ms) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the owner reads the voice service's announcement");
+}
+
+/// Waits until the owner has acted on the answer to the capture proof the delegation `id` asked
+/// for. News held behind the proof's marker is told after this, so that an owner that did not wait
+/// for the marker has acted on the proof before the news it should have waited for is read.
+async fn until_proof_handled(scene: &Scene, id: &str) {
+    let calls = scene.phone.companion.app.state::<Calls>();
+    tokio::time::timeout(WATCHDOG, async {
+        while !calls.has_handled_proof(id) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the owner acts on the proof's answer");
 }
 
 fn row_of(state: &serde_json::Value, id: &str) -> Option<serde_json::Value> {
@@ -5283,13 +5311,6 @@ async fn until_a_proof_is_asked_at_use(scene: &Scene) {
     .expect("the request is composed and its proof asked for");
 }
 
-/// Gives an owner time to act on a proof's answer before the news behind it is told, so that an
-/// owner that did not wait for the marker would act on it. Nothing a case asserts depends on how
-/// long this is: it can only make a case that should fail fail more surely.
-async fn let_the_owner_act() {
-    tokio::time::sleep(Duration::from_millis(300)).await;
-}
-
 /// What the model was told of the delegation `id`, in the order it was told.
 fn told_of(scene: &Scene, id: &str) -> Vec<String> {
     scene
@@ -5322,7 +5343,7 @@ async fn a_status_asked_for_after_a_pause_is_handed_to_the_host_and_performed() 
     calling(&scene).await;
     chatter(&scene).await;
     let end = speak(&scene, 6_000, "what is the status");
-    ask(&scene, "d-1", end - 200);
+    ask(&scene, "d-1", end - 200).await;
 
     let row = row_reaching(&scene, "d-1", "performed").await;
 
@@ -5373,11 +5394,11 @@ async fn a_second_utterance_after_the_first_is_a_set_of_its_own() {
     calling(&scene).await;
     chatter(&scene).await;
     let first = speak(&scene, 6_000, "what is the status");
-    ask(&scene, "d-1", first - 200);
+    ask(&scene, "d-1", first - 200).await;
     row_reaching(&scene, "d-1", "performed").await;
 
     let second = speak(&scene, 12_000, "status");
-    ask(&scene, "d-2", second - 200);
+    ask(&scene, "d-2", second - 200).await;
 
     row_reaching(&scene, "d-2", "performed").await;
     assert_eq!(at_the_host(&scene), 2);
@@ -5392,7 +5413,7 @@ async fn the_first_utterance_of_a_call_never_acts() {
     let mut scene = delegating().await;
     calling(&scene).await;
     let end = speak(&scene, 0, "what is the status");
-    ask(&scene, "d-1", end - 200);
+    ask(&scene, "d-1", end - 200).await;
 
     let row = row_reaching(&scene, "d-1", "refused").await;
 
@@ -5426,7 +5447,7 @@ async fn a_capture_change_before_the_set_is_complete_refuses_it_and_every_later_
         chatter(&scene).await;
         scene.platform.hold("capture_proof");
         let end = speak(&scene, 6_000, "what is the status");
-        ask(&scene, "d-1", end - 200);
+        ask(&scene, "d-1", end - 200).await;
         until_proofs_are_asked(&scene, 2).await;
         scene.platform.tell(CallEvent::Capture { state });
         scene.platform.release("capture_proof");
@@ -5440,7 +5461,7 @@ async fn a_capture_change_before_the_set_is_complete_refuses_it_and_every_later_
             state: CaptureState::Capturing,
         });
         let again = speak(&scene, 12_000, "status");
-        ask(&scene, "d-2", again - 200);
+        ask(&scene, "d-2", again - 200).await;
         let later = row_settled(&scene, "d-2").await;
         assert_eq!(later["state"], "refused", "{state:?}: {later}");
         assert_eq!(later["cause"], "capture_break", "{state:?}");
@@ -5453,26 +5474,24 @@ async fn a_capture_change_before_the_set_is_complete_refuses_it_and_every_later_
 
 /// What native code had waiting in an earlier queue when the proof was read is told after the
 /// proof's answer, and before its marker: a set is frozen at the marker and not at the answer. The
-/// last word of the request waits that way, and the host reads the whole of it. The owner is given
-/// time to act on the answer before the news is told, so that an owner that did not wait for the
-/// marker would freeze a set without the word.
+/// last word of the request waits that way, and the host reads the whole of it. The news is told
+/// once the owner has acted on the proof's answer, so that an owner that did not wait for the
+/// marker has frozen a set without the word by then.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn events_waiting_in_an_earlier_queue_are_read_before_the_set_is_frozen() {
-    let timings = Timings {
-        drain_within: Duration::from_secs(5),
-        ..delegating_timings()
-    };
-    let mut scene = delegating_with(timings, 1).await;
+    let mut scene = delegating().await;
     calling(&scene).await;
     chatter(&scene).await;
     let end = speak(&scene, 6_000, "what is the");
-    ask(&scene, "d-1", end);
+    scene.platform.hold("capture_proof");
+    ask(&scene, "d-1", end).await;
+    until_proofs_are_asked(&scene, 2).await;
     scene.platform.hold_news();
     scene
         .platform
         .tell_provider(&fragment(end, end + 200, " status"));
-    until_proofs_are_asked(&scene, 2).await;
-    let_the_owner_act().await;
+    scene.platform.release("capture_proof");
+    until_proof_handled(&scene, "d-1").await;
     scene.platform.release_news();
 
     let row = row_settled(&scene, "d-1").await;
@@ -5490,11 +5509,13 @@ async fn news_lost_in_an_earlier_queue_is_read_before_the_marker_and_refuses_the
     calling(&scene).await;
     chatter(&scene).await;
     let end = speak(&scene, 6_000, "what is the status");
-    ask(&scene, "d-1", end - 200);
+    scene.platform.hold("capture_proof");
+    ask(&scene, "d-1", end - 200).await;
+    until_proofs_are_asked(&scene, 2).await;
     scene.platform.hold_news();
     scene.platform.lose_some_news();
-    until_proofs_are_asked(&scene, 2).await;
-    let_the_owner_act().await;
+    scene.platform.release("capture_proof");
+    until_proof_handled(&scene, "d-1").await;
     scene.platform.release_news();
 
     let row = row_settled(&scene, "d-1").await;
@@ -5521,8 +5542,11 @@ async fn a_marker_that_never_came_refuses_the_set_and_a_late_one_stands_for_no_o
     chatter(&scene).await;
     // A delegation with nothing said for it: the proof's marker is held behind the news, and never
     // read in time.
-    ask(&scene, "d-1", 5_000);
+    scene.platform.hold("capture_proof");
+    ask(&scene, "d-1", 5_000).await;
+    until_proofs_are_asked(&scene, 2).await;
     scene.platform.hold_news();
+    scene.platform.release("capture_proof");
     let not_drained = row_settled(&scene, "d-1").await;
     assert_eq!(not_drained["state"], "refused", "{not_drained}");
     assert_eq!(not_drained["cause"], "not_drained");
@@ -5531,13 +5555,15 @@ async fn a_marker_that_never_came_refuses_the_set_and_a_late_one_stands_for_no_o
     scene.platform.release_news();
 
     let second = speak(&scene, 12_000, "what is the");
-    ask(&scene, "d-2", second);
+    scene.platform.hold("capture_proof");
+    ask(&scene, "d-2", second).await;
+    until_proofs_are_asked(&scene, 3).await;
     scene.platform.hold_news();
     scene
         .platform
         .tell_provider(&fragment(second, second + 200, " status"));
-    until_proofs_are_asked(&scene, 3).await;
-    let_the_owner_act().await;
+    scene.platform.release("capture_proof");
+    until_proof_handled(&scene, "d-2").await;
     scene.platform.release_news();
 
     let row = row_settled(&scene, "d-2").await;
@@ -5552,24 +5578,20 @@ async fn a_marker_that_never_came_refuses_the_set_and_a_late_one_stands_for_no_o
 /// wait is over does not vouch for the set, even when it is read before the set is frozen.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_announcement_read_after_the_wait_does_not_vouch_for_the_set() {
-    let timings = Timings {
-        drain_within: Duration::from_secs(5),
-        ..delegating_timings()
-    };
-    let mut scene = delegating_with(timings, 1).await;
+    let mut scene = delegating().await;
     calling(&scene).await;
     chatter(&scene).await;
     let end = speak(&scene, 6_000, "what is the status");
+    scene.platform.hold("capture_proof");
     scene
         .platform
         .tell_provider(&delegation_event("d-1", end - 200));
-    scene.platform.hold_news();
+    // The proof is asked for once the wait is over, and is held.
     until_proofs_are_asked(&scene, 2).await;
-    // The wait is over. The service announces the delegation now, and the owner reads it while the
-    // news is still being read up to the marker.
+    // The service announces the delegation now, and the owner reads it before the set is frozen.
     scene.stand_in.control().announce("d-1", end - 200);
-    let_the_owner_act().await;
-    scene.platform.release_news();
+    until_announced(&scene, "d-1", end - 200).await;
+    scene.platform.release("capture_proof");
 
     let row = row_settled(&scene, "d-1").await;
 
@@ -5589,7 +5611,7 @@ async fn a_break_the_record_shows_and_the_news_does_not_refuses_the_set() {
     chatter(&scene).await;
     scene.platform.hold("capture_proof");
     let end = speak(&scene, 6_000, "what is the status");
-    ask(&scene, "d-1", end - 200);
+    ask(&scene, "d-1", end - 200).await;
     until_proofs_are_asked(&scene, 2).await;
     scene.platform.show_a_gap_in_progress();
     scene.platform.release("capture_proof");
@@ -5612,7 +5634,7 @@ async fn a_break_after_the_set_was_read_and_before_the_write_stops_the_write() {
     chatter(&scene).await;
     scene.platform.hold("capture_proof_at_use");
     let end = speak(&scene, 6_000, "what is the status");
-    ask(&scene, "d-1", end - 200);
+    ask(&scene, "d-1", end - 200).await;
     until_a_proof_is_asked_at_use(&scene).await;
     scene.platform.tell(CallEvent::Capture {
         state: CaptureState::Interrupted,
@@ -5639,7 +5661,7 @@ async fn a_capture_change_while_the_request_waits_for_the_writer_stops_the_write
     chatter(&scene).await;
     let end = speak(&scene, 6_000, "what is the status");
     scene.link.hold_next_request(HostMethod::VoiceDelegate);
-    ask(&scene, "d-1", end - 200);
+    ask(&scene, "d-1", end - 200).await;
     scene.link.until_request_held().await;
     scene.platform.tell(CallEvent::Capture {
         state: CaptureState::Interrupted,
@@ -5670,7 +5692,7 @@ async fn a_gap_the_record_shows_at_the_write_stops_the_write_whatever_the_news_s
     chatter(&scene).await;
     scene.platform.hold("capture_proof_at_use");
     let end = speak(&scene, 6_000, "what is the status");
-    ask(&scene, "d-1", end - 200);
+    ask(&scene, "d-1", end - 200).await;
     until_a_proof_is_asked_at_use(&scene).await;
     scene.platform.show_a_gap_in_progress();
     scene.platform.release("capture_proof_at_use");
@@ -5693,7 +5715,7 @@ async fn a_taint_that_comes_while_the_request_waits_for_the_writer_stops_the_wri
     chatter(&scene).await;
     let end = speak(&scene, 6_000, "what is the status");
     scene.link.hold_next_request(HostMethod::VoiceDelegate);
-    ask(&scene, "d-1", end - 200);
+    ask(&scene, "d-1", end - 200).await;
     scene.link.until_request_held().await;
     scene.platform.lose_some_news();
     scene
@@ -5720,7 +5742,7 @@ async fn a_request_the_host_refuses_is_shown_as_the_hosts_refusal() {
     calling(&scene).await;
     chatter(&scene).await;
     let end = speak(&scene, 6_000, "what is the status of session seven");
-    ask(&scene, "d-1", end - 200);
+    ask(&scene, "d-1", end - 200).await;
 
     let row = row_reaching(&scene, "d-1", "host_refused").await;
 
@@ -5740,7 +5762,7 @@ async fn an_answer_that_turns_discontinuous_transmission_on_refuses_every_delega
     calling(&scene).await;
     speak(&scene, 0, "hello there");
     let end = speak(&scene, 6_000, "what is the status");
-    ask(&scene, "d-1", end - 200);
+    ask(&scene, "d-1", end - 200).await;
 
     let row = row_reaching(&scene, "d-1", "refused").await;
 
@@ -5780,7 +5802,7 @@ async fn what_the_call_cannot_read_of_its_data_channel_taints_it() {
         chatter(&scene).await;
         scene.platform.tell_provider_bytes(bytes);
         let end = speak(&scene, 6_000, "what is the status");
-        ask(&scene, "d-1", end - 200);
+        ask(&scene, "d-1", end - 200).await;
 
         let row = row_reaching(&scene, "d-1", "refused").await;
 
@@ -5808,7 +5830,7 @@ async fn fragments_that_overlap_or_run_backwards_taint_the_call() {
         scene
             .platform
             .tell_provider(&fragment(late.0, late.1, " status"));
-        ask(&scene, "d-1", 6_600);
+        ask(&scene, "d-1", 6_600).await;
 
         let row = row_reaching(&scene, "d-1", "refused").await;
 
@@ -5828,7 +5850,7 @@ async fn a_fragment_that_arrives_after_its_set_was_read_taints_the_call() {
     calling(&scene).await;
     chatter(&scene).await;
     let end = speak(&scene, 6_000, "what is the status");
-    ask(&scene, "d-1", end);
+    ask(&scene, "d-1", end).await;
     row_reaching(&scene, "d-1", "performed").await;
 
     scene
@@ -5889,7 +5911,7 @@ async fn a_proof_that_is_not_young_is_not_written_on() {
         scene.platform.show_progress_age(age);
         chatter(&scene).await;
         let end = speak(&scene, 6_000, "what is the status");
-        ask(&scene, "d-1", end - 200);
+        ask(&scene, "d-1", end - 200).await;
 
         let row = row_reaching(&scene, "d-1", "not_sent").await;
 
@@ -5898,7 +5920,7 @@ async fn a_proof_that_is_not_young_is_not_written_on() {
         // The call is not tainted by it: the recorder shows again, and the same words are heard.
         scene.platform.show_progress_age(Some(10));
         let again = speak(&scene, 12_000, "what is the status");
-        ask(&scene, "d-2", again - 200);
+        ask(&scene, "d-2", again - 200).await;
         row_reaching(&scene, "d-2", "performed").await;
         assert_eq!(at_the_host(&scene), 1);
         let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
@@ -5920,7 +5942,7 @@ async fn a_request_whose_proof_ran_out_while_the_writer_was_held_is_never_writte
     chatter(&scene).await;
     let end = speak(&scene, 6_000, "what is the status");
     scene.link.hold_next_request(HostMethod::VoiceDelegate);
-    ask(&scene, "d-1", end - 200);
+    ask(&scene, "d-1", end - 200).await;
     scene.link.until_request_held().await;
     // The proof is as old as the bound by the time the writer is let go, whatever else runs.
     tokio::time::sleep(Duration::from_millis(900)).await;
@@ -5942,7 +5964,7 @@ async fn a_delegation_announced_twice_is_one_attempt_and_one_below_an_earlier_of
     calling(&scene).await;
     chatter(&scene).await;
     let end = speak(&scene, 6_000, "what is the status");
-    ask(&scene, "d-1", end - 200);
+    ask(&scene, "d-1", end - 200).await;
     scene
         .platform
         .tell_provider(&delegation_event("d-1", end - 200));
@@ -5979,7 +6001,7 @@ async fn the_providers_mute_after_the_opening_taints_the_call() {
         "event_id": "event_m",
     }));
     let end = speak(&scene, 6_000, "what is the status");
-    ask(&scene, "d-1", end - 200);
+    ask(&scene, "d-1", end - 200).await;
 
     let row = row_reaching(&scene, "d-1", "refused").await;
 
@@ -6024,7 +6046,7 @@ async fn a_fragment_that_arrives_before_capture_opened_taints_the_call() {
         .await;
     scene.platform.show_progress_age(Some(10));
     let end = speak(&scene, 6_000, "what is the status");
-    ask(&scene, "d-1", end - 200);
+    ask(&scene, "d-1", end - 200).await;
 
     let row = row_reaching(&scene, "d-1", "refused").await;
 
@@ -6051,7 +6073,7 @@ async fn a_reply_lost_after_the_host_acted_is_asked_about_again_and_reads_perfor
     scene
         .link
         .lose_the_answer_to(Some(HostMethod::VoiceDelegate));
-    ask(&scene, "d-1", end - 200);
+    ask(&scene, "d-1", end - 200).await;
     tokio::time::timeout(WATCHDOG, async {
         while at_the_host(&scene) < 1 {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -6091,7 +6113,7 @@ async fn a_request_written_before_the_host_was_lost_stays_unknown_and_the_end_sa
         .link
         .lose_the_answer_to(Some(HostMethod::VoiceDelegate));
     scene.link.unreachable(true);
-    ask(&scene, "d-1", end - 200);
+    ask(&scene, "d-1", end - 200).await;
 
     let row = row_reaching(&scene, "d-1", "unknown").await;
 
@@ -6140,7 +6162,7 @@ async fn a_delegation_waiting_when_the_host_is_lost_is_discarded() {
     chatter(&scene).await;
     scene.platform.hold("capture_proof");
     let end = speak(&scene, 6_000, "what is the status");
-    ask(&scene, "d-1", end - 200);
+    ask(&scene, "d-1", end - 200).await;
     until_proofs_are_asked(&scene, 2).await;
     lose_the_host(&scene);
     scene
@@ -6165,7 +6187,7 @@ async fn a_request_composed_and_not_written_when_the_host_is_lost_is_not_written
     chatter(&scene).await;
     scene.platform.hold("capture_proof_at_use");
     let end = speak(&scene, 6_000, "what is the status");
-    ask(&scene, "d-1", end - 200);
+    ask(&scene, "d-1", end - 200).await;
     tokio::time::timeout(WATCHDOG, async {
         while !scene
             .platform
@@ -6202,7 +6224,7 @@ async fn a_request_waiting_for_the_writer_is_not_written_once_the_call_is_ending
     chatter(&scene).await;
     let end = speak(&scene, 6_000, "what is the status");
     scene.link.hold_next_request(HostMethod::VoiceDelegate);
-    ask(&scene, "d-1", end - 200);
+    ask(&scene, "d-1", end - 200).await;
     scene.link.until_request_held().await;
     scene.platform.hold("stop");
     let _holding = scene.platform.release_when_done("stop");
@@ -6219,7 +6241,7 @@ async fn a_request_waiting_for_the_writer_is_not_written_once_the_call_is_ending
     .await
     .expect("the call is ending");
     scene.link.release_request();
-    let_the_owner_act().await;
+    scene.link.until_the_held_request_has_passed().await;
 
     assert_eq!(
         at_the_host(&scene),
@@ -6257,7 +6279,7 @@ async fn a_request_waiting_for_the_writer_is_not_written_once_the_owner_has_fail
     chatter(&scene).await;
     let end = speak(&scene, 6_000, "what is the status");
     scene.link.hold_next_request(HostMethod::VoiceDelegate);
-    ask(&scene, "d-1", end - 200);
+    ask(&scene, "d-1", end - 200).await;
     scene.link.until_request_held().await;
 
     reach.told.store(1, Ordering::SeqCst);
@@ -6269,7 +6291,7 @@ async fn a_request_waiting_for_the_writer_is_not_written_once_the_owner_has_fail
     let words = ended["ended"]["words"].as_str().expect("words");
     assert!(words.contains("may or may not"), "{words}");
     scene.link.release_request();
-    let_the_owner_act().await;
+    scene.link.until_the_held_request_has_passed().await;
 
     assert_eq!(
         at_the_host(&scene),
