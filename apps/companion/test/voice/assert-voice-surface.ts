@@ -36,7 +36,8 @@
  * KR-REQ-15.36: muted or unavailable capture shown, with the statement that unheard speech never
  *   authorises. The refusal itself (KR-ACC-014) is not reachable from this screen, and is said so.
  * KR-REQ-15.17: local mute and closure survive broker failure.
- * KR-REQ-15.22: speech interruption stops playback only; cancellation is a separate host request.
+ * KR-REQ-15.22: speech interruption stops playback only; cancellation is a separate host request
+ *   that names the turn the host says the agent is on.
  */
 
 import { chromium, webkit, type Browser, type BrowserType, type Locator, type Page } from '@playwright/test'
@@ -52,6 +53,9 @@ declare const process: {
 
 /** The harness's address, the program that reads text in an image, and where the image goes. */
 const [, , addressArgument, readerArgument, imagesArgument] = process.argv
+
+/** The session the scripted host's call reaches, whose agent the host answers for. */
+const CALL_SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
 /** One surface, and the engine the platform draws it with. */
 interface Target {
@@ -392,6 +396,19 @@ function hostDoes(page: Page, control: string, ...args: readonly unknown[]): Ste
   }
 }
 
+/** Has the scripted host's agent end the turn it was on, so that the host names no turn. */
+function hostEndsItsTurn(page: Page): Step {
+  return {
+    says: "the scripted host's agent ends its turn",
+    run: () =>
+      page.evaluate((session) => {
+        const host = (window as unknown as { krTestHost: { records: { endTurn(session: string): void } } })
+          .krTestHost
+        host.records.endTurn(session)
+      }, CALL_SESSION)
+  }
+}
+
 // ---- Things seen -------------------------------------------------------------------------------
 
 function shows(page: Page, words: string): Step {
@@ -529,6 +546,24 @@ function cannotPress(page: Page, name: string): Step {
     says: `"${name}" cannot be pressed`,
     run: async () => {
       expect(await page.getByRole('button', { name, exact: true }).isDisabled(), `"${name}" can be pressed`)
+    }
+  }
+}
+
+/** Whether the scripted host's agent is on a turn now, as the host itself holds it. */
+function hostAgentIsOnATurn(page: Page, on: boolean): Step {
+  return {
+    says: on ? "the scripted host's agent is on a turn" : "the scripted host's agent is on no turn",
+    run: async () => {
+      const turn = await page.evaluate((session) => {
+        const host = (
+          window as unknown as {
+            krTestHost: { records: { agentOf(session: string): { binding: { turn_id: string | null } } } }
+          }
+        ).krTestHost
+        return host.records.agentOf(session).binding.turn_id
+      }, CALL_SESSION)
+      expect((turn !== null) === on, on ? "the host's agent is on no turn" : `the host's agent is still on ${turn}`)
     }
   }
 }
@@ -722,6 +757,7 @@ async function assertStopIsNotCancel(page: Page, base: string, target: Target): 
   const where = `${target.surface}/${target.engineName}`
   await prove('KR-REQ-15.22', where, [
     opening(page, base, target),
+    hostEndsItsTurn(page),
     pressing(page, 'Start voice session'),
     heading(page, 'Voice session'),
     pressing(page, 'Stop the voice'),
@@ -731,6 +767,27 @@ async function assertStopIsNotCancel(page: Page, base: string, target: Target): 
     inOwnSection(page, 'Cancel the current turn', 'Cancel what the agent is doing'),
     cannotPress(page, 'Cancel the current turn'),
     shows(page, 'has not said which turn the agent is on')
+  ])
+}
+
+/**
+ * A cancellation is asked about the turn the host named. The scripted host takes one only for the
+ * turn its agent is on, at the binding revision it holds, so its agent being on no turn afterwards
+ * is the host's own word that the request carried both.
+ */
+async function assertCancelNamesTheTurn(page: Page, base: string, target: Target): Promise<void> {
+  const where = `${target.surface}/${target.engineName}`
+  await prove('KR-REQ-15.22', where, [
+    opening(page, base, target),
+    hostAgentIsOnATurn(page, true),
+    pressing(page, 'Start voice session'),
+    heading(page, 'Voice session'),
+    canPress(page, ['Cancel the current turn']),
+    pressing(page, 'Cancel the current turn'),
+    canPress(page, ['Cancel this turn', 'Keep it running']),
+    pressing(page, 'Cancel this turn'),
+    shows(page, 'The host was asked to cancel that turn'),
+    hostAgentIsOnATurn(page, false)
   ])
 }
 
@@ -761,6 +818,7 @@ async function assertTarget(base: string, target: Target): Promise<void> {
     await assertCaptureStates(page, base, target)
     await assertBrokerFailure(page, base, target)
     await assertStopIsNotCancel(page, base, target)
+    await assertCancelNamesTheTurn(page, base, target)
     await assertTargetSize(page, base, target)
   } finally {
     await browser.close()
@@ -1047,11 +1105,6 @@ async function main(): Promise<void> {
     'KR-PERF-010',
     'first-audio and delegation latency',
     'the harness drives the screen against a scripted host with no media path, so there is no first audio and no delegation to time'
-  )
-  unproved(
-    'KR-REQ-15.22',
-    'a cancellation carrying the current turn identifier',
-    'no host answer names the turn an agent is on, so the confirmation step cannot be reached'
   )
   unproved(
     'KR-REQ-15.13',

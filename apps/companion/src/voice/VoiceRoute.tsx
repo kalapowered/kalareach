@@ -12,7 +12,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 
 import { VoiceGrantStep } from './VoiceGrantStep'
-import { VoiceSurface, type VoiceSurfaceActions } from './VoiceSurface'
+import { VoiceSurface, type CurrentTurn, type VoiceSurfaceActions } from './VoiceSurface'
 import {
   callAsReported,
   choiceFromPreparation,
@@ -28,14 +28,18 @@ import {
   type ProviderChoice,
   type RunningCall
 } from './model'
+import { AGENT_READ_CADENCE_MS } from '../app/agent'
+import { readOnCadence } from '../app/cadence'
 import { useApp } from '../app/state'
 import {
   failureCode,
   failureMessage as portFailureMessage,
-  follow
+  follow,
+  watch
 } from '../host/port'
-import type { VoiceCallState, VoiceClosure } from '../host/port'
+import type { HostPort, VoiceCallState, VoiceClosure, Watch } from '../host/port'
 import type { Surface } from '../mobile/platform'
+import { liveInstance, subjectOf } from '../model/agent'
 
 /** The message to show for a failure, whatever shape it arrived in. */
 function failureMessage(value: unknown): string {
@@ -74,6 +78,28 @@ class AskFailed extends Error {
   constructor(readonly payload: unknown) {
     super('that request could not be made')
     this.name = 'AskFailed'
+  }
+}
+
+/**
+ * The turn a session's agent is on, with the instance running it and the binding revision the
+ * host answered at, or null when the session has no live agent or its agent is on no turn.
+ *
+ * Only the session's own worker can say which turn that is, so it is read, never remembered: the
+ * instance first, then the binding that instance is at.
+ */
+async function readTurn(port: HostPort, sessionId: string): Promise<CurrentTurn | null> {
+  const agents = await port.sessionAgents(sessionId)
+  const live = liveInstance(agents.instances.instances)
+  if (live === null) return null
+  const instanceId = live.application_instance_id
+  const { binding } = await port.agentCapabilities({ subject: subjectOf(sessionId, instanceId) })
+  if (binding.turn_id === null) return null
+  return {
+    sessionId,
+    instanceId,
+    bindingRevision: binding.binding_revision,
+    turnId: binding.turn_id
   }
 }
 
@@ -252,10 +278,53 @@ export function VoiceRoute({
     }
   }, [prepare])
 
-  // This screen reads no agent, so it holds no turn. Cancelling one needs the turn the session's
-  // worker reports now, with the instance and binding it was read at; one remembered from an
-  // address would go stale the moment the agent moved on.
-  const currentTurn = null
+  // The turn the host says the agent is on, while a call runs. Cancelling one names the turn, the
+  // instance running it and the binding revision it was read at, which only the session's worker
+  // can say, so the screen reads them on the agent's cadence and again when the host is reached
+  // again, and takes none from an address. A call that reaches several sessions has no one turn
+  // to name, and the screen does not pick one. A read that fails names no turn, and what an earlier
+  // call read is gone with that call.
+  const reached = call?.sessions ?? []
+  const turnSession = reached.length === 1 ? (reached[0] ?? null) : null
+  const [turnRead, setTurnRead] = useState<{
+    readonly session: string
+    readonly turn: CurrentTurn | null
+  } | null>(null)
+  const currentTurn =
+    turnSession !== null && turnRead?.session === turnSession ? turnRead.turn : null
+  const readTurnAgain = useRef<() => void>(() => undefined)
+  useEffect(() => {
+    if (turnSession === null) return
+    const session = turnSession
+    let watching: Watch | null = null
+    const cadence = readOnCadence(() => {
+      const newest = watching?.read() ?? null
+      if (newest === null) return Promise.resolve()
+      return ask(() => readTurn(port, session))
+        .then((turn) => {
+          if (newest()) setTurnRead({ session, turn })
+        })
+        .catch(() => {
+          if (newest()) setTurnRead({ session, turn: null })
+        })
+    }, AGENT_READ_CADENCE_MS)
+    watching = watch(
+      [
+        port.onConnection((state) => {
+          if (state.connected) cadence.now()
+        })
+      ],
+      cadence.now
+    )
+    readTurnAgain.current = cadence.now
+    const started = watching
+    return () => {
+      cadence.stop()
+      started.stop()
+      readTurnAgain.current = () => undefined
+      setTurnRead(null)
+    }
+  }, [port, turnSession])
 
   // The call as the screen is holding it, so an action that runs later acts on the call that is
   // running now rather than on the one that was on screen when the handler was written.
@@ -684,6 +753,10 @@ export function VoiceRoute({
           })
           .catch((error: unknown) => {
             setNotice(failureMessage(error))
+          })
+          // The host's answer, either way, says where the agent is now.
+          .finally(() => {
+            readTurnAgain.current()
           })
       },
 
