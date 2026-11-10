@@ -443,18 +443,6 @@ impl Fidelity {
 mod tests {
     use super::*;
 
-    /// A console that names a terminal declares that terminal, and one that names none, or names
-    /// nothing, declares the console's own profile.
-    #[test]
-    fn a_console_declares_the_terminal_its_environment_names_and_otherwise_itself() {
-        assert_eq!(
-            console_declaration(Some("xterm-256color")),
-            "xterm-256color"
-        );
-        assert_eq!(console_declaration(None), CONSOLE_PROFILE);
-        assert_eq!(console_declaration(Some("")), CONSOLE_PROFILE);
-    }
-
     /// KR-REQ-08.52, the part about the final underscore: a record is written as
     /// `CSI Vk;Sc;Uc;Kd;Cs;Rc_` with all six fields (`\x1b[65;30;97;1;0;1_`), ending in an
     /// underscore and not an APC string, and reads back as the record it was written from.

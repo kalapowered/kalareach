@@ -481,6 +481,19 @@ async fn a_key_typed_at_an_attached_console_reaches_the_application_as_the_conso
 /// session's stream; and the key written to it reaches the application.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_console_that_names_no_terminal_holds_the_input_lease_and_types() {
+    a_console_whose_environment_names_no_terminal_types(None).await;
+}
+
+/// KR-REQ-08.53, the part about who may type: a console whose `TERM` is set to nothing names no
+/// terminal either, so it declares the profile of a Windows console, is given the session's input
+/// lease and types, as the test above shows for one with no `TERM`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_console_whose_terminal_name_is_empty_holds_the_input_lease_and_types() {
+    a_console_whose_environment_names_no_terminal_types(Some("")).await;
+}
+
+/// The body of the two tests above: the console's `TERM` is `term`, which names no terminal.
+async fn a_console_whose_environment_names_no_terminal_types(term: Option<&str>) {
     let host = WorkerHost::start().await;
     let (mut typist, session_id, dimensions) = session_waiting_for_keys(
         &host,
@@ -495,7 +508,7 @@ async fn a_console_that_names_no_terminal_holds_the_input_lease_and_types() {
     let typist_id = typist.attachment_id();
 
     // The console that withholds its declaration is shown the session and is not given the keys.
-    let mut withholding = Attached::start_in(&host, &session, dimensions, None, &["--no-probe"]);
+    let mut withholding = Attached::start_in(&host, &session, dimensions, term, &["--no-probe"]);
     withholding.shows(
         "the session's screen",
         |text| text.matches("kr-ready.").count(),
@@ -535,7 +548,7 @@ async fn a_console_that_names_no_terminal_holds_the_input_lease_and_types() {
     .await;
 
     // The console that declares itself is given them.
-    let mut console = Attached::start_in(&host, &session, dimensions, None, &[]);
+    let mut console = Attached::start_in(&host, &session, dimensions, term, &[]);
     console.shows(
         "the session's screen",
         |text| text.matches("kr-ready.").count(),
