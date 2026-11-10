@@ -8,12 +8,13 @@
  * replacement owed. It is offered only while a spoken request can reach the host at all.
  */
 
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, type FakeHostControls } from '../../src/host/fake'
+import type { HostPort } from '../../src/host/port'
 import { VoiceRoute } from '../../src/voice/VoiceRoute'
 
 afterEach(() => {
@@ -24,23 +25,42 @@ const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
 const CLOSE_SENTENCE = 'Close a session, after a confirmation on an unlocked screen.'
 
-function start(setup?: (controls: FakeHostControls) => void): { controls: FakeHostControls } {
+function start(setup?: (controls: FakeHostControls) => void): {
+  controls: FakeHostControls
+  scopeReads: Promise<unknown>[]
+} {
   const { port, controls } = fakeHost()
   setup?.(controls)
+  // Every read of what a person may add, so that a case can wait for the answer it was given.
+  const scopeReads: Promise<unknown>[] = []
+  const watched: HostPort = {
+    ...port,
+    voiceScope: () => {
+      const read = port.voiceScope()
+      scopeReads.push(read)
+      return read
+    }
+  }
   render(
-    <AppProvider port={port}>
+    <AppProvider port={watched}>
       <VoiceRoute surface="ios" />
     </AppProvider>
   )
-  return { controls }
+  return { controls, scopeReads }
 }
 
 describe('what voice may do', () => {
   // A person is not asked to allow what cannot happen: with the constant off, which every shipped
   // build holds, the idle screen offers nothing to add.
   it('is not offered while no spoken request reaches the host', async () => {
-    start()
+    const { scopeReads } = start()
     expect(await screen.findByRole('button', { name: 'Start voice session' })).toBeInTheDocument()
+    // Nothing is offered only once the host has answered what could be added: asserting before the
+    // answer is read would pass for any screen.
+    await waitFor(() => expect(scopeReads).toHaveLength(1))
+    await act(async () => {
+      await scopeReads[0]
+    })
     expect(screen.queryByTestId('voice-grant-entry')).toBeNull()
     expect(screen.queryByText(CLOSE_SENTENCE)).toBeNull()
   })
