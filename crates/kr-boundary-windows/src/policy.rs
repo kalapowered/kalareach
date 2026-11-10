@@ -123,11 +123,21 @@ pub struct Collection {
 
 /// A policy: its collections by name. A collection a policy does not mention is not configured and
 /// holds no rules.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct Policy {
     /// The collections, by the name the platform gives them (`Exe`, `Dll`, `Script`, `Msi`, `Appx`).
     pub collections: BTreeMap<String, Collection>,
 }
+
+/// Two policies are equal when no collection differs: one that is not configured and holds no
+/// rule is the same as one the policy does not mention.
+impl PartialEq for Policy {
+    fn eq(&self, other: &Self) -> bool {
+        self.differences(other).is_empty()
+    }
+}
+
+impl Eq for Policy {}
 
 /// A policy that could not be read.
 #[derive(Debug, thiserror::Error)]
