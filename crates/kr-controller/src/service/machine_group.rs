@@ -356,12 +356,18 @@ impl Controller {
         self.settle_machine_record().await?;
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        let hold = match self.sharing.grants().claim_action(
+        let claimed = match self.sharing.grants().claim_action(
             actor_id,
             mutation.action_id,
             &digest,
             kr_ipc::now_ms().get(),
-        )? {
+        ) {
+            Ok(claimed) => claimed,
+            // Another attempt claimed the action for another payload while this one waited for the
+            // step lock: what that says of its record goes back only under this attempt's authority.
+            Err(error) => return Err(self.conflict_under_authority(&carried, error).await),
+        };
+        let hold = match claimed {
             crate::grants::ActionClaim::Claimed { hold } => hold,
             crate::grants::ActionClaim::Recorded(record) => {
                 // An earlier attempt recorded this action between the lookup that found nothing

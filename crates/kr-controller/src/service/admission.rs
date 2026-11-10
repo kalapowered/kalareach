@@ -446,6 +446,26 @@ impl Controller {
         answered
     }
 
+    /// What a claim or a lookup that found another attempt's record refuses with, given back only
+    /// under the authority this attempt arrived under.
+    ///
+    /// A reused identifier's conflict says that another attempt has used the identifier for
+    /// another request, which is a read of that attempt's record as much as its answer is, so it
+    /// waits for the same check, asked once it is in hand. Any other refusal says nothing of
+    /// another attempt's record and is given back as it is.
+    pub(crate) async fn conflict_under_authority(
+        &self,
+        carried: &crate::authority::AdmittedMutation,
+        found: ControllerError,
+    ) -> ControllerError {
+        if matches!(found, ControllerError::IdConflict { .. })
+            && let Err(lapsed) = self.check_retained_in_hand(carried).await
+        {
+            return lapsed;
+        }
+        found
+    }
+
     /// The check a recorded answer is owed, for a service that finds it on a blocking thread:
     /// [`Self::check_retained_under`] on the registration `carried` names, handed to the service
     /// beside [`Self::admission_in_service`] and asked with the answer in hand.

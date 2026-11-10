@@ -1334,6 +1334,68 @@ async fn a_stop_recorded_by_another_copy_before_its_claim_is_given_back_only_und
     call.world.serving.abort();
 }
 
+/// What a stop of the call is given where it claims its action, when another copy of the action,
+/// a stop of another voice session, claimed that action after this one's early look found no record
+/// of it.
+///
+/// The first copy is held before it claims (`held_before_its_claim`). The second copy claims the
+/// identifier there for its own request, and `then` is done next, given the admission the first
+/// copy carries. The first copy goes on and meets the other's claim where it claims.
+async fn a_stop_that_meets_a_conflicting_claim_where_it_claims(
+    call: &Call,
+    then: impl FnOnce(&Controller, &crate::authority::AdmittedMutation),
+) -> crate::given::Given<crate::error::Result<ParamsValue>> {
+    let stop = call.stop_submitted();
+    let mut other = stop.clone();
+    other.params = ParamsValue::from_typed(&VoiceStopParams {
+        voice_session_id: VoiceSessionId::new(kr_ipc::new_uuid()),
+    })
+    .expect("encodes");
+    held_before_its_claim(
+        &call.controller,
+        &call.device.principal(),
+        call.device.device_id,
+        Method::VoiceStop,
+        &stop,
+        async |admission| {
+            // The other copy names no call of this device, and what it is told does not matter:
+            // it has claimed the identifier for its own request.
+            let _ = call.submit_voice(Method::VoiceStop, &other).await;
+            then(&call.controller, admission);
+        },
+    )
+    .await
+}
+
+/// KR-REQ-09.09, the voice claim race, the part about a claim error: a stop that finds no record
+/// of its action at the early look and meets another copy's claim for another request where it
+/// claims is told of that conflict only under the authority it arrived under. The control: with
+/// nothing owed the conflict is told. While this host owes a fence it could not raise it is
+/// refused for the fence, and told nothing of the other copy's claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stops_conflict_with_another_copys_claim_is_told_only_under_its_authority() {
+    let call = Call::start().await;
+    let late =
+        a_stop_that_meets_a_conflicting_claim_where_it_claims(&call, |_controller, _admission| {})
+            .await;
+    let told = late.into_answer().expect_err("the conflict is told");
+    assert_eq!(told.code(), ErrorCode::IdConflict, "{told}");
+    call.world.serving.abort();
+
+    let call = Call::start().await;
+    let late =
+        a_stop_that_meets_a_conflicting_claim_where_it_claims(&call, |controller, _admission| {
+            controller.hold_fence(true)
+        })
+        .await;
+    let refused = late
+        .into_answer()
+        .expect_err("the conflict is not told while a fence is owed");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+    assert!(refused.to_string().contains("fence"), "{refused}");
+    call.world.serving.abort();
+}
+
 /// KR-REQ-15.13 and 09.12: withdrawing a call's grant while a close is on its way raises a barrier
 /// that withdraws no connection. The connection of the device that holds the call stays admitted,
 /// so the answer to the stop and to every request on that link is delivered, and so does every

@@ -317,7 +317,21 @@ impl Controller {
                 }
                 super::respond(mutation.request_id, answered)
             }
-            Err(error) => super::respond(mutation.request_id, Err(error)),
+            // Another attempt claimed the action for another payload while this one waited: the
+            // conflict goes back only under the authority this attempt arrived under, as a recorded
+            // answer does. Any other refusal names nothing of another attempt's record.
+            Err(error) => {
+                if matches!(error, ControllerError::IdConflict { .. })
+                    && let Err(lapsed) = self.check_retained_answer(connection_id, admitted)
+                {
+                    return super::error_reply(
+                        mutation.request_id,
+                        lapsed.code(),
+                        lapsed.to_string(),
+                    );
+                }
+                super::respond(mutation.request_id, Err(error))
+            }
         }
     }
 

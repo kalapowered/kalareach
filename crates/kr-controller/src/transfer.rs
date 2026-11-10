@@ -211,6 +211,23 @@ impl TransferAdmission {
             .map_err(|error| error.to_protocol_error())
     }
 
+    /// What a look at the record found, with the conflict a reused identifier meets given back
+    /// only under the check a retained answer is owed: it says that another attempt used the
+    /// identifier for another request, which is a read of that attempt's record. Any other refusal
+    /// of the look says nothing of it and is given back as it is.
+    fn retained_under_the_check<T>(
+        &self,
+        found: std::result::Result<T, ProtocolError>,
+    ) -> std::result::Result<T, ProtocolError> {
+        match found {
+            Err(error) if error.code == ErrorCode::IdConflict => {
+                self.check_retained()?;
+                Err(error)
+            }
+            found => found,
+        }
+    }
+
     fn refused(&self, error: &ControllerError) -> ProtocolError {
         let refusal = error.to_protocol_error();
         self.refusal
@@ -986,7 +1003,9 @@ impl TransferModule {
         #[cfg(feature = "testing")]
         let after_the_outer_check = Arc::clone(&self.after_the_outer_check);
         blocking(move || {
-            if let Some(retained) = kept(&service, &actor, action_id, name, digest)? {
+            if let Some(retained) = admission
+                .retained_under_the_check(kept(&service, &actor, action_id, name, digest))?
+            {
                 // Found here, after the lookup the local door made before it considered a first
                 // admission: another attempt may have recorded it since. It goes back under the
                 // same check, asked once the answer is in hand.
@@ -1015,7 +1034,9 @@ impl TransferModule {
                 // A claim moves from open to settled and never back, so one that is not open
                 // now and was when the lookup above found it open has been settled since, and
                 // what it was settled with is the answer.
-                if let Some(retained) = kept(&service, &actor, action_id, name, digest)? {
+                if let Some(retained) = admission
+                    .retained_under_the_check(kept(&service, &actor, action_id, name, digest))?
+                {
                     admission.check_retained()?;
                     return answer_of(retained);
                 }

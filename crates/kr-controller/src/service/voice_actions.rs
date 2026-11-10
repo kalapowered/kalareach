@@ -690,7 +690,13 @@ impl Controller {
         }
         #[cfg(test)]
         self.before_a_voice_change_claims.wait().await;
-        let hold = match self.claim_voice_action(&actor_id, mutation)? {
+        let claimed = match self.claim_voice_action(&actor_id, mutation) {
+            Ok(claimed) => claimed,
+            // Another copy claimed the action for another payload while this one waited: what that
+            // says of its record goes back only under this copy's authority, as its answer does.
+            Err(error) => return Err(self.conflict_under_authority(&carried, error).await),
+        };
+        let hold = match claimed {
             crate::grants::ActionClaim::Claimed { hold } => hold,
             crate::grants::ActionClaim::Recorded(record) => {
                 *copied = true;

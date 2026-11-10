@@ -1491,6 +1491,11 @@ mod a_transfer_left_unanswered;
 #[cfg(test)]
 mod a_recorded_answer_another_copy_wrote;
 
+/// What a claim another copy made for another request goes back under, where each service claims
+/// its action after the door's own look.
+#[cfg(test)]
+mod a_claim_another_copy_made;
+
 /// A transfer of control from a device that holds a grant the given-up grant was delegated from.
 #[cfg(test)]
 mod a_transfer_whose_giver_keeps_control;

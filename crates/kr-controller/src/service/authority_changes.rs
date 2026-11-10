@@ -1201,7 +1201,14 @@ impl Controller {
             _ => None,
         };
         let claimed_at_ms = kr_ipc::now_ms().get();
-        let hold = match self.claim_authority_change(actor_id, mutation, claimed_at_ms)? {
+        let claimed = match self.claim_authority_change(actor_id, mutation, claimed_at_ms) {
+            Ok(claimed) => claimed,
+            // Another attempt claimed the action for another payload between the lookup that found
+            // nothing and this claim: what that says of its record goes back only under this
+            // attempt's authority, as its answer does.
+            Err(error) => return Err(self.conflict_under_authority(&carried, error).await),
+        };
+        let hold = match claimed {
             crate::grants::ActionClaim::Claimed { hold } => hold,
             crate::grants::ActionClaim::Recorded(record) => {
                 // An earlier attempt recorded this action between the lookup that found nothing
@@ -2007,7 +2014,9 @@ impl Controller {
                     .await,
                 );
             }
-            Err(error) => return Given::Fresh(Err(error)),
+            Err(error) => {
+                return Given::Fresh(Err(self.conflict_under_authority(&carried, error).await));
+            }
         };
         let outcome = self
             .device_preview_key_update(actor_id, mutation, carried)
@@ -2048,7 +2057,9 @@ impl Controller {
                     .await,
                 );
             }
-            Err(error) => return Given::Fresh(Err(error)),
+            Err(error) => {
+                return Given::Fresh(Err(self.conflict_under_authority(&carried, error).await));
+            }
         };
         let outcome = self.device_push_register(actor_id, mutation, carried).await;
         if let Err(error) = self.settle_claim(&hold, &outcome) {
