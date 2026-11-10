@@ -539,7 +539,8 @@ against the connection: no bulk slot, no registry entry.
 
 A stream that passes goes to the host through `AuthorisedSession::data_streams` (`DataStreams`), a
 queue of four (`listener::DATA_STREAM_QUEUE_DEPTH`). A full queue and a receiver that was dropped
-each reset the stream, and dropping `DataStreams` resets every stream still queued. A host that
+each reset the stream, and dropping `DataStreams` resets every stream still queued (one whose send
+raced the drop is reset when the connection's accept task ends, at the latest). A host that
 never reads the queue holds at most four streams for a device that opens them, each with a bulk
 slot, a registry entry and its flow-control credit, until the connection ends, and resets the rest. What a header names beyond this, the environment, the transfer and the
 right to use it, is the host's to decide when it receives the stream. A lookup it makes for that runs
@@ -558,10 +559,13 @@ stream's revocation handle, and the stream stays registered and keeps its bulk s
 dropped. `write_message_while` writes a frame on either as `FrameWriter::write_message_while` does:
 the write is held to the caller's check at every attempt to hand bytes to the stream, to the queue
 budget, to the write deadline and to revocation. The stream's revoked state is asked at each
-attempt, in the same poll and before the caller's check, so no byte goes to the stream after a
-revocation, even when the stream is writable at that moment. A revocation, a deadline or a refused
-reservation ends it with an error, never with `Ok(false)`, which means only that the caller's own
-check refused.
+attempt, in the same poll: before the caller's check, and again inside the attempt once the check
+holds what it holds. No attempt starts after the stream is seen revoked, even when the stream is
+writable at that moment. An attempt that is already handing bytes over when another thread revokes
+the stream is not stopped, and no later one is made. `write_message` and `write_payload` do not ask
+at each attempt: they race the revocation, and a write that wins the race can still go after it. A
+revocation, a deadline or a refused reservation ends the write with an error, never with
+`Ok(false)`, which means only that the caller's own check refused.
 A refusal leaves the stream reset and revokes it, so the half that reads stops too. A read or a
 write that is dropped before it ends, because a caller raced it in a `select!`, leaves part of a
 frame consumed or sent and revokes the stream for the same reason: end a stream by revoking its
@@ -628,7 +632,8 @@ library call.
 
 What an authorised connection holds in memory is at most as many streams as the raised limit, each
 up to the library's per-stream receive window of 1.25 MB, plus one decoded frame of 1 MiB + 4 KiB for each stream whose
-frame is being read. A connection that is not authorised holds the buffers of one stream. The
+frame is being read. A connection that is not authorised holds the receive window of one stream, and the library also
+buffers datagrams that a peer sends it, up to the same 1.25 MB, though the product reads none. The
 connection-wide receive window is not limited. If one is ever set, it has to stay above that bound,
 or a stalled data stream could take the credit the control stream needs.
 

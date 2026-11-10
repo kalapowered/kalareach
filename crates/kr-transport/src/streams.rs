@@ -211,8 +211,8 @@ impl DataStream {
     /// [`FrameWriter::write_message_while`] makes it: `admits` is asked at every attempt to hand
     /// bytes to the stream, and a frame it refuses leaves the stream reset. A revocation ends the
     /// write with an error, and so does a refused reservation, never with `Ok(false)`: the
-    /// stream's revoked state is asked at each attempt before `admits` is, so no byte goes after
-    /// a revocation.
+    /// stream's revoked state is asked at each attempt, before `admits` is and again inside the
+    /// attempt, so no attempt starts after the stream is seen revoked.
     ///
     /// # Errors
     ///
@@ -382,10 +382,12 @@ impl DataWriter {
 
     /// Writes one message for as long as `admits` holds, and says whether it went.
     ///
-    /// The stream's revoked state is asked in the same poll as `admits`, before it, at each attempt
-    /// to hand bytes to the stream, so nothing is written after a revocation even when the
-    /// stream is writable at the moment it is revoked: the write ends with
-    /// [`TransportError::ControlLost`] and the stream is reset.
+    /// The stream's revoked state is asked in the same poll as each attempt to hand bytes to the
+    /// stream: before `admits` is called, and again inside the attempt, once `admits` holds what
+    /// it holds and immediately before the bytes are handed over. No attempt starts after the
+    /// stream is seen revoked, even when the stream is writable at that moment: the write ends
+    /// with [`TransportError::ControlLost`] and the stream is reset. An attempt already handing
+    /// bytes over when another thread revokes the stream is not stopped, and no later one is made.
     ///
     /// # Errors
     ///
@@ -400,15 +402,23 @@ impl DataWriter {
         let unless = UnlessFinished::new(&handle);
         let mut deadline = Deadline::start(self.deadlines.as_ref(), DeadlineKind::Write);
         // A race between the write and the revocation can be won by the write when both are ready,
-        // so the revoked state is part of what each attempt asks. The host's own refusal and this
-        // one both stop the frame; only the host's is `Ok(false)`.
+        // so the revoked state is part of what each attempt asks: once before the host's check,
+        // which may wait for a lock and so be a while, and once inside the attempt, after the
+        // check holds what it holds. The host's own refusal and a revocation both stop the frame;
+        // only the host's is `Ok(false)`.
         let revoked_at_an_attempt = std::sync::atomic::AtomicBool::new(false);
         let admits_while_not_revoked = |attempt: &mut dyn FnMut()| {
             if handle.is_revoked() {
                 revoked_at_an_attempt.store(true, std::sync::atomic::Ordering::Relaxed);
                 return false;
             }
-            admits(attempt)
+            admits(&mut || {
+                if handle.is_revoked() {
+                    revoked_at_an_attempt.store(true, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    attempt();
+                }
+            })
         };
         let outcome = tokio::select! {
             outcome = self.writer.write_payload_while(&payload, &admits_while_not_revoked) => {
@@ -870,6 +880,12 @@ impl StreamRegistry {
     ///
     /// A bulk stream is admitted against the connection's bulk limits before the QUIC stream is
     /// opened, so a peer cannot hold open more transfers than the connection allows.
+    ///
+    /// The open waits for the peer's stream credit, and holds the bulk slot while it waits. A host
+    /// that takes data streams grants it when it authorises the connection, a round trip after the
+    /// handshake; a host that takes none never does, and the open then waits until the registry is
+    /// revoked or the connection ends. No deadline bounds it, so a caller that must not wait
+    /// bounds it itself.
     ///
     /// # Errors
     ///
