@@ -137,6 +137,14 @@ android {
         val minifierRules = fileTree(".") { include("**/*.pro") }
             .plus(getDefaultProguardFile("proguard-android-optimize.txt"))
             .toList().toTypedArray()
+        // `KR_MINIFY_DEBUG` reads as 1 or as unset (an empty value is unset). Another value is a
+        // request this does not understand, and the build stops rather than leave it unminified.
+        val minifyDebug = providers.environmentVariable("KR_MINIFY_DEBUG").orNull.let { value ->
+            when (value) {
+                null, "", "1" -> value == "1"
+                else -> throw GradleException("KR_MINIFY_DEBUG is $value, and the build reads only 1")
+            }
+        }
         getByName("debug") {
             manifestPlaceholders["usesCleartextTraffic"] = "true"
             isDebuggable = true
@@ -147,7 +155,7 @@ android {
             // debug build's test hooks. A debuggable build is minified in R8's debug mode, which removes
             // and renames the classes no Java reaches, as the release build does, and does not
             // optimise across the ones that are left.
-            isMinifyEnabled = providers.environmentVariable("KR_MINIFY_DEBUG").orNull == "1"
+            isMinifyEnabled = minifyDebug
             if (isMinifyEnabled) proguardFiles(*minifierRules)
             packaging {                jniLibs.keepDebugSymbols.add("*/arm64-v8a/*.so")
                 jniLibs.keepDebugSymbols.add("*/armeabi-v7a/*.so")
