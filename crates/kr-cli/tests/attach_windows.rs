@@ -153,8 +153,8 @@ impl ConsoleOutput {
             );
             assert!(
                 started.elapsed() < LIVENESS_DEADLINE,
-                "{what}: waited {:?} for the console to show it {times} time(s) while {}; the end of \
-                 what it showed: {:?}",
+                "{what}: waited {:?} for the console to show it {times} time(s) while {}; the end \
+                 of what it showed: {:?}",
                 started.elapsed(),
                 command(),
                 end_of(&text)
@@ -1401,30 +1401,9 @@ async fn the_console_an_attachment_ran_in_is_given_back_in_the_modes_it_had() {
     probe.waits_for("kr-probe:end");
     probe.report();
     let shown = probe.shown();
-    let modes = |which: &str| -> (u32, u32) {
-        let line = shown
-            .lines()
-            .find_map(|line| line.find(which).map(|at| &line[at..]))
-            .unwrap_or_else(|| panic!("the probe said nothing of {which}: {shown:?}"));
-        let mut fields = line[which.len()..].trim().split(':');
-        // A field is its leading hexadecimal digits; the console may follow the line with a
-        // sequence of its own.
-        let mut next = || {
-            fields
-                .next()
-                .map(|word| {
-                    word.chars()
-                        .take_while(char::is_ascii_hexdigit)
-                        .collect::<String>()
-                })
-                .and_then(|digits| u32::from_str_radix(&digits, 16).ok())
-                .unwrap_or_else(|| panic!("the modes in {line:?}"))
-        };
-        (next(), next())
-    };
-    let before = modes("kr-probe:before:");
-    let inside = modes("kr-probe:inside:");
-    let after = modes("kr-probe:after:");
+    let before = probed_modes(&shown, "kr-probe:before:");
+    let inside = probed_modes(&shown, "kr-probe:inside:");
+    let after = probed_modes(&shown, "kr-probe:after:");
     assert_ne!(
         inside, before,
         "the attachment did not change the console's modes, so there was nothing to give back"
@@ -1434,6 +1413,30 @@ async fn the_console_an_attachment_ran_in_is_given_back_in_the_modes_it_had() {
         "the console's input and output modes after the attachment are not the ones before it \
          (before {before:x?}, inside {inside:x?}, after {after:x?}): {shown:?}"
     );
+}
+
+/// The input and output modes a probe printed on its line that begins with `which`, as two
+/// hexadecimal numbers.
+fn probed_modes(shown: &str, which: &str) -> (u32, u32) {
+    let line = shown
+        .lines()
+        .find_map(|line| line.find(which).map(|at| &line[at..]))
+        .unwrap_or_else(|| panic!("the probe said nothing of {which}: {shown:?}"));
+    let mut fields = line[which.len()..].trim().split(':');
+    // A field is its leading hexadecimal digits; the console may follow the line with a sequence of
+    // its own.
+    let mut next = || {
+        fields
+            .next()
+            .map(|word| {
+                word.chars()
+                    .take_while(char::is_ascii_hexdigit)
+                    .collect::<String>()
+            })
+            .and_then(|digits| u32::from_str_radix(&digits, 16).ok())
+            .unwrap_or_else(|| panic!("the modes in {line:?}"))
+    };
+    (next(), next())
 }
 
 /// The console half of the test of the console's modes, run in a console of its own.
@@ -1602,9 +1605,9 @@ async fn only_the_attachment_that_ended_is_removed(ending: Ending) {
             "{what} is still running after the attachment ended"
         );
     }
-    // The attachment that is left takes the keys, which the command that ended had taken for itself,
-    // and the shell answers it. The line the shell echoes holds the marker with a caret in it, so that
-    // only what the shell prints holds it whole.
+    // The attachment that is left takes the keys, which the command that ended had taken for
+    // itself, and the shell answers it. The line the shell echoes holds the marker with a caret in
+    // it, so that only what the shell prints holds it whole.
     holder.take_the_keys().await;
     holder.type_line("echo kr-aft^er-the-ending").await;
     holder
@@ -1630,9 +1633,9 @@ async fn only_the_attachment_that_ended_is_removed(ending: Ending) {
 /// KR-REQ-07.52, the part about detaching: `kr detach --attachment`, run from another command,
 /// removes the attachment it names and nothing else.
 ///
-/// The `kr attach` that holds the attachment ends, and not as a failure; the session, its worker and
-/// its root shell go on, and the other attachment is still attached and, once it takes the keys the
-/// command had, types into the shell.
+/// The `kr attach` that holds the attachment ends, and not as a failure; the session, its worker
+/// and its root shell go on, and the other attachment is still attached and, once it takes the keys
+/// the command had, types into the shell.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_detach_from_another_command_removes_only_the_attachment_it_names() {
     only_the_attachment_that_ended_is_removed(Ending::Detached).await;
@@ -1660,8 +1663,8 @@ async fn an_attachment_whose_connection_is_lost_is_removed_and_nothing_else_is()
     only_the_attachment_that_ended_is_removed(Ending::ProcessKilled).await;
 }
 
-/// The variable that makes this test binary, started in the session's console, ask for the mouse and
-/// print the reports it is given.
+/// The variable that makes this test binary, started in the session's console, ask for the mouse
+/// and print the reports it is given.
 const MOUSE_READER: &str = "KR_ATTACH_MOUSE_READER";
 
 /// The file the application waits for before it asks for the mouse.
@@ -1672,12 +1675,13 @@ const MOUSE_GATE: &str = "KR_ATTACH_MOUSE_GATE";
 /// as records.
 ///
 /// The session's root shell starts this test binary, which reads the console's virtual-terminal
-/// input as a terminal application does and, once `kr attach` is attached and a file exists, asks to
-/// be told of clicks in the SGR encoding. The console that `kr attach` runs in is then written a
+/// input as a terminal application does and, once `kr attach` is attached and a file exists, asks
+/// to be told of clicks in the SGR encoding. The console that `kr attach` runs in is then written a
 /// press and its release at column 10 and row 5, as a terminal that reports the mouse sends them.
 /// The application is told of them as the two reports a terminal would send, at that cell: a
-/// command that kept the mouse for the console, or that handed on nothing for a record that is not
-/// a key, tells it nothing.
+/// command that handed on nothing for a record that is not a key tells it nothing. A pseudo console
+/// turns the reports into records whatever its input mode is, so that the console is given the
+/// mouse while the application asks, and has it back after, is the next case's to show.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_mouse_event_at_an_attached_console_reaches_the_application_that_asked_for_the_mouse() {
     if std::env::var_os(MOUSE_READER).is_some() {
@@ -1724,8 +1728,8 @@ async fn a_mouse_event_at_an_attached_console_reaches_the_application_that_asked
             "the application asked for the mouse and said so",
         )
         .await;
-    // The command gives the console the mouse before it shows what the application wrote, so a
-    // console that shows this has been asked for the mouse.
+    // The command reads the application's request in what it shows the console, so a console that
+    // shows this has been shown the request.
     console.shows(
         "the application's request for the mouse",
         |text| text.matches("kr-mouse-ready").count(),
@@ -1767,9 +1771,9 @@ async fn a_mouse_event_at_an_attached_console_reaches_the_application_that_asked
 }
 
 /// The session half of the test above: gives the console virtual-terminal input as a terminal
-/// application does, asks for clicks in the SGR encoding once the gate exists, and prints what it was
-/// given as the first two reports, each of which ends in the letter that says whether a button went
-/// down or came up.
+/// application does, asks for clicks in the SGR encoding once the gate exists, and prints what it
+/// was given as the first two reports, each of which ends in the letter that says whether a button
+/// went down or came up.
 fn mouse_reader_in_the_session() {
     use kr_cli::platform::ControllingTerminal;
 
@@ -1807,4 +1811,237 @@ fn mouse_reader_in_the_session() {
 /// `bytes` as lower-case hexadecimal.
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The variable that makes this test binary, started in the session's console, ask for the mouse
+/// and then stop asking, each once a file of that name exists in the directory the variable gives.
+const MOUSE_ASKER: &str = "KR_ATTACH_MOUSE_ASKER";
+
+/// The variable that makes this test binary, started in a console of its own, run the console half
+/// of the test of the console's mouse.
+const MOUSE_MODE_PROBE: &str = "KR_ATTACH_MOUSE_MODE_PROBE";
+
+/// The console's input mode flag that has it report the mouse as records.
+const ENABLE_MOUSE_INPUT: u32 = 0x0010;
+
+/// The console's input mode flag that has it select text with the mouse.
+const ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
+
+/// KR-REQ-08.56: the console an attachment runs in is given the mouse for as long as the session's
+/// application asks to be told of it, and has the mouse back, to select text with, when the
+/// application stops asking.
+///
+/// This test binary is started in a pseudo-console of its own, as the outer console of a person's
+/// attachment, and there it reads the console's input mode, starts the real `kr attach` for a
+/// session in that console, and reads the mode again each time the application in the session
+/// changes what it asks of the mouse: while it asks the console reports the mouse and no longer
+/// selects text with it, and once it stops the console selects text again as it did before. The
+/// test, outside, has the application ask and stop by creating files, and closes the session, and
+/// the probe reads the mode a last time once `kr attach` has gone: it is the one before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_console_an_attachment_ran_in_is_given_the_mouse_while_the_application_asks_for_it() {
+    const NAME: &str =
+        "the_console_an_attachment_ran_in_is_given_the_mouse_while_the_application_asks_for_it";
+    if std::env::var_os(MOUSE_MODE_PROBE).is_some() {
+        mouse_mode_probe_in_the_console();
+        return;
+    }
+    if std::env::var_os(MOUSE_ASKER).is_some() {
+        mouse_asker_in_the_session();
+        return;
+    }
+
+    let host = WorkerHost::start().await;
+    let (session_id, dimensions) = host
+        .kr_new(&["--shell-mode", "native_compat", "--shell", &command_shell()])
+        .await
+        .session();
+    let environment = host.tree.environment();
+    let mut typist = WorkerTerminal::attach(&environment, session_id, dimensions).await;
+    let gates = tempfile::tempdir().expect("a directory on the internal disk");
+    let asker = std::env::current_exe().expect("this test binary");
+    typist
+        .type_line(&format!(
+            "set {MOUSE_ASKER}={}&& \"{}\" --exact {NAME} --nocapture --test-threads=1",
+            gates.path().display(),
+            asker.display()
+        ))
+        .await;
+    typist
+        .shown(
+            "kr-asker-waiting",
+            "the application waits to ask for the mouse",
+        )
+        .await;
+
+    let mut probe = Probe::start_marked(
+        NAME,
+        MOUSE_MODE_PROBE,
+        &[
+            (
+                "KR_RUNTIME_DIR",
+                host.tree.paths().runtime_root().display().to_string(),
+            ),
+            (
+                "KR_STATE_DIR",
+                host.tree.paths().state_root().display().to_string(),
+            ),
+            ("KR_PROBE_SESSION", session_id.to_string()),
+            ("KR_PROBE_KR", kr().display().to_string()),
+        ],
+    );
+    probe.waits_for("kr-probe:inside:");
+    // The command draws the session's screen in the console, so it is attached to the session once
+    // the console shows what the application has written.
+    probe.waits_for("kr-asker-waiting");
+    std::fs::write(gates.path().join("ask"), b"ask").expect("the file the application waits for");
+    typist
+        .shown("kr-asker-asking", "the application asked for the mouse")
+        .await;
+    probe.waits_for("kr-probe:asked:");
+    std::fs::write(gates.path().join("stop"), b"stop").expect("the file the application waits for");
+    typist
+        .shown(
+            "kr-asker-stopped",
+            "the application stopped asking for the mouse",
+        )
+        .await;
+    probe.waits_for("kr-probe:released:");
+    let closed = host.kr(&["close", &session_id.to_string()], &[]).await;
+    assert!(
+        closed.status.success(),
+        "kr close: {}{}",
+        String::from_utf8_lossy(&closed.stdout),
+        String::from_utf8_lossy(&closed.stderr)
+    );
+    probe.waits_for("kr-probe:end");
+    probe.report();
+    let shown = probe.shown();
+    let before = probed_modes(&shown, "kr-probe:before:");
+    let asked = probed_modes(&shown, "kr-probe:asked:");
+    let released = probed_modes(&shown, "kr-probe:released:");
+    let after = probed_modes(&shown, "kr-probe:after:");
+    assert_ne!(
+        asked.0 & ENABLE_MOUSE_INPUT,
+        0,
+        "the console was not asked to report the mouse while the application asked for it: \
+         {asked:x?}"
+    );
+    assert_eq!(
+        asked.0 & ENABLE_QUICK_EDIT_MODE,
+        0,
+        "the console went on selecting text with the mouse the application asked for: {asked:x?}"
+    );
+    assert_eq!(
+        released.0 & ENABLE_MOUSE_INPUT,
+        0,
+        "the console still reports the mouse after the application stopped asking: {released:x?}"
+    );
+    assert_eq!(
+        released.0 & ENABLE_QUICK_EDIT_MODE,
+        before.0 & ENABLE_QUICK_EDIT_MODE,
+        "the console does not select text as it did before the mouse was asked for (before \
+         {before:x?}, released {released:x?})"
+    );
+    assert_eq!(
+        after, before,
+        "the console's modes after the attachment are not the ones before it (before \
+         {before:x?}, after {after:x?}): {shown:?}"
+    );
+}
+
+/// The session half of the test above: asks to be told of clicks once the file `ask` exists in the
+/// directory the variable gives, and stops asking once the file `stop` does. The console is given
+/// the output mode that lets the sequences through, as a terminal application has it.
+fn mouse_asker_in_the_session() {
+    use kr_cli::platform::ControllingTerminal;
+
+    let directory = PathBuf::from(std::env::var_os(MOUSE_ASKER).expect("the directory to wait in"));
+    let console = ControllingTerminal::open().expect("this process has a console");
+    let _modes = console
+        .enter_raw_mode()
+        .expect("the console is given virtual-terminal input");
+    let wait_for = |name: &str| {
+        while !directory.join(name).exists() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    print!("kr-asker-waiting\r\n");
+    std::io::stdout().flush().expect("flushes the first word");
+    wait_for("ask");
+    print!("\x1b[?1000hkr-asker-asking\r\n");
+    std::io::stdout().flush().expect("flushes the request");
+    wait_for("stop");
+    print!("\x1b[?1000lkr-asker-stopped\r\n");
+    std::io::stdout()
+        .flush()
+        .expect("flushes the end of the request");
+}
+
+/// The console half of the test of the console's mouse, run in a console of its own: waits for the
+/// input mode to say what the console does with the mouse, each time the application changes what
+/// it asks, and prints the mode it reads.
+fn mouse_mode_probe_in_the_console() {
+    use kr_cli::platform::ControllingTerminal;
+
+    let console = ControllingTerminal::open().expect("this process has a console");
+    let before = console.modes().expect("the console's modes");
+    println!("kr-probe:before:{:x}:{:x}", before.input, before.output);
+    let variable = |name: &str| {
+        std::env::var_os(name).unwrap_or_else(|| panic!("{name} is set for the probe"))
+    };
+    let mut attach = std::process::Command::new(variable("KR_PROBE_KR"))
+        .arg("attach")
+        .arg(variable("KR_PROBE_SESSION"))
+        .spawn()
+        .expect("starts kr attach");
+    // The mode that says the console does what `wanted` says, once the command has put it there.
+    let waits_for = |attach: &mut std::process::Child, what: &str, wanted: &dyn Fn(u32) -> bool| {
+        let deadline = Instant::now() + LIVENESS_DEADLINE;
+        loop {
+            let now = console.modes().expect("the console's modes");
+            if wanted(now.input) {
+                return now;
+            }
+            assert!(
+                attach.try_wait().expect("the command's state").is_none(),
+                "kr attach ended before {what}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the console's input mode did not show {what}: {:x}",
+                now.input
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    // The command has taken the console over once its mode does not report the mouse: the console
+    // the probe starts in does, as every console does until a command that reads the keys itself
+    // says otherwise.
+    let inside = waits_for(&mut attach, "the console taken over", &|input| {
+        input & ENABLE_MOUSE_INPUT == 0
+    });
+    println!("kr-probe:inside:{:x}:{:x}", inside.input, inside.output);
+    let asked = waits_for(
+        &mut attach,
+        "the mouse reported while the application asks for it",
+        &|input| input & ENABLE_MOUSE_INPUT != 0,
+    );
+    println!("kr-probe:asked:{:x}:{:x}", asked.input, asked.output);
+    let released = waits_for(
+        &mut attach,
+        "the mouse given back after the application stopped asking",
+        &|input| input & ENABLE_MOUSE_INPUT == 0,
+    );
+    println!(
+        "kr-probe:released:{:x}:{:x}",
+        released.input, released.output
+    );
+    let status = attach.wait().expect("kr attach ends");
+    let after = console.modes().expect("the console's modes");
+    println!(
+        "kr-probe:after:{:x}:{:x}:attach {status}",
+        after.input, after.output
+    );
+    println!("kr-probe:end");
 }
