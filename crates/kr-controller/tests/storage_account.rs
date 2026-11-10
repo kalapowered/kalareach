@@ -925,3 +925,108 @@ async fn a_shipped_controller_refuses_a_plain_http_storage_origin_before_it_send
         }
     }
 }
+
+/// KR-REQ-20.19: an account for a storage service whose scope in the secret store has the managed
+/// account's name is refused before the account exists, so nothing is settled in that scope: not
+/// the managed account's queued revocation, which holds a refresh token and no issuer and which the
+/// storage service would otherwise be sent. A truncated digest names a scope, and one for another
+/// origin cannot be made to equal the managed one's here, so the case is the one origin the managed
+/// account is at: the scope is the same name by construction. The control is a storage service at
+/// another origin, which is built.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_storage_account_whose_scope_is_the_managed_accounts_is_refused_before_it_exists() {
+    use kr_controller::account::{HostAccount, Service};
+    use kr_controller::config::Outbound;
+    use kr_protocol::service::GatewayOrigin;
+
+    let host = kr_ipc::testing::TempHost::create();
+    let environment = host.environment();
+    environment.create().expect("the environment's directories");
+    let listener = |what: &str| {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener");
+        listener
+            .set_nonblocking(true)
+            .unwrap_or_else(|error| panic!("{what}: {error}"));
+        listener
+    };
+    let managed_at = listener("the managed service");
+    let managed_origin = GatewayOrigin::new(format!(
+        "http://127.0.0.1:{}",
+        managed_at.local_addr().expect("an address").port()
+    ))
+    .expect("an origin");
+    let other_at = listener("another service");
+    let other_origin = GatewayOrigin::new(format!(
+        "http://127.0.0.1:{}",
+        other_at.local_addr().expect("an address").port()
+    ))
+    .expect("an origin");
+    let opened = kr_crypto::store::open_store_in(&environment.secrets_dir())
+        .expect("the daemon's secret store");
+    let store: Arc<dyn kr_crypto::store::SecretStore> = Arc::from(opened.store);
+    let closed = || Outbound::Closed("the service is not asked".to_owned());
+
+    // A sign-out that could not reach the managed service leaves its revocation queued in the
+    // managed scope.
+    let seeding = HostAccount::new(
+        Arc::clone(&store),
+        host.environment_id(),
+        environment.runtime_root(),
+        Ok(Service::at_origin(&managed_origin, Vec::new(), closed())),
+        None,
+    );
+    seeding
+        .keep_for_test(grant("managed-token", &["openid", "voice"]))
+        .await;
+    seeding.sign_out().await.expect("the host signs out");
+    drop(seeding);
+
+    // The managed account, as the daemon holds it, sends nothing: its route is closed.
+    let managed = HostAccount::new(
+        Arc::clone(&store),
+        host.environment_id(),
+        environment.runtime_root(),
+        Ok(Service::at_origin(&managed_origin, Vec::new(), closed())),
+        None,
+    );
+
+    // A storage service at the same origin has the same scope, and no account is built for it.
+    let refused = HostAccount::for_storage(
+        &managed,
+        Arc::clone(&store),
+        host.environment_id(),
+        Ok(Service::at_origin(
+            &managed_origin,
+            vec![kr_client::services::account::BACKUP_WRITE_SCOPE],
+            Outbound::Direct,
+        )),
+        None,
+    )
+    .err()
+    .expect("a storage service whose scope is the managed account's is refused");
+    assert!(
+        matches!(&refused, kr_controller::ControllerError::NotConfigured(text)
+            if text.contains("storage.origin")),
+        "{refused}"
+    );
+
+    // The control: a storage service at another origin has a scope of its own, and is built.
+    HostAccount::for_storage(
+        &managed,
+        Arc::clone(&store),
+        host.environment_id(),
+        Ok(Service::at_origin(
+            &other_origin,
+            vec![kr_client::services::account::BACKUP_WRITE_SCOPE],
+            Outbound::Direct,
+        )),
+        None,
+    )
+    .unwrap_or_else(|error| panic!("a storage account at another origin is built: {error}"));
+
+    let connected = |listener: &std::net::TcpListener| !matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock);
+    assert!(
+        !connected(&managed_at),
+        "nothing was sent to the service whose scope is the managed account's"
+    );
+}

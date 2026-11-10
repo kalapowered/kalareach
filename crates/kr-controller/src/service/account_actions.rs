@@ -57,29 +57,6 @@ fn refuse_plain_http(origin: &GatewayOrigin, plain_http_permitted: bool) -> Resu
     Ok(())
 }
 
-/// Refuses two accounts whose grants would be kept under one name in the secret store.
-///
-/// A scope is named by a truncated digest of the origin, and a revocation that waits to be sent
-/// holds a grant identifier and a refresh token and no issuer, so a storage origin chosen to share
-/// the managed account's name would read the managed queue and send live managed refresh tokens to
-/// the storage service.
-///
-/// # Errors
-///
-/// Returns [`ControllerError::NotConfigured`] naming `storage.origin`.
-fn refuse_equal_scopes(managed: &str, storage: &str) -> Result<()> {
-    if managed == storage {
-        return Err(ControllerError::NotConfigured(format!(
-            "{} in this host's configuration document ({}) names a service whose sign-in would be \
-             kept under the same name as the managed account's: name the service by another \
-             origin",
-            kr_protocol::hostinfo::configuration::STORAGE_ORIGIN.key,
-            kr_protocol::hostinfo::configuration::FILE_NAME,
-        )));
-    }
-    Ok(())
-}
-
 impl Controller {
     /// The host's managed account, through the proxy the configuration document selects.
     ///
@@ -159,8 +136,9 @@ impl Controller {
     ///
     /// The account asks for `backup.write` and hands out that scope and no other. It is built
     /// after the two rules that keep it from sending an account token where none should go: the
-    /// storage origin is served over https in a shipped build, and its scope in the secret store
-    /// has a name of its own, because building it starts settling what that scope holds.
+    /// storage origin is served over https in a shipped build, which is checked here, and its scope
+    /// in the secret store has a name of its own, which the account's constructor checks before it
+    /// exists, because building it starts settling what that scope holds.
     ///
     /// # Errors
     ///
@@ -187,10 +165,6 @@ impl Controller {
             storage,
         )?;
         refuse_plain_http(&storage, PLAIN_HTTP_PERMITTED)?;
-        refuse_equal_scopes(
-            &crate::account::scope_of(environment_id, &managed_origin),
-            &crate::account::scope_of(environment_id, storage.as_str()),
-        )?;
         let route = Self::outbound_of(started)?;
         let refused = matches!(&route, Outbound::Closed(_)).then_some(SignInUnavailable::NotUsable);
         let service = Service::at_origin(
@@ -198,13 +172,7 @@ impl Controller {
             vec![kr_client::services::account::BACKUP_WRITE_SCOPE],
             route,
         );
-        Ok(Some(HostAccount::for_storage(
-            managed,
-            store,
-            environment_id,
-            Ok(service),
-            refused,
-        )))
+        HostAccount::for_storage(managed, store, environment_id, Ok(service), refused).map(Some)
     }
 
     /// This host's own sign-in to the managed account service.
@@ -340,7 +308,7 @@ impl Controller {
 mod tests {
     use kr_protocol::service::GatewayOrigin;
 
-    use super::{refuse_equal_scopes, refuse_plain_http};
+    use super::refuse_plain_http;
 
     fn origin(text: &str) -> GatewayOrigin {
         GatewayOrigin::new(text).expect("an origin")
@@ -365,15 +333,5 @@ mod tests {
         let owner = origin("https://owner.example");
         assert!(refuse_plain_http(&owner, false).is_ok());
         assert!(refuse_plain_http(&owner, true).is_ok());
-    }
-
-    /// Two accounts whose grants would be kept under one name in the secret store are refused, and
-    /// the refusal names the key. Two names that differ are not.
-    #[test]
-    fn a_storage_account_whose_scope_has_the_managed_accounts_name_is_refused() {
-        let refusal = refuse_equal_scopes("env/host-account/aa", "env/host-account/aa")
-            .expect_err("a refusal");
-        assert!(refusal.to_string().contains("storage.origin"), "{refusal}");
-        assert!(refuse_equal_scopes("env/host-account/aa", "env/host-account/bb").is_ok());
     }
 }

@@ -358,28 +358,46 @@ impl HostAccount {
     /// whatever its grant holds. A sign-in of either account ends a waiting sign-in of the other,
     /// because the two share the one address a browser comes back to.
     ///
-    /// Starts settling what an earlier run left in its scope at once, so a caller checks what must
-    /// hold before this account exists first.
-    #[must_use]
+    /// A scope is named by a truncated digest of its service's origin, and a revocation that waits
+    /// to be sent holds a grant identifier and a refresh token and no issuer. A storage service
+    /// whose scope has the managed account's name would read the managed queue and be sent live
+    /// managed refresh tokens, so it is refused here, before the account exists and before
+    /// anything is settled in its scope: building the account starts settling at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::NotConfigured`] naming `storage.origin` when the two scopes have
+    /// one name.
     pub fn for_storage(
         managed: &Self,
         store: Arc<dyn SecretStore>,
         environment_id: EnvironmentId,
         service: std::result::Result<Service, SignInUnavailable>,
         refused: Option<SignInUnavailable>,
-    ) -> Self {
+    ) -> Result<Self> {
+        if let (Ok(service), Some(held)) = (&service, &managed.inner.held)
+            && scope_of(environment_id, &service.origin) == scope_of(environment_id, &held.origin)
+        {
+            return Err(ControllerError::NotConfigured(format!(
+                "{} in this host's configuration document ({}) names a service whose sign-in \
+                 would be kept under the same name as the managed account's: name the service by \
+                 another origin",
+                kr_protocol::hostinfo::configuration::STORAGE_ORIGIN.key,
+                kr_protocol::hostinfo::configuration::FILE_NAME,
+            )));
+        }
         let accounts = Arc::clone(&managed.inner.accounts);
         if let Ok(service) = &service {
             let _ = accounts.storage_origin.set(service.origin.clone());
         }
-        Self::build(
+        Ok(Self::build(
             store,
             environment_id,
             service,
             refused,
             accounts,
             Some(BACKUP_WRITE_SCOPE),
-        )
+        ))
     }
 
     fn build(
