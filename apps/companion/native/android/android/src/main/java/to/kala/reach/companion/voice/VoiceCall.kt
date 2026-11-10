@@ -163,6 +163,7 @@ class VoiceCall private constructor(
      */
     private val audioDevice: JavaAudioDeviceModule =
         JavaAudioDeviceModule.builder(context)
+            .setAudioSource(RECORDER_SOURCE)
             .setAudioRecordStateCallback(
                 object : JavaAudioDeviceModule.AudioRecordStateCallback {
                     override fun onWebRtcAudioRecordStart() {
@@ -281,7 +282,10 @@ class VoiceCall private constructor(
         /** The label the provider's protocol gives the channel its events arrive on. */
         const val EVENTS_LABEL = "oai-events"
 
-        /** The source the audio device takes this call's audio from: WebRTC's default for a call. */
+        /**
+         * The source the audio device takes this call's audio from. The device is built with it, and
+         * the recording the system lists for the call is the one from this source.
+         */
         const val RECORDER_SOURCE = MediaRecorder.AudioSource.VOICE_COMMUNICATION
 
         /** How long the call's thread is given to read its record before the proof is given up on. */
