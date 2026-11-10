@@ -10,11 +10,12 @@
 
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, type FakeHostControls } from '../../src/host/fake'
 import type { HostPort } from '../../src/host/port'
+import { VoiceGrantEntry } from '../../src/voice/VoiceGrantEntry'
 import { VoiceRoute } from '../../src/voice/VoiceRoute'
 
 afterEach(() => {
@@ -24,6 +25,13 @@ afterEach(() => {
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
 const CLOSE_SENTENCE = 'Close a session, after a confirmation on an unlocked screen.'
+
+/** Two of the sentences the screen lists for what the default grant permits. */
+const NAVIGATE_SENTENCE = 'Move between the sessions this grant covers.'
+const STATUS_SENTENCE = 'Read what a session is doing.'
+
+/** The environment of a host other than the one the fake host starts as. */
+const OTHER_HOST = '3f1a2c40-11aa-4b2c-9d3e-000000000002'
 
 function start(setup?: (controls: FakeHostControls) => void): {
   controls: FakeHostControls
@@ -207,30 +215,33 @@ describe('what voice may do', () => {
   })
 
   // What is shown is bound to the host it was read from: when the host is another by the time the
-  // person presses, nothing is sent, and the entry is read again.
+  // person presses, nothing is sent, and the screen above the entry is read again with it.
   it('sends nothing when the host changed between what was shown and the press', async () => {
-    const { controls, settled } = start((fake) => {
-      fake.speechReachesTheHost(true)
-    })
+    const { port, controls } = fakeHost()
+    controls.speechReachesTheHost(true)
+    const onChanged = vi.fn()
+    render(<VoiceGrantEntry port={port} sessionNames={{}} onChanged={onChanged} />)
     const entry = await screen.findByTestId('voice-grant-entry')
     await userEvent.click(within(entry).getByRole('checkbox', { name: new RegExp(CLOSE_SENTENCE) }))
-    await settled()
 
     act(() => {
-      controls.switchHost('3f1a2c40-11aa-4b2c-9d3e-000000000002')
+      controls.switchHost(OTHER_HOST)
     })
-    await userEvent.click(within(screen.getByTestId('voice-grant-entry')).getByTestId('voice-grant-entry-allow'))
+    await userEvent.click(within(entry).getByTestId('voice-grant-entry-allow'))
 
     expect((await screen.findByTestId('voice-grant-entry-failure')).textContent).toContain('has changed')
     expect(controls.voiceAllows).toHaveLength(0)
+    expect(onChanged).toHaveBeenCalledTimes(1)
   })
 
-  // The grant changing under the screen is the same: what was shown is not what is changed.
-  it('sends nothing when the grant changed between what was shown and the press', async () => {
+  // The grant changing under the screen is the same: what was shown is not what is changed, and
+  // the list of what speaking will be allowed to do, above the entry, is read again with it.
+  it('sends nothing when the grant changed between what was shown and the press, and shows the new grant above', async () => {
     const { controls, settled } = start((fake) => {
       fake.speechReachesTheHost(true)
     })
     const entry = await screen.findByTestId('voice-grant-entry')
+    expect(screen.getByText(STATUS_SENTENCE)).toBeInTheDocument()
     await userEvent.click(within(entry).getByRole('checkbox', { name: new RegExp(CLOSE_SENTENCE) }))
     await settled()
 
@@ -239,6 +250,50 @@ describe('what voice may do', () => {
 
     expect((await screen.findByTestId('voice-grant-entry-failure')).textContent).toContain('has changed')
     expect(controls.voiceAllows).toHaveLength(0)
+    await waitFor(() => {
+      expect(screen.queryByText(STATUS_SENTENCE)).toBeNull()
+    })
+    expect(screen.getByText(NAVIGATE_SENTENCE)).toBeInTheDocument()
+  })
+
+  // What was read from one host is not shown for the next: when the connection moves to another
+  // host, the entry and the list above it are gone until the host in use has been read, so that no
+  // press can act on the one that was left; a change is then sent to the host in use.
+  it('clears what it read when the connection moves to another host, and reads the new one', async () => {
+    const { controls, settled } = start((fake) => {
+      fake.speechReachesTheHost(true)
+    })
+    await screen.findByTestId('voice-grant-entry')
+    expect(screen.getByText(STATUS_SENTENCE)).toBeInTheDocument()
+    await settled()
+
+    const held = controls.hold('voicePrepare')
+    controls.standingVoiceGrant(['navigate'])
+    act(() => {
+      controls.switchHost(OTHER_HOST)
+    })
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('voice-grant-entry')).toBeNull()
+    })
+    expect(screen.queryByText(STATUS_SENTENCE)).toBeNull()
+    expect(screen.queryByText(NAVIGATE_SENTENCE)).toBeNull()
+
+    await act(async () => {
+      held.release()
+      await Promise.resolve()
+    })
+    const entry = await screen.findByTestId('voice-grant-entry')
+    await waitFor(() => {
+      expect(screen.getByText(NAVIGATE_SENTENCE)).toBeInTheDocument()
+    })
+    expect(screen.queryByText(STATUS_SENTENCE)).toBeNull()
+    await userEvent.click(within(entry).getByRole('checkbox', { name: new RegExp(CLOSE_SENTENCE) }))
+    await userEvent.click(within(entry).getByTestId('voice-grant-entry-allow'))
+    await waitFor(() => {
+      expect(controls.voiceAllows).toHaveLength(1)
+    })
+    expect(controls.voiceAllows[0].environmentId).toBe(OTHER_HOST)
   })
 
   // Section 9: a replacement ends the calls under the grant it replaces, and a withdrawal is not

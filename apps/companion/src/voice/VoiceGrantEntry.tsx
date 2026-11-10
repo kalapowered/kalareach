@@ -12,7 +12,8 @@
  *
  * What is shown is bound to the host it was read from: the change is sent for that host's
  * environment, and is not sent when the grant has changed or the host is another by the time the
- * person presses.
+ * person presses. A press that finds either changed has the screen read what a call would be again,
+ * so that what is shown above this entry describes the host and the grant the entry shows.
  *
  * It is offered only while a spoken request can reach the host at all: a person is not asked to
  * allow what cannot happen.
@@ -85,7 +86,10 @@ export function VoiceGrantEntry({
   readonly port: HostPort
   /** How the host names each session, where it said. */
   readonly sessionNames: Readonly<Record<string, string>>
-  /** Called once the host has written the new grant, so the screen reads what a call would be. */
+  /**
+   * Called once the host has written the new grant, and when the grant or the host is found to
+   * have changed since it was shown, so the screen reads what a call would be again.
+   */
   readonly onChanged: () => void
 }): ReactNode {
   const id = useId()
@@ -137,6 +141,7 @@ export function VoiceGrantEntry({
           setFailure('What voice may do has changed since this was shown. It is shown again: check it, then change it.')
           setReading((count) => count + 1)
           setEdits(new Map())
+          onChanged()
           return
         }
         // Every action of the grant the person did not tick or clear stays as it is.

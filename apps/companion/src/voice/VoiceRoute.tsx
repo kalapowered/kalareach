@@ -209,6 +209,13 @@ export function VoiceRoute({
   const [needsGrant, setNeedsGrant] = useState<string | null>(null)
   /** The sessions the person allowed voice for here, which the preparation is then asked about. */
   const [allowed, setAllowed] = useState<readonly string[] | null>(null)
+  /**
+   * The environment of the host this screen reads from, once it has read one, and how many times
+   * the connection has moved to another host. What was read from one host is not shown for the
+   * next: the choice is cleared and read again from the host in use.
+   */
+  const hostEnvironment = useRef<string | null>(null)
+  const [hostMoves, setHostMoves] = useState(0)
   const [call, setCall] = useState<RunningCall | null>(null)
   const [busy, setBusy] = useState(false)
   /**
@@ -345,12 +352,16 @@ export function VoiceRoute({
    * names the grant, and a start that names the one read before the change is refused.
    */
   const refreshChoice = useCallback(() => {
+    const host = hostEnvironment.current
     void prepare().then(
       (prepared) => {
+        // A read made before the connection moved to another host describes the host it left.
+        if (hostEnvironment.current !== host) return
         setNeedsGrant(null)
         setChoice(prepared)
       },
       (error: unknown) => {
+        if (hostEnvironment.current !== host) return
         setNotice(failureMessage(error))
       }
     )
@@ -377,7 +388,7 @@ export function VoiceRoute({
     return () => {
       current = false
     }
-  }, [prepare])
+  }, [prepare, hostMoves])
 
   // The turn the host says the agent is on, while a call runs. Cancelling one names the turn, the
   // instance running it and the binding revision it was read at, which only the session's worker
@@ -625,6 +636,17 @@ export function VoiceRoute({
         (state) => {
           setHostReachable(state.connected)
           setRights(state.connected ? state.rights : null)
+          if (!state.connected || state.environment_id === null) return
+          const left = hostEnvironment.current
+          hostEnvironment.current = state.environment_id
+          if (left !== null && left !== state.environment_id) {
+            // What is shown was read from the host the connection left. Nothing of it can be acted
+            // on for this one: it is cleared, and asked again of the host in use.
+            setChoice(null)
+            setNeedsGrant(null)
+            setAllowed(null)
+            setHostMoves((count) => count + 1)
+          }
         },
         () => {
           setHostReachable(false)

@@ -1008,6 +1008,7 @@ export type HeldRead =
   | 'deviceList'
   | 'grantList'
   | 'voiceAllow'
+  | 'voicePrepare'
 
 /** The reads of one kind a test is holding. */
 export interface HeldReads {
@@ -2677,31 +2678,32 @@ export function fakeHost(
      * first one fails. The mute controls and the closure below therefore touch no switch at all.
      */
 
-    voicePrepare: (params) => {
-      requireConnection()
-      if (voiceGrantMissing !== null) refuse('PERMISSION_DENIED', voiceGrantMissing)
-      const asked = requireFields(params, ['session_ids', 'selected'])
-      const selected = Array.isArray(asked.selected) ? (asked.selected as readonly string[]) : []
-      const sessions = Array.isArray(asked.session_ids) ? (asked.session_ids as string[]) : []
-      return Promise.resolve({
-        ...VOICE_SCOPE,
-        statement: statementOf(voiceStanding),
-        session_ids:
-          sessions.length > 0
-            ? sessions.filter((session) => voiceStandingSessions.includes(session))
-            : [...voiceStandingSessions],
-        prepared: preparedFor(voice),
-        selected: VOICE_EXCLUDED_CLASSES.filter((each) => selected.includes(each)),
-        managed:
-          voice.terms === 'unread'
-            ? null
-            : { ...VOICE_TERMS, enabled: voice.terms === 'published', rate: { ...voice.rate } },
-        managed_unavailable:
-          voice.terms === 'unread'
-            ? "This host could not read the managed service's terms, so a managed call cannot start from here: the managed service did not answer"
-            : null
-      })
-    },
+    voicePrepare: (params) =>
+      reading('voicePrepare', () => {
+        requireConnection()
+        if (voiceGrantMissing !== null) refuse('PERMISSION_DENIED', voiceGrantMissing)
+        const asked = requireFields(params, ['session_ids', 'selected'])
+        const selected = Array.isArray(asked.selected) ? (asked.selected as readonly string[]) : []
+        const sessions = Array.isArray(asked.session_ids) ? (asked.session_ids as string[]) : []
+        return {
+          ...VOICE_SCOPE,
+          statement: statementOf(voiceStanding),
+          session_ids:
+            sessions.length > 0
+              ? sessions.filter((session) => voiceStandingSessions.includes(session))
+              : [...voiceStandingSessions],
+          prepared: preparedFor(voice),
+          selected: VOICE_EXCLUDED_CLASSES.filter((each) => selected.includes(each)),
+          managed:
+            voice.terms === 'unread'
+              ? null
+              : { ...VOICE_TERMS, enabled: voice.terms === 'published', rate: { ...voice.rate } },
+          managed_unavailable:
+            voice.terms === 'unread'
+              ? "This host could not read the managed service's terms, so a managed call cannot start from here: the managed service did not answer"
+              : null
+        }
+      }),
 
     voiceScope: () =>
       Promise.resolve({
