@@ -265,6 +265,7 @@ fn voice_calls(app: &tauri::AppHandle) -> voice::Calls {
     match voice::Service::managed() {
         Ok(service) => voice::Calls::on_phone(
             Arc::new(NativeCalls::new(PluginCommands::new(app.clone()))),
+            verify::pairing_ceremony(app),
             service,
             voice::Timings::default(),
             // What a call left owed, and the note, are kept in the application's own directory.
@@ -307,6 +308,7 @@ fn manage_harness(
     app.manage(harness.account());
     app.manage(voice::Calls::on_phone(
         Arc::new(NativeCalls::new(PluginCommands::new(app.clone()))),
+        verify::pairing_ceremony(app),
         harness.service()?,
         voice::Timings::default(),
         kept,

@@ -17,6 +17,7 @@
 
 mod advice;
 mod cause;
+mod confirm;
 mod delegation;
 mod host;
 mod kept;
@@ -35,6 +36,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use companion_platform::call::{CallId, CallPlatform, Mute};
+use kr_client::pairing::owner::Ceremony;
 use kr_client::services::account::SignedInAccount;
 use kr_client::services::voice::{ManagedVoiceBroker, ManagedVoiceService};
 use kr_client::services::voice_control::ControlConnector;
@@ -291,6 +293,9 @@ pub(crate) fn now_ms() -> u64 {
 /// What the owner and the commands share.
 pub(crate) struct Shared {
     platform: Arc<dyn CallPlatform>,
+    /// The platform's ceremony, which asks the person to confirm what a spoken request needs
+    /// confirmed on the unlocked screen.
+    ceremony: Arc<dyn Ceremony>,
     service: Service,
     timings: Timings,
     slot: Mutex<Option<(u64, mpsc::Sender<Cmd>)>>,
@@ -323,6 +328,10 @@ pub(crate) struct Shared {
     /// What the owner has read and acted on, which a case waits for instead of a delay.
     #[cfg(any(test, feature = "testing"))]
     handled: Handled,
+    /// How far ahead of the time the system says this device's clock reads a confirmation's expiry,
+    /// in milliseconds: a case's way of making the clock disagree with the host's.
+    #[cfg(any(test, feature = "testing"))]
+    clock_ahead_ms: std::sync::atomic::AtomicU64,
 }
 
 /// What the owner has read and acted on. A case that has to act after the owner did, and not after
@@ -335,6 +344,9 @@ struct Handled {
     announcements: Mutex<Vec<(String, Option<u64>)>>,
     /// The delegations whose capture proof the owner has acted on.
     proofs: Mutex<Vec<String>>,
+    /// The delegations whose confirmation asked for a capture proof after its ceremony and whose
+    /// answer the owner has acted on.
+    seals: Mutex<Vec<String>>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -347,6 +359,15 @@ impl Handled {
             .push((id, offset_ms));
     }
 
+    /// The owner acted on the answer to the proof the confirmation of the delegation `id` asked
+    /// for after its ceremony.
+    fn seal(&self, id: &str) {
+        self.seals
+            .lock()
+            .expect("the record is not poisoned")
+            .push(id.to_owned());
+    }
+
     /// The owner acted on the answer to the proof the delegation `id` asked for.
     fn proof(&self, id: &str) {
         self.proofs
@@ -357,6 +378,23 @@ impl Handled {
 }
 
 impl Shared {
+    /// The time this device reads a confirmation's expiry against, in milliseconds since the epoch:
+    /// its own clock. The host's is the authority for whether a confirmation has run out; this one
+    /// only stops the phone asking a person for, or signing, what its own clock says is over.
+    pub(crate) fn confirmation_now_ms(&self) -> u64 {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            now_ms().saturating_add(
+                self.clock_ahead_ms
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            )
+        }
+        #[cfg(not(any(test, feature = "testing")))]
+        {
+            now_ms()
+        }
+    }
+
     /// Whether a spoken delegation may be handed to the host, read as a call begins.
     #[cfg(any(test, feature = "testing", debug_assertions))]
     pub(crate) fn accepts_host_delegations(&self) -> bool {
@@ -972,6 +1010,7 @@ impl Calls {
     #[must_use]
     pub fn on_phone(
         platform: Arc<dyn CallPlatform>,
+        ceremony: Arc<dyn Ceremony>,
         service: Service,
         timings: Timings,
         kept: Kept,
@@ -991,6 +1030,7 @@ impl Calls {
         Self {
             shared: Some(Arc::new(Shared {
                 platform,
+                ceremony,
                 service,
                 timings,
                 slot: Mutex::new(None),
@@ -1007,6 +1047,8 @@ impl Calls {
                 accept: std::sync::atomic::AtomicBool::new(ACCEPT_HOST_DELEGATIONS),
                 #[cfg(any(test, feature = "testing"))]
                 handled: Handled::default(),
+                #[cfg(any(test, feature = "testing"))]
+                clock_ahead_ms: std::sync::atomic::AtomicU64::new(0),
             })),
         }
     }
@@ -1020,6 +1062,26 @@ impl Calls {
                 .accept
                 .store(accept, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    /// Makes this device's clock read `ahead_ms` milliseconds ahead of the host's where a
+    /// confirmation's expiry is concerned. For cases, which cannot wait out a confirmation's life.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn run_the_confirmation_clock_ahead(&self, ahead_ms: u64) {
+        if let Some(shared) = &self.shared {
+            shared
+                .clock_ahead_ms
+                .store(ahead_ms, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Whether the calls this makes hand spoken requests to the host: the constant every shipped
+    /// build holds as false. What a person is asked to allow is only worth asking while it is true.
+    #[must_use]
+    pub fn hands_spoken_requests_to_the_host(&self) -> bool {
+        self.shared
+            .as_ref()
+            .is_some_and(|shared| shared.accepts_host_delegations())
     }
 
     /// Whether an owner has read the voice service's announcement of the delegation `id` at
@@ -1036,6 +1098,23 @@ impl Calls {
                 .expect("the record is not poisoned")
                 .iter()
                 .any(|(known, offset)| known == id && *offset == Some(offset_ms))
+        })
+    }
+
+    /// Whether an owner has acted on the answer to the capture proof the confirmation of the
+    /// delegation `id` asked for after its ceremony. For cases, which let the news behind that
+    /// proof's marker through only once it has.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn has_handled_seal(&self, id: &str) -> bool {
+        self.shared.as_ref().is_some_and(|shared| {
+            shared
+                .handled
+                .seals
+                .lock()
+                .expect("the record is not poisoned")
+                .iter()
+                .any(|known| known == id)
         })
     }
 
@@ -1396,6 +1475,7 @@ mod tests {
     fn calls_with_owner_nine_after_seven_ended() -> Calls {
         let calls = Calls::on_phone(
             Arc::new(NoNativeCode),
+            Arc::new(crate::verify::NoCeremony),
             Service::managed().expect("a service"),
             Timings::default(),
             Kept::nowhere(),

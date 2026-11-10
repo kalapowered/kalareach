@@ -1059,6 +1059,13 @@ pub struct LinkControl {
     ended_asks: tokio::sync::Notify,
 }
 
+/// A change a case makes to the voice result that carries a challenge.
+type ChallengeChange = Arc<
+    dyn Fn(&mut kr_protocol::voice::VoiceDelegateResult, &kr_protocol::voice::VoiceDelegateParams)
+        + Send
+        + Sync,
+>;
+
 #[derive(Default)]
 struct LinkState {
     holding: bool,
@@ -1076,6 +1083,17 @@ struct LinkState {
     /// The method of the requests whose answer is lost: each is sent to the host, which acts on it,
     /// and the connection then fails for the caller as one that ended.
     losing_answer_to: Option<String>,
+    /// How many requests of that method are sent whole before the answers begin to be lost.
+    losing_answer_after: usize,
+    /// What to do to the host's next answer that is a challenge for a spoken request's
+    /// confirmation, once: the host answers, and the caller is handed the answer as this changed it.
+    altering_challenge: Option<ChallengeChange>,
+    /// The parameters of the latest `voice.delegate` sent, which a change to a challenge is made
+    /// beside: what the digest it carries is computed over.
+    delegate_params: Option<kr_protocol::voice::VoiceDelegateParams>,
+    /// Whether the next `voice.delegate` is answered with a receipt, as a host that held the action
+    /// and said no more would, and not with the method's result.
+    receipting_delegate: bool,
     /// The method of the requests whose answer is replaced by a result nothing can read as that
     /// method's result: the host answers, and the caller is handed something else.
     garbling_answer_to: Option<String>,
@@ -1210,6 +1228,36 @@ impl LinkControl {
     pub fn lose_the_answer_to(&self, method: Option<kr_protocol::method::Method>) {
         self.state.lock().expect("the record").losing_answer_to =
             method.map(|method| method.as_str().to_owned());
+    }
+
+    /// As [`Self::lose_the_answer_to`], for the requests after the first `skip` of that method:
+    /// those are answered, and the ones after them are not.
+    pub fn lose_the_answer_to_after(&self, skip: usize, method: kr_protocol::method::Method) {
+        let mut state = self.state.lock().expect("the record");
+        state.losing_answer_to = Some(method.as_str().to_owned());
+        state.losing_answer_after = skip;
+    }
+
+    /// Changes the next challenge the host answers a spoken request with, once, before the caller
+    /// reads it: the host issued what it issued and the caller is handed `change` of it, given the
+    /// parameters of the request it answers.
+    pub fn change_the_next_challenge(
+        &self,
+        change: impl Fn(
+            &mut kr_protocol::voice::VoiceDelegateResult,
+            &kr_protocol::voice::VoiceDelegateParams,
+        ) + Send
+        + Sync
+        + 'static,
+    ) {
+        self.state.lock().expect("the record").altering_challenge = Some(Arc::new(change));
+    }
+
+    /// Answers the next `voice.delegate` with a receipt for its action, as a host that held the
+    /// action and said no more would, in place of the method's result: the host acts on the request
+    /// all the same, and the caller is handed the receipt.
+    pub fn answer_the_next_delegation_with_a_receipt(&self) {
+        self.state.lock().expect("the record").receipting_delegate = true;
     }
 
     /// Makes the answer to every request of `method`, on any connection to the host, a result that
@@ -1387,8 +1435,58 @@ impl LinkControl {
                 .entry(method.to_owned())
                 .or_default()
                 .push(request.action_id.to_string());
+            if let Ok(params) = request.params.to_typed() {
+                state.delegate_params = Some(params);
+            }
         }
-        state.losing_answer_to.as_deref() == Some(method)
+        let sent = state.sent.get(method).copied().unwrap_or(0);
+        state.losing_answer_to.as_deref() == Some(method) && sent > state.losing_answer_after
+    }
+
+    /// The action `frame` carries, when it is a `voice.delegate` whose answer is to be a receipt.
+    fn receipted_request(
+        &self,
+        frame: &ControlFrame,
+    ) -> Option<(kr_protocol::ids::RequestId, kr_protocol::ids::ActionId)> {
+        let ControlFrame::Mutation(request) = frame else {
+            return None;
+        };
+        if request.method.as_str() != kr_protocol::method::Method::VoiceDelegate.as_str() {
+            return None;
+        }
+        let mut state = self.state.lock().expect("the record");
+        std::mem::take(&mut state.receipting_delegate)
+            .then_some((request.request_id, request.action_id))
+    }
+
+    /// What the next challenge is to be changed to, taking it, when `response` carries one.
+    fn challenge_changed(
+        &self,
+        response: &kr_protocol::envelope::Response,
+    ) -> Option<kr_protocol::envelope::Response> {
+        let kr_protocol::envelope::Outcome::Ok(value) = &response.outcome else {
+            return None;
+        };
+        let mut result: kr_protocol::voice::VoiceDelegateResult = value.to_typed().ok()?;
+        if !matches!(
+            result.outcome,
+            kr_protocol::voice::VoiceDelegationOutcome::ConfirmationRequired { .. }
+        ) {
+            return None;
+        }
+        let (change, params) = {
+            let mut state = self.state.lock().expect("the record");
+            (
+                state.altering_challenge.take()?,
+                state.delegate_params.clone()?,
+            )
+        };
+        change(&mut result, &params);
+        let mut response = response.clone();
+        response.outcome = kr_protocol::envelope::Outcome::Ok(
+            kr_protocol::envelope::ParamsValue::from_typed(&result).ok()?,
+        );
+        Some(response)
     }
 
     /// The request `frame` is, when its answer is to be garbled.
@@ -1531,7 +1629,104 @@ impl ControlledLink {
             inner: transport,
             control: Arc::clone(&self.control),
             garbled: Mutex::new(Vec::new()),
+            receipted: Mutex::new(Vec::new()),
         }))
+    }
+}
+
+/// The receipt of a host that holds the action and says no more than that it holds it.
+fn receipt_for(
+    request_id: kr_protocol::ids::RequestId,
+    action_id: kr_protocol::ids::ActionId,
+) -> kr_protocol::receipt::ReceiptResponse {
+    kr_protocol::receipt::ReceiptResponse {
+        request_id,
+        receipt: kr_protocol::receipt::Receipt {
+            action_id,
+            actor_id: kr_protocol::ids::ActorId::new("a-paired-device").expect("an actor"),
+            method: kr_protocol::method::Method::VoiceDelegate.into(),
+            method_version: kr_protocol::method::Method::VoiceDelegate.entry().version,
+            revision: kr_protocol::scalars::U64::new(1),
+            state: kr_protocol::receipt::ReceiptState::Accepted,
+            reason: kr_protocol::scalars::Nullable::null(),
+            payload_digest: kr_protocol::scalars::Digest256::from_bytes([0; 32]),
+            accepted_deadline_ms: kr_protocol::scalars::Nullable::null(),
+            error: kr_protocol::scalars::Nullable::null(),
+            error_withheld: false,
+            updated_at_ms: kr_protocol::scalars::TimestampMs::new(0),
+        },
+    }
+}
+
+/// The platform's ceremony as a test describes it: what the person does, whether they are kept
+/// waiting, and what they were asked.
+pub struct ScriptedCeremony {
+    outcome: Mutex<CeremonyOutcome>,
+    asked: Mutex<Vec<String>>,
+    holding: tokio::sync::watch::Sender<bool>,
+}
+
+impl ScriptedCeremony {
+    /// A ceremony the person completes at once.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            outcome: Mutex::new(CeremonyOutcome::Confirmed),
+            asked: Mutex::new(Vec::new()),
+            holding: tokio::sync::watch::channel(false).0,
+        })
+    }
+
+    /// What the person does from the next question on.
+    pub fn answer_with(&self, outcome: CeremonyOutcome) {
+        *self.outcome.lock().expect("the record") = outcome;
+    }
+
+    /// Keeps the person on the dialog, from the next question on, until [`Self::release`].
+    pub fn hold(&self) {
+        self.holding.send_replace(true);
+    }
+
+    /// Lets the person answer.
+    pub fn release(&self) {
+        self.holding.send_replace(false);
+    }
+
+    /// What the dialog was told to print each time it was shown.
+    pub fn asked(&self) -> Vec<String> {
+        self.asked.lock().expect("the record").clone()
+    }
+
+    /// Waits until the person has been asked `count` times.
+    pub async fn until_asked(&self, count: usize) {
+        tokio::time::timeout(WATCHDOG, async {
+            while self.asked().len() < count {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the person is asked");
+    }
+}
+
+impl Ceremony for ScriptedCeremony {
+    fn kind(&self) -> CeremonyKind {
+        CeremonyKind::FaceId
+    }
+
+    fn verify<'a>(&'a self, reason: &'a str, _within: Duration) -> BoxFuture<'a, CeremonyOutcome> {
+        Box::pin(async move {
+            self.asked
+                .lock()
+                .expect("the record")
+                .push(reason.to_owned());
+            let mut holding = self.holding.subscribe();
+            while *holding.borrow_and_update() {
+                if holding.changed().await.is_err() {
+                    break;
+                }
+            }
+            *self.outcome.lock().expect("the record")
+        })
     }
 }
 
@@ -1553,6 +1748,9 @@ struct Tapped {
     /// The requests on this connection whose answers are garbled: request identifiers are counted
     /// for the lifetime of one connection.
     garbled: Mutex<Vec<kr_protocol::ids::RequestId>>,
+    /// The requests on this connection whose answers are to be a receipt, with the action each
+    /// carried.
+    receipted: Mutex<Vec<(kr_protocol::ids::RequestId, kr_protocol::ids::ActionId)>>,
 }
 
 impl std::fmt::Debug for LinkControl {
@@ -1578,6 +1776,9 @@ impl Tapped {
         let lost = self.control.sent_and_lost(frame);
         if let Some(request) = self.control.garbled_request(frame) {
             self.garbled.lock().expect("the record").push(request);
+        }
+        if let Some(receipted) = self.control.receipted_request(frame) {
+            self.receipted.lock().expect("the record").push(receipted);
         }
         if !self.inner.send_before(frame, not_after, wanted).await? {
             return Ok(false);
@@ -1630,6 +1831,9 @@ impl kr_client::transport::ControlTransport for Tapped {
             if let Some(request) = self.control.garbled_request(frame) {
                 self.garbled.lock().expect("the record").push(request);
             }
+            if let Some(receipted) = self.control.receipted_request(frame) {
+                self.receipted.lock().expect("the record").push(receipted);
+            }
             self.inner.send(frame).await?;
             if lost {
                 // The host has the request and acts on it; the caller never hears.
@@ -1679,6 +1883,24 @@ impl kr_client::transport::ControlTransport for Tapped {
                         .expect("a text encodes"),
                     );
                     ControlFrame::Response(response)
+                }
+                ControlFrame::Response(response) => {
+                    let receipted = {
+                        let mut receipted = self.receipted.lock().expect("the record");
+                        receipted
+                            .iter()
+                            .position(|(request, _)| *request == response.request_id)
+                            .map(|position| receipted.remove(position))
+                    };
+                    match receipted {
+                        Some((request_id, action_id)) => {
+                            ControlFrame::Receipt(Box::new(receipt_for(request_id, action_id)))
+                        }
+                        None => match self.control.challenge_changed(&response) {
+                            Some(changed) => ControlFrame::Response(changed),
+                            None => ControlFrame::Response(response),
+                        },
+                    }
                 }
                 other => other,
             }))

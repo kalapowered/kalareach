@@ -4505,3 +4505,161 @@ async fn a_reconnect_reaches_a_screen_a_terminal_can_draw_inside_the_budget() {
     session.close();
     second_serving.abort();
 }
+
+/// What the delegation of a spoken request is as the device first sends it, and with the
+/// device's confirmation of the host's challenge on it: the same delegation, a changed payload.
+fn spoken_close(confirmed: bool) -> kr_protocol::voice::VoiceDelegateParams {
+    use kr_protocol::scalars::{Digest256, Nonce256, TimestampMs};
+    use kr_protocol::voice::{
+        FragmentText, TranscriptFragment, VoiceAction, VoiceConfirmationRequest,
+        VoiceDelegateParams, VoiceDelegationId,
+    };
+
+    let mut params = VoiceDelegateParams {
+        voice_session_id: kr_protocol::ids::VoiceSessionId::new(Uuid::from_bytes([0x21; 16])),
+        delegation_id: VoiceDelegationId::new("d-1").expect("an identifier"),
+        offset_ms: kr_protocol::scalars::U64::new(6_000),
+        fragments: vec![TranscriptFragment {
+            start_ms: kr_protocol::scalars::U64::new(5_000),
+            end_ms: kr_protocol::scalars::U64::new(5_600),
+            text: FragmentText::new(" close session 1").expect("words"),
+        }],
+        confirmation: Nullable::null(),
+    };
+    if confirmed {
+        let key = kr_crypto::keys::AuthorisationKeyPair::generate().expect("a device key");
+        let challenge = VoiceConfirmationRequest {
+            confirmation_id: kr_protocol::ids::ConfirmationId::new(Uuid::from_bytes([0x22; 16])),
+            voice_session_id: params.voice_session_id,
+            action: VoiceAction::CloseSession,
+            action_digest: Digest256::from_bytes([0x23; 32]),
+            action_id: kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x61; 16])),
+            host_device_id: kr_protocol::ids::DeviceId::new(Uuid::from_bytes([0x24; 16])),
+            device_id: kr_protocol::ids::DeviceId::new(Uuid::from_bytes([0x25; 16])),
+            nonce: Nonce256::from_bytes([0x26; 32]),
+            expires_at_ms: TimestampMs::new(1_700_000_000_000),
+        };
+        params.confirmation = Nullable::some(
+            kr_client::services::voice_confirm::sign_voice_confirmation(&key, &challenge)
+                .expect("the device signs"),
+        );
+    }
+    params
+}
+
+/// The continuation of a spoken request that needed a confirmation goes out under the action the
+/// delegation first went out under, with the confirmation on it, once the first request is settled:
+/// until the caller settles the action the client is still accounting for it and sends nothing, and
+/// after it the changed request is composed on the connection and sent, as the host takes it.
+#[tokio::test]
+async fn a_changed_request_goes_under_the_same_action_once_the_first_was_settled() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+    let target = ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16])));
+    let action = kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x61; 16]));
+    let compose = |params: kr_protocol::voice::VoiceDelegateParams| {
+        let (session, target) = (&session, target.clone());
+        async move {
+            session
+                .compose(
+                    Method::VoiceDelegate,
+                    action,
+                    target,
+                    None,
+                    &Empty {},
+                    &params,
+                    DurationMs::new(120_000),
+                )
+                .await
+                .expect("composed")
+        }
+    };
+
+    *script.answer_mutations_with_result.lock().await = 1;
+    let first = compose(spoken_close(false)).await;
+    session
+        .send(&first)
+        .await
+        .expect("the host answers with its challenge");
+    let signed = compose(spoken_close(true)).await;
+    assert!(
+        matches!(
+            session.send(&signed).await,
+            Err(ClientError::StillAccounting)
+        ),
+        "until the caller settles the action, nothing is sent under it"
+    );
+
+    session.settle(action).await;
+    *script.answer_mutations_with_result.lock().await = 1;
+    session
+        .send(&signed)
+        .await
+        .expect("the changed request goes under the same action");
+
+    let requests = script.requests.lock().await;
+    assert_eq!(requests.len(), 2, "the refused send reached nobody");
+    assert_eq!(requests[0].action_id, requests[1].action_id);
+    assert_ne!(
+        requests[0].params, requests[1].params,
+        "the payload is the one that changed"
+    );
+    drop(requests);
+    session.close();
+    serving.abort();
+}
+
+/// A host that answers a spoken request with a receipt in a result's place has decided nothing: the
+/// receipt stays on the connection's book, and settling the action does not clear it, so a request
+/// with a changed payload under the same action is refused and nothing is sent.
+#[tokio::test]
+async fn a_receipt_held_for_an_action_stops_a_changed_request_under_it() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+    let target = ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16])));
+    let action = kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x61; 16]));
+    let compose = |params: kr_protocol::voice::VoiceDelegateParams| {
+        let (session, target) = (&session, target.clone());
+        async move {
+            session
+                .compose(
+                    Method::VoiceDelegate,
+                    action,
+                    target,
+                    None,
+                    &Empty {},
+                    &params,
+                    DurationMs::new(120_000),
+                )
+                .await
+                .expect("composed")
+        }
+    };
+
+    let first = compose(spoken_close(false)).await;
+    let settled = session.send(&first).await.expect("the host answers");
+    assert!(settled.receipt().is_some(), "a receipt, and no result");
+    session.settle(action).await;
+    let signed = compose(spoken_close(true)).await;
+
+    assert!(
+        matches!(
+            session.send(&signed).await,
+            Err(ClientError::StillAccounting)
+        ),
+        "a receipt that is held is an action still accounted for"
+    );
+    assert_eq!(
+        script.requests.lock().await.len(),
+        1,
+        "nothing more was sent"
+    );
+    session.close();
+    serving.abort();
+}
