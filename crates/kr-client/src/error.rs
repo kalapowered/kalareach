@@ -110,6 +110,12 @@ pub enum ClientError {
     /// It is not the host's answer: the earlier request can still be in flight or have been
     /// answered, and a caller that classifies answers must not take this for a refusal of it.
     StillAccounting,
+    /// The caller's time for sending the request had run out by the moment the connection could
+    /// write it, so nothing was written and the action is not on this client's book.
+    ///
+    /// It is not the host's answer: the host never saw the request. A caller that bounded the send
+    /// ([`crate::session::Session::send_before`]) learns here that nothing left.
+    Withheld,
     /// The connection ended before the request was answered.
     ConnectionEnded,
     /// The connection ended after a mutation was sent, so its outcome is unknown.
@@ -158,6 +164,7 @@ impl ClientError {
             | Self::Misdirected { .. }
             | Self::OtherHost
             | Self::StillAccounting => ErrorCode::InvalidArgument,
+            Self::Withheld => ErrorCode::ResourceUnavailable,
             Self::UnsupportedVersion { .. } => ErrorCode::UnsupportedSchema,
             Self::TooManyOutstandingMutations { .. }
             | Self::TooManyUnresolvedActions { .. }
@@ -309,6 +316,10 @@ impl Said for ClientError {
             Self::StillAccounting => Shown::said(
                 "that action is one this client is still accounting for, so it cannot carry \
                  another request",
+            ),
+            Self::Withheld => Shown::said(
+                "the time given for sending the request ran out before it could be written, so \
+                 nothing was sent",
             ),
             Self::ConnectionEnded => {
                 Shown::said("the connection ended before the request was answered")

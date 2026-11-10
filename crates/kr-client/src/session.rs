@@ -1234,7 +1234,33 @@ impl Session {
         if composed.composed_on != Some(self.id) {
             return Err(ClientError::Misdirected { repeating: false });
         }
-        self.submit_composed(composed).await
+        self.submit_composed(composed, None).await
+    }
+
+    /// Sends a composed mutation for the first time as [`Session::send`] does, and writes nothing
+    /// after `not_after`.
+    ///
+    /// For a request that is only good while something the caller read before sending still
+    /// holds. The time is looked at where it matters, once this connection holds the right to
+    /// write, so waiting for the book or for another sender's write counts against it. When it had
+    /// passed by then, nothing was written and the action is not on the book: the answer is
+    /// [`ClientError::Withheld`], and the same request can be sent again under the same
+    /// identifier. A request whose write began is written to its end, and every outcome after that
+    /// is as for [`Session::send`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Withheld`] when nothing was written because `not_after` had
+    /// passed, and otherwise as [`Session::send`].
+    pub async fn send_before(
+        &self,
+        composed: &ComposedMutation,
+        not_after: tokio::time::Instant,
+    ) -> Result<Settled> {
+        if composed.composed_on != Some(self.id) {
+            return Err(ClientError::Misdirected { repeating: false });
+        }
+        self.submit_composed(composed, Some(not_after)).await
     }
 
     /// Asks the host again with exactly the request that was composed, on another connection.
@@ -1279,7 +1305,7 @@ impl Session {
             (Some(composed_for), Some(this)) if *composed_for == this => {}
             _ => return Err(ClientError::OtherHost),
         }
-        self.submit_composed(composed).await
+        self.submit_composed(composed, None).await
     }
 
     /// Reads what the host recorded of an action, and lets that record settle the action here.
@@ -1336,7 +1362,11 @@ impl Session {
 
     /// Records a composed mutation as held by its caller and sends it under a request identifier
     /// of this session's.
-    async fn submit_composed(&self, composed: &ComposedMutation) -> Result<Settled> {
+    async fn submit_composed(
+        &self,
+        composed: &ComposedMutation,
+        not_after: Option<tokio::time::Instant>,
+    ) -> Result<Settled> {
         let Some(method) = composed.request.method.method() else {
             return Err(ClientError::Cbor(crate::shown::Shown::said(
                 "a composed mutation names a method this build lacks",
@@ -1368,8 +1398,18 @@ impl Session {
                 None,
             )?;
         }
-        if self.transport.send(&frame).await.is_err() {
-            return Err(ClientError::SubmissionUncertain { action_id });
+        let written = match not_after {
+            None => self.transport.send(&frame).await.map(|()| true),
+            Some(not_after) => self.transport.send_before(&frame, not_after).await,
+        };
+        match written {
+            Ok(true) => {}
+            Ok(false) => {
+                // Nothing left: the record made before the send is withdrawn with the request.
+                self.state.outcomes.lock().await.settle_action(action_id);
+                return Err(ClientError::Withheld);
+            }
+            Err(_) => return Err(ClientError::SubmissionUncertain { action_id }),
         }
         match waiter.wait().await {
             Ok(Answer::Receipt(receipt)) => Ok(Settled::Receipt(receipt)),

@@ -28,6 +28,7 @@ use kr_transport::handshake::{self, LocalIdentity};
 use kr_transport::scheduler::{SendLimits, StreamBudget};
 use kr_transport::streams::{DataStream, StreamRegistry};
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 use crate::error::{ClientError, Result};
 
@@ -84,6 +85,32 @@ pub trait ControlTransport: Send + Sync + std::fmt::Debug {
 
     /// Sends one control frame.
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()>;
+
+    /// Sends one control frame unless `not_after` has passed by the moment this transport holds
+    /// the right to write it, and says whether it was written.
+    ///
+    /// `false` means nothing was written: the frame was not started and the connection is as it
+    /// was. A caller whose request is only good for a bounded time sends this way, so that the
+    /// time spent waiting for the writer counts against it. A frame whose write has begun is
+    /// written to its end whatever the time, and a failure after that is the caller's to read as an
+    /// outcome that is not known.
+    ///
+    /// The provided method looks at the time once, before it asks the transport to send, which is
+    /// all a transport can do whose writer is not shared; a transport that can wait for a writer
+    /// held by another sender looks at the time again once it holds it.
+    fn send_before<'a>(
+        &'a self,
+        frame: &'a ControlFrame,
+        not_after: Instant,
+    ) -> TransportFuture<'a, bool> {
+        Box::pin(async move {
+            if Instant::now() > not_after {
+                return Ok(false);
+            }
+            self.send(frame).await?;
+            Ok(true)
+        })
+    }
 
     /// Claims the right to read this connection, which exactly one session may hold.
     ///
@@ -229,6 +256,26 @@ impl ControlTransport for NetworkTransport {
         Box::pin(async move {
             self.writer.lock().await.write_message(frame).await?;
             Ok(())
+        })
+    }
+
+    fn send_before<'a>(
+        &'a self,
+        frame: &'a ControlFrame,
+        not_after: Instant,
+    ) -> TransportFuture<'a, bool> {
+        Box::pin(async move {
+            // The writer is shared with every other sender on this connection: the time is
+            // looked at once the lock is held, which is the last moment before the write.
+            let Ok(mut writer) = tokio::time::timeout_at(not_after, self.writer.lock()).await
+            else {
+                return Ok(false);
+            };
+            if Instant::now() > not_after {
+                return Ok(false);
+            }
+            writer.write_message(frame).await?;
+            Ok(true)
         })
     }
 

@@ -560,6 +560,7 @@ impl AnswerFailure {
             | ClientError::Misdirected { .. }
             | ClientError::OtherHost
             | ClientError::StillAccounting
+            | ClientError::Withheld
             | ClientError::TooManyOutstandingMutations { .. }
             | ClientError::TooManyUnresolvedActions { .. }
             | ClientError::WrongEffect { .. }

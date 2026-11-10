@@ -29,6 +29,7 @@ use kr_protocol::identity::BootIdentity;
 use kr_protocol::ids::{BuildId, ConnectionId, EnvironmentId};
 use kr_protocol::local::{LocalClientKind, LocalPeer, LocalRole};
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 use crate::error::{ClientError, Result};
 use crate::transport::{ControlTransport, Reach, TransportFuture};
@@ -174,6 +175,57 @@ fn reach_of(context: &LocalContext) -> Option<Reach> {
     })
 }
 
+impl IpcTransport {
+    /// Writes `frame` when this connection has its turn, unless `not_after` has passed by then, and
+    /// says whether it was written.
+    async fn write(&self, frame: &ControlFrame, not_after: Option<Instant>) -> Result<bool> {
+        // One frame at a time. A second caller waits for the first's turn rather than finding
+        // an empty slot and reporting a connection that is perfectly alive as ended.
+        let _turn = match not_after {
+            None => self.turn.lock().await,
+            Some(limit) => match tokio::time::timeout_at(limit, self.turn.lock()).await {
+                Ok(turn) => turn,
+                Err(_) => return Ok(false),
+            },
+        };
+        if not_after.is_some_and(|limit| Instant::now() > limit) {
+            return Ok(false);
+        }
+        // The notification is registered *before* the last look at the flag, so a close
+        // that lands between the two is delivered to this future rather than missed: a `Notified`
+        // created afterwards would wait for the next notification, and there is not one.
+        let closing = self.ending.notified();
+        if self.has_closed() {
+            return Err(ClientError::ConnectionEnded);
+        }
+        // The write half is taken out for the duration of the write, for the same reason the
+        // read half is: a caller that drops this future part way through drops the half with
+        // it, so a cancelled write closes the socket rather than leaving it on a transport
+        // nobody is using. It cannot be resumed either — the frame writer refuses to continue
+        // a stream an interrupted write left in pieces.
+        let Some(mut writer) = self.writer.lock().await.take() else {
+            return Err(ClientError::ConnectionEnded);
+        };
+        let outcome = tokio::select! {
+            outcome = writer.write_message(frame) => outcome,
+            // Closing while this was waiting for the socket. The half is dropped with this
+            // future, which is what ends the connection rather than waiting for a peer that
+            // may never read again.
+            () = closing => return Err(ClientError::ConnectionEnded),
+        };
+        // A write that failed has ended this connection, and so has a close that arrived while
+        // this one was in progress. Either way the half goes rather than going back.
+        if outcome.is_ok() {
+            let mut held = self.writer.lock().await;
+            if !self.has_closed() {
+                *held = Some(writer);
+            }
+        }
+        outcome?;
+        Ok(true)
+    }
+}
+
 impl ControlTransport for IpcTransport {
     fn connection_id(&self) -> ConnectionId {
         self.connection_id
@@ -197,42 +249,17 @@ impl ControlTransport for IpcTransport {
 
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
         Box::pin(async move {
-            // One frame at a time. A second caller waits for the first's turn rather than finding
-            // an empty slot and reporting a connection that is perfectly alive as ended.
-            let _turn = self.turn.lock().await;
-            // The notification is registered *before* the last look at the flag, so a close that
-            // lands between the two is delivered to this future rather than missed: a `Notified`
-            // created afterwards would wait for the next notification, and there is not one.
-            let closing = self.ending.notified();
-            if self.has_closed() {
-                return Err(ClientError::ConnectionEnded);
-            }
-            // The write half is taken out for the duration of the write, for the same reason the
-            // read half is: a caller that drops this future part way through drops the half with
-            // it, so a cancelled write closes the socket rather than leaving it on a transport
-            // nobody is using. It cannot be resumed either — the frame writer refuses to continue
-            // a stream an interrupted write left in pieces.
-            let Some(mut writer) = self.writer.lock().await.take() else {
-                return Err(ClientError::ConnectionEnded);
-            };
-            let outcome = tokio::select! {
-                outcome = writer.write_message(frame) => outcome,
-                // Closing while this was waiting for the socket. The half is dropped with this
-                // future, which is what ends the connection rather than waiting for a peer that
-                // may never read again.
-                () = closing => return Err(ClientError::ConnectionEnded),
-            };
-            // A write that failed has ended this connection, and so has a close that arrived while
-            // this one was in progress. Either way the half goes rather than going back.
-            if outcome.is_ok() {
-                let mut held = self.writer.lock().await;
-                if !self.has_closed() {
-                    *held = Some(writer);
-                }
-            }
-            outcome?;
+            self.write(frame, None).await?;
             Ok(())
         })
+    }
+
+    fn send_before<'a>(
+        &'a self,
+        frame: &'a ControlFrame,
+        not_after: Instant,
+    ) -> TransportFuture<'a, bool> {
+        Box::pin(async move { self.write(frame, Some(not_after)).await })
     }
 
     fn claim_receiver(&self) -> Result<()> {
