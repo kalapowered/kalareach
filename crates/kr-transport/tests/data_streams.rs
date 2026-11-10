@@ -16,8 +16,10 @@ mod support;
 
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use futures::FutureExt as _;
 use futures::future::select_all;
 use iroh::endpoint::{Connection, ReadError, RecvStream, SendStream, WriteError};
 use kr_cbor::CanonicalValue;
@@ -67,6 +69,8 @@ enum Taking {
     AfterTheGate,
     /// Drops the receiver as soon as it has the session.
     Never,
+    /// Holds the receiver, without reading it, until the case opens the gate, and then drops it.
+    DropAfterTheGate,
 }
 
 /// A host that forwards the data streams it is handed to the case and otherwise only holds the
@@ -83,7 +87,33 @@ struct ChunkHost {
     registry: std::sync::Mutex<Option<oneshot::Sender<Arc<StreamRegistry>>>>,
     /// Said once the host has dropped the receiver, for [`Taking::Never`].
     dropped: Notify,
-    receiver_dropped: std::sync::atomic::AtomicBool,
+    receiver_dropped: AtomicBool,
+    /// Set when the connection's `serve` future has been dropped.
+    serve_ended: Arc<AtomicBool>,
+    /// What `serve_ended` said when the host's `control_stream_lost` hook ran.
+    hook_saw_serve_ended: AtomicBool,
+    hook_ran: AtomicBool,
+    hook: Notify,
+}
+
+/// Sets a flag when it is dropped, as the host's handler does when the listener drops it.
+struct SetWhenDropped(Arc<AtomicBool>);
+
+impl Drop for SetWhenDropped {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Waits until `flag` is set, which `changed` announces.
+async fn until_set(flag: &AtomicBool, changed: &Notify) {
+    loop {
+        let notified = changed.notified();
+        if flag.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
 }
 
 impl PairedDirectory for ChunkHost {
@@ -105,8 +135,16 @@ impl HostHandler for ChunkHost {
         None
     }
 
+    fn control_stream_lost(&self, _connection_id: ConnectionId) {
+        self.hook_saw_serve_ended
+            .store(self.serve_ended.load(Ordering::Acquire), Ordering::Release);
+        self.hook_ran.store(true, Ordering::Release);
+        self.hook.notify_waiters();
+    }
+
     fn serve(self: Arc<Self>, mut session: AuthorisedSession) -> BoxFuture<'static, ()> {
         Box::pin(async move {
+            let _serving = SetWhenDropped(Arc::clone(&self.serve_ended));
             if let Some(sender) = self
                 .registry
                 .lock()
@@ -116,10 +154,16 @@ impl HostHandler for ChunkHost {
                 let _ = sender.send(Arc::clone(&session.streams));
             }
             match self.taking {
-                Taking::Never => {
+                Taking::Never | Taking::DropAfterTheGate => {
+                    if self.taking == Taking::DropAfterTheGate {
+                        self.gate
+                            .acquire()
+                            .await
+                            .expect("the gate is never closed")
+                            .forget();
+                    }
                     drop(session.data_streams);
-                    self.receiver_dropped
-                        .store(true, std::sync::atomic::Ordering::Release);
+                    self.receiver_dropped.store(true, Ordering::Release);
                     self.dropped.notify_waiters();
                     while session.control.recv().await.is_some() {}
                 }
@@ -176,7 +220,11 @@ impl Harness {
             forwarded,
             registry: std::sync::Mutex::new(Some(registry_tx)),
             dropped: Notify::new(),
-            receiver_dropped: std::sync::atomic::AtomicBool::new(false),
+            receiver_dropped: AtomicBool::new(false),
+            serve_ended: Arc::new(AtomicBool::new(false)),
+            hook_saw_serve_ended: AtomicBool::new(false),
+            hook_ran: AtomicBool::new(false),
+            hook: Notify::new(),
         });
         let deadlines = ManualDeadlines::new();
         let config = ListenerConfig {
@@ -468,27 +516,82 @@ async fn a_stream_that_finds_the_queue_full_is_reset() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stream_for_a_host_that_dropped_its_receiver_is_reset() {
     let harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::Never).await;
-    awaited("the host dropping its receiver", async {
-        while !harness
-            .host
-            .receiver_dropped
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            harness.host.dropped.notified().await;
-        }
-    })
+    awaited(
+        "the host dropping its receiver",
+        until_set(&harness.host.receiver_dropped, &harness.host.dropped),
+    )
     .await;
 
     let (_send, mut recv) = harness
         .raw(&attachment_header(harness.authorised.connection_id, 1))
         .await;
     assert_eq!(reset_code(&mut recv).await, u64::from(STREAM_REVOKED));
-    assert_eq!(
-        harness.registry.len(),
-        0,
-        "a stream nobody took stayed registered"
-    );
+    awaited(
+        "the stream leaving the registry",
+        emptied(&harness.registry),
+    )
+    .await;
     assert_eq!(harness.registry.budget().open_bulk_streams(), 0);
+
+    harness.finish().await;
+}
+
+/// Waits until the registry holds no stream: a reset is sent before the stream's accounting ends.
+async fn emptied(registry: &StreamRegistry) {
+    while !registry.is_empty() {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// A host that stops taking streams while its connection stands tells the device each stream that
+/// was still queued was taken away: the queue's streams are reset, not finished as though they had
+/// ended cleanly, and what they held is returned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_drops_its_queue_resets_the_streams_still_in_it() {
+    let harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::DropAfterTheGate).await;
+    let connection_id = harness.authorised.connection_id;
+    let mut queued = vec![
+        harness.raw(&attachment_header(connection_id, 1)).await,
+        harness.raw(&attachment_header(connection_id, 2)).await,
+    ];
+    // Both are admitted, and so queued or about to be: the host has not read the queue.
+    awaited("both streams being admitted", async {
+        while harness.registry.len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+
+    harness.host.gate.add_permits(1);
+    for (_, recv) in &mut queued {
+        assert_eq!(reset_code(recv).await, u64::from(STREAM_REVOKED));
+    }
+    awaited(
+        "the streams leaving the registry",
+        emptied(&harness.registry),
+    )
+    .await;
+    assert_eq!(harness.registry.budget().open_bulk_streams(), 0);
+
+    harness.finish().await;
+}
+
+/// The host's `control_stream_lost` hook runs once its handler has gone. The listener revokes the
+/// streams as soon as the loss is declared, but a host that registers the connection while it serves
+/// has to be asked to withdraw it after the handler, never before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hosts_hook_runs_after_its_handler_has_gone() {
+    let mut harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::Forward).await;
+    harness.authorised.control_writer.reset();
+    awaited(
+        "the host's control_stream_lost hook",
+        until_set(&harness.host.hook_ran, &harness.host.hook),
+    )
+    .await;
+    assert!(
+        harness.host.hook_saw_serve_ended.load(Ordering::Acquire),
+        "the hook ran while the host's handler was still being served"
+    );
 
     harness.finish().await;
 }
@@ -623,6 +726,106 @@ async fn a_write_the_device_does_not_read_is_cut_by_the_write_deadline() {
     harness.finish().await;
 }
 
+/// A host that refuses to let a write go.
+fn refuse(_attempt: &mut dyn FnMut()) -> bool {
+    false
+}
+
+/// Ending a stream by revoking its handle ends a write that waits for the device. The write fails
+/// as a revoked stream's does, never with a refusal, and the stream is reset when it is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoking_a_stream_ends_a_write_the_device_does_not_read() {
+    let mut harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::Forward).await;
+    let header = attachment_header(harness.authorised.connection_id, 1);
+    let (_send, mut recv) = harness.raw(&header).await;
+    let stream = harness.next().await;
+    let handle = stream.handle();
+    let (reader, mut writer) = stream.split();
+
+    let first_written = Arc::new(Notify::new());
+    let signal = Arc::clone(&first_written);
+    let writing = tokio::spawn(async move {
+        let first = writer
+            .write_message_while(&blob(1_000_000), &admit_always)
+            .await;
+        signal.notify_one();
+        let second = writer
+            .write_message_while(&blob(1_000_000), &admit_always)
+            .await;
+        (first, second, writer)
+    });
+    awaited("the first frame being written", first_written.notified()).await;
+    // The second frame holds its queue space for as long as it is being written, and the device
+    // reads nothing, so it is still in the write when the stream is revoked.
+    awaited("the second frame being written", async {
+        while harness.registry.budget().queued_bytes() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    handle.revoke();
+    let (first, second, writer) = awaited("the write that was ended", writing)
+        .await
+        .expect("the write task ended");
+    assert!(matches!(first, Ok(true)), "the first frame was not written");
+    assert!(
+        matches!(second, Err(TransportError::ControlLost)),
+        "a revoked stream's write did not fail as one: {second:?}"
+    );
+    assert!(reader.is_revoked());
+    assert_eq!(harness.registry.budget().queued_bytes(), 0);
+    drop((reader, writer));
+    assert_eq!(reset_code(&mut recv).await, u64::from(STREAM_REVOKED));
+
+    harness.finish().await;
+}
+
+/// A write the host's own check refuses leaves the stream reset, and the half that reads stops with
+/// it: the host has withdrawn what it asked, so there is nothing more to take from the stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_the_hosts_check_refuses_resets_the_stream_and_stops_the_reader() {
+    let mut harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::Forward).await;
+    let header = attachment_header(harness.authorised.connection_id, 1);
+    let (_send, mut recv) = harness.raw(&header).await;
+    let (reader, mut writer) = harness.next().await.split();
+
+    let written = writer
+        .write_message_while(&blob(100), &refuse)
+        .await
+        .expect("a refusal by the host's own check is not an error");
+    assert!(!written, "a refused frame was reported as written");
+    assert!(
+        reader.is_revoked(),
+        "the half that reads kept reading a stream whose write was refused"
+    );
+    drop((reader, writer));
+    assert_eq!(reset_code(&mut recv).await, u64::from(STREAM_REVOKED));
+
+    harness.finish().await;
+}
+
+/// A read the host drops before it ends has consumed part of a frame, or waited for one, and the
+/// stream can carry nothing more: dropping it revokes the stream, so the other half stops too and
+/// the device sees a reset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_dropped_before_it_ends_revokes_the_stream() {
+    let mut harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::Forward).await;
+    let header = attachment_header(harness.authorised.connection_id, 1);
+    let (_send, mut recv) = harness.raw(&header).await;
+    let mut stream = harness.next().await;
+
+    // Nothing has been sent, so the read waits, and dropping it is a host giving up on it.
+    assert!(stream.read_payload().now_or_never().is_none());
+    assert!(
+        stream.is_revoked(),
+        "a stream whose read was dropped part way was left usable"
+    );
+    drop(stream);
+    assert_eq!(reset_code(&mut recv).await, u64::from(STREAM_REVOKED));
+
+    harness.finish().await;
+}
+
 /// KR-PERF-005 and KR-REQ-23.21: a stream the listener hands over is scheduled as a transfer is, on
 /// the host's side and on the device's, so its answers go behind control and receipts. Frames pass
 /// both ways, and the stream stays counted against its connection until both halves are dropped.
@@ -739,7 +942,7 @@ impl HostHandler for LossHost {
                 kr_protocol::envelope::ControlEvent::Keepalive,
             );
             while sender.send(&keepalive).await.is_ok() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                tokio::task::yield_now().await;
             }
             let revoked = stream.is_revoked();
             if let Some(verdict) = self
@@ -770,6 +973,7 @@ async fn a_failed_control_write_revokes_the_data_streams_before_it_returns() {
     });
     let config = ListenerConfig {
         accepted_kinds: vec![StreamKind::AttachmentChunks],
+        deadlines: ManualDeadlines::new(),
         ..ListenerConfig::new(
             EndpointConfig {
                 bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
