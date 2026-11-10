@@ -1575,6 +1575,36 @@ impl kr_client::transport::ControlTransport for Tapped {
         })
     }
 
+    fn send_before<'a>(
+        &'a self,
+        frame: &'a ControlFrame,
+        not_after: tokio::time::Instant,
+    ) -> kr_client::transport::TransportFuture<'a, bool> {
+        Box::pin(async move {
+            // A request the test holds waits here, where a transport waits for its writer, and the
+            // time is looked at once it is let go.
+            self.control.before_sending(frame).await;
+            if tokio::time::Instant::now() > not_after {
+                return Ok(false);
+            }
+            if let Some(refusal) = self.control.refusal_of(frame) {
+                return Err(kr_client::ClientError::Host(refusal));
+            }
+            let lost = self.control.sent_and_lost(frame);
+            if let Some(request) = self.control.garbled_request(frame) {
+                self.garbled.lock().expect("the record").push(request);
+            }
+            if !self.inner.send_before(frame, not_after).await? {
+                return Ok(false);
+            }
+            if lost {
+                // The host has the request and acts on it; the caller never hears.
+                return Err(kr_client::ClientError::ConnectionEnded);
+            }
+            Ok(true)
+        })
+    }
+
     fn claim_receiver(&self) -> kr_client::Result<()> {
         self.inner.claim_receiver()
     }

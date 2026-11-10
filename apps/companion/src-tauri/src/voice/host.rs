@@ -8,15 +8,21 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use kr_client::Session;
+use companion_platform::call::{CallId, CallPlatform};
 use kr_client::pairing::paired::PairedHost;
+use kr_client::session::ComposedMutation;
+use kr_client::{ClientError, Session, Settled};
 use kr_protocol::envelope::ActionTarget;
-use kr_protocol::ids::{EnvironmentId, VoiceSessionId};
+use kr_protocol::ids::{ActionId, EnvironmentId, VoiceSessionId};
 use kr_protocol::method::Method;
+use kr_protocol::voice::{VoiceDelegateParams, VoiceDelegateResult};
 use tauri::{AppHandle, Manager as _, Runtime};
+use tokio::time::Instant;
 
+use super::delegation::{Cause, usable};
 use super::view::HostEnd;
 use crate::commands::{MUTATION_TTL, NoPreconditions, fence_of};
 use crate::connection::{Connection, Standing};
@@ -229,4 +235,183 @@ fn told_the_service(answer: &kr_client::Settled) -> bool {
         kr_cbor::CanonicalValue::Map(result)
             if matches!(result.get("broker_notified"), Some(kr_cbor::CanonicalValue::Bool(true)))
     )
+}
+
+/// What came of handing one delegation to the host.
+pub(super) enum Delivered {
+    /// The host answered with a result.
+    Result(Box<VoiceDelegateResult>),
+    /// The host refused the request itself, and said so with an error.
+    Refused,
+    /// The host answered with a receipt, which is not a decision: it says the host holds the
+    /// action, never what became of it.
+    Receipt,
+    /// Nothing was written, for this cause. The same delegation can be said again.
+    Withheld(Cause),
+    /// The proof taken before the send showed what taints the call. Nothing was written.
+    Tainted(Cause),
+    /// The request was written, or may have been, and no answer came: what became of it is not
+    /// known, and only the host's record can say.
+    Unknown,
+}
+
+/// A delegation handed to the host, with what the owner needs to ask about it again.
+pub(super) struct Exchange {
+    /// The connection the request was composed on, and sent on when it was sent.
+    pub session: Arc<Session>,
+    /// The whole request as composed, window included, which is what is asked again with. None
+    /// when it was never composed.
+    pub composed: Option<ComposedMutation>,
+    /// What came of it.
+    pub delivered: Delivered,
+}
+
+/// What a delegation is handed over with.
+pub(super) struct Handover {
+    pub host: CallHost,
+    pub platform: Arc<dyn CallPlatform>,
+    pub call: CallId,
+    pub params: VoiceDelegateParams,
+    /// How old a capture proof may be at the moment the request is written.
+    pub age_bound: Duration,
+    /// How long the host is given to answer.
+    pub within: Duration,
+    /// Set by the owner when the path to the host is lost: nothing is written after it.
+    pub lost: Arc<AtomicBool>,
+}
+
+/// Hands one delegation to the host, once: the request is composed once and kept whole, a capture
+/// proof is taken as late as it can be, and the request is written only while that proof is
+/// young, where the writing happens and not where it is asked for.
+///
+/// The send is made on the connection that composed the request, which is the one whose window
+/// admits it. It is settled when the host answered, as the host's word, whatever the word was; an
+/// answer that did not come leaves it unsettled, and unknown.
+pub(super) async fn hand_over(handover: Handover) -> Exchange {
+    let Handover {
+        host,
+        platform,
+        call,
+        params,
+        age_bound,
+        within,
+        lost,
+    } = handover;
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let session = Arc::clone(&host.session);
+    let nothing = |cause: Cause, composed: Option<ComposedMutation>| Exchange {
+        session: Arc::clone(&session),
+        composed,
+        delivered: Delivered::Withheld(cause),
+    };
+    let composed = match host
+        .session
+        .compose(
+            Method::VoiceDelegate,
+            action_id,
+            ActionTarget::environment(host.environment_id),
+            None,
+            &NoPreconditions {},
+            &params,
+            MUTATION_TTL,
+        )
+        .await
+    {
+        Ok(composed) => composed,
+        Err(_) => return nothing(Cause::NotComposed, None),
+    };
+    // The proof is asked for as late as it can be, and its age is counted from the moment it is
+    // asked: what native code answers is how old the freshest sign was then, and the time the
+    // answer and the write take is added to it.
+    let asked = Instant::now();
+    let proof = platform.capture_proof(&call, false).await;
+    let age = match proof {
+        Ok(proof) => match usable(&proof, &call) {
+            Ok(age) => age,
+            Err(cause) if cause.taints() => {
+                return Exchange {
+                    session,
+                    composed: Some(composed),
+                    delivered: Delivered::Tainted(cause),
+                };
+            }
+            Err(cause) => return nothing(cause, Some(composed)),
+        },
+        Err(_) => return nothing(Cause::NoProof, Some(composed)),
+    };
+    // A proof as old as the bound is not young: nothing is asked of the writer for it.
+    let age = Duration::from_millis(age);
+    if age >= age_bound {
+        return nothing(Cause::StaleProof, Some(composed));
+    }
+    let not_after = asked + (age_bound - age);
+    if lost.load(Ordering::SeqCst) {
+        return nothing(Cause::HostLost, Some(composed));
+    }
+    let sent = tokio::time::timeout(within, host.session.send_before(&composed, not_after)).await;
+    let delivered = match sent {
+        Ok(Ok(Settled::Result(value))) => {
+            host.session.settle(action_id).await;
+            match value.to_typed::<VoiceDelegateResult>() {
+                Ok(result) => Delivered::Result(Box::new(result)),
+                // An answer that is not a result of the method is not the host's word.
+                Err(_) => Delivered::Unknown,
+            }
+        }
+        Ok(Ok(Settled::Receipt(_))) => Delivered::Receipt,
+        Ok(Err(ClientError::Withheld)) => Delivered::Withheld(Cause::StaleProof),
+        Ok(Err(ClientError::Host(_))) => {
+            host.session.settle(action_id).await;
+            Delivered::Refused
+        }
+        // Nothing of these left, or nothing was recorded: the request was not sent.
+        Ok(Err(
+            ClientError::Cbor(_)
+            | ClientError::NoActionWindow
+            | ClientError::Misdirected { .. }
+            | ClientError::StillAccounting
+            | ClientError::TooManyOutstandingMutations { .. }
+            | ClientError::TooManyUnresolvedActions { .. },
+        )) => Delivered::Withheld(Cause::NotComposed),
+        Ok(Err(_)) | Err(_) => Delivered::Unknown,
+    };
+    Exchange {
+        session,
+        composed: Some(composed),
+        delivered,
+    }
+}
+
+/// Asks the host what became of a delegation whose answer was lost, with the request as it was
+/// composed, on a connection other than the one that sent it. A repeat is a question: the host
+/// answers it from the record it kept of the action, or does not answer. Only a result settles it.
+///
+/// Asks after each of `delays`, and returns the result when one came.
+pub(super) async fn ask_again(
+    reach: Arc<dyn HostReach>,
+    host: CallHost,
+    composed: ComposedMutation,
+    delays: [Duration; 3],
+    within: Duration,
+) -> Option<VoiceDelegateResult> {
+    let action_id = composed.action_id();
+    let mut found = None;
+    for delay in delays {
+        tokio::time::sleep(delay).await;
+        let Ok(session) = reach.session_to(&host.paired, Some(&host.session)).await else {
+            continue;
+        };
+        let asked = tokio::time::timeout(within, session.repeat(&composed)).await;
+        if let Ok(Ok(Settled::Result(value))) = asked
+            && let Ok(result) = value.to_typed::<VoiceDelegateResult>()
+        {
+            found = Some(result);
+        }
+        session.settle(action_id).await;
+        if found.is_some() {
+            break;
+        }
+    }
+    host.session.settle(action_id).await;
+    found
 }

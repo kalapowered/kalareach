@@ -1,0 +1,477 @@
+{
+  "about": "Messages of the provider data channel, for the delegation gate. `recorded` holds events of the recorded real-provider qualification session; `unreadable` holds the edge cases the gate must refuse to read, which the profile schemas let through or forbid. Golden data: nothing in it is a live call.",
+  "profile": "gpt-live-1",
+  "profile_revision": "ec1c838a96f79139092a3d77a3cccfcd1ac1be69",
+  "profile_digest": "2641c984ebd71ac131ddcaa2f7f8d7c0a59461860d0023ac157820b2677f6b8f",
+  "files": {
+    "infra/providers/gpt-live-1/profile.json": "c253f4f00c5d8c1a7fc4ada6f4c5ee5a459d2048d08aa8c0fc72d1897323193c",
+    "infra/providers/gpt-live-1/schemas/server/session.input_transcript.delta.json": "9510a7865e046ccd9b27a30c1fab799b6133bb05cc6d3ef77b7dd6c59c6e213a",
+    "infra/providers/gpt-live-1/schemas/server/session.delegation.created.json": "45524d8ded74bc946b2fbca5c76bf18752b011aa01823fd6408f8bd9dec48fd5",
+    "infra/providers/gpt-live-1/schemas/server/session.input_audio.muted.json": "2ca8c2385c1314bf82a99fdc3e6ec6ea7f30a09a9cab8bfb32d0aff89729d8b8",
+    "infra/providers/gpt-live-1/evidence/run-2026-09-15T20-42-58-168Z.json": "e6081eea80f417963945b166142e8ef11fbf7aa7e36e7fcea9557f726f62565f"
+  },
+  "recorded": [
+    {
+      "reads_as": "fragment",
+      "start_ms": 1000,
+      "end_ms": 1200,
+      "event": {
+        "type": "session.input_transcript.delta",
+        "start_ms": 1000,
+        "end_ms": 1200,
+        "delta": " What",
+        "event_id": "event_EOUHvqghlaKhQUdbFdWOa"
+      }
+    },
+    {
+      "reads_as": "fragment",
+      "start_ms": 1200,
+      "end_ms": 1400,
+      "event": {
+        "type": "session.input_transcript.delta",
+        "start_ms": 1200,
+        "end_ms": 1400,
+        "delta": " is",
+        "event_id": "event_EOUHvUrwnUe2h78M8fIma"
+      }
+    },
+    {
+      "reads_as": "fragment",
+      "start_ms": 1400,
+      "end_ms": 1600,
+      "event": {
+        "type": "session.input_transcript.delta",
+        "start_ms": 1400,
+        "end_ms": 1600,
+        "delta": " the",
+        "event_id": "event_EOUHwzq1p97KRP5GUNWDu"
+      }
+    },
+    {
+      "reads_as": "fragment",
+      "start_ms": 1800,
+      "end_ms": 2000,
+      "event": {
+        "type": "session.input_transcript.delta",
+        "start_ms": 1800,
+        "end_ms": 2000,
+        "delta": " status",
+        "event_id": "event_EOUHwXgcJfHCofcjYA992"
+      }
+    },
+    {
+      "reads_as": "fragment",
+      "start_ms": 2000,
+      "end_ms": 2200,
+      "event": {
+        "type": "session.input_transcript.delta",
+        "start_ms": 2000,
+        "end_ms": 2200,
+        "delta": " of",
+        "event_id": "event_EOUHwuSbo6wD8YOUjmE7f"
+      }
+    },
+    {
+      "reads_as": "fragment",
+      "start_ms": 2200,
+      "end_ms": 2400,
+      "event": {
+        "type": "session.input_transcript.delta",
+        "start_ms": 2200,
+        "end_ms": 2400,
+        "delta": " order",
+        "event_id": "event_EOUHw7dbhSN02958gvuIZ"
+      }
+    },
+    {
+      "reads_as": "fragment",
+      "start_ms": 2400,
+      "end_ms": 2600,
+      "event": {
+        "type": "session.input_transcript.delta",
+        "start_ms": 2400,
+        "end_ms": 2600,
+        "delta": " A",
+        "event_id": "event_EOUHxZ67RU0sR2XhNWZCj"
+      }
+    },
+    {
+      "reads_as": "fragment",
+      "start_ms": 3000,
+      "end_ms": 3200,
+      "event": {
+        "type": "session.input_transcript.delta",
+        "start_ms": 3000,
+        "end_ms": 3200,
+        "delta": " zero zero",
+        "event_id": "event_EOUHxYSfrW41HYaDlW5Pe"
+      }
+    },
+    {
+      "reads_as": "fragment",
+      "start_ms": 3400,
+      "end_ms": 3600,
+      "event": {
+        "type": "session.input_transcript.delta",
+        "start_ms": 3400,
+        "end_ms": 3600,
+        "delta": " four",
+        "event_id": "event_EOUHy0q8CfOiDh4UXMBPM"
+      }
+    },
+    {
+      "reads_as": "fragment",
+      "start_ms": 3800,
+      "end_ms": 4000,
+      "event": {
+        "type": "session.input_transcript.delta",
+        "start_ms": 3800,
+        "end_ms": 4000,
+        "delta": " two",
+        "event_id": "event_EOUHybLLh8tikxWOa0nUP"
+      }
+    },
+    {
+      "reads_as": "delegation",
+      "offset_ms": 3800,
+      "event": {
+        "type": "session.delegation.created",
+        "offset_ms": 3800,
+        "delegation": {
+          "id": "item_EOUHyQU5lXyHNguo8HH7l",
+          "type": "delegation",
+          "target": "client"
+        },
+        "event_id": "event_EOUHy0Vefn3Cki4Zyol1v"
+      }
+    },
+    {
+      "reads_as": "muted",
+      "event": {
+        "type": "session.input_audio.muted",
+        "event_id": "event_EOUHVgikdgBUsukoWzgWP",
+        "client_event_id": "p_mute"
+      }
+    },
+    {
+      "reads_as": "other",
+      "event": {
+        "type": "session.input_audio.unmuted",
+        "event_id": "event_EOUHWAN9uQAmVlqbvNps6",
+        "client_event_id": "p_unmute"
+      }
+    },
+    {
+      "reads_as": "other",
+      "event": {
+        "type": "session.usage.updated",
+        "usage": {
+          "seconds": 2
+        },
+        "context_window": {
+          "usage_ratio": 0.0066796875
+        },
+        "event_id": "event_EOUHxs3lQWdtcpaWhRnwN"
+      }
+    },
+    {
+      "reads_as": "other",
+      "event": {
+        "type": "session.output_transcript.delta",
+        "start_ms": 4000,
+        "end_ms": 4200,
+        "delta": " Checking",
+        "event_id": "event_EOUHzKCROaJp136AUAnCx"
+      }
+    },
+    {
+      "reads_as": "other",
+      "event": {
+        "type": "session.commentary.appended",
+        "start_ms": 4400,
+        "end_ms": 4600,
+        "event_id": "event_EOUHzPvQZ0LiOk6zJXreQ",
+        "client_event_id": "c_result"
+      }
+    },
+    {
+      "reads_as": "other",
+      "event": {
+        "type": "session.instructions.appended",
+        "start_ms": 12600,
+        "end_ms": 12800,
+        "event_id": "event_EOUI87d22HNltRILFgqnW",
+        "client_event_id": "c_instructions"
+      }
+    },
+    {
+      "reads_as": "other",
+      "event": {
+        "type": "session.thinking.appended",
+        "start_ms": 13400,
+        "end_ms": 13600,
+        "event_id": "event_EOUI83lUgk6EtdU92nWsD",
+        "client_event_id": "c_thinking"
+      }
+    }
+  ],
+  "unreadable": [
+    {
+      "why": "not JSON",
+      "event": "not json at all",
+      "malformed": "not_an_event"
+    },
+    {
+      "why": "JSON that is not an object",
+      "event": "[\"session.input_transcript.delta\"]",
+      "malformed": "not_an_event"
+    },
+    {
+      "why": "an object with no type",
+      "event": {
+        "delta": " hello"
+      },
+      "malformed": "not_an_event"
+    },
+    {
+      "why": "a type that is not a string",
+      "event": {
+        "type": 7
+      },
+      "malformed": "not_an_event"
+    },
+    {
+      "why": "a fragment with no event_id",
+      "event": {
+        "type": "session.input_transcript.delta",
+        "start_ms": 1000,
+        "end_ms": 1200,
+        "delta": " hello"
+      },
+      "malformed": "schema"
+    },
+    {
+      "why": "a fragment with a member the schema does not list",
+      "event": {
+        "type": "session.input_transcript.delta",
+        "event_id": "event_x",
+        "start_ms": 1000,
+        "end_ms": 1200,
+        "delta": " hello",
+        "speaker": "caller"
+      },
+      "malformed": "schema"
+    },
+    {
+      "why": "a fragment whose delta is not text",
+      "event": {
+        "type": "session.input_transcript.delta",
+        "event_id": "event_x",
+        "start_ms": 1000,
+        "end_ms": 1200,
+        "delta": 5
+      },
+      "malformed": "schema"
+    },
+    {
+      "why": "a fragment whose start is not a number",
+      "event": {
+        "type": "session.input_transcript.delta",
+        "event_id": "event_x",
+        "start_ms": "1000",
+        "end_ms": 1200,
+        "delta": " hello"
+      },
+      "malformed": "schema"
+    },
+    {
+      "why": "a fragment with an empty client_event_id",
+      "event": {
+        "type": "session.input_transcript.delta",
+        "event_id": "event_x",
+        "start_ms": 1000,
+        "end_ms": 1200,
+        "delta": " hello",
+        "client_event_id": ""
+      },
+      "malformed": "schema"
+    },
+    {
+      "why": "an empty delta, which the schema permits",
+      "event": {
+        "type": "session.input_transcript.delta",
+        "event_id": "event_x",
+        "start_ms": 1000,
+        "end_ms": 1200,
+        "delta": ""
+      },
+      "malformed": "text"
+    },
+    {
+      "why": "a delta of 513 bytes",
+      "event": {
+        "type": "session.input_transcript.delta",
+        "event_id": "event_x",
+        "start_ms": 1000,
+        "end_ms": 1200,
+        "delta": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "malformed": "text"
+    },
+    {
+      "why": "a delta with a control character",
+      "event": {
+        "type": "session.input_transcript.delta",
+        "event_id": "event_x",
+        "start_ms": 1000,
+        "end_ms": 1200,
+        "delta": "do\u0007not"
+      },
+      "malformed": "text"
+    },
+    {
+      "why": "a start that is a fraction",
+      "event": {
+        "type": "session.input_transcript.delta",
+        "event_id": "event_x",
+        "start_ms": 1000.5,
+        "end_ms": 1200,
+        "delta": " hello"
+      },
+      "malformed": "time"
+    },
+    {
+      "why": "a start below zero",
+      "event": {
+        "type": "session.input_transcript.delta",
+        "event_id": "event_x",
+        "start_ms": -1,
+        "end_ms": 1200,
+        "delta": " hello"
+      },
+      "malformed": "time"
+    },
+    {
+      "why": "an end above a call's longest length",
+      "event": {
+        "type": "session.input_transcript.delta",
+        "event_id": "event_x",
+        "start_ms": 1000,
+        "end_ms": 86400001,
+        "delta": " hello"
+      },
+      "malformed": "time"
+    },
+    {
+      "why": "a fragment that ends before it starts",
+      "event": {
+        "type": "session.input_transcript.delta",
+        "event_id": "event_x",
+        "start_ms": 1200,
+        "end_ms": 1000,
+        "delta": " hello"
+      },
+      "malformed": "ends"
+    },
+    {
+      "why": "a delegation with no offset",
+      "event": {
+        "type": "session.delegation.created",
+        "event_id": "event_y",
+        "delegation": {
+          "id": "item_x",
+          "type": "delegation",
+          "target": "client"
+        }
+      },
+      "malformed": "schema"
+    },
+    {
+      "why": "a delegation for a target that is not the client",
+      "event": {
+        "type": "session.delegation.created",
+        "event_id": "event_y",
+        "offset_ms": 3800,
+        "delegation": {
+          "id": "item_x",
+          "type": "delegation",
+          "target": "responses"
+        }
+      },
+      "malformed": "schema"
+    },
+    {
+      "why": "a delegation with an empty id",
+      "event": {
+        "type": "session.delegation.created",
+        "event_id": "event_y",
+        "offset_ms": 3800,
+        "delegation": {
+          "id": "",
+          "type": "delegation",
+          "target": "client"
+        }
+      },
+      "malformed": "schema"
+    },
+    {
+      "why": "a delegation with a member the schema does not list",
+      "event": {
+        "type": "session.delegation.created",
+        "event_id": "event_y",
+        "offset_ms": 3800,
+        "delegation": {
+          "id": "item_x",
+          "type": "delegation",
+          "target": "client",
+          "response_id": "r"
+        }
+      },
+      "malformed": "schema"
+    },
+    {
+      "why": "a delegation offset that is a fraction",
+      "event": {
+        "type": "session.delegation.created",
+        "event_id": "event_y",
+        "offset_ms": 3800.25,
+        "delegation": {
+          "id": "item_x",
+          "type": "delegation",
+          "target": "client"
+        }
+      },
+      "malformed": "time"
+    },
+    {
+      "why": "a delegation offset below zero",
+      "event": {
+        "type": "session.delegation.created",
+        "event_id": "event_y",
+        "offset_ms": -5,
+        "delegation": {
+          "id": "item_x",
+          "type": "delegation",
+          "target": "client"
+        }
+      },
+      "malformed": "time"
+    },
+    {
+      "why": "a type that begins as the transcript does and is not it",
+      "event": {
+        "type": "session.input_transcript.completed",
+        "event_id": "event_z"
+      },
+      "malformed": "unknown_required"
+    },
+    {
+      "why": "a type that begins as a delegation does and is not it",
+      "event": {
+        "type": "session.delegation.cancelled",
+        "event_id": "event_z"
+      },
+      "malformed": "unknown_required"
+    }
+  ]
+}
