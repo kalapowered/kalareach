@@ -394,9 +394,10 @@ mod console {
         /// A console answers for neither, so both are usually empty here and the reset block is the
         /// whole restoration.
         ///
-        /// The sequences are written while the output mode the attachment set still holds, which
-        /// has virtual-terminal processing on, and only then is the console's own output mode put
-        /// back: a console that had no such processing would print them as text.
+        /// When the attachment has set the output mode, the sequences are written while it still
+        /// holds, with virtual-terminal processing on, and only then is the console's own output
+        /// mode put back: a console that had no such processing would print them as text. Before
+        /// the attachment sets it, the console's own mode holds throughout.
         ///
         /// # Errors
         ///
