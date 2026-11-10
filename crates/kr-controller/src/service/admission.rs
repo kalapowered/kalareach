@@ -426,12 +426,20 @@ impl Controller {
     ///
     /// Section 9 returns a retained receipt to a duplicate only under authority that has not been
     /// withdrawn, so a fence this host owes, or a registration withdrawn or replaced while the
-    /// answer was read, stops it. A service whose work is asynchronous gives a recorded answer
-    /// back through here, whatever it records: a result, a refusal, the conflict a reused
-    /// identifier meets or an outcome that is not known. A service that reads its record on a
-    /// blocking thread asks the same check with the answer in hand through
-    /// [`Self::retained_in_service`] (the project service) or its own admission's
-    /// `check_retained` (the transfer, change-set and catalogue services).
+    /// answer was read, stops it.
+    ///
+    /// A service that finds its record itself, in asynchronous work, gives it back through here:
+    /// the voice, machine group, authority change, installation and create services, whatever the
+    /// record holds (a result, a refusal, an outcome that is not known). The services that find it
+    /// in a module of their own, or on a blocking thread, ask the same check once the answer is in
+    /// hand by other means: the attention, change-set and automation services through
+    /// [`Self::check_retained_in_hand`] on each answer they read from a record, the project
+    /// service through [`Self::retained_in_service`], the pairing door through its
+    /// `pairing_standing` check, the catalogue through its admission's `check_retained`, and the
+    /// transfer service through `TransferAdmission::check_retained`. The conflict a reused
+    /// identifier meets, found by a claim or a look after a wait, goes back through
+    /// [`Self::conflict_under_authority`] where the service claims in asynchronous work, and
+    /// through the same check in the transfer service and in the door's claim of an action.
     ///
     /// # Errors
     ///
