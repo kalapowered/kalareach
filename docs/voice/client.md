@@ -272,17 +272,19 @@ confirmation ran out").
 The person is asked through the platform's ceremony, which names the session and the host. The
 dialog is put up only while the confirmation is still open and the phone's clock does not say it has
 run out, and it stays for what is left of it. While they are asked the call goes on, and anything
-that taints it, or a loss of the path to the host, drops the confirmation at once. A challenge that
+that taints it, or a loss of the path to the host, drops the confirmation at once, as does the end
+of the call. What was handed over before a loss is not carried on after it: a challenge that
 reaches the phone after the path to the host was lost is put to nobody, whether or not the host is
-back by then: what was handed over before a loss is not carried on after it.
+back by then.
 
 After the ceremony the owner looks at taint and the phone's clock again, takes a capture proof with
 a marker and reads the news up to the marker, so that anything said while the person was asked has
 been read before anything is signed; then it looks at taint, the path to the host and the clock once
-more. The task that reads a proof raises the call's taint flag when the proof shows a break, before
-it tells the owner. Every request waiting for the connection's turn looks at that flag, which no
-reconnection clears, so none leaves before the owner has handled the message that tells it; the
-proof taken just before the signed write does the same.
+more. The task that reads the proof taken after the ceremony raises the call's taint flag when the
+proof shows a break, before it tells the owner, and so does the task that reads the proof taken
+just before the signed write. Every request waiting for the connection's turn looks at that flag,
+which no reconnection clears, so none leaves before the owner has handled the message that tells
+it.
 
 The challenge is then signed with the device's own identity key, and the request goes out again
 through the same hand-over as the first: composed once, after the first was settled, with the same
