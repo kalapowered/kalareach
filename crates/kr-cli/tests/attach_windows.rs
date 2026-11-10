@@ -1774,11 +1774,14 @@ fn mouse_reader_in_the_session() {
     let _modes = console
         .enter_raw_mode()
         .expect("the console is given virtual-terminal input");
-    println!("kr-mouse-waiting");
+    // The console the mode left on does not return the carriage at a line feed, so each line ends
+    // with both, and a word is not broken across two rows of the screen.
+    print!("kr-mouse-waiting\r\n");
+    std::io::stdout().flush().expect("flushes the first word");
     while !gate.exists() {
         std::thread::sleep(Duration::from_millis(20));
     }
-    print!("\x1b[?1000h\x1b[?1006hkr-mouse-ready");
+    print!("\x1b[?1000h\x1b[?1006hkr-mouse-ready\r\n");
     std::io::stdout().flush().expect("flushes the request");
     let mut input = console.handle();
     let mut seen = Vec::new();
@@ -1793,7 +1796,8 @@ fn mouse_reader_in_the_session() {
         assert_ne!(read, 0, "the console's input ended");
         seen.extend_from_slice(&buffer[..read]);
     }
-    println!("kr-mouse:{};kr-mouse-end", hex(&seen));
+    print!("kr-mouse:{};kr-mouse-end\r\n", hex(&seen));
+    std::io::stdout().flush().expect("flushes the reports");
 }
 
 /// `bytes` as lower-case hexadecimal.
