@@ -221,17 +221,26 @@ impl Controller {
     }
 
     /// The account of the storage service the person runs, or the refusal a host with none is
-    /// given: its `storage.origin` is unset or names the managed account service, so it holds no
-    /// account of its own for storage.
+    /// given. Over a configuration document the daemon cannot use nothing is selected, and the
+    /// refusal says that; otherwise its `storage.origin` is unset or names the managed account
+    /// service, so it holds no account of its own for storage.
     fn own_storage_account(&self) -> Result<&Arc<HostAccount>> {
         self.storage_account.as_ref().ok_or_else(|| {
-            ControllerError::NotConfigured(format!(
-                "{} in this host's configuration document ({}) is unset or names the managed \
-                 account service, so this host holds no account for a storage service you run; \
-                 `kr account sign-in` signs in the managed account",
-                kr_protocol::hostinfo::configuration::STORAGE_ORIGIN.key,
-                kr_protocol::hostinfo::configuration::FILE_NAME,
-            ))
+            let key = kr_protocol::hostinfo::configuration::STORAGE_ORIGIN.key;
+            let file = kr_protocol::hostinfo::configuration::FILE_NAME;
+            ControllerError::NotConfigured(if self.started.unusable.is_some() {
+                format!(
+                    "this host's configuration document ({file}) cannot be used, so its {key} \
+                     selects no storage service and this host holds no account for one you run; \
+                     `kr doctor` says how to put the document right"
+                )
+            } else {
+                format!(
+                    "{key} in this host's configuration document ({file}) is unset or names the \
+                     managed account service, so this host holds no account for a storage \
+                     service you run; `kr account sign-in` signs in the managed account"
+                )
+            })
         })
     }
 

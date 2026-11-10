@@ -719,3 +719,44 @@ async fn a_host_with_no_storage_service_of_its_own_refuses_all_three_by_name() {
         host.stop().await;
     }
 }
+
+/// KR-REQ-20.19: a daemon started over a configuration document it cannot use selects no storage
+/// service, and its refusals of the three storage methods say that the document cannot be used and
+/// point at `kr doctor`, not that `storage.origin` is unset: the document may name a service the
+/// person runs. The refusal still names `storage.origin` and is `HOST_NOT_CONFIGURED`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_over_a_document_it_cannot_use_says_so_in_its_storage_refusals() {
+    let managed = AccountServer::start().await;
+    let storage = AccountServer::start().await;
+    let host = host_over(
+        &document(Some(&managed.origin), None, Some(&storage.origin)),
+        &managed,
+    )
+    .await;
+    let stopped = host.shut_down().await;
+    let settings = stopped.settings().clone();
+    net_support::write_unusable_document(stopped.tree());
+    let host = stopped.start(settings).await;
+    let mut refused = Vec::new();
+    for method in [Method::AccountStorageSignIn, Method::AccountStorageSignOut] {
+        refused.push(
+            mutate(&host, method, ActionId::new(kr_ipc::new_uuid()))
+                .await
+                .expect_err("a host with no storage account refuses"),
+        );
+    }
+    refused.push(
+        report(&host, Method::AccountStorageStatus)
+            .await
+            .expect_err("a host with no storage account refuses"),
+    );
+    for refusal in &refused {
+        assert_eq!(refusal.code, ErrorCode::HostNotConfigured, "{refusal:?}");
+        assert!(
+            refusal.message.contains("storage.origin") && refusal.message.contains("kr doctor"),
+            "{}",
+            refusal.message
+        );
+    }
+    host.stop().await;
+}
