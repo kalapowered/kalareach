@@ -64,8 +64,8 @@ pub fn with_failure(mut document: Document, error: &CliError) -> Document {
 ///
 /// Every failure, warning and notice this program writes there goes through here or through
 /// [`failed`], and each is a [`Shown`]: this program's own words, values with nothing in them to
-/// hide, and what a reducer or a door decided may be said. The one other thing written there is
-/// the preview of a content export, by [`show_preview`].
+/// hide, and what a reducer or a door decided may be said. The other things written there are the
+/// preview of a content export, by [`show_preview`], and the composed line of [`say_line`].
 ///
 /// A stream that refuses the line does not end the process: the failure is kept, and [`ending`]
 /// says what could not be written once the command is done.
@@ -76,6 +76,20 @@ pub fn say(line: &Shown) {
         return;
     }
     if let Err(error) = writeln!(error_stream(), "{line}") {
+        let _ = ERROR_UNWRITTEN.set(Shown::io(&error));
+    }
+}
+
+/// Writes one composed line on standard error: a value the person asked for, which a command whose
+/// standard output is its `--json` document must name before it acts and so cannot name there.
+///
+/// It is written as [`output::line`] writes it on standard output, so that the one line reads the
+/// same in both modes. A stream that refuses it is handled as [`say`] handles one.
+pub fn say_line(line: &Line) {
+    if ERROR_UNWRITTEN.get().is_some() {
+        return;
+    }
+    if let Err(error) = output::write_line(&mut error_stream(), line) {
         let _ = ERROR_UNWRITTEN.set(Shown::io(&error));
     }
 }
