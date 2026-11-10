@@ -199,6 +199,56 @@ async fn a_registered_host_serves_an_authorised_connection_and_ends_it_cleanly()
     listener.shutdown().await;
 }
 
+/// A listener that goes ends every connection it was serving, though its peer stays connected and
+/// answers: the peer sees the connection closed with the code a lost control stream gives, and the
+/// host's handler, which each connection's task holds, is let go.
+///
+/// The handle the case keeps is weak, and it waits on what the listener's tasks do (the peer's
+/// close, the handle's release), never a length of time: a task is cancelled at the runtime's next
+/// turn, so the case gives the runtime its turns until the condition holds. The bound only stops a
+/// hang.
+#[tokio::test]
+async fn a_listener_that_goes_ends_the_connections_it_serves() {
+    let (host, client) = paired_pair().await;
+    let handler = Arc::new(TestHandler::new(client.record));
+    let held = Arc::downgrade(&handler);
+    let listener = start(&host, Arc::clone(&handler)).await;
+    let addr = listener_addr(&listener);
+
+    let connection = client
+        .endpoint
+        .connect(addr, ALPN)
+        .await
+        .expect("a connection");
+    let _authorised = handshake::connect(&connection, &client.identity, &host.record)
+        .await
+        .expect("an authorised connection");
+
+    let ended = tokio::time::timeout(Duration::from_secs(30), async {
+        while handler.served.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        // From here only the listener's tasks hold the handler.
+        drop(handler);
+        drop(listener);
+        let closed = connection.closed().await;
+        while held.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+        closed
+    })
+    .await
+    .expect("the connection closed and the handler was let go");
+    assert!(
+        matches!(
+            ended,
+            iroh::endpoint::ConnectionError::ApplicationClosed(ref close)
+                if close.error_code == kr_transport::listener::CONTROL_LOST.into()
+        ),
+        "the peer was closed as a lost control stream is: {ended:?}"
+    );
+}
+
 /// KR-REQ-23.18: losing the control stream alone is enough. With the connection itself left open,
 /// the end of its control stream revokes every data stream it authorised and runs the host's
 /// control-loss hook, which is where the host stops renewing that connection's leases.

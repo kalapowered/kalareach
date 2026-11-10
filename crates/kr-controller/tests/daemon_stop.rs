@@ -91,8 +91,10 @@ async fn a_stopped_daemon_lets_go_of_its_controller_and_its_pairing_service() {
         reached(until_let_go(&controller)),
         reached(until_let_go(&pairing)),
     );
-    assert!(device_closed, "the device's connection is still open");
-    assert!(client_closed, "the local client's connection is still open");
-    assert!(controller_let_go, "the daemon's controller is still held");
-    assert!(pairing_let_go, "the daemon's pairing service is still held");
+    assert!(
+        device_closed && client_closed && controller_let_go && pairing_let_go,
+        "after the stop, within the bound: the device's connection closed: {device_closed}; \
+         the local client's connection closed: {client_closed}; the controller was let go: \
+         {controller_let_go}; the pairing service was let go: {pairing_let_go}"
+    );
 }
