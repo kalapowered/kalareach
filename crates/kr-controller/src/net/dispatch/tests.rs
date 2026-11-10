@@ -3107,6 +3107,7 @@ fn an_empty_draft(
                 text: "look at this".to_owned(),
             },
             None,
+            None,
         )
         .expect("creates the draft")
         .draft
@@ -3145,6 +3146,7 @@ fn a_draft_written_for(
                 application_instance_id: Nullable::some(application_instance_id),
                 text: "look at this".to_owned(),
             },
+            None,
             None,
         )
         .expect("creates the draft")

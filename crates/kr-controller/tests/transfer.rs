@@ -1668,6 +1668,7 @@ fn offer(
                 text: "have a look at this".to_owned(),
             },
             None,
+            None,
         )
         .expect("creates the draft")
         .draft;
@@ -1833,6 +1834,7 @@ async fn a_daemon_that_stopped_after_recording_a_closure_ends_its_insertions_whe
                 text: "too late".to_owned(),
             },
             None,
+            None,
         )
     };
     let refusal = draft_for_unnamed(service, Nullable::some(unnamed))
@@ -1894,6 +1896,7 @@ async fn the_sweep_ends_the_insertions_of_a_session_closed_beneath_a_running_dae
                 application_instance_id: Nullable::null(),
                 text: "too late".to_owned(),
             },
+            None,
             None,
         )
     };

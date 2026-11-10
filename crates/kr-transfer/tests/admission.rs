@@ -589,13 +589,14 @@ fn a_draft_write_the_host_refuses_inside_the_lock_changes_nothing() {
             &harness.actor,
             &draft_params(&harness),
             Some(&action(&harness, "draft.create", b"create", &host)),
+            None,
         );
         assert_not_admitted(created, refuses, &host);
 
         // A draft that exists, to update and to bind an attachment to.
         let existing = harness
             .service
-            .draft_create(&harness.actor, &draft_params(&harness), None)
+            .draft_create(&harness.actor, &draft_params(&harness), None, None)
             .expect("creates the draft")
             .draft;
         let handle = harness.publish(&pattern(2048), "image/png", "photo.png");
@@ -653,16 +654,59 @@ fn a_draft_write_the_host_refuses_inside_the_lock_changes_nothing() {
             &harness.actor,
             &draft_params(&harness),
             Some(&action(&harness, "draft.create", b"create", &host)),
+            None,
         )
         .expect("under an admission that stands the draft is created");
     assert_eq!(host.committed.load(Ordering::SeqCst), 1);
+}
+
+/// KR-REQ-23.41 and KR-REQ-09.09: a create at the bound a device's drafts are held to is refused
+/// for its admission when the host's answer is no, wherever it turns to no, and the bound speaks
+/// only to an admission that stands: a device whose authority has gone is not told how many drafts
+/// it holds. The control is the same create under an admission that stands, which is refused for the
+/// bound under the quota code.
+#[test]
+fn a_create_at_the_bound_whose_admission_is_gone_is_told_that_and_not_the_count() {
+    for refuses in REFUSALS {
+        let harness = Harness::create();
+        for _ in 0..2 {
+            harness
+                .service
+                .draft_create(&harness.actor, &draft_params(&harness), None, Some(2))
+                .expect("a place is free");
+        }
+        let host = Host::new(refuses);
+        let refused = harness.service.draft_create(
+            &harness.actor,
+            &draft_params(&harness),
+            Some(&action(&harness, "draft.create", b"create", &host)),
+            Some(2),
+        );
+        assert_not_admitted(refused, refuses, &host);
+
+        let host = Host::new(Refuses::Never);
+        let refused = harness
+            .service
+            .draft_create(
+                &harness.actor,
+                &draft_params(&harness),
+                Some(&action(&harness, "draft.create", b"create", &host)),
+                Some(2),
+            )
+            .expect_err("a device at its bound");
+        assert_eq!(refused.code(), ErrorCode::QuotaExceeded, "{refuses:?}");
+        assert!(
+            host.asked.load(Ordering::SeqCst) > 0,
+            "{refuses:?}: the bound spoke only after the host was asked"
+        );
+    }
 }
 
 /// A draft for the session `draft_params` names, holding one published attachment.
 fn a_draft_holding_an_attachment(harness: &Harness) -> kr_protocol::transfer::DraftRecord {
     let draft = harness
         .service
-        .draft_create(&harness.actor, &draft_params(harness), None)
+        .draft_create(&harness.actor, &draft_params(harness), None, None)
         .expect("creates the draft")
         .draft;
     let handle = harness.publish(&pattern(2048), "image/png", "photo.png");
@@ -782,7 +826,12 @@ fn a_repeat_answered_from_its_record_asks_the_host_nothing() {
     let performed = action(&harness, "draft.create", b"create", &first);
     let created = harness
         .service
-        .draft_create(&harness.actor, &draft_params(&harness), Some(&performed))
+        .draft_create(
+            &harness.actor,
+            &draft_params(&harness),
+            Some(&performed),
+            None,
+        )
         .expect("the draft is created");
     let refusing = Host::new(Refuses::WhenAsked);
     let repeat = Action {
@@ -791,7 +840,7 @@ fn a_repeat_answered_from_its_record_asks_the_host_nothing() {
     };
     let again = harness
         .service
-        .draft_create(&harness.actor, &draft_params(&harness), Some(&repeat))
+        .draft_create(&harness.actor, &draft_params(&harness), Some(&repeat), None)
         .expect("the repeat is answered from the record");
     assert_eq!(again, created, "one action, one answer");
     assert_eq!(
