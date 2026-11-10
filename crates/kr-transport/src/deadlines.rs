@@ -153,6 +153,7 @@ pub use manual::ManualDeadlines;
 
 #[cfg(feature = "testing")]
 mod manual {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::sync::Mutex;
 
@@ -164,7 +165,7 @@ mod manual {
     /// after it was started, and at no other time. A deadline is fired by what the host is doing
     /// and never by how long it has been doing it: [`ManualDeadlines::fire_when_armed`] waits for
     /// a deadline of the kind to be in force, which is the host having reached the wait the
-    /// deadline bounds, and then fires it.
+    /// deadline bounds, fires it, and waits until a deadline has seen the firing.
     #[derive(Debug, Default)]
     pub struct ManualDeadlines {
         shared: Arc<Shared>,
@@ -180,8 +181,13 @@ mod manual {
     struct State {
         /// How many times each kind has been fired.
         fired: [u64; 5],
-        /// How many deadlines of each kind are in force: started, not yet dropped.
-        armed: [usize; 5],
+        /// The deadlines of each kind in force, by the number each was started with: started,
+        /// not yet dropped.
+        armed: [BTreeSet<u64>; 5],
+        /// How many deadlines of each kind have resolved.
+        resolved: [u64; 5],
+        /// The number the next deadline started gets.
+        next: u64,
     }
 
     impl Shared {
@@ -196,12 +202,13 @@ mod manual {
     struct Armed {
         shared: Arc<Shared>,
         index: usize,
+        number: u64,
     }
 
     impl Drop for Armed {
         fn drop(&mut self) {
             let mut state = self.shared.lock();
-            state.armed[self.index] = state.armed[self.index].saturating_sub(1);
+            state.armed[self.index].remove(&self.number);
             drop(state);
             self.shared.changed.notify_waiters();
         }
@@ -224,7 +231,7 @@ mod manual {
         /// How many deadlines of `kind` are in force: started, and neither resolved nor dropped.
         #[must_use]
         pub fn armed(&self, kind: DeadlineKind) -> usize {
-            self.shared.lock().armed[kind.index()]
+            self.shared.lock().armed[kind.index()].len()
         }
 
         /// Waits until a deadline of `kind` is in force.
@@ -238,10 +245,37 @@ mod manual {
             }
         }
 
-        /// Waits until a deadline of `kind` is in force, and fires it.
+        /// Waits until a deadline of `kind` is in force, fires it, and returns once a deadline has
+        /// resolved because of it.
+        ///
+        /// A host that is about to leave a wait drops its deadline without looking at it again, and
+        /// a firing that lands then has resolved nothing. When every deadline that was in force at
+        /// the firing has gone without one resolving, this waits for the next to be started and
+        /// fires that, so that a case which has to cut one wait is not left holding a firing that
+        /// nobody saw.
         pub async fn fire_when_armed(&self, kind: DeadlineKind) {
-            self.wait_armed(kind).await;
-            self.fire(kind);
+            let index = kind.index();
+            loop {
+                self.wait_armed(kind).await;
+                let (resolved_before, fired_at) = {
+                    let state = self.shared.lock();
+                    (state.resolved[index], state.armed[index].clone())
+                };
+                self.fire(kind);
+                loop {
+                    let changed = self.shared.changed.notified();
+                    {
+                        let state = self.shared.lock();
+                        if state.resolved[index] > resolved_before {
+                            return;
+                        }
+                        if state.armed[index].is_disjoint(&fired_at) {
+                            break;
+                        }
+                    }
+                    changed.await;
+                }
+            }
         }
     }
 
@@ -249,22 +283,31 @@ mod manual {
         fn start(&self, kind: DeadlineKind) -> BoxFuture<'static, ()> {
             let index = kind.index();
             let shared = Arc::clone(&self.shared);
-            let started_after = {
+            let (started_after, number) = {
                 let mut state = shared.lock();
-                state.armed[index] += 1;
-                state.fired[index]
+                let number = state.next;
+                state.next += 1;
+                state.armed[index].insert(number);
+                (state.fired[index], number)
             };
             shared.changed.notify_waiters();
             let armed = Armed {
                 shared: Arc::clone(&shared),
                 index,
+                number,
             };
             Box::pin(async move {
                 let _armed = armed;
                 loop {
                     let changed = shared.changed.notified();
-                    if shared.lock().fired[index] > started_after {
-                        return;
+                    {
+                        let mut state = shared.lock();
+                        if state.fired[index] > started_after {
+                            state.resolved[index] += 1;
+                            drop(state);
+                            shared.changed.notify_waiters();
+                            return;
+                        }
                     }
                     changed.await;
                 }
