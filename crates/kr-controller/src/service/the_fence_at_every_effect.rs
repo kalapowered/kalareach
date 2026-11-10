@@ -982,25 +982,31 @@ async fn a_transfer_action_recorded_before_a_late_attempt_is_not_given_back_whil
             &mutation,
             Method::DraftCreate,
             crate::transfer::TransferAdmission::new(Arc::clone(&controller), admission),
+            None,
         )
     };
-    late()
-        .await
+    let given = late().await;
+    assert!(given.is_copied(), "the late attempt is given the record");
+    given
+        .into_answer()
         .expect("with nothing owed the late attempt is answered from the record");
 
     controller.hold_fence(true);
     let refused = late()
         .await
+        .into_withheld()
         .expect_err("a fence this host owes stops the retained answer");
     refused_for_a_fence(&refused);
     controller.hold_fence(false);
     late()
         .await
+        .into_answer()
         .expect("once the fence is gone it is answered again");
 
     controller.admitted_write().remove(&connection_id);
     let refused = late()
         .await
+        .into_withheld()
         .expect_err("a registration that is gone stops the retained answer");
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
 }

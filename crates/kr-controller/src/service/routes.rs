@@ -442,10 +442,13 @@ impl Controller {
                 Some(_) => crate::transfer::TransferAdmission::new(Arc::clone(self), carried),
                 None => crate::transfer::TransferAdmission::settling(Arc::clone(self), carried),
             };
+            // The person at this machine has no bound on the drafts it keeps, and is told every
+            // answer whole.
             return self
                 .transfer
-                .write_frame(actor_id, mutation, method, admission)
-                .await;
+                .write_frame(actor_id, mutation, method, admission, None)
+                .await
+                .into_answer();
         }
         if crate::voice::VoiceModule::serves(method) {
             // Section 23 gives `voice.grant` both ingresses: a paired device changes its own voice

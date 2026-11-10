@@ -585,6 +585,35 @@ impl RemoteConnection {
             crate::voice::VoiceModule::check_subject(entry.method, mutation)
                 .map_err(|error| error.to_protocol_error())?;
         }
+        // A draft write names its draft in its parameters, which an action target cannot carry:
+        // the environment and the session a draft is made for have to be the ones the target
+        // names, as at the local ingress, and the service compares the stored subject with the
+        // target once it has looked the draft up. The device a draft is labelled with is recorded
+        // as the service finds it, so it is this device or none: a device does not label what it
+        // makes as another's.
+        if crate::transfer::TransferModule::serves(entry.method) {
+            crate::transfer::TransferModule::check_subject(entry.method, mutation)
+                .map_err(|error| error.to_protocol_error())?;
+            if entry.method == Method::DraftCreate {
+                let params = mutation
+                    .params
+                    .to_typed::<kr_protocol::transfer::DraftCreateParams>()
+                    .map_err(|error| {
+                        ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
+                    })?;
+                if params
+                    .device_id
+                    .0
+                    .is_some_and(|label| label != self.device.device_id)
+                {
+                    return Err(ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "a draft carries the identity of the device that makes it, and this \
+                         connection is another device's",
+                    ));
+                }
+            }
+        }
         // The target and the parameters have to name the same subject. One that pointed at a
         // session the grant admits and carried another in its parameters would act on the one
         // nobody addressed, and the grant check above would have looked at the wrong one.
