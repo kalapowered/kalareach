@@ -7149,6 +7149,11 @@ async fn a_signed_request_stopped_while_it_waits_for_the_writer_is_never_written
     scene.platform.tell(CallEvent::Capture {
         state: CaptureState::MutedByPerson,
     });
+    scene
+        .state_where("the call tainted", |state| {
+            kinds_of(state).contains(&"spoken_requests".to_owned())
+        })
+        .await;
     scene.link.release_request();
     scene.link.until_the_held_request_has_passed().await;
 
