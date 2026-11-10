@@ -409,10 +409,16 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
     // the host signs an account in on its own, at this machine: a write that starts the sign-in, a
     // write that ends it and a read of where it stands, all served on the local socket alone and
     // asking for host management. A paired device neither starts, ends nor reads them.
-    let account: [(&str, EffectClass); 3] = [
+    //
+    // A host whose storage service is one its owner runs holds a second account there, with a
+    // sign-in, a sign-out and a read of its own that are served and asked for in the same way.
+    let account: [(&str, EffectClass); 6] = [
         ("account.sign_in", EffectClass::Write),
         ("account.sign_out", EffectClass::Write),
         ("account.status", EffectClass::Read),
+        ("account.storage_sign_in", EffectClass::Write),
+        ("account.storage_sign_out", EffectClass::Write),
+        ("account.storage_status", EffectClass::Read),
     ];
     for (name, effect) in account {
         let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));

@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 193,
+  "method_count": 196,
   "methods": [
     {
       "capability": "none",
@@ -520,6 +520,93 @@
         "environment"
       ],
       "summary": "Where this host's sign-in to the managed account service stands: signed out, waiting for the browser, signed in at which service, or ended, and how the last attempt ended.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "account.storage_sign_in",
+      "name": "account.storage_sign_in",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment"
+      ],
+      "summary": "Start this host's own sign-in to the storage service its owner runs, the one `storage.origin` names: listen on the loopback address the desktop client is registered with, and keep the grant that comes back from the person's browser in this host's secret store, apart from the managed account's. The grant asks for backup storage and nothing else. A host whose `storage.origin` names no service of its own is refused. The address the person opens is read with account.storage_status. Nothing in the answer is a token.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "account.storage_sign_out",
+      "name": "account.storage_sign_out",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment"
+      ],
+      "summary": "End this host's own sign-in to the storage service its owner runs: remove the grant from this host's secret store and ask that service to end it. The managed account is not touched. A host whose `storage.origin` names no service of its own is refused. The answer says whether an account was signed in and whether the service acknowledged ending it; nothing in it is a token.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": "idempotent_read",
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "account.storage_status",
+      "name": "account.storage_status",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment"
+      ],
+      "summary": "Where this host's sign-in to the storage service its owner runs stands: signed out, waiting for the browser, signed in at which service, or ended, and how the last attempt ended. A host whose `storage.origin` names no service of its own is refused.",
       "version": 1
     },
     {

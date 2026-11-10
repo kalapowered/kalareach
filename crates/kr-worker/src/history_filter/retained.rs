@@ -279,6 +279,8 @@ pub const fn result_content(method: Method) -> ResultContent {
         | Method::HostClockEstablish
         | Method::AccountSignIn
         | Method::AccountSignOut
+        | Method::AccountStorageSignIn
+        | Method::AccountStorageSignOut
         | Method::DescriptionConfigure
         | Method::DescriptionDownload
         | Method::EnvironmentCapabilitiesCheck => Environment,

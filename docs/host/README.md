@@ -629,6 +629,14 @@ daemon exchanges the answer with the service and keeps the grant in the host's s
 account show` says whether the host is signed out, waiting for the browser, signed in, or ended, and
 how the last attempt that ended ended. Nothing it prints or answers is a token.
 
+A host whose `storage.origin` names a service its owner runs holds a second account, at that
+service, for backup storage and nothing else. `kr account sign-in --storage` starts its sign-in
+(`account.storage_sign_in`), `kr account sign-out --storage` ends it (`account.storage_sign_out`),
+and `kr account show` also reads where it stands (`account.storage_status`). The three are served
+on the local socket alone and ask for host management, as the managed account's are. Each acts on
+the storage account and never on the managed one. A host whose `storage.origin` is unset or names
+the managed account service refuses all three with `HOST_NOT_CONFIGURED`, naming `storage.origin`.
+
 The browser signs in at the managed account service, and the code it brings back is redeemable there
 and nowhere else, so the exchange, every refresh and every revocation go to that one service. The
 host presents a token to the voice broker, the storage service or the relay lease service its

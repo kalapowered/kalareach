@@ -506,6 +506,36 @@ methods! {
     doc: "Where this host's sign-in to the managed account service stands: signed out, waiting for \
           the browser, signed in at which service, or ended, and how the last attempt ended.";
 
+    AccountStorageSignIn = "account.storage_sign_in", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Start this host's own sign-in to the storage service its owner runs, the one \
+          `storage.origin` names: listen on the loopback address the desktop client is \
+          registered with, and keep the grant that comes back from the person's browser in this \
+          host's secret store, apart from the managed account's. The grant asks for backup \
+          storage and nothing else. A host whose `storage.origin` names no service of its \
+          own is refused. The address the person opens is read with account.storage_status. \
+          Nothing in the answer is a token.";
+
+    AccountStorageSignOut = "account.storage_sign_out", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "End this host's own sign-in to the storage service its owner runs: remove the grant \
+          from this host's secret store and ask that service to end it. The managed account is \
+          not touched. A host whose `storage.origin` names no service of its own is refused. The \
+          answer says whether an account was signed in and whether the service acknowledged \
+          ending it; nothing in it is a token.";
+
+    AccountStorageStatus = "account.storage_status", HostAndEnvironment,
+    effect: Read, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "Where this host's sign-in to the storage service its owner runs stands: signed out, \
+          waiting for the browser, signed in at which service, or ended, and how the last attempt \
+          ended. A host whose `storage.origin` names no service of its own is refused.";
+
     BackupRead = "backup.read", HostAndEnvironment,
     effect: Read, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
@@ -2162,6 +2192,11 @@ mod tests {
         ("account.sign_in", &[ActionRight::HostManage]),
         ("account.sign_out", &[ActionRight::HostManage]),
         ("account.status", &[ActionRight::HostManage]),
+        // The same, for the storage service this host's owner runs: a second account at that
+        // service, which the host presents to nothing else.
+        ("account.storage_sign_in", &[ActionRight::HostManage]),
+        ("account.storage_sign_out", &[ActionRight::HostManage]),
+        ("account.storage_status", &[ActionRight::HostManage]),
         // Reading what the managed storage service holds for a restore, with this host's account.
         ("backup.read", &[ActionRight::HostManage]),
         // Setting this host's backups up and reading where they stand, at the host itself.

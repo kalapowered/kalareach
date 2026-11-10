@@ -22584,6 +22584,21 @@
           "type": "string"
         },
         {
+          "const": "account.storage_sign_in",
+          "description": "Start this host's own sign-in to the storage service its owner runs, the one `storage.origin` names: listen on the loopback address the desktop client is registered with, and keep the grant that comes back from the person's browser in this host's secret store, apart from the managed account's. The grant asks for backup storage and nothing else. A host whose `storage.origin` names no service of its own is refused. The address the person opens is read with account.storage_status. Nothing in the answer is a token.",
+          "type": "string"
+        },
+        {
+          "const": "account.storage_sign_out",
+          "description": "End this host's own sign-in to the storage service its owner runs: remove the grant from this host's secret store and ask that service to end it. The managed account is not touched. A host whose `storage.origin` names no service of its own is refused. The answer says whether an account was signed in and whether the service acknowledged ending it; nothing in it is a token.",
+          "type": "string"
+        },
+        {
+          "const": "account.storage_status",
+          "description": "Where this host's sign-in to the storage service its owner runs stands: signed out, waiting for the browser, signed in at which service, or ended, and how the last attempt ended. A host whose `storage.origin` names no service of its own is refused.",
+          "type": "string"
+        },
+        {
           "const": "backup.read",
           "description": "One read of what the managed storage service holds, for a restore that runs in the command line: which service this host is configured for and whether it may be asked, the recovery bundle at a locator, the newest generation published for an archive held to a checkpoint, or one range of a stored object. The host relays ciphertext and public records with its own account and sees no seed, plaintext, file name or destination. It answers none of the last three while privacy mode is on, and it sends nothing while the service has asked to be left alone, answering what is left of the delay instead.",
           "type": "string"

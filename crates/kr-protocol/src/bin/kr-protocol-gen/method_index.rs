@@ -137,9 +137,12 @@ pub(crate) const fn described_in(method: Method) -> Section {
             at(HOST, "Reading a backup for a restore")
         }
         Method::BackupStatus | Method::BackupEnable => at(HOST, "Setting up backups"),
-        Method::AccountSignIn | Method::AccountSignOut | Method::AccountStatus => {
-            at(HOST, "Account sign-in")
-        }
+        Method::AccountSignIn
+        | Method::AccountSignOut
+        | Method::AccountStatus
+        | Method::AccountStorageSignIn
+        | Method::AccountStorageSignOut
+        | Method::AccountStorageStatus => at(HOST, "Account sign-in"),
         Method::HostUpdateHandover => at(HOST_UPDATES, "The handover"),
         Method::OrganisationEnrol
         | Method::OrganisationList
