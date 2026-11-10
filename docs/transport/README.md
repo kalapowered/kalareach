@@ -533,7 +533,8 @@ against the connection: no bulk slot, no registry entry.
 2. The whole header arrives within the header deadline.
 3. The header names this connection, and its resource fits its kind.
 4. The kind is one the host accepts. `ListenerConfig::accepted_kinds` lists them and is empty by
-   default, so a host that asks for none takes none and resets every stream after its header.
+   default. A host that names none takes none, and a device cannot open a data stream on its
+   connections at all (see "Stream limits").
 5. A bulk stream finds a free slot among the connection's bulk streams.
 
 A stream that passes goes to the host through `AuthorisedSession::data_streams` (`DataStreams`), a
@@ -556,8 +557,11 @@ can wait for the next frame while the other writes the answer to the last. The h
 stream's revocation handle, and the stream stays registered and keeps its bulk slot until both are
 dropped. `write_message_while` writes a frame on either as `FrameWriter::write_message_while` does:
 the write is held to the caller's check at every attempt to hand bytes to the stream, to the queue
-budget, to the write deadline and to revocation. A revocation, a deadline or a refused reservation
-ends it with an error, never with `Ok(false)`, which means only that the caller's own check refused.
+budget, to the write deadline and to revocation. The stream's revoked state is asked at each
+attempt, in the same poll and before the caller's check, so no byte goes to the stream after a
+revocation, even when the stream is writable at that moment. A revocation, a deadline or a refused
+reservation ends it with an error, never with `Ok(false)`, which means only that the caller's own
+check refused.
 A refusal leaves the stream reset and revokes it, so the half that reads stops too. A read or a
 write that is dropped before it ends, because a caller raced it in a `select!`, leaves part of a
 frame consumed or sent and revokes the stream for the same reason: end a stream by revoking its
@@ -600,17 +604,33 @@ takes.
 
 ### Stream limits
 
-A connection lets its peer open no unidirectional stream, since the product uses none, and at most
-as many bidirectional streams as the control stream, the bulk streams the host allows, the places
-for streams that are waiting for their headers and one more: 10 with the default of four bulk
-streams. The library's default is a hundred of each kind, and a connection that is not yet
-authorised could otherwise hold them. A host that raises `SendLimits::max_bulk_streams` raises the
-bound with it.
+A connection lets its peer open no unidirectional stream, since the product uses none. The library's
+default is a hundred streams of each kind, and up to 64 connections that are not yet authorised
+could otherwise hold them, so bidirectional streams are limited in two steps.
 
-What a connection holds in memory is at most that many streams, each up to the library's per-stream
-receive window of 1.25 MB, plus one decoded frame of 1 MiB + 4 KiB for each stream whose frame is
-being read. The connection-wide receive window is not limited. If one is ever set, it has to stay
-above that bound, or a stalled data stream could take the credit the control stream needs.
+A listening endpoint starts every connection with room for one bidirectional stream: the one the
+handshake runs on, which is the control stream once the connection is authorised. A peer that opens
+a second one waits for credit the host does not give. When the listener authorises a connection for
+a host that takes data streams (`ListenerConfig::accepted_kinds` names a kind), it raises the limit
+with the library's `Connection::set_max_concurrent_bi_streams` to the control stream, the bulk
+streams the host allows, the places for streams that are waiting for their headers and one more: 10
+with the default of four bulk streams. The library grants the difference at once, and a stream the
+peer was waiting to open is opened when the credit arrives. A host that raises
+`SendLimits::max_bulk_streams` raises the bound with it. A host that names no kind never raises the
+limit, so its devices can open no stream but the control stream.
+
+An endpoint that only dials (`bind_dialer`) starts at none, because a host opens no stream to a
+client. `StreamRegistry::accept` on a client's connection, which kr-client's
+`NetworkTransport::accept_stream` calls, therefore waits until the connection ends and then
+returns an error. A caller that accepts connections itself, with `bind_listener` and
+`handshake::accept`, has one stream per connection until it raises the limit with the same
+library call.
+
+What an authorised connection holds in memory is at most as many streams as the raised limit, each
+up to the library's per-stream receive window of 1.25 MB, plus one decoded frame of 1 MiB + 4 KiB for each stream whose
+frame is being read. A connection that is not authorised holds the buffers of one stream. The
+connection-wide receive window is not limited. If one is ever set, it has to stay above that bound,
+or a stalled data stream could take the credit the control stream needs.
 
 ### Revocation
 
