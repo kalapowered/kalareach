@@ -143,8 +143,8 @@ async fn until_claimed(
 /// The refusal an answer carries, or a panic naming what it carried.
 fn refused(answer: &Answer) -> &ControllerError {
     match answer {
-        Given::Fresh(Err(error)) | Given::Copied(Err(error)) => error,
-        Given::Fresh(Ok(value)) | Given::Copied(Ok(value)) => {
+        Given::Fresh(Err(error)) | Given::Copied(Err(error)) | Given::Withheld(Err(error)) => error,
+        Given::Fresh(Ok(value)) | Given::Copied(Ok(value)) | Given::Withheld(Ok(value)) => {
             panic!("the share was written: {value:?}")
         }
     }
