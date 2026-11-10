@@ -192,7 +192,7 @@ fn announce_the_wait() {
 /// Panics when the store cannot be read, or reads differently, while its index is held, and when
 /// `open` fails while it is held or after it has been let go of.
 #[cfg(all(windows, feature = "testing"))]
-pub fn assert_an_open_waits_for_the_previous_holder<E: std::fmt::Debug>(
+pub fn assert_an_open_succeeds_while_a_holder_maps_the_index<E: std::fmt::Debug>(
     database: &std::path::Path,
     open: impl Fn() -> Result<(), E>,
 ) {

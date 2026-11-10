@@ -5181,10 +5181,10 @@ mod a_previous_holder_that_is_letting_go {
     use super::*;
 
     #[test]
-    fn the_open_waits_for_it() {
+    fn the_open_succeeds_and_reads_what_the_previous_holder_committed() {
         let directory = tempfile::tempdir().expect("a directory");
         let path = directory.path().join("registry.sqlite3");
-        kr_flush::release::assert_an_open_waits_for_the_previous_holder(&path, || {
+        kr_flush::release::assert_an_open_succeeds_while_a_holder_maps_the_index(&path, || {
             GrantDirectory::open(&path).map(drop)
         });
     }

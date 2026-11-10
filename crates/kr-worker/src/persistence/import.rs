@@ -168,8 +168,9 @@ pub enum ImportRefusal {
 /// Returns an [`ImportRefusal`] naming what the importer could not read. The journal is then
 /// exactly as it was.
 pub fn import_journal(path: impl AsRef<Path>) -> Result<Imported, ImportRefusal> {
-    // Opened as the journal's own openers are, so that a store that cannot make its index ready is
-    // asked again and not reported as a journal that cannot be read.
+    // Opened as the journal's own openers are: an open that is told the store's index cannot be
+    // made ready is asked again, so that a refusal that passes is not reported as a journal that
+    // cannot be read. One that lasts is.
     let mut connection = kr_flush::release::open_connection(
         path.as_ref(),
         Some(
@@ -702,11 +703,11 @@ mod a_previous_holder_that_is_letting_go {
     use super::*;
 
     #[test]
-    fn the_open_waits_for_it() {
+    fn the_open_succeeds_and_reads_what_the_previous_holder_committed() {
         let directory = tempfile::tempdir().expect("a directory");
         let database = directory.path().join("journal.sqlite");
         drop(crate::journal::Journal::open(&database).expect("a journal of the current schema"));
-        kr_flush::release::assert_an_open_waits_for_the_previous_holder(&database, || {
+        kr_flush::release::assert_an_open_succeeds_while_a_holder_maps_the_index(&database, || {
             import_journal(&database).map(drop)
         });
     }
