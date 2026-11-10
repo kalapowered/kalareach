@@ -32,6 +32,8 @@ private final class Told: VoiceCallObserver {
     }
 
     func voiceCallPlayedAudio(_: VoiceCall) {}
+
+    func voiceCall(_: VoiceCall, barrier _: UInt64) {}
 }
 
 /// A peer in this process that answers an offer and reads the channel the offer names.

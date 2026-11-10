@@ -166,6 +166,14 @@ public final class VoiceCaptureGate: @unchecked Sendable {
     private var openedAtMs: UInt64?
     private var openedUntilMs: UInt64 = .max
     private var heard: [Range<UInt64>] = []
+    /// How many times capture went from off to on in this call, the first opening included.
+    private var openings: UInt64 = 0
+    /// How many times capture was broken: it went off after an opening, or what the recorder
+    /// delivered showed a gap, or a reading had no figure to tell by, while capture was on.
+    private var breaks: UInt64 = 0
+    /// The moment the freshest sign was seen that audio is being recorded, since capture last
+    /// opened. Nil when none has been.
+    private var progressAtMs: UInt64?
     /// Where the recorder is known only from readings taken now and then, the latest moment audio
     /// was seen arriving. Nil where every moment the recorder runs counts as heard.
     private var confirmedUntilMs: UInt64?
@@ -255,6 +263,51 @@ public final class VoiceCaptureGate: @unchecked Sendable {
             guard let confirmed = confirmedUntilMs else { return }
             confirmedUntilMs = max(confirmed, min(atMs, nowMs))
             settle(nowMs)
+            if enabled(nowMs) { progressAtMs = max(progressAtMs ?? 0, min(atMs, nowMs)) }
+        }
+    }
+
+    /// What the recorder delivered showed a gap, or a reading had no figure to tell by, while
+    /// capture was on. A break is counted only while capture is on: before it opens and after it
+    /// closes there is nothing carried to break. True when one was counted.
+    @discardableResult
+    public func progressBroke(nowMs: UInt64) -> Bool {
+        locked {
+            settle(nowMs)
+            guard enabled(nowMs) else { return false }
+            breaks += 1
+            return true
+        }
+    }
+
+    /// What this gate has recorded of capture, read in one step under its lock: the record is the
+    /// authority on whether capture was unbroken, not the news told of it, which can arrive after
+    /// the moment it is about.
+    public struct Proof: Equatable, Sendable {
+        /// What the microphone is doing now.
+        public let state: VoiceCaptureState
+        /// Whether capture has been on at some time in the call.
+        public let opened: Bool
+        /// How many times capture went from off to on, the first opening included.
+        public let openings: UInt64
+        /// How many times capture was broken.
+        public let breaks: UInt64
+        /// How long ago the freshest sign of recording was seen, since capture last opened; nil
+        /// when none has been.
+        public let progressAgeMs: UInt64?
+    }
+
+    /// The record as it stands at `nowMs`.
+    public func proof(nowMs: UInt64) -> Proof {
+        locked {
+            settle(nowMs)
+            return Proof(
+                state: shown(nowMs),
+                opened: openings > 0,
+                openings: openings,
+                breaks: breaks,
+                progressAgeMs: progressAtMs.map { nowMs - min($0, nowMs) }
+            )
         }
     }
 
@@ -282,17 +335,22 @@ public final class VoiceCaptureGate: @unchecked Sendable {
     public func displayed(nowMs: UInt64) -> VoiceCaptureState {
         locked {
             settle(nowMs)
-            guard !stopped, let held = permit, nowMs < held.deadlineMs else { return .idle }
-            // What the system did is said first: it is why the recorder stopped, when it did.
-            switch taken {
-            case .interrupted: return .interrupted
-            case .suspended: return .suspendedBySystem
-            case .none: break
-            }
-            if routeChanging { return .routeChanging }
-            if !inputAvailable || !recorderRunning { return .unavailable }
-            return mutedByPerson ? .mutedByPerson : .capturing
+            return shown(nowMs)
         }
+    }
+
+    /// What is displayed at `nowMs`, after `settle`, under the lock.
+    private func shown(_ nowMs: UInt64) -> VoiceCaptureState {
+        guard !stopped, let held = permit, nowMs < held.deadlineMs else { return .idle }
+        // What the system did is said first: it is why the recorder stopped, when it did.
+        switch taken {
+        case .interrupted: return .interrupted
+        case .suspended: return .suspendedBySystem
+        case .none: break
+        }
+        if routeChanging { return .routeChanging }
+        if !inputAvailable || !recorderRunning { return .unavailable }
+        return mutedByPerson ? .mutedByPerson : .capturing
     }
 
     /// Whether the microphone was carrying speech at `atMs`, asked at `nowMs`.
@@ -333,7 +391,11 @@ public final class VoiceCaptureGate: @unchecked Sendable {
         if on, openedAtMs == nil {
             openedAtMs = nowMs
             openedUntilMs = permit?.deadlineMs ?? nowMs
+            openings += 1
+            progressAtMs = nil
         } else if !on, let open = openedAtMs {
+            breaks += 1
+            progressAtMs = nil
             // Capture that ran out at the deadline ended there, not whenever somebody next asked;
             // and where hearing is confirmed by readings, it ended at the last one that saw audio.
             let end = heardUntil(min(nowMs, openedUntilMs))
@@ -536,6 +598,21 @@ public final class VoiceCallControl: @unchecked Sendable {
     /// whose deadline has passed.
     public func recorderUnchanged() {
         entered {}
+    }
+
+    /// What the recorder delivered showed a gap, or a reading had no figure to tell by: a break in
+    /// the record while capture is on, and nothing while it is not.
+    public func progressBroke() {
+        entered {
+            guard !stopped else { return }
+            gate.progressBroke(nowMs: platform.nowMs())
+        }
+    }
+
+    /// What this call's record of capture shows now. Like every way into the control it first ends
+    /// a call whose deadline has passed, so a proof is never read from a call that ran out.
+    public func captureProof() -> VoiceCaptureGate.Proof {
+        entered { gate.proof(nowMs: platform.nowMs()) }
     }
 
     /// The person's own mute. Nothing the system does changes it.
@@ -776,6 +853,74 @@ public struct VoiceRecorderWatch: Sendable {
     }
 }
 
+/// Whether the audio the call's source takes in keeps pace with the clock, read from the same
+/// readings of `totalSamplesDuration` the recorder watch reads.
+///
+/// A recorder can stall for a few hundred milliseconds and go on, which the watch's quiet time never
+/// tells: a word can be lost in that gap. Over a window of up to `windowReadings` readings the audio
+/// that was taken in is compared with the time that passed, and a shortfall of `gapMs` or more is a
+/// gap. The time that passed is a bound that cannot be too small: from the earlier reading's
+/// request to the later reading's answer, both stamped with the monotonic clock at the moment
+/// they were made, with the age of the oldest report the statistics may serve added. The statistics
+/// are read on a queue that also carries other news, so a slow queue only makes the bound larger and
+/// the gap larger, which is a false gap and never a hidden one: audio `G` taken in over a window of
+/// true length `E <= E_max` hides a gap `g` only if `E_max - G < g`, and `E_max - G >= g` always.
+/// A reading with no figure tells nothing, and says so. Not thread-safe: the reader uses it on the
+/// call's own queue only. The figures are test parameters, not safety bounds.
+public struct VoiceProgressWatch: Sendable {
+    /// The age of the oldest report the connection's statistics may serve, in milliseconds. WebRTC's
+    /// statistics collector answers from a report up to 50 ms old.
+    public static let staleReportMs: UInt64 = 50
+
+    /// What a reading showed about the audio keeping pace.
+    public enum Verdict: Equatable, Sendable {
+        /// The audio kept pace, or there is nothing yet to compare with.
+        case progressing
+        /// The audio fell short of the time that passed by the gap or more.
+        case gap
+        /// The report had no figure, so nothing can be told.
+        case noFigure
+    }
+
+    private let windowReadings: Int
+    private let gapMs: Double
+    /// The readings of the window, oldest first: when each was asked for and what it showed.
+    private var window: [(requestedAtMs: UInt64, seconds: Double)] = []
+
+    public init(windowReadings: Int = 4, gapMs: UInt64 = 100) {
+        self.windowReadings = windowReadings
+        self.gapMs = Double(gapMs)
+    }
+
+    /// Takes one reading of the source's total captured seconds, nil when the report had none. The
+    /// reading was asked for at `requestedAtMs` and answered at `answeredAtMs`, both read from the
+    /// monotonic clock in the platform's callback and not on the queue the answer later runs on.
+    /// After a gap the window starts afresh at this reading, so one gap is told once.
+    public mutating func observe(capturedSeconds: Double?, requestedAtMs: UInt64, answeredAtMs: UInt64) -> Verdict {
+        guard let seconds = capturedSeconds else {
+            window.removeAll()
+            return .noFigure
+        }
+        if let oldest = window.first {
+            let passed = Double(max(answeredAtMs, oldest.requestedAtMs) - oldest.requestedAtMs)
+                + Double(Self.staleReportMs)
+            let taken = (seconds - oldest.seconds) * 1_000
+            if passed - taken >= gapMs {
+                window = [(requestedAtMs, seconds)]
+                return .gap
+            }
+        }
+        window.append((requestedAtMs, seconds))
+        if window.count > windowReadings + 1 { window.removeFirst() }
+        return .progressing
+    }
+
+    /// Starts afresh, for a device that has just come on or gone off.
+    public mutating func reset() {
+        window.removeAll()
+    }
+}
+
 /// Turns what WebRTC reports about a call's audio source into the recorder's state, for one call.
 ///
 /// The call's adapter only carries things here: when its audio device comes on or goes off, each
@@ -787,6 +932,7 @@ public struct VoiceRecorderWatch: Sendable {
 public final class VoiceRecorderReader {
     private let control: VoiceCallControl
     private var watch: VoiceRecorderWatch
+    private var progress = VoiceProgressWatch()
     private var generation: UInt64 = 0
     private var on = false
 
@@ -801,21 +947,36 @@ public final class VoiceRecorderReader {
         self.on = on
         generation += 1
         watch.reset()
+        progress.reset()
     }
 
     /// Whether a reading should be asked for now, and the generation to send with it.
     public func request() -> UInt64? { on ? generation : nil }
 
     /// A reading asked for in `generation`: the source's total captured seconds, nil when the
-    /// report had none, at `atMs` on the monotonic clock. Every reading reaches the call, one that
+    /// report had none. It was asked for at `requestedAtMs` and answered at `answeredAtMs`, both
+    /// on the monotonic clock and stamped where the request was made and in the platform's
+    /// callback, not on the queue the answer ran on after. Every reading reaches the call, one that
     /// shows nothing new or comes too late included, so the first reading after the deadline ends
     /// the call however late its timer is.
-    public func reading(capturedSeconds: Double?, generation: UInt64, atMs: UInt64) {
+    ///
+    /// A gap in the audio taken in, and a reading with no figure, are breaks in the call's record
+    /// while capture is on. Audio is vouched for from the moment of the oldest report the
+    /// statistics may have served, so the record never claims more than the reading showed.
+    public func reading(capturedSeconds: Double?, generation: UInt64, requestedAtMs: UInt64, answeredAtMs: UInt64) {
         guard on, generation == self.generation else {
             control.recorderUnchanged()
             return
         }
-        switch watch.observe(capturedSeconds: capturedSeconds, atMs: atMs) {
+        switch progress.observe(
+            capturedSeconds: capturedSeconds, requestedAtMs: requestedAtMs, answeredAtMs: answeredAtMs)
+        {
+        case .gap, .noFigure: control.progressBroke()
+        case .progressing: break
+        }
+        let seenAtMs = answeredAtMs > VoiceProgressWatch.staleReportMs
+            ? answeredAtMs - VoiceProgressWatch.staleReportMs : 0
+        switch watch.observe(capturedSeconds: capturedSeconds, atMs: seenAtMs) {
         case let .started(at)?:
             control.recorder(running: true)
             control.recorderHeard(atMs: at)
@@ -832,6 +993,7 @@ public final class VoiceRecorderReader {
     public func stopped() {
         generation += 1
         watch.reset()
+        progress.reset()
         control.recorder(running: false)
     }
 }

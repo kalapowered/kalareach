@@ -30,6 +30,9 @@ public protocol CallEngine: AnyObject {
     var isMutedByPerson: Bool { get }
     /// What the call's media has carried, or nil when it cannot be read.
     func media() async -> MediaCounters?
+    /// What the call's record of capture shows now, and the number of the marker told in the news in
+    /// the same step when one was asked for; nil when the call has ended.
+    func captureProof(barrier: Bool) async -> (proof: VoiceCaptureGate.Proof, barrier: UInt64?)?
     func stop()
 }
 
@@ -54,6 +57,9 @@ private final class BridgedCall: CallEngine {
     var isPlaybackMuted: Bool { call.isPlaybackMuted }
     var isMutedByPerson: Bool { call.isMutedByPerson }
     func media() async -> MediaCounters? { await call.mediaCounters() }
+    func captureProof(barrier: Bool) async -> (proof: VoiceCaptureGate.Proof, barrier: UInt64?)? {
+        await call.captureProof(barrier: barrier)
+    }
     func stop() { call.stop() }
 }
 
@@ -75,6 +81,7 @@ public protocol CallReporting: AnyObject {
     func playout()
     func capture(_ state: VoiceCaptureState)
     func ended()
+    func barrier(_ token: UInt64)
 }
 
 /// Makes the call, with the reporter it tells.
@@ -99,6 +106,8 @@ private final class ObserverBridge: VoiceCallObserver {
     func voiceCall(_: VoiceCall, captureChanged state: VoiceCaptureState) { reporting.capture(state) }
 
     func voiceCallEnded(_: VoiceCall) { reporting.ended() }
+
+    func voiceCall(_: VoiceCall, barrier token: UInt64) { reporting.barrier(token) }
 }
 
 /// The product's call and the product's device.
@@ -147,6 +156,8 @@ enum CallItem {
     case playout
     case capture(VoiceCaptureState)
     case ended
+    /// The marker a capture proof asked for, with its number in the call.
+    case barrier(UInt64)
     /// Some news was dropped here. Never queued as news: it marks a place in the queue.
     case lost
 
@@ -346,6 +357,10 @@ enum CallWire {
         let what: String
         let muted: Bool
     }
+    struct Proof: Decodable {
+        let call: String
+        let barrier: Bool
+    }
 
     static func decode<T: Decodable>(_ type: T.Type, _ arguments: String) throws -> T {
         do { return try JSONDecoder().decode(type, from: Data(arguments.utf8)) } catch {
@@ -398,10 +413,27 @@ enum CallWire {
             frame["state"] = captureWord(state)
         case .ended:
             frame["kind"] = "ended"
+        case .barrier(let token):
+            frame["kind"] = "barrier"
+            frame["token"] = token
         case .lost:
             frame["kind"] = "lost"
         }
         return text(frame)
+    }
+
+    /// What the capture proof answers: native code's record, and the marker's number when one was
+    /// told. A figure that was not seen is `null`, never zero.
+    static func proof(call: String, _ read: (proof: VoiceCaptureGate.Proof, barrier: UInt64?)) -> String {
+        text([
+            "call": call,
+            "state": captureWord(read.proof.state),
+            "opened": read.proof.opened,
+            "openings": read.proof.openings,
+            "breaks": read.proof.breaks,
+            "progressAgeMs": read.proof.progressAgeMs.map { $0 as Any } ?? NSNull(),
+            "barrier": read.barrier.map { $0 as Any } ?? NSNull(),
+        ])
     }
 }
 
@@ -428,7 +460,8 @@ public final class CallAdapter: NSObject {
     private let maker: CallEngineMaker
     private let device: CallDevice
     /// Everything below is touched on this queue only, apart from the news, which has its own.
-    private let queue = DispatchQueue(label: "to.kala.reach.call-adapter")
+    /// Every report of a call, the barrier included, passes through it in the order it was made.
+    private let queue: DispatchQueue
     /// Where the adapter's calls into the engine's control run. The control is one lock, and a stop
     /// holds it while it waits for the connection to close, so a call that touches it (a stop, a
     /// permit, a mute, a read of a mute) can wait behind a stop. It waits here, on a thread of
@@ -451,11 +484,13 @@ public final class CallAdapter: NSObject {
         maker: CallEngineMaker,
         device: CallDevice,
         clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-        watches: Bool = true
+        watches: Bool = true,
+        queue: DispatchQueue = DispatchQueue(label: "to.kala.reach.call-adapter")
     ) {
         self.maker = maker
         self.device = device
         self.clock = clock
+        self.queue = queue
         super.init()
         if watches { startWatching() }
     }
@@ -543,6 +578,15 @@ public final class CallAdapter: NSObject {
                 held.news.offer(.ended)
             }
             return "{}"
+        case "callCaptureProof":
+            let asked = try CallWire.decode(CallWire.Proof.self, arguments)
+            let engine = try engine(asked.call)
+            // The record is read and the marker told in one block on the call's own queue, so
+            // nothing the call had waiting passes the marker.
+            guard let read = await engine.captureProof(barrier: asked.barrier) else {
+                throw CallRefusal(code: CallRefusal.ended, message: "that call has ended")
+            }
+            return CallWire.proof(call: asked.call, read)
         case "callState":
             return await state(withMedia: true)
         case "callAlive":
@@ -644,6 +688,7 @@ public final class CallAdapter: NSObject {
         func playout() { adapter?.report(call, .playout) }
         func capture(_ state: VoiceCaptureState) { adapter?.report(call, .capture(state)) }
         func ended() { adapter?.report(call, .ended) }
+        func barrier(_ token: UInt64) { adapter?.report(call, .barrier(token)) }
     }
 
     private func report(_ call: String, _ item: CallItem) {

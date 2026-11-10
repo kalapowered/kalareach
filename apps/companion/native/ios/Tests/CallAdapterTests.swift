@@ -49,6 +49,10 @@ private final class FakeEngine: CallEngine {
     var isMutedByPerson = false
     /// What the call's statistics say the media carried, when a test gives it.
     var counters: MediaCounters?
+    /// What the call's record of capture shows, and the number its next marker has.
+    var proof = VoiceCaptureGate.Proof(
+        state: .capturing, opened: true, openings: 1, breaks: 0, progressAgeMs: 120)
+    var nextMarker: UInt64 = 3
     /// Where a real call reports its end, which a stop is followed by.
     var reporting: CallReporting?
 
@@ -65,6 +69,16 @@ private final class FakeEngine: CallEngine {
 
     func accept(answerSdp: String) async throws { record("accept \(answerSdp.count)") }
     func media() async -> MediaCounters? { counters }
+
+    /// A real call reads the record and tells the marker in one step on its own queue; this one does
+    /// both before it answers.
+    func captureProof(barrier: Bool) async -> (proof: VoiceCaptureGate.Proof, barrier: UInt64?)? {
+        record("captureProof \(barrier)")
+        guard !asked.contains("stop") else { return nil }
+        guard barrier else { return (proof, nil) }
+        reporting?.barrier(nextMarker)
+        return (proof, nextMarker)
+    }
     var answerUsesDtx: Bool? { usesDtx }
 
     func permit(voiceSessionId: String, closesAtEpochMs: UInt64) -> Bool {
@@ -253,6 +267,71 @@ final class CallAdapterTests: XCTestCase {
         XCTAssertNil(unread.result?["media"], "statistics that did not come back are nothing said")
     }
 
+    /// The capture proof answers what the fixtures hold, with the marker's number when one was asked
+    /// for, a figure that was not seen as `null`, and nothing at all for a call that has ended.
+    func testTheCaptureProofAnswersWhatTheFixtureHolds() async throws {
+        let maker = FakeMaker()
+        let adapter = CallAdapter(maker: maker, device: FakeDevice(), watches: false)
+        let told = Told()
+        _ = await ask(adapter, "callOpen", #"{"call":"c1","events":"__CHANNEL__:7"}"#, told: told)
+
+        let first = try Fixtures.command("callCaptureProof", 0)
+        let marked = await ask(adapter, "callCaptureProof", first.request)
+        XCTAssertEqual(marked.result, first.response, "\(String(describing: marked))")
+        XCTAssertTrue(maker.engine.asked.contains("captureProof true"))
+        await fulfillment(of: [told.expectation(frames: 1)], timeout: 10)
+        XCTAssertEqual(told.news.first?["kind"] as? String, "barrier", "the marker is in the news")
+        XCTAssertEqual(told.news.first?["token"] as? Int, 3)
+
+        maker.engine.proof = VoiceCaptureGate.Proof(
+            state: .mutedByPerson, opened: true, openings: 2, breaks: 3, progressAgeMs: nil)
+        let second = try Fixtures.command("callCaptureProof", 1)
+        let plain = await ask(adapter, "callCaptureProof", second.request)
+        XCTAssertEqual(plain.result, second.response, "no marker was asked for, and none is told")
+        XCTAssertEqual(told.news.count, 1)
+
+        // A call whose capture never opened answers with nothing seen, and a marker of its own.
+        let third = try Fixtures.command("callCaptureProof", 2)
+        let otherMaker = FakeMaker()
+        otherMaker.engine.proof = VoiceCaptureGate.Proof(
+            state: .unavailable, opened: false, openings: 0, breaks: 0, progressAgeMs: nil)
+        otherMaker.engine.nextMarker = 1
+        let other = CallAdapter(maker: otherMaker, device: FakeDevice(), watches: false)
+        _ = await ask(other, "callOpen", #"{"call":"c2","events":"__CHANNEL__:8"}"#, told: Told())
+        let unopened = await ask(other, "callCaptureProof", third.request)
+        XCTAssertEqual(unopened.result, third.response, "\(String(describing: unopened))")
+
+        _ = await ask(adapter, "callStop", #"{"call":"c1"}"#)
+        let ended = await ask(adapter, "callCaptureProof", first.request)
+        XCTAssertEqual(ended.code, "ended")
+        let named = await ask(adapter, "callCaptureProof", #"{"call":"c9","barrier":false}"#)
+        XCTAssertEqual(named.code, "no_such_call")
+    }
+
+    /// A call's report of the marker takes the adapter's queue as every other report does, so the
+    /// news waiting there is sent ahead of it, and what is reported after it is sent after it.
+    func testTheMarkerIsSentBehindTheNewsWaitingInTheAdaptersQueue() async throws {
+        let maker = FakeMaker()
+        let queue = DispatchQueue(label: "test.call-adapter")
+        let adapter = CallAdapter(maker: maker, device: FakeDevice(), watches: false, queue: queue)
+        let told = Told()
+        _ = await ask(adapter, "callOpen", #"{"call":"c1","events":"__CHANNEL__:7"}"#, told: told)
+        let reporting = try XCTUnwrap(maker.reporting)
+
+        let held = DispatchSemaphore(value: 0)
+        queue.async { held.wait() }
+        reporting.providerEvent(Data([1]))
+        reporting.capture(.interrupted)
+        reporting.barrier(5)
+        reporting.providerEvent(Data([2]))
+        held.signal()
+
+        await fulfillment(of: [told.expectation(frames: 4)], timeout: 10)
+        XCTAssertEqual(
+            told.news.map { $0["kind"] as? String }, ["provider_event", "capture", "barrier", "provider_event"])
+        XCTAssertEqual(told.news[2]["token"] as? Int, 5)
+    }
+
     func testASignOfLifeNamesACallAndIsAnsweredWithWhatTheCallIsDoing() async throws {
         let maker = FakeMaker()
         let adapter = CallAdapter(maker: maker, device: FakeDevice(), watches: false)
@@ -432,7 +511,7 @@ final class CallAdapterTests: XCTestCase {
             .providerEvent(Data(#"{"type":"session.created"}"#.utf8)), .playout,
             .capture(.capturing), .capture(.mutedByPerson), .capture(.interrupted),
             .capture(.routeChanging), .capture(.suspendedBySystem), .capture(.unavailable),
-            .capture(.idle), .lost, .ended,
+            .capture(.idle), .lost, .ended, .barrier(3),
         ]
         let frames = (try Fixtures.json("events.json") as! [[String: Any]]).map { $0["frame"] as! NSDictionary }
         XCTAssertEqual(frames.count, items.count)
@@ -474,6 +553,7 @@ final class CallAdapterTests: XCTestCase {
             case "capture": return .capture(.capturing)
             case "playout": return .playout
             case "ended": return .ended
+            case "barrier": return .barrier(1)
             default: preconditionFailure("the fixture names news of a kind \(kind)")
             }
         }
@@ -488,6 +568,7 @@ final class CallAdapterTests: XCTestCase {
                 case .capture: return "capture"
                 case .playout: return "playout"
                 case .ended: return "ended"
+                case .barrier: return "barrier"
                 case .lost: preconditionFailure("a loss is never queued as news")
                 }
             }
