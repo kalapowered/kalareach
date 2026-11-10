@@ -3277,6 +3277,42 @@ attachment-chunk stream and this host opens none on a network connection. A devi
 hold the right the read requires (`files.upload` for the first, `files.read` for the other two) is
 refused `PERMISSION_DENIED` first.
 
+The four upload writes, `upload.begin`, `upload.chunk`, `upload.finish` and `upload.cancel`, are
+refused `UNSUPPORTED_CAPABILITY` for the same reason. A device's upload could not carry a chunk
+here, so none could finish, and a begin that no chunk can follow would only hold the device's
+reservation until it expired. The refusal of `upload.chunk` names the attachment-chunk stream, and
+the other three say that this host does not serve a device's upload. `terminal.palette.set` is
+refused `UNSUPPORTED_CAPABILITY` too, because no part of this host performs it for a paired device,
+and `input.write` sent as a mutation is refused `INVALID_ARGUMENT`, because raw input travels as a
+request and carries no action. Each refusal comes after the device's rights are asked, so a device
+without the right is told `PERMISSION_DENIED` first, and before anything is recorded for the
+action: it claims no route, no record is looked up and nothing is staged, so a repeat of the same
+action is refused as the first was. Every other write the method table admits for a paired device
+is performed by a service of this daemon or forwarded to a worker whose own table lists the method;
+none is answered as a method this host does not know.
+
+`draft.create`, `draft.update` and `agent.draft.add_attachment` are performed by the transfer
+service under the device's own principal, which the host derives from the device's identity, so
+a device's drafts are its own and the owner's, and other devices', are unknown to it.
+`agent.draft.add_attachment` needs `files.upload` and `agent.prompt` over its session, and binds
+only an upload the same device holds to a draft the same device made. A draft written for a session
+is written only by a request that names that session. A `draft.create` that labels the draft with
+another device's identity is refused `PERMISSION_DENIED`: the label is this device's or none. The
+admission is asked again inside the service's own lock, so a registration withdrawn after the
+door's check writes nothing and is refused as withdrawn. A repeat of a draft write on a replacement
+connection is answered from the service's record, under the check any recorded answer is owed: a
+device that may not read the session's receipts is told `OUTCOME_UNKNOWN`.
+
+A device holds at most 64 open drafts. A draft is open until a prompt sends it to a session or the
+session it targets closes: the closure of a session queues, on a task of its own, the write that
+orphans its drafts. A `draft.create` past the bound is refused `QUOTA_EXCEEDED` with the bound in the message, only after
+the service has asked the admission again, so a device whose authority has gone learns no count.
+The bound is one constant of this host, which an owner cannot change, and the person at this
+machine is held to none. A device cannot end a draft itself: this level has no method that discards
+one, so a prompt that sends it, or the end of its session, is how a place is freed. Sent and
+orphaned drafts stay in the journal, and each `draft.update` adds one row to the journal's events
+and a receipt that holds the updated draft for the de-duplication window.
+
 What a device is told of a failure passes one rule, applied where this host's words leave it for a
 device: the write boundary of an authorised connection, the refusal of a connection that is not
 admitted, and the pairing surface a candidate reaches before it is paired. An error keeps its code,
