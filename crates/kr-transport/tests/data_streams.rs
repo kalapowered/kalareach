@@ -320,7 +320,7 @@ fn admit_always(attempt: &mut dyn FnMut()) -> bool {
     true
 }
 
-/// KR-REQ-23.12: a stream whose header is half sent holds no one back. The listener reads each
+/// KR-REQ-23.11: a stream whose header is half sent holds no one back. The listener reads each
 /// header on a task of its own, so the stream behind it is taken and handed to the host while the
 /// first still waits, and when the header deadline passes the first is reset with nothing admitted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -371,7 +371,7 @@ async fn a_stream_with_half_a_header_does_not_hold_back_the_next_one() {
     harness.finish().await;
 }
 
-/// KR-REQ-23.12: a stream the host does not take is reset, and the next one is taken as usual: a
+/// KR-REQ-23.11: a stream the host does not take is reset, and the next one is taken as usual: a
 /// kind the host does not accept, a header that names another connection, and a resource that does
 /// not fit its kind are each refused, before any slot or registration is taken for them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -419,7 +419,7 @@ async fn a_stream_the_host_does_not_accept_is_reset_and_counted_nowhere() {
     harness.finish().await;
 }
 
-/// KR-REQ-23.12: a host that is not taking streams costs nothing. A stream that finds the queue full
+/// A host that is not taking streams costs nothing. A stream that finds the queue full
 /// is reset, and the streams already waiting are untouched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stream_that_finds_the_queue_full_is_reset() {
@@ -464,7 +464,7 @@ async fn a_stream_that_finds_the_queue_full_is_reset() {
     harness.finish().await;
 }
 
-/// KR-REQ-23.12: a host that is gone from its queue costs nothing either: the stream is reset.
+/// A host that is gone from its queue costs nothing either: the stream is reset.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stream_for_a_host_that_dropped_its_receiver_is_reset() {
     let harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::Never).await;
@@ -493,7 +493,7 @@ async fn a_stream_for_a_host_that_dropped_its_receiver_is_reset() {
     harness.finish().await;
 }
 
-/// KR-REQ-23.12: a frame that stops arriving is cut by the stall deadline. The device sends a
+/// A frame that stops arriving is cut by the stall deadline. The device sends a
 /// frame's length and a few of its bytes and then nothing; the read ends, the stream is revoked and
 /// the device sees it reset.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -538,7 +538,7 @@ async fn a_frame_that_stops_arriving_is_cut_by_the_stall_deadline() {
     harness.finish().await;
 }
 
-/// KR-REQ-23.12: a stream that is quiet between frames is cut by the idle deadline, and the device
+/// A stream that is quiet between frames is cut by the idle deadline, and the device
 /// sees it reset.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stream_that_sends_no_frame_is_cut_by_the_idle_deadline() {
@@ -570,7 +570,7 @@ async fn a_stream_that_sends_no_frame_is_cut_by_the_idle_deadline() {
     harness.finish().await;
 }
 
-/// KR-REQ-23.12: a device that never reads its answers cannot hold the stream. A write that waits
+/// A device that never reads its answers cannot hold the stream. A write that waits
 /// for the device is cut by the write deadline, and because the stream is split, the half that
 /// reads sees the stream revoked too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
