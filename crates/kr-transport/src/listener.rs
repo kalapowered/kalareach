@@ -479,10 +479,12 @@ pub struct AuthorisedSession {
     /// under the header deadline, and checks the header against this connection and its kind
     /// against [`ListenerConfig::accepted_kinds`]. A stream that passes is sent here, and a stream
     /// that fails any step, or that finds [`DATA_STREAM_QUEUE_DEPTH`] streams waiting, or whose
-    /// receiver is gone, is reset. A host that never reads this therefore holds nothing for a
-    /// device that opens streams. The receiver ends when the connection does; a stream still in it
-    /// is reset when it is dropped.
-    pub data_streams: tokio::sync::mpsc::Receiver<DataStream>,
+    /// receiver is gone, is reset. A host that never reads this holds at most
+    /// [`DATA_STREAM_QUEUE_DEPTH`] streams for a device that opens them, each with its place in the
+    /// queue, its bulk slot and its flow-control credit, until the connection ends, and resets the
+    /// rest. The receiver ends when the connection does, and a stream still queued when it is
+    /// dropped is reset.
+    pub data_streams: DataStreams,
     /// The deadlines a data stream is held to ([`ListenerConfig::deadlines`]), for the waits a
     /// host makes on a stream's behalf: the lookup that admits it runs under
     /// [`DeadlineKind::Admission`](crate::deadlines::DeadlineKind::Admission).
@@ -497,6 +499,34 @@ pub struct AuthorisedSession {
     /// ([`HostHandler::authority_revision`]), and so the latest one its authorisation can have been
     /// decided under.
     pub authorised_under: AuthorityRevision,
+}
+
+/// The data streams the listener has admitted and the host has not taken yet.
+///
+/// Dropping it resets every stream still queued, so a host that stops taking streams while its
+/// connection stands tells the device each of them was taken away, instead of letting each finish
+/// as though it had ended cleanly.
+#[derive(Debug)]
+pub struct DataStreams {
+    queue: tokio::sync::mpsc::Receiver<DataStream>,
+}
+
+impl DataStreams {
+    /// Returns the next admitted stream, or `None` once the connection has ended.
+    pub async fn recv(&mut self) -> Option<DataStream> {
+        self.queue.recv().await
+    }
+}
+
+impl Drop for DataStreams {
+    fn drop(&mut self) {
+        // Closed first, so a stream a header task sends from now on is refused and reset by that
+        // task, and then every stream already queued is reset here.
+        self.queue.close();
+        while let Ok(stream) = self.queue.try_recv() {
+            stream.reset();
+        }
+    }
 }
 
 /// How many admitted data streams a connection holds for a host that has not taken them yet.
@@ -986,7 +1016,8 @@ async fn serve_authorised<H: HostHandler>(
     // The streams the device opens are taken here, on a task the guard owns beside the keepalive
     // and the control reader, and never by the host's handler: a handler that is answering a
     // control request must not be what decides whether a stream waits.
-    let (admitted, data_streams) = tokio::sync::mpsc::channel(DATA_STREAM_QUEUE_DEPTH);
+    let (admitted, queue) = tokio::sync::mpsc::channel(DATA_STREAM_QUEUE_DEPTH);
+    let data_streams = DataStreams { queue };
     let data_accept = tokio::spawn(data_accept_loop(
         Arc::clone(&streams),
         connection.clone(),
@@ -1078,7 +1109,9 @@ impl Drop for ConnectionCleanup {
 ///
 /// Declaring it also revokes the connection's data streams, at once and on the task that saw the
 /// loss, so that a read or a write on one fails now and not when the connection's supervisor next
-/// runs. The connection's cleanup revokes them again, and revoking twice is harmless.
+/// runs. It does not run the host's hook: that waits for the cleanup, which runs once the host's
+/// handler has been dropped, so a host that registers the connection while it serves is never
+/// asked to withdraw it before it has.
 #[derive(Debug)]
 struct ControlLoss {
     lost: std::sync::atomic::AtomicBool,
@@ -1097,7 +1130,7 @@ impl ControlLoss {
 
     fn declare(&self) {
         self.lost.store(true, std::sync::atomic::Ordering::Release);
-        self.streams.revoke_all();
+        self.streams.revoke_streams();
         self.woken.notify_waiters();
     }
 
