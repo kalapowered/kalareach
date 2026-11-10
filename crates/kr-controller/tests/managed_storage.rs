@@ -9791,9 +9791,15 @@ async fn storage_that_moves_between_the_managed_service_and_one_the_owner_runs_l
         passes.changed().await.expect("the carrier is running");
     })
     .await;
+    let after = owner.web().arrived();
     assert_eq!(
-        owner.web().arrived().len(),
+        after.len(),
         before,
-        "nothing reached the service the owner ran after storage moved off it"
+        "nothing reached the service the owner ran after storage moved off it: {:?}",
+        after
+            .iter()
+            .skip(before)
+            .map(|request| (request.path.as_str(), request.token.is_some()))
+            .collect::<Vec<_>>()
     );
 }
