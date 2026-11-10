@@ -79,13 +79,18 @@ fn plant_a_refusal_this_build_cannot_read(
 }
 
 /// What `attempt`, a service that claims its action and meets a record that cannot be read, is
-/// told: the control (nothing owed: what became of the action is not known), and then, with a fence
-/// landing once that is in hand, the fence.
+/// told: the control (nothing owed: what became of the action is not known, told as a copy of the
+/// record), and then, with a fence landing once that is in hand, the fence, as the refusal of a copy
+/// the service withheld.
 async fn a_record_that_cannot_be_read_is_told_only_under_its_authority(
     controller: &Controller,
     attempt: impl AsyncFn() -> Given<crate::error::Result<ParamsValue>>,
 ) {
     let control = attempt().await;
+    assert!(
+        control.is_copied(),
+        "a record that cannot be read says that it exists, so it is a copy"
+    );
     let told = control
         .into_answer()
         .expect_err("a record that cannot be read does not answer the copy");
@@ -93,7 +98,7 @@ async fn a_record_that_cannot_be_read_is_told_only_under_its_authority(
 
     let refused = answered_after_a_fence_lands_at_the_check(controller, attempt())
         .await
-        .into_answer()
+        .into_withheld()
         .expect_err("a fence that landed once the record was met is the answer");
     refused_for_a_fence(&refused.to_protocol_error());
 }
