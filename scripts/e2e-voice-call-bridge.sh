@@ -112,7 +112,9 @@ required_checks=(
     "a call that could not use its answer ends"
     "permit"
     "news after permit has no gap"
+    "the capture proof is of the call and its marker reaches the news"
     "a muted microphone is held and never reported as capturing"
+    "a mute is a break in the capture record when capture was on"
 )
 
 # Reads the lines the application wrote, and decides the run.
