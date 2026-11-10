@@ -384,8 +384,17 @@ cd apps/companion/src-tauri/gen/android && ./gradlew :app:compileUniversalDebugK
 # What the packaged application actually carries. It reads the class definitions out of the dex
 # files the application loads -- an APK's root classes*.dex, an AAB's base/dex/classes*.dex -- and
 # names anything missing; `--list` prints the whole hand-written half of whatever it is given.
-# `pnpm -C apps/companion android` checks the packages that build asked for. Given no path, this
-# reads every APK and AAB under app/build/outputs, whichever build left them.
+# It also reads the native libraries the package holds (`lib/<abi>/*.so` in an APK,
+# `base/lib/<abi>/*.so` in an AAB) for the Java classes they find by name, in their type
+# descriptors and in their NUL-ended strings, and fails when the dex does not define one of them
+# under that name, or when a native method of a class the libraries of an ABI are bound to (they
+# export other natives of it) has no exported `Java_` symbol there. A minified build removes or renames a class that only native code reaches,
+# and the runtime then aborts the application when the library asks for it, so only a minified
+# package shows this. The classes of the media library are kept whole by
+# `src-tauri/gen/android/app/proguard-rules.pro`.
+# `pnpm -C apps/companion android` checks the packages that build asked for, and core-ci's
+# `android-app` job builds the release variant, which is minified, besides the debug one. Given no
+# path, this reads every APK and AAB under app/build/outputs, whichever build left them.
 pnpm -C apps/companion android:classes
 pnpm -C apps/companion android:classes --list
 pnpm -C apps/companion android:classes path/to/app-universal-debug.apk
@@ -393,7 +402,9 @@ pnpm -C apps/companion android:classes path/to/app-universal-debug.apk
 # The check's own answers, on archives and output directories built for the purpose: an
 # application dex, a dex in an asset or an optional feature, a class named but not defined,
 # archive comments shaped like the end-of-directory record, a package missing one class, a dex
-# layout it does not read, and which packages each form of the build command is checked against.
+# layout it does not read, which packages each form of the build command is checked against, and
+# what a package's native libraries find by name: a class its dex lacks, names that are no class,
+# a native method of a bound class that no library exports, and which libraries are read.
 pnpm -C apps/companion test:android-classes
 
 # The iOS application's privacy manifests, held to the built bundle. The script builds the release
