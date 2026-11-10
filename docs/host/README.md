@@ -637,7 +637,9 @@ on the local socket alone and ask for host management, as the managed account's 
 the storage account and never on the managed one. Both accounts sign in through the one loopback
 address, so a sign-in of either ends a sign-in of the other that still waits for the browser, and
 never a grant that is held. A host whose `storage.origin` is unset or names the managed account
-service refuses all three with `HOST_NOT_CONFIGURED`, naming `storage.origin`.
+service refuses all three with `HOST_NOT_CONFIGURED`, naming `storage.origin`; so does a host whose
+daemon started over a configuration document it could not use, which says so and points at
+`kr doctor`.
 
 The browser signs in at the managed account service, and the code it brings back is redeemable there
 and nowhere else, so the exchange, every refresh and every revocation go to that one service. The

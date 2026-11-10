@@ -198,9 +198,10 @@ impl Controller {
             let file = kr_protocol::hostinfo::configuration::FILE_NAME;
             ControllerError::NotConfigured(if self.started.unusable.is_some() {
                 format!(
-                    "this host's configuration document ({file}) cannot be used, so its {key} \
-                     selects no storage service and this host holds no account for one you run; \
-                     `kr doctor` says how to put the document right"
+                    "this host's daemon started over a configuration document ({file}) it could \
+                     not use, so its {key} selected no storage service and this host holds no \
+                     account for one you run; `kr doctor` says how to put the document right, and \
+                     the daemon reads it again when it next starts"
                 )
             } else {
                 format!(
