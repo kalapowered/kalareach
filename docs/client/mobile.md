@@ -347,7 +347,7 @@ scripts/check-android.sh [<target>]
 
 # The packaged applications.
 pnpm -C apps/companion android --debug --target aarch64
-pnpm -C apps/companion exec tauri ios build --debug --target aarch64-sim
+pnpm -C apps/companion ios build --debug --target aarch64-sim
 
 # Both simulators, with a screenshot for each screen a requirement needs.
 scripts/e2e-mobile.sh              # both
@@ -387,16 +387,27 @@ cd apps/companion/src-tauri/gen/android && ./gradlew :app:compileUniversalDebugK
 # It also reads the native libraries the package holds (`lib/<abi>/*.so` in an APK,
 # `base/lib/<abi>/*.so` in an AAB) for the Java classes they find by name, in their type
 # descriptors and in their NUL-ended strings, and fails when the dex does not define one of them
-# under that name, or when a native method of a class the libraries of an ABI are bound to (they
-# export other natives of it) has no exported `Java_` symbol there; a class whose natives a library
-# exports in part and registers in part therefore fails, and nothing overrides that. A minified
-# build removes or renames a class that only native code reaches, and the runtime then aborts the
-# application when the library asks for it, so only a minified package shows this. The classes of the media library are kept whole by
-# `src-tauri/gen/android/app/proguard-rules.pro`.
-# `pnpm -C apps/companion android` runs each build in a temporary directory of its own, since the
-# command line tool shares the build's options with Gradle through a file there named for the
-# application (`to.kala.reach-server-addr`), which two builds at once on a machine would cross. It
-# checks the packages that build asked for, and core-ci's
+# under that name. It fails as well when a native method of a class that a library exports natives
+# for has no `Java_` symbol, spelled exactly as the runtime looks it up, in that library's copy in
+# every ABI that carries it, and when one ABI carries a library that another lacks. A class whose
+# natives a library exports in part and registers in part therefore fails, and nothing overrides
+# that. What the check cannot read in full is a failure and never "nothing found": an archive that
+# ends inside a member or gives it another size, a library whose header or symbol table is cut or
+# does not add up, and a dex file with an offset, number or count past its end. A minified build
+# removes or renames a class that only native code reaches, and the runtime then aborts the
+# application when the library asks for it, so only a minified package shows this. The classes of
+# the media library are kept whole by `src-tauri/gen/android/app/proguard-rules.pro`.
+# For a minified package the check also reads the merged rules the minifier wrote
+# (`app/build/outputs/mapping/<variant>/configuration.txt`) and fails when they do not name
+# `proguard-tauri.pro` and `proguard-wry.pro`. The Rust build writes those two files, and they keep
+# the classes the Rust library calls by names it builds as it runs, which the check of the libraries
+# cannot see. The release variant is always minified. A debug build is when `KR_MINIFY_DEBUG=1`
+# asks for it; the Gradle project stops on any other value of that variable.
+# `pnpm -C apps/companion android` and `pnpm -C apps/companion ios` run each build in a temporary
+# directory of its own, given by an absolute path, since the command line tool shares the build's
+# options with Gradle and Xcode through a file there named for the application
+# (`to.kala.reach-server-addr`), which two builds at once on a machine would cross. The Android
+# command checks the packages that build asked for, and core-ci's
 # `android-app` job builds the release variant, which is minified, besides the debug one. Given no
 # path, this reads every APK and AAB under app/build/outputs, whichever build left them.
 pnpm -C apps/companion android:classes
@@ -408,7 +419,9 @@ pnpm -C apps/companion android:classes path/to/app-universal-debug.apk
 # archive comments shaped like the end-of-directory record, a package missing one class, a dex
 # layout it does not read, which packages each form of the build command is checked against, and
 # what a package's native libraries find by name: a class its dex lacks, names that are no class,
-# a native method of a bound class that no library exports, and which libraries are read.
+# a native method of a bound class that no library exports (or exports in the wrong case), a library
+# that one ABI lacks, which libraries are read, members, libraries and dex files that are cut short
+# or hold an offset past their end, and the merged rules of a minified build.
 pnpm -C apps/companion test:android-classes
 
 # The iOS application's privacy manifests, held to the built bundle. The script builds the release
