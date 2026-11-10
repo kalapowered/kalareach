@@ -85,6 +85,11 @@ export interface VoiceSurfaceProps {
   readonly call: RunningCall | null
   /** The turn a cancellation would name, when the host has published one. */
   readonly currentTurn: CurrentTurn | null
+  /**
+   * Why no turn is offered, when the screen knows a reason other than the host not having said
+   * which turn the agent is on. Without one the screen says that.
+   */
+  readonly noTurnBecause?: string | null
   /** True while a request this screen made is in flight. */
   readonly busy: boolean
   /**
@@ -166,6 +171,7 @@ export function VoiceSurface({
   choice,
   call,
   currentTurn,
+  noTurnBecause = null,
   busy,
   waiting = false,
   notice,
@@ -181,6 +187,7 @@ export function VoiceSurface({
       <CallScreen
         call={call}
         currentTurn={currentTurn}
+        noTurnBecause={noTurnBecause}
         busy={busy}
         notice={notice}
         focusOnShow={focusHeadingOnShow}
@@ -605,6 +612,7 @@ function CostPanel({
 function CallScreen({
   call,
   currentTurn,
+  noTurnBecause,
   busy,
   notice,
   focusOnShow,
@@ -612,6 +620,7 @@ function CallScreen({
 }: {
   readonly call: RunningCall
   readonly currentTurn: CurrentTurn | null
+  readonly noTurnBecause: string | null
   readonly busy: boolean
   readonly notice: string | null
   readonly focusOnShow: boolean
@@ -759,8 +768,8 @@ function CallScreen({
         <p className="kr-voice__note">{STOP_MEANS.task}</p>
         {!currentTurn && (
           <p className="kr-voice__note">
-            The host has not said which turn the agent is on, so there is no turn to cancel from
-            here.
+            {noTurnBecause ??
+              'The host has not said which turn the agent is on, so there is no turn to cancel from here.'}
           </p>
         )}
         {confirmingCancel ? (

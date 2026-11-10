@@ -11,6 +11,12 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 
+import type {
+  ActionRight,
+  AgentBindingState,
+  InstanceCapabilityRecord
+} from '@kalareach/protocol'
+
 import { VoiceGrantStep } from './VoiceGrantStep'
 import { VoiceSurface, type CurrentTurn, type VoiceSurfaceActions } from './VoiceSurface'
 import {
@@ -39,7 +45,7 @@ import {
 } from '../host/port'
 import type { HostPort, VoiceCallState, VoiceClosure, Watch } from '../host/port'
 import type { Surface } from '../mobile/platform'
-import { liveInstance, subjectOf } from '../model/agent'
+import { capabilityRecords, composerOffers, liveInstance, subjectOf } from '../model/agent'
 
 /** The message to show for a failure, whatever shape it arrived in. */
 function failureMessage(value: unknown): string {
@@ -81,25 +87,63 @@ class AskFailed extends Error {
   }
 }
 
+/** What a session's agent said of itself: the instance, the binding it is at and what it can do. */
+interface AgentRead {
+  readonly instanceId: string
+  readonly binding: AgentBindingState
+  readonly capabilities: ReadonlyMap<string, InstanceCapabilityRecord>
+}
+
 /**
- * The turn a session's agent is on, with the instance running it and the binding revision the
- * host answered at, or null when the session has no live agent or its agent is on no turn.
- *
- * Only the session's own worker can say which turn that is, so it is read, never remembered: the
- * instance first, then the binding that instance is at.
+ * Reads a session's live agent: the instance first, then the binding that instance is at and the
+ * capabilities it holds. Only the session's own worker can say these, so they are read, never
+ * remembered. A session with no live instance has nothing to read.
  */
-async function readTurn(port: HostPort, sessionId: string): Promise<CurrentTurn | null> {
+async function readAgent(port: HostPort, sessionId: string): Promise<AgentRead | null> {
   const agents = await port.sessionAgents(sessionId)
   const live = liveInstance(agents.instances.instances)
   if (live === null) return null
   const instanceId = live.application_instance_id
-  const { binding } = await port.agentCapabilities({ subject: subjectOf(sessionId, instanceId) })
-  if (binding.turn_id === null) return null
+  const facts = await port.agentCapabilities({ subject: subjectOf(sessionId, instanceId) })
   return {
-    sessionId,
     instanceId,
-    bindingRevision: binding.binding_revision,
-    turnId: binding.turn_id
+    binding: facts.binding,
+    capabilities: capabilityRecords(facts.capabilities.records)
+  }
+}
+
+/** What a call that reaches several sessions says in place of a turn. */
+const SEVERAL_SESSIONS_WORDS =
+  'This call reaches more than one session, so there is no one turn to cancel from here.'
+
+/**
+ * The turn a cancellation names, and the reason none is offered when the agent is on one.
+ *
+ * A turn is offered on the rule the composer offers its interrupt by: the binding is one the host
+ * verified, the agent's cancel capability is usable now, and this device holds the right. Where
+ * the agent is on no turn there is nothing to say beyond that the host named none.
+ */
+function cancellationFrom(
+  sessionId: string,
+  read: AgentRead | null,
+  rights: readonly ActionRight[] | null
+): { readonly turn: CurrentTurn | null; readonly because: string | null } {
+  if (read === null || read.binding.turn_id === null) return { turn: null, because: null }
+  const offer = composerOffers({
+    known: true,
+    binding: read.binding,
+    capabilities: read.capabilities,
+    rights: rights === null ? null : new Set(rights)
+  }).interrupt
+  if (!offer.offered) return { turn: null, because: offer.reason }
+  return {
+    turn: {
+      sessionId,
+      instanceId: read.instanceId,
+      bindingRevision: read.binding.binding_revision,
+      turnId: read.binding.turn_id
+    },
+    because: null
   }
 }
 
@@ -181,6 +225,8 @@ export function VoiceRoute({
    * voice service does, which is what section 15 ¶10 asks for.
    */
   const [hostReachable, setHostReachable] = useState(true)
+  /** What the connection to the host may do, or null while it has not said or is out of contact. */
+  const [rights, setRights] = useState<readonly ActionRight[] | null>(null)
 
   /**
    * The platform's own touch target, resolved where the tokens look for it.
@@ -288,10 +334,17 @@ export function VoiceRoute({
   const turnSession = reached.length === 1 ? (reached[0] ?? null) : null
   const [turnRead, setTurnRead] = useState<{
     readonly session: string
-    readonly turn: CurrentTurn | null
+    readonly read: AgentRead | null
   } | null>(null)
-  const currentTurn =
-    turnSession !== null && turnRead?.session === turnSession ? turnRead.turn : null
+  const cancellation = useMemo(
+    () =>
+      turnSession !== null && turnRead?.session === turnSession
+        ? cancellationFrom(turnSession, turnRead.read, rights)
+        : { turn: null, because: null },
+    [turnSession, turnRead, rights]
+  )
+  const currentTurn = cancellation.turn
+  const noTurnBecause = reached.length > 1 ? SEVERAL_SESSIONS_WORDS : cancellation.because
   const readTurnAgain = useRef<() => void>(() => undefined)
   useEffect(() => {
     if (turnSession === null) return
@@ -300,12 +353,12 @@ export function VoiceRoute({
     const cadence = readOnCadence(() => {
       const newest = watching?.read() ?? null
       if (newest === null) return Promise.resolve()
-      return ask(() => readTurn(port, session))
-        .then((turn) => {
-          if (newest()) setTurnRead({ session, turn })
+      return ask(() => readAgent(port, session))
+        .then((read) => {
+          if (newest()) setTurnRead({ session, read })
         })
         .catch(() => {
-          if (newest()) setTurnRead({ session, turn: null })
+          if (newest()) setTurnRead({ session, read: null })
         })
     }, AGENT_READ_CADENCE_MS)
     watching = watch(
@@ -509,9 +562,11 @@ export function VoiceRoute({
         () => port.connectionState(),
         (state) => {
           setHostReachable(state.connected)
+          setRights(state.connected ? state.rights : null)
         },
         () => {
           setHostReachable(false)
+          setRights(null)
         }
       ),
     [port]
@@ -847,6 +902,7 @@ export function VoiceRoute({
           }
         }
         currentTurn={currentTurn}
+        noTurnBecause={noTurnBecause}
         busy={busy}
         waiting={waitingForHost}
         notice={notice}

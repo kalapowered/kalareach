@@ -15,6 +15,7 @@ import closures from '../fixtures/voice-stop-closures.json'
 
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, type FakeHostControls } from '../../src/host/fake'
+import { EVERY_RIGHT } from '../../src/host/fake-state'
 import type { HostPort, VoiceClosure } from '../../src/host/port'
 import { VoiceRoute } from '../../src/voice/VoiceRoute'
 
@@ -24,6 +25,8 @@ const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 const SESSION_BUILD = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
 /** The instance the main session's agent runs in. */
 const INSTANCE_MAIN = 'a1a1a1a1-0000-4000-8000-000000000001'
+/** The instance the second session's agent runs in. */
+const INSTANCE_BUILD = 'a1a1a1a1-0000-4000-8000-000000000002'
 
 /** The voice calls this screen made, watched from before it was rendered. */
 type Watched = Record<
@@ -823,8 +826,17 @@ describe('while a call is running', () => {
   // KR-REQ-15.22: a call that reaches more than one session has no one turn to name, and a
   // confirmation that does not say whose turn it cancels must not pick one.
   it('names no turn for a call that reaches more than one session', async () => {
-    start((controls) => {
+    const { port } = start((controls) => {
       controls.holdAVoiceCall([SESSION_MAIN, SESSION_BUILD])
+    })
+    // Both sessions' agents are on a turn, so a screen that took either one would offer it.
+    await port.composerSubmit({
+      target: {
+        subject: { session_id: SESSION_BUILD, application_instance_id: INSTANCE_BUILD },
+        binding_revision: '4'
+      },
+      draft_id: null,
+      text: 'Build it.'
     })
     await screen.findByRole('button', { name: 'End session' })
     // The scripted host answers every read through promises alone, and a task that yields to the
@@ -835,21 +847,84 @@ describe('while a call is running', () => {
     })
 
     expect(askToCancel()).toBeDisabled()
+    expect(screen.getByText(/reaches more than one session/)).toBeInTheDocument()
+    expect(screen.queryByText(/has not said which turn the agent is on/)).not.toBeInTheDocument()
+  })
+
+  // KR-REQ-15.22: the screen offers a cancellation on the rule the composer offers its interrupt
+  // by, and says why when it offers none: a binding the host could not verify, an agent whose
+  // cancel capability is not usable, and a device that was not granted the right are each refused
+  // before the person is asked to confirm what the host would refuse.
+  it.each([
+    {
+      why: 'the host could not verify the binding',
+      host: (controls: FakeHostControls) => {
+        controls.records.suspend(
+          SESSION_MAIN,
+          'The host could not confirm which conversation this agent is in.'
+        )
+      },
+      words: /could not confirm which conversation this agent is in/
+    },
+    {
+      why: 'the agent cannot cancel a turn now',
+      host: (controls: FakeHostControls) => {
+        controls.records.setCapability(
+          SESSION_MAIN,
+          'agent.cancel',
+          'incompatible',
+          'This agent’s upstream cannot cancel a turn.'
+        )
+      },
+      words: /upstream cannot cancel a turn/
+    },
+    {
+      why: 'this device was not granted the right',
+      host: (controls: FakeHostControls) => {
+        controls.setRights(EVERY_RIGHT.filter((right) => right !== 'agent.cancel'))
+      },
+      words: /This device was not granted this/
+    }
+  ])('offers no cancellation when $why, and says so', async ({ host, words }) => {
+    await startACall(host)
+
+    expect(await screen.findByText(words)).toBeInTheDocument()
+    expect(askToCancel()).toBeDisabled()
+    expect(screen.queryByText(/has not said which turn the agent is on/)).not.toBeInTheDocument()
+  })
+
+  // KR-REQ-15.22: a session whose agent has ended has no instance to name, and the screen takes the
+  // read that finds none as naming no turn.
+  it('names no turn once the session has no live agent', async () => {
+    const { port } = await startACall()
+    await waitFor(() => {
+      expect(askToCancel()).toBeEnabled()
+    })
+
+    vi.spyOn(port, 'sessionAgents').mockResolvedValue({
+      instances: { sequence: '2', instances: [] },
+      resources: []
+    })
+    await readAgain()
+
+    await waitFor(() => {
+      expect(askToCancel()).toBeDisabled()
+    })
     expect(screen.getByText(/has not said which turn the agent is on/)).toBeInTheDocument()
   })
 
   // KR-REQ-15.22: a cancellation is a typed request to the host naming the turn the agent is on.
-  // A host whose agent is on no turn names none, so the screen says so rather than holding one of
-  // its own, and the host going quiet takes the host requests away and nothing local.
+  // When the agent's turn ends the screen reads that and names none rather than holding one of its
+  // own, and the host going quiet takes the host requests away and nothing local.
   it('says there is no turn to cancel, and what the host going quiet takes away', async () => {
-    const person = userEvent.setup()
-    const { controls } = start((host) => {
-      host.records.endTurn(SESSION_MAIN)
-    })
-    await waitForChoice()
-    await person.click(screen.getByRole('button', { name: 'Start voice session' }))
+    const { controls } = await startACall()
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Cancel the current turn' })).toBeDisabled()
+      expect(askToCancel()).toBeEnabled()
+    })
+    controls.records.endTurn(SESSION_MAIN)
+    await readAgain()
+    await waitFor(() => {
+      expect(askToCancel()).toBeDisabled()
     })
     expect(screen.getByText(/has not said which turn the agent is on/)).toBeInTheDocument()
 

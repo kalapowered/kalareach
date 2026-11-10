@@ -228,16 +228,21 @@ The call controls keep them strictly separated:
   running its agent, the binding revision and the turn ID.
 
 The screen reads the instance, the revision and the turn from the session's worker while a call
-runs: first the session's live instance, then that instance's binding (`agent.capabilities`). It
-reads again on the agent's cadence, when the host is reached again, and after each cancellation. The
-control stays off, and the screen says why, while no read names a turn. That is so when the agent is
-on no turn, when the read failed, and when the call reaches more than one session, since the screen
-does not pick one.
+runs: first the session's live instance, then that instance's binding and capabilities
+(`agent.capabilities`). It reads again on the agent's cadence, when the host is reached again, and
+after each cancellation. The control is offered on the rule the composer offers its interrupt by: the
+agent is on a turn, the binding is one the host verified, the agent's cancel capability is usable
+now, and this device holds the right. When the agent is on a turn and one of the last three does not
+hold, the screen says which. Otherwise the control stays off with the words that the host has not
+said which turn the agent is on: the agent is on no turn, the session has no live instance, or the
+read failed. A call that reaches more than one session names no turn, and the screen says so rather
+than pick one.
 
-The confirmation keeps the turn and revision it was opened on. A later read that shows another turn
-or revision discards the question, and it has to be asked again. When the host moved on before the
-screen read it, the request still names what the person was shown. The host refuses it, and the
-screen shows the host's words. The screen never reads the turn at the moment a person confirms.
+The confirmation keeps the turn and revision it was opened on. A later read that shows another turn,
+revision or instance, no turn, or no answer discards the question, and it has to be asked again.
+When the host moved on before the screen read it, the request still names what the person was shown.
+The host refuses it, and the screen shows the host's words. The screen never reads the turn at the
+moment a person confirms.
 
 ## Device runs
 
