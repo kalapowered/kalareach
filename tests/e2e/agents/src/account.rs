@@ -88,13 +88,7 @@ impl Ledger {
         }
         let total = u64::try_from(entries.len()).unwrap_or(u64::MAX);
         ledger["budgets"][&self.budget] = Value::Array(entries);
-        let next = self.path.with_extension("next");
-        std::fs::write(
-            &next,
-            serde_json::to_vec_pretty(&ledger).expect("the ledger is JSON"),
-        )
-        .and_then(|()| std::fs::rename(&next, &self.path))
-        .map_err(|error| format!("the ledger {}: {error}", self.path.display()))?;
+        write_ledger(&self.path, &ledger)?;
         Ok(total)
     }
 
@@ -142,17 +136,32 @@ impl Ledger {
         let mut entries = entries;
         entries.push(json!({ "at_ms": now_ms(), "part": part, "what": what }));
         ledger["budgets"][&self.budget] = Value::Array(entries);
-        let next = self.path.with_extension("next");
-        std::fs::write(
-            &next,
-            serde_json::to_vec_pretty(&ledger).expect("the ledger is JSON"),
-        )
-        .and_then(|()| std::fs::rename(&next, &self.path))
-        .map_err(|error| format!("the ledger {}: {error}", self.path.display()))?;
+        write_ledger(&self.path, &ledger)?;
         self.charged
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(spent + 1)
     }
+}
+
+/// Writes the ledger so that it is on disk when this returns: the new file is written and
+/// synchronised, renamed over the old one, and the directory that holds the name is synchronised
+/// too. A charge is made before a prompt is sent, so a crash after the prompt must not leave the
+/// older ledger to be read next.
+fn write_ledger(path: &Path, ledger: &Value) -> Result<(), String> {
+    use std::io::Write as _;
+    let failed = |error: std::io::Error| format!("the ledger {}: {error}", path.display());
+    let next = path.with_extension("next");
+    let mut file = std::fs::File::create(&next).map_err(failed)?;
+    file.write_all(&serde_json::to_vec_pretty(ledger).expect("the ledger is JSON"))
+        .and_then(|()| file.sync_all())
+        .map_err(failed)?;
+    std::fs::rename(&next, path).map_err(failed)?;
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    std::fs::File::open(directory.unwrap_or_else(|| Path::new(".")))
+        .and_then(|directory| directory.sync_all())
+        .map_err(failed)
 }
 
 /// Reads the ledger, or an empty one where there is no file yet.
@@ -1366,6 +1375,38 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// A second process reads the ledger the moment a charge returns, and finds the charge.
+    #[test]
+    fn a_charge_is_in_the_file_another_process_reads_when_the_charge_returns() {
+        let scratch = Scratch::new("durable");
+        let path = scratch.0.join("turns.json");
+        let ledger = Ledger {
+            path: path.clone(),
+            budget: "agent".to_owned(),
+            limit: 3,
+            charged: std::sync::Arc::default(),
+        };
+        for expected in 1..=2_u64 {
+            assert_eq!(ledger.charge("1", "a prompt"), Ok(expected));
+            let read = std::process::Command::new("/bin/cat")
+                .arg(&path)
+                .output()
+                .expect("cat starts");
+            assert!(read.status.success());
+            let seen: Value = serde_json::from_slice(&read.stdout).expect("a ledger");
+            assert_eq!(
+                seen["budgets"]["agent"].as_array().map(Vec::len),
+                Some(usize::try_from(expected).expect("a count")),
+                "the second process sees every charge made"
+            );
+            assert!(
+                !path.with_extension("next").exists(),
+                "no half-written file is left beside it"
+            );
+        }
+        assert_eq!(ledger.charge_found("1", "found", 1), Ok(3));
     }
 
     #[test]
