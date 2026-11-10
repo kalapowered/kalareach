@@ -392,7 +392,10 @@ cd apps/companion/src-tauri/gen/android && ./gradlew :app:compileUniversalDebugK
 # and the runtime then aborts the application when the library asks for it, so only a minified
 # package shows this. The classes of the media library are kept whole by
 # `src-tauri/gen/android/app/proguard-rules.pro`.
-# `pnpm -C apps/companion android` checks the packages that build asked for, and core-ci's
+# `pnpm -C apps/companion android` runs each build in a temporary directory of its own, since the
+# command line tool shares the build's options with Gradle through a file there named for the
+# application (`to.kala.reach-server-addr`), which two builds at once on a machine would cross. It
+# checks the packages that build asked for, and core-ci's
 # `android-app` job builds the release variant, which is minified, besides the debug one. Given no
 # path, this reads every APK and AAB under app/build/outputs, whichever build left them.
 pnpm -C apps/companion android:classes
