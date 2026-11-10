@@ -258,6 +258,40 @@ describe('allowing voice for the first time', () => {
     expect(controls.voiceAllows).toHaveLength(0)
   })
 
+  // The sessions the person allowed on one host are not asked about on the next: the voice screen
+  // asks the host it was moved to about what it shows, and names none the person chose elsewhere.
+  it('asks about none of the sessions allowed on a host the connection has left', async () => {
+    const { port, controls } = fakeHost()
+    controls.requireVoiceGrant('PERMISSION_DENIED: name the sessions this voice session may reach')
+    const asked: (readonly string[])[] = []
+    const watched: HostPort = {
+      ...port,
+      voicePrepare: (params) => {
+        asked.push((params as { readonly session_ids: readonly string[] }).session_ids)
+        return port.voicePrepare(params)
+      }
+    }
+    render(
+      <AppProvider port={watched}>
+        <VoiceRoute surface="ios" />
+      </AppProvider>
+    )
+    await screen.findAllByRole('checkbox')
+    await userEvent.click(screen.getByTestId('voice-allow'))
+    expect(await screen.findByRole('button', { name: 'Start voice session' })).toBeInTheDocument()
+    expect(asked.at(-1)).not.toHaveLength(0)
+
+    const before = asked.length
+    act(() => {
+      controls.switchHost(OTHER_HOST)
+    })
+    await waitFor(() => {
+      expect(asked.length).toBeGreaterThan(before)
+    })
+
+    expect(asked.at(-1)).toEqual([])
+  })
+
   it('shows no question to a device the host already allowed', async () => {
     const { port, controls } = fakeHost()
     render(

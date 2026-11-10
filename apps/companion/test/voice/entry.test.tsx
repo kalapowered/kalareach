@@ -296,6 +296,57 @@ describe('what voice may do', () => {
     expect(controls.voiceAllows[0].environmentId).toBe(OTHER_HOST)
   })
 
+  // A read of what a call would be that was made for the host the connection has since left is
+  // not shown: it would put the old host's grant above an entry that reads the new one.
+  it('does not show a refresh made for the host the connection has left', async () => {
+    const { controls, settled } = start((fake) => {
+      fake.speechReachesTheHost(true)
+    })
+    const entry = await screen.findByTestId('voice-grant-entry')
+    await userEvent.click(within(entry).getByRole('checkbox', { name: new RegExp(CLOSE_SENTENCE) }))
+    await settled()
+
+    // The grant changes, and the press that finds it so has the screen read again, slowly.
+    const held = controls.hold('voicePrepare')
+    controls.standingVoiceGrant(['navigate'])
+    await userEvent.click(within(entry).getByTestId('voice-grant-entry-allow'))
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+    await act(async () => {
+      held.answer(0)
+      await Promise.resolve()
+    })
+    await waitFor(() => {
+      expect(held.count).toBeGreaterThanOrEqual(3)
+    })
+    // The connection moves to another host, whose grant is read after that.
+    const readsBefore = held.count
+    controls.standingVoiceGrant(['navigate', 'status'])
+    act(() => {
+      controls.switchHost(OTHER_HOST)
+    })
+    await waitFor(() => {
+      expect(held.count).toBeGreaterThan(readsBefore)
+    })
+    // The new host's read is answered first, and the reads made for the host that was left after it.
+    await act(async () => {
+      held.answer(held.count - 1)
+      await Promise.resolve()
+    })
+    await act(async () => {
+      held.release()
+      await Promise.resolve()
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText(STATUS_SENTENCE)).toBeInTheDocument()
+    })
+    await settled()
+    expect(screen.getByText(STATUS_SENTENCE)).toBeInTheDocument()
+    expect(screen.getByText(NAVIGATE_SENTENCE)).toBeInTheDocument()
+  })
+
   // Section 9: a replacement ends the calls under the grant it replaces, and a withdrawal is not
   // complete until its barrier holds: the sessions the host has still to confirm are named.
   it('says what the host could not carry and which sessions it has still to confirm', async () => {
