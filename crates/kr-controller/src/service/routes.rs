@@ -446,12 +446,18 @@ impl Controller {
                 None => crate::transfer::TransferAdmission::settling(Arc::clone(self), carried),
             };
             // The person at this machine has no bound on the drafts it keeps, and is told every
-            // answer whole.
+            // answer whole except a copy the service withheld, which is told as not shown.
             return self
                 .transfer
                 .write_frame(actor_id, mutation, method, admission, None)
                 .await
-                .into_answer();
+                .into_answer_or(|| {
+                    error_reply(
+                        mutation.request_id,
+                        ErrorCode::OutcomeUnknown,
+                        ControllerError::outcome_not_shown().to_string(),
+                    )
+                });
         }
         if crate::voice::VoiceModule::serves(method) {
             // Section 23 gives `voice.grant` both ingresses: a paired device changes its own voice

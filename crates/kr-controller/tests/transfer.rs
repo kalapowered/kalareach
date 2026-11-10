@@ -3244,26 +3244,28 @@ async fn a_copy_that_finds_a_record_where_it_records_its_refusal(
 /// KR-REQ-09.09: a refusal that cannot be recorded, and that finds the record another copy of the
 /// action left, gives that record back only under the check any retained answer is owed. A host
 /// that comes to owe a fence after the copy passed its own check does not disclose a result under
-/// authority that has gone: the copy is refused for it, as a lookup that finds the same record is.
+/// authority that has gone: the caller at this machine is told that what became of the action is not
+/// shown, and not the refusal of the authority, which is a definite word and says the action did
+/// not happen.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_record_found_when_a_refusal_cannot_be_recorded_is_not_given_while_a_fence_is_owed() {
     let told = a_copy_that_finds_a_record_where_it_records_its_refusal(true).await;
     assert_eq!(
         told.code,
-        ErrorCode::PermissionDenied,
+        ErrorCode::OutcomeUnknown,
         "the record is not given while a fence is owed: {told:?}"
     );
 }
 
 /// KR-REQ-09.09: the same for the record another copy left when the copy's own refusal is recorded
 /// without a fault. The write meets the other copy's row, and the answer is that row, given under
-/// the same check.
+/// the same check and told as not shown while a fence is owed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_record_another_copy_left_is_not_given_while_a_fence_is_owed() {
     let told = a_copy_that_finds_a_record_where_it_records_its_refusal(false).await;
     assert_eq!(
         told.code,
-        ErrorCode::PermissionDenied,
+        ErrorCode::OutcomeUnknown,
         "the record is not given while a fence is owed: {told:?}"
     );
 }
