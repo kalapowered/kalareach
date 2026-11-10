@@ -6215,6 +6215,96 @@ async fn a_delegation_waiting_when_the_host_is_lost_is_discarded() {
     scene.stop_host().await;
 }
 
+/// What a delegation that was dropped when the path to the host was lost would have read is spent
+/// with it: once the host is back, another delegation announced at the same offset, with nothing
+/// new said, has nothing to answer, and the host is sent nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_a_delegation_dropped_with_the_host_would_have_read_answers_no_other() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    scene.platform.hold("capture_proof");
+    let end = speak(&scene, 6_000, "what is the status");
+    ask(&scene, "d-1", end - 200).await;
+    until_proofs_are_asked(&scene, 2).await;
+    scene.link.unreachable(true);
+    lose_the_host(&scene);
+    scene
+        .state_where("the host lost", |state| state["host"] == "lost")
+        .await;
+    let dropped = row_reaching(&scene, "d-1", "not_sent").await;
+    assert_eq!(dropped["cause"], "host_lost");
+    scene.platform.release("capture_proof");
+    scene.link.unreachable(false);
+    scene
+        .state_where("the host back", |state| state["host"] == "reachable")
+        .await;
+
+    ask(&scene, "d-2", end - 200).await;
+
+    let row = row_settled(&scene, "d-2").await;
+    assert_eq!(row["state"], "refused", "{row}");
+    assert_eq!(row["cause"], "empty");
+    assert_eq!(at_the_host(&scene), 0, "nothing reached the host");
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// A set refused because the news was not read up to the marker in time is spent too: another
+/// delegation announced at the same offset, with nothing new said, has nothing to answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_a_set_refused_as_not_drained_would_have_read_answers_no_other() {
+    let timings = Timings {
+        drain_within: Duration::from_secs(2),
+        ..delegating_timings()
+    };
+    let mut scene = delegating_with(timings, 1).await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    scene.platform.hold("capture_proof");
+    let end = speak(&scene, 6_000, "what is the status");
+    ask(&scene, "d-1", end - 200).await;
+    until_proofs_are_asked(&scene, 2).await;
+    scene.platform.hold_news();
+    scene.platform.release("capture_proof");
+    let dropped = row_settled(&scene, "d-1").await;
+    assert_eq!(dropped["cause"], "not_drained", "{dropped}");
+    scene.platform.release_news();
+
+    ask(&scene, "d-2", end - 200).await;
+
+    let row = row_settled(&scene, "d-2").await;
+    assert_eq!(row["state"], "refused", "{row}");
+    assert_eq!(row["cause"], "empty");
+    assert_eq!(at_the_host(&scene), 0, "nothing reached the host");
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// A set refused because native code could not give the proof is spent too: another delegation
+/// announced at the same offset, with nothing new said, has nothing to answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_a_set_refused_for_want_of_a_proof_would_have_read_answers_no_other() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    let end = speak(&scene, 6_000, "what is the status");
+    scene.platform.fail_the_proof_that_completes_a_set(true);
+    ask(&scene, "d-1", end - 200).await;
+    let dropped = row_settled(&scene, "d-1").await;
+    assert_eq!(dropped["cause"], "no_proof", "{dropped}");
+    scene.platform.fail_the_proof_that_completes_a_set(false);
+
+    ask(&scene, "d-2", end - 200).await;
+
+    let row = row_settled(&scene, "d-2").await;
+    assert_eq!(row["state"], "refused", "{row}");
+    assert_eq!(row["cause"], "empty");
+    assert_eq!(at_the_host(&scene), 0, "nothing reached the host");
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
 /// A request composed and not yet written when the path to the host is lost is not written: it is
 /// refused as not sent, and the host is sent nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
