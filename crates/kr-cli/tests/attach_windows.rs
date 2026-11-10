@@ -209,6 +209,18 @@ impl Attached {
     /// Runs `kr attach` for `session` on a pseudo-console of the session's own size, against the
     /// host `host` runs. At that size the worker streams what the session writes as it is written.
     fn start(host: &WorkerHost, session: &str, dimensions: Dimensions) -> Self {
+        Self::start_in(host, session, dimensions, Some("xterm-256color"), &[])
+    }
+
+    /// Runs `kr attach` with `options` in a console whose environment names the terminal `term`, or
+    /// names none: a Windows console sets no `TERM` of its own.
+    fn start_in(
+        host: &WorkerHost,
+        session: &str,
+        dimensions: Dimensions,
+        term: Option<&str>,
+        options: &[&str],
+    ) -> Self {
         let pty = native_pty_system()
             .openpty(PtySize {
                 rows: u16::try_from(dimensions.rows.get()).expect("a console's rows"),
@@ -218,18 +230,26 @@ impl Attached {
             })
             .expect("opens a console");
         let mut command = CommandBuilder::new(kr());
-        command.args(["attach", session]);
+        command.arg("attach");
+        command.args(options);
+        command.arg(session);
         command.env_clear();
         // The process's own variables as the system holds them, with this host's directories on
-        // top, and never a session or attachment identifier of this test's own.
+        // top, and never a session or attachment identifier of this test's own, nor a terminal it
+        // happens to have been started in.
         for (name, value) in std::env::vars_os() {
-            if name != "KR_SESSION" && name != "KR_ATTACHMENT" {
+            if name != "KR_SESSION"
+                && name != "KR_ATTACHMENT"
+                && !name.to_string_lossy().eq_ignore_ascii_case("TERM")
+            {
                 command.env(name, value);
             }
         }
         command.env("KR_RUNTIME_DIR", host.tree.paths().runtime_root());
         command.env("KR_STATE_DIR", host.tree.paths().state_root());
-        command.env("TERM", "xterm-256color");
+        if let Some(term) = term {
+            command.env("TERM", term);
+        }
         let writer: Arc<Mutex<Box<dyn Write + Send>>> =
             Arc::new(Mutex::new(pty.master.take_writer().expect("a writer")));
         let output = ConsoleOutput::collect(
@@ -436,6 +456,99 @@ async fn a_key_typed_at_an_attached_console_reaches_the_application_as_the_conso
         1,
     );
     // Shift and Return: virtual key 13, scan code 0x1c, the carriage return, Shift held.
+    console.press(b"\x1b[13;28;13;1;16;1_");
+    let seen = typist
+        .shown(":kr-end", "the application printed the key it was given")
+        .await;
+    assert!(
+        seen.contains("kr-key:13:13:Shift:kr-end"),
+        "the application was given Return with Shift held: {seen:?}"
+    );
+
+    let _ = console.child.kill();
+    drop(typist);
+}
+
+/// KR-REQ-08.53, the part about who may type: a console whose environment names no terminal, as a
+/// Windows console's names none, is given the session's input lease under a profile of its own, and
+/// a key written to it reaches the application; the same console attached with `--no-probe`
+/// declares nothing and does not take the lease.
+///
+/// The session's application waits for one key. A console with no `TERM` attached with `--no-probe`
+/// is shown the session, and the worker still names the typist as the holder of the lease. The
+/// same console attached without the option is the holder, under the profile a Windows console
+/// declares; it is shown a viewport, because the host has qualified no console to be sent the
+/// session's stream; and the key written to it reaches the application.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_console_that_names_no_terminal_holds_the_input_lease_and_types() {
+    let host = WorkerHost::start().await;
+    let (mut typist, session_id, dimensions) = session_waiting_for_keys(
+        &host,
+        "Write-Host ('kr-rea' + 'dy.'); \
+         $key = [Console]::ReadKey($true); \
+         Write-Host (('kr-key:{0}:{1}:{2}:kr-' -f [int]$key.Key, [int]$key.KeyChar, $key.Modifiers) + 'end'); \
+         Start-Sleep -Seconds 300",
+    )
+    .await;
+    let environment = host.tree.environment();
+    let session = session_id.to_string();
+    let typist_id = typist.attachment_id();
+
+    // The console that withholds its declaration is shown the session and is not given the keys.
+    let mut withholding = Attached::start_in(&host, &session, dimensions, None, &["--no-probe"]);
+    withholding.shows(
+        "the session's screen",
+        |text| text.matches("kr-ready.").count(),
+        1,
+    );
+    let snapshot = snapshot_of(&environment, session_id)
+        .await
+        .expect("the worker's snapshot");
+    assert_eq!(
+        snapshot.lease.holder.as_ref(),
+        Some(&typist_id),
+        "a console attached with --no-probe declares nothing and was not given the keys"
+    );
+    let _ = withholding.child.kill();
+    drop(withholding);
+    attachments_until(
+        &environment,
+        session_id,
+        |attached| attached == [typist_id],
+        "the console attached with --no-probe is removed",
+    )
+    .await;
+
+    // The console that declares itself is given them.
+    let mut console = Attached::start_in(&host, &session, dimensions, None, &[]);
+    console.shows(
+        "the session's screen",
+        |text| text.matches("kr-ready.").count(),
+        1,
+    );
+    let snapshot = snapshot_of(&environment, session_id)
+        .await
+        .expect("the worker's snapshot");
+    let attached = snapshot
+        .attachments
+        .iter()
+        .find(|summary| summary.attachment_id != typist_id)
+        .expect("the console is attached");
+    assert_eq!(
+        snapshot.lease.holder.as_ref(),
+        Some(&attached.attachment_id),
+        "a console that names no terminal is given the keys"
+    );
+    assert_eq!(
+        attached.terminal_profile_id.as_ref().map(String::as_str),
+        Some(kr_term::win32::CONSOLE_PROFILE),
+        "and it declares the profile of a Windows console"
+    );
+    assert_eq!(
+        attached.presentation_reason,
+        Some(kr_protocol::attachment::PresentationReason::UnqualifiedTerminalProfile),
+        "the host has qualified no console to be sent the session's stream, so it is shown a viewport"
+    );
     console.press(b"\x1b[13;28;13;1;16;1_");
     let seen = typist
         .shown(":kr-end", "the application printed the key it was given")
