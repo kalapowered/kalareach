@@ -362,7 +362,10 @@ impl HostAccount {
     /// to be sent holds a grant identifier and a refresh token and no issuer. A storage service
     /// whose scope has the managed account's name would read the managed queue and be sent live
     /// managed refresh tokens, so it is refused here, before the account exists and before
-    /// anything is settled in its scope: building the account starts settling at once.
+    /// anything is settled in its scope: building the account starts settling at once. The name
+    /// is compared with the scope of `managed_origin`, the managed account service's origin, and
+    /// not with whatever the managed account holds, so the rule does not depend on how that
+    /// account was built.
     ///
     /// # Errors
     ///
@@ -372,11 +375,12 @@ impl HostAccount {
         managed: &Self,
         store: Arc<dyn SecretStore>,
         environment_id: EnvironmentId,
+        managed_origin: &str,
         service: std::result::Result<Service, SignInUnavailable>,
         refused: Option<SignInUnavailable>,
     ) -> Result<Self> {
-        if let (Ok(service), Some(held)) = (&service, &managed.inner.held)
-            && scope_of(environment_id, &service.origin) == scope_of(environment_id, &held.origin)
+        if let Ok(service) = &service
+            && scope_of(environment_id, &service.origin) == scope_of(environment_id, managed_origin)
         {
             return Err(ControllerError::NotConfigured(format!(
                 "{} in this host's configuration document ({}) names a service whose sign-in \

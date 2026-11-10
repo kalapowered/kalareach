@@ -172,7 +172,15 @@ impl Controller {
             vec![kr_client::services::account::BACKUP_WRITE_SCOPE],
             route,
         );
-        HostAccount::for_storage(managed, store, environment_id, Ok(service), refused).map(Some)
+        HostAccount::for_storage(
+            managed,
+            store,
+            environment_id,
+            &managed_origin,
+            Ok(service),
+            refused,
+        )
+        .map(Some)
     }
 
     /// This host's own sign-in to the managed account service.

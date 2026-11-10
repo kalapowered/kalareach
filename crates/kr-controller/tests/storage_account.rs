@@ -995,6 +995,7 @@ async fn a_storage_account_whose_scope_is_the_managed_accounts_is_refused_before
         &managed,
         Arc::clone(&store),
         host.environment_id(),
+        managed_origin.as_str(),
         Ok(Service::at_origin(
             &managed_origin,
             vec![kr_client::services::account::BACKUP_WRITE_SCOPE],
@@ -1009,11 +1010,35 @@ async fn a_storage_account_whose_scope_is_the_managed_accounts_is_refused_before
         "{refused}"
     );
 
+    // The rule does not depend on what the managed account holds: one that holds no service at all
+    // (its outbound route could not be built) leaves the managed scope no less the managed one's.
+    let unbuilt = HostAccount::new(
+        Arc::clone(&store),
+        host.environment_id(),
+        environment.runtime_root(),
+        Err(kr_protocol::host_account::SignInUnavailable::NotUsable),
+        None,
+    );
+    HostAccount::for_storage(
+        &unbuilt,
+        Arc::clone(&store),
+        host.environment_id(),
+        managed_origin.as_str(),
+        Ok(Service::at_origin(
+            &managed_origin,
+            vec![kr_client::services::account::BACKUP_WRITE_SCOPE],
+            Outbound::Direct,
+        )),
+        None,
+    )
+    .expect_err("the scope is the managed account's whatever that account holds");
+
     // The control: a storage service at another origin has a scope of its own, and is built.
     HostAccount::for_storage(
         &managed,
         Arc::clone(&store),
         host.environment_id(),
+        managed_origin.as_str(),
         Ok(Service::at_origin(
             &other_origin,
             vec![kr_client::services::account::BACKUP_WRITE_SCOPE],
