@@ -176,6 +176,7 @@ impl Reply {
                 | ClientError::Misdirected { .. }
                 | ClientError::OtherHost
                 | ClientError::StillAccounting
+                | ClientError::Withheld
                 | ClientError::ServiceNotConfigured(_)
                 | ClientError::Draft(_),
             ) => Self::NotSent,
