@@ -269,14 +269,20 @@ clock decides whether a confirmation has run out; the phone's only stops it aski
 what its own clock says is over, and the person is told so ("this phone's clock says the
 confirmation ran out").
 
-The person is asked through the platform's ceremony, which names the session and the host. While
-they are asked the call goes on, and anything that taints it drops the confirmation at once. After
-the ceremony the owner looks at taint, the path to the host and the phone's clock again, takes a
-capture proof with a marker and reads the news up to the marker, so that anything said while the
-person was asked has been read before anything is signed. The task that reads the proof raises the
-flag every write waits on when the proof shows a break, so no other request waiting for the
-connection's turn leaves before the owner has handled the message that tells it; the proof taken
-just before the signed write does the same.
+The person is asked through the platform's ceremony, which names the session and the host. The
+dialog is put up only while the confirmation is still open and the phone's clock does not say it has
+run out, and it stays for what is left of it. While they are asked the call goes on, and anything
+that taints it, or a loss of the path to the host, drops the confirmation at once. A challenge that
+reaches the phone after the path to the host was lost is put to nobody, whether or not the host is
+back by then: what was handed over before a loss is not carried on after it.
+
+After the ceremony the owner looks at taint and the phone's clock again, takes a capture proof with
+a marker and reads the news up to the marker, so that anything said while the person was asked has
+been read before anything is signed; then it looks at taint, the path to the host and the clock once
+more. The task that reads a proof raises the call's taint flag when the proof shows a break, before
+it tells the owner. Every request waiting for the connection's turn looks at that flag, which no
+reconnection clears, so none leaves before the owner has handled the message that tells it; the
+proof taken just before the signed write does the same.
 
 The challenge is then signed with the device's own identity key, and the request goes out again
 through the same hand-over as the first: composed once, after the first was settled, with the same
@@ -452,6 +458,5 @@ The platform asks the person, and the shared client library signs:
 - The signature binds the exact action hash and request ID with the paired device's identity key,
   never a session key. Provider text or model claims cannot produce a valid confirmation.
 
-The desktop application holds no such ceremony. The voice screen has no way to reach these
-ceremonies. A challenge the host sends it is shown with the host's words and the fact that the
-screen cannot sign it, and the host does not act on it.
+The desktop application holds no such ceremony. A challenge the host sends it is shown with the
+host's words and the fact that the screen cannot sign it, and the host does not act on it.
