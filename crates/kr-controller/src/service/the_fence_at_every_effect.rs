@@ -2368,6 +2368,117 @@ async fn a_fence_that_lands_while_a_late_attempt_holds_the_step_lock_stops_the_a
     );
 }
 
+/// KR-REQ-09.09, the authority part: an agent-tool installation another attempt recorded after the
+/// local door's own lookup found nothing is not given back to a late attempt while this host owes a
+/// fence it could not raise, or to a connection whose registration was replaced after the revision
+/// the attempt carries was read. What the host keeps of the action goes back under the same
+/// authority whatever it is: the receipt, and the conflict a reused identifier meets. The control:
+/// the same late attempt, with nothing owed, is answered from the record, and is again once the
+/// fence is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_installation_recorded_before_a_late_attempts_lookup_is_not_given_back_while_a_fence_is_owed()
+ {
+    use kr_protocol::skill::{AgentTarget, AgentToolsParams, InstallScope};
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let captured = controller
+        .admitted_revision(connection_id)
+        .expect("the connection is registered");
+    let project = tempfile::TempDir::new().expect("a project directory of this test's own");
+    let installing = |directory: &std::path::Path| {
+        mutation_of(
+            &temp,
+            Method::AgentToolsInstall,
+            ParamsValue::from_typed(&AgentToolsParams {
+                agent: AgentTarget::Codex,
+                scope: InstallScope::Project,
+                project_dir: Nullable::some(directory.display().to_string()),
+            })
+            .expect("encodes"),
+        )
+    };
+    // The late attempt reaches the service itself, as one does that began before the record was
+    // written: nothing in front of it has looked for the action.
+    let attempt = |mutation: MutationRequest| {
+        let controller = Arc::clone(&controller);
+        let actor_id = actor_id.clone();
+        async move {
+            controller
+                .write_method(
+                    &actor_id,
+                    &mutation,
+                    Method::AgentToolsInstall,
+                    connection_id,
+                    None,
+                    Some(accepted(&controller)),
+                    Some(captured),
+                )
+                .await
+        }
+    };
+    let mutation = installing(project.path());
+    let first = attempt(mutation.clone()).await;
+    assert!(
+        refusal(&first).is_none(),
+        "the first attempt installs: {first:?}"
+    );
+
+    let late = attempt(mutation.clone()).await;
+    assert_eq!(
+        late, first,
+        "with nothing owed the late attempt is answered from the record"
+    );
+    let other = project.path().join("another");
+    let reused = MutationRequest {
+        action_id: mutation.action_id,
+        ..installing(&other)
+    };
+    let conflict = attempt(reused.clone()).await;
+    assert_eq!(
+        refusal(&conflict)
+            .unwrap_or_else(|| panic!("a reused identifier is a conflict: {conflict:?}"))
+            .code,
+        ErrorCode::IdConflict
+    );
+
+    controller.hold_fence(true);
+    let refused = attempt(mutation.clone()).await;
+    refused_for_a_fence(refusal(&refused).unwrap_or_else(|| {
+        panic!("a fence this host owes stops the retained answer: {refused:?}")
+    }));
+    let refused = attempt(reused.clone()).await;
+    refused_for_a_fence(refusal(&refused).unwrap_or_else(|| {
+        panic!("a fence this host owes stops what it keeps of the action: {refused:?}")
+    }));
+    controller.hold_fence(false);
+    let again = attempt(mutation.clone()).await;
+    assert_eq!(again, first, "once the fence is gone it is answered again");
+
+    // Another device's revocation replaces the registration after the late attempt's revision was
+    // read.
+    {
+        let mut registry = controller.registry.lock().await;
+        registry
+            .advance_authority_revision()
+            .expect("the revision advances");
+        let revision = registry
+            .authority_revision()
+            .expect("the revision in force");
+        for connection in controller.admitted_write().values_mut() {
+            connection.admitted_revision = revision;
+        }
+    }
+    let refused = attempt(mutation).await;
+    let replaced = refusal(&refused).unwrap_or_else(|| {
+        panic!("a registration replaced since stops the retained answer: {refused:?}")
+    });
+    assert_eq!(replaced.code, ErrorCode::PermissionDenied, "{replaced:?}");
+    assert_eq!(
+        replaced.message,
+        crate::authority::AdmissionLapse::Revoked.to_string()
+    );
+}
+
 /// KR-REQ-09.09, 09.12 and 26.16: an environment record change another attempt recorded is not
 /// given back to a late attempt while this host owes a fence, including one that lands while the
 /// answer is read, after the claim found the record. The control: with nothing owed, the same late

@@ -43,7 +43,8 @@ impl Controller {
     /// the change with no outcome after it is `unknown` rather than something to do again. What
     /// can be refused without touching anything is refused before the marker.
     ///
-    /// `carried` is the admission the change was accepted under, asked at the marker.
+    /// `carried` is the admission the change was accepted under, asked at the marker and, for an
+    /// answer the host already holds, with that answer in hand.
     pub(super) async fn agent_tools_change(
         &self,
         actor_id: &ActorId,
@@ -62,8 +63,17 @@ impl Controller {
         // completed action or a change to their files. Both need current authority, so it is
         // checked here rather than before the wait.
         self.authorised(carried.connection_id)?;
-        if let Some(retained) = installer.retained(actor_id, mutation.action_id, &digest)? {
-            return Ok(retained);
+        // What the host kept of the action, a refusal as much as a result, goes back only under
+        // the authority this attempt arrived under, asked with it in hand: a record that another
+        // copy wrote while this one waited is found after the door's own look, and a fence owed
+        // or a registration replaced since then stops it, as it does at that look.
+        if let Some(kept) = installer
+            .retained(actor_id, mutation.action_id, &digest)
+            .transpose()
+        {
+            return self
+                .retained_under_authority(&carried, async { kept })
+                .await;
         }
         // What either change can refuse without touching anything, refused here: the platform, the
         // scope, a file or entry this host did not write, a record it cannot read, a document whose
