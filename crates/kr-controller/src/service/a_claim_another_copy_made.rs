@@ -87,8 +87,11 @@ async fn a_machine_group_steps_conflict_is_not_told_while_a_fence_is_owed() {
     controller.hold_fence(false);
 }
 
-/// KR-REQ-09.09, the same conflict where an authority change, a preview key's update and a push
-/// registration claim their action.
+/// KR-REQ-09.09, the conflict of a reused identifier, found where an authority change, a preview
+/// key's update and a push registration claim their action: another attempt claimed the identifier
+/// for another request, and what that says goes back only under the authority this attempt arrived
+/// under. The control: with nothing owed each conflict is told. While this host owes a fence each
+/// is refused for the fence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_authority_changes_conflict_is_not_told_while_a_fence_is_owed() {
     let (temp, controller, _clock) = daemon().await;
@@ -141,8 +144,11 @@ async fn an_authority_changes_conflict_is_not_told_while_a_fence_is_owed() {
     refused_for_the_fence(&controller, register).await;
 }
 
-/// KR-REQ-09.09, the same conflict where an action the host performs under one claim in the shared
-/// store (a privacy change, an environment's record, an account's sign-in) claims its action.
+/// KR-REQ-09.09, the conflict of a reused identifier, found where an action the host performs under
+/// one claim in the shared store (a privacy change, an environment's record, an account's sign-in)
+/// claims its action: another attempt claimed the identifier for another request, and what that says
+/// goes back only under the authority this attempt arrived under. The control: with nothing owed the
+/// conflict is told. While this host owes a fence it is refused for the fence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_privacy_changes_conflict_is_not_told_while_a_fence_is_owed() {
     let (temp, controller, _clock) = daemon().await;
@@ -181,7 +187,10 @@ async fn a_privacy_changes_conflict_is_not_told_while_a_fence_is_owed() {
     controller.hold_fence(false);
 }
 
-/// KR-REQ-09.09, the same conflict where the transfer service looks for the record of its action.
+/// KR-REQ-09.09, the conflict of a reused identifier, found where the transfer service looks for the
+/// record of its action: another attempt recorded the identifier for another request, and what that
+/// says goes back only under the authority this attempt arrived under. The control: with nothing
+/// owed the conflict is told. While this host owes a fence it is refused for the fence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_transfers_conflict_is_not_told_while_a_fence_is_owed() {
     let (temp, controller, _clock) = daemon().await;
