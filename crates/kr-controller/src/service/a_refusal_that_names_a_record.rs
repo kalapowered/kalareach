@@ -10,9 +10,9 @@
 //! Each case plants what the other attempt left, and asks the service the control (nothing owed:
 //! the refusal is told) and then a fence. Where the service asks its check on the async side, the
 //! fence lands at the pause that check starts with, so the case shows the check is asked after the
-//! record is read. Where the check runs on a thread that blocks (the project and change-set
-//! services), no pause stops it, the fence is set before the call, and the case shows that the
-//! check runs, not when.
+//! record is read. Where the check runs on a thread that blocks (the project service), or a case
+//! sets the fence before the call, no pause stops it, and the case shows that the check runs, not
+//! when.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -666,9 +666,121 @@ async fn a_project_action_whose_admission_refuses_beside_another_requests_record
     .await;
 }
 
+/// KR-REQ-09.09, the project service reading what the journal holds once its admission has refused,
+/// and meeting a journal it cannot read: the look before the admission found no record, and the
+/// journal went out of reach while the admission was asked. That a record may exist is what the
+/// caller would be told, so what the second look refuses with goes back only under the authority
+/// the copy arrived under. The control: with nothing owed the copy is told that what became of the
+/// action is not known, as a copy of the record. While this host owes a fence it is refused for the
+/// fence, as the refusal of a copy the service withheld. The fence is set before the call, as in
+/// the cases around it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_project_action_whose_admission_refuses_beside_a_journal_it_cannot_read_is_not_told_while_a_fence_is_owed()
+ {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let admission = carried(&controller, connection_id);
+    let mutation = cancellation(&temp);
+    let journal_file = kr_project::ProjectService::root_of(&controller.paths)
+        .join(kr_project::store::STORE_FILE_NAME);
+    let beside_the_journal = || {
+        let journal = rusqlite::Connection::open(&journal_file)
+            .expect("the journal opens beside the daemon's own handle");
+        journal
+            .busy_timeout(Duration::from_secs(10))
+            .expect("waits for the daemon's own writes");
+        journal
+    };
+    // The admission the first look has passed: it puts the journal out of reach, and refuses.
+    let begin = || -> Begin {
+        let journal_file = journal_file.clone();
+        Box::new(move || {
+            let journal = rusqlite::Connection::open(&journal_file)
+                .expect("the journal opens beside the daemon's own handle");
+            journal
+                .busy_timeout(Duration::from_secs(10))
+                .expect("waits for the daemon's own writes");
+            journal
+                .execute_batch("ALTER TABLE actions RENAME TO actions_aside;")
+                .expect("the journal cannot be read");
+            Err(a_deadline_that_passed())
+        })
+    };
+
+    let control = project_answer(&controller, &actor_id, &mutation, admission, begin()).await;
+    assert!(
+        control.is_copied(),
+        "a journal that cannot be read says that a record may exist, so it is a copy"
+    );
+    let told = control
+        .into_answer()
+        .expect_err("a journal that cannot be read does not answer the copy");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    beside_the_journal()
+        .execute_batch("ALTER TABLE actions_aside RENAME TO actions;")
+        .expect("the journal can be read again");
+
+    controller.hold_fence(true);
+    let refused = project_answer(&controller, &actor_id, &mutation, admission, begin())
+        .await
+        .into_withheld()
+        .expect_err("a fence this host owes stops what the second look refuses with");
+    refused_for_a_fence(&refused);
+    controller.hold_fence(false);
+    beside_the_journal()
+        .execute_batch("ALTER TABLE actions_aside RENAME TO actions;")
+        .expect("the journal can be read again");
+}
+
 // ---------------------------------------------------------------------------------------------
 // The change-set service
 // ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-09.09, the change-set service's own look meeting a record of actions it cannot read: that
+/// a record may exist is what the caller would be told, so what the look refuses with goes back
+/// only under the authority the copy arrived under. The control: with nothing owed the copy is
+/// told that what became of the action is not known, as a copy of the record. A fence that lands
+/// once that is in hand refuses it, as the refusal of a copy the service withheld.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_set_action_whose_records_cannot_be_read_is_not_told_after_a_fence_lands() {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let admission = carried(&controller, connection_id);
+    let mutation = materialisation(&temp);
+    let records = rusqlite::Connection::open(
+        kr_changeset::ChangeSetService::root_of(&controller.paths)
+            .join(kr_changeset::store::STORE_FILE_NAME),
+    )
+    .expect("the records open beside the daemon's own handle");
+    records
+        .busy_timeout(Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    records
+        .execute_batch("ALTER TABLE actions RENAME TO actions_aside;")
+        .expect("the records cannot be read");
+
+    let control = changeset_answer(&controller, &actor_id, &mutation, admission).await;
+    assert!(
+        control.is_copied(),
+        "records that cannot be read say that one may exist, so the answer is a copy"
+    );
+    let told = control
+        .into_answer()
+        .expect_err("records that cannot be read do not answer the copy");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+
+    let refused = answered_after_a_fence_lands_at_the_check(
+        &controller,
+        changeset_answer(&controller, &actor_id, &mutation, admission),
+    )
+    .await
+    .into_withheld()
+    .expect_err("a fence that landed once the refusal was in hand is the answer");
+    refused_for_a_fence(&refused);
+    records
+        .execute_batch("ALTER TABLE actions_aside RENAME TO actions;")
+        .expect("the records can be read again");
+}
 
 /// KR-REQ-09.09, the change-set service's own look finding another request's record under the
 /// action's identifier: the conflict goes back only under the authority the copy arrived under. The

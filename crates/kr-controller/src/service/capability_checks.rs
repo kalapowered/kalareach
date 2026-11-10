@@ -378,10 +378,11 @@ impl Controller {
     ///
     /// Returns [`ControllerError::WindowExpired`] for a first start whose window has passed or that
     /// carries no freshness (a copy of an action this host answered is given the answer whatever
-    /// its window), the admission's refusal, [`ControllerError::InvalidArgument`] for a request that is not for
-    /// this environment, [`ControllerError::IdConflict`] for an identifier the record holds for
-    /// another request, and the error of the registry or of the record of answers, which answers
-    /// `STORAGE_UNAVAILABLE`, when either cannot be read or the answer cannot be written down.
+    /// its window), the admission's refusal, [`ControllerError::InvalidArgument`] for a request
+    /// that is not for this environment, [`ControllerError::IdConflict`] for an identifier the
+    /// record holds for another request, an error that answers `OUTCOME_UNKNOWN` for a record of
+    /// answers that cannot be read (the action may have run), and the error of the registry or of
+    /// writing the answer down, which answers `STORAGE_UNAVAILABLE`.
     pub(super) async fn start_capability_checks(
         self: &Arc<Self>,
         actor_id: &ActorId,
