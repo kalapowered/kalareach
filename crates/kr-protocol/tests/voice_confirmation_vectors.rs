@@ -1,10 +1,9 @@
 //! The voice confirmation's signing input and its signer's key identifier, held to fixed bytes.
 //!
-//! The paired phones sign the host's challenge in Swift and in Kotlin. A phone that encodes the
-//! challenge its own way produces a proof the host rejects, and no test on the phone can see that
-//! without this side's bytes. The phones' ceremony tests (`VoiceCeremonyTests.swift`,
-//! `VoiceCeremonyTest.kt`) hold the same two constants, so a change to either encoding fails here
-//! and on both phones together.
+//! A paired device signs the host's challenge and the host verifies the signature over the same
+//! bytes, each through this crate's encoding. A change to either encoding would make every proof a
+//! device signs one the host rejects, and no test of either side alone can see that without these
+//! bytes.
 //!
 //! The confirmation is a signature over the exact action, so these bytes are what a confirmation
 //! covers.
@@ -20,7 +19,7 @@ const SIGNING_INPUT_HEX: &str = "82726b722d766f6963652f636f6e6669726d2f31a9656e6
 /// `SHA256(CBOR(["kr-key-id/1", "authorisation", key]))` for the fixed public key, hex encoded.
 const SIGNER_KEY_ID_HEX: &str = "a1e1283a5a7d9396772f55cfbd0867b9836c583a4381dd3f70a7a78afd9dec7f";
 
-/// The fixed challenge, field by field, as every language's test builds it.
+/// The fixed challenge, field by field.
 fn challenge() -> VoiceConfirmationRequest {
     VoiceConfirmationRequest {
         confirmation_id: ConfirmationId::new(Uuid::from_bytes([0x11; 16])),
