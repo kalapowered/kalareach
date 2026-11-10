@@ -125,6 +125,13 @@ async function startAnotherTurn(
   })
 }
 
+/** Ends the running call from its screen and starts another from the choice that follows. */
+async function endAndStartAnotherCall(person: ReturnType<typeof userEvent.setup>): Promise<void> {
+  await person.click(screen.getByRole('button', { name: 'End session' }))
+  await person.click(await screen.findByRole('button', { name: 'Start voice session' }))
+  await screen.findByRole('button', { name: 'End session' })
+}
+
 /** Has the screen read the host again, as it does when the page is shown again. */
 async function readAgain(): Promise<void> {
   await act(async () => {
@@ -868,37 +875,86 @@ describe('while a call is running', () => {
     })
   })
 
-  // KR-REQ-15.22: the answer to a cancellation is told on the call it was asked on. Once the call
-  // has ended, the screen says how it ended and nothing the host answered afterwards.
-  it('does not tell the answer to a cancellation once its call has ended', async () => {
+  // KR-REQ-15.22: the answer to a cancellation is told on the call it was asked on. When the call
+  // has ended, and another has begun, what the host answered later says nothing about the new one,
+  // whether it took the request or refused it.
+  it.each([
+    { answer: 'takes it', settle: 'resolve' as const, words: /asked to cancel that turn/ },
+    { answer: 'refuses it', settle: 'reject' as const, words: /the turn named is not the one running/ }
+  ])('does not tell a later call that the host $answer', async ({ settle, words }) => {
     const { person, port } = await startACall()
     await waitFor(() => {
       expect(askToCancel()).toBeEnabled()
     })
     const answer = port.composerInterrupt.bind(port)
     let release: () => void = () => undefined
-    const waiting = vi.spyOn(port, 'composerInterrupt').mockImplementation(
+    vi.spyOn(port, 'composerInterrupt').mockImplementation(
       (...args) =>
-        new Promise((resolve) => {
-          release = () => resolve(answer(...args))
+        new Promise((resolve, reject) => {
+          release =
+            settle === 'resolve'
+              ? () => resolve(answer(...args))
+              : () =>
+                  reject({
+                    code: 'DRAFT_CONFLICT',
+                    message: 'the turn named is not the one running',
+                    user_action: 'retry'
+                  })
         })
     )
     await person.click(askToCancel())
     await person.click(screen.getByRole('button', { name: 'Cancel this turn' }))
-    expect(waiting).toHaveBeenCalledTimes(1)
+    await endAndStartAnotherCall(person)
 
-    await person.click(screen.getByRole('button', { name: 'End session' }))
-    await waitFor(() => {
-      expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
-    })
-    // The host answers now, and a task that yields to the event loop runs every promise that is
-    // waiting first, so once it returns the screen has taken the answer.
+    // The host answers the first call's request now, and a task that yields to the event loop runs
+    // every promise that is waiting first, so once it returns the screen has taken the answer.
     await act(async () => {
       release()
       await new Promise((resolve) => setTimeout(resolve, 0))
     })
 
-    expect(screen.queryByText(/asked to cancel that turn/)).not.toBeInTheDocument()
+    expect(screen.queryByText(words)).not.toBeInTheDocument()
+  })
+
+  // KR-REQ-15.22: what the host selected for a call is shown on that call. A reply to the first
+  // call's request that arrives after another has begun is not the new call's, whether the host
+  // selected context or refused to.
+  it.each([
+    { reply: 'selects context', settle: 'resolve' as const, words: /Selected by the host/ },
+    { reply: 'refuses', settle: 'reject' as const, words: /will not select context/ }
+  ])('does not show a later call what the host did when it $reply for the first', async ({ settle, words }) => {
+    const { person, port } = await startACall()
+    // What the host selects, asked for before the request is held.
+    const selected = await port.voiceContext({
+      voice_session_id: 'an-earlier-request',
+      session_id: SESSION_MAIN,
+      selected: [],
+      delegation_id: null
+    })
+    let release: () => void = () => undefined
+    vi.spyOn(port, 'voiceContext').mockImplementation(
+      () =>
+        new Promise((resolve, reject) => {
+          release =
+            settle === 'resolve'
+              ? () => resolve(selected)
+              : () =>
+                  reject({
+                    code: 'PERMISSION_DENIED',
+                    message: 'The host will not select context.',
+                    user_action: 'none'
+                  })
+        })
+    )
+    await person.click(screen.getByRole('button', { name: 'Show what the host selected' }))
+    await endAndStartAnotherCall(person)
+
+    await act(async () => {
+      release()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+
+    expect(screen.queryByText(words)).not.toBeInTheDocument()
   })
 
   // KR-REQ-15.22: a call that reaches more than one session has no one turn to name, and a

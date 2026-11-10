@@ -410,6 +410,12 @@ export function VoiceRoute({
   useEffect(() => {
     held.current = call
   }, [call])
+  /**
+   * How many calls have ended on this screen. A request that is asked on a call and answered after
+   * it ended is answered on the next call too, so an answer is told only while this count is what it
+   * was when the request was asked, however the host names its calls.
+   */
+  const callsEnded = useRef(0)
   const shown = useRef<ProviderChoice | null>(null)
   useEffect(() => {
     shown.current = choice
@@ -454,6 +460,7 @@ export function VoiceRoute({
     setSetUp(false)
     setEndingSetUp(false)
     if (held.current !== null || watched) {
+      callsEnded.current += 1
       setCall(null)
       setLeftCount((count) => count + 1)
       if (!hangingUp.current) {
@@ -794,6 +801,7 @@ export function VoiceRoute({
         if (!running) return
         endTheCall(running.voiceSessionId, (closure) => {
           if (closure.closed_locally) {
+            callsEnded.current += 1
             setCall(null)
             setLeftCount((count) => count + 1)
           }
@@ -820,9 +828,9 @@ export function VoiceRoute({
 
       cancelTask: (turn) => {
         // The answer is told on the call the request was asked on: once that call has ended, what
-        // the screen says belongs to how it ended.
-        const asked = held.current?.voiceSessionId
-        const stillOnIt = () => asked !== undefined && held.current?.voiceSessionId === asked
+        // the screen says belongs to how it ended, or to the call that followed.
+        const asked = callsEnded.current
+        const stillOnIt = () => callsEnded.current === asked
         void ask(() =>
           port.composerInterrupt({
             target: {
@@ -849,6 +857,8 @@ export function VoiceRoute({
         const running = held.current
         if (!running) return
         const requestId = `ctx-${running.requests.length + 1}`
+        // A reply is shown on the call it was asked on, never on one that came after it.
+        const asked = callsEnded.current
         // The session this screen was opened for, or the first one the call was bound to. A voice
         // session is not a terminal session, so its identifier is never sent as one.
         const sessionId = sessionIds[0] ?? running.sessions[0]
@@ -875,6 +885,7 @@ export function VoiceRoute({
           })
         )
           .then((selection) => {
+            if (callsEnded.current !== asked) return
             // A read from the host, and nothing more: what the host selected for the call. It
             // says nothing about the voice service, which this read never reaches.
             const tokens = selection.selection.text_tokens
@@ -891,6 +902,7 @@ export function VoiceRoute({
             )
           })
           .catch((error: unknown) => {
+            if (callsEnded.current !== asked) return
             setCall((current) =>
               current
                 ? withRequest(current, requestId, 'voice.context', 'refused', failureMessage(error))
