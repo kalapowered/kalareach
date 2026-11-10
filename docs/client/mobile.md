@@ -403,10 +403,12 @@ cd apps/companion/src-tauri/gen/android && ./gradlew :app:compileUniversalDebugK
 # the classes the Rust library calls by names it builds as it runs, which the check of the libraries
 # cannot see. The release variant is always minified. A debug build is when `KR_MINIFY_DEBUG=1`
 # asks for it; the Gradle project stops on any other value of that variable.
-# `pnpm -C apps/companion android` and `pnpm -C apps/companion ios` run each build in a temporary
-# directory of its own, given by an absolute path, since the command line tool shares the build's
-# options with Gradle and Xcode through a file there named for the application
-# (`to.kala.reach-server-addr`), which two builds at once on a machine would cross. The Android
+# `pnpm -C apps/companion android` and `pnpm -C apps/companion ios build` run each build in a
+# temporary directory of its own, given by an absolute path, since the command line tool shares the
+# build's options with Gradle and Xcode through a file there named for the application
+# (`to.kala.reach-server-addr`), which two builds at once on a machine would cross. The iOS command
+# runs the build only: `dev`, `open` and `--open` start Xcode.app with its own directory, and it
+# refuses them. The Android
 # command checks the packages that build asked for, and core-ci's
 # `android-app` job builds the release variant, which is minified, besides the debug one. Given no
 # path, this reads every APK and AAB under app/build/outputs, whichever build left them.
