@@ -391,7 +391,11 @@ export interface Delegation {
   readonly delegationId: string
   /** Where in the call it happened, in milliseconds from the start, or null when it is not known. */
   readonly offsetMs: number | null
-  /** Whether the model was told that nothing was done. */
+  /** What became of it: `not_done` while this version acts on no spoken request. */
+  readonly state: string
+  /** Why, when the state names a cause. */
+  readonly cause: string | null
+  /** Whether the model was told what became of it. */
   readonly told: boolean
 }
 
@@ -400,6 +404,8 @@ export function delegationsFrom(rows: readonly VoiceDelegationRow[]): readonly D
   return rows.map((row) => ({
     delegationId: row.delegation_id,
     offsetMs: row.offset_ms,
+    state: row.state,
+    cause: row.cause ?? null,
     told: row.told
   }))
 }

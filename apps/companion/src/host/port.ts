@@ -1128,7 +1128,11 @@ export interface VoiceCallState {
 }
 
 /** What kind of problem a call met. */
-export type VoiceProblemKind = 'opening_context' | 'host_path' | 'no_such_call'
+export type VoiceProblemKind =
+  | 'opening_context'
+  | 'host_path'
+  | 'no_such_call'
+  | 'spoken_requests'
 
 /** A problem a call met, in words for a person. */
 export interface VoiceProblem {
@@ -1136,7 +1140,9 @@ export interface VoiceProblem {
    * `opening_context` when the call was not given all of the host's context as its opening context
    * (the host did not give it, the voice service took part of it, or the call ended first);
    * `host_path` when the host answered and would not say the call is still its own; `no_such_call`
-   * when the last call found that the voice service has no such call for this account.
+   * when the last call found that the voice service has no such call for this account;
+   * `spoken_requests` when the call can no longer hand a spoken request to the host, because what
+   * was said may not all have been heard and read.
    */
   readonly kind: VoiceProblemKind
   /** What a person is told. */
@@ -1181,10 +1187,17 @@ export interface VoiceDelegationRow {
    * did not say: a delegation listed when the control attached.
    */
   readonly offset_ms: number | null
-  /** What became of it: always `not_done` in this version, which acts on no spoken request. */
+  /**
+   * What became of it. `not_done` for every delegation while this version acts on no spoken
+   * request. A call that hands spoken requests to the host, which only a test or the debug build's
+   * probe makes, also says `collecting`, `asking`, `refused`, `not_sent`, `performed`, `admitted`,
+   * `confirmation_required`, `host_refused` and `unknown`.
+   */
   readonly state: string
-  /** Whether the model was told so. */
+  /** Whether the model was told what became of it. */
   readonly told: boolean
+  /** Why, for a state that names a cause; absent while this version acts on nothing. */
+  readonly cause?: string
 }
 
 /** Something this device could not finish, which the host may still hold open. */

@@ -737,9 +737,14 @@ export interface FakeHostControls {
   setVoiceCapture(state: string): void
   /**
    * Records one delegation the provider announced to the running call, as the call's owner does:
-   * this version acts on none, so the row says so, and says whether the model was told.
+   * this version acts on none, so the row says so, and says whether the model was told. A call
+   * that hands spoken requests to the host says another `state`, and a `cause` for some.
    */
-  announceVoiceDelegation(delegationId: string, told?: boolean): void
+  announceVoiceDelegation(
+    delegationId: string,
+    told?: boolean,
+    outcome?: { readonly state: string; readonly cause?: string }
+  ): void
   /**
    * Ends the running call without the page asking, as the notification's stop, a failed connection
    * or the voice service would: the call is gone, and `ended` is what it left.
@@ -3663,13 +3668,14 @@ export function fakeHost(
     setVoiceCapture(state) {
       if (voice.call) voice.call.capture = state
     },
-    announceVoiceDelegation(delegationId, told = true) {
+    announceVoiceDelegation(delegationId, told = true, outcome = { state: 'not_done' }) {
       if (!voice.call) return
       voice.delegations.push({
         delegation_id: delegationId,
         offset_ms: 1_000 * (voice.delegations.length + 1),
-        state: 'not_done',
-        told
+        state: outcome.state,
+        told,
+        ...(outcome.cause === undefined ? {} : { cause: outcome.cause })
       })
     },
     endVoiceCall(ended) {
