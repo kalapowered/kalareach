@@ -53,6 +53,12 @@
 #   late_fragment     a fragment of a request arrives after the request was read
 #   broker_disagrees  the service announces a delegation at another offset than the provider's
 #
+# A leg counts only on a call whose own recorder did not break before the leg's subject: the leg reads
+# native code's record of capture before it says anything, and a break it did not make (the gate's
+# gap between two recorder buffers fires when a loaded machine stalls the emulator at the call's
+# start) ends that attempt, which the script keeps under its own name and plays again on a new call,
+# up to `KR_LEG_ATTEMPTS` (three) in all. A leg that breaks by itself on every attempt fails.
+#
 # `delegating` with no leg runs them all, one after another, with one build and one device. The
 # simulator has no recorder, so a run with the peer's file naming a synthetic recorder gives the call
 # a recording device of its own that makes a tone, opens no microphone of this machine and is the
@@ -357,6 +363,8 @@ set_required_checks() {
                 "native code holds the call"
                 "native code's capture is on"
                 "the provider's events channel is open"
+                "the call carries audio before the leg begins"
+                "the recorder delivered without a break before the leg began"
             )
             case "$leg" in
                 production)
@@ -381,7 +389,8 @@ set_required_checks() {
                     required_checks+=(
                         "the first utterance is refused"
                         "a status said before the break is performed"
-                        "the person mutes and unmutes between two parts of a command"
+                        "the person mutes between two parts of a command"
+                        "the microphone is back to capturing after the unmute"
                         "a mute between two parts of a command refuses it"
                         "the call stays refused after the microphone is back"
                     )
@@ -513,13 +522,38 @@ conclude() { # <application status> <host status>
 # Decides every run of a script from the verdict of each: the worst of them, where a failure is
 # worse than a run that could not measure.
 worst=0
-note_verdict() { # <leg> <status>
-    say "== leg ${1:-the call} exit $2"
+note_verdict() { # <leg> <status> [<attempts>]
+    say "== leg ${1:-the call} exit $2${3:+ after $3 attempts}"
     case "$2" in
         0) ;;
         4) [ "$worst" != 0 ] || worst=4 ;;
         *) worst=2 ;;
     esac
+}
+
+# Plays one run of a leg, and plays it again on a new call, up to `KR_LEG_ATTEMPTS` (three) in all, when
+# its result says the call's own recorder broke by itself: a break in a part of the leg that is not
+# about one, which a phone's recorder can make when the device is busy with its own start (the emulator
+# on a loaded machine does). The leg's subject was never reached then, so the attempt counts for
+# nothing, is kept under its own name with the break it names, and the leg's verdict is its last
+# attempt's. A run that fails for any other reason fails at once, and a leg that breaks by itself on
+# every attempt fails, saying so.
+play_leg() { # <leg> <runner> <runner arguments...>
+    local each=$1 runner=$2 rc attempt=1 attempts="${KR_LEG_ATTEMPTS:-3}"
+    shift 2
+    while :; do
+        begin_run "$each"
+        rc=0
+        "$runner" "$@" || rc=$?
+        end_run
+        [ "$rc" != 0 ] || break
+        grep -q 'the recorder broke by itself' "$artefacts/$result_name" 2>/dev/null || break
+        say "== leg ${each:-the call} attempt $attempt of $attempts: $(grep -h 'the recorder broke by itself' "$artefacts/$result_name" | cut -c1-160 | head -2 | tr '\n' ' ')"
+        [ "$attempt" -lt "$attempts" ] || break
+        mv "$artefacts" "$artefacts-attempt-$attempt" || break
+        attempt=$((attempt + 1))
+    done
+    note_verdict "$each" "$rc" "$attempt"
 }
 
 # The text the iOS simulator's application peer file holds: a port and a token, and for the
@@ -600,13 +634,9 @@ run_ios() {
     xcrun simctl boot "$udid" >/dev/null 2>&1
     xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1
 
-    local each rc
+    local each
     for each in "${legs[@]}"; do
-        begin_run "$each"
-        rc=0
-        ios_run "$udid" "$app" || rc=$?
-        end_run
-        note_verdict "$each" "$rc"
+        play_leg "$each" ios_run "$udid" "$app"
     done
     return "$worst"
 }
@@ -749,13 +779,9 @@ run_android() {
         say "mobile data is off on the emulator"
     fi
 
-    local each rc
+    local each
     for each in "${legs[@]}"; do
-        begin_run "$each"
-        rc=0
-        android_run "$adb" "$serial" "$apk" || rc=$?
-        end_run
-        note_verdict "$each" "$rc"
+        play_leg "$each" android_run "$adb" "$serial" "$apk"
     done
     return "$worst"
 }

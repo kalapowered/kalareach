@@ -6,10 +6,10 @@
 `mode` is `native-failure` (the answer leads nowhere and native code ends the call), `outage` (the
 answer is the phone's own peer, the call carries audio and then the voice service goes away) or
 `delegating` (the call hands spoken requests to the host; `leg` says which of the legs the run
-played, and what the voice service carried to the model and what the host's sessions were sent is
-read against what that leg expects). `platform` is `ios` or `android`. `--send-unmeasured` says the
-phone's own result could not measure the audio it sent, as a simulator with no microphone cannot, so
-a peer that heard nothing is no evidence against the call.
+played, and what the voice service carried to the model is read against what that leg expects).
+`platform` is `ios` or `android`. `--send-unmeasured` says the phone's own result could not measure
+the audio it sent, as a simulator with no microphone cannot, so a peer that heard nothing is no
+evidence against the call.
 
 It prints one line per check, `== [voice-call-device] host check=<name> ok=<0, 1 or 2> detail=<text>`,
 and exits 0 when every check passed, 4 when every check that measured passed and some could not
@@ -148,18 +148,21 @@ def told_kind(text):
 
 
 # For each leg: whether the attach words say the phone can ask the host, what each delegation the
-# call answered was told (by identifier, in the order told), whether the call is tainted for good
-# (the model is told so once, as instructions), and how many requests the host was sent.
+# call answered was told (by identifier, in the order told), and whether the call is tainted for good
+# (the model is told so once, as instructions). "The person's computer read it." is the control's
+# word for a host's answer and no other path makes it, so a delegation told as performed is one the
+# host performed; the report also lists what the host's session workers received, by method, which
+# carries the call's opening reads as well and is kept as evidence, not judged.
 LEGS = {
-    "production": dict(attach="cannot", told={"d-9": ["not_done"]}, tainted=False, at_host=0),
-    "positive": dict(attach="can", told={"d-0": ["refused"], "d-1": ["performed"]}, tainted=False, at_host=1),
-    "first_utterance": dict(attach="can", told={"d-1": ["refused"], "d-2": ["performed"]}, tainted=False, at_host=1),
-    "mute": dict(attach="can", told={"d-0": ["refused"], "d-1": ["performed"], "d-2": ["tainted"], "d-3": ["tainted"]}, tainted=True, at_host=1),
-    "gap": dict(attach="can", told={"d-0": ["refused"], "d-1": ["performed"], "d-2": ["tainted"]}, tainted=True, at_host=1),
-    "dtx": dict(attach="can", told={"d-1": ["tainted"]}, tainted=True, at_host=0),
-    "malformed": dict(attach="can", told={"d-0": ["refused"], "d-1": ["performed"], "d-2": ["tainted"]}, tainted=True, at_host=1),
-    "late_fragment": dict(attach="can", told={"d-0": ["refused"], "d-1": ["performed"], "d-2": ["tainted"]}, tainted=True, at_host=1),
-    "broker_disagrees": dict(attach="can", told={"d-0": ["refused"], "d-1": ["performed"], "d-2": ["refused"], "d-3": ["performed"]}, tainted=False, at_host=2),
+    "production": dict(attach="cannot", told={"d-9": ["not_done"]}, tainted=False),
+    "positive": dict(attach="can", told={"d-0": ["refused"], "d-1": ["performed"]}, tainted=False),
+    "first_utterance": dict(attach="can", told={"d-1": ["refused"], "d-2": ["performed"]}, tainted=False),
+    "mute": dict(attach="can", told={"d-0": ["refused"], "d-1": ["performed"], "d-2": ["tainted"], "d-3": ["tainted"]}, tainted=True),
+    "gap": dict(attach="can", told={"d-0": ["refused"], "d-1": ["performed"], "d-2": ["tainted"]}, tainted=True),
+    "dtx": dict(attach="can", told={"d-1": ["tainted"]}, tainted=True),
+    "malformed": dict(attach="can", told={"d-0": ["refused"], "d-1": ["performed"], "d-2": ["tainted"]}, tainted=True),
+    "late_fragment": dict(attach="can", told={"d-0": ["refused"], "d-1": ["performed"], "d-2": ["tainted"]}, tainted=True),
+    "broker_disagrees": dict(attach="can", told={"d-0": ["refused"], "d-1": ["performed"], "d-2": ["refused"], "d-3": ["performed"]}, tainted=False),
 }
 
 

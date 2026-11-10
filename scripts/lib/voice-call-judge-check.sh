@@ -131,5 +131,78 @@ judge_report rate-against-pause ios 2
 judge_report never-offered-unheard ios 4 --send-unmeasured
 judge_report unanswered android 2
 
+# The machine side's report of a spoken-requests run: a good report of each leg passes, and a report
+# with the wrong attach words, a wrong kind told of a delegation, a tainted call the model was not told
+# of (or told of when the call was never tainted), or a delegation the leg did not make is refused.
+delegating_report() { # <leg> <name> <python expression editing `attach`, `told` and `tainted`>
+    python3 - "$here/voice-call-host-judge.py" "$dir/$2.json" "$1" "$3" <<'PY'
+import importlib.util
+import json
+import sys
+
+judge, out, leg, edit = sys.argv[1:5]
+spec = importlib.util.spec_from_file_location("judge", judge)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+want = module.LEGS[leg]
+words = {
+    "performed": "The person's computer read it. It said: all quiet.",
+    "refused": "Nothing was done on the person's computer: what was said could not be used as a request, so ask the person to say it again.",
+    "tainted": "This call can no longer act on what the person says. Tell the person to start a new call.",
+    "not_done": "Nothing was done on the person's computer: this version does not act on spoken requests.",
+}
+attach = "You can ask the person's computer to read for you." if want["attach"] == "can" else "You cannot act on the person's computer."
+told = {delegation: list(kinds) for delegation, kinds in want["told"].items()}
+tainted = want["tainted"]
+exec(edit)
+sent = [{"id": "i-0", "command": "instructions", "delegation": None, "content": attach}]
+for delegation, kinds in told.items():
+    for kind in kinds:
+        sent.append({"id": "s-%s-%s" % (delegation, kind), "command": "instructions", "delegation": delegation, "content": words[kind]})
+if tainted:
+    sent.append({"id": "i-1", "command": "instructions", "delegation": None, "content": words["tainted"]})
+r = {
+    "creations": 1,
+    "host_closes": 1,
+    "control_tokens": ["Bearer t"],
+    "control_commands": [],
+    "token": "t",
+    "control_sent": sent,
+    "peer": {"relayed": 1, "answered": 1, "errors": [], "figures": []},
+}
+json.dump(r, open(out, "w"))
+PY
+}
+judge_delegating() { # <name> <leg> <expected status>
+    local status=0 name=$1 leg=$2 want=$3
+    python3 "$here/voice-call-host-judge.py" "$dir/$name.json" delegating android "$leg" >/dev/null || status=$?
+    if [ "$status" != "$want" ]; then
+        echo "FAILED: the delegating report $name judged $status, expected $want"
+        failed=1
+    fi
+}
+for leg in production positive first_utterance mute gap dtx malformed late_fragment broker_disagrees; do
+    delegating_report "$leg" "good-$leg" "pass"
+    judge_delegating "good-$leg" "$leg" 0
+    delegating_report "$leg" "words-$leg" "attach = 'You cannot act on the person\\'s computer.' if want['attach'] == 'can' else 'You can ask the person\\'s computer to read for you.'"
+    judge_delegating "words-$leg" "$leg" 2
+    delegating_report "$leg" "kind-$leg" "k = sorted(told)[-1]; told[k] = ['refused' if told[k][-1] != 'refused' else 'performed']"
+    judge_delegating "kind-$leg" "$leg" 2
+    delegating_report "$leg" "stray-$leg" "told['d-8'] = ['performed']"
+    judge_delegating "stray-$leg" "$leg" 2
+    if [ "$leg" = production ] || [ "$leg" = positive ] || [ "$leg" = first_utterance ] || [ "$leg" = broker_disagrees ]; then
+        # No break in these calls: the model must never have been told that the call can no longer act.
+        delegating_report "$leg" "tainted-told-$leg" "tainted = True"
+    else
+        delegating_report "$leg" "tainted-silent-$leg" "tainted = False"
+    fi
+done
+for leg in production positive first_utterance broker_disagrees; do
+    judge_delegating "tainted-told-$leg" "$leg" 2
+done
+for leg in mute gap dtx malformed late_fragment; do
+    judge_delegating "tainted-silent-$leg" "$leg" 2
+done
+
 [ "$failed" = 0 ] && echo "the judges decide every case as they should"
 exit "$failed"
