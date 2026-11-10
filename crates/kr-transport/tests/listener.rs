@@ -224,7 +224,9 @@ async fn a_listener_that_goes_ends_the_connections_it_serves() {
         .await
         .expect("an authorised connection");
 
-    let ended = tokio::time::timeout(Duration::from_secs(30), async {
+    // Shorter than the thirty seconds a connection nobody closed takes to time out, so a peer that
+    // was never told its connection is closed does not pass for one that was.
+    let ended = tokio::time::timeout(Duration::from_secs(15), async {
         while handler.served.load(Ordering::Acquire) == 0 {
             tokio::task::yield_now().await;
         }

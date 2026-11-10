@@ -28,8 +28,10 @@ use kr_protocol::rights::ActionRight;
 use net_support::Host;
 
 /// How long a condition the daemon is expected to reach is given before the case calls it
-/// unreached. A bound on a hang, never a measure of how long letting go takes.
-const LIVENESS: Duration = Duration::from_secs(30);
+/// unreached. A bound on a hang, never a measure of how long letting go takes. It is shorter than
+/// the time a connection nobody closed takes to time out (thirty seconds), so a peer that was
+/// never told its connection is closed does not pass for one that was.
+const LIVENESS: Duration = Duration::from_secs(15);
 
 fn typed<T: kr_protocol::wire::WireMessage>(value: &ParamsValue) -> T {
     value.to_typed().expect("a result of the declared shape")

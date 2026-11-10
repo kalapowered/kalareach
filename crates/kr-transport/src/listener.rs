@@ -498,19 +498,31 @@ impl ConnectionTasks {
         }
     }
 
-    /// Ends every task and every one that would be spawned from now on.
+    /// Ends every task and every one that would be spawned from now on, and hands back the set, so
+    /// that a caller that can wait learns when each task has been dropped.
     ///
     /// Each task is cancelled at its next turn on the runtime, where it drops what it holds: a
     /// connection that was authorised closes with the code a lost control stream gives, a
     /// connection still in its handshake or its pairing exchange closes as it is dropped.
-    fn end(&self) {
+    fn end(&self) -> tokio::task::JoinSet<()> {
         let mut serving = self
             .serving
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         serving.ended = true;
         serving.tasks.abort_all();
+        std::mem::take(&mut serving.tasks)
     }
+}
+
+/// Waits for every ended connection task to have been dropped, and then closes the endpoint, so
+/// that each peer is told its connection is closed instead of waiting for it to time out.
+///
+/// The endpoint is closed after the tasks have gone because a task's own close, with the code a lost
+/// control stream gives, has then been made before the endpoint closes what is left with none.
+async fn wind_down(endpoint: Endpoint, mut ended: tokio::task::JoinSet<()>) {
+    while ended.join_next().await.is_some() {}
+    endpoint.close().await;
 }
 
 /// A running listener.
@@ -544,8 +556,7 @@ impl NetworkListener {
     /// Stops accepting, ends every connection being served and closes the endpoint.
     pub async fn shutdown(self) {
         self.accept_loop.abort();
-        self.connections.end();
-        self.endpoint.close().await;
+        wind_down(self.endpoint.clone(), self.connections.end()).await;
     }
 }
 
@@ -555,10 +566,17 @@ impl Drop for NetworkListener {
         // connection's task own a handle on the host, so detached ones would keep that host, its
         // database and its connections alive for as long as the process ran, and a device that
         // stayed connected would keep them for as long as it answered the keepalive. A shutdown
-        // that can await the endpoint's close is the orderly end, and this is the one that happens
-        // either way. Every task is cancelled at its next turn on the runtime, not before.
+        // that can await the endpoint's close is the orderly end; this is the end that happens
+        // either way. Every task is cancelled at its next turn on the runtime, not before, and the
+        // endpoint is closed on a task of its own once they have gone: an endpoint dropped without
+        // being closed sends its peers nothing, and each would wait for its connection to time out.
         self.accept_loop.abort();
-        self.connections.end();
+        let ended = self.connections.end();
+        if !self.endpoint.is_closed()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(wind_down(self.endpoint.clone(), ended));
+        }
     }
 }
 
