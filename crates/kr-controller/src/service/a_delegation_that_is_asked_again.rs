@@ -382,10 +382,10 @@ async fn a_delegations_receipt_goes_back_only_to_a_device_that_is_still_paired()
 /// The control: with the device paired, the late copy is given the receipt as one read from the
 /// record.
 ///
-/// KR-REQ-23.24, the rules of its first two sentences at that race: the device's pairing, its
-/// current authority, is checked before the other copy's receipt is returned, so a device revoked
-/// after that copy kept it is given nothing; a duplicate from a device that is still paired is
-/// given the retained receipt, read from the record as a copy.
+/// KR-REQ-23.24, the rules of its first two sentences at that race: the device's pairing, the part
+/// of its current authority the case changes, is checked before the other copy's receipt is
+/// returned, so a device revoked after that copy kept it is given nothing; a duplicate from a
+/// device that is still paired is given the retained receipt, read from the record as a copy.
 ///
 /// Not shown here: a device whose grant expiry is on record, which the pairing check refuses as it
 /// refuses a revoked one, and the new read of a session that the receipt of a performed read is
