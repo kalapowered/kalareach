@@ -482,7 +482,6 @@ impl Host {
 
     /// Makes this environment's record of the processes its daemon and workers create, which the
     /// product writes to wherever a test has made one, before the daemon starts.
-    #[cfg(unix)]
     fn recording_creations(self) -> Self {
         kr_ipc::testing::created::begin(self.paths().state_dir())
             .expect("makes the record of what is created");
@@ -491,7 +490,6 @@ impl Host {
 
     /// Everything the daemon and its workers have created for this environment, in the order each
     /// wrote it.
-    #[cfg(unix)]
     fn creations(&self) -> Vec<kr_ipc::testing::created::Created> {
         kr_ipc::testing::created::read(self.paths().state_dir())
             .unwrap_or_else(|error| panic!("{error}"))
@@ -1878,9 +1876,9 @@ async fn a_worker_that_cannot_reach_its_controller_says_why_and_ends_whatever_it
 /// left running, nor a creation: the record is not written there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_idle_session_runs_nothing_beside_its_shell() {
-    let host = Host::create().recording_launches();
+    let host = Host::create().recording_launches().recording_creations();
     #[cfg(unix)]
-    let host = host.marking_workers().recording_creations();
+    let host = host.marking_workers();
     let daemon = host.start().await;
     let mut client = host.client().await;
     let created = create(&mut client, &host).await;
@@ -1888,13 +1886,11 @@ async fn an_idle_session_runs_nothing_beside_its_shell() {
     nothing_the_worker_started_beside_the_shell_runs(&host, &created).await;
     #[cfg(windows)]
     only_the_pseudo_console_runs_beside_the_shell(&host, &created);
-    #[cfg(unix)]
     let worker = worker_of(&host, created.session.session_id);
     close(&mut client, &host, created.session.session_id).await;
     // Read once the worker has ended (it creates nothing more), the daemon has let the session go
     // (it asks for nothing more for it, and a request for the plugin host that comes later is
     // refused) and its description host has taken what was posted about the session, in order.
-    #[cfg(unix)]
     until("the worker to end", || {
         (kr_ipc::identity::process_state(&worker) == kr_ipc::identity::ProcessState::Ended)
             .then_some(())
@@ -1937,6 +1933,11 @@ async fn an_idle_session_runs_nothing_beside_its_shell() {
         &host.creations(),
         u32::try_from(worker.pid.get()).expect("a process identifier"),
         std::process::id(),
+    );
+    #[cfg(windows)]
+    only_the_root_shell_and_the_clock_check_were_created(
+        &host.creations(),
+        u32::try_from(worker.pid.get()).expect("a process identifier"),
     );
 }
 
@@ -1998,6 +1999,38 @@ fn only_the_root_shell_and_platform_questions_were_created(
             .any(|made| made.by == daemon && is_a_question(made)),
         "no question of the daemon's is in the record, so what it starts through the helpers it \
          shares with the worker is not seen: {created:?}"
+    );
+}
+
+/// What a worker created for an idle session on Windows, from the record it wrote: its root shell,
+/// once, and the check of the kernel's clock it makes the first time it orders a start (a process
+/// created suspended and ended at once, which is not a backend, a Wasm instance or a model), and
+/// nothing else. The worker asks its platform no question there: it reads the login session
+/// through the operating system's own interface, so a question in the record is a creation the
+/// session has no use for. The daemon creates nothing here at idle that a helper of the worker's
+/// writes, so the record holds what the worker wrote.
+#[cfg(windows)]
+fn only_the_root_shell_and_the_clock_check_were_created(
+    created: &[kr_ipc::testing::created::Created],
+    worker: u32,
+) {
+    let strangers: Vec<_> = created
+        .iter()
+        .filter(|made| !(made.by == worker && (made.what == "shell" || made.what == "clock")))
+        .collect();
+    assert!(
+        strangers.is_empty(),
+        "an idle session's worker created more than its root shell and the check of the kernel's \
+         clock: {strangers:?} of {created:?}"
+    );
+    assert_eq!(
+        created.iter().filter(|made| made.what == "shell").count(),
+        1,
+        "the worker created the root shell once: {created:?}"
+    );
+    assert!(
+        created.iter().filter(|made| made.what == "clock").count() <= 1,
+        "the worker checked the kernel's clock at most once: {created:?}"
     );
 }
 
