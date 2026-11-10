@@ -665,8 +665,10 @@ async fn show_limits_what_it_says_of_no_managed_account_to_that_account() {
         .unwrap_or_else(|| {
             panic!("a line says the managed account presents no account: {printed}")
         });
+    // What follows the "so" says who presents no account.
+    let who = nowhere.rsplit_once("so ").map_or("", |(_, rest)| rest);
     assert!(
-        nowhere.contains("managed account"),
+        who.contains("managed account"),
         "what is said of no account is said of the managed one: {printed}"
     );
     assert!(
