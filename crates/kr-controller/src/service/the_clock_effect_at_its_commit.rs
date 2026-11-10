@@ -326,12 +326,14 @@ async fn a_connection_that_goes_away_does_not_cut_the_establishment() {
             let admission = controller.pairing_admission(connection_id, revision, deadline);
             let guard = controller.pairing_guard(connection_id, revision, deadline);
             let life = controller.pairing_life(deadline);
+            let retained = controller.pairing_standing(connection_id, revision);
             controller
                 .pairing_write(
                     caller,
                     Method::HostClockEstablish,
                     &mutation,
                     admission,
+                    retained,
                     guard,
                     life,
                 )

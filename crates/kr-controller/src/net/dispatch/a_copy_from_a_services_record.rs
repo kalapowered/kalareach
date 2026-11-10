@@ -749,6 +749,7 @@ async fn the_project_service_gives_a_refusal_another_copy_recorded_first_as_a_co
                         let _ = go_rx.recv();
                         Ok(())
                     },
+                    || Ok(()),
                     None,
                 )
                 .await
@@ -759,7 +760,14 @@ async fn the_project_service_gives_a_refusal_another_copy_recorded_first_as_a_co
         .expect("the wait ends")
         .expect("the first copy reaches its admission");
     let recorded_first = module
-        .write(&actor, &mutation, Method::ProjectInit, || Ok(()), None)
+        .write(
+            &actor,
+            &mutation,
+            Method::ProjectInit,
+            || Ok(()),
+            || Ok(()),
+            None,
+        )
         .await;
     go.send(()).expect("the first copy goes on");
     let held = held.await.expect("the first copy ends");

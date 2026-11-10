@@ -131,6 +131,7 @@ impl Controller {
                     token: order.token.get(),
                     digest: order.digest,
                     origin: EnvironmentOrigin::HostContext,
+                    carried: None,
                 },
                 order.create,
                 Some(launch),

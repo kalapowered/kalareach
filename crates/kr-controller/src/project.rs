@@ -584,41 +584,68 @@ impl ProjectModule {
     /// as the caller's class, so nothing the request carries can make a device the owner.
     ///
     /// An answer this reads from the record an earlier submission of the action left is given as a
-    /// copy.
+    /// copy, and goes back only while `retained` says the authority the mutation arrived under
+    /// stands. `admission` is the check a first admission begins under, deadline included;
+    /// `retained` is the one a recorded answer is owed, without the deadline a receipt outlives.
+    /// A copy is found after the lookup the door made before it considered a first admission, and
+    /// after waits of its own, so `retained` is asked once the answer is in hand, whichever place
+    /// found it.
     ///
     /// # Errors
     ///
     /// Returns the refusal the service decided, under the service's own code.
-    pub async fn write<A>(
+    pub async fn write<A, R>(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
         admission: A,
+        retained: R,
         grant: Option<GrantId>,
     ) -> Given<Answer<ParamsValue>>
     where
         A: Fn() -> std::result::Result<(), ProtocolError> + Send + 'static,
+        R: Fn() -> std::result::Result<(), ProtocolError> + Send + Sync + 'static,
     {
         let copied = Arc::new(AtomicBool::new(false));
+        let retained = Arc::new(retained);
         let answer = self
-            .perform(actor_id, mutation, method, admission, grant, &copied)
+            .perform(
+                actor_id,
+                mutation,
+                method,
+                admission,
+                Arc::clone(&retained),
+                grant,
+                &copied,
+            )
             .await;
-        Given::of(answer, copied.load(Ordering::Acquire))
+        let copied = copied.load(Ordering::Acquire);
+        // The answer first, then the authority it is owed: a refusal replaces what the record
+        // held, as the shared check replaces it everywhere a recorded answer goes back.
+        let answer = if copied && let Err(refusal) = retained() {
+            Err(refusal)
+        } else {
+            answer
+        };
+        Given::of(answer, copied)
     }
 
     /// [`Self::write`], setting `copied` when the answer is the record's.
-    async fn perform<A>(
+    #[allow(clippy::too_many_arguments)]
+    async fn perform<A, R>(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
         admission: A,
+        retained: Arc<R>,
         grant: Option<GrantId>,
         copied: &Arc<AtomicBool>,
     ) -> Answer<ParamsValue>
     where
         A: Fn() -> std::result::Result<(), ProtocolError> + Send + 'static,
+        R: Fn() -> std::result::Result<(), ProtocolError> + Send + Sync + 'static,
     {
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
@@ -637,7 +664,7 @@ impl ProjectModule {
             return blocking(move || {
                 confirmed(
                     &service, &actor, action_id, name, digest, method, &params, owner, &admission,
-                    &copied,
+                    &*retained, &copied,
                 )
             })
             .await;
@@ -656,7 +683,7 @@ impl ProjectModule {
             // that admitted it is gone. One whose first attempt has not settled its claim does,
             // and is not refused as though it were a first admission.
             if let Err(answer) = admitted_to_begin(
-                &service, &actor, action_id, name, digest, &admission, &copied,
+                &service, &actor, action_id, name, digest, &admission, &*retained, &copied,
             ) {
                 return answer;
             }
@@ -816,29 +843,41 @@ fn kept(
 /// holds is read once, after the refusal: a claim still open tells the copy that what became of the
 /// action is not known, a claim the first attempt has settled since is the copy's answer, and no
 /// claim leaves the refusal as it is, as for any first action.
-fn admitted_to_begin<A>(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the action's identity, the two questions its admission answers and the flag that \
+              says the answer is the record's are each part of one decision"
+)]
+fn admitted_to_begin<A, R>(
     service: &ProjectService,
     actor: &ActorId,
     action_id: kr_protocol::scalars::Uuid,
     name: &str,
     digest: kr_protocol::scalars::Digest256,
     admission: &A,
+    retained: &R,
     copied: &AtomicBool,
 ) -> std::result::Result<(), Answer<ParamsValue>>
 where
     A: Fn() -> std::result::Result<(), ProtocolError>,
+    R: Fn() -> std::result::Result<(), ProtocolError>,
 {
     let Err(refusal) = admission() else {
         return Ok(());
     };
     match service.action_state(actor, action_id, name, digest) {
         Ok(ActionState::Absent) => Err(Err(refusal)),
-        Ok(ActionState::Open) => Err(Err(
-            ControllerError::claim_without_outcome().to_protocol_error()
-        )),
-        Ok(ActionState::Settled(retained)) => {
+        // That an action is still being carried out is told to the caller that may be told of the
+        // action, asked with the state in hand: a fence owed or a registration replaced is the
+        // refusal, whatever the claim says.
+        Ok(ActionState::Open) => Err(Err(match retained() {
+            Ok(()) => ControllerError::claim_without_outcome().to_protocol_error(),
+            Err(lapsed) => lapsed,
+        })),
+        // A settled record is a copy, and `write` asks the retained check of every copy.
+        Ok(ActionState::Settled(found)) => {
             copied.store(true, Ordering::Release);
-            Err(recorded(retained))
+            Err(recorded(found))
         }
         Err(error) => Err(Err(ControllerError::found_unreadable_on_the_wire(
             error.into(),
@@ -869,10 +908,11 @@ fn recorded(retained: RetainedOutcome) -> Answer<ParamsValue> {
 #[expect(
     clippy::too_many_arguments,
     reason = "one confirmed decision is its service, its actor, its action, its method and \
-              digest, its parameters, the owner that confirms it and the admission it runs under; \
-              each is part of the decision, and a struct would hide which of them a caller left out"
+              digest, its parameters, the owner that confirms it and the two questions its \
+              admission answers; each is part of the decision, and a struct would hide which of \
+              them a caller left out"
 )]
-fn confirmed<A>(
+fn confirmed<A, R>(
     service: &ProjectService,
     actor: &ActorId,
     action_id: kr_protocol::scalars::Uuid,
@@ -882,10 +922,12 @@ fn confirmed<A>(
     params: &ParamsValue,
     owner: Option<Arc<HostOwner>>,
     admission: &A,
+    retained: &R,
     copied: &AtomicBool,
 ) -> Answer<ParamsValue>
 where
     A: Fn() -> std::result::Result<(), ProtocolError>,
+    R: Fn() -> std::result::Result<(), ProtocolError>,
 {
     // A retry of an answered action is answered before its admission is asked about, as every
     // other mutation's is: a receipt stays readable after the freshness that admitted it is gone.
@@ -896,9 +938,9 @@ where
         copied.store(true, Ordering::Release);
         return recorded(retained);
     }
-    if let Err(answer) =
-        admitted_to_begin(service, actor, action_id, name, digest, admission, copied)
-    {
+    if let Err(answer) = admitted_to_begin(
+        service, actor, action_id, name, digest, admission, retained, copied,
+    ) {
         return answer;
     }
     let claim = Action {

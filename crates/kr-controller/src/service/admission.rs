@@ -393,31 +393,72 @@ impl Controller {
         })
     }
 
+    /// The check a recorded answer is owed, for a mutation that carries its admission:
+    /// [`Self::check_registration`] without the deadline a receipt outlives.
+    ///
+    /// Every place that gives back what another attempt of an action recorded asks it, once the
+    /// answer is in hand: this function where the service is asynchronous, and the closure or the
+    /// method its blocking work is handed where it is not.
+    pub(crate) fn check_retained_under(
+        &self,
+        carried: &crate::authority::AdmittedMutation,
+    ) -> Result<()> {
+        self.check_registration(&crate::authority::AdmittedMutation {
+            deadline: None,
+            ..*carried
+        })
+    }
+
+    /// [`Self::check_retained_under`], asked once the answer is in hand, after the point where this
+    /// host's own tests stop a retained answer so that a fence can land first.
+    pub(crate) async fn check_retained_in_hand(
+        &self,
+        carried: &crate::authority::AdmittedMutation,
+    ) -> Result<()> {
+        #[cfg(feature = "testing")]
+        self.after_the_retained_lookup.wait().await;
+        self.check_retained_under(carried)
+    }
+
     /// Gives back what an earlier attempt of an action recorded, found after this mutation was
     /// admitted: the answer is waited for first, and the registration it arrived under is asked
     /// with it in hand, without the deadline a receipt outlives.
     ///
     /// Section 9 returns a retained receipt to a duplicate only under authority that has not been
     /// withdrawn, so a fence this host owes, or a registration withdrawn or replaced while the
-    /// answer was read, stops it. A service that finds a recorded action after its mutation was
-    /// admitted gives it back through here.
+    /// answer was read, stops it. A service whose work is asynchronous gives a recorded answer
+    /// back through here, whatever it records: a result, a refusal, the conflict a reused
+    /// identifier meets or an outcome that is not known. A service that reads its record on a
+    /// blocking thread asks the same check with the answer in hand through
+    /// [`Self::retained_in_service`] (the project service) or its own admission's
+    /// `check_retained` (the transfer, change-set and catalogue services).
     ///
     /// # Errors
     ///
     /// Returns what [`Self::check_registration`] refuses with, and otherwise the answer.
-    pub(super) async fn retained_under_authority(
+    pub(crate) async fn retained_under_authority(
         &self,
         carried: &crate::authority::AdmittedMutation,
         answer: impl std::future::Future<Output = Result<kr_protocol::envelope::ParamsValue>>,
     ) -> Result<kr_protocol::envelope::ParamsValue> {
         let answered = answer.await;
-        #[cfg(feature = "testing")]
-        self.after_the_retained_lookup.wait().await;
-        self.check_registration(&crate::authority::AdmittedMutation {
-            deadline: None,
-            ..*carried
-        })?;
+        self.check_retained_in_hand(carried).await?;
         answered
+    }
+
+    /// The check a recorded answer is owed, for a service that finds it on a blocking thread:
+    /// [`Self::check_retained_under`] on the registration `carried` names, handed to the service
+    /// beside [`Self::admission_in_service`] and asked with the answer in hand.
+    pub(crate) fn retained_in_service(
+        self: &Arc<Self>,
+        carried: crate::authority::AdmittedMutation,
+    ) -> impl Fn() -> std::result::Result<(), ProtocolError> + Send + Sync + 'static {
+        let controller = Arc::clone(self);
+        move || {
+            controller
+                .check_retained_under(&carried)
+                .map_err(|error| error.to_protocol_error())
+        }
     }
 
     /// The admission a service asks again from inside the work a mutation has begun.

@@ -2411,7 +2411,14 @@ async fn an_admission_withdrawn_during_a_creation_is_refused_inside_the_services
         }
     };
     let refusal = module
-        .write(&actor, &mutation, Method::ProjectAdopt, admission, None)
+        .write(
+            &actor,
+            &mutation,
+            Method::ProjectAdopt,
+            admission,
+            || Ok(()),
+            None,
+        )
         .await
         .into_answer()
         .expect_err("the adoption does not begin");
@@ -3975,7 +3982,7 @@ async fn a_copy_of_an_action_with_an_open_claim_is_told_the_outcome_is_unknown_w
         let copy = host
             .controller
             .project()
-            .write(&actor, mutation, method, lapsed, None)
+            .write(&actor, mutation, method, lapsed, || Ok(()), None)
             .await
             .into_answer()
             .expect_err("the admission lapsed");
@@ -3984,7 +3991,7 @@ async fn a_copy_of_an_action_with_an_open_claim_is_told_the_outcome_is_unknown_w
     let first = host
         .controller
         .project()
-        .write(&actor, &fresh, Method::ProjectInit, lapsed, None)
+        .write(&actor, &fresh, Method::ProjectInit, lapsed, || Ok(()), None)
         .await
         .into_answer()
         .expect_err("the admission lapsed");
@@ -4043,7 +4050,14 @@ async fn a_copy_of_an_action_with_an_open_claim_is_told_the_outcome_is_unknown_w
     let given = host
         .controller
         .project()
-        .write(&actor, &racing, Method::ProjectInit, settling, None)
+        .write(
+            &actor,
+            &racing,
+            Method::ProjectInit,
+            settling,
+            || Ok(()),
+            None,
+        )
         .await;
     assert!(given.is_copied(), "the answer is the record's");
     let answered: ProjectInitResult = typed(

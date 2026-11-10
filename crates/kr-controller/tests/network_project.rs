@@ -6346,7 +6346,7 @@ async fn a_grant_withdrawn_before_the_write_stops_each_of_the_five_operations() 
             .host
             .controller()
             .project()
-            .write(&actor, &mutation, method, admission, Some(grant))
+            .write(&actor, &mutation, method, admission, || Ok(()), Some(grant))
             .await;
         // The attempt that performs, or is refused before it can, answers for itself.
         assert!(!outcome.is_copied(), "{name}: a fresh answer is not a copy");

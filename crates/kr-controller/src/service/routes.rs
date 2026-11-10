@@ -105,8 +105,9 @@ impl Controller {
         // that preparation, or a fence this host fails to raise in it, reaches an action that then
         // does not begin. That is section 9's revalidation immediately before the effect.
         let admission = self.admission_in_service(carried);
+        let retained = self.retained_in_service(carried);
         self.project
-            .write(actor_id, mutation, method, admission, grant)
+            .write(actor_id, mutation, method, admission, retained, grant)
             .await
     }
 
@@ -153,9 +154,19 @@ impl Controller {
         let admission: crate::automation::Admission = Arc::new(self.admission_in_service(carried));
         #[cfg(feature = "testing")]
         self.after_the_automation_admission.wait().await;
-        self.automation
+        let given = self
+            .automation
             .write(actor_id, mutation, method, admission, caller_grant)
-            .await
+            .await;
+        // The journal reads a repeat's record inside its own transaction, after the lookup the
+        // door made and without asking the admission, so what it gives back as a copy goes back
+        // only under the authority this attempt arrived under, asked with the answer in hand.
+        if given.is_copied()
+            && let Err(refusal) = self.check_retained_in_hand(&carried).await
+        {
+            return Given::Copied(Err(refusal.to_protocol_error()));
+        }
+        given
     }
 
     /// Reads one session's summary the way `session.read` answers it: from its worker while it
@@ -376,8 +387,9 @@ impl Controller {
                 accepted.map(|accepted| accepted.deadline),
             );
             let life = self.pairing_life(accepted.map(|accepted| accepted.deadline));
+            let retained = self.pairing_standing(connection_id, admitted);
             let outcome = self
-                .pairing_write(caller, method, mutation, admission, guard, life)
+                .pairing_write(caller, method, mutation, admission, retained, guard, life)
                 .await
                 .into_answer();
             return respond(mutation.request_id, outcome);

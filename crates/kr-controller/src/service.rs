@@ -1486,6 +1486,11 @@ mod a_delegation_that_is_asked_again;
 #[cfg(test)]
 mod a_transfer_left_unanswered;
 
+/// What an answer that another copy of an action recorded goes back under, where each service
+/// looks for it after the door's own look.
+#[cfg(test)]
+mod a_recorded_answer_another_copy_wrote;
+
 /// A transfer of control from a device that holds a grant the given-up grant was delegated from.
 #[cfg(test)]
 mod a_transfer_whose_giver_keeps_control;

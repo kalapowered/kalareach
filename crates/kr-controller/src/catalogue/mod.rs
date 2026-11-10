@@ -75,11 +75,23 @@ pub type Answer<T> = std::result::Result<T, ProtocolError>;
 pub trait Admission: Authority {
     /// The deadline this mutation was accepted under, on the wall clock, where it has one.
     fn accepted_deadline_ms(&self) -> Option<u64>;
+
+    /// Asks what a receipt this catalogue found is owed before it goes back: whether the authority
+    /// the mutation was admitted under still stands, without the deadline a receipt outlives.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal that ended the authority.
+    fn check_retained(&self) -> CatalogueResult<()>;
 }
 
 impl Admission for Owner {
     fn accepted_deadline_ms(&self) -> Option<u64> {
         None
+    }
+
+    fn check_retained(&self) -> CatalogueResult<()> {
+        Ok(())
     }
 }
 
@@ -134,6 +146,12 @@ impl Authority for DaemonAdmission {
 impl Admission for DaemonAdmission {
     fn accepted_deadline_ms(&self) -> Option<u64> {
         self.controller.receipt_deadline_ms(&self.admitted)
+    }
+
+    fn check_retained(&self) -> CatalogueResult<()> {
+        self.controller
+            .check_retained_under(&self.admitted)
+            .map_err(|error| CatalogueError::Refused(error.to_protocol_error()))
     }
 }
 
@@ -331,6 +349,10 @@ impl Authority for Committing {
 impl Admission for Committing {
     fn accepted_deadline_ms(&self) -> Option<u64> {
         self.inner.accepted_deadline_ms()
+    }
+
+    fn check_retained(&self) -> CatalogueResult<()> {
+        self.inner.check_retained()
     }
 }
 
@@ -1545,7 +1567,11 @@ impl CatalogueModule {
         {
             Claimed::Retained(record) => {
                 *copied = true;
-                return answered(&record, &digest, mutation.action_id);
+                // Another attempt's receipt, found after the check above: it goes back only under
+                // the authority this attempt arrived under, asked with the answer in hand.
+                let kept = answered(&record, &digest, mutation.action_id);
+                admission.check_retained().map_err(ProtocolError::from)?;
+                return kept;
             }
             Claimed::Fresh => {}
         }

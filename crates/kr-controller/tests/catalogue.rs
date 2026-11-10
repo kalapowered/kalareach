@@ -1471,6 +1471,10 @@ impl Admission for RefusedAtCommit {
     fn accepted_deadline_ms(&self) -> Option<u64> {
         None
     }
+
+    fn check_retained(&self) -> CatalogueResult<()> {
+        Authority::check(self)
+    }
 }
 
 /// An admission whose first check already fails, as a lapsed window does.
@@ -1479,6 +1483,10 @@ struct Lapsed;
 impl Admission for Lapsed {
     fn accepted_deadline_ms(&self) -> Option<u64> {
         None
+    }
+
+    fn check_retained(&self) -> CatalogueResult<()> {
+        Authority::check(self)
     }
 }
 
@@ -3202,6 +3210,10 @@ impl Admission for WithdrawnAtRecords {
     fn accepted_deadline_ms(&self) -> Option<u64> {
         None
     }
+
+    fn check_retained(&self) -> CatalogueResult<()> {
+        Authority::check(self)
+    }
 }
 
 /// An installation withdrawn after its package was in place is unknown, says what it left, and
@@ -3404,6 +3416,10 @@ impl Authority for WaitsForTheDatabase {
 impl Admission for WaitsForTheDatabase {
     fn accepted_deadline_ms(&self) -> Option<u64> {
         None
+    }
+
+    fn check_retained(&self) -> CatalogueResult<()> {
+        Authority::check(self)
     }
 }
 
@@ -5888,6 +5904,10 @@ mod off_the_executor {
     impl Admission for Handshaking {
         fn accepted_deadline_ms(&self) -> Option<u64> {
             None
+        }
+
+        fn check_retained(&self) -> CatalogueResult<()> {
+            Authority::check(self)
         }
     }
 

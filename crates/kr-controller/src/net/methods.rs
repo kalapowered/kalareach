@@ -95,6 +95,19 @@ impl Controller {
         Arc::new(move || controller.check_registration(&carried))
     }
 
+    /// Returns the check a recorded answer of one pairing mutation is owed: its connection's
+    /// registration under the revision it was admitted at, and the fence this host owes, without
+    /// the deadline a receipt outlives. A mutation admitted under no revision has no registration
+    /// to answer under.
+    pub(crate) fn pairing_standing(
+        self: &Arc<Self>,
+        connection_id: ConnectionId,
+        admitted: Option<AuthorityRevision>,
+    ) -> Admission {
+        let controller = Arc::clone(self);
+        Arc::new(move || controller.check_retained_answer(connection_id, admitted))
+    }
+
     /// Returns how much of its time one mutation has left: what its accepted deadline leaves on the
     /// continuous clock, read each time it is asked.
     ///
@@ -234,16 +247,23 @@ impl Controller {
 
     /// Serves one pairing or owner-confirmation mutation.
     ///
+    /// An answer read from the record of an earlier submission of the action is given as a copy,
+    /// and goes back only while `retained` ([`Self::pairing_standing`]) says the authority the
+    /// mutation arrived under stands. The copy is found by the service's own look, after the one
+    /// the door made, and the answer is read first, so a refusal replaces what the record held.
+    ///
     /// # Errors
     ///
     /// Returns `HOST_NOT_CONFIGURED` on a host that is not on the network, and the refusal the
     /// pairing service decides.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn pairing_write(
         self: &Arc<Self>,
         caller: Caller,
         method: Method,
         mutation: &MutationRequest,
         admission: Admission,
+        retained: Admission,
         guard: CommitGuard,
         life: Life,
     ) -> Given<Result<ParamsValue>> {
@@ -251,7 +271,13 @@ impl Controller {
         let answer = self
             .write_pairing(caller, method, mutation, admission, guard, life, &copied)
             .await;
-        Given::of(answer, copied.load(Ordering::Acquire))
+        let copied = copied.load(Ordering::Acquire);
+        let answer = if copied && let Err(refusal) = retained() {
+            Err(refusal)
+        } else {
+            answer
+        };
+        Given::of(answer, copied)
     }
 
     /// [`Self::pairing_write`], setting `copied` when the answer is the one an earlier submission

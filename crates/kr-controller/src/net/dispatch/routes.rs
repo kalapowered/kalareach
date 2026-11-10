@@ -1653,10 +1653,21 @@ impl RemoteConnection {
                     Some(accepted.deadline),
                 );
                 let life = self.controller.pairing_life(Some(accepted.deadline));
+                let retained = self
+                    .controller
+                    .pairing_standing(self.connection_id(), Some(validated));
                 noting(
                     &mut copied,
                     self.controller
-                        .pairing_write(caller, entry.method, mutation, admission, guard, life)
+                        .pairing_write(
+                            caller,
+                            entry.method,
+                            mutation,
+                            admission,
+                            retained,
+                            guard,
+                            life,
+                        )
                         .await
                         .map(|answer| framed(mutation.request_id, answer)),
                 )

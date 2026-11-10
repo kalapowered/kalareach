@@ -2830,6 +2830,7 @@ async fn a_project_mutation_does_not_act_while_a_fence_is_owed() {
             &mutation,
             Method::ProjectInit,
             controller.admission_in_service(carried),
+            controller.retained_in_service(carried),
             None,
         )
         .await

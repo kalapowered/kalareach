@@ -2442,17 +2442,30 @@ impl AttentionModule {
             .map_err(|error| error.to_protocol_error())?;
         // A window change moves the next timer; the maintenance loop works it out again.
         self.wake.notify_one();
-        let answer = match performed {
-            Performed::Done(answer) => result_of(&answer, reading),
+        let (answer, kept) = match performed {
+            Performed::Done(answer) => (result_of(&answer, reading)?, false),
             Performed::Retained(record) => {
                 *copied = true;
-                decode_answer(&record.answer)
+                (decode_answer(&record.answer)?, true)
             }
-        }?;
-        if method == Method::VisitAcknowledge {
-            return self.shown_visit(caller, actor, mutation, answer);
+        };
+        let shown = if method == Method::VisitAcknowledge {
+            self.shown_visit(caller, actor, mutation, answer)
+        } else {
+            Ok(answer)
+        };
+        // The store returns a record before it asks the admission, and the guarded write that
+        // admitted this action ended before it was read. What an earlier submission recorded goes
+        // back only under the authority this attempt arrived under, asked with the answer, as the
+        // caller is shown it, in hand: a fence owed or a registration replaced since the entry
+        // check stops it.
+        if kept {
+            controller
+                .check_retained_in_hand(carried)
+                .await
+                .map_err(|error| error.to_protocol_error())?;
         }
-        Ok(answer)
+        shown
     }
 
     /// Writes the answer to a visit's acknowledgement in the numbers its caller is shown.

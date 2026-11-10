@@ -327,7 +327,11 @@ impl ChangeSetModule {
     }
 
     /// Serves one change-set mutation, answering an exact repeat from its retained record. An
-    /// answer read from that record is given as a copy.
+    /// answer read from that record is given as a copy, and goes back only under the authority the
+    /// mutation arrived under, asked once the answer is in hand: it is found after the lookup the
+    /// door made, and the places that find it (the first look, a claim another copy holds, an
+    /// apply's deferred claim) each wait for a lock or a blocking thread first. The answer is
+    /// read first, so a refusal replaces what the record held and not the other way round.
     ///
     /// # Errors
     ///
@@ -342,12 +346,20 @@ impl ChangeSetModule {
         caller: Caller,
     ) -> Given<Answer<ParamsValue>> {
         let copied = Arc::new(AtomicBool::new(false));
+        let standing = std::sync::Arc::clone(&controller);
         let answer = self
             .perform(
                 actor_id, mutation, method, carried, controller, caller, &copied,
             )
             .await;
-        Given::of(answer, copied.load(Ordering::Acquire))
+        let copied = copied.load(Ordering::Acquire);
+        let answer = if copied && let Err(refusal) = standing.check_retained_in_hand(&carried).await
+        {
+            Err(refusal.to_protocol_error())
+        } else {
+            answer
+        };
+        Given::of(answer, copied)
     }
 
     /// [`Self::write`], setting `copied` when the answer is the record's.

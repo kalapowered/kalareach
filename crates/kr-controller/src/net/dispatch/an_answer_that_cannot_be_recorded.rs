@@ -66,7 +66,14 @@ async fn a_project_action_performed_and_not_recorded_is_told_the_outcome_is_unkn
         }
         let given = controller
             .project()
-            .write(&actor, &mutation, Method::ProjectInit, || Ok(()), None)
+            .write(
+                &actor,
+                &mutation,
+                Method::ProjectInit,
+                || Ok(()),
+                || Ok(()),
+                None,
+            )
             .await;
         let answer = given.into_answer();
         if refused {

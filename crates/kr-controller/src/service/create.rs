@@ -192,6 +192,10 @@ pub(super) struct CreateFor<'a> {
     pub(super) digest: kr_protocol::scalars::Digest256,
     /// Whose environment the session is started with.
     pub(super) origin: EnvironmentOrigin,
+    /// The admission a connection's create arrived under, which a repeat of the create is asked
+    /// again before it is given the session its first attempt made. A workflow node has none: its
+    /// own admission is asked for a repeat, under the registry guard.
+    pub(super) carried: Option<crate::authority::AdmittedMutation>,
 }
 
 /// What keeps a workflow node's right to start its session true until the worker is admitted, and
@@ -452,6 +456,7 @@ impl Controller {
                 token: mutation.action_id.get(),
                 digest,
                 origin,
+                carried: Some(carried),
             },
             create,
             None,
@@ -517,6 +522,7 @@ impl Controller {
             token,
             digest,
             origin,
+            carried,
         } = who;
         // Before the reservation, because this is a request that can never be served rather than
         // one this environment happens to have no room for. The palette travels to the worker in
@@ -671,7 +677,17 @@ impl Controller {
                 admit(&registry)?;
             }
             *copied = true;
-            return self.replay_create(&reservation).await;
+            // A connection's repeat is told what the first attempt made only under the authority
+            // it arrived under, asked once the answer is in hand: the reservation was found after
+            // the door's own look, and waiting for the registry and for the session's worker can
+            // outlast a fence this host owes or the registration the repeat arrived on.
+            return match carried {
+                Some(carried) => {
+                    self.retained_under_authority(&carried, self.replay_create(&reservation))
+                        .await
+                }
+                None => self.replay_create(&reservation).await,
+            };
         }
 
         // A desktop-bound session needs a desktop, and this host does not manufacture one: an SSH

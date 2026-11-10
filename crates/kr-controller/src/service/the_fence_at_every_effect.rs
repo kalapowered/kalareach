@@ -24,7 +24,7 @@ const STANDING: Duration = Duration::from_secs(60);
 
 /// A daemon on a tree of its own, on a continuous clock the test moves, with a supervisor that
 /// starts nothing.
-async fn daemon() -> (kr_ipc::testing::TempHost, Arc<Controller>, ManualClock) {
+pub(super) async fn daemon() -> (kr_ipc::testing::TempHost, Arc<Controller>, ManualClock) {
     let temp = kr_ipc::testing::TempHost::create();
     let clock = ManualClock::new();
     let controller = Controller::start_on_clocks(
@@ -40,7 +40,7 @@ async fn daemon() -> (kr_ipc::testing::TempHost, Arc<Controller>, ManualClock) {
 }
 
 /// Registers one connection, the way a caller's handshake does.
-async fn admitted(controller: &Controller) -> (ConnectionId, ActorId) {
+pub(super) async fn admitted(controller: &Controller) -> (ConnectionId, ActorId) {
     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
     let actor_id = ActorId::new("local:test").expect("a principal");
     controller
@@ -76,7 +76,7 @@ fn privacy_request(temp: &kr_ipc::testing::TempHost, enabled: bool) -> MutationR
 }
 
 /// The deadline a first admission of a mutation carries in these tests.
-fn accepted(controller: &Controller) -> AcceptedDeadline {
+pub(super) fn accepted(controller: &Controller) -> AcceptedDeadline {
     AcceptedDeadline {
         deadline: controller
             .clock
@@ -124,7 +124,7 @@ async fn performed_once(
 }
 
 /// The refusal a frame carries, when it carries one.
-fn refusal(frame: &ControlFrame) -> Option<&kr_protocol::error::ProtocolError> {
+pub(super) fn refusal(frame: &ControlFrame) -> Option<&kr_protocol::error::ProtocolError> {
     match frame {
         ControlFrame::Response(kr_protocol::envelope::Response {
             outcome: Outcome::Error(error),
@@ -239,7 +239,7 @@ async fn a_retained_answer_outlives_the_window_that_admitted_its_action() {
 
 /// Another device's revocation: the revision advances and every surviving registration is stamped
 /// with it, which is what a revocation that withdraws one device does to the rest.
-async fn another_devices_revocation_lands(controller: &Controller) {
+pub(super) async fn another_devices_revocation_lands(controller: &Controller) {
     let mut registry = controller.registry.lock().await;
     registry
         .advance_authority_revision()
@@ -255,8 +255,8 @@ async fn another_devices_revocation_lands(controller: &Controller) {
 
 /// A supervisor that counts the launches it is asked for, and starts nothing.
 #[derive(Debug, Default)]
-struct CountingSupervisor {
-    asked: Arc<std::sync::atomic::AtomicUsize>,
+pub(super) struct CountingSupervisor {
+    pub(super) asked: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl crate::supervision::WorkerSupervisor for CountingSupervisor {
@@ -887,7 +887,7 @@ async fn a_lease_taken_before_a_debt_is_published_lapses_and_is_not_renewed() {
 }
 
 /// A mutation of `method` under a fresh action identifier, carrying `params`.
-fn mutation_of(
+pub(super) fn mutation_of(
     temp: &kr_ipc::testing::TempHost,
     method: Method,
     params: ParamsValue,
@@ -907,7 +907,7 @@ fn mutation_of(
 }
 
 /// The admission a first admission of a mutation carries on `connection_id`.
-fn carried(
+pub(super) fn carried(
     controller: &Controller,
     connection_id: ConnectionId,
 ) -> crate::authority::AdmittedMutation {
@@ -921,7 +921,7 @@ fn carried(
 }
 
 /// What a refusal in `answer` says, when it is one.
-fn refused_for_a_fence(error: &kr_protocol::error::ProtocolError) {
+pub(super) fn refused_for_a_fence(error: &kr_protocol::error::ProtocolError) {
     assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
     assert!(error.message.contains("fence"), "{error:?}");
 }
