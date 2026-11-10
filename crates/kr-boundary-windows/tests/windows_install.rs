@@ -244,14 +244,16 @@ fn installation_lays_down_and_removal_restores() {
         ],
         "the service holds the privileges it uses and no others"
     );
+    // The access list is the part before the audit list, which every service carries for everyone.
     let security = sc(&["sdshow", SERVICE]);
+    let access = security.split("S:").next().unwrap_or_default();
     assert!(
-        security.contains(&format!("(A;;CCLCLORC;;;{})", case.person.to_text())),
+        access.contains(&format!("(A;;CCLCLORC;;;{})", case.person.to_text())),
         "the person may only look at the service: {security}"
     );
     assert!(
-        !security.contains(";;;WD)") && !security.contains(";;;AU)"),
-        "{security}"
+        !access.contains(";;;WD)") && !access.contains(";;;AU)"),
+        "no one else may reach the service: {security}"
     );
 
     // The files are the administrators' and match the recorded digests.
