@@ -10,9 +10,9 @@
 //!
 //! # Two accounts, one for each role
 //!
-//! A host holds the managed account, for managed voice, the relay lease service and push, and,
-//! when its `storage.origin` names a service the person runs, a second account of its own at that
-//! service, for storage and for nothing else. Each is a [`HostAccount`] with its own grant in its
+//! A host holds the managed account, for managed voice, the relay lease service and managed
+//! storage, and, when its `storage.origin` names a service the person runs, a second account of its
+//! own at that service, for storage and for nothing else. Each is a [`HostAccount`] with its own grant in its
 //! own scope of the secret store, its own transport, its own sign-in and sign-out. A client is
 //! given the account of its role when it is built: the voice client, the relay payer and the call
 //! watch are given the managed account and never the storage one, and the storage clients are
@@ -444,16 +444,6 @@ impl HostAccount {
         account
     }
 
-    /// The command a person signs this account in with.
-    #[must_use]
-    pub fn sign_in_command(&self) -> &'static str {
-        if self.inner.only.is_some() {
-            "kr account sign-in --storage"
-        } else {
-            "kr account sign-in"
-        }
-    }
-
     /// Whether this is the account of a storage service the person runs, beside the managed one.
     #[must_use]
     pub fn is_storage(&self) -> bool {
@@ -786,8 +776,9 @@ impl HostAccount {
         })
     }
 
-    /// Signs the host out: ends the sign-in that is waiting, removes the grant and asks the service
-    /// to end it. A host with no account answers that there was none and changes nothing. A host
+    /// Signs the host out: ends this account's waiting sign-in, if it has one (a waiting sign-in of
+    /// the host's other account is not this one's to end), removes the grant and asks the service to
+    /// end it. A host with no account answers that there was none and changes nothing. A host
     /// moved off the managed broker signs out all the same: the account service it keeps its grant
     /// for does not depend on the broker.
     ///
