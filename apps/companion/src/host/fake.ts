@@ -745,8 +745,11 @@ export interface FakeHostControls {
    * or the voice service would: the call is gone, and `ended` is what it left.
    */
   endVoiceCall(ended?: Partial<VoiceEnded>): void
-  /** Starts a call that no screen asked for, as a screen that is loaded again finds one. */
-  holdAVoiceCall(): void
+  /**
+   * Starts a call that no screen asked for, as a screen that is loaded again finds one. It reaches
+   * `sessionIds`, or the main session when none are named.
+   */
+  holdAVoiceCall(sessionIds?: readonly string[]): void
   /**
    * Makes the device busy setting a call up with no call to name yet, as it is while the
    * microphone question is asked or the host has not said whether it made the call. A stop that
@@ -3705,10 +3708,10 @@ export function fakeHost(
       voice.delegations = []
       voice.host = 'none'
     },
-    holdAVoiceCall() {
+    holdAVoiceCall(sessionIds = [SESSION_MAIN]) {
       voice.settingUp = false
       voice.ending = false
-      const session = fakeVoiceSession([SESSION_MAIN], VOICE_NOW_MS + 1_800_000)
+      const session = fakeVoiceSession(sessionIds, VOICE_NOW_MS + 1_800_000)
       voice.call = { session, capture: voice.startCapture, playing: true }
       voice.ended = null
       voice.delegations = []

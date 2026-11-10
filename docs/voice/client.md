@@ -223,10 +223,21 @@ silencing the voice and ending the session stay available, as do the requests th
 Section 15 ¶13: speech interruption stops playback, not a coding task.
 The call controls keep them strictly separated:
 - **Stop the voice**: silences the speaker locally. It contacts no host and cancels no task.
-- **Cancel the current turn**: sends a typed cancellation naming the current session and turn ID to
-  the host, after a deliberate confirmation step ("Cancel this turn"). It needs the turn the agent
-  is on from the host; while no host answer names one, the control stays off and the screen says
-  why.
+- **Cancel the current turn**: sends a typed cancellation to the host, after a deliberate
+  confirmation step ("Cancel this turn"). The request names the session, the application instance
+  running its agent, the binding revision and the turn ID.
+
+The screen reads the instance, the revision and the turn from the session's worker while a call
+runs: first the session's live instance, then that instance's binding (`agent.capabilities`). It
+reads again on the agent's cadence, when the host is reached again, and after each cancellation. The
+control stays off, and the screen says why, while no read names a turn. That is so when the agent is
+on no turn, when the read failed, and when the call reaches more than one session, since the screen
+does not pick one.
+
+The confirmation keeps the turn and revision it was opened on. A later read that shows another turn
+or revision discards the question, and it has to be asked again. When the host moved on before the
+screen read it, the request still names what the person was shown. The host refuses it, and the
+screen shows the host's words. The screen never reads the turn at the moment a person confirms.
 
 ## Device runs
 

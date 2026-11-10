@@ -20,6 +20,10 @@ import { VoiceRoute } from '../../src/voice/VoiceRoute'
 
 /** The session the fake host's workers answer for. */
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+/** A second session on that host, with an agent of its own. */
+const SESSION_BUILD = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
+/** The instance the main session's agent runs in. */
+const INSTANCE_MAIN = 'a1a1a1a1-0000-4000-8000-000000000001'
 
 /** The voice calls this screen made, watched from before it was rendered. */
 type Watched = Record<
@@ -67,6 +71,59 @@ function start(setup?: (controls: FakeHostControls) => void): {
 async function waitForChoice(): Promise<void> {
   await waitFor(() => {
     expect(screen.getByRole('button', { name: 'Start voice session' })).toBeInTheDocument()
+  })
+}
+
+/** Starts a call from the choice screen and waits until the call's screen is shown. */
+async function startACall(setup?: (controls: FakeHostControls) => void) {
+  const person = userEvent.setup()
+  const started = start(setup)
+  await waitForChoice()
+  await person.click(screen.getByRole('button', { name: 'Start voice session' }))
+  await screen.findByRole('button', { name: 'End session' })
+  return { person, ...started }
+}
+
+/** The control that asks whether to cancel the agent's current turn. */
+function askToCancel(): HTMLElement {
+  return screen.getByRole('button', { name: 'Cancel the current turn' })
+}
+
+/** What the screen sends the host to cancel `turnId` of the main session's agent at `revision`. */
+function cancellation(turnId: string, revision = '4') {
+  return {
+    target: {
+      subject: { session_id: SESSION_MAIN, application_instance_id: INSTANCE_MAIN },
+      binding_revision: revision
+    },
+    turn_id: turnId
+  }
+}
+
+/**
+ * The main session's agent ends the turn it was on and starts the next one at `revision`, as it
+ * does between two prompts, with nothing on the screen asking for it.
+ */
+async function startAnotherTurn(
+  { port, controls }: { port: HostPort; controls: FakeHostControls },
+  revision: string
+): Promise<void> {
+  controls.records.endTurn(SESSION_MAIN)
+  await port.composerSubmit({
+    target: {
+      subject: { session_id: SESSION_MAIN, application_instance_id: INSTANCE_MAIN },
+      binding_revision: revision
+    },
+    draft_id: null,
+    text: 'Carry on.'
+  })
+}
+
+/** Has the screen read the host again, as it does when the page is shown again. */
+async function readAgain(): Promise<void> {
+  await act(async () => {
+    document.dispatchEvent(new Event('visibilitychange'))
+    await Promise.resolve()
   })
 }
 
@@ -616,12 +673,179 @@ describe('while a call is running', () => {
     expect(screen.queryByText('Sent')).not.toBeInTheDocument()
   })
 
+  // KR-REQ-15.22: a cancellation is a typed request to the host naming the turn the agent is on,
+  // the instance running it and the binding revision it was read at, all from the host's own
+  // answer about the call's session.
+  it('cancels the turn the host named, at the instance and revision it was read at', async () => {
+    const { person, port, controls } = await startACall()
+    await waitFor(() => {
+      expect(askToCancel()).toBeEnabled()
+    })
+    expect(screen.queryByText(/has not said which turn the agent is on/)).not.toBeInTheDocument()
+
+    const cancelled = vi.spyOn(port, 'composerInterrupt')
+    await person.click(askToCancel())
+    await person.click(screen.getByRole('button', { name: 'Cancel this turn' }))
+
+    expect(cancelled).toHaveBeenCalledTimes(1)
+    expect(cancelled).toHaveBeenCalledWith(cancellation('turn-9'))
+    await waitFor(() => {
+      expect(controls.records.agentOf(SESSION_MAIN).binding.turn_id).toBeNull()
+    })
+    expect(await screen.findByText(/asked to cancel that turn/)).toBeInTheDocument()
+  })
+
+  // KR-REQ-15.22: a question is about the turn it was asked on. When the screen reads that the host
+  // has moved to another conversation and turn, the question is gone and the next one names the
+  // turn and the revision of that read.
+  it('discards an open question when it reads that the host moved to another turn', async () => {
+    const started = await startACall()
+    const { person, port, controls } = started
+    await waitFor(() => {
+      expect(askToCancel()).toBeEnabled()
+    })
+    await person.click(askToCancel())
+    expect(screen.getByRole('button', { name: 'Cancel this turn' })).toBeInTheDocument()
+
+    controls.records.moveBinding(SESSION_MAIN)
+    await startAnotherTurn(started, '5')
+    await readAgain()
+
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: 'Cancel this turn' })).not.toBeInTheDocument()
+    })
+    const cancelled = vi.spyOn(port, 'composerInterrupt')
+    await person.click(askToCancel())
+    await person.click(screen.getByRole('button', { name: 'Cancel this turn' }))
+
+    expect(cancelled).toHaveBeenCalledTimes(1)
+    expect(cancelled).toHaveBeenCalledWith(cancellation('turn-10', '5'))
+  })
+
+  // KR-REQ-15.22: a host that moved on before the screen read it is still asked about the turn and
+  // revision the person was shown, never about the turn it is on by the time they answer. The host
+  // refuses the request, the screen says so in the host's words, and the turn that is running there
+  // is not touched.
+  it.each([
+    {
+      moved: 'another binding revision',
+      advance: async ({ controls }: { controls: FakeHostControls }) => {
+        controls.records.moveBinding(SESSION_MAIN)
+      },
+      refusal: /the binding is at revision 5, not 4/,
+      running: null
+    },
+    {
+      moved: 'another turn at the same revision',
+      advance: async (started: { port: HostPort; controls: FakeHostControls }) => {
+        await startAnotherTurn(started, '4')
+      },
+      refusal: /the turn named is not the one running/,
+      running: 'turn-10'
+    }
+  ])(
+    'asks the host about the turn it showed when the host moved to $moved unseen',
+    async ({ advance, refusal, running }) => {
+      const started = await startACall()
+      const { person, port, controls } = started
+      await waitFor(() => {
+        expect(askToCancel()).toBeEnabled()
+      })
+      // From here every read of the agent waits, so the screen cannot have seen what follows.
+      const unseen = controls.hold('agentCapabilities')
+      await advance(started)
+
+      const cancelled = vi.spyOn(port, 'composerInterrupt')
+      await person.click(askToCancel())
+      await person.click(screen.getByRole('button', { name: 'Cancel this turn' }))
+
+      expect(cancelled).toHaveBeenCalledTimes(1)
+      expect(cancelled).toHaveBeenCalledWith(cancellation('turn-9'))
+      expect(await screen.findByText(refusal)).toBeInTheDocument()
+      expect(controls.records.agentOf(SESSION_MAIN).binding.turn_id).toBe(running)
+      unseen.release()
+    }
+  )
+
+  // KR-REQ-15.22: a read of the agent that fails names no turn. The question that was open is gone,
+  // the control is off with the words it always has, and the next read that answers gives it back.
+  it('names no turn while the host cannot be read, and again once it can', async () => {
+    const { person, port } = await startACall()
+    await waitFor(() => {
+      expect(askToCancel()).toBeEnabled()
+    })
+    await person.click(askToCancel())
+
+    const unreadable = vi.spyOn(port, 'agentCapabilities').mockRejectedValue({
+      code: 'RESOURCE_UNAVAILABLE',
+      message: 'The session’s worker is not answering.',
+      user_action: 'retry'
+    })
+    await readAgain()
+
+    await waitFor(() => {
+      expect(askToCancel()).toBeDisabled()
+    })
+    expect(screen.queryByRole('button', { name: 'Cancel this turn' })).not.toBeInTheDocument()
+    expect(screen.getByText(/has not said which turn the agent is on/)).toBeInTheDocument()
+
+    unreadable.mockRestore()
+    await readAgain()
+    await waitFor(() => {
+      expect(askToCancel()).toBeEnabled()
+    })
+  })
+
+  // KR-REQ-15.22: the turn a call names is the one read for that call. A call that follows another
+  // starts with no turn and names one only once the host has answered its own read.
+  it('names no turn for a new call until the host has answered it', async () => {
+    const { person, controls } = await startACall()
+    await waitFor(() => {
+      expect(askToCancel()).toBeEnabled()
+    })
+    controls.endVoiceCall()
+    await screen.findByRole('button', { name: 'Start voice session' })
+
+    const reads = controls.hold('agentCapabilities')
+    await person.click(screen.getByRole('button', { name: 'Start voice session' }))
+    await screen.findByRole('button', { name: 'End session' })
+    await waitFor(() => {
+      expect(reads.count).toBe(1)
+    })
+    expect(askToCancel()).toBeDisabled()
+
+    reads.release()
+    await waitFor(() => {
+      expect(askToCancel()).toBeEnabled()
+    })
+  })
+
+  // KR-REQ-15.22: a call that reaches more than one session has no one turn to name, and a
+  // confirmation that does not say whose turn it cancels must not pick one.
+  it('names no turn for a call that reaches more than one session', async () => {
+    start((controls) => {
+      controls.holdAVoiceCall([SESSION_MAIN, SESSION_BUILD])
+    })
+    await screen.findByRole('button', { name: 'End session' })
+    // The scripted host answers every read through promises alone, and a task that yields to the
+    // event loop runs every promise that is waiting first, so once it returns each read this
+    // screen made has been answered.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+
+    expect(askToCancel()).toBeDisabled()
+    expect(screen.getByText(/has not said which turn the agent is on/)).toBeInTheDocument()
+  })
+
   // KR-REQ-15.22: a cancellation is a typed request to the host naming the turn the agent is on.
-  // No host answer names that turn, so the screen says so rather than holding one of its own, and
-  // the host going quiet takes the host requests away and nothing local.
+  // A host whose agent is on no turn names none, so the screen says so rather than holding one of
+  // its own, and the host going quiet takes the host requests away and nothing local.
   it('says there is no turn to cancel, and what the host going quiet takes away', async () => {
     const person = userEvent.setup()
-    const { controls } = start()
+    const { controls } = start((host) => {
+      host.records.endTurn(SESSION_MAIN)
+    })
     await waitForChoice()
     await person.click(screen.getByRole('button', { name: 'Start voice session' }))
     await waitFor(() => {
