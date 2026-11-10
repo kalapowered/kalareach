@@ -307,9 +307,10 @@ export function elf({
 /**
  * A zip of `members` ({name, bytes}), stored, with an optional archive comment.
  *
- * A member with `deflate: true` is compressed. `claimCompressed` and `claimUncompressed` are the
- * sizes the central directory gives for it when they are not the true ones, which is how a member
- * that the archive cannot give in full is made.
+ * A member with `deflate: true` is compressed, and `cutBy` drops that many bytes off the end of its
+ * compressed data, which the directory then gives as its size (a stream that ends too soon).
+ * `claimCompressed` and `claimUncompressed` are the sizes the central directory gives for it when
+ * they are not the true ones, which is how a member that the archive cannot give in full is made.
  */
 export function zip(members, comment = Buffer.alloc(0)) {
   const pieces = []
@@ -317,7 +318,8 @@ export function zip(members, comment = Buffer.alloc(0)) {
   let at = 0
   for (const member of members) {
     const name = Buffer.from(member.name, 'utf8')
-    const data = member.deflate ? deflateRawSync(member.bytes) : member.bytes
+    const whole = member.deflate ? deflateRawSync(member.bytes) : member.bytes
+    const data = member.cutBy ? whole.subarray(0, whole.length - member.cutBy) : whole
     const method = member.deflate ? 8 : 0
     const local = Buffer.alloc(30)
     local.writeUInt32LE(0x04034b50, 0)

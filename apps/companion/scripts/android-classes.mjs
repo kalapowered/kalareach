@@ -202,8 +202,14 @@ function contents(handle, member, archiveSize) {
   const raw = readAt(handle, dataAt, member.compressedSize)
   let bytes
   if (member.method === 0) bytes = raw
-  else if (member.method === 8) bytes = inflateRawSync(raw)
-  else throw new Error(`${member.name}: compression method ${member.method} is not read here`)
+  else if (member.method === 8) {
+    try {
+      bytes = inflateRawSync(raw)
+    } catch (failure) {
+      // The decompressor's own message says nothing of which member it was reading.
+      throw new Error(`${member.name}: ${failure.message}`, { cause: failure })
+    }
+  } else throw new Error(`${member.name}: compression method ${member.method} is not read here`)
   if (bytes.length !== member.uncompressedSize) {
     throw new Error(
       `${member.name}: the member is ${bytes.length} bytes, and its directory gives ${member.uncompressedSize}`
@@ -505,6 +511,10 @@ function and(items) {
  * A library is built once for each ABI, so a class is bound by a library, and not by an ABI: when
  * any ABI's copy of a library exports a native method for a class, the copy in every ABI that
  * carries the library is asked for all of the class's natives, whatever else that ABI exports.
+ *
+ * That holds for the ABIs a package holds. A package built for one ABI (an APK per ABI, with
+ * `--split-per-abi`) has no other copy to compare with, so a library there that lost every export of
+ * a class leaves the class in the "not asked" list below.
  *
  * A class that declares natives and that no library exports a native for, such as the encoder of a
  * codec the library was built without, is not asked for symbols, in any ABI, and neither is a

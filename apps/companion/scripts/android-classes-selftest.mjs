@@ -26,6 +26,7 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 import { dex, elf, zip } from './archive-fixtures.mjs'
 import { libraryClassNames } from './android-native-names.mjs'
+import { refusal as iosRefusal } from './ios.mjs'
 import { privateTemporary } from './private-temp.mjs'
 import {
   definedClasses,
@@ -1088,6 +1089,17 @@ expectNames(
   [application(), { ...library(), deflate: true, claimUncompressed: FULL + 1 }],
   `refused: ${MEDIA}: the member is ${FULL} bytes, and its directory gives ${FULL + 1}`
 )
+{
+  // The stream that ends too soon is refused by the decompressor, whose message says nothing of the
+  // member: the refusal has to name it.
+  const path = join(work, 'members-cut-stream.apk')
+  writeFileSync(path, zip([filler, application(), { ...library(), deflate: true, cutBy: 8 }]))
+  held(
+    'a compressed member whose stream ends too soon is refused with the member named',
+    'true',
+    String(readAs(nativeNames, path).startsWith(`${MEDIA}: `))
+  )
+}
 expectNames(
   'a compressed member whose directory is right is read',
   'members-deflated.apk',
@@ -1109,20 +1121,23 @@ function readAs(read, bytes) {
   }
 }
 
-/** A dex file with one class that declares one native method, and the place of its class data. */
-function classWithData() {
+/**
+ * A dex file with one class that declares one native method (with these argument types), and the
+ * place of its class data.
+ */
+function classWithData(params = []) {
   const bytes = Buffer.from(
     dex({
       defined: [FACTORY],
-      methods: { [FACTORY]: [{ name: 'nativeCreate', native: true }] }
+      methods: { [FACTORY]: [{ name: 'nativeCreate', native: true, params }] }
     })
   )
   const classDef = bytes.readUInt32LE(0x64)
   return { bytes, classDef, data: bytes.readUInt32LE(classDef + 24) }
 }
 {
-  const refuses = (what, read, mutate, why) => {
-    const { bytes, classDef, data } = classWithData()
+  const refuses = (what, read, mutate, why, { params = [] } = {}) => {
+    const { bytes, classDef, data } = classWithData(params)
     mutate(bytes, classDef, data)
     held(what, why, readAs(read, bytes))
   }
@@ -1188,6 +1203,13 @@ function classWithData() {
     definedNatives,
     (bytes) => bytes.writeUInt32LE(bytes.length + 20, bytes.readUInt32LE(0x4c) + 8),
     'a dex file with an offset past its end'
+  )
+  refuses(
+    'a prototype whose type list counts more types than the file holds is refused',
+    definedNatives,
+    (bytes) => bytes.writeUInt32LE(0x7fffffff, bytes.readUInt32LE(bytes.readUInt32LE(0x4c) + 8)),
+    'a dex file with a type list past its end',
+    { params: ['I', 'I'] }
   )
   const plain = Buffer.from(dex({ defined: [FACTORY] }))
   const stringAtIndex = (bytes, index) => bytes.readUInt32LE(bytes.readUInt32LE(0x3c) + index * 4)
@@ -1274,16 +1296,20 @@ held(
 // them by a relative path would be a different one for each.
 {
   const here = process.cwd()
-  const was = process.env.TMPDIR
+  // The names a platform reads its temporary directory from: Unix reads the first, Windows the others.
+  const names = ['TMPDIR', 'TEMP', 'TMP']
+  const was = names.map((name) => process.env[name])
   process.chdir(work)
   mkdirSync('relative-tmp')
-  process.env.TMPDIR = 'relative-tmp'
+  for (const name of names) process.env[name] = 'relative-tmp'
   let fromRelative
   try {
     fromRelative = privateTemporary()
   } finally {
-    if (was === undefined) delete process.env.TMPDIR
-    else process.env.TMPDIR = was
+    names.forEach((name, index) => {
+      if (was[index] === undefined) delete process.env[name]
+      else process.env[name] = was[index]
+    })
   }
   const where = resolve('relative-tmp')
   process.chdir(here)
@@ -1346,6 +1372,29 @@ held(
   )
 )
 
+// The wrapper for the iOS build runs the build and nothing that opens Xcode.app, whose own
+// temporary directory the build would not be given.
+{
+  const refused = (argv) => iosRefusal(argv) !== null
+  held(
+    'the iOS build is run as it is given',
+    'false',
+    String(refused(['build', '--debug', '--ci', '--target', 'aarch64-sim']))
+  )
+  held(
+    'an iOS build with a configuration given as JSON and archive options is run as it is given',
+    'false',
+    String(refused(['build', '--config', '{"build":{"frontendDist":"../dist"}}', '--archive-only', '--no-sign']))
+  )
+  for (const argv of [[], ['dev'], ['open'], ['build', '--open'], ['build', '-o'], ['build', '-do']]) {
+    held(
+      `\`pnpm ios ${argv.join(' ')}\` is refused, since it would hand the work to Xcode.app`,
+      'true',
+      String(refused(argv))
+    )
+  }
+}
+
 // -- the rule files the Rust build writes --------------------------------------------------------
 // The minifier takes its rule files when Gradle configures, and two of them are written by the Rust
 // build, which keep what the Rust library calls by name that no Java reaches. A minified build whose
@@ -1353,6 +1402,10 @@ held(
 // libraries found: the library's own calls by name cannot be read from it.
 
 const RULES = 'outputs-rules'
+// What a debug build is held to depends on the environment `KR_MINIFY_DEBUG` was run in, so these
+// cases set it themselves and put back what they found.
+const minifyWas = process.env.KR_MINIFY_DEBUG
+delete process.env.KR_MINIFY_DEBUG
 const section = (file) =>
   `# The proguard configuration file for the following section is /build/${file}\n-keep class x.Y\n\n`
 const BOTH =
@@ -1422,6 +1475,7 @@ try {
 } finally {
   delete process.env.KR_MINIFY_DEBUG
 }
+if (minifyWas !== undefined) process.env.KR_MINIFY_DEBUG = minifyWas
 const bundle = withRules(
   'bundle/universalRelease/app-universal-release.aab',
   'universalRelease',
