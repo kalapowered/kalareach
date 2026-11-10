@@ -396,10 +396,14 @@ impl Controller {
     /// The check a recorded answer is owed, for a mutation that carries its admission:
     /// [`Self::check_registration`] without the deadline a receipt outlives.
     ///
-    /// Every place that gives back what another attempt of an action recorded asks it, through
-    /// this function, once the answer is in hand: the door's own check ([`Self::check_retained_answer`]
-    /// and the network door's), the transfer service's, the catalogue's and the pairing door's, and
-    /// the project service's closure ([`Self::retained_in_service`]).
+    /// What gives back what another attempt of an action recorded asks it, through this function,
+    /// once the answer is in hand: the door's own check ([`Self::check_retained_answer`] and the
+    /// network door's), the transfer service's, the catalogue's and the pairing door's, the project
+    /// service's closure ([`Self::retained_in_service`]), and [`Self::check_retained_in_hand`],
+    /// which the services that read a record after a wait call. Two places ask the same thing
+    /// without it: the start of the disclosed checks asks `check_fence` again under its own hold on
+    /// the registration, and the setup of backups builds the check by hand in
+    /// `SetupStands::retained`, from [`Self::check_registration`] without the deadline.
     pub(crate) fn check_retained_under(
         &self,
         carried: &crate::authority::AdmittedMutation,
@@ -439,7 +443,8 @@ impl Controller {
     /// `pairing_standing` check, the catalogue through its admission's `check_retained`, and the
     /// transfer service through `TransferAdmission::check_retained`. The start of the disclosed
     /// checks reads its record inside the hold on the registration, which keeps a revocation out,
-    /// and asks the fence again once the answer is in hand. The conflict a reused
+    /// and asks the fence again once the record is read, whatever it holds (an answer, another
+    /// request's identifier, a row that cannot be read). The conflict a reused
     /// identifier meets, found by a claim or a look after a wait, goes back through
     /// [`Self::conflict_under_authority`] where the service claims in asynchronous work, and
     /// through the same check in the transfer service and in the door's claim of an action.
