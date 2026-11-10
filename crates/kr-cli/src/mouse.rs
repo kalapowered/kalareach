@@ -520,9 +520,9 @@ pub const fn mouse_input_mode(current: u32, attached: u32, asked: bool) -> u32 {
 mod tests {
     use super::{
         ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT,
-        ENABLE_PROCESSED_INPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT, LEFT,
-        MIDDLE, MOUSE_MOVED, MOUSE_WHEELED, MouseRecord, MouseReporting, MouseSpeller, RIGHT,
-        Tracking, Window, mouse_input_mode, record_input_mode,
+        ENABLE_PROCESSED_INPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
+        ENABLE_WINDOW_INPUT, LEFT, MIDDLE, MOUSE_MOVED, MOUSE_WHEELED, MouseRecord, MouseReporting,
+        MouseSpeller, RIGHT, Tracking, Window, mouse_input_mode, record_input_mode,
     };
 
     /// A record at `column` and `row` with the buttons and flags the console reported it with.
@@ -900,6 +900,35 @@ mod tests {
     /// and reported only by a console that reports those.
     const PRIVATE_FLAGS: u32 =
         ENABLE_INSERT_MODE | ENABLE_QUICK_EDIT_MODE | ENABLE_EXTENDED_FLAGS | ENABLE_AUTO_POSITION;
+
+    /// The mode a record reader reads in takes away what would have the console translate keys,
+    /// read a line, show what is typed or handle the interrupt, whatever the console had.
+    #[test]
+    fn the_record_mode_never_asks_the_console_to_translate_for_us() {
+        let saved = ENABLE_LINE_INPUT
+            | ENABLE_ECHO_INPUT
+            | ENABLE_PROCESSED_INPUT
+            | ENABLE_VIRTUAL_TERMINAL_INPUT
+            | ENABLE_MOUSE_INPUT
+            | ENABLE_WINDOW_INPUT;
+        let mode = record_input_mode(saved);
+        assert_eq!(
+            mode & ENABLE_VIRTUAL_TERMINAL_INPUT,
+            0,
+            "the console's own translation is what records exist to avoid"
+        );
+        assert_eq!(mode & (ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT), 0);
+        assert_eq!(
+            mode & (ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT),
+            0,
+            "no mouse or window-size record is asked for until the application asks for the mouse"
+        );
+        assert_eq!(
+            mode & ENABLE_PROCESSED_INPUT,
+            0,
+            "the interrupt key is input to forward rather than an event for this process"
+        );
+    }
 
     /// The modes an attachment writes to a console, in order: when it begins, when the application
     /// asks for the mouse, when it stops, and the console's own mode put back at the end.
