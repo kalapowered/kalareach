@@ -874,7 +874,7 @@ const DELEGATION_WORDS: Readonly<Record<string, string>> = {
   not_sent: 'Not done. Nothing was sent to the computer.',
   performed: 'Done by the computer.',
   admitted: 'Taken by the computer. Whether it was carried out is not known.',
-  confirmation_required: 'Not done. It needs a confirmation on this phone, unlocked.',
+  confirmation_required: 'Not done yet. It waits for your confirmation on this phone, unlocked.',
   host_refused: 'Not done. The computer refused it.',
   cancelled: 'Not done. It was sent, and then dropped.',
   unknown: 'It is not known whether the computer did it.'
@@ -890,7 +890,15 @@ const DELEGATION_CAUSES: Readonly<Record<string, string>> = {
   provider_muted: 'The voice was muted. This call can no longer act on speech.',
   stale_proof: 'The microphone could not be shown to be working. Say it again.',
   host_lost: 'The computer was out of reach.',
-  broker_disagrees: 'The voice service did not confirm it. Say it again.'
+  broker_disagrees: 'The voice service did not confirm it. Say it again.',
+  not_drained: 'Part of what was said could not be read in time. Say it again.',
+  no_proof: 'The microphone could not be shown to be working. Say it again.',
+  not_confirmed: 'You did not confirm it. Say it again to be asked again.',
+  no_ceremony: 'This phone could not ask for your confirmation.',
+  challenge_mismatch:
+    'What the computer asked you to confirm was not what was said, so you were not asked. Say it again.',
+  confirmation_expired: "This phone's clock says the confirmation ran out. Say it again.",
+  confirmation_not_taken: 'The computer asked for a confirmation again instead of taking yours.'
 }
 
 /**

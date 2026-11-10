@@ -19,6 +19,7 @@
  */
 
 import type {
+  VoiceAction,
   VoiceManagedTerms,
   VoicePrepareResult,
   VoiceRate,
@@ -204,6 +205,8 @@ export interface ProviderChoice {
   readonly sessionNames: Readonly<Record<string, string>>
   /** What the voice grant would permit, in the host's own sentences. */
   readonly permits: readonly string[]
+  /** The actions the grant permits now, by name. */
+  readonly actions: readonly VoiceAction[]
   /** Whether any of those actions asks for a confirmation on this device's unlocked screen. */
   readonly needsUnlockedScreen: boolean
 }
@@ -251,6 +254,7 @@ export function choiceFromPreparation(preparation: VoicePrepareResult): Provider
     sessions: preparation.session_ids,
     sessionNames: {},
     permits: preparation.statement.statements,
+    actions: preparation.statement.actions ?? [],
     needsUnlockedScreen: preparation.statement.unlocked_screen_actions.length > 0
   }
 }

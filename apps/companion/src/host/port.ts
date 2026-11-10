@@ -1027,6 +1027,11 @@ export interface VoiceScopeAction {
 /** What allowing voice on this device permits when the person chooses nothing further. */
 export interface VoiceScope {
   readonly actions: readonly VoiceScopeAction[]
+  /**
+   * What a person may add to that, each in the sentence that states it. Empty while no spoken
+   * request reaches the host, so that nobody is asked to allow what cannot happen.
+   */
+  readonly optional: readonly VoiceScopeAction[]
 }
 
 /**

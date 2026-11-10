@@ -17,6 +17,7 @@ import type {
   InstanceCapabilityRecord
 } from '@kalareach/protocol'
 
+import { VoiceGrantEntry } from './VoiceGrantEntry'
 import { VoiceGrantStep } from './VoiceGrantStep'
 import { VoiceSurface, type CurrentTurn, type VoiceSurfaceActions } from './VoiceSurface'
 import {
@@ -338,6 +339,22 @@ export function VoiceRoute({
       ),
     [port, sessionIds]
   )
+
+  /**
+   * Reads what a call would be again, as the person changes what voice may do: the preparation
+   * names the grant, and a start that names the one read before the change is refused.
+   */
+  const refreshChoice = useCallback(() => {
+    void prepare().then(
+      (prepared) => {
+        setNeedsGrant(null)
+        setChoice(prepared)
+      },
+      (error: unknown) => {
+        setNotice(failureMessage(error))
+      }
+    )
+  }, [prepare])
 
   useEffect(() => {
     let current = true
@@ -968,6 +985,17 @@ export function VoiceRoute({
         focusHeadingOnShow={call === null ? choiceLostAfterStart : call.voiceSessionId === startedHere}
         actions={actions}
       />
+      {/* What a person who allowed voice already may add to what it may do: offered between calls,
+          and only while a spoken request can reach the host at all. */}
+      {choice !== null && call === null && !setUp ? (
+        <VoiceGrantEntry
+          port={port}
+          sessions={choice.sessions}
+          sessionNames={choice.sessionNames}
+          standing={choice.actions}
+          onChanged={refreshChoice}
+        />
+      ) : null}
     </Region>
   )
 }

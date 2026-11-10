@@ -149,6 +149,7 @@ function choice(over: Partial<ProviderChoice> = {}): ProviderChoice {
     sessions: ['s-1'],
     sessionNames: {},
     permits: ['navigate sessions', 'ask for status'],
+    actions: ['navigate', 'status'],
     needsUnlockedScreen: false,
     ...over
   }
