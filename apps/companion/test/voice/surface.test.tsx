@@ -758,6 +758,35 @@ describe('while a call is running', () => {
     expect(screen.queryByText(NOT_ACTED_ON_WORDS)).not.toBeInTheDocument()
   })
 
+  // A confirmation dropped because the call ended is not said to have waited for the person, who may
+  // have confirmed it already, and is not said to leave the voice to be told: the voice goes with
+  // the call. One whose session could not be read is not said to have run out of time.
+  it('says a confirmation dropped at the end of a call, or without a session number, as it was', () => {
+    render(
+      <VoiceSurface
+        choice={choice()}
+        call={call({
+          delegations: [
+            { delegationId: 'd-1', offsetMs: 1000, state: 'cancelled', cause: 'call_ended', told: false },
+            { delegationId: 'd-2', offsetMs: 2000, state: 'cancelled', cause: 'session_not_named', told: true }
+          ]
+        })}
+        currentTurn={null}
+        busy={false}
+        notice={null}
+        actions={actions()}
+      />
+    )
+    const [ended, unnamed] = screen
+      .getAllByRole('listitem')
+      .filter((item) => item.classList.contains('kr-voice__delegation'))
+    expect(ended).toHaveTextContent('The call ended')
+    expect(ended).not.toHaveTextContent('not been told yet')
+    expect(ended).not.toHaveTextContent('before you confirmed')
+    expect(unnamed).toHaveTextContent("session's number")
+    expect(unnamed).not.toHaveTextContent('in time')
+  })
+
   // A delegation the voice service listed when the control attached has no offset, and is not said
   // to have been asked at the start of the call.
   it('does not place a delegation in the call when the service gave no offset', () => {

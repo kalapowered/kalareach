@@ -217,7 +217,7 @@ impl Owner {
         });
     }
 
-    /// The session the confirmation is for could not be named to the person in time.
+    /// The number of the session the confirmation is for could not be read from the host.
     pub(in crate::voice) fn on_unnamed(&mut self, id: &str, generation: u64) {
         if !self.is_current(id, generation) {
             return;

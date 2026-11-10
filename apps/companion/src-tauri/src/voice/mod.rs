@@ -85,7 +85,8 @@ pub struct Timings {
     /// parameter of the cases, not a safety bound.
     pub proof_age: Duration,
     /// How long the number of the session a confirmation is for is waited for, so the dialog can
-    /// name it. A courtesy: the confirmation does not depend on it, and a parameter of the cases.
+    /// name it. Without the number nobody is asked, so this is also how long a person waits for the
+    /// dialog. A parameter of the cases.
     pub session_name_within: Duration,
 }
 

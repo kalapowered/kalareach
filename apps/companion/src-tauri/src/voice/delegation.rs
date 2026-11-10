@@ -120,10 +120,12 @@ pub(super) enum Cause {
     NoCeremony,
     /// This device's own clock says the challenge has run out.
     ConfirmationExpired,
-    /// The session the confirmation is for could not be named to the person in time, so nobody was
-    /// asked: a confirmation the person cannot tell the target of is not asked for.
+    /// The number of the session the confirmation is for could not be read from the host (no answer
+    /// in time, a refusal, or an answer for another session), so nobody was asked: a confirmation
+    /// the person cannot tell the target of is not asked for.
     SessionNotNamed,
-    /// The call ended while the person was being asked, or before they were.
+    /// The call ended while the confirmation was open: while the person was being asked, or after
+    /// they confirmed and before the signature was sent.
     CallEnded,
 }
 

@@ -124,9 +124,11 @@ const DELEGATION_CHALLENGE_MISMATCH: &str = "Nothing was done: what the computer
 const DELEGATION_CONFIRMATION_EXPIRED: &str = "Nothing was done: this phone's clock says the \
     confirmation ran out. Say so, and ask the person to say it again.";
 
-/// What the model is told when the session a confirmation is for could not be named to the person.
-const DELEGATION_SESSION_NOT_NAMED: &str = "Nothing was done: this phone could not name the session \
-    to the person in time, so the person was not asked. Say so, and ask the person to say it again.";
+/// What the model is told when the number of the session a confirmation is for could not be read
+/// from the computer, so the person could not be told which session it is about.
+const DELEGATION_SESSION_NOT_NAMED: &str = "Nothing was done: this phone could not read the \
+    session's number from the person's computer, so the person was not asked. Say so, and ask the \
+    person to say it again.";
 
 /// What the model is told when the confirmation was dropped before it was sent.
 const DELEGATION_CONFIRMATION_DROPPED: &str = "Nothing was done: the confirmation was not sent. Say \
@@ -201,8 +203,9 @@ enum Internal {
         generation: u64,
         outcome: CeremonyOutcome,
     },
-    /// The session the confirmation `generation` of the delegation `id` is for could not be named
-    /// to the person in time, so the ceremony was not started.
+    /// The number of the session the confirmation `generation` of the delegation `id` is for could
+    /// not be read from the host (no answer in time, a refusal, or an answer for another session),
+    /// so the ceremony was not started.
     Unnamed { id: String, generation: u64 },
     /// What native code's capture proof said, when the confirmation `generation` of the delegation
     /// `id` asked for it with a marker after the ceremony.

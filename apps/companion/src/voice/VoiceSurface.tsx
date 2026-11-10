@@ -899,8 +899,22 @@ const DELEGATION_CAUSES: Readonly<Record<string, string>> = {
     'What the computer asked you to confirm was not what was said, so you were not asked. Say it again.',
   confirmation_expired: "This phone's clock says the confirmation ran out. Say it again.",
   confirmation_not_taken: 'The computer asked for a confirmation again instead of taking yours.',
-  session_not_named: 'This phone could not name the session to you in time, so you were not asked. Say it again.',
-  call_ended: 'The call ended before you confirmed it.'
+  session_not_named:
+    "This phone could not read the session's number from the computer, so you were not asked. Say it again to try again.",
+  call_ended: 'The call ended before it could be finished.'
+}
+
+/**
+ * What a row says of whether the voice was told what became of the request. A request dropped
+ * because the call ended is told to nobody: the voice goes with the call, so the row does not say
+ * the voice has yet to be told.
+ */
+function toldWords(delegation: Delegation, what: string): string {
+  if (delegation.cause === 'call_ended') return what
+  if (delegation.state === 'not_done' || delegation.state === 'collecting') {
+    return delegation.told ? `${what} The voice was told so.` : `${what} The voice has not been told yet.`
+  }
+  return delegation.told ? `${what} The voice was told.` : `${what} The voice has not been told yet.`
 }
 
 /**
@@ -918,13 +932,7 @@ function DelegationRow({ delegation }: { readonly delegation: Delegation }): Rea
           : `Asked ${(delegation.offsetMs / 1000).toFixed(1)} seconds in`}
       </span>
       <span className="kr-voice__summary">
-        {delegation.state === 'not_done' || delegation.state === 'collecting'
-          ? delegation.told
-            ? `${what} The voice was told so.`
-            : `${what} The voice has not been told yet.`
-          : delegation.told
-            ? `${what} The voice was told.`
-            : `${what} The voice has not been told yet.`}
+        {toldWords(delegation, what)}
         {why !== undefined && ` ${why}`}
       </span>
     </li>
