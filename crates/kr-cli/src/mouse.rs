@@ -253,6 +253,47 @@ impl MouseReporting {
     }
 }
 
+/// The part of a console's screen buffer that its window shows.
+///
+/// A mouse record's position is counted in the screen buffer, and what an application is told is
+/// counted in the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Window {
+    /// The column of the buffer where the window begins.
+    pub left: i16,
+    /// The row of the buffer where the window begins.
+    pub top: i16,
+    /// How many columns the window shows.
+    pub columns: u16,
+    /// How many rows the window shows.
+    pub rows: u16,
+}
+
+impl Window {
+    /// The window of a console that says nothing of its window, and of a terminal that sends the
+    /// reports itself: it begins at the buffer's origin and every cell after it is shown.
+    pub const UNBOUNDED: Self = Self {
+        left: 0,
+        top: 0,
+        columns: u16::MAX,
+        rows: u16::MAX,
+    };
+
+    /// The cell of the window that the buffer's `column` and `row` is, or none when the window does
+    /// not show it.
+    fn cell(self, column: i16, row: i16) -> Option<(u32, u32)> {
+        let within = |position: i16, from: i16, extent: u16| {
+            u32::try_from(i32::from(position) - i32::from(from))
+                .ok()
+                .filter(|cell| *cell < u32::from(extent))
+        };
+        Some((
+            within(column, self.left, self.columns)?,
+            within(row, self.top, self.rows)?,
+        ))
+    }
+}
+
 /// Spells the console's mouse records as reports.
 ///
 /// It remembers which buttons the console last said were down, because a record says which are down
@@ -277,14 +318,15 @@ impl MouseSpeller {
     /// The bytes that tell the application of `record`, or none when it asked for nothing the
     /// record is.
     ///
-    /// `origin` is the column and row of the console's screen buffer where its window begins, which
-    /// a record's position is counted from and a report's is not. The buttons the record says are
-    /// down are remembered whether or not anything is reported.
+    /// `window` is the part of the console's screen buffer its window shows. A record's position is
+    /// counted in the buffer and a report's in the window, and a record whose position the window
+    /// does not show is told to nobody: it is no cell of the grid the application draws on. The
+    /// buttons the record says are down are remembered whether or not anything is reported.
     pub fn spell(
         &mut self,
         record: MouseRecord,
         reporting: &MouseReporting,
-        origin: (i16, i16),
+        window: Window,
     ) -> Vec<u8> {
         let modifiers = Modifiers {
             shift: record.control_keys & SHIFT_PRESSED != 0,
@@ -292,12 +334,13 @@ impl MouseSpeller {
             control: record.control_keys & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0,
             superkey: false,
         };
-        let cell = |position: i16, from: i16| {
-            u32::try_from(i32::from(position) - i32::from(from)).unwrap_or(0)
+        let cell = window.cell(record.column, record.row);
+        let actions = self.actions(record);
+        let Some((column, row)) = cell else {
+            return Vec::new();
         };
-        let (column, row) = (cell(record.column, origin.0), cell(record.row, origin.1));
         let mut report = Vec::new();
-        for action in self.actions(record) {
+        for action in actions {
             let asked = match action {
                 MouseAction::Press(_) | MouseAction::Release(_) | MouseAction::Wheel(_) => {
                     Tracking::Clicks
@@ -479,7 +522,7 @@ mod tests {
         ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT,
         ENABLE_PROCESSED_INPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT, LEFT,
         MIDDLE, MOUSE_MOVED, MOUSE_WHEELED, MouseRecord, MouseReporting, MouseSpeller, RIGHT,
-        Tracking, mouse_input_mode, record_input_mode,
+        Tracking, Window, mouse_input_mode, record_input_mode,
     };
 
     /// A record at `column` and `row` with the buttons and flags the console reported it with.
@@ -501,7 +544,7 @@ mod tests {
         let mut speller = MouseSpeller::default();
         records
             .iter()
-            .flat_map(|record| speller.spell(*record, &reporting, (0, 0)))
+            .flat_map(|record| speller.spell(*record, &reporting, Window::UNBOUNDED))
             .collect()
     }
 
@@ -640,10 +683,53 @@ mod tests {
         let mut reporting = MouseReporting::default();
         reporting.observe(b"\x1b[?1000h\x1b[?1006h");
         let mut speller = MouseSpeller::default();
+        let window = Window {
+            left: 10,
+            top: 38,
+            columns: 80,
+            rows: 25,
+        };
         assert_eq!(
-            speller.spell(record(12, 40, LEFT, 0), &reporting, (10, 38)),
+            speller.spell(record(12, 40, LEFT, 0), &reporting, window),
             b"\x1b[<0;3;3M".to_vec()
         );
+    }
+
+    /// A record whose position is outside the window is told to nobody, and not as the nearest cell
+    /// or the first row or column: only a position inside the window is a cell of the grid.
+    #[test]
+    fn a_position_outside_the_window_is_told_to_nobody() {
+        let window = Window {
+            left: 10,
+            top: 38,
+            columns: 80,
+            rows: 25,
+        };
+        let mut reporting = MouseReporting::default();
+        reporting.observe(b"\x1b[?1000h\x1b[?1006h");
+        // Each is a press by a speller that has not seen one.
+        let spelled = |column, row| {
+            MouseSpeller::default().spell(record(column, row, LEFT, 0), &reporting, window)
+        };
+        // The first and the last cell of the window are inside it.
+        assert_eq!(spelled(10, 38), b"\x1b[<0;1;1M".to_vec());
+        assert_eq!(spelled(89, 62), b"\x1b[<0;80;25M".to_vec());
+        // One cell beyond each edge is not, and neither is a position far off or negative.
+        for (column, row) in [
+            (9, 40),
+            (12, 37),
+            (90, 40),
+            (12, 63),
+            (-1, 40),
+            (12, -1),
+            (0, 0),
+        ] {
+            assert_eq!(
+                spelled(column, row),
+                Vec::<u8>::new(),
+                "({column}, {row}) is outside the window"
+            );
+        }
     }
 
     /// An application is told only of what it asked for: nothing before it asks, a move with a
@@ -704,7 +790,7 @@ mod tests {
             reporting
         };
         let mut speller = MouseSpeller::default();
-        let mut spelled = |record| speller.spell(record, &reporting, (0, 0));
+        let mut spelled = |record| speller.spell(record, &reporting, Window::UNBOUNDED);
         assert_eq!(spelled(up(60)), Vec::<u8>::new(), "half a notch");
         assert_eq!(
             spelled(up(60)),
@@ -746,12 +832,12 @@ mod tests {
         reporting.observe(b"\x1b[?1000h\x1b[?1006h");
         let mut speller = MouseSpeller::default();
         assert_eq!(
-            speller.spell(record(0, 0, LEFT, 0), &reporting, (0, 0)),
+            speller.spell(record(0, 0, LEFT, 0), &reporting, Window::UNBOUNDED),
             b"\x1b[<0;1;1M".to_vec()
         );
         speller.forget_the_buttons();
         assert_eq!(
-            speller.spell(record(0, 0, LEFT, 0), &reporting, (0, 0)),
+            speller.spell(record(0, 0, LEFT, 0), &reporting, Window::UNBOUNDED),
             b"\x1b[<0;1;1M".to_vec()
         );
     }
@@ -763,7 +849,7 @@ mod tests {
         let mut reporting = MouseReporting::default();
         reporting.observe(b"\x1b[?1000h\x1b[?1006h");
         let mut speller = MouseSpeller::default();
-        let mut spelled = |record| speller.spell(record, &reporting, (0, 0));
+        let mut spelled = |record| speller.spell(record, &reporting, Window::UNBOUNDED);
         assert_eq!(spelled(record(0, 0, LEFT, 0)), b"\x1b[<0;1;1M".to_vec());
         assert_eq!(
             spelled(record(0, 0, LEFT | MIDDLE, 0)),

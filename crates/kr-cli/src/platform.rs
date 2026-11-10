@@ -254,7 +254,7 @@ mod console {
             }
         }
 
-        /// Where the console's window begins in its screen buffer, as a column and a row.
+        /// The part of the console's screen buffer its window shows.
         ///
         /// A mouse record's position is counted in the screen buffer, and what an application is
         /// told is counted in the window.
@@ -262,10 +262,18 @@ mod console {
         /// # Errors
         ///
         /// Returns an error when the console will not answer.
-        pub fn window_origin(&self) -> Result<(i16, i16)> {
+        pub fn window(&self) -> Result<crate::mouse::Window> {
             let info =
                 self.buffer_info("read where the console's window is: the console did not answer")?;
-            Ok((info.srWindow.Left, info.srWindow.Top))
+            let extent = |from: i16, to: i16| {
+                u16::try_from(i32::from(to) - i32::from(from) + 1).unwrap_or(0)
+            };
+            Ok(crate::mouse::Window {
+                left: info.srWindow.Left,
+                top: info.srWindow.Top,
+                columns: extent(info.srWindow.Left, info.srWindow.Right),
+                rows: extent(info.srWindow.Top, info.srWindow.Bottom),
+            })
         }
 
         /// Gives the mouse to the session's application while it asks to be told of it, and back to

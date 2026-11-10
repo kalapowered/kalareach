@@ -2234,7 +2234,7 @@ impl ConsoleMouse {
             return Vec::new();
         }
         self.speller
-            .spell(record, &self.reporting, window_origin(terminal))
+            .spell(record, &self.reporting, window(terminal))
     }
 }
 
@@ -2251,16 +2251,17 @@ const fn report_mouse(_terminal: &ControllingTerminal, _asked: bool) -> bool {
     true
 }
 
-/// Where the console's window begins in its screen buffer, which a mouse record's position is
-/// counted from; the buffer's own origin when the console does not say.
+/// The part of the console's screen buffer its window shows, which a mouse record's position is
+/// counted in and a report's is not; all of the buffer from its origin when the console does not
+/// say.
 #[cfg(not(unix))]
-fn window_origin(terminal: &ControllingTerminal) -> (i16, i16) {
-    terminal.window_origin().unwrap_or((0, 0))
+fn window(terminal: &ControllingTerminal) -> crate::mouse::Window {
+    terminal.window().unwrap_or(crate::mouse::Window::UNBOUNDED)
 }
 
 #[cfg(unix)]
-const fn window_origin(_terminal: &ControllingTerminal) -> (i16, i16) {
-    (0, 0)
+const fn window(_terminal: &ControllingTerminal) -> crate::mouse::Window {
+    crate::mouse::Window::UNBOUNDED
 }
 
 /// Runs the attachment's input, output and connection in one loop.
