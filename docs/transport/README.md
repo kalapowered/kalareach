@@ -536,9 +536,11 @@ against the connection: no bulk slot, no registry entry.
    default, so a host that asks for none takes none and resets every stream after its header.
 5. A bulk stream finds a free slot among the connection's bulk streams.
 
-A stream that passes goes to the host through `AuthorisedSession::data_streams`, a queue of four
-(`listener::DATA_STREAM_QUEUE_DEPTH`). A full queue and a receiver that was dropped each reset the
-stream, so a host that never reads the queue holds nothing for a device that opens streams. What a header names beyond this, the environment, the transfer and the
+A stream that passes goes to the host through `AuthorisedSession::data_streams` (`DataStreams`), a
+queue of four (`listener::DATA_STREAM_QUEUE_DEPTH`). A full queue and a receiver that was dropped
+each reset the stream, and dropping `DataStreams` resets every stream still queued. A host that
+never reads the queue holds at most four streams for a device that opens them, each with a bulk
+slot, a registry entry and its flow-control credit, until the connection ends, and resets the rest. What a header names beyond this, the environment, the transfer and the
 right to use it, is the host's to decide when it receives the stream. A lookup it makes for that runs
 under the admission deadline, which the session carries as `AuthorisedSession::deadlines`.
 
@@ -556,6 +558,10 @@ dropped. `write_message_while` writes a frame on either as `FrameWriter::write_m
 the write is held to the caller's check at every attempt to hand bytes to the stream, to the queue
 budget, to the write deadline and to revocation. A revocation, a deadline or a refused reservation
 ends it with an error, never with `Ok(false)`, which means only that the caller's own check refused.
+A refusal leaves the stream reset and revokes it, so the half that reads stops too. A read or a
+write that is dropped before it ends, because a caller raced it in a `select!`, leaves part of a
+frame consumed or sent and revokes the stream for the same reason: end a stream by revoking its
+handle, not by cancelling a read.
 A host that takes a data stream builds a `ReceivedFrame` for each frame it reads with
 `ReceivedFrame::read`, using the connection's clock, so that a frame from either stream goes through
 the same door.
@@ -570,7 +576,7 @@ Each wait on a device has an end:
 | `admission` | The host's lookup that admits a stream, once it has the header | 10 s |
 | `idle` | The wait for the next frame to begin | 60 s |
 | `stall` | Each piece of a frame, once it has begun | 30 s |
-| `write` | Writing one frame to a device that has to read it | 30 s |
+| `write` | The write of one frame to a device that has to read it, as a whole | 30 s |
 
 `ListenerConfig::deadlines` supplies them. A deadline is a future that resolves when it has passed,
 and `deadlines::Deadlines` is where those futures come from. `TimerDeadlines` makes them from timers.
@@ -582,9 +588,13 @@ and starts a fresh stall deadline for each piece, so a frame of any size is neve
 long on a slow link, and a device that stops sending part way through one is. The idle deadline
 covers only the wait before the first byte of a frame.
 
-A deadline that passes ends the operation with `TransportError::Deadline`, stops the stream's
-receiving side and revokes the stream. Revocation resets each half when it is dropped, so the host
-ends a stream it cut by dropping it, and the device sees a reset, never a clean end. A registry made
+The write deadline is the exception: it starts with the write and is not restarted by progress, so
+it suits an answer of a few hundred bytes, and a frame of a megabyte takes the whole of it.
+
+A deadline that passes ends the operation with `TransportError::Deadline` and revokes the stream,
+and an idle or stall deadline also stops its receiving side. Revocation resets each half when it is
+dropped, so the host ends a stream it cut by dropping it, and the device sees a reset, never a clean
+end. A registry made
 without deadlines, which is how a client opens its streams, waits for its peer as long as the peer
 takes.
 
@@ -615,8 +625,10 @@ first-admit a request through a connection that no longer exists.
 
 The loss is acted on where it is declared. When the control stream's reader ends or a write to the
 control stream fails, the streams are revoked on the task that saw it, so a host that learns of the
-loss from a failed write finds its streams already revoked when the write returns. The connection's
-cleanup revokes them again, which does nothing.
+loss from a failed write finds its streams already revoked when the write returns. The host's
+`control_stream_lost` hook does not run there: it runs once from the connection's cleanup, after the
+host's handler has been dropped, so a host that registers the connection while it serves is never
+asked to withdraw it before it has.
 
 The cleanup runs on every way a connection can end, including a failed keepalive write, a panic in
 the host's handler and a cancelled task, because it is a guard the connection owns rather than a
