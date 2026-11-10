@@ -9764,6 +9764,13 @@ async fn storage_that_moves_between_the_managed_service_and_one_the_owner_runs_l
             .is_none(),
         "and not at the managed service"
     );
+    assert!(
+        owner.web().arrived().iter().all(|request| request
+            .token
+            .as_deref()
+            .is_none_or(|token| token == OWNER_TOKEN)),
+        "the service the owner runs was shown only the account it issued"
+    );
 
     // Back to the managed service: the grant for the owner's service is presented to nothing.
     serving.abort();
