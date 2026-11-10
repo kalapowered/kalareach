@@ -73,6 +73,9 @@ enum Taking {
     DropAfterTheGate,
 }
 
+/// Where the host sends its session's registry and its end of the connection.
+type SessionSender = oneshot::Sender<(Arc<StreamRegistry>, Connection)>;
+
 /// A host that forwards the data streams it is handed to the case and otherwise only holds the
 /// connection.
 #[derive(Debug)]
@@ -83,8 +86,12 @@ struct ChunkHost {
     gate: Semaphore,
     /// Where each stream the host takes is forwarded.
     forwarded: mpsc::UnboundedSender<DataStream>,
-    /// The connection's registry, sent to the case once the host has the session.
-    registry: std::sync::Mutex<Option<oneshot::Sender<Arc<StreamRegistry>>>>,
+    /// The connection's registry and the host's end of the connection, sent to the case once the
+    /// host has the session.
+    session: std::sync::Mutex<Option<SessionSender>>,
+    /// Holds the host's lookup of the device, and with it the device's authorisation, until the
+    /// case lets it go.
+    hold: Option<Arc<LookupHold>>,
     /// Said once the host has dropped the receiver, for [`Taking::Never`].
     dropped: Notify,
     receiver_dropped: AtomicBool,
@@ -94,6 +101,51 @@ struct ChunkHost {
     hook_saw_serve_ended: AtomicBool,
     hook_ran: AtomicBool,
     hook: Notify,
+}
+
+/// A hold on the host's lookup of a device, which the handshake cannot finish without.
+///
+/// The lookup is a plain call that blocks the thread it runs on, so the case holds the device's
+/// authorisation where it is, with the device's offer read and nothing yet granted, for as long as
+/// it needs to look at the connection in that state.
+#[derive(Debug, Default)]
+struct LookupHold {
+    arrived: AtomicBool,
+    arrival: Notify,
+    released: std::sync::Mutex<bool>,
+    release: std::sync::Condvar,
+}
+
+impl LookupHold {
+    /// Called by the host's lookup: says it is here, and waits to be let go.
+    fn wait(&self) {
+        self.arrived.store(true, Ordering::Release);
+        self.arrival.notify_waiters();
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*released {
+            released = self
+                .release
+                .wait(released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// Resolves once the host's lookup has been reached.
+    async fn reached(&self) {
+        until_set(&self.arrived, &self.arrival).await;
+    }
+
+    /// Lets the host's lookup, and the authorisation behind it, go on.
+    fn let_go(&self) {
+        *self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.release.notify_all();
+    }
 }
 
 /// Sets a flag when it is dropped, as the host's handler does when the listener drops it.
@@ -118,6 +170,9 @@ async fn until_set(flag: &AtomicBool, changed: &Notify) {
 
 impl PairedDirectory for ChunkHost {
     fn paired_peer(&self, endpoint_id: &EndpointKey) -> Option<PairedPeer> {
+        if let Some(hold) = &self.hold {
+            hold.wait();
+        }
         (endpoint_id == &self.client.endpoint_id).then_some(self.client)
     }
 }
@@ -146,12 +201,12 @@ impl HostHandler for ChunkHost {
         Box::pin(async move {
             let _serving = SetWhenDropped(Arc::clone(&self.serve_ended));
             if let Some(sender) = self
-                .registry
+                .session
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take()
             {
-                let _ = sender.send(Arc::clone(&session.streams));
+                let _ = sender.send((Arc::clone(&session.streams), session.connection.clone()));
             }
             match self.taking {
                 Taking::Never | Taking::DropAfterTheGate => {
@@ -201,24 +256,50 @@ struct Harness {
     host: Arc<ChunkHost>,
     /// Every stream the host took, in the order it took them.
     admitted: mpsc::UnboundedReceiver<DataStream>,
-    /// The host's registry for the connection.
+    /// The host's registry for the connection, and the host's end of it.
     registry: Arc<StreamRegistry>,
+    host_connection: Connection,
     /// The device's own registry, which opens streams with a proper header.
     device: Arc<StreamRegistry>,
     _sides: (Side, Side),
 }
 
+/// A host on loopback and a device connected to it at the QUIC level, with nothing authorised yet.
+struct Listening {
+    listener: NetworkListener,
+    connection: Connection,
+    deadlines: Arc<ManualDeadlines>,
+    host: Arc<ChunkHost>,
+    admitted: mpsc::UnboundedReceiver<DataStream>,
+    session: oneshot::Receiver<(Arc<StreamRegistry>, Connection)>,
+    host_side: Side,
+    client: Side,
+}
+
 impl Harness {
     async fn start(accepted: &[StreamKind], taking: Taking) -> Self {
+        Self::listen(accepted, taking, None)
+            .await
+            .authorised()
+            .await
+    }
+
+    /// Starts the host and connects the device to it, without the handshake.
+    async fn listen(
+        accepted: &[StreamKind],
+        taking: Taking,
+        hold: Option<Arc<LookupHold>>,
+    ) -> Listening {
         let (host_side, client) = paired_pair().await;
         let (forwarded, admitted) = mpsc::unbounded_channel();
-        let (registry_tx, registry_rx) = oneshot::channel();
+        let (session_tx, session) = oneshot::channel();
         let host = Arc::new(ChunkHost {
             client: client.record,
             taking,
             gate: Semaphore::new(0),
             forwarded,
-            registry: std::sync::Mutex::new(Some(registry_tx)),
+            session: std::sync::Mutex::new(Some(session_tx)),
+            hold,
             dropped: Notify::new(),
             receiver_dropped: AtomicBool::new(false),
             serve_ended: Arc::new(AtomicBool::new(false)),
@@ -256,28 +337,15 @@ impl Harness {
             .connect(addr, ALPN)
             .await
             .expect("a connection");
-        let authorised = handshake::connect(&connection, &client.identity, &host_side.record)
-            .await
-            .expect("an authorised connection");
-        let registry = awaited("the host's session", registry_rx)
-            .await
-            .expect("the host sent its registry");
-        let device = Arc::new(StreamRegistry::with_limits(
-            authorised.connection_id,
-            Arc::new(StreamBudget::new(SendLimits::default())),
-            None,
-            authorised.selection.limits,
-        ));
-        Self {
+        Listening {
             listener,
             connection,
-            authorised,
             deadlines,
             host,
             admitted,
-            registry,
-            device,
-            _sides: (host_side, client),
+            session,
+            host_side,
+            client,
         }
     }
 
@@ -299,6 +367,55 @@ impl Harness {
         drop(self.authorised);
         self.connection.close(0u32.into(), b"done");
         self.listener.shutdown().await;
+    }
+}
+
+impl Listening {
+    /// Runs the device's side of the handshake, and returns once the host has the session.
+    async fn authorised(self) -> Harness {
+        let authorised = handshake::connect(
+            &self.connection,
+            &self.client.identity,
+            &self.host_side.record,
+        )
+        .await
+        .expect("an authorised connection");
+        self.with(authorised).await
+    }
+
+    /// The harness for a device whose handshake the case has run.
+    async fn with(self, authorised: AuthorisedConnection) -> Harness {
+        let Self {
+            listener,
+            connection,
+            deadlines,
+            host,
+            admitted,
+            session,
+            host_side,
+            client,
+        } = self;
+        let (registry, host_connection) = awaited("the host's session", session)
+            .await
+            .expect("the host sent its session");
+        let device = Arc::new(StreamRegistry::with_limits(
+            authorised.connection_id,
+            Arc::new(StreamBudget::new(SendLimits::default())),
+            None,
+            authorised.selection.limits,
+        ));
+        Harness {
+            listener,
+            connection,
+            authorised,
+            deadlines,
+            host,
+            admitted,
+            registry,
+            host_connection,
+            device,
+            _sides: (host_side, client),
+        }
     }
 }
 
@@ -867,6 +984,136 @@ async fn a_read_dropped_before_it_ends_revokes_the_stream() {
     );
     drop(stream);
     assert_eq!(reset_code(&mut recv).await, u64::from(STREAM_REVOKED));
+
+    harness.finish().await;
+}
+
+/// Lets a held lookup go when a case ends, however it ends: a case that fails while the host's
+/// lookup is held would otherwise leave a runtime thread blocked in it.
+struct LetGoWhenDropped(Arc<LookupHold>);
+
+impl Drop for LetGoWhenDropped {
+    fn drop(&mut self) {
+        self.0.let_go();
+    }
+}
+
+/// KR-REQ-23.19: a connection that is not authorised yet has room for one stream, the one the
+/// handshake runs on. While the host's lookup of the device is held, a second stream the device
+/// opens finds no credit; once the host has authorised the connection and raised the limit, the
+/// same open completes and the stream is taken as a data stream is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_stream_waits_until_the_connection_is_authorised() {
+    let hold = Arc::new(LookupHold::default());
+    let _let_go = LetGoWhenDropped(Arc::clone(&hold));
+    let listening = Harness::listen(
+        &[StreamKind::AttachmentChunks],
+        Taking::Forward,
+        Some(Arc::clone(&hold)),
+    )
+    .await;
+
+    // The device's offer is sent on the connection's first stream and the host's lookup of the
+    // device is reached. The connection has been granted nothing yet.
+    let mut handshaking = Box::pin(handshake::connect(
+        &listening.connection,
+        &listening.client.identity,
+        &listening.host_side.record,
+    ));
+    tokio::select! {
+        outcome = &mut handshaking => {
+            panic!("the handshake ended while the host's lookup was held: {:?}", outcome.map(|_| ()))
+        }
+        () = awaited("the host's lookup of the device", hold.reached()) => {}
+    }
+    let mut second = Box::pin(listening.connection.open_bi());
+    assert!(
+        futures::poll!(&mut second).is_pending(),
+        "a connection that is not authorised yet had room for a second stream"
+    );
+
+    hold.let_go();
+    let authorised = awaited("the handshake", handshaking)
+        .await
+        .expect("an authorised connection");
+    let (mut send, _recv) = awaited(
+        "the second stream, once the connection is authorised",
+        second,
+    )
+    .await
+    .expect("a second stream");
+    let mut harness = listening.with(authorised).await;
+    let header = attachment_header(harness.authorised.connection_id, 1);
+    write_header(&mut send, &header, None).await;
+    assert_eq!(harness.next().await.header(), &header);
+
+    harness.finish().await;
+}
+
+/// KR-REQ-23.19: a host that takes no data streams leaves its connections at room for one stream.
+/// A second stream the device opens finds no credit: the host has been told the device is blocked,
+/// reports that it granted nothing, and the open ends only with the connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_takes_no_data_streams_leaves_a_device_one_stream() {
+    let harness = Harness::start(&[], Taking::Forward).await;
+
+    let mut second = Box::pin(harness.connection.open_bi());
+    assert!(
+        futures::poll!(&mut second).is_pending(),
+        "a device had room for a second stream on a host that takes none"
+    );
+    awaited("the host being told the device is blocked", async {
+        while harness
+            .host_connection
+            .stats()
+            .frame_rx
+            .streams_blocked_bidi
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert_eq!(
+        harness.host_connection.stats().frame_tx.max_streams_bidi,
+        0,
+        "the host granted a device more streams though it takes none"
+    );
+    assert!(futures::poll!(&mut second).is_pending());
+    harness.connection.close(0u32.into(), b"done");
+    let outcome = awaited("the open that waited", second).await;
+    assert!(
+        outcome.is_err(),
+        "the second stream was opened on a host that takes no data streams"
+    );
+
+    harness.finish().await;
+}
+
+/// A host opens no stream to a device: a client's endpoint allows none, so a stream the host tries
+/// to open finds no credit, and a client that waits to accept one waits for the end of the
+/// connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_opens_no_stream_to_a_device() {
+    let harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::Forward).await;
+
+    let mut from_the_host = Box::pin(harness.host_connection.open_bi());
+    assert!(
+        futures::poll!(&mut from_the_host).is_pending(),
+        "a device's endpoint had room for a stream the host opens"
+    );
+    let device = Arc::clone(&harness.device);
+    let connection = harness.connection.clone();
+    let accepting = tokio::spawn(async move { device.accept(&connection).await.map(|_| ()) });
+    harness.host_connection.close(0u32.into(), b"done");
+    let accepted = awaited("the device's accept ending with the connection", accepting)
+        .await
+        .expect("the accept task ended");
+    assert!(
+        accepted.is_err(),
+        "a device accepted a stream the host cannot open"
+    );
+    drop(from_the_host);
 
     harness.finish().await;
 }

@@ -50,7 +50,7 @@ use kr_transport::scheduler::{
     CONTROL_RESERVE_BYTES, SendLimits, StreamBudget, StreamClass, class_of, priority_of,
 };
 use kr_transport::streams::{DataStream, StreamRegistry};
-use support::{OneDevice, Side, direct_addr, epochs, ledger, paired_pair, windows};
+use support::{OneDevice, Side, allow_streams, direct_addr, epochs, ledger, paired_pair, windows};
 
 /// How many keystrokes are sent while the transfer runs.
 const KEYSTROKES: usize = 32;
@@ -234,6 +234,7 @@ async fn the_connection_uses_the_priority_each_kind_is_scheduled_at() {
             .expect("an incoming connection")
             .await
             .expect("a connection");
+        allow_streams(&connection);
         let clock = ManualClock::new();
         let challenges = ledger();
         let issuer = windows(&clock);
@@ -372,6 +373,7 @@ async fn every_keystroke_is_answered_while_a_transfer_runs() {
             .expect("an incoming connection")
             .await
             .expect("a connection");
+        allow_streams(&connection);
         let clock = ManualClock::new();
         let challenges = ledger();
         let issuer = windows(&clock);

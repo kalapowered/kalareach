@@ -39,7 +39,8 @@ use kr_transport::random::fresh_nonce;
 use kr_transport::scheduler::{SendLimits, StreamBudget, StreamClass};
 use kr_transport::streams::StreamRegistry;
 use support::{
-    NoDevices, OneDevice, Side, direct_addr, epochs, ledger, paired_pair, side, windows,
+    NoDevices, OneDevice, Side, allow_streams, direct_addr, epochs, ledger, paired_pair, side,
+    windows,
 };
 use tokio::task::JoinHandle;
 
@@ -57,6 +58,7 @@ fn spawn_accept(
     let identity = Arc::clone(&host.identity);
     tokio::spawn(async move {
         let connection = accept_connection(&endpoint).await;
+        allow_streams(&connection);
         let challenges = ledger();
         let issuer = windows(&clock);
         let admitted = handshake::accept(

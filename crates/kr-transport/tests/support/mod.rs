@@ -25,6 +25,16 @@ use kr_transport::config::EndpointConfig;
 use kr_transport::handshake::{HostEpochs, LocalIdentity, PairedDirectory};
 use kr_transport::window::{ActionWindowIssuer, MAX_WINDOW_VALIDITY};
 
+/// Lets the peer of a connection that a test accepted by hand open the streams a host that takes
+/// data streams allows.
+///
+/// A listening endpoint starts every connection with room for one bidirectional stream, and the
+/// listener raises it when it authorises a connection for a host that takes data streams. A test
+/// that accepts connections itself, and then takes streams from them, raises it the same way.
+pub fn allow_streams(connection: &iroh::endpoint::Connection) {
+    connection.set_max_concurrent_bi_streams(iroh::endpoint::VarInt::from_u32(16));
+}
+
 /// One side of a paired pair.
 pub struct Side {
     pub keys: DeviceKeys,
