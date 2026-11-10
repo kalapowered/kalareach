@@ -532,111 +532,132 @@ impl RunScan {
     }
 }
 
-/// How a file of the person's stood at one moment, as its metadata says and nothing of its content.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Stat {
-    inode: u64,
-    bytes: u64,
-    modified: (i64, i64),
+/// How a tree of the person's stood at one moment, by metadata alone: how many entries it holds,
+/// and a digest of every entry's name, kind, identity, size and times. Only the digest and the
+/// count are kept, in memory; no name, size or time is printed, logged or recorded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Tree {
+    entries: usize,
+    digest: [u8; 32],
 }
 
-/// A file's [`Stat`] now, or none where there is no such file.
-fn stat_of(path: &Path) -> Result<Option<Stat>, String> {
+/// The tree at `path` as its metadata says it stands now: a file is a tree of one entry, a path that
+/// is not there a tree of none. A symbolic link is an entry and is not followed. Nothing is read of
+/// any file but its metadata, and no file is written.
+fn tree_of(path: &Path) -> Result<Tree, String> {
     use std::os::unix::fs::MetadataExt as _;
-    match std::fs::metadata(path) {
-        Ok(metadata) => Ok(Some(Stat {
-            inode: metadata.ino(),
-            bytes: metadata.len(),
-            modified: (metadata.mtime(), metadata.mtime_nsec()),
-        })),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("{}: {error}", path.display())),
+    let mut lines: Vec<String> = Vec::new();
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(entry) = pending.pop() {
+        let metadata = match std::fs::symlink_metadata(&entry) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && entry == path => {
+                break;
+            }
+            Err(error) => return Err(format!("{}: {error}", entry.display())),
+        };
+        let relative = entry.strip_prefix(path).unwrap_or(&entry);
+        lines.push(format!(
+            "{}\0{}\0{}\0{}\0{}.{}\0{}.{}",
+            relative.display(),
+            metadata.mode() & 0o170_000,
+            metadata.ino(),
+            metadata.len(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+        ));
+        if metadata.is_dir() {
+            let names = std::fs::read_dir(&entry)
+                .map_err(|error| format!("{}: {error}", entry.display()))?;
+            for name in names {
+                pending.push(
+                    name.map_err(|error| format!("{}: {error}", entry.display()))?
+                        .path(),
+                );
+            }
+        }
     }
+    lines.sort();
+    Ok(Tree {
+        entries: lines.len(),
+        digest: kr_cbor::sha256(lines.join("\n").as_bytes()),
+    })
 }
 
 /// The person's own agent files as their metadata stood before a driver started anything, and the
-/// check that none of them changed. Only metadata is read, by `stat`: never a file's content, so
-/// the person's login and settings stay unread. A file that is there, gone or replaced is a
-/// change. A directory is recorded and stops nothing: the person's own programs add and remove
-/// entries in it while a driver runs.
+/// check that none of them changed. Every entry under each named path is looked at, by `stat` and
+/// directory listing alone: never a file's content, so the person's login and settings stay unread,
+/// and nothing is written there. An entry that is added, removed, replaced, resized or touched is a
+/// change. What is kept is a digest and a count; what is said is `changed` or `unchanged` and the
+/// counts. A stat cannot show that a file was read, so this is a tripwire for writes.
 #[derive(Clone, Debug)]
 pub struct MetaGuard {
     home: PathBuf,
-    files: Vec<(String, Option<Stat>)>,
-    directories: Vec<(String, Option<Stat>)>,
+    trees: Vec<(String, Tree)>,
 }
 
 impl MetaGuard {
-    /// Takes the metadata of `files` and `directories`, each a path relative to `home`.
+    /// Takes the trees at `trees`, each a path relative to `home`.
     ///
     /// # Panics
     ///
-    /// Panics when the system refuses a path's metadata for a reason other than the path not being
-    /// there: a file whose state is not known cannot be shown unchanged.
+    /// Panics when the system refuses an entry's metadata for a reason other than its not being
+    /// there: a tree whose state is not known cannot be shown unchanged.
     #[must_use]
-    pub fn take(home: &Path, files: &[&str], directories: &[&str]) -> Self {
-        let state = |relative: &&str| {
-            let stat = stat_of(&home.join(relative))
-                .unwrap_or_else(|why| panic!("a file of the person's cannot be looked at: {why}"));
-            ((*relative).to_owned(), stat)
-        };
+    pub fn take(home: &Path, trees: &[&str]) -> Self {
         Self {
             home: home.to_path_buf(),
-            files: files.iter().map(state).collect(),
-            directories: directories.iter().map(state).collect(),
+            trees: trees
+                .iter()
+                .map(|relative| {
+                    let tree = tree_of(&home.join(relative)).unwrap_or_else(|why| {
+                        panic!("a file of the person's cannot be looked at: {why}")
+                    });
+                    ((*relative).to_owned(), tree)
+                })
+                .collect(),
         }
     }
 
-    /// Looks again and says what stops the driver, with what was seen: for each file whether it
-    /// was there and whether its size, modification time or identity changed; never a value.
+    /// Looks again and says what stops the driver, with what was seen: for each tree whether it
+    /// changed and how many entries it held before and holds now; never a name or a value.
     #[must_use]
     pub fn compare(&self) -> (Vec<Stop>, Value) {
         let mut stops: Vec<Stop> = Vec::new();
-        let mut look = |entries: &[(String, Option<Stat>)], stops_on_change: bool| -> Vec<Value> {
-            entries
-                .iter()
-                .map(|(relative, before)| {
-                    let after = stat_of(&self.home.join(relative));
-                    let (changed, present, detail) = match &after {
-                        Ok(after) => (
-                            after != before,
-                            after.is_some(),
-                            json!({
-                                "size_changed": before.as_ref().map(|b| b.bytes) != after.as_ref().map(|a| a.bytes),
-                                "modified_changed": before.as_ref().map(|b| b.modified) != after.as_ref().map(|a| a.modified),
-                                "replaced": before.as_ref().map(|b| b.inode) != after.as_ref().map(|a| a.inode),
-                            }),
-                        ),
-                        Err(why) => {
-                            stops.push((
-                                "person_file_unreadable",
-                                format!("~/{relative} cannot be looked at after the run: {why}"),
-                            ));
-                            (true, false, json!({ "unreadable": true }))
-                        }
-                    };
-                    if changed && stops_on_change && after.is_ok() {
+        let seen: Vec<Value> = self
+            .trees
+            .iter()
+            .map(|(relative, before)| match tree_of(&self.home.join(relative)) {
+                Ok(after) => {
+                    let changed = after != *before;
+                    if changed {
                         stops.push((
                             "guarded_file_changed",
-                            format!("~/{relative} changed while the run ran"),
+                            format!(
+                                "~/{relative} changed while the run ran ({} entries before, {} after)",
+                                before.entries, after.entries
+                            ),
                         ));
                     }
                     json!({
                         "path": format!("~/{relative}"),
-                        "was_there": before.is_some(),
-                        "is_there": present,
                         "changed": changed,
-                        "detail": detail,
+                        "entries_before": before.entries,
+                        "entries_after": after.entries,
                     })
-                })
-                .collect()
-        };
-        let files = look(&self.files, true);
-        let directories = look(&self.directories, false);
-        (
-            stops,
-            json!({ "files": files, "directories_recorded_only": directories }),
-        )
+                }
+                Err(why) => {
+                    stops.push((
+                        "person_file_unreadable",
+                        format!("~/{relative} cannot be looked at after the run: {why}"),
+                    ));
+                    json!({ "path": format!("~/{relative}"), "unreadable": true })
+                }
+            })
+            .collect();
+        (stops, json!({ "trees": seen }))
     }
 }
 
@@ -653,28 +674,45 @@ fn turn_identifier(value: &Value) -> Option<String> {
     }
 }
 
+/// The turns the agent's own record holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Recorded {
+    /// How many turns the model ran, as the record counts them.
+    pub turns: u64,
+    /// How many of them are counted by the text of their line, because the line names no turn.
+    pub unnamed: u64,
+}
+
 /// How many turns the model ran, as the agent's own record under `root` holds them: the lines the
 /// entry's turn line marks, each turn once, whichever of the agent's files, a copy of a
 /// conversation among them, holds it. A line is the same turn as another where both name the same
-/// turn, and where a line names none, where the two lines are equal.
+/// turn (`turn_id`), and where a line names none, where the two lines are equal. Such a line holds
+/// the time it was written, so a copy of a conversation that writes its lines again with other times
+/// counts a turn it copies once more: the count is then too high, never too low, and
+/// [`Recorded::unnamed`] says how many turns stand on their text. No other member of a line
+/// identifies a turn offline.
 ///
 /// # Errors
 ///
 /// Returns why the count is not whole: the entry names no turn line, or an entry of the record
 /// could not be read.
-pub fn turns_recorded(account: &Account, root: &Path) -> Result<u64, String> {
+pub fn turns_recorded(account: &Account, root: &Path) -> Result<Recorded, String> {
     let marker = account.turn_line.as_deref().ok_or_else(|| {
         "the entry names no line that marks a turn, so the turns the agent ran cannot be counted"
             .to_owned()
     })?;
     let mut turns: BTreeSet<String> = BTreeSet::new();
+    let mut unnamed: BTreeSet<String> = BTreeSet::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(path) = pending.pop() {
         let metadata = match std::fs::metadata(&path) {
             Ok(metadata) => metadata,
             // No conversation was written: no turn ran.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && path == root => {
-                return Ok(0);
+                return Ok(Recorded {
+                    turns: 0,
+                    unnamed: 0,
+                });
             }
             Err(error) => return Err(format!("{}: {error}", path.display())),
         };
@@ -694,12 +732,23 @@ pub fn turns_recorded(account: &Account, root: &Path) -> Result<u64, String> {
                         .ok()
                         .as_ref()
                         .and_then(turn_identifier);
-                    turns.insert(named.unwrap_or_else(|| line.to_owned()));
+                    match named {
+                        Some(named) => {
+                            turns.insert(named);
+                        }
+                        None => {
+                            unnamed.insert(line.to_owned());
+                        }
+                    }
                 }
             }
         }
     }
-    Ok(u64::try_from(turns.len()).unwrap_or(u64::MAX))
+    // A name and a line's text cannot be the same turn: they are kept apart, and counted together.
+    Ok(Recorded {
+        turns: u64::try_from(turns.len() + unnamed.len()).unwrap_or(u64::MAX),
+        unnamed: u64::try_from(unnamed.len()).unwrap_or(u64::MAX),
+    })
 }
 
 /// Where the agent's conversations are under its configuration directory: the entry's path before
@@ -737,34 +786,41 @@ mod tests {
     }
 
     #[test]
-    fn a_guarded_file_that_is_written_replaced_or_made_is_a_change_and_a_directory_is_not() {
+    fn a_tree_of_the_persons_is_unchanged_until_any_entry_in_it_is_added_resized_or_removed() {
         let home = scratch("guard");
-        let present = home.join("present");
-        let absent = "absent";
-        std::fs::write(&present, b"one").expect("a file");
-        std::fs::create_dir(home.join("dir")).expect("a directory");
-        let guard = MetaGuard::take(&home, &["present", absent], &["dir"]);
+        let deep = home.join(".agent/sessions/2026/11");
+        std::fs::create_dir_all(&deep).expect("directories");
+        std::fs::write(deep.join("a.jsonl"), b"one").expect("a file");
+        std::fs::write(home.join(".agent/config"), b"x").expect("a file");
+        let guard = MetaGuard::take(&home, &[".agent", ".absent"]);
         let (stops, evidence) = guard.compare();
         assert!(stops.is_empty(), "{stops:?}");
-        assert_eq!(evidence["files"][0]["changed"], json!(false));
-        // A directory gaining an entry is recorded and stops nothing.
-        std::fs::write(home.join("dir").join("x"), b"x").expect("an entry");
+        assert_eq!(evidence["trees"][0]["changed"], json!(false));
+        assert_eq!(evidence["trees"][0]["entries_before"], json!(6));
+        // A new file in a subdirectory two levels down is a change, which no listing of named files
+        // would see.
+        std::fs::write(deep.join("b.jsonl"), b"new").expect("a new file");
         let (stops, evidence) = guard.compare();
-        assert!(stops.is_empty(), "{stops:?}");
-        assert_eq!(
-            evidence["directories_recorded_only"][0]["changed"],
-            json!(true)
-        );
-        // A file written in place changes its size.
-        std::fs::write(&present, b"three").expect("a rewrite");
-        let (stops, _) = guard.compare();
         assert_eq!(stops.len(), 1, "{stops:?}");
         assert_eq!(stops[0].0, "guarded_file_changed");
-        // A file that was not there and is, and one that was there and is gone.
-        std::fs::write(home.join(absent), b"new").expect("a new file");
-        std::fs::remove_file(&present).expect("a removal");
-        let (stops, _) = guard.compare();
-        assert_eq!(stops.len(), 2, "{stops:?}");
+        assert_eq!(evidence["trees"][0]["entries_after"], json!(7));
+        // Nothing of a name goes into what is said or recorded.
+        let said = format!("{stops:?}{evidence}");
+        assert!(
+            !said.contains("jsonl") && !said.contains("sessions"),
+            "{said}"
+        );
+        // A file resized in place, and a path made where there was none, each against a look of its
+        // own: the times of a directory move with every entry added to it or removed from it.
+        let guard = MetaGuard::take(&home, &[".agent", ".absent"]);
+        std::fs::write(deep.join("a.jsonl"), b"three").expect("a rewrite");
+        assert_eq!(guard.compare().0.len(), 1);
+        let guard = MetaGuard::take(&home, &[".agent", ".absent"]);
+        std::fs::write(home.join(".absent"), b"now there").expect("a new file");
+        let (stops, evidence) = guard.compare();
+        assert_eq!(stops.len(), 1, "{stops:?}");
+        assert_eq!(evidence["trees"][1]["entries_before"], json!(0));
+        assert_eq!(evidence["trees"][1]["entries_after"], json!(1));
         std::fs::remove_dir_all(&home).expect("clean up");
     }
 
@@ -791,8 +847,20 @@ mod tests {
             "{\"type\":\"task_started\"}\nnot json \"type\":\"task_started\"\n",
         )
         .expect("lines with no name");
-        assert_eq!(turns_recorded(&account(), &root), Ok(5));
-        assert_eq!(turns_recorded(&account(), &root.join("none")), Ok(0));
+        assert_eq!(
+            turns_recorded(&account(), &root),
+            Ok(Recorded {
+                turns: 5,
+                unnamed: 2
+            })
+        );
+        assert_eq!(
+            turns_recorded(&account(), &root.join("none")),
+            Ok(Recorded {
+                turns: 0,
+                unnamed: 0
+            })
+        );
         let mut unnamed = account();
         unnamed.turn_line = None;
         assert!(turns_recorded(&unnamed, &root).is_err());

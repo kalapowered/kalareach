@@ -19,19 +19,30 @@
 //!   or `resume` or `fork` and a saved thread, and no launch that types an option, so the line
 //!   typed is never more than that and the entry's arguments and switches are keys of the
 //!   `config.toml` of the run's own configuration directory instead
-//!   (`build::Account::configuration_with_switches`). Before a case sends any prompt, the host must
-//!   announce the instance as served through a gateway. The model answers, so each prompt a case
-//!   sends is charged to the turn ledger (`KR_AGENTS_TURNS`) before it is typed or sent; the
-//!   login's value arrives on the descriptor `KR_AGENTS_KEY_FD` names and the values of the other
-//!   keys the harness's shell holds on the one `KR_AGENTS_SCAN_FD` names, exactly as for the
-//!   qualification cases, and one case runs in each process: the pipes empty when they are read.
+//!   (`build::Account::configuration_with_switches`). Before the first launch the entry's isolation
+//!   probes (`features list`, `debug prompt-input`, `mcp list`, the stub's request) run with the
+//!   run's configuration directory and none of the switches, and their answers are compared with
+//!   the entry's lines: a switch the file does not give the agent stops the case before any
+//!   prompt, and so does an entry that asks to stop before its first turn. Before a case sends any
+//!   prompt, the host must announce the instance as served through a gateway. The model answers,
+//!   so each prompt a case sends is charged to the turn ledger (`KR_AGENTS_TURNS`), on disk before
+//!   it is typed or sent; a slash command is sent only once the agent's own list of commands names
+//!   it on the screen, and its text is the entry's (`commands`). The harness's closed-port proxy
+//!   variables stay in the session, since the entry's provider and the gateway are on loopback.
+//!   The login's value arrives on the descriptor `KR_AGENTS_KEY_FD` names and the values of the
+//!   other keys the harness's shell holds on the one `KR_AGENTS_SCAN_FD` names, exactly as for the
+//!   qualification cases, `KR_AGENTS_KEY_SCAN` names the file the search of the run's directory is
+//!   recorded in and is required, and one case runs in each process: the pipes empty when they are
+//!   read.
 //!
-//! On a real route every case, whatever became of it, ends the same way (`held`): what the run
-//! started is ended, the run's directory is searched for the keys and removed, and the search and
-//! the removal are recorded (`KR_AGENTS_KEY_SCAN` names the file); the person's own Codex files are
-//! looked at again by their metadata alone and none may have changed; the agent's own record is
-//! counted for the turns it ran, and one the ledger was not charged for is charged and stops the
-//! case; and no panic message prints a piece of a held key.
+//! On a real route every case, whatever became of it (a failure of its own setup included), ends
+//! the same way (`held`): what the run started is ended, the run's directory is searched for the
+//! keys and removed, and the search and the removal are recorded; the person's own Codex directory
+//! is looked at again, every entry under it by its metadata alone, and nothing there may have
+//! changed; the agent's own record is counted for the turns it ran, and one the ledger was not
+//! charged for is charged and stops the case; an outcome line is written; and no panic message
+//! prints a piece of a held key. Where the managed shell is missing and a real agent was asked
+//! for, the case fails and does not skip.
 //!
 //! Each case shows one assumption of the package's table, and where the real agent's answer differs
 //! from the table's reading it fails and says what it saw:
@@ -76,17 +87,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kr_e2e_agents::RESULT_VARIABLE;
-use kr_e2e_agents::account::Ledger;
-use kr_e2e_agents::build::{self, Account, Build, InstallSwitch};
+use kr_e2e_agents::account::{KEY_SCAN_VARIABLE, Ledger};
+use kr_e2e_agents::build::{self, Account, Build, InstallSwitch, Probe};
 use kr_e2e_agents::held::{
-    Absent, CONFIG_DIRECTORY, HeldKeys, ISOLATION_UNPROVEN, MetaGuard, PROXY_VARIABLES, RunScan,
-    Stop, absent_paths, conversations_root, kept_panic_text, panic_text, turns_recorded,
+    Absent, CONFIG_DIRECTORY, HeldKeys, ISOLATION_UNPROVEN, MetaGuard, RunScan, Stop, absent_paths,
+    conversations_root, kept_panic_text, panic_text, turns_recorded,
 };
 use kr_e2e_agents::outcome::Outcome;
 use kr_e2e_agents::stage::{Installation, closed_port, session_variables};
+use kr_e2e_agents::stub::RequestStub;
 use kr_e2e_m1b::device::{Device, PairedHost, Remote, RequestError};
 use kr_e2e_m1b::host::{Host, HostOptions, Preparation};
-use kr_e2e_m1b::run::Run;
+use kr_e2e_m1b::run::{Run, output_within};
 use kr_e2e_m1b::window::{Window, answered};
 use kr_e2e_m1b::{LIVENESS, ceremony, shells};
 use kr_ipc::paths::EnvironmentPaths;
@@ -145,23 +157,11 @@ const ACCEPT: &str = "accept";
 /// The decision a device gives to end the turn that waits on an approval.
 const DECLINE: &str = "decline-and-stop";
 
-/// The person's own Codex files whose metadata a real run is held to leave as it found it: the
-/// login, the settings, the instructions and hooks the agent would load, and the files it appends
-/// to when it is used. Nothing of them is read.
-const PERSON_FILES: [&str; 8] = [
-    ".codex/auth.json",
-    ".codex/config.toml",
-    ".codex/AGENTS.md",
-    ".codex/hooks.json",
-    ".codex/.credentials.json",
-    ".codex/history.jsonl",
-    ".codex/session_index.jsonl",
-    ".codex/log/codex-tui.log",
-];
-
-/// The person's own Codex directory, recorded and not held: the person's own programs add and
-/// remove entries in it.
-const PERSON_DIRECTORIES: [&str; 1] = [".codex"];
+/// The person's own Codex directory, whose every entry a real run is held to leave as it found it:
+/// the login, the settings, the instructions and hooks the agent would load, its conversations and
+/// the files it appends to when it is used. Entries are looked at by their metadata alone: nothing
+/// of a file is read, and nothing is written there.
+const PERSON_TREES: [&str; 1] = [".codex"];
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
@@ -246,6 +246,11 @@ impl Route {
         else {
             return Self::StandIn;
         };
+        assert!(
+            std::env::var_os(KEY_SCAN_VARIABLE).is_some_and(|value| !value.is_empty()),
+            "{BUILD_VARIABLE} asks for a real agent, and {KEY_SCAN_VARIABLE} names no file to record \
+             the search of the run's directory for the keys in"
+        );
         let build = build::read_build(&path);
         let account = build.account.clone().unwrap_or_else(|| {
             panic!("{BUILD_VARIABLE} names an entry with no login, which no case may start")
@@ -253,7 +258,7 @@ impl Route {
         let held = HeldKeys::read(&format!("gateway case {case}"), &account);
         let ledger = Ledger::from_environment(&account.budget, account.turns);
         let home = PathBuf::from(std::env::var_os("HOME").expect("the person's home in HOME"));
-        let person = MetaGuard::take(&home, &PERSON_FILES, &PERSON_DIRECTORIES);
+        let person = MetaGuard::take(&home, &PERSON_TREES);
         Self::Real(Box::new(Real {
             build,
             account,
@@ -290,14 +295,13 @@ impl Real {
         (run.root().display().to_string(), work)
     }
 
-    /// The environment a session of the run is created with: the harness's own for a session, with
-    /// no proxy variable, since the agent reaches its provider on loopback, the entry's variables,
-    /// its configuration directory with the entry's arguments and switches written as the keys of
-    /// its `config.toml`, and its login, and none of the variables the entry clears but the ones it
-    /// sets itself.
+    /// The environment a session of the run is created with: the harness's own for a session, its
+    /// closed-port proxy variables included (the entry's provider and the gateway are on loopback,
+    /// which `NO_PROXY` exempts), the entry's variables, its configuration directory with the
+    /// entry's arguments and switches written as the keys of its `config.toml`, and its login, and
+    /// none of the variables the entry clears but the ones it sets itself.
     fn variables(&self, host: &Host<'_>, shell: &shells::ManagedShell) -> Vec<(String, String)> {
         let mut variables = session_variables(host, shell, &self.build.environment, closed_port());
-        variables.retain(|(name, _)| !PROXY_VARIABLES.contains(&name.as_str()));
         for name in ["USER", "LOGNAME"] {
             if let Ok(value) = std::env::var(name) {
                 variables.push((name.to_owned(), value));
@@ -379,6 +383,107 @@ impl Real {
         }
     }
 
+    /// Runs the entry's isolation probes before the agent's first launch, as the qualification
+    /// parts run them, but with the run's own configuration directory and none of the switches the
+    /// entry types: what each answers is what the run's `config.toml` gave the agent. Each answer is
+    /// compared with the entry's lines, which stand for what the switches do; a probe that does not
+    /// answer as it must stops the case, with no prompt sent and no turn spent. A probe that sends
+    /// the agent's request to the stub is checked too against a tool added on purpose, which its
+    /// check must refuse. No model is called and no login is sent. The person's servers are not
+    /// read: the run's home names none.
+    ///
+    /// # Panics
+    ///
+    /// Panics at the first probe that does not answer as it must.
+    fn proves_isolation(&self, run: &Run, variables: &[(String, String)]) {
+        for probe in &self.account.isolated {
+            self.proves(run, variables, probe).unwrap_or_else(|why| {
+                panic!(
+                    "{ISOLATION_UNPROVEN} `{} {}` did not answer as it must with the entry's \
+                         switches in the run's configuration file alone: {why}",
+                    self.build.command,
+                    probe.arguments.join(" ")
+                )
+            });
+        }
+    }
+
+    /// One probe of [`Real::proves_isolation`].
+    fn proves(
+        &self,
+        run: &Run,
+        variables: &[(String, String)],
+        probe: &Probe,
+    ) -> Result<(), String> {
+        let stub = probe
+            .arguments
+            .iter()
+            .any(|argument| argument.contains("{stub}"))
+            .then(RequestStub::start)
+            .transpose()?;
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("exec \"$0\" \"$@\"")
+            .arg(&self.build.command)
+            .args(probe.arguments.iter().map(|argument| match &stub {
+                Some(stub) => argument.replace("{stub}", stub.address()),
+                None => argument.clone(),
+            }))
+            .env_clear()
+            .envs(
+                variables
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            )
+            .current_dir(run.work());
+        let output = output_within(command, LIVENESS)?;
+        match stub {
+            // The stub refuses the request on purpose, so how the command ended says nothing: what
+            // the request offered is the answer.
+            Some(stub) => {
+                let text = stub.finish()?.join("\n");
+                probe.check(&text, &[], None)?;
+                let lacking = probe
+                    .lacks
+                    .iter()
+                    .find(|lack| lack.as_str() != "{servers}")
+                    .cloned()
+                    .unwrap_or_default();
+                if !lacking.is_empty()
+                    && probe
+                        .check(&format!("{text}\nnested control/{lacking}"), &[], None)
+                        .is_ok()
+                {
+                    return Err(format!(
+                        "its check did not refuse a tool named for {lacking:?}, added on purpose"
+                    ));
+                }
+                Ok(())
+            }
+            None => {
+                if !output.status.success() {
+                    return Err(format!("it ended with {}", output.status));
+                }
+                let text = String::from_utf8_lossy(&output.stdout).into_owned()
+                    + &String::from_utf8_lossy(&output.stderr);
+                probe.check(&text, &[], None)
+            }
+        }
+    }
+
+    /// The text the entry names for the slash command `name` (`fork`, `new` or `quit`).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the entry names none: the driver's code carries no command of its own.
+    fn command(&self, name: &str) -> &str {
+        self.account.commands.get(name).map_or_else(
+            || panic!("the entry names no {name:?} command, which this case sends"),
+            String::as_str,
+        )
+    }
+
     /// Charges one turn to the entry's budget before a prompt the model answers is sent.
     fn charge(&self, case: &str, what: &str) {
         let _ = self
@@ -435,20 +540,24 @@ struct Context {
 }
 
 impl Context {
-    /// Makes the run and places the agent, or says why the case cannot run here.
-    fn start(leg: &str, case: &str) -> Option<Self> {
-        let shell = match shells::managed_zsh() {
-            Ok(shell) => shell,
-            Err(why) if shells::required() => panic!("the {leg} leg's managed shell: {why}"),
-            Err(why) => {
-                eprintln!("skipping the {leg} leg: {why}");
-                return None;
-            }
-        };
-        let route = Route::from_environment(case);
-        let run = Run::start(leg);
+    /// A case's context before the agent is placed: nothing but what exists already.
+    fn new(shell: shells::ManagedShell, route: Route, run: Run) -> Self {
+        Self {
+            runtime: runtime(),
+            run,
+            shell,
+            route,
+            executable: PathBuf::new(),
+            bin: PathBuf::new(),
+        }
+    }
+
+    /// Places the forwarder and the agent in the run, and checks the entry. A failure here is a
+    /// failure of the case, which ends as every case does.
+    fn place(&mut self) {
+        let run = &self.run;
         run.place_built("kr-hook", &run.binary("kr-hook"), &["--version"]);
-        let (executable, bin) = match &route {
+        let (executable, bin) = match &self.route {
             Route::StandIn => {
                 let tools = run.root().join("t");
                 kr_ipc::paths::create_private_tree(run.root(), &tools)
@@ -457,7 +566,7 @@ impl Context {
                 (tools.join("codex"), tools)
             }
             Route::Real(real) => {
-                real.checks_installs_off(&run);
+                real.checks_installs_off(run);
                 let pinned = real.build.pinned_file();
                 let bytes = std::fs::read(&pinned).unwrap_or_else(|error| {
                     panic!("the pinned build {}: {error}", pinned.display())
@@ -470,19 +579,12 @@ impl Context {
                     real.build.sha256,
                     "the pinned build is the file the entry's digest names"
                 );
-                let installation =
-                    Installation::link(&run, &real.build.prefix, &real.build.runtime);
+                let installation = Installation::link(run, &real.build.prefix, &real.build.runtime);
                 (pinned, installation.bin())
             }
         };
-        Some(Self {
-            runtime: runtime(),
-            run,
-            shell,
-            route,
-            executable,
-            bin,
-        })
+        self.executable = executable;
+        self.bin = bin;
     }
 
     /// The distribution and version the generation lists the executable as.
@@ -995,6 +1097,30 @@ impl Person {
         self.window.type_text(b"\r");
     }
 
+    /// Types the slash command `command`, waits until the agent's own list of commands names it on
+    /// the screen, pauses, and submits it. Where the list never names it, nothing is submitted and
+    /// the case fails: a text the agent does not know as a command goes to its model as a prompt,
+    /// which no charge was made for.
+    fn sends_command(&self, command: &str) {
+        self.window.type_text(command.as_bytes());
+        let started = Instant::now();
+        loop {
+            let rows = self.window.screen();
+            if rows.iter().any(|row| lists_command(row, command)) {
+                break;
+            }
+            assert!(
+                started.elapsed() < LIVENESS,
+                "the agent's list of commands does not name {command:?} after {LIVENESS:?}, so it \
+                 was not sent; the screen is:\n{}",
+                rows.join("\n")
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        self.window.type_text(b"\r");
+    }
+
     /// A question whose answer is on the screen now and in none of `avoid`, so that the answer's
     /// appearing is the agent's.
     fn asks(&self, avoid: &[&str]) -> (String, String) {
@@ -1045,6 +1171,18 @@ impl Person {
     }
 }
 
+/// Whether `row` of the screen is a line of the agent's own list of commands that names `command`:
+/// the command first, with the frame an agent draws around its rows and the spaces beside it taken
+/// off, and a description after it. The composer's own row, which shows what was typed after the
+/// prompt's mark, and a longer command that begins with the same letters, are not it.
+fn lists_command(row: &str, command: &str) -> bool {
+    let row = row.trim_matches(|character: char| {
+        character.is_whitespace() || matches!(character, '│' | '┃' | '║')
+    });
+    row.strip_prefix(command)
+        .is_some_and(|rest| rest.starts_with(char::is_whitespace) && !rest.trim().is_empty())
+}
+
 /// A named pipe in the run's own directory: a command that writes to it waits there until the case
 /// reads, so the case holds a turn open for as long as it needs, and reads what the command wrote.
 struct Fifo(PathBuf);
@@ -1061,34 +1199,48 @@ impl Fifo {
     }
 
     /// Opens the pipe for reading without waiting for a writer, which lets a command blocked on
-    /// opening it for writing go on, and reads until a line arrives or `within` has passed.
-    fn line(&self, within: Duration) -> Option<String> {
+    /// opening it for writing go on. The reader stays open, so that a second run of the command,
+    /// which would block on opening the pipe, finds it open and writes: what it wrote is read too.
+    fn reader(&self) -> FifoReader {
         let flags = i32::try_from(rustix::fs::OFlags::NONBLOCK.bits()).expect("a flag");
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(flags)
             .open(&self.0)
-            .ok()?;
-        let started = Instant::now();
-        let mut text = Vec::new();
+            .unwrap_or_else(|error| panic!("the case's pipe cannot be opened: {error}"));
+        FifoReader {
+            file,
+            text: Vec::new(),
+        }
+    }
+}
+
+/// An open reader of a [`Fifo`], and everything it has read.
+struct FifoReader {
+    file: std::fs::File,
+    text: Vec<u8>,
+}
+
+impl FifoReader {
+    /// Reads what the pipe holds now, without waiting.
+    fn poll(&mut self) {
         loop {
             let mut buffer = [0_u8; 256];
-            match file.read(&mut buffer) {
-                Ok(count) if count > 0 => {
-                    text.extend_from_slice(&buffer[..count]);
-                    if text.contains(&b'\n') {
-                        return Some(String::from_utf8_lossy(&text).trim().to_owned());
-                    }
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => return None,
+            match self.file.read(&mut buffer) {
+                Ok(count) if count > 0 => self.text.extend_from_slice(&buffer[..count]),
+                Ok(_) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(error) => panic!("the case's pipe cannot be read: {error}"),
             }
-            if started.elapsed() >= within {
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// The lines read so far, each trimmed.
+    fn lines(&self) -> Vec<String> {
+        String::from_utf8_lossy(&self.text)
+            .lines()
+            .map(|line| line.trim().to_owned())
+            .collect()
     }
 }
 
@@ -1207,6 +1359,10 @@ impl<'a> Session<'a> {
                 // agent's first start, as they are before any part's.
                 if not.is_none() {
                     real.checks_absent(&self.ctx.run);
+                    // The entry's isolation probes, with the run's configuration directory and no
+                    // switch typed: no prompt, no turn, and no model.
+                    real.proves_isolation(&self.ctx.run, &self.ctx.variables(&self.host));
+                    real.checks_absent(&self.ctx.run);
                 }
                 let _ = self.person.types_until_it_shows(
                     &real.typed(extra),
@@ -1230,6 +1386,13 @@ impl<'a> Session<'a> {
             .find(|id| Some(*id) != not)
             .expect("an instance");
         self.gateway_serves(instance);
+        if let Route::Real(real) = &self.ctx.route {
+            assert!(
+                !real.account.stop_before_turns,
+                "the case stops once the agent is up behind the gateway and the checks before its \
+                 first prompt have passed, as the build list asks: no turn was started"
+            );
+        }
         instance
     }
 
@@ -1344,8 +1507,8 @@ fn ends(ctx: Context, case: &str, test: &str, result: std::thread::Result<serde_
             &conversations_root(&real.account, &run.root().join(CONFIG_DIRECTORY)),
         );
         match &recorded {
-            Ok(found) if *found > charged => {
-                let surplus = found - charged;
+            Ok(found) if found.turns > charged => {
+                let surplus = found.turns - charged;
                 let said = real
                     .ledger
                     .charge_found(
@@ -1360,8 +1523,11 @@ fn ends(ctx: Context, case: &str, test: &str, result: std::thread::Result<serde_
                 stops.push((
                     "uncharged_turns",
                     format!(
-                        "the agent's record holds {found} turn(s) against {charged} charged; \
-                         {surplus} charged now ({said})"
+                        "the agent's record holds {} turn(s), {} of them counted by the text of their \
+                         line, against {charged} charged; {surplus} charged now ({said}). A copy of \
+                         a conversation written again with other times counts its turns twice, so \
+                         the count can be too high and never too low",
+                        found.turns, found.unnamed
                     ),
                 ));
             }
@@ -1373,7 +1539,8 @@ fn ends(ctx: Context, case: &str, test: &str, result: std::thread::Result<serde_
         }
         evidence["turns"] = serde_json::json!({
             "charged": charged,
-            "in_the_agents_record": recorded.as_ref().ok(),
+            "in_the_agents_record": recorded.as_ref().ok().map(|found| found.turns),
+            "counted_by_the_text_of_their_line": recorded.as_ref().ok().map(|found| found.unnamed),
         });
         scan = Some(RunScan::of(&root, &real.held));
         secrets = real.held.values();
@@ -1383,6 +1550,15 @@ fn ends(ctx: Context, case: &str, test: &str, result: std::thread::Result<serde_
     if let Some(scan) = scan {
         let (scan_stops, scan_evidence) = scan.finish(&root, case, writers_ended);
         stops.extend(scan_stops);
+        eprintln!(
+            "the {case} run's directory, which the run's own end above says it keeps, was searched \
+             for the keys, recorded and removed: {}",
+            if scan_evidence["run_gone"] == serde_json::json!(true) {
+                "it is gone"
+            } else {
+                "it is still there"
+            }
+        );
         evidence["keys"] = scan_evidence;
     }
     let path = std::env::var_os(RESULT_VARIABLE)
@@ -1426,8 +1602,20 @@ fn ends(ctx: Context, case: &str, test: &str, result: std::thread::Result<serde_
     }
 }
 
+/// Appends the outcome of a case that failed before its run stood, where a result file is named.
+fn records_failure(case: &str, test: &str, why: &str, secrets: &[String]) {
+    if let Some(path) = std::env::var_os(RESULT_VARIABLE).filter(|value| !value.is_empty()) {
+        Outcome::failed(case, test, why, serde_json::json!({}))
+            .without(secrets)
+            .append(Path::new(&path));
+    }
+}
+
 /// Runs one case: a host, a paired device and a person in a managed shell, `body` on them, the
-/// host's close, and whatever follows every outcome of a case ([`ends`]).
+/// host's close, and whatever follows every outcome of a case ([`ends`]). What can fail before the
+/// run exists (the managed shell, the keys, the run's own start) leaves an outcome line; what fails
+/// once it does, placing the agent included, ends as every case does. A case that asked for a real
+/// agent does not skip where the managed shell is missing.
 fn run_case(
     leg: &str,
     case: &str,
@@ -1435,10 +1623,40 @@ fn run_case(
     variants: &str,
     body: impl FnOnce(&Context, &Session<'_>) -> serde_json::Value,
 ) {
-    let Some(ctx) = Context::start(leg, case) else {
-        return;
+    let real_asked = std::env::var_os(BUILD_VARIABLE).is_some_and(|value| !value.is_empty());
+    let shell = match shells::managed_zsh() {
+        Ok(shell) => shell,
+        Err(why) if shells::required() || real_asked => {
+            let why = format!("the {leg} leg's managed shell: {why}");
+            records_failure(case, test, &why, &[]);
+            panic!("{why}");
+        }
+        Err(why) => {
+            eprintln!("skipping the {leg} leg: {why}");
+            return;
+        }
     };
+    let route = match std::panic::catch_unwind(|| Route::from_environment(case)) {
+        Ok(route) => route,
+        Err(panic) => {
+            records_failure(case, test, &kept_panic_text(&panic_text(&*panic)), &[]);
+            std::panic::resume_unwind(panic);
+        }
+    };
+    let secrets = match &route {
+        Route::Real(real) => real.held.values(),
+        Route::StandIn => Vec::new(),
+    };
+    let run = match std::panic::catch_unwind(|| Run::start(leg)) {
+        Ok(run) => run,
+        Err(panic) => {
+            records_failure(case, test, &kept_panic_text(&panic_text(&*panic)), &secrets);
+            std::panic::resume_unwind(panic);
+        }
+    };
+    let mut ctx = Context::new(shell, route, run);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.place();
         let session = Session::open(&ctx, variants);
         let shows = body(&ctx, &session);
         ctx.close(&session.host);
@@ -1562,16 +1780,32 @@ fn gateway_a_device_answers_an_approval_and_the_terminal_closes_its_prompt() {
                         "the turn ended with the dialog's closing, so the closing is not shown to be \
                          the server's word: {open:?}"
                     );
-                    let written = pipe.line(LIVENESS);
-                    assert_eq!(
-                        written.as_deref(),
-                        Some(mark.as_str()),
-                        "the command ran once and wrote its marker"
+                    // The reader is opened now, and stays open until the turn has ended: a run of
+                    // the command is a line in the pipe, and a second run would find the pipe open
+                    // and write its line too.
+                    let mut reader = pipe.reader();
+                    let started = Instant::now();
+                    loop {
+                        reader.poll();
+                        let binding = ctx.binding(&session.remote, session.session_id(), instance);
+                        if binding.turn_id.0.is_none() && unsuspended(&binding) {
+                            break;
+                        }
+                        assert!(
+                            started.elapsed() < LIVENESS,
+                            "the turn does not end after {LIVENESS:?}: the binding is {binding:?}"
+                        );
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    reader.poll();
+                    let ran = reader.lines().iter().filter(|line| **line == mark).count();
+                    let others = reader.lines().len() - ran;
+                    assert!(
+                        ran == 1 && others == 0,
+                        "the command wrote its marker {ran} time(s) and something else {others} time(s) \
+                         through the end of the turn, where it was to run once"
                     );
-                    let _ = session.binding_until(instance, "the turn ends", |binding| {
-                        binding.turn_id.0.is_none() && unsuspended(binding)
-                    });
-                    serde_json::json!({ "command_ran": 1, "turn_open_after_the_prompt_closed": true })
+                    serde_json::json!({ "command_ran": ran, "turn_open_after_the_prompt_closed": true })
                 }
             }
         },
@@ -1731,9 +1965,7 @@ fn gateway_the_binding_changes_its_thread_only_where_the_terminal_starts_resumes
                         &account.busy,
                         "the composer waits before the command",
                     );
-                    session
-                        .person
-                        .composes(&account.slash.input, &account.slash.input);
+                    session.person.sends_command(&account.slash.input);
                     let _ = session
                         .person
                         .sees(&account.slash.shows, "the command answers");
@@ -1754,7 +1986,7 @@ fn gateway_the_binding_changes_its_thread_only_where_the_terminal_starts_resumes
                         &account.busy,
                         "the composer waits before the fork",
                     );
-                    session.person.composes("/fork", "/fork");
+                    session.person.sends_command(real.command("fork"));
                     let forked = session.binding_until(
                         instance,
                         "the terminal forks the thread",
@@ -1769,7 +2001,7 @@ fn gateway_the_binding_changes_its_thread_only_where_the_terminal_starts_resumes
                         &account.busy,
                         "the composer waits before the new conversation",
                     );
-                    session.person.composes("/new", "/new");
+                    session.person.sends_command(real.command("new"));
                     let fresh = session.binding_until(
                         instance,
                         "the terminal starts a new thread",
@@ -1790,7 +2022,7 @@ fn gateway_the_binding_changes_its_thread_only_where_the_terminal_starts_resumes
                         &account.busy,
                         "the composer waits before the quit",
                     );
-                    session.person.composes("/quit", "/quit");
+                    session.person.sends_command(real.command("quit"));
                     let _ = ctx.instances_until(
                         &session.remote,
                         session.session_id(),
@@ -1873,9 +2105,7 @@ fn gateway_a_whole_session_names_no_method_the_table_does_not_list() {
                         &account.busy,
                         "the composer waits before the command",
                     );
-                    session
-                        .person
-                        .composes(&account.slash.input, &account.slash.input);
+                    session.person.sends_command(&account.slash.input);
                     let _ = session
                         .person
                         .sees(&account.slash.shows, "the command answers");
@@ -2052,4 +2282,17 @@ fn the_launches_the_real_route_types_are_ones_the_command_integration_serves() {
         let words = launch_words("codex", options);
         assert!(backend.refuses(&words).is_some(), "{words:?}");
     }
+}
+
+/// The agent's list of commands names a command with a description after it, and nothing else on
+/// the screen counts: not the composer's own row, not a longer command that begins with the same
+/// letters, not the command alone.
+#[test]
+fn a_command_is_named_only_by_a_row_of_the_agents_own_list_of_commands() {
+    assert!(lists_command("  /fork      fork the current chat", "/fork"));
+    assert!(lists_command("│ /fork  copy this conversation │", "/fork"));
+    assert!(!lists_command("› /fork", "/fork"), "the composer's row");
+    assert!(!lists_command("/fork", "/fork"), "no description");
+    assert!(!lists_command("  /forked    another command", "/fork"));
+    assert!(!lists_command("  /new       start a new chat", "/fork"));
 }

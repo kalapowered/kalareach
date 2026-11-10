@@ -920,6 +920,12 @@ pub struct Account {
     pub busy: String,
     /// A slash command that calls no model and changes no conversation, and the text it shows.
     pub slash: Keys,
+    /// The agent's own slash commands that a driver sends by what they do, each the text typed at
+    /// the composer: `fork` copies the conversation into a thread of its own, `new` starts a new
+    /// conversation, `quit` ends the agent. A driver sends one only once the agent's own list of
+    /// commands names it on the screen.
+    #[serde(default)]
+    pub commands: BTreeMap<String, String>,
     /// What closes the slash command's screen; nothing, where it leaves none to close.
     #[serde(default)]
     pub dismiss: String,
