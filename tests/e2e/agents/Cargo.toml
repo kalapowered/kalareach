@@ -14,6 +14,11 @@ name = "cases"
 [[test]]
 name = "integration"
 
+[[test]]
+# The assumptions the Codex package's table makes of the pinned terminal and server, shown behind a
+# gateway with the application stand-in or, as one switch says, the pinned build.
+name = "gateway"
+
 [dependencies]
 # The host, the paired device, the terminal windows and the process record: the cross-boundary
 # checkpoint's own harness, used as a library.
@@ -45,6 +50,16 @@ tokio.workspace = true
 [target.'cfg(unix)'.dependencies]
 # Signals by recorded process, and opening a mapped file without waiting on it.
 rustix = { workspace = true, features = ["fs", "process", "termios"] }
+
+[dev-dependencies]
+# The keys and expiry a test signs a catalogue generation of its own with, through the catalogue's
+# own generation builder, and the connector package the host reads.
+aws-lc-rs.workspace = true
+jiff.workspace = true
+kr-plugin-catalogue = { workspace = true, features = ["testing"] }
+kr-worker = { workspace = true, features = ["testing"] }
+tough.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true
