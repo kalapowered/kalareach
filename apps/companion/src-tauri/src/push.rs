@@ -2870,8 +2870,13 @@ impl<T: Clone> Held<T> {
 
     /// Drops what is held for `host` for any action but `action`, which is about to be sent: the
     /// registration the host is asked about is the one the phone sends now, and what was held was
-    /// for an earlier one.
-    fn superseded_by(&mut self, host: DeviceId, action: ActionId) {
+    /// for an earlier one. Says whether the line is still the current one: a line made before the
+    /// host was forgotten (`forgettings` is the count it was made at) drops nothing, as it keeps
+    /// nothing, since what is held now belongs to a run that began after.
+    fn superseded_by(&mut self, host: DeviceId, forgettings: u64, action: ActionId) -> bool {
+        if self.forgettings(host) != forgettings {
+            return false;
+        }
         if self
             .requests
             .get(&host)
@@ -2879,6 +2884,7 @@ impl<T: Clone> Held<T> {
         {
             self.requests.remove(&host);
         }
+        true
     }
 
     /// Drops what is held for `host`, which was forgotten: no line made before this keeps another.
@@ -3103,7 +3109,12 @@ impl HostLine for ConnectionLine {
 
             // The desk kept this registration before it called, in place of the one it was asked
             // about: what is held for the host is for an earlier action, whatever happens next.
-            self.repeats().superseded_by(self.host_device_id, action);
+            if !self
+                .repeats()
+                .superseded_by(self.host_device_id, self.forgettings, action)
+            {
+                return Err(LineStop::Phone(forgotten_host().words));
+            }
             self.still_the_account()?;
             let session = self.connection.session();
             // Composed first, so that the action is the desk's own and is known whatever happens
@@ -3514,7 +3525,7 @@ mod tests {
         let mut held = Held::<&str>::default();
         let now = held.forgettings(host);
         assert!(held.keep(host, now, earlier, "the earlier request"));
-        held.superseded_by(host, newer);
+        assert!(held.superseded_by(host, now, newer));
         assert!(
             !held.holds(host, earlier),
             "a registration about to be sent drops what was held for an earlier one"
@@ -3527,10 +3538,40 @@ mod tests {
             held.holds(host, newer),
             "the answer to the earlier registration is not the answer to this one"
         );
-        held.superseded_by(host, newer);
+        assert!(held.superseded_by(host, now, newer));
         assert!(held.holds(host, newer), "control: the same action is kept");
         held.settled(host, newer);
         assert!(!held.holds(host, newer), "control: its own answer drops it");
+    }
+
+    /// A line made before its host was forgotten, resuming after a new run kept its own request,
+    /// does not drop that request when it supersedes what it believes is held: it is not the line
+    /// of the run that holds the host any more.
+    #[test]
+    fn a_line_made_before_its_host_was_forgotten_cannot_supersede_a_newer_request() {
+        let host = DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([8; 16]));
+        let old = ActionId::new(kr_ipc::new_uuid());
+        let newer = ActionId::new(kr_ipc::new_uuid());
+        let mut held = Held::<&str>::default();
+        let old_line = held.forgettings(host);
+        assert!(held.keep(host, old_line, old, "the old request"));
+
+        held.forget(host);
+        let new_line = held.forgettings(host);
+        assert!(held.keep(host, new_line, newer, "the newer request"));
+        assert!(
+            !held.superseded_by(host, old_line, old),
+            "the old line is not the current one"
+        );
+
+        assert!(
+            held.holds(host, newer),
+            "the old line does not drop what a later run kept"
+        );
+        assert!(
+            held.superseded_by(host, new_line, newer),
+            "control: the current line is"
+        );
     }
 
     /// A time later than the start's own is a clock set back: the retry is not delayed by it.
