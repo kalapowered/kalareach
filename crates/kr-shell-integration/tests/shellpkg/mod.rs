@@ -1277,7 +1277,10 @@ impl Session {
         command.env("XDG_CONFIG_HOME", home.join(".config"));
         command.env("XDG_DATA_HOME", home.join(".local").join("share"));
         command.env("TERM", "xterm-256color");
+        // `LC_ALL` is set with `LANG`: a run that inherits `LC_ALL` or `LC_CTYPE` would otherwise
+        // run the shell in that locale, whatever `LANG` says.
         command.env("LANG", "C");
+        command.env("LC_ALL", "C");
         if managed {
             command.env("KR_SESSION", session_id.to_string());
             command.env("KR_SHELL_BRIDGE", &endpoint.path);
@@ -3610,6 +3613,7 @@ mod identity;
 mod inbox;
 mod launch;
 mod lines;
+mod locale;
 mod stacks;
 
 // Each test binary that includes this module uses one part of it: the four package suites use the
@@ -3628,5 +3632,7 @@ pub use inbox::*;
 pub use launch::*;
 #[allow(unused_imports)]
 pub use lines::*;
+#[allow(unused_imports)]
+pub use locale::*;
 #[allow(unused_imports)]
 pub use stacks::*;

@@ -988,6 +988,7 @@ fn home_environment(home: &Path, order: &Path) -> Vec<(String, String)> {
         ("KR_TEST_ORDER".to_owned(), told(order)),
         ("TERM".to_owned(), "xterm-256color".to_owned()),
         ("LANG".to_owned(), "C".to_owned()),
+        ("LC_ALL".to_owned(), "C".to_owned()),
     ]
 }
 

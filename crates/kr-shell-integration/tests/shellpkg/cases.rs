@@ -1222,6 +1222,8 @@ pub fn a_hosts_answer_behind_typed_text_leaves_the_text_drawn(kind: ShellKind) {
 /// line that prints a word from two arguments with a letter missing from the second, presses
 /// Escape, takes in an answer and presses `b` in the same write: the editor's backward-word. The
 /// letter then goes in front of the second argument only if the Escape and the `b` made the key.
+/// The case runs under a byte locale and under a UTF-8 locale, each named, whatever locale the run
+/// inherited.
 ///
 /// # Panics
 ///
@@ -1229,13 +1231,20 @@ pub fn a_hosts_answer_behind_typed_text_leaves_the_text_drawn(kind: ShellKind) {
 #[cfg(unix)]
 pub fn an_escape_and_a_hosts_answer_in_one_delivery_leave_the_escape_a_key(kind: ShellKind) {
     let package = Package::built(kind);
-    let mut session = Session::start(&package);
-    session.first_prompt();
-    let line = format!("printf '%s%s\\n' kr-ans ered\x1b{}bw", HOST_ANSWERS[0]);
-    assert!(
-        session.run(&line, "kr-answered"),
-        "the Escape in front of the host's answer was not the Escape of the key that followed:\n{}",
-        session.terminal_output()
+    in_each_locale(
+        kind,
+        "an_escape_and_a_hosts_answer_in_one_delivery_leave_the_escape_a_key",
+        |locale| {
+            let mut session = Session::start_in_locale(&package, locale);
+            session.first_prompt();
+            let line = format!("printf '%s%s\\n' kr-ans ered\x1b{}bw", HOST_ANSWERS[0]);
+            assert!(
+                session.run(&line, "kr-answered"),
+                "the Escape in front of the host's answer was not the Escape of the key that \
+                 followed, under the {locale} locale:\n{}",
+                session.terminal_output()
+            );
+        },
     );
 }
 
@@ -1250,35 +1259,48 @@ pub fn an_escape_and_a_hosts_answer_in_one_delivery_leave_the_escape_a_key(kind:
 /// the indicator to say command mode, and then appends a second word with `A` and runs the line.
 /// The indicator is the editor's own drawing, which nothing the person typed can put on the screen.
 ///
+/// The wait is for the mode's name, `cmd`, and not for the whole indicator `(cmd)`. A byte locale
+/// redraws the indicator with its parentheses, and a UTF-8 locale moves the cursor over the
+/// parentheses that stay and writes only what changed, so the whole indicator is never on the
+/// screen in one piece there. The case runs under each locale, named, whatever locale the run
+/// inherited.
+///
 /// # Panics
 ///
 /// Panics when the indicator does not change, or the line does not print the word.
 #[cfg(unix)]
 pub fn an_escape_and_a_hosts_answer_in_one_delivery_leave_vi_insert_mode(kind: ShellKind) {
     let package = Package::built(kind);
-    let mut session = Session::start(&package);
-    session.first_prompt();
-    assert!(
-        session.run(
-            "set -o vi; bind 'set show-mode-in-prompt on'; printf '%s%s\\n' kr-vi- on",
-            "kr-vi-on"
-        ),
-        "the editor did not switch to vi bindings:\n{}",
-        session.terminal_output()
-    );
-    let _ = session.next_prompt();
-    let start = session.written();
-    let keys = format!("printf '%s%s\\n' kr-\x1b{}", HOST_ANSWERS[0]);
-    session.type_bytes(keys.as_bytes());
-    assert!(
-        session.drew_after(start, "(cmd)", REPLY).was_drawn(),
-        "the editor stayed in insert mode after an Escape with an answer behind it:\n{}",
-        session.terminal_output()
-    );
-    assert!(
-        session.finish_line(&keys, "A ab", "kr-ab"),
-        "the line appended in command mode did not run:\n{}",
-        session.terminal_output()
+    in_each_locale(
+        kind,
+        "an_escape_and_a_hosts_answer_in_one_delivery_leave_vi_insert_mode",
+        |locale| {
+            let mut session = Session::start_in_locale(&package, locale);
+            session.first_prompt();
+            assert!(
+                session.run(
+                    "set -o vi; bind 'set show-mode-in-prompt on'; printf '%s%s\\n' kr-vi- on",
+                    "kr-vi-on"
+                ),
+                "the editor did not switch to vi bindings under the {locale} locale:\n{}",
+                session.terminal_output()
+            );
+            let _ = session.next_prompt();
+            let start = session.written();
+            let keys = format!("printf '%s%s\\n' kr-\x1b{}", HOST_ANSWERS[0]);
+            session.type_bytes(keys.as_bytes());
+            assert!(
+                session.drew_after(start, "cmd", REPLY).was_drawn(),
+                "the editor stayed in insert mode after an Escape with an answer behind it, \
+                 under the {locale} locale:\n{}",
+                session.terminal_output()
+            );
+            assert!(
+                session.finish_line(&keys, "A ab", "kr-ab"),
+                "the line appended in command mode did not run under the {locale} locale:\n{}",
+                session.terminal_output()
+            );
+        },
     );
 }
 
