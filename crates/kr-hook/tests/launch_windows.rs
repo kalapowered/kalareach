@@ -390,11 +390,10 @@ impl Shell {
     /// letter in its name makes a line that is not valid text there. Such a byte reads back as the
     /// replacement character.
     ///
-    /// The report is the condition: the end of the launcher does not end the wait, since a report a
-    /// program wrote just before it ended can be refused to a read for a moment (a file that was
-    /// only just renamed into place is still held by whatever looks at it). The wait goes on until
-    /// the report reads or the liveness bound passes, and then says how the launcher stood and why
-    /// the last read failed.
+    /// The report is the condition, whether the launcher has ended or not: a program that exits
+    /// at once after writing its report (`EXIT_WITH`) ends the launcher, and the wait still reads
+    /// the report. It goes on until the report reads or the liveness bound passes, and then says
+    /// how the launcher stood and why the last read failed.
     fn report_from(&self, name: &str, launcher: &mut Child) -> BTreeMap<String, String> {
         let path = self.reports.join(name);
         let started = Instant::now();
