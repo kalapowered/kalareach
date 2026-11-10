@@ -245,6 +245,65 @@ out. A call that ends with such a request open says so, and never says nothing w
 does the record that a call that may act leaves for the next launch, nor the end of a call whose
 owner failed: neither can know what was written.
 
+### A request that needs a confirmation on the unlocked screen
+
+A close said aloud is the one request in the five classes that need an unlocked-screen confirmation
+which the host's grammar reads. The host answers its first submission with a challenge, and the
+same delegation then goes back under the same action with the person's signature on it.
+
+The first request is settled when the host answers it, and kept whole. Before anybody is asked, the
+owner compares the challenge with that request and with the call:
+
+- the challenge is for the action the request carried, and for the delegation it named;
+- the class of action it names is the one the host read the words to ask for;
+- the host that issued it is the host the call belongs to, it is for this device, and it is for this
+  voice session;
+- the class is one the call's grant says still needs a confirmation on the unlocked screen;
+- the session the host says the words named is one the call reaches;
+- the digest it asks to be signed over is the digest of the plan the phone computes itself, from the
+  delegation it sent and the action and session the host named.
+
+A challenge that fails any of these is put to nobody, and the person is told it was not what was
+said. A challenge that the phone's own clock says has run out is put to nobody either. The host's
+clock decides whether a confirmation has run out; the phone's only stops it asking for, or signing,
+what its own clock says is over, and the person is told so ("this phone's clock says the
+confirmation ran out").
+
+The person is asked through the platform's ceremony, which names the session and the host. While
+they are asked the call goes on, and anything that taints it drops the confirmation at once. After
+the ceremony the owner looks at taint, the path to the host and the phone's clock again, takes a
+capture proof with a marker and reads the news up to the marker, so that anything said while the
+person was asked has been read before anything is signed. The task that reads the proof raises the
+flag every write waits on when the proof shows a break, so no other request waiting for the
+connection's turn leaves before the owner has handled the message that tells it; the proof taken
+just before the signed write does the same.
+
+The challenge is then signed with the device's own identity key, and the request goes out again
+through the same hand-over as the first: composed once, after the first was settled, with the same
+fragments, under the same action; a fresh capture proof just before the write, whose age is held to
+through the write itself. The signed request is composed once and kept whole. When its answer is
+lost it is asked about again with the request as it was composed, on another connection, and the
+host answers from its record with the result; it is never sent again as new. A receipt in a result's
+place is no decision: the row says it is not known, and nothing more is sent. A host that answers
+the signed request with a challenge again has not taken the confirmation, and the person is not
+asked a second time.
+
+A person who does not confirm, and a phone with no ceremony to run, sign nothing and leave the call
+as it was: the same request can be said again and is asked for again. A confirmation dropped for a
+break, a late fragment, a lost host or a news queue not read in time is dropped with the cause the
+row shows, and the call is tainted where the cause is one that taints.
+
+### What voice may do
+
+A person who already allowed voice has no other way to say that a spoken close is welcome, so the
+idle voice screen offers "What voice may do" while a spoken request can reach the host at all. It
+reads what the host says the standing grant permits, shows the close in the protocol's own sentence
+(off unless the grant already permits it), and allowing sends the call's sessions and the default
+actions, with the close if it was chosen, as a replacement grant. The host's answer says what the
+phone's own access could not carry and which sessions' workers have still to confirm the fence the
+replacement owed, because a replacement ends the calls that ran under the grant it replaces. With
+the constant off the entry is not offered.
+
 ## What a call's media has carried
 
 Native code reads the connection's statistics and reports what the call's media has carried as an
@@ -379,11 +438,15 @@ script turns the emulator's mobile data off, so that only Wi-Fi carries the run;
 ## Unlocked-screen ceremony
 
 Actions requiring unlocked-screen confirmation (session closure, grant changes, arbitrary shell input,
-diff application, and external delivery) require a client-signed confirmation over the action hash:
-- **iOS**: `LocalAuthentication` (`evaluatePolicy(.deviceOwnerAuthentication)`), followed by CryptoKit Ed25519 signing.
-- **Android**: `BiometricPrompt`, followed by Ed25519 signing. From Android 11 it accepts a strong
+diff application, and external delivery) require a client-signed confirmation over the action hash.
+The platform asks the person, and the shared client library signs:
+- **iOS**: `LocalAuthentication` (`evaluatePolicy(.deviceOwnerAuthentication)`) asks the person.
+- **Android**: `BiometricPrompt` asks the person. From Android 11 it accepts a strong
   biometric or the device credential; before it, a strong biometric only, on a device with a secure
   lock screen, because the older way to allow the credential also admits weak biometrics.
+- The client library (`kr-client`) signs the host's challenge with the paired device's identity key
+  once the person has confirmed, on every platform, so there is one signing code and one set of
+  vectors.
 - A phone that cannot verify the owner's presence refuses the confirmation rather than falsely
   answering "verified".
 - The signature binds the exact action hash and request ID with the paired device's identity key,
