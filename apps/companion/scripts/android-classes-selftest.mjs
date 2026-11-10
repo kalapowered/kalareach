@@ -20,7 +20,8 @@
 // type, method and class tables and nothing else, a library carries its dynamic symbols and the
 // bytes a case puts in it, and neither is one any runtime would accept.
 import { Buffer } from 'node:buffer'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
@@ -1372,8 +1373,8 @@ held(
   )
 )
 
-// The wrapper for the iOS build runs the build and nothing that opens Xcode.app, whose own
-// temporary directory the build would not be given.
+// The wrapper for the iOS build runs the build, and not a build that opens Xcode.app, which the
+// system starts with the person's own temporary directory and not the one made for the build.
 {
   const refused = (argv) => iosRefusal(argv) !== null
   held(
@@ -1386,13 +1387,44 @@ held(
     'false',
     String(refused(['build', '--config', '{"build":{"frontendDist":"../dist"}}', '--archive-only', '--no-sign']))
   )
-  for (const argv of [[], ['dev'], ['open'], ['build', '--open'], ['build', '-o'], ['build', '-do']]) {
-    held(
-      `\`pnpm ios ${argv.join(' ')}\` is refused, since it would hand the work to Xcode.app`,
-      'true',
-      String(refused(argv))
-    )
+  // Short options are read as the command line tool reads them, left to right in a bundle: `d`, `v`
+  // and `o` take no value, and the first `t`, `f` or `c` takes the rest of the bundle as its value.
+  for (const argv of [
+    ['build', '-t', 'aarch64-sim'],
+    ['build', '-fopus'],
+    ['build', '-dv', '--target', 'x86_64'],
+    ['build', '--', '-o'],
+    ['build', '--ci', '--', '--open']
+  ]) {
+    held(`\`pnpm ios ${argv.join(' ')}\` is run as it is given`, 'false', String(refused(argv)))
   }
+  for (const argv of [[], ['dev'], ['open'], ['run', '--debug']]) {
+    held(`\`pnpm ios ${argv.join(' ')}\` is refused, since only the build is run`, 'true', String(refused(argv)))
+  }
+  for (const argv of [
+    ['build', '--open'],
+    ['build', '--ope'],
+    ['build', '--o'],
+    ['build', '-o'],
+    ['build', '-do'],
+    ['build', '-otaarch64-sim'],
+    ['build', '-dotaarch64'],
+    ['build', '-otx86_64'],
+    ['build', '-ot=aarch64-sim'],
+    ['build', '--ci', '-o']
+  ]) {
+    held(`\`pnpm ios ${argv.join(' ')}\` is refused, since it would open Xcode.app`, 'true', String(refused(argv)))
+  }
+  // Started by a path that holds a symbolic link, the wrapper still runs, and so still refuses: the
+  // command line tool is never started by this case.
+  const link = join(work, 'scripts-link')
+  symlinkSync(import.meta.dirname, link)
+  const started = spawnSync(process.execPath, [join(link, 'ios.mjs'), 'dev'], { encoding: 'utf8' })
+  held(
+    'the wrapper started through a symbolic link still runs, and refuses a command that is not the build',
+    '2 true',
+    `${started.status} ${started.stderr.includes('pnpm ios runs')}`
+  )
 }
 
 // -- the rule files the Rust build writes --------------------------------------------------------

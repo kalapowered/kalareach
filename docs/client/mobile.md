@@ -407,9 +407,8 @@ cd apps/companion/src-tauri/gen/android && ./gradlew :app:compileUniversalDebugK
 # temporary directory of its own, given by an absolute path, since the command line tool shares the
 # build's options with Gradle and Xcode through a file there named for the application
 # (`to.kala.reach-server-addr`), which two builds at once on a machine would cross. The iOS command
-# runs the build only: `dev`, `open` and `--open` start Xcode.app with its own directory, and it
-# refuses them. The Android
-# command checks the packages that build asked for, and core-ci's
+# runs the build only, and refuses `--open`, which starts Xcode.app with its own directory. The
+# Android command checks the packages that build asked for, and core-ci's
 # `android-app` job builds the release variant, which is minified, besides the debug one. Given no
 # path, this reads every APK and AAB under app/build/outputs, whichever build left them.
 pnpm -C apps/companion android:classes
