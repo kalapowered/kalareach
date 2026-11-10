@@ -137,6 +137,58 @@ pub struct StandIn {
     state: Arc<Mutex<State>>,
     /// The task that accepts connections, until a test closes the port.
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// What keeps the port the service's for as long as the service lives, while it is closed too.
+    _anchor: Option<Anchor>,
+}
+
+/// A connection the service made to its own port and kept, so that the port stays the service's
+/// while nothing listens on it.
+///
+/// The accepted end of the connection is bound to the port. While it lives, no program that binds
+/// the port by number can have it, no program that asks for any port is given it, and the system
+/// makes no connection from it. A connection made to the port meanwhile finds no listener and is
+/// refused outright, as one to a closed port is. The service's own listeners share the port with
+/// the connection by setting `SO_REUSEPORT`, which no other program here sets.
+#[cfg(unix)]
+struct Anchor {
+    _made: TcpStream,
+    _accepted: TcpStream,
+}
+
+/// Where a listener cannot share a port with a connection that holds it, the service holds
+/// nothing and a closed port is a free one.
+#[cfg(not(unix))]
+type Anchor = ();
+
+/// A listener on `address` that can share the port with an `Anchor`.
+fn listen_on(address: std::net::SocketAddr) -> std::io::Result<TcpListener> {
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    #[cfg(unix)]
+    socket.set_reuseport(true)?;
+    socket.bind(address)?;
+    socket.listen(1024)
+}
+
+/// The anchor of the port `listener` listens on, made before anything else is accepted from it.
+#[cfg(unix)]
+async fn anchor_of(listener: &TcpListener) -> Option<Anchor> {
+    let address = listener.local_addr().expect("an address");
+    let made = TcpStream::connect(address)
+        .await
+        .expect("the service reaches its own port");
+    let (accepted, _) = listener
+        .accept()
+        .await
+        .expect("the service takes its own connection");
+    Some(Anchor {
+        _made: made,
+        _accepted: accepted,
+    })
+}
+
+#[cfg(not(unix))]
+async fn anchor_of(_listener: &TcpListener) -> Option<Anchor> {
+    None
 }
 
 impl Drop for StandIn {
@@ -199,10 +251,10 @@ impl AsyncWrite for Prefixed {
 impl StandIn {
     /// Starts the service on a free loopback port.
     pub async fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("a loopback port");
+        let listener =
+            listen_on("127.0.0.1:0".parse().expect("a loopback address")).expect("a loopback port");
         let address = listener.local_addr().expect("an address");
+        let anchor = anchor_of(&listener).await;
         let origin = format!("http://{address}");
         let route = Arc::new(ControlRoute::detached(origin.clone(), None));
         let state = Arc::new(Mutex::new(State {
@@ -230,6 +282,7 @@ impl StandIn {
             route,
             state,
             task: Mutex::new(Some(task)),
+            _anchor: anchor,
         }
     }
 
@@ -338,6 +391,9 @@ impl StandIn {
     /// connection is refused outright, and every control socket that is open is dropped. A request
     /// made to it was never carried out. [`Self::go_down`] is the other way down: the service takes
     /// the connection and ends it, so a request may have been carried out.
+    ///
+    /// No other program listens on the port meanwhile: the service keeps hold of it, so what
+    /// refuses the connection is the closed port, and never a program that took the port.
     pub async fn refuse_connections(&self) {
         let task = self.task.lock().expect("the stand-in's task").take();
         if let Some(task) = task {
@@ -361,7 +417,7 @@ impl StandIn {
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let listener = loop {
-            match TcpListener::bind(self.address).await {
+            match listen_on(self.address) {
                 Ok(listener) => break listener,
                 Err(error)
                     if error.kind() == std::io::ErrorKind::AddrInUse
