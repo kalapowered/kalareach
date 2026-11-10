@@ -41,6 +41,10 @@ const ROW_WITHIN: Duration = Duration::from_secs(60);
 /// report that a hook ran.
 const SIGN_WITHIN: Duration = Duration::from_secs(30);
 
+/// How long a recorder is given to be seen stopping after the microphone track was turned off. A
+/// platform whose recorder keeps running does not show it, and the leg goes on with what it read.
+const STOP_WITHIN: Duration = Duration::from_secs(5);
+
 /// How long an HTTP exchange with the peer or the stand-in is given.
 const EXCHANGE_WITHIN: Duration = Duration::from_secs(20);
 
@@ -83,6 +87,12 @@ pub trait Driver: Send + Sync {
     /// code tells the news of it by itself, so a driver that plays a device has nothing to do; one
     /// that stands in for native code tells it here.
     fn after_a_mute(&self, muted: bool) -> DriverFuture<'_, ()>;
+
+    /// Whether the recorder this driver plays stops when the call's microphone track is turned off,
+    /// as a phone's does: the voice stack stops recording once nothing is being sent, and what the
+    /// recorder reports is native code's to tell, after the time its own watch needs. A driver that
+    /// stands in for native code has no recorder to stop.
+    fn recorder_stops_with_the_mute(&self) -> bool;
 }
 
 /// What a [`Driver`] step comes to.
@@ -302,6 +312,10 @@ impl Driver for PeerDriver {
     fn after_a_mute(&self, _muted: bool) -> DriverFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
+
+    fn recorder_stops_with_the_mute(&self) -> bool {
+        true
+    }
 }
 
 /// The provider's fragment of what the caller said.
@@ -475,10 +489,10 @@ impl<R: Runtime> Play<'_, R> {
         .await
     }
 
-    /// Waits until the microphone's capture word is `word`.
-    async fn capture_is(&self, word: &str) -> bool {
+    /// Waits up to `within` until the microphone's capture word is `word`.
+    async fn capture_is(&self, word: &str, within: Duration) -> bool {
         let app = self.app;
-        until(SIGN_WITHIN, || async move {
+        until(within, || async move {
             (call_state(app).await["capture"] == word).then_some(())
         })
         .await
@@ -599,7 +613,7 @@ pub(super) async fn run<R: Runtime>(
     // The microphone is carrying speech before anything is said: what the provider is sent before
     // the gate opens is a call the gate refuses for good, and a leg that began so would be about
     // that, not about its own subject.
-    let on = play.capture_is("capturing").await;
+    let on = play.capture_is("capturing", SIGN_WITHIN).await;
     let word = call_state(app).await["capture"].clone();
     checks.push(Check::found(
         "native code's capture is on",
@@ -819,15 +833,24 @@ async fn mute<R: Runtime>(play: &Play<'_, R>, checks: &mut Checks<'_>) -> Result
         commands::voice_set_muted(play.app.state(), commands::VoiceMute::Microphone, true).await;
     play.driver.after_a_mute(true).await?;
     let shown = play.mute_is_held().await;
+    // Where the recorder stops with the muted track, native code says so once it has seen it stop,
+    // and the unmute is made after that: a track that waited for the recorder would never be turned
+    // on again, which a person who stays muted for a while meets and one who unmutes at once does
+    // not. Where the recorder goes on, nothing is said, and the leg goes on after the bound.
+    let stopped = !play.driver.recorder_stops_with_the_mute()
+        || play.capture_is("unavailable", STOP_WITHIN).await;
     checks.push(Check::found(
         "the person mutes between two parts of a command",
         muted.is_ok() && shown.is_some(),
-        format!("mute ok {} held {shown:?}", muted.is_ok()),
+        format!(
+            "mute ok {} held {shown:?} recorder stopped {stopped}",
+            muted.is_ok()
+        ),
     ));
     let unmuted =
         commands::voice_set_muted(play.app.state(), commands::VoiceMute::Microphone, false).await;
     play.driver.after_a_mute(false).await?;
-    let back = play.capture_is("capturing").await;
+    let back = play.capture_is("capturing", SIGN_WITHIN).await;
     checks.push(Check::found(
         "the microphone is back to capturing after the unmute",
         unmuted.is_ok() && back,

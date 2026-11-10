@@ -751,6 +751,10 @@ impl Driver for Scripted<'_> {
         Box::pin(async move { Ok(self.drops.load(Ordering::SeqCst)) })
     }
 
+    fn recorder_stops_with_the_mute(&self) -> bool {
+        false
+    }
+
     fn after_a_mute(&self, muted: bool) -> DriverFuture<'_, ()> {
         Box::pin(async move {
             // Native code tells the news of a mute, and the recorder's progress starts afresh once
