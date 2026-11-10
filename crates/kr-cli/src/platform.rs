@@ -457,11 +457,13 @@ mod console {
         /// What this console declares itself to be.
         ///
         /// The terminfo name its environment gives it, when there is one: a person who sets `TERM`
-        /// has said what their terminal is. A console sets none, and an attachment that declares
-        /// nothing is refused the input lease, so a console names itself. The declaration is made
-        /// only here, where this command has read the console's input and output modes and will put
-        /// them back, and it claims no more than the keys this command reads can produce: console
-        /// key records, which the session spells in the ordinary encoding.
+        /// has said what their terminal is, and that name is declared with what it claims, although
+        /// this command reads the keys as console key records whatever `TERM` says. A console sets
+        /// none, and an attachment that declares nothing is refused the input lease, so a console
+        /// then names itself. The declaration is made only here, where this command has read the
+        /// console's input and output modes and will put them back, and the console's own name
+        /// claims no more than the keys this command reads can produce: console key records, which
+        /// the session spells in the ordinary encoding.
         #[must_use]
         pub fn profile(&self) -> Option<String> {
             let term = std::env::var("TERM").ok();

@@ -509,6 +509,21 @@ async fn a_console_that_names_no_terminal_holds_the_input_lease_and_types() {
         Some(&typist_id),
         "a console attached with --no-probe declares nothing and was not given the keys"
     );
+    let withheld = snapshot
+        .attachments
+        .iter()
+        .find(|summary| summary.attachment_id != typist_id)
+        .expect("the console attached with --no-probe is attached");
+    assert_eq!(
+        withheld.terminal_profile_id.as_ref(),
+        None,
+        "and it declared no terminal"
+    );
+    assert_eq!(
+        withheld.presentation_reason,
+        Some(kr_protocol::attachment::PresentationReason::NoTerminalProfile),
+        "which is why the host kept it off the stream"
+    );
     let _ = withholding.child.kill();
     drop(withholding);
     attachments_until(

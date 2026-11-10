@@ -142,8 +142,10 @@ pub const KEYBOARD_PROTOCOLS: &[TerminalKeyboard] = &[
     // A Windows console, which is not a terminal either: its keys reach the host as console key
     // records, and the host spells them in the ordinary encoding, or sends the records as they are
     // where the backend asked for them. It supplies no enhanced protocol, so it claims the ordinary
-    // encoding and nothing more. It is no qualified terminal either: nothing has been established
-    // about how a console draws this stream.
+    // encoding and nothing more; the check does not ask whether records were asked for, which are
+    // sent as they are in any keyboard state, so a console is refused under an enhanced protocol
+    // there too. It is no qualified terminal either: nothing has been established about how a
+    // console draws this stream.
     TerminalKeyboard::new(kr_term::win32::CONSOLE_PROFILE, 0, 0),
     // The companion's raw terminal view, which is not a terminal: it builds each key through the
     // client's shared encoder from what its platform reports of the key, so it produces

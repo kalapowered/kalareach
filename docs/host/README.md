@@ -1953,8 +1953,9 @@ Two presentations, and the choice is the host's:
 
 `kr attach --no-probe` withholds the declaration, so that attachment is projected: a host that has
 not been told which terminal it is talking to does not hand it a byte stream and hope. A Windows
-console declares `windows-console`, which is on no list of terminals the host hands the stream, so
-it is always projected, with the reason that its profile is not qualified.
+console whose environment names no terminal declares `windows-console`, which is on no list of
+terminals the host hands the stream, so it is projected, with the reason that its profile is not
+qualified.
 
 An attachment never receives replayed history. What it is given when it joins, and again whenever
 it resynchronises, is the screen as it is now, rendered from a closed set of operations with no
@@ -2146,8 +2147,10 @@ the terminal profile that `TERM` names. A Windows console sets none, so it decla
 `windows-console` (`kr_term::win32::CONSOLE_PROFILE`), which says that its keys are console key
 records and nothing about how it draws a stream. The worker gives that profile the input lease while
 the application reads the ordinary encoding, and refuses it under either enhanced protocol, because
-a console's records are spelled in the ordinary encoding or in no other. `kr attach --no-probe`
-declares nothing, as on every platform, so that attachment watches and does not type.
+a console's records are spelled in the ordinary encoding or in no other. The refusal does not ask
+whether the backend asked for records, which are sent as they are in any keyboard state, so a
+console is refused there too. `kr attach --no-probe` declares nothing, as on every platform, so
+that attachment watches and does not type.
 Under `Fidelity::LegacyVt`, which is every session of a Unix worker and a Windows session whose
 pseudo-console did not ask for records, and while the application in the session has negotiated
 `modifyOtherKeys` or the Kitty keyboard protocol, the worker refuses a write of console keys with

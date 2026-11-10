@@ -440,17 +440,19 @@ mod platform {
         let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
         let executable = std::path::Path::new(&root).join("System32").join("cmd.exe");
         let before = own()?.query_interrupt_time;
+        let mut command = std::process::Command::new(executable);
+        command
+            .creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
         #[cfg(feature = "testing")]
-        kr_ipc::testing::created::note_words_here("clock", &executable.to_string_lossy(), &[]);
+        kr_ipc::testing::created::note_here("clock", &command);
         let mut child = {
             // Created under the lock every launch takes: a process started while a launch's
             // streams are inheritable would hold them.
             let _inheriting = crate::windows::launch::inheriting();
-            std::process::Command::new(executable)
-                .creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+            command
                 .spawn()
                 .map_err(|error| failed(format!("a process could not be created: {error}")))?
         };

@@ -1878,7 +1878,10 @@ async fn a_worker_that_cannot_reach_its_controller_says_why_and_ends_whatever_it
 /// since a server is run only on a Unix host. The record holds the root shell once, the clock
 /// check at most once and the questions, and nothing else. The worker's children are read as well,
 /// by their recorded parent, which leaves the pseudo-console's host and nothing else, and does not
-/// see a process that a child of the worker left running.
+/// see a process that a child of the worker left running. The pseudo-console's host is created by
+/// the system for the worker's call, not by a place that writes, so only that read sees it, and it
+/// takes any number of console hosts by their names; the daemon's call to the task scheduler that
+/// starts the worker is the supervisor's, in the list of launches asserted above.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_idle_session_runs_nothing_beside_its_shell() {
     let host = Host::create().recording_launches().recording_creations();
@@ -1938,6 +1941,10 @@ async fn an_idle_session_runs_nothing_beside_its_shell() {
         u32::try_from(worker.pid.get()).expect("a process identifier"),
         std::process::id(),
     );
+    // Ended as its process exiting would end it, before the host's tree goes: the daemon's tasks
+    // hold the registry and the environment's lock open until they end, and Windows does not
+    // delete a file that is open.
+    daemon.stop().await;
 }
 
 /// Waits until the daemon has let the session's worker go: its last step of a closure, the removal
