@@ -394,6 +394,10 @@ mod console {
         /// A console answers for neither, so both are usually empty here and the reset block is the
         /// whole restoration.
         ///
+        /// The sequences are written while the output mode the attachment set still holds, which
+        /// has virtual-terminal processing on, and only then is the console's own output mode put
+        /// back: a console that had no such processing would print them as text.
+        ///
         /// # Errors
         ///
         /// Returns an error when the modes cannot be set.
@@ -406,7 +410,6 @@ mod console {
             use std::io::Write as _;
 
             set_console_mode(&self.input, saved.input)?;
-            set_console_mode(&self.output, saved.output)?;
             let mut handle = &self.output;
             let _ = handle.write_all(RESET_SEQUENCES);
             let _ = handle.write_all(&screen.restore_sequences());
@@ -414,7 +417,7 @@ mod console {
                 let _ = handle.write_all(&keyboard.cleanup_sequences());
             }
             let _ = handle.flush();
-            Ok(())
+            set_console_mode(&self.output, saved.output)
         }
 
         /// Runs the bounded capability handshake.
