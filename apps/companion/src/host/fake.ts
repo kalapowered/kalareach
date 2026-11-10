@@ -39,6 +39,7 @@ import type {
   ShellLaunchResult,
   VoiceAction,
   VoiceContextResult,
+  VoiceGrantResult,
   VoiceManagedTerms,
   VoicePrepareResult,
   VoiceRate,
@@ -115,6 +116,7 @@ import type {
   VoiceOwed,
   VoiceProblem,
   VoiceScope,
+  VoiceScopeAction,
   VoiceStartRequest,
   Written
 } from './port'
@@ -717,6 +719,11 @@ export interface FakeHostControls {
    * refused, as the host refuses it.
    */
   changeVoiceScope(): void
+  /**
+   * Makes a spoken request reach the host or not, as the device's build decides. With it, the
+   * scope the person is shown offers the actions they may add to the default grant.
+   */
+  speechReachesTheHost(reaches: boolean): void
   /** Makes the next start answer `unavailable` with this reason, or clears that with null. */
   refuseVoiceStart(reason: string | null): void
   /**
@@ -1355,6 +1362,10 @@ export function fakeHost(
   let holdingInboxHosts: Promise<void> = Promise.resolve()
   /** The words the host refuses a preparation with while no voice grant stands, or none. */
   let voiceGrantMissing: string | null = null
+  /** Whether a spoken request reaches the host, which decides what a person may add to the grant. */
+  let speechReachesHost = false
+  /** What the standing grant permits, which a preparation states and an allowance replaces. */
+  let voiceStanding: VoiceAction[] = VOICE_SCOPE.statement.actions.map((action) => action)
   let voiceAllowFailure: string | null = null
   let voiceHeldBack: readonly VoiceAction[] = []
   let voiceAllowUnconfirmed = false
@@ -2670,6 +2681,7 @@ export function fakeHost(
       const sessions = Array.isArray(asked.session_ids) ? (asked.session_ids as string[]) : []
       return Promise.resolve({
         ...VOICE_SCOPE,
+        statement: statementOf(voiceStanding),
         session_ids: sessions.length > 0 ? sessions : [...VOICE_SCOPE.session_ids],
         prepared: preparedFor(voice),
         selected: VOICE_EXCLUDED_CLASSES.filter((each) => selected.includes(each)),
@@ -2684,7 +2696,11 @@ export function fakeHost(
       })
     },
 
-    voiceScope: () => Promise.resolve(VOICE_DEFAULT_SCOPE),
+    voiceScope: () =>
+      Promise.resolve({
+        ...VOICE_DEFAULT_SCOPE,
+        optional: speechReachesHost ? [VOICE_OPTIONAL_CLOSE] : []
+      }),
     voiceAllow: (request) => {
       requireConnection()
       voiceAllows.push(request)
@@ -2706,20 +2722,15 @@ export function fakeHost(
       const actions = asked.filter((action) => !voiceHeldBack.includes(action))
       const notHeld = asked.filter((action) => voiceHeldBack.includes(action))
       voiceHeldBack = []
+      voiceStanding = actions
+      voice.scope += 1
       const unreadableFence = allowFenceUnreadable
       allowFenceUnreadable = false
       return reading('voiceAllow', () => ({
         receipt: null,
         action_id: null,
         value: {
-          statement: {
-            actions,
-            statements: actions.map(
-              (action) =>
-                VOICE_DEFAULT_SCOPE.actions.find((each) => each.action === action)?.sentence ?? ''
-            ),
-            unlocked_screen_actions: []
-          },
+          statement: statementOf(actions),
           not_held_by_device: notHeld,
           fence: unreadableFence ? ({ kind: 'unreadable' } as const) : voiceFence(voiceBarrier())
         } satisfies VoiceAllowed
@@ -3658,6 +3669,9 @@ export function fakeHost(
     changeVoiceScope() {
       voice.scope += 1
     },
+    speechReachesTheHost(reaches) {
+      speechReachesHost = reaches
+    },
     changeVoiceRate(version, minorUnitsPerSecond) {
       voice.rate = { ...voice.rate, version, minor_units_per_second: minorUnitsPerSecond }
     },
@@ -4014,8 +4028,27 @@ const VOICE_SCOPE: Omit<VoicePrepareResult, 'managed' | 'managed_unavailable' | 
   broker_origin: 'https://reach.kala.to'
 }
 
+/** The action a person may add to the default grant, in the protocol's own sentence. */
+const VOICE_OPTIONAL_CLOSE: VoiceScopeAction = {
+  action: 'close_session',
+  sentence: 'Close a session, after a confirmation on an unlocked screen.',
+  needs_unlocked_screen: true
+}
+
+/** What a grant of `actions` states, as the host's answer does. */
+function statementOf(actions: readonly VoiceAction[]): VoiceGrantResult['statement'] {
+  const sentences = [...VOICE_DEFAULT_SCOPE.actions, VOICE_OPTIONAL_CLOSE]
+  return {
+    actions: [...actions],
+    statements: actions.map((action) => sentences.find((each) => each.action === action)?.sentence ?? ''),
+    unlocked_screen_actions: sentences
+      .filter((each) => each.needs_unlocked_screen && actions.includes(each.action))
+      .map((each) => each.action)
+  }
+}
+
 /** What allowing voice permits by default, in the protocol's own sentences. */
-const VOICE_DEFAULT_SCOPE: VoiceScope = {
+const VOICE_DEFAULT_SCOPE: Omit<VoiceScope, 'optional'> = {
   actions: [
     {
       action: 'navigate',
