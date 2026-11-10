@@ -785,9 +785,23 @@ impl Driver for Scripted<'_> {
     }
 }
 
+/// What native code's statistics say of the audio the call has received.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Counters {
+    /// More packets than the floor a leg needs.
+    #[default]
+    Counted,
+    /// Native code reads no media at all.
+    NoMedia,
+    /// Native code reads media but no count of packets received.
+    NoPacketCount,
+}
+
 /// What `scene.platform` shows before the leg starts.
 #[derive(Clone, Copy, Default)]
 struct Before {
+    /// What the audio counters say.
+    counters: Counters,
     /// The answer turns discontinuous transmission on.
     dtx: bool,
     /// Native code's record shows a gap from the start, which makes the gate refuse every set.
@@ -802,6 +816,19 @@ async fn play(leg: Leg, before: Before) -> (Scene, Vec<companion_tauri::probe::C
     let scene = scene_over(1, delegating_timings()).await;
     if before.dtx {
         scene.platform.answer_with_dtx(true);
+    }
+    match before.counters {
+        Counters::Counted => scene.platform.carry(Media {
+            packets_received: Some(100),
+            packets_sent: Some(100),
+            played_samples: Some(48_000),
+        }),
+        Counters::NoMedia => {}
+        Counters::NoPacketCount => scene.platform.carry(Media {
+            packets_received: None,
+            packets_sent: Some(100),
+            played_samples: Some(48_000),
+        }),
     }
     let (text, invitation) = scene.invitation().await;
     let mut report = scene.reporting();
@@ -979,6 +1006,38 @@ async fn a_call_whose_capture_broke_before_the_leg_is_not_played() {
     );
     assert_eq!(at_the_host(&scene), 0);
     stop(scene).await;
+}
+
+/// A call whose native code reads no media, or no count of the audio packets received, has shown
+/// nothing about audio: the leg fails on the audio check and says nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_whose_native_code_reads_no_audio_counters_is_not_played() {
+    for counters in [Counters::NoMedia, Counters::NoPacketCount] {
+        let (scene, checks) = play(
+            Leg::Positive,
+            Before {
+                counters,
+                ..Before::default()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            measured_failures(&checks),
+            ["the call carries audio before the leg begins"],
+            "{:#?}",
+            failed(&checks)
+        );
+        assert!(
+            failed(&checks)
+                .iter()
+                .any(|check| check.contains("native code reads no")),
+            "{:#?}",
+            failed(&checks)
+        );
+        assert_eq!(at_the_host(&scene), 0);
+        stop(scene).await;
+    }
 }
 
 /// A call whose record of capture shows a gap once the leg is under way is one the gate refuses for

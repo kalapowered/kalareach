@@ -8,8 +8,12 @@
 //! probe plays the person and the provider: it writes the provider's events to the call's
 //! `oai-events` channel through the peer in this process, has the stand-in voice service announce
 //! each delegation on the control socket as the service does, and reads what became of each one from
-//! the call's own state. It never decides by a time. Each step waits for the owner's own sign: the
-//! row of the delegation reaching a state, the capture word, the peer's report that a drop ran.
+//! the call's own state. It never decides by a time. Each step waits for a sign: the row of the
+//! delegation reaching a state, the capture word, the peer's report that a drop ran. In process the
+//! driver also waits for the owner to say it has read each announcement, before the provider's
+//! delegation is written. On a device the owner's record of an announcement exists only in test
+//! builds, so a delegation is announced ahead of the words that make it, and a control frame that
+//! comes late makes a leg red, never green.
 //!
 //! Each negative leg is read beside its control, a request the same call handed over and the host
 //! performed before the break the leg makes. The legs prove what this application does with the
@@ -260,6 +264,9 @@ impl Driver for PeerDriver {
         })
     }
 
+    // The stand-in sends the announcement on the control socket, and nothing here sees the owner read
+    // it: the owner's record of an announcement exists only in test builds. The leg announces first
+    // and waits for the row, so a frame that comes late makes it red.
     fn announce<'a>(&'a self, id: &'a str, offset_ms: u64) -> DriverFuture<'a, ()> {
         Box::pin(async move {
             ask(
@@ -500,23 +507,41 @@ impl<R: Runtime> Play<'_, R> {
 /// Before a leg says anything, the call carries audio and native code's own record of capture shows
 /// no break. Both are readings of the call's own signs, never a wait for a time: a leg's subject is a
 /// break the leg makes, and a recorder that broke while the application was starting is not one. A
-/// call that fails either is not the leg's to judge, and says so for the device script to play the
-/// leg again on a new call.
+/// call whose record shows such a break says so in words the device script reads to play the leg
+/// again on a new call; a call that shows no audio fails the leg, and so does one whose native code
+/// reads no counter of audio packets, which is no measurement.
 async fn settled<R: Runtime>(play: &Play<'_, R>, checks: &mut Checks<'_>) -> bool {
     let platform = play.platform;
+    let last = std::sync::Mutex::new("no reading".to_owned());
+    let seen = &last;
     let carries = until(SIGN_WITHIN, || async move {
-        let media = platform.held().await.ok()?.media;
-        // Where native code reads no media there is nothing to wait for.
-        media
-            .is_none_or(|media| media.packets_received.is_none_or(|n| n >= AUDIO_FLOOR))
+        // A missing counter is no measurement: native code that reads no media, or no count of
+        // packets received, has not shown that the call carries audio.
+        let reading = match platform.held().await.ok()?.media {
+            None => Err("native code reads no media".to_owned()),
+            Some(media) => media
+                .packets_received
+                .ok_or_else(|| "native code reads no count of audio packets received".to_owned()),
+        };
+        *seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = match &reading {
+            Ok(received) => format!("{received} audio packets received"),
+            Err(why) => why.clone(),
+        };
+        reading
+            .is_ok_and(|received| received >= AUDIO_FLOOR)
             .then_some(())
     })
     .await
     .is_some();
+    let last = last
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     checks.push(Check::found(
         "the call carries audio before the leg begins",
         carries,
-        format!("the call received at least {AUDIO_FLOOR} audio packets"),
+        format!("at least {AUDIO_FLOOR} audio packets are needed; the last reading: {last}"),
     ));
     if !carries {
         return false;
