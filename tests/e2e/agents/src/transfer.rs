@@ -121,10 +121,11 @@ impl Transfer {
     /// The transfer as evidence: the caller, the steps, and what the host published, never the
     /// bytes or a name of the file.
     #[must_use]
-    pub fn evidence(&self, caller: Caller) -> serde_json::Value {
+    pub fn evidence(&self, caller: Caller, lane: Lane) -> serde_json::Value {
         match self {
             Self::Sent(handle) => serde_json::json!({
                 "caller": caller.word(),
+                "route": lane.word(),
                 "driver": "kr-client uploads::send",
                 "published": {
                     "byte_len": handle.byte_len.get(),
@@ -135,11 +136,13 @@ impl Transfer {
             }),
             Self::Refused { step, code } => serde_json::json!({
                 "caller": caller.word(),
+                "route": lane.word(),
                 "driver": "kr-client uploads::send",
                 "refused": { "call": step.method(), "code": code },
             }),
             Self::Failed { step, error } => serde_json::json!({
                 "caller": caller.word(),
+                "route": lane.word(),
                 "driver": "kr-client uploads::send",
                 "failed": { "call": step.method(), "error": error },
             }),
@@ -147,9 +150,36 @@ impl Transfer {
     }
 }
 
-/// The route the device's chunks travel: the host's local attachment-chunk endpoint, which is the
-/// only route the client library has. The network route a paired device's chunks will take replaces
-/// this body when the client library has it.
+/// Whose lane a transfer's chunks travel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lane {
+    /// The host's local attachment-chunk endpoint, which only the host's own owner on this machine
+    /// reaches: chunks sent on it are not a paired device's, whoever began the upload.
+    Local,
+}
+
+impl Lane {
+    /// The word a record names the lane by.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Local => "local endpoint",
+        }
+    }
+
+    /// Whether a paired device's chunks travel it.
+    #[must_use]
+    pub const fn is_a_devices(self) -> bool {
+        match self {
+            Self::Local => false,
+        }
+    }
+}
+
+/// The route the device's chunks travel, and whose lane it is: the host's local attachment-chunk
+/// endpoint, which is the only route the client library has. The network route a paired device's
+/// chunks will take replaces this body, and a lane for it is added, when the client library has it;
+/// until then no transfer passes as a device's.
 ///
 /// # Errors
 ///
@@ -157,8 +187,8 @@ impl Transfer {
 pub fn chunk_route(
     environment: &EnvironmentPaths,
     build_id: BuildId,
-) -> Result<ChunkRoute, ClientError> {
-    ChunkRoute::local(environment, build_id)
+) -> Result<(ChunkRoute, Lane), ClientError> {
+    Ok((ChunkRoute::local(environment, build_id)?, Lane::Local))
 }
 
 /// A session of the host's own owner on this machine, over the local control endpoint, as the
@@ -290,8 +320,9 @@ pub fn hex_of(bytes: &[u8]) -> String {
 }
 
 /// The digests of the images a conversation file records as given to the agent: each line the
-/// build list's `marker` is in, with the base64 text after `base64,` in it decoded and hashed.
-/// A line the marker is in whose image cannot be decoded is `None`.
+/// build list's `marker` is in, with the base64 text after each `base64,` in it decoded and hashed,
+/// so a message that holds several images gives one digest for each. A line the marker is in with
+/// no image text after it, or whose image cannot be decoded, gives `None`.
 #[must_use]
 pub fn images_recorded(conversation: &Path, marker: &str) -> Vec<Option<String>> {
     use base64::Engine as _;
@@ -301,22 +332,52 @@ pub fn images_recorded(conversation: &Path, marker: &str) -> Vec<Option<String>>
     };
     let mut found = Vec::new();
     for line in text.lines().filter(|line| line.contains(marker)) {
-        let Some((_, after)) = line.split_once("base64,") else {
+        let mut images = line.split("base64,").skip(1).peekable();
+        if images.peek().is_none() {
             found.push(None);
-            continue;
-        };
-        let encoded: String = after
-            .chars()
-            .take_while(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '=')
-            })
-            .collect();
-        found.push(
-            base64::engine::general_purpose::STANDARD
-                .decode(encoded.as_bytes())
-                .ok()
-                .map(|bytes| hex_of(&kr_cbor::sha256(&bytes))),
-        );
+        }
+        for after in images {
+            let encoded: String = after
+                .chars()
+                .take_while(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '=')
+                })
+                .collect();
+            found.push(
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded.as_bytes())
+                    .ok()
+                    .map(|bytes| hex_of(&kr_cbor::sha256(&bytes))),
+            );
+        }
     }
     found
+}
+
+#[cfg(test)]
+mod tests {
+    use base64::Engine as _;
+
+    use super::*;
+
+    #[test]
+    fn a_message_that_holds_several_images_gives_a_digest_for_each() {
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let line = format!(
+            r#"{{"role":"user","content":[{{"type":"input_image","image_url":"data:image/png;base64,{}"}},{{"type":"input_image","image_url":"data:image/png;base64,{}"}}]}}"#,
+            encode(b"first image"),
+            encode(b"second image")
+        );
+        let file = std::env::temp_dir().join(format!("kr-images-{}.jsonl", kr_ipc::new_uuid()));
+        std::fs::write(&file, format!("{line}\n")).expect("writes the record");
+        let found = images_recorded(&file, "\"type\":\"input_image\"");
+        let _ = std::fs::remove_file(&file);
+        assert_eq!(
+            found,
+            vec![
+                Some(hex_of(&kr_cbor::sha256(b"first image"))),
+                Some(hex_of(&kr_cbor::sha256(b"second image")))
+            ]
+        );
+    }
 }
