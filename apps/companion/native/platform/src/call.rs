@@ -1330,6 +1330,54 @@ mod tests {
         assert_eq!(never.barrier, Some(1));
     }
 
+    /// Native code that answers a command with the fixture's response and keeps what it was sent.
+    struct Fixtured {
+        sent: Arc<Mutex<Vec<(&'static str, serde_json::Value)>>>,
+        answers: Mutex<VecDeque<serde_json::Value>>,
+    }
+
+    impl Commands for Fixtured {
+        fn channel(&self, _sink: EventSink) -> serde_json::Value {
+            serde_json::json!("__CHANNEL__:1")
+        }
+
+        fn invoke(&self, method: &'static str, arguments: serde_json::Value) -> CommandFuture {
+            self.sent.lock().unwrap().push((method, arguments));
+            let answer = self.answers.lock().unwrap().pop_front().expect("an answer");
+            Box::pin(async move { Ok(answer) })
+        }
+    }
+
+    /// The capture proof goes to native code as the fixture's command, with the barrier flag the
+    /// caller gave, and what native code answers is read as the fixture's record.
+    #[tokio::test]
+    async fn the_capture_proof_is_asked_and_read_as_the_fixtures_say() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let calls = NativeCalls::new(Fixtured {
+            sent: Arc::clone(&sent),
+            answers: Mutex::new(VecDeque::from([
+                of("callCaptureProof", 0).response,
+                of("callCaptureProof", 1).response,
+            ])),
+        });
+        let call = CallId("c1".to_owned());
+
+        let marked = calls.capture_proof(&call, true).await.expect("a proof");
+        let plain = calls.capture_proof(&call, false).await.expect("a proof");
+
+        assert_eq!(marked.barrier, Some(3));
+        assert_eq!(marked.progress_age_ms, Some(120));
+        assert_eq!(plain.barrier, None);
+        assert_eq!(plain.state, CaptureState::MutedByPerson);
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![
+                ("callCaptureProof", of("callCaptureProof", 0).request),
+                ("callCaptureProof", of("callCaptureProof", 1).request),
+            ]
+        );
+    }
+
     /// Native code that is never asked to do anything, or never answers: the commands a test of
     /// the deadlines sends reach this.
     struct Unanswering {
