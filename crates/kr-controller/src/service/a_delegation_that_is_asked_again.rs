@@ -173,6 +173,13 @@ async fn ask_voice_given(
     method: Method,
     mutation: &MutationRequest,
 ) -> crate::given::Given<crate::error::Result<ParamsValue>> {
+    let carried = admitted_for_five_minutes(controller).await;
+    submitted_under(controller, actor_id, device_id, method, mutation, carried).await
+}
+
+/// The admission a voice mutation submitted in these cases carries: a connection this host
+/// admitted, the revision in force and a deadline five minutes out.
+async fn admitted_for_five_minutes(controller: &Controller) -> crate::authority::AdmittedMutation {
     let accepted = AcceptedDeadline {
         deadline: controller
             .clock
@@ -181,8 +188,18 @@ async fn ask_voice_given(
             .expect("a deadline five minutes out"),
         bound: DeadlineBound::RequestedTtl,
     };
-    let carried =
-        crate::service::a_close_a_worker_never_answers::admission(controller, accepted).await;
+    crate::service::a_close_a_worker_never_answers::admission(controller, accepted).await
+}
+
+/// A voice mutation submitted under `carried`, and where its answer came from.
+async fn submitted_under(
+    controller: &Arc<Controller>,
+    actor_id: &kr_protocol::ids::ActorId,
+    device_id: kr_protocol::ids::DeviceId,
+    method: Method,
+    mutation: &MutationRequest,
+    carried: crate::authority::AdmittedMutation,
+) -> crate::given::Given<crate::error::Result<ParamsValue>> {
     let revision = controller.policy().authority_revision();
     controller
         .voice_mutation(
@@ -197,6 +214,51 @@ async fn ask_voice_given(
             carried,
         )
         .await
+}
+
+/// A voice mutation of `method` submitted as a copy of its action that is held before it claims
+/// the action, once its early look has found no record of the action.
+///
+/// `meanwhile` is done while the copy is held, given the admission the copy carries: another copy
+/// of the action can claim and record it there, and the authority the copy arrived under can
+/// lapse. The copy then goes on, and what it is given is returned.
+pub(super) async fn held_before_its_claim(
+    controller: &Arc<Controller>,
+    actor_id: &kr_protocol::ids::ActorId,
+    device_id: kr_protocol::ids::DeviceId,
+    method: Method,
+    mutation: &MutationRequest,
+    meanwhile: impl AsyncFnOnce(&crate::authority::AdmittedMutation),
+) -> crate::given::Given<crate::error::Result<ParamsValue>> {
+    let carried = admitted_for_five_minutes(controller).await;
+    let (arrived, go) = controller.before_a_voice_change_claims.arm();
+    let held = tokio::spawn({
+        let controller = Arc::clone(controller);
+        let (actor_id, mutation) = (actor_id.clone(), mutation.clone());
+        async move {
+            submitted_under(
+                &controller,
+                &actor_id,
+                device_id,
+                method,
+                &mutation,
+                carried,
+            )
+            .await
+        }
+    });
+    tokio::pin!(held);
+    tokio::select! {
+        arrived = tokio::time::timeout(std::time::Duration::from_secs(30), arrived) => {
+            arrived
+                .expect("the copy reaches the place it is held at")
+                .expect("the pause is armed");
+        }
+        early = &mut held => panic!("the copy was answered before its claim: {early:?}"),
+    }
+    meanwhile(&carried).await;
+    go.send(()).expect("the copy goes on");
+    held.await.expect("the copy finishes")
 }
 
 /// A provider that answers without a network call.
@@ -311,6 +373,73 @@ async fn a_delegations_receipt_goes_back_only_to_a_device_that_is_still_paired()
         .await
         .expect_err("a revoked device is given nothing");
     assert_eq!(refused.code(), ErrorCode::PermissionDenied);
+}
+
+/// KR-REQ-09.09, the voice claim race for a delegation, the identity part: a delegation that found
+/// no record of its action at the early look and meets one where it claims the action, because
+/// another copy kept a receipt in between, is given that receipt as the early look gives one back,
+/// to a device that is still paired and to nobody once it is not. The control: with the device
+/// paired, the late copy is given the receipt as one read from the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_receipt_another_copy_kept_before_a_delegations_claim_goes_back_only_to_a_paired_device()
+{
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let now = wall.load(std::sync::atomic::Ordering::SeqCst);
+    let device = paired(&controller, 48, None);
+    let actor_id = device.principal();
+
+    for revoked in [false, true] {
+        let mutation = delegation_of(
+            temp.environment_id(),
+            VoiceSessionId::new(kr_ipc::new_uuid()),
+            "send it to this session",
+        );
+        let params: VoiceDelegateParams = mutation.params.to_typed().expect("decodes");
+        // What the other copy answers, and keeps under the device's claim.
+        let receipt = VoiceDelegateResult {
+            delegation_id: params.delegation_id,
+            action: Nullable::some(VoiceAction::SubmitPrompt),
+            session_id: Nullable::null(),
+            outcome: VoiceDelegationOutcome::Admitted {
+                action_id: mutation.action_id,
+                note: "admitted".to_owned(),
+            },
+        };
+        let late = held_before_its_claim(
+            &controller,
+            &actor_id,
+            device.device_id,
+            Method::VoiceDelegate,
+            &mutation,
+            async |_admission| {
+                keep(&controller, &actor_id, &mutation, &receipt);
+                if revoked {
+                    controller
+                        .devices()
+                        .revoke(device.device_id, TimestampMs::new(now + 1))
+                        .expect("the device is revoked");
+                }
+            },
+        )
+        .await;
+        if revoked {
+            let refused = late
+                .into_answer()
+                .expect_err("a device that is no longer paired is given nothing");
+            assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+        } else {
+            assert!(late.is_copied(), "the late copy read the other's receipt");
+            assert_eq!(
+                late.into_answer()
+                    .expect("a paired device is given its receipt")
+                    .to_typed::<VoiceDelegateResult>()
+                    .expect("a result"),
+                receipt
+            );
+        }
+    }
 }
 
 /// A call the device holds over `session_id`, started through the daemon's own voice service and a

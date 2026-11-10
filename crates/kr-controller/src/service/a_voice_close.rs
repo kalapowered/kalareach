@@ -22,7 +22,8 @@ use kr_protocol::voice::{
 };
 
 use super::a_delegation_that_is_asked_again::{
-    ask, ask_voice, call_over, call_over_for, delegation_named, voice_mutation_of,
+    ask, ask_voice, call_over, call_over_for, delegation_named, held_before_its_claim,
+    voice_mutation_of,
 };
 use super::a_floor_owed_its_record::until;
 use super::a_read_that_meets_a_worker_on_its_way_out::{Scripted, scripted};
@@ -1225,6 +1226,108 @@ async fn a_reused_voice_action_identifier_is_not_told_so_while_a_fence_is_owed()
         .expect_err("what the host kept of the action is not told while a fence is owed");
     assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
     assert!(refused.to_string().contains("fence"), "{refused}");
+    call.world.serving.abort();
+}
+
+/// What a stop of the call is given where it claims its action, when another copy of the stop
+/// claimed that action after this one's early look found no record of it.
+///
+/// The first copy is held before it claims, once its early look has found no record
+/// (`held_before_its_claim`). The second copy is made whole there: it claims the action, stops
+/// the call and records what the stop came to. `then` is done next, given the admission the first
+/// copy carries, and the first copy goes on and meets the record where it claims. Returns what the
+/// second copy was answered and what the first was given.
+async fn a_stop_that_meets_the_other_copys_record_where_it_claims(
+    call: &Call,
+    then: impl FnOnce(&Controller, &crate::authority::AdmittedMutation),
+) -> (
+    ParamsValue,
+    crate::given::Given<crate::error::Result<ParamsValue>>,
+) {
+    let stop = call.stop_submitted();
+    let mut recorded = None;
+    let late = held_before_its_claim(
+        &call.controller,
+        &call.device.principal(),
+        call.device.device_id,
+        Method::VoiceStop,
+        &stop,
+        async |admission| {
+            recorded = Some(
+                call.submit_voice(Method::VoiceStop, &stop)
+                    .await
+                    .expect("the second copy stops the call and records it"),
+            );
+            then(&call.controller, admission);
+        },
+    )
+    .await;
+    (recorded.expect("the second copy was made"), late)
+}
+
+/// KR-REQ-09.09, the voice claim race, the authority part: a stop that found no record of its action
+/// at the early look and meets one where it claims the action, because another copy of the stop
+/// claimed it in between and recorded what it came to, is given that record only under the
+/// authority it arrived under, asked with the record in hand. The control: with nothing owed the
+/// late copy is given the answer the other recorded, as one read from the record. While this host
+/// owes a fence it could not raise, or once the registration the late copy arrived on is gone, the
+/// record is not given back, and the stop is not performed again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_recorded_by_another_copy_before_its_claim_is_given_back_only_under_its_authority() {
+    // The control.
+    let call = Call::start().await;
+    let (recorded, late) = a_stop_that_meets_the_other_copys_record_where_it_claims(
+        &call,
+        |_controller, _admission| {},
+    )
+    .await;
+    assert!(late.is_copied(), "the late copy read the other's record");
+    let late = late
+        .into_answer()
+        .expect("the record's answer is given back");
+    assert_eq!(
+        late.to_typed::<VoiceStopResult>().expect("a stop result"),
+        recorded
+            .to_typed::<VoiceStopResult>()
+            .expect("a stop result"),
+        "the late copy is given what the other copy recorded"
+    );
+    assert_eq!(call.controller.voice().coordinator().live_sessions(), 0);
+    call.world.serving.abort();
+
+    // A fence this host owes lands after the other copy recorded.
+    let call = Call::start().await;
+    let (_recorded, late) = a_stop_that_meets_the_other_copys_record_where_it_claims(
+        &call,
+        |controller, _admission| controller.hold_fence(true),
+    )
+    .await;
+    let refused = late
+        .into_answer()
+        .expect_err("the record is not given back while a fence is owed");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+    assert!(refused.to_string().contains("fence"), "{refused}");
+    call.world.serving.abort();
+
+    // The registration the late copy arrived on is withdrawn after the other copy recorded.
+    let call = Call::start().await;
+    let (_recorded, late) =
+        a_stop_that_meets_the_other_copys_record_where_it_claims(&call, |controller, admission| {
+            controller
+                .admitted_write()
+                .remove(&admission.connection_id)
+                .expect("the late copy's registration stands until it is withdrawn");
+        })
+        .await;
+    let refused = late
+        .into_answer()
+        .expect_err("the record is not given back to a connection that is gone");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+    assert_eq!(
+        refused.to_string(),
+        crate::authority::AdmissionLapse::Deregistered.to_string(),
+        "the refusal is the withdrawn registration's, and not a fence this host owes"
+    );
     call.world.serving.abort();
 }
 
