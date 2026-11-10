@@ -5,7 +5,6 @@ import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.AudioRecordingConfiguration
-import android.media.MediaRecorder
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
@@ -32,7 +31,6 @@ import to.kala.reach.companion.mobile.VoiceCallControl
 import to.kala.reach.companion.mobile.VoiceCallPlatform
 import to.kala.reach.companion.mobile.VoiceCaptureState
 import to.kala.reach.companion.mobile.VoiceMediaSwitches
-import to.kala.reach.companion.mobile.recordingOf
 import to.kala.reach.companion.push.AudioSession
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
@@ -163,7 +161,7 @@ class VoiceCall private constructor(
      */
     private val audioDevice: JavaAudioDeviceModule =
         JavaAudioDeviceModule.builder(context)
-            .setAudioSource(RECORDER_SOURCE)
+            .setAudioSource(VoiceCallControl.RECORDER_SOURCE)
             .setAudioRecordStateCallback(
                 object : JavaAudioDeviceModule.AudioRecordStateCallback {
                     override fun onWebRtcAudioRecordStart() {
@@ -281,12 +279,6 @@ class VoiceCall private constructor(
 
         /** The label the provider's protocol gives the channel its events arrive on. */
         const val EVENTS_LABEL = "oai-events"
-
-        /**
-         * The source the audio device takes this call's audio from. The device is built with it, and
-         * the recording the system lists for the call is the one from this source.
-         */
-        const val RECORDER_SOURCE = MediaRecorder.AudioSource.VOICE_COMMUNICATION
 
         /** How long the call's thread is given to read its record before the proof is given up on. */
         private const val PROOF_TIMEOUT_SECONDS = 10L
@@ -563,12 +555,7 @@ class VoiceCall private constructor(
         val manager = context.getSystemService(AudioManager::class.java) ?: return
         val callback = object : AudioManager.AudioRecordingCallback() {
             override fun onRecordingConfigChanged(configs: List<AudioRecordingConfiguration>) {
-                control.recording(
-                    recordingOf(
-                        configs.map { RecordingReport(it.clientAudioSource, it.isClientSilenced) },
-                        RECORDER_SOURCE,
-                    ),
-                )
+                control.recording(configs.map { RecordingReport(it.clientAudioSource, it.isClientSilenced) })
             }
         }
         synchronized(lock) { recordingCallback = callback }

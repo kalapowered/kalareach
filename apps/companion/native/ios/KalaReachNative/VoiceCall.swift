@@ -81,6 +81,9 @@ public final class VoiceCall: NSObject {
     private var playbackSwitchesSeen: UInt64 = 0
     /// The call's own queue: its timer, and every report from the audio session and WebRTC.
     private let queue: DispatchQueue
+    /// Marks the call's own queue, so work that is already on it is told at once and not queued
+    /// behind what is waiting there.
+    private let queueMark = DispatchSpecificKey<Void>()
     /// How many barriers this call has told its observer of. Queue only.
     private var barriers: UInt64 = 0
     /// The provider's events channel, which this end creates before the offer and only reads.
@@ -173,6 +176,7 @@ public final class VoiceCall: NSObject {
         // carries nothing until the control lets it.
         microphone.isEnabled = false
         self.queue = queue
+        queue.setSpecific(key: queueMark, value: ())
         self.observer = observer
         super.init()
         // Before the control exists: building it sets every switch off, and a call that does not
@@ -249,6 +253,9 @@ public final class VoiceCall: NSObject {
         let requestedAtMs = VoiceCall.nowMs()
         connection.statistics { [weak self] report in
             let answeredAtMs = VoiceCall.nowMs()
+            // A report carries the moment its collection began, in UTC microseconds: how old it was
+            // when it was answered, whatever the connection's cache or a slow collection did.
+            let reportAgeMs = VoiceCall.ageMs(ofReportAt: report.timestamp_us)
             let source = report.statistics.values.first {
                 $0.type == "media-source" && ($0.values["kind"] as? String) == "audio"
             }
@@ -260,7 +267,8 @@ public final class VoiceCall: NSObject {
                     capturedSeconds: seconds,
                     generation: generation,
                     requestedAtMs: requestedAtMs,
-                    answeredAtMs: answeredAtMs
+                    answeredAtMs: answeredAtMs,
+                    reportAgeMs: reportAgeMs
                 )
                 if self.playout.reading(
                     reading,
@@ -469,6 +477,14 @@ public final class VoiceCall: NSObject {
     /// This device's monotonic clock, in milliseconds. The gate's deadlines are on it.
     fileprivate static func nowMs() -> UInt64 { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
 
+    /// How old a statistics report is now, from its own timestamp in UTC microseconds, or nil when it
+    /// has none. A timestamp in the future reads as no age.
+    static func ageMs(ofReportAt timestampUs: Double) -> UInt64? {
+        guard timestampUs > 0 else { return nil }
+        let nowUs = Date().timeIntervalSince1970 * 1_000_000
+        return UInt64(max(0, (nowUs - timestampUs) / 1_000))
+    }
+
     /// The platform, as the control sees it.
     private final class Platform: VoiceCallPlatform {
         private unowned let call: VoiceCall
@@ -500,10 +516,16 @@ public final class VoiceCall: NSObject {
         func publish(_ state: VoiceCaptureState, mutedByPerson: Bool) {
             AudioSession.shared.publish(state, for: call)
             // Told on the call's own queue, not on the thread that changed it: the control calls
-            // this under its lock, and what an observer does must not wait for that thread.
+            // this under its lock, and what an observer does must not wait for that thread. A change
+            // made by a report that is already running on that queue is told there at once, so the
+            // news of it is not queued behind a proof read after it, and its marker.
             let call = call
             call.lockScreen.follow(mutedByPerson: mutedByPerson)
-            call.queue.async { call.observer?.voiceCall(call, captureChanged: state) }
+            if DispatchQueue.getSpecific(key: call.queueMark) != nil {
+                call.observer?.voiceCall(call, captureChanged: state)
+            } else {
+                call.queue.async { call.observer?.voiceCall(call, captureChanged: state) }
+            }
         }
 
         func ended() {

@@ -5,6 +5,7 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioRecordingConfiguration
+import android.media.MediaRecorder
 import android.os.Handler
 import android.os.Looper
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -20,7 +21,8 @@ import to.kala.reach.companion.mobile.CaptureProofRead
 import to.kala.reach.companion.mobile.RecordingReport
 import to.kala.reach.companion.mobile.VoiceCaptureGate
 import to.kala.reach.companion.mobile.VoiceCaptureState
-import to.kala.reach.companion.mobile.recordingOf
+import to.kala.reach.companion.mobile.RecordingWatch
+import to.kala.reach.companion.mobile.VoiceCallControl
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -121,24 +123,29 @@ class VoiceCaptureProofTest {
      */
     @Test
     fun a_recording_from_the_calls_source_is_listed_by_the_system_and_reads_as_audible() {
+        assertEquals(
+            "the source the call looks for is the platform's own",
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+            VoiceCallControl.RECORDER_SOURCE,
+        )
         InstrumentationRegistry.getInstrumentation().uiAutomation
             .grantRuntimePermission(context.packageName, Manifest.permission.RECORD_AUDIO)
         val manager = context.getSystemService(AudioManager::class.java)
+        val watch = RecordingWatch(VoiceCallControl.RECORDER_SOURCE)
+        fun reports(configs: List<AudioRecordingConfiguration>) =
+            configs.map { RecordingReport(it.clientAudioSource, it.isClientSilenced) }
+        // What is recording before this call's recorder runs belongs to others.
+        watch.read(reports(manager.activeRecordingConfigurations), deviceOn = false)
         val seen = LinkedBlockingQueue<VoiceCaptureGate.Recording>()
         val callback = object : AudioManager.AudioRecordingCallback() {
             override fun onRecordingConfigChanged(configs: List<AudioRecordingConfiguration>) {
-                seen.add(
-                    recordingOf(
-                        configs.map { RecordingReport(it.clientAudioSource, it.isClientSilenced) },
-                        VoiceCall.RECORDER_SOURCE,
-                    ),
-                )
+                seen.add(watch.read(reports(configs), deviceOn = true))
             }
         }
         manager.registerAudioRecordingCallback(callback, Handler(Looper.getMainLooper()))
         val size = AudioRecord.getMinBufferSize(16_000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
         val record = AudioRecord(
-            VoiceCall.RECORDER_SOURCE,
+            VoiceCallControl.RECORDER_SOURCE,
             16_000,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,

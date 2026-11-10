@@ -1,5 +1,6 @@
 package to.kala.reach.companion.voice
 
+import android.Manifest
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.After
@@ -38,7 +39,12 @@ class VoiceNegotiationTest {
     private class Told : VoiceCall.Observer {
         val events = LinkedBlockingQueue<ByteArray>()
 
-        override fun onCaptureState(state: VoiceCaptureState) {}
+        /** Counted down when the microphone was told as capturing. */
+        val capturing = CountDownLatch(1)
+
+        override fun onCaptureState(state: VoiceCaptureState) {
+            if (state == VoiceCaptureState.CAPTURING) capturing.countDown()
+        }
 
         override fun onProviderEvent(bytes: ByteArray) {
             events.add(bytes)
@@ -247,6 +253,30 @@ class VoiceNegotiationTest {
         started.accept(answering.answer(offer))
         assertTrue(started.answerIsApplied)
         assertEquals(false, started.answerUsesDtx)
+    }
+
+    /**
+     * KR-REQ-15.36: on the real recorder, a call that the host permitted opens capture once the
+     * system reports its recording: the gate's record shows one opening and no break, and the news
+     * says the microphone is capturing. This is the call's own recorder with the in-process peer, not
+     * a phone: it shows that the rule that waits for the system's report does open on a device that
+     * reports the call's recording.
+     */
+    @Test
+    fun a_permitted_call_opens_capture_when_the_system_reports_its_recording() {
+        InstrumentationRegistry.getInstrumentation().uiAutomation.apply {
+            grantRuntimePermission(context.packageName, Manifest.permission.RECORD_AUDIO)
+            grantRuntimePermission(context.packageName, Manifest.permission.POST_NOTIFICATIONS)
+        }
+        val told = Told()
+        val (started, _) = negotiated(told)
+        assertTrue(started.permit("voice-session-1", System.currentTimeMillis() + 300_000))
+
+        assertTrue("the microphone was told as capturing", told.capturing.await(SECONDS, TimeUnit.SECONDS))
+        val read = started.captureProof(barrier = false)!!
+        assertEquals(VoiceCaptureState.CAPTURING, read.proof.state)
+        assertEquals(1L, read.proof.openings)
+        assertTrue(read.proof.opened)
     }
 
     private companion object {

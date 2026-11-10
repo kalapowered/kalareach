@@ -102,6 +102,7 @@ class VoiceCallControl(
 
     private val lock = Any()
     private val gate = VoiceCaptureGate(keptIntervals)
+    private val recordings = RecordingWatch(RECORDER_SOURCE)
     private var asked: Asked? = null
     private var deviceOn = false
     private var focusHeld = false
@@ -236,12 +237,14 @@ class VoiceCallControl(
     }
 
     /**
-     * What the system reports of this call's recording: heard, silenced because another application
-     * holds the microphone, or not reported at all. Silenced closes the gate and shows the
-     * microphone paused by the system, and a phone that reports nothing of the call's recording
-     * leaves the gate closed.
+     * The system's list of active recordings. What it says of this call's recording (see
+     * [RecordingWatch]) is heard, silenced because another application holds the microphone, or not
+     * reported at all. Silenced closes the gate and shows the microphone paused by the system, and a
+     * phone that reports nothing of the call's recording leaves the gate closed.
      */
-    fun recording(state: VoiceCaptureGate.Recording) = change { now -> gate.recording(state, now) }
+    fun recording(reports: List<RecordingReport>) = change { now ->
+        gate.recording(recordings.read(reports, deviceOn), now)
+    }
 
     /** Something about the media changed, such as a track arriving, and the switches are set again. */
     fun refresh() = change { }
@@ -357,5 +360,12 @@ class VoiceCallControl(
     companion object {
         /** The furthest deadline a call is given: a day. No call runs that long. */
         const val LONGEST_CALL_MS = 86_400_000L
+
+        /**
+         * The source the call's audio device takes its audio from, `MediaRecorder.AudioSource.VOICE_COMMUNICATION`
+         * (WebRTC's own default for a call). The device is built with it, and the recording the system
+         * lists for the call is one from this source.
+         */
+        const val RECORDER_SOURCE = 7
     }
 }
