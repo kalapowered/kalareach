@@ -7309,10 +7309,11 @@ async fn a_challenge_read_after_the_host_was_lost_is_put_to_nobody() {
     scene.stop_host().await;
 }
 
-/// A call that ends while the dialog's lookup of the session's number is still waiting asks nobody:
-/// the person is not asked to confirm what can no longer be sent.
+/// A call that is ending while the dialog's lookup of the session's number is still waiting asks
+/// nobody: the person is not asked to confirm what can no longer be sent. Native code is held at its
+/// stop, so the call is ending and not yet ended while the lookup is let go.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_confirmation_is_not_asked_once_the_call_has_ended() {
+async fn a_confirmation_is_not_asked_once_the_call_is_ending() {
     let mut scene = closing().await;
     calling(&scene).await;
     chatter(&scene).await;
@@ -7321,15 +7322,30 @@ async fn a_confirmation_is_not_asked_once_the_call_has_ended() {
     ask(&scene, "d-1", end - 200).await;
     // The lookup of the session's number, which the dialog waits for, is held.
     scene.link.until_request_held().await;
-    hang_up(&scene);
-    scene
-        .state_where("the call ended", |state| state["running"] == false)
-        .await;
+    scene.platform.hold("stop");
+    let _holding = scene.platform.release_when_done("stop");
+    let stopping = scene
+        .phone
+        .companion
+        .start_call("voice_stop", json!({ "voiceSessionId": null }));
+    tokio::time::timeout(WATCHDOG, async {
+        while scene.platform.count("stop") == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("native code was asked to stop");
     scene.link.release_request();
 
     until_the_ceremony_is_handled(&scene, "d-1").await;
 
     assert!(scene.ceremony.asked().is_empty(), "nobody was asked");
     assert_eq!(at_the_host(&scene), 1, "no signature was sent");
+    assert!(!stopping.is_finished(), "the call has not ended");
+    scene.platform.release("stop");
+    stopping
+        .await
+        .expect("the stop ran")
+        .expect("the call ends");
     scene.stop_host().await;
 }
