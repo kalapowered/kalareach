@@ -322,13 +322,21 @@ What is shown is bound to the host it was read from. The change names that host'
 the command refuses it when the application is connected to another host by then. When the person
 presses, the page reads the grant again and sends nothing if the grant or the host has changed. The
 command checks the host only, so a change to the grant made after that read is overwritten. A press
-that finds a change has the screen read what a call would be again, and a connection that moves to
-another host clears what was read from the first and reads the next. The first-use step, which
-grants the default scope for the sessions the person chose, names the host it listed them from in
-the same way. The host's answer says what the
-phone's own access could not carry and which sessions' workers have still to confirm the fence the
-replacement owed, because a replacement ends the calls that ran under the grant it replaces. With
-the constant off the entry is not offered.
+that finds a change, and a change that was made, have the screen read what a call would be again.
+The entry takes no further change until that read has ended. If it failed, the entry says so and
+offers the read again.
+
+The screen counts the hosts the connection reports. When the connection moves to another host, the
+screen clears what it read from the first, drops the session the address named, and reads the next.
+An answer asked for under an earlier count is ignored, even if the connection has come back to that
+host. The first-use step, which grants the default scope for the sessions the person chose, names
+the host it listed them from in the same way. It answers under the count it was submitted under,
+and only while it is shown. If the connection drops while it reads the sessions, the step says so
+and offers the read again.
+
+The host's answer says what the phone's own access could not carry and which sessions' workers
+have still to confirm the fence the replacement owed, because a replacement ends the calls that ran
+under the grant it replaces. With the constant off the entry is not offered.
 
 ## What a call's media has carried
 
