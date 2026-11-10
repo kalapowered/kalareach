@@ -196,14 +196,24 @@ async fn let_go(controller: Arc<Controller>) {
     drop(controller);
 }
 
-/// Whether the daemon did not join the network because it could not bind the address a suite gave
-/// it, which only a port a device holds can be: a port the system chooses cannot be refused.
-fn address_was_held(settings: &NetworkSettings, error: &impl std::fmt::Display) -> bool {
-    settings
+/// What the transport says when the sockets of its endpoint cannot be bound, which is the one way a
+/// held address makes a bind fail. Its other bind failures (the QUIC endpoint, the network monitor,
+/// the TLS configuration) are not words of a held address.
+const SOCKETS_NOT_BOUND: &str = "Failed to bind sockets";
+
+/// The address a suite gave the daemon, when the daemon did not join the network because it could
+/// not bind the sockets for that address. Only an address a device holds can be refused: a port the
+/// system chooses cannot. Any other failure to join is no sign of a held address.
+fn held_address(
+    settings: &NetworkSettings,
+    error: &impl std::fmt::Display,
+) -> Option<std::net::SocketAddr> {
+    let address = settings
         .endpoint
         .bind_addr
-        .is_some_and(|address| address.port() != 0)
-        && error.to_string().contains("could not be bound")
+        .filter(|address| address.port() != 0)?;
+    let said = error.to_string();
+    (said.contains("could not be bound") && said.contains(SOCKETS_NOT_BOUND)).then_some(address)
 }
 
 /// One daemon, its local endpoint and its network, with a temporary environment of its own.
@@ -971,8 +981,9 @@ impl Host {
     /// offering codes through `room`, with its network built from `settings`.
     ///
     /// A daemon that is given an address a device holds cannot take another, and the address is
-    /// free only until another program binds it. When the daemon cannot bind it, it is started
-    /// again once the address can be bound, for as many as [`BIND_TRIES`] starts in all.
+    /// free only until another program binds it. When the daemon cannot bind the sockets for it,
+    /// it is started again once the address can be bound, for as many as [`BIND_TRIES`] starts in
+    /// all. Any other failure to join the network fails the start at once.
     #[allow(clippy::too_many_arguments)]
     async fn start_on(
         temp: kr_ipc::testing::TempHost,
@@ -1125,10 +1136,10 @@ impl Host {
         .await;
         let network = match joined {
             Ok(network) => network,
-            // A daemon joins the network once, so the one that could not bind its address is let go
-            // and another is started over the same tree, as a restart does, when the address can
-            // be bound again.
-            Err(error) if tries > 1 && address_was_held(&settings, &error) => {
+            // A daemon joins the network once, so the one that could not bind the sockets for its
+            // address is let go and another is started over the same tree, as a restart does, when
+            // the address can be bound again.
+            Err(error) if tries > 1 && held_address(&settings, &error).is_some() => {
                 clients.abort();
                 let _ = clients.await;
                 let_go(controller).await;
@@ -1145,7 +1156,13 @@ impl Host {
                 ))
                 .await;
             }
-            Err(error) => panic!("the daemon joins the network: {error}"),
+            Err(error) => match held_address(&settings, &error) {
+                Some(address) => panic!(
+                    "the daemon could not bind {address} in {BIND_TRIES} starts, each after the \
+                     address could be bound: {error}"
+                ),
+                None => panic!("the daemon joins the network: {error}"),
+            },
         };
         Self {
             temp,
