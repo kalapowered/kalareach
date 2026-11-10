@@ -273,6 +273,17 @@ impl Slave {
         command: &CommandBuilder,
         before_it_runs: impl FnOnce() -> Result<(), E>,
     ) -> Result<Box<dyn Child + Send + Sync>, StartFailure<E>> {
+        #[cfg(feature = "testing")]
+        {
+            let words: Vec<String> = command
+                .get_argv()
+                .iter()
+                .map(|word| word.to_string_lossy().into_owned())
+                .collect();
+            if let Some((program, arguments)) = words.split_first() {
+                kr_ipc::testing::created::note_words_here("shell", program, arguments);
+            }
+        }
         let spawned = handle::spawn(&self.console, &self.job, command, before_it_runs)?;
         // The boundary is established from the root shell's identity, after this call and away
         // from the terminal that made it, so the job is recorded where that lookup can find it.

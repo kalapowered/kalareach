@@ -440,6 +440,8 @@ mod platform {
         let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
         let executable = std::path::Path::new(&root).join("System32").join("cmd.exe");
         let before = own()?.query_interrupt_time;
+        #[cfg(feature = "testing")]
+        kr_ipc::testing::created::note_words_here("clock", &executable.to_string_lossy(), &[]);
         let mut child = {
             // Created under the lock every launch takes: a process started while a launch's
             // streams are inheritable would hold them.

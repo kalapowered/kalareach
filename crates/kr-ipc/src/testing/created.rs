@@ -5,9 +5,12 @@
 //! its directory and its environment are not in a table read at one moment. This is the other
 //! way: the places that create a process for a session (the worker's root shell, backend server,
 //! backend probe, platform questions and desktop checks, and the daemon's description process)
-//! write one line here before they create it, so a creation that fails is a line too. Other
-//! places, and every start on Windows, write none. A test reads the lines once it can say, by a
-//! condition of its own, that those places have nothing more to be asked for.
+//! write one line here before they create it, so a creation that fails is a line too. On Windows
+//! the same places write, and so do the worker's check of the kernel's clock and its query of the
+//! time service, the starts that are made through the system's own create rather than through
+//! [`std::process::Command`] naming their words ([`note_words_here`]). Other places write none. A
+//! test reads the lines once it can say, by a condition of its own, that those places have nothing
+//! more to be asked for.
 //!
 //! The record is a file in the environment's state directory, so the daemon and every worker of
 //! the environment write to the one list. It exists only where a test made it ([`begin`]); a
@@ -91,6 +94,19 @@ pub fn here(state_dir: &Path) {
 /// Panics when a record that exists cannot be written: a creation that is not in the record
 /// would pass for one that did not happen.
 pub fn note_here(what: &str, command: &std::process::Command) {
+    let (program, arguments) = words_of(command);
+    note_words_here(what, &program, &arguments);
+}
+
+/// Writes that this process is about to create a process named by `program` and `arguments`, as
+/// `what`, where [`note_here`] would. For a creation that does not go through
+/// [`std::process::Command`], such as a Windows start that calls the system's own create; the
+/// place says the words it hands the system.
+///
+/// # Panics
+///
+/// As [`note_here`].
+pub fn note_words_here(what: &str, program: &str, arguments: &[String]) {
     let file = HERE.get().cloned().or_else(|| {
         let runtime = tokio::runtime::Handle::try_current().ok()?;
         BY_RUNTIME
@@ -101,7 +117,7 @@ pub fn note_here(what: &str, command: &std::process::Command) {
             .map(|(_, file)| file.clone())
     });
     if let Some(file) = file {
-        append(&file, what, command);
+        append(&file, what, program, arguments);
     }
 }
 
@@ -112,23 +128,29 @@ pub fn note_here(what: &str, command: &std::process::Command) {
 ///
 /// As [`note_here`].
 pub fn note_in(state_dir: &Path, what: &str, command: &std::process::Command) {
-    append(&state_dir.join(FILE), what, command);
+    let (program, arguments) = words_of(command);
+    append(&state_dir.join(FILE), what, &program, &arguments);
 }
 
-fn append(file: &Path, what: &str, command: &std::process::Command) {
+/// The program of a command and its arguments, as text.
+fn words_of(command: &std::process::Command) -> (String, Vec<String>) {
+    (
+        command.get_program().to_string_lossy().into_owned(),
+        command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect(),
+    )
+}
+
+fn append(file: &Path, what: &str, program: &str, arguments: &[String]) {
     let mut line = format!("{}", std::process::id());
-    for field in std::iter::once(what.to_owned())
-        .chain(std::iter::once(
-            command.get_program().to_string_lossy().into_owned(),
-        ))
-        .chain(
-            command
-                .get_args()
-                .map(|argument| argument.to_string_lossy().into_owned()),
-        )
+    for field in [what, program]
+        .into_iter()
+        .chain(arguments.iter().map(String::as_str))
     {
         line.push('\t');
-        escape_into(&mut line, &field);
+        escape_into(&mut line, field);
     }
     line.push('\n');
     // Not created: a record exists only where a test made it. One write, so that two processes
@@ -230,6 +252,7 @@ mod tests {
         begin(&state).expect("makes the record");
         let named = |name: &str| std::process::Command::new(name);
         note_here("task", &named("on-the-runtime"));
+        note_words_here("words", "by-its-words", &["one".to_owned()]);
         tokio::task::spawn_blocking(|| {
             note_here("blocking", &std::process::Command::new("blocking"))
         })
@@ -251,7 +274,7 @@ mod tests {
             .into_iter()
             .map(|created| created.program)
             .collect();
-        assert_eq!(written, ["on-the-runtime", "blocking"]);
+        assert_eq!(written, ["on-the-runtime", "by-its-words", "blocking"]);
     }
 
     /// A record that was made is read back as it was written, whatever a field holds, and a

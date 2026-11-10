@@ -216,6 +216,12 @@ struct Process {
 impl Process {
     fn start(executable: &Path, arguments: &[String], directory: &Path) -> std::io::Result<Self> {
         let job = crate::windows::job::AgentJob::create_owning()?;
+        #[cfg(feature = "testing")]
+        kr_ipc::testing::created::note_words_here(
+            "backend-probe",
+            &executable.to_string_lossy(),
+            arguments,
+        );
         let child = crate::windows::launch::start(&crate::windows::launch::Spec {
             program: executable,
             arguments,

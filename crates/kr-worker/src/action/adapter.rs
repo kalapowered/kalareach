@@ -480,6 +480,12 @@ mod windows {
         // Started under the lock every start of this worker's takes, while a launch's stream ends
         // may be inheritable, and let go of as soon as the process exists: it is not held for as
         // long as `w32tm` runs.
+        #[cfg(feature = "testing")]
+        kr_ipc::testing::created::note_words_here(
+            "time",
+            "w32tm",
+            &["/query".to_owned(), "/status".to_owned()],
+        );
         let child = {
             let _inheriting = crate::windows::launch::inheriting();
             std::process::Command::new("w32tm")
