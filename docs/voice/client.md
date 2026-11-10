@@ -151,19 +151,84 @@ plainly, with the statement that **unheard speech never authorises an action** (
 - `interrupted`: Another call or high-priority audio took the microphone.
 - `route_changing`: Switching between speaker, receiver, or Bluetooth.
 - `suspended_by_system`: The OS suspended capture.
-- `unavailable`: No microphone hardware or permission is available, or the recorder has not
-  started or has failed.
+- `unavailable`: No microphone hardware or permission is available, the recorder has not
+  started or has failed, or (on Android) the system has not reported the call's own recording, so
+  the call cannot tell its own recording from another application's.
 - `idle`: No call has been permitted, the call has ended, or its deadline has passed.
 
 On the phones, what a call displays and whether its microphone carries speech come from the same
 gate, so the two cannot disagree. The gate keeps the recent intervals in which capture was on, and
 answers for the past only: an instant later than the moment it is asked at, or older than the oldest
 interval it kept, is treated as unheard. That record is what a claim that something was said would
-be checked against (KR-ACC-014). The screen does not check a delegation against it: delegations
-reach the screen from the host, not from the provider's channel.
+be checked against (KR-ACC-014). A spoken delegation is checked against the gate's record of the
+call, not against the news the call tells of it ([Spoken delegations](#spoken-delegations)).
 
 Whenever capture is in any state other than `capturing`, the UI displays:
 > "Nothing spoken while the microphone was not carrying your voice can authorise an action."
+
+## Spoken delegations
+
+This version hands no spoken delegation to the host. The provider announces a delegation on its
+data channel and on the voice service's control socket; each one is answered to the model by a
+fixed sentence that nothing was done, the screen shows a row that says so, and the transcript and
+delegation events on the data channel are not read at all. A constant in the call's owner holds
+this, and the code that would act otherwise is switched on only by a setter compiled in test and
+debug builds. A release build compiles neither the setter nor any caller of it.
+
+Switched on, the call's owner decides each delegation itself, from the provider's data channel
+alone. The voice service's announcement only has to agree with it, at the same identifier and the
+same offset. The owner reads `session.input_transcript.delta` (a fragment of what the caller said,
+with the interval of the call's timeline it covers) and `session.delegation.created` (the
+delegation's identifier and offset). Neither carries authority. The owner collects the fragments
+for a wait after the delegation, asks native code for a capture proof that also puts a marker into
+the call's news, reads the news up to that marker, and only then decides:
+
+- **Taint.** What shows the device cannot know it read everything said since the call began ends
+  the call's authority for good, and the person is told once: news that was lost; a required event
+  that cannot be read as its schema states it; a fragment whose text is empty, over 512 bytes or
+  holds a control character; a time that is not a whole number from 0 to a call's longest length
+  (a fraction, a negative and a huge value pass the provider's schema); fragments that run
+  backwards or overlap; a delegation whose offset is below an earlier one's; a fragment that
+  arrives after the set it belongs to was read; a fragment that arrives before capture first
+  opened; native code's own record of capture showing more than one opening or any break (a
+  mute, an interruption, a route change, a suspension, a recorder gap or a silenced recording);
+  an answer that turns discontinuous transmission on; and the provider's own acknowledgement of a
+  mute after capture opened. A call that starts muted and whose provider acknowledges the mute
+  after the microphone first opens is tainted by it for the rest of the call.
+- **The first fragment.** The device cannot hear what was said before capture first opened, and a
+  person can say "do not" before it. A set that holds the first fragment the call delivered, or
+  the first one that arrived after the opening, never authorises: the first thing a person says in
+  a call never acts. The two are checked apart, each by when the fragment arrived against the
+  first opening.
+- **The set.** The fragments that start at or before the delegation's offset, no more than 30
+  seconds before it, that no earlier set used, in the order they arrived; at most 16 fragments and
+  2,048 bytes, otherwise the set is refused and never cut. A fragment outside the set that
+  overlaps its span taints the call, and one that ends within 2 seconds before the set's first
+  fragment refuses the set, since it may be the first half of the same instruction.
+
+The 30 seconds, the 2 seconds, the wait after a delegation, the 40 ms and 100 ms capture-gap
+thresholds and the 500 ms age of a proof are parameters of the device's reading, not safety bounds,
+and no rule here decides exactly what separates two instructions. These limits stand and no case
+asserts them:
+
+- A first fragment older than the 30 seconds, followed after a pause by a command, leaves a set
+  that holds no first fragment: "do not ever", said as the call opens, does not stop "show me the
+  status of session three" said a minute later.
+- A fragment can arrive after the wait, so a later "no" can follow a read that was performed.
+  Nothing on the device decides how long the provider takes to send a fragment.
+- Loss below the capture gate's thresholds, silence supplied at the normal rate, an invented
+  transcript, the model's own voice echoed and a bystander are outside what the device can see.
+- On Android, another application that starts recording from the call's audio source after the
+  device is on and before the system lists the call's own recording reads as the call's.
+
+A request is composed once, as a whole, and kept: the host answers an exact repeat from its record
+and refuses a request recomposed under a later action window as another request under the same
+identifier. Before the request is written, a fresh capture proof is taken, and it is used only
+while its age plus the time to the write is within the bound, checked once the connection holds
+the right to write: a write that waits past the bound writes nothing. A request that was written
+and not answered stays unknown, and is asked about again by repeat on another connection; when the
+host is lost, a request not yet written is discarded and one that was is not known to have been
+carried out. A call that ends with such a request open says so, and never says nothing was done.
 
 ## What a call's media has carried
 
