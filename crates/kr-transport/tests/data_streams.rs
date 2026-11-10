@@ -348,11 +348,17 @@ fn terminal_header(connection_id: ConnectionId, session: u8) -> StreamHeader {
 /// A clean end of the stream, or a read that fails any other way, fails the case: a stream the host
 /// refuses or cuts has to be seen taken away, never ended as though it had completed.
 async fn reset_code(recv: &mut RecvStream) -> u64 {
+    reset_after_bytes(recv).await.0
+}
+
+/// As [`reset_code`], and says how many bytes arrived before the reset.
+async fn reset_after_bytes(recv: &mut RecvStream) -> (u64, usize) {
     let mut byte = [0u8; 4096];
+    let mut received = 0;
     loop {
         match awaited("the host's reset of the stream", recv.read(&mut byte)).await {
-            Err(ReadError::Reset(code)) => return code.into_inner(),
-            Ok(Some(_)) => {}
+            Err(ReadError::Reset(code)) => return (code.into_inner(), received),
+            Ok(Some(count)) => received += count,
             other => panic!("the stream did not end in a reset: {other:?}"),
         }
     }
@@ -776,6 +782,45 @@ async fn revoking_a_stream_ends_a_write_the_device_does_not_read() {
     assert_eq!(harness.registry.budget().queued_bytes(), 0);
     drop((reader, writer));
     assert_eq!(reset_code(&mut recv).await, u64::from(STREAM_REVOKED));
+
+    harness.finish().await;
+}
+
+/// A frame is not written past the moment its stream is revoked. A write hands a frame to the
+/// stream in attempts, and the stream's revoked state is asked in the same poll as each of them, so
+/// a revocation that arrives between two attempts, which a race against the revocation cannot
+/// tell from one that arrives just after the write, ends the write there: here the host's check
+/// revokes the stream while it admits the first attempt, with the stream still writable, and the
+/// second attempt is not made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_is_not_written_once_the_stream_is_revoked() {
+    let mut harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::Forward).await;
+    let header = attachment_header(harness.authorised.connection_id, 1);
+    let (_send, mut recv) = harness.raw(&header).await;
+    let stream = harness.next().await;
+    let handle = stream.handle();
+    let (reader, mut writer) = stream.split();
+
+    let revoke_at_the_first_attempt = |attempt: &mut dyn FnMut()| {
+        attempt();
+        handle.revoke();
+        true
+    };
+    let outcome = writer
+        .write_message_while(&blob(100), &revoke_at_the_first_attempt)
+        .await;
+    assert!(
+        matches!(outcome, Err(TransportError::ControlLost)),
+        "a write that was revoked part way did not fail as a revoked stream's does: {outcome:?}"
+    );
+    assert!(reader.is_revoked());
+    drop((reader, writer));
+    let (code, received) = reset_after_bytes(&mut recv).await;
+    assert_eq!(code, u64::from(STREAM_REVOKED));
+    assert!(
+        received <= kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN,
+        "{received} bytes reached the device, so part of the frame went after the revocation"
+    );
 
     harness.finish().await;
 }
