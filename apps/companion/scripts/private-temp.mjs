@@ -29,7 +29,7 @@ export function privateTemporary(env = process.env) {
       try {
         rmSync(directory, { recursive: true, force: true })
       } catch {
-        // Nothing to do: the directory holds only what the build's tools cached.
+        // Nothing to do: the directory holds what the build's tools cached, and its options file.
       }
     }
   }

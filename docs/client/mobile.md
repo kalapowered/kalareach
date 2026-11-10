@@ -388,9 +388,10 @@ cd apps/companion/src-tauri/gen/android && ./gradlew :app:compileUniversalDebugK
 # `base/lib/<abi>/*.so` in an AAB) for the Java classes they find by name, in their type
 # descriptors and in their NUL-ended strings, and fails when the dex does not define one of them
 # under that name, or when a native method of a class the libraries of an ABI are bound to (they
-# export other natives of it) has no exported `Java_` symbol there. A minified build removes or renames a class that only native code reaches,
-# and the runtime then aborts the application when the library asks for it, so only a minified
-# package shows this. The classes of the media library are kept whole by
+# export other natives of it) has no exported `Java_` symbol there; a class whose natives a library
+# exports in part and registers in part therefore fails, and nothing overrides that. A minified
+# build removes or renames a class that only native code reaches, and the runtime then aborts the
+# application when the library asks for it, so only a minified package shows this. The classes of the media library are kept whole by
 # `src-tauri/gen/android/app/proguard-rules.pro`.
 # `pnpm -C apps/companion android` runs each build in a temporary directory of its own, since the
 # command line tool shares the build's options with Gradle through a file there named for the
