@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use iroh::endpoint::{
     Builder, ConnectOptions, ConnectingError, Connection, ConnectionError, QuicTransportConfig,
-    RelayStatus, presets,
+    RelayStatus, VarInt, presets,
 };
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr, Watcher,
@@ -40,6 +40,8 @@ use rustls_pki_types::CertificateDer;
 
 use crate::config::{EndpointConfig, PublishedAddresses};
 use crate::error::{RelayRefusal, Result, TransportError};
+use crate::scheduler::DEFAULT_MAX_BULK_STREAMS;
+use crate::streams::MAX_PENDING_HEADERS;
 
 /// How often an idle connection sends a QUIC keepalive.
 ///
@@ -65,7 +67,17 @@ pub async fn bind_listener(
     config: &EndpointConfig,
     identity: &TransportIdentityKeyPair,
 ) -> Result<Endpoint> {
-    bind(config, identity, true, None).await
+    bind_listener_for(config, identity, DEFAULT_MAX_BULK_STREAMS).await
+}
+
+/// Builds the endpoint of a host that lets a device hold `max_bulk_streams` bulk streams open at
+/// once, which is what [`transport_config`] sizes the connection's stream limit for.
+pub(crate) async fn bind_listener_for(
+    config: &EndpointConfig,
+    identity: &TransportIdentityKeyPair,
+    max_bulk_streams: usize,
+) -> Result<Endpoint> {
+    bind(config, identity, true, None, max_bulk_streams).await
 }
 
 /// Builds an endpoint that listens, as [`bind_listener`] does, and looks every name up through the
@@ -83,7 +95,14 @@ pub async fn bind_listener_asking(
     identity: &TransportIdentityKeyPair,
     name_server: std::net::SocketAddr,
 ) -> Result<Endpoint> {
-    bind(config, identity, true, Some(name_server)).await
+    bind(
+        config,
+        identity,
+        true,
+        Some(name_server),
+        DEFAULT_MAX_BULK_STREAMS,
+    )
+    .await
 }
 
 /// Builds an endpoint that only dials.
@@ -99,7 +118,7 @@ pub async fn bind_dialer(
     config: &EndpointConfig,
     identity: &TransportIdentityKeyPair,
 ) -> Result<Endpoint> {
-    bind(config, identity, false, None).await
+    bind(config, identity, false, None, DEFAULT_MAX_BULK_STREAMS).await
 }
 
 /// Builds an endpoint that only dials, as [`bind_dialer`] does, and looks every name up through the
@@ -114,7 +133,14 @@ pub async fn bind_dialer_asking(
     identity: &TransportIdentityKeyPair,
     name_server: std::net::SocketAddr,
 ) -> Result<Endpoint> {
-    bind(config, identity, false, Some(name_server)).await
+    bind(
+        config,
+        identity,
+        false,
+        Some(name_server),
+        DEFAULT_MAX_BULK_STREAMS,
+    )
+    .await
 }
 
 /// Builds the endpoint. `name_server` names the one name server it asks, where a test names one;
@@ -124,12 +150,13 @@ async fn bind(
     identity: &TransportIdentityKeyPair,
     accept: bool,
     name_server: Option<std::net::SocketAddr>,
+    max_bulk_streams: usize,
 ) -> Result<Endpoint> {
     let seed = identity.export_endpoint_seed();
     let secret_key = SecretKey::from_bytes(seed.expose());
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret_key)
-        .transport_config(transport_config())
+        .transport_config(transport_config(max_bulk_streams))
         .relay_mode(relay_mode(config))
         // This endpoint keeps no TLS session tickets, so it never offers QUIC 0-RTT to anyone.
         // Version 1 accepts no application mutation in 0-RTT, and the simplest way not to send
@@ -734,17 +761,42 @@ fn fallback_nameservers() -> Vec<iroh::dns::NameserverConfig> {
     servers
 }
 
+/// How many bidirectional streams a peer may have open on one connection to an endpoint that lets
+/// it hold `max_bulk_streams` bulk streams: the control stream, the bulk streams, the streams
+/// whose headers are being read ([`MAX_PENDING_HEADERS`]) and one more, so that a stream the
+/// peer opens as another ends is not refused for the moment the old one's end takes to reach it.
+const fn max_peer_bidi_streams(max_bulk_streams: usize) -> u32 {
+    let streams = 1u64 + max_bulk_streams as u64 + MAX_PENDING_HEADERS as u64 + 1;
+    if streams > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        streams as u32
+    }
+}
+
 /// Returns the transport configuration every KalaReach peer connection uses.
 ///
 /// The keepalive and the idle timeout are the section 23 values. Setting them here rather than per
 /// connection means a connection cannot be opened without them.
-fn transport_config() -> QuicTransportConfig {
+///
+/// The streams a peer may open are bounded here too, because the library's default is a hundred of
+/// each kind and a connection that has not been authorised yet can hold them. The product uses no
+/// unidirectional stream, so a peer may open none. Bidirectional streams are the control stream,
+/// the bulk streams the endpoint lets a peer hold, the streams whose headers are being read and
+/// one more ([`max_peer_bidi_streams`]). What a connection can hold is then at most that many
+/// streams, each up to the library's per-stream receive window of 1.25 MB, and one decoded frame
+/// for each stream whose frame is being read. A finite connection-wide receive window, if one is
+/// ever set, has to stay above that product, or a stalled data stream could take the credit the
+/// control stream needs.
+fn transport_config(max_bulk_streams: usize) -> QuicTransportConfig {
     let idle_timeout = IDLE_TIMEOUT
         .try_into()
         .expect("the 30-second inactivity threshold fits an idle timeout");
     QuicTransportConfig::builder()
         .keep_alive_interval(KEEPALIVE)
         .max_idle_timeout(Some(idle_timeout))
+        .max_concurrent_uni_streams(VarInt::from_u32(0))
+        .max_concurrent_bidi_streams(VarInt::from_u32(max_peer_bidi_streams(max_bulk_streams)))
         // Section 9's 8 MiB bounded send queue per peer, enforced by the connection itself rather
         // than only by the application's own accounting: past this, a write waits instead of
         // handing more bytes to a queue nothing can drain.
@@ -912,7 +964,7 @@ mod tests {
                 ..EndpointConfig::default()
             };
             for accept in [true, false] {
-                let endpoint = bind(&config, &identity, accept, None)
+                let endpoint = bind(&config, &identity, accept, None, DEFAULT_MAX_BULK_STREAMS)
                     .await
                     .expect("an endpoint");
                 let sockets = endpoint.bound_sockets();

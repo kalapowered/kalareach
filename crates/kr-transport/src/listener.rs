@@ -19,6 +19,7 @@ use iroh::endpoint::Connection;
 use kr_crypto::connect::ChallengeLedger;
 use kr_crypto::keys::TransportIdentityKeyPair;
 use kr_protocol::envelope::{ControlEvent, ControlFrame};
+use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::{ActionWindow, ClientOffer, HostSelection};
 use kr_protocol::ids::{ActorId, AuthorityRevision, ConnectionId, ControllerGeneration, DeviceId};
 use kr_protocol::scalars::{Digest256, EndpointKey, to_base64url};
@@ -29,12 +30,13 @@ use crate::actor::ConnectionActor;
 use crate::clock::{ContinuousClock, ContinuousInstant, SystemContinuousClock};
 use crate::codec::{FrameReader, FrameWriter};
 use crate::config::EndpointConfig;
-use crate::endpoint::{KEEPALIVE, bind_listener};
+use crate::deadlines::{Deadlines, TimerDeadlines};
+use crate::endpoint::{KEEPALIVE, bind_listener_for};
 use crate::error::{Result, TransportError};
 use crate::handshake::{Admitted, HostEpochs, LocalIdentity, PairedDirectory};
 use crate::preauth::{PairingSurface, PreAuthLimits};
 use crate::scheduler::{SendLimits, StreamBudget};
-use crate::streams::{RevocationHook, StreamRegistry};
+use crate::streams::{DataStream, RevocationHook, StreamRegistry};
 use crate::window::{ActionWindowIssuer, MAX_WINDOW_VALIDITY};
 
 /// A boxed future, so [`HostHandler`] stays usable behind a trait object.
@@ -75,6 +77,15 @@ pub struct ListenerConfig {
     pub unauthorised_burst: u32,
     /// How often one place in that burst is returned.
     pub unauthorised_refill: Duration,
+    /// The stream kinds this host takes from a device. A stream a device opens whose header names
+    /// any other kind is reset before it takes a bulk slot or a place in the registry. A host that
+    /// names none takes none: every data stream a device opens is reset once its header is read,
+    /// which is what a host that never reads [`AuthorisedSession::data_streams`] gets.
+    pub accepted_kinds: Vec<StreamKind>,
+    /// The deadlines a data stream is held to: the header a device sends, each frame it sends and
+    /// each answer it is sent. A host that does not choose them gets [`TimerDeadlines`]; a test
+    /// that must not wait for a clock supplies its own.
+    pub deadlines: Arc<dyn Deadlines>,
 }
 
 impl ListenerConfig {
@@ -98,6 +109,8 @@ impl ListenerConfig {
             max_unauthorised_connections: DEFAULT_MAX_UNAUTHORISED_CONNECTIONS,
             unauthorised_burst: DEFAULT_UNAUTHORISED_BURST,
             unauthorised_refill: DEFAULT_UNAUTHORISED_REFILL,
+            accepted_kinds: Vec::new(),
+            deadlines: Arc::new(TimerDeadlines::default()),
         }
     }
 }
@@ -283,8 +296,16 @@ impl std::fmt::Debug for ReceivedFrame {
 }
 
 impl ReceivedFrame {
-    /// A frame the stream reader has just read, with what the host holds for it.
-    fn read(frame: ControlFrame, clock: &dyn ContinuousClock, hold: Option<FrameHold>) -> Self {
+    /// A frame the host has just read from a stream, stamped on `clock`, with what the host holds
+    /// for it.
+    ///
+    /// The control stream's reader makes these itself. A host that reads frames from a data stream
+    /// ([`AuthorisedSession::data_streams`]) makes one for each, with the connection's clock
+    /// ([`AuthorisedSession::clock`]) and what it holds for the frame from the moment it was read
+    /// ([`HostHandler::frame_read`]), so that a frame from either stream goes through the same
+    /// door.
+    #[must_use]
+    pub fn read(frame: ControlFrame, clock: &dyn ContinuousClock, hold: Option<FrameHold>) -> Self {
         Self {
             received_at: clock.now(),
             frame,
@@ -451,6 +472,21 @@ pub struct AuthorisedSession {
     pub control: ControlChannel,
     /// Every data stream of this connection.
     pub streams: Arc<StreamRegistry>,
+    /// The data streams the device opened and the listener has admitted, in the order their
+    /// headers arrived.
+    ///
+    /// The listener takes every stream the device opens, reads each header on a task of its own
+    /// under the header deadline, and checks the header against this connection and its kind
+    /// against [`ListenerConfig::accepted_kinds`]. A stream that passes is sent here, and a stream
+    /// that fails any step, or that finds [`DATA_STREAM_QUEUE_DEPTH`] streams waiting, or whose
+    /// receiver is gone, is reset. A host that never reads this therefore holds nothing for a
+    /// device that opens streams. The receiver ends when the connection does; a stream still in it
+    /// is reset when it is dropped.
+    pub data_streams: tokio::sync::mpsc::Receiver<DataStream>,
+    /// The deadlines a data stream is held to ([`ListenerConfig::deadlines`]), for the waits a
+    /// host makes on a stream's behalf: the lookup that admits it runs under
+    /// [`DeadlineKind::Admission`](crate::deadlines::DeadlineKind::Admission).
+    pub deadlines: Arc<dyn Deadlines>,
     /// The host's action windows.
     pub windows: Arc<ActionWindowIssuer>,
     /// The window this connection started with.
@@ -462,6 +498,12 @@ pub struct AuthorisedSession {
     /// decided under.
     pub authorised_under: AuthorityRevision,
 }
+
+/// How many admitted data streams a connection holds for a host that has not taken them yet.
+///
+/// A stream that arrives to a full queue is reset, not waited for: a host that falls this far
+/// behind is not made to hold a device's streams open.
+pub const DATA_STREAM_QUEUE_DEPTH: usize = 4;
 
 /// The tasks that serve a listener's connections, which the listener ends with itself.
 ///
@@ -660,7 +702,12 @@ pub async fn register_with_clock<H: HostHandler>(
     clock: Arc<dyn ContinuousClock>,
 ) -> Result<NetworkListener> {
     config.send_limits.check()?;
-    let endpoint = bind_listener(&config.endpoint, transport_key).await?;
+    let endpoint = bind_listener_for(
+        &config.endpoint,
+        transport_key,
+        config.send_limits.max_bulk_streams,
+    )
+    .await?;
     let windows = Arc::new(ActionWindowIssuer::new(
         Arc::clone(&clock),
         config.action_window_validity,
@@ -875,7 +922,7 @@ async fn serve_authorised<H: HostHandler>(
     let hook: Arc<dyn RevocationHook> = Arc::new(HandlerHook {
         handler: Arc::clone(&state.handler) as Arc<dyn ControlLossListener>,
     });
-    let streams = Arc::new(StreamRegistry::with_limits(
+    let streams = Arc::new(StreamRegistry::with_deadlines(
         connection_id,
         Arc::new(StreamBudget::new(
             state
@@ -885,8 +932,9 @@ async fn serve_authorised<H: HostHandler>(
         )),
         Some(hook),
         authorised.selection.limits,
+        Arc::clone(&state.config.deadlines),
     ));
-    let lost = Arc::new(ControlLoss::default());
+    let lost = Arc::new(ControlLoss::new(Arc::clone(&streams)));
     let (frames_in, frames) = tokio::sync::mpsc::channel(CONTROL_QUEUE_DEPTH);
     let control = ControlChannel {
         writer: Arc::new(Mutex::new(authorised.control_writer)),
@@ -914,6 +962,7 @@ async fn serve_authorised<H: HostHandler>(
         connection_id,
         keepalive: None,
         control_reader: None,
+        data_accept: None,
         issuing: Arc::clone(&issuing),
         connection: connection.clone(),
     };
@@ -934,11 +983,23 @@ async fn serve_authorised<H: HostHandler>(
         issuing: Arc::clone(&issuing),
     }));
 
+    // The streams the device opens are taken here, on a task the guard owns beside the keepalive
+    // and the control reader, and never by the host's handler: a handler that is answering a
+    // control request must not be what decides whether a stream waits.
+    let (admitted, data_streams) = tokio::sync::mpsc::channel(DATA_STREAM_QUEUE_DEPTH);
+    let data_accept = tokio::spawn(data_accept_loop(
+        Arc::clone(&streams),
+        connection.clone(),
+        state.config.accepted_kinds.clone().into(),
+        admitted,
+    ));
+
     // The guard now owns the keepalive too, so every way out of this function stops it: a panic in
     // the host's handler, a cancellation of this task, or the connection ending underneath it.
     let mut cleanup = cleanup;
     cleanup.keepalive = Some(keepalive);
     cleanup.control_reader = Some(control_reader);
+    cleanup.data_accept = Some(data_accept);
 
     let session = AuthorisedSession {
         connection: connection.clone(),
@@ -951,6 +1012,8 @@ async fn serve_authorised<H: HostHandler>(
         actor,
         control,
         streams: Arc::clone(&streams),
+        data_streams,
+        deadlines: Arc::clone(&state.config.deadlines),
         windows: Arc::clone(&state.windows),
         action_window: authorised.action_window,
         clock: Arc::clone(&state.clock),
@@ -978,6 +1041,8 @@ struct ConnectionCleanup {
     connection_id: ConnectionId,
     keepalive: Option<tokio::task::JoinHandle<()>>,
     control_reader: Option<tokio::task::JoinHandle<()>>,
+    /// The task that takes the device's data streams, whose header tasks end with it.
+    data_accept: Option<tokio::task::JoinHandle<()>>,
     issuing: Arc<std::sync::atomic::AtomicBool>,
     connection: Connection,
 }
@@ -995,6 +1060,9 @@ impl Drop for ConnectionCleanup {
         if let Some(control_reader) = self.control_reader.take() {
             control_reader.abort();
         }
+        if let Some(data_accept) = self.data_accept.take() {
+            data_accept.abort();
+        }
         self.connection
             .close(CONTROL_LOST.into(), b"the connection ended");
         self.streams.revoke_all();
@@ -1007,15 +1075,29 @@ impl Drop for ConnectionCleanup {
 /// A notification alone would not do: the reader task starts before the supervisor waits, so a
 /// stream that ends immediately would fire into an empty room. The flag is the durable half, and a
 /// waiter checks it before and after it parks.
-#[derive(Debug, Default)]
+///
+/// Declaring it also revokes the connection's data streams, at once and on the task that saw the
+/// loss, so that a read or a write on one fails now and not when the connection's supervisor next
+/// runs. The connection's cleanup revokes them again, and revoking twice is harmless.
+#[derive(Debug)]
 struct ControlLoss {
     lost: std::sync::atomic::AtomicBool,
     woken: tokio::sync::Notify,
+    streams: Arc<StreamRegistry>,
 }
 
 impl ControlLoss {
+    fn new(streams: Arc<StreamRegistry>) -> Self {
+        Self {
+            lost: std::sync::atomic::AtomicBool::new(false),
+            woken: tokio::sync::Notify::new(),
+            streams,
+        }
+    }
+
     fn declare(&self) {
         self.lost.store(true, std::sync::atomic::Ordering::Release);
+        self.streams.revoke_all();
         self.woken.notify_waiters();
     }
 
@@ -1070,6 +1152,59 @@ async fn control_read_loop(
         }
     }
     lost.declare();
+}
+
+/// Takes every stream the device opens on an authorised connection, until the connection ends.
+///
+/// The loop does nothing slow itself. It takes a stream from the connection
+/// ([`StreamRegistry::accept_pending`], which waits for one of the connection's few places for
+/// streams that are waiting for their headers) and gives it to a task of its own that reads the
+/// header, so a device that sends half a header holds one place for the header deadline and no
+/// more, and the stream behind it is taken meanwhile. A stream that passes admission goes to the
+/// host through `admitted`, with `try_send`: a full queue and a host that is gone both reset it.
+async fn data_accept_loop(
+    streams: Arc<StreamRegistry>,
+    connection: Connection,
+    accepted: Arc<[StreamKind]>,
+    admitted: tokio::sync::mpsc::Sender<DataStream>,
+) {
+    // Dropped with the loop, which aborts every header read that is still waiting and resets its
+    // stream.
+    let mut headers = tokio::task::JoinSet::new();
+    loop {
+        // Header tasks that ended are collected as the next stream arrives, so the set holds the
+        // streams still waiting and those that ended since the last one.
+        while headers.try_join_next().is_some() {}
+        match streams.accept_pending(&connection).await {
+            Ok(pending) => {
+                let accepted = Arc::clone(&accepted);
+                let admitted = admitted.clone();
+                headers.spawn(async move {
+                    match pending.open(&accepted).await {
+                        Ok(stream) => match admitted.try_send(stream) {
+                            Ok(()) => {}
+                            Err(
+                                tokio::sync::mpsc::error::TrySendError::Full(stream)
+                                | tokio::sync::mpsc::error::TrySendError::Closed(stream),
+                            ) => {
+                                tracing::debug!(
+                                    "a data stream was reset: the host is not taking more"
+                                );
+                                stream.reset();
+                            }
+                        },
+                        Err(error) => tracing::debug!(%error, "a data stream was refused"),
+                    }
+                });
+            }
+            // A stream refused at the door, which was reset: the next one is taken as usual.
+            Err(TransportError::Handshake(error)) => {
+                tracing::debug!(%error, "a data stream was refused");
+            }
+            // The control stream ended or the connection did.
+            Err(_) => break,
+        }
+    }
 }
 
 /// The QUIC application error code an unpaired connection is closed with when pairing is not open.

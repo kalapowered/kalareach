@@ -32,6 +32,7 @@
 //! | [`config`] | The selected relay map, Pkarr publisher, Pkarr resolver, DNS origin and HTTP proxy |
 //! | [`endpoint`] | Endpoint construction from `presets::Minimal` and the ALPN |
 //! | [`codec`] | Length-delimited KR-CBOR-1 frames over a QUIC stream |
+//! | [`deadlines`] | The deadlines a data stream is held to, as futures a test can fire |
 //! | [`handshake`] | `hello` and the `kr-connect/1` mutual proof |
 //! | [`preauth`] | The bounded pre-authorisation pairing surface |
 //! | [`streams`] | Stream headers, data streams and revocation |
@@ -54,6 +55,7 @@ pub mod actor;
 pub mod clock;
 pub mod codec;
 pub mod config;
+pub mod deadlines;
 pub mod endpoint;
 pub mod error;
 pub mod handshake;

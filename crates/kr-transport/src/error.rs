@@ -86,6 +86,10 @@ pub enum TransportError {
     /// The control stream ended, so every stream it authorised is revoked.
     #[error("the control stream ended, revoking every associated data stream")]
     ControlLost,
+    /// A wait on a data stream's peer passed its deadline, and the stream was cut: the peer sent
+    /// no header, no frame, or no further byte of one, or did not read what was written to it.
+    #[error("the {} deadline of the stream passed", .0.name())]
+    Deadline(crate::deadlines::DeadlineKind),
 }
 
 impl TransportError {
@@ -106,7 +110,11 @@ impl TransportError {
             Self::Configuration { .. } | Self::Bind(_) => {
                 ProtocolError::new(ErrorCode::HostNotConfigured, "the host is not configured")
             }
-            Self::Connect(_) | Self::Closed(_) | Self::Stream(_) | Self::ControlLost => {
+            Self::Connect(_)
+            | Self::Closed(_)
+            | Self::Stream(_)
+            | Self::ControlLost
+            | Self::Deadline(_) => {
                 ProtocolError::new(ErrorCode::ResourceUnavailable, "the connection ended")
             }
             Self::RelayRefused(refusal) => match refusal.kind {
