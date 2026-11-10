@@ -1901,11 +1901,16 @@ async fn an_idle_session_runs_nothing_beside_its_shell() {
     })
     .await;
     until_the_daemon_has_let_the_session_go(&host, created.session.session_id).await;
-    daemon
-        .controller
-        .descriptions()
-        .until_host_has_taken_what_was_posted()
-        .await;
+    // By its condition, under the suite's hang guard: a host that is slow to turn is a healthy one,
+    // and only one that never does is a failure.
+    assert!(
+        daemon
+            .controller
+            .descriptions()
+            .until_host_has_taken_what_was_posted_within(LIVENESS_DEADLINE)
+            .await,
+        "the description host took no turn in {LIVENESS_DEADLINE:?}"
+    );
     // Everything the daemon asked the platform to run for this environment, over the whole of it.
     let launched = host.launches();
     assert_eq!(
