@@ -1901,6 +1901,8 @@ async fn the_console_an_attachment_ran_in_is_given_the_mouse_while_the_applicati
             ),
             ("KR_PROBE_SESSION", session_id.to_string()),
             ("KR_PROBE_KR", kr().display().to_string()),
+            // A terminal that says what it is is sent the modes it can use, the mouse's among them.
+            ("TERM", "xterm-256color".to_owned()),
         ],
         u16::try_from(dimensions.rows.get()).expect("a console's rows"),
         u16::try_from(dimensions.columns.get()).expect("a console's columns"),
@@ -1913,10 +1915,6 @@ async fn the_console_an_attachment_ran_in_is_given_the_mouse_while_the_applicati
     typist
         .shown("kr-asker-asking", "the application asked for the mouse")
         .await;
-    println!(
-        "kr-test:the session wrote {:?}",
-        typist.end_of_what_was_written(200)
-    );
     probe.waits_for("kr-probe:asked:");
     std::fs::write(gates.path().join("stop"), b"stop").expect("the file the application waits for");
     probe.waits_for("kr-probe:released:");
