@@ -631,14 +631,17 @@ data directory: per host, whether the person asked, the authorisation identifier
 it (so that asking again issues under the same one), the digest of the token the registration that
 last turned the host on proposed, the choice of previews and the choice the host was last told (a
 record from before the choice existed reads as on), and the last outcome in words. For a host whose
-registration has no known outcome the entry has one more field, `unsettled`: the action the
-registration was sent under, words that say why it is not settled, the digest of the token it
-proposed, the choice of previews it carried, and the time it was sent. It is written before the
-registration is sent, so that the application ending cannot lose that one was; it is cleared when
-the host's answer settles it (the host took it, or refused it) or `action.read` says which, and when
-the account the registration was made under is deleted, since the service may have removed it with
-the rest and the person's next request then runs the whole sequence. It is replaced by the new
-registration's own entry when the person asks for one and it is sent. A host with none has no such field in its
+registration has no known outcome the entry has one more field, `unsettled`, an object of five
+members: `action_id`, the action the registration was sent under; `words`, why it is not settled;
+`digest`, the digest of the token it proposed; `previews`, the choice of previews it carried; and
+`at_ms`, the time it was sent. It is written before the registration is sent, so that the
+application ending cannot lose that one was; it is cleared when the host's answer settles it (the
+host took it, or refused it) or `action.read` says which, and when the account the registration was
+made under is deleted, since the service may have removed it with the rest and the person's next
+request then runs the whole sequence. When the person asks for another, the gateway's new issue
+replaces the credential the earlier one was sent with, so the new registration's own entry takes
+its place before it is sent, and when that entry cannot be written the earlier one is dropped, not
+put back: the registration is made again as one that was never sent. A host with none has no such field in its
 entry, a record without it reads as none, and a release that does not keep it reads the record and
 ignores it. The file holds no token, no key and no credential. A file that cannot be read, damaged or
 written by a build this one does not know, is moved aside as `push/push.unreadable-<time>.json`
