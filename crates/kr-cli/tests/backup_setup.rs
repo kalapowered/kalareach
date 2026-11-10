@@ -16,14 +16,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use kr_client::recovery::{kit_fingerprint, parse_kit};
-use kr_client::services::ServiceFuture;
-use kr_client::services::account::{
-    AccountIdentity, AccountService, AccountToken, AccountUsage, AuthorisationGrant, Exchanged,
-    IssuedGrant, RefreshToken, Refreshed, StoredGrant,
-};
+use kr_client::services::account::{AccountToken, IssuedGrant, RefreshToken};
 use kr_controller::account::{HostAccount, Service};
 use kr_controller::backup::store::{Production, Remote};
 use kr_controller::backup::uploader::SERVICE_CHAIN_LENGTH;
+use kr_controller::config::Outbound;
 use kr_controller::quiet::Timer;
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
@@ -39,6 +36,7 @@ use kr_protocol::ids::{ArchiveId, BackupGeneration, BuildId};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
+use kr_protocol::service::GatewayOrigin;
 use kr_service_stand_in::{ACCOUNT, Moment, Served, TOKEN, serve};
 use serde_json::Value;
 
@@ -72,42 +70,6 @@ impl WorkerSupervisor for NoWorkers {
 
     fn describe(&self) -> &'static str {
         "a supervisor that starts nothing"
-    }
-}
-
-/// The account service of a host that is signed in before its daemon starts: the seeding keeps a
-/// grant and asks the service nothing.
-#[derive(Debug)]
-struct NeverAsked;
-
-fn never_asked<T>() -> ServiceFuture<'static, T> {
-    Box::pin(async {
-        Err(kr_client::ClientError::refusal(
-            kr_protocol::error::ErrorCode::ResourceUnavailable,
-            kr_client::shown::Shown::said("this stand-in is never asked"),
-        ))
-    })
-}
-
-impl AccountService for NeverAsked {
-    fn exchange<'a>(&'a self, _grant: &'a AuthorisationGrant) -> ServiceFuture<'a, Exchanged> {
-        never_asked()
-    }
-
-    fn refresh<'a>(&'a self, _stored: &'a StoredGrant) -> ServiceFuture<'a, Refreshed> {
-        never_asked()
-    }
-
-    fn revoke<'a>(&'a self, _refresh: &'a RefreshToken) -> ServiceFuture<'a, ()> {
-        never_asked()
-    }
-
-    fn identity<'a>(&'a self, _access: &'a AccountToken) -> ServiceFuture<'a, AccountIdentity> {
-        never_asked()
-    }
-
-    fn usage<'a>(&'a self, _access: &'a AccountToken) -> ServiceFuture<'a, AccountUsage> {
-        never_asked()
     }
 }
 
@@ -348,12 +310,11 @@ async fn keep_sign_in(host: &kr_ipc::testing::TempHost, origin: &str) {
         Arc::from(store.store),
         host.environment_id(),
         environment.runtime_root(),
-        Ok(Service {
-            origin: origin.to_owned(),
-            scopes: Vec::new(),
-            account: Arc::new(NeverAsked),
-            closed: None,
-        }),
+        Ok(Service::at_origin(
+            &GatewayOrigin::new(origin).expect("the service's origin"),
+            Vec::new(),
+            Outbound::Closed("this suite only keeps the grant it seeds".to_owned()),
+        )),
         None,
     );
     account

@@ -15,10 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kr_client::services::account::{
-    AccountIdentity, AccountService, AccountToken, AccountUsage, AuthorisationGrant, Exchanged,
-    IssuedGrant, RefreshToken, Refreshed, StoredGrant,
-};
+use kr_client::services::account::{AccountToken, IssuedGrant, RefreshToken};
 use kr_client::services::storage::STORAGE_PART_SIZE_BYTES;
 use kr_client::services::{
     BackupManifestService, HttpService, ManagedBackupManifestService, ServiceFuture, ServiceHttp,
@@ -27,6 +24,7 @@ use kr_client::services::{
 use kr_controller::account::{HostAccount, Service};
 use kr_controller::backup::runtime::{OPERATOR_CEILING, TOKEN_CHECK};
 use kr_controller::backup::store::{AttemptStatus, MadeFrom, Production, Remote};
+use kr_controller::config::Outbound;
 use kr_controller::quiet::{LONGEST_DELAY, Timer};
 use kr_controller::service::{Clocks, Controller, ControllerSetup, WallClock};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
@@ -764,12 +762,11 @@ async fn keep_sign_in(
         Arc::from(store.store),
         host.environment_id(),
         environment.runtime_root(),
-        Ok(Service {
-            origin: origin.to_owned(),
-            scopes: Vec::new(),
-            account: Arc::new(NeverAsked),
-            closed: None,
-        }),
+        Ok(Service::at_origin(
+            &GatewayOrigin::new(origin).expect("the service's origin"),
+            Vec::new(),
+            Outbound::Closed("this suite only keeps the grant it seeds".to_owned()),
+        )),
         None,
     );
     account
@@ -782,42 +779,6 @@ async fn keep_sign_in(
         })
         .await;
     account
-}
-
-/// The account service of a host that is signed in before its daemon starts: the seeding keeps a
-/// grant and asks the service nothing, so every question it is asked is turned away.
-#[derive(Debug)]
-struct NeverAsked;
-
-fn never_asked<T>() -> ServiceFuture<'static, T> {
-    Box::pin(async {
-        Err(kr_client::ClientError::refusal(
-            kr_protocol::error::ErrorCode::ResourceUnavailable,
-            kr_client::shown::Shown::said("this stand-in is never asked"),
-        ))
-    })
-}
-
-impl AccountService for NeverAsked {
-    fn exchange<'a>(&'a self, _grant: &'a AuthorisationGrant) -> ServiceFuture<'a, Exchanged> {
-        never_asked()
-    }
-
-    fn refresh<'a>(&'a self, _stored: &'a StoredGrant) -> ServiceFuture<'a, Refreshed> {
-        never_asked()
-    }
-
-    fn revoke<'a>(&'a self, _refresh: &'a RefreshToken) -> ServiceFuture<'a, ()> {
-        never_asked()
-    }
-
-    fn identity<'a>(&'a self, _access: &'a AccountToken) -> ServiceFuture<'a, AccountIdentity> {
-        never_asked()
-    }
-
-    fn usage<'a>(&'a self, _access: &'a AccountToken) -> ServiceFuture<'a, AccountUsage> {
-        never_asked()
-    }
 }
 
 /// Starts a daemon on `host`, whose carrier waits by `timer`, and serves its local socket.

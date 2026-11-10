@@ -51,11 +51,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kr_client::services::account::{
-    AccountService, AccountStatus, AccountTokenSource, Answer, AnswerFault, AuthorisationGrant,
-    AuthorisationRequest, Client, Commit, Exchanged, IdentityRead, PendingAuthorisation,
-    RELAY_LEASE_SCOPE, Redirect, SignedInAccount, TokenOfAccount,
+    AccountHttp, AccountService, AccountStatus, AccountTokenSource, Answer, AnswerFault,
+    AuthorisationGrant, AuthorisationRequest, Client, Commit, Exchanged, IdentityRead,
+    ManagedAccountService, PendingAuthorisation, RELAY_LEASE_SCOPE, Redirect, SignedInAccount,
+    TokenOfAccount,
 };
-use kr_client::services::{AccountToken, ServiceFuture};
+use kr_client::services::{AccountToken, HttpDeadlines, ServiceFuture};
 use kr_crypto::store::SecretStore;
 use kr_loopback::{BindError, Listener};
 use kr_protocol::error::ErrorCode;
@@ -65,9 +66,12 @@ use kr_protocol::host_account::{
 };
 use kr_protocol::ids::EnvironmentId;
 use kr_protocol::scalars::{Nullable, TimestampMs};
+use kr_protocol::service::GatewayOrigin;
 use tokio::sync::watch;
 
+use crate::config::Outbound;
 use crate::error::{ControllerError, Result};
+use crate::managed_transport::{ClosedTransport, ManagedTransport};
 
 /// How long the daemon waits for the person's browser to come back.
 const WAIT: Duration = Duration::from_secs(15 * 60);
@@ -84,17 +88,59 @@ const BIND_PAUSE: Duration = Duration::from_millis(25);
 const IMPORTED_TOKEN_FILE: &str = "account-token.json";
 
 /// The account service a host signs in at: its origin, and the client of it.
+///
+/// Built from one origin, so the client, the transport it goes over and the scope the grant is kept
+/// in cannot belong to different services.
 pub struct Service {
     /// The account service's origin. Everything stored for the sign-in is kept under its name.
-    pub origin: String,
+    origin: String,
     /// The resource scopes a sign-in asks for: one for each service the host presents its account
     /// to, and none for a service the host does not select.
-    pub scopes: Vec<&'static str>,
+    scopes: Vec<&'static str>,
     /// The account service at that origin.
-    pub account: Arc<dyn AccountService>,
+    account: Arc<dyn AccountService>,
     /// Why every request to it is turned away, when the host's outbound route is closed: the
     /// account it keeps can be read and ended, and nothing is sent until the route is open.
-    pub closed: Option<String>,
+    closed: Option<String>,
+}
+
+impl Service {
+    /// The account service at `origin`, reached over `route`, where a sign-in asks for `scopes`.
+    ///
+    /// The client checks every answer against `origin`'s own issuer, and the transport reaches that
+    /// origin and no other.
+    #[must_use]
+    pub fn at_origin(origin: &GatewayOrigin, scopes: Vec<&'static str>, route: Outbound) -> Self {
+        let (transport, closed): (Arc<dyn AccountHttp>, Option<String>) = match route {
+            Outbound::Closed(refusal) => (Arc::new(ClosedTransport), Some(refusal)),
+            Outbound::Through(proxy) => (
+                Arc::new(ManagedTransport::new(
+                    origin.clone(),
+                    Some(proxy),
+                    HttpDeadlines::default(),
+                )),
+                None,
+            ),
+            Outbound::Direct => (
+                Arc::new(ManagedTransport::new(
+                    origin.clone(),
+                    None,
+                    HttpDeadlines::default(),
+                )),
+                None,
+            ),
+        };
+        Self {
+            origin: origin.as_str().to_owned(),
+            scopes,
+            account: Arc::new(ManagedAccountService::at_origin(
+                origin.as_str(),
+                transport,
+                Client::Desktop,
+            )),
+            closed,
+        }
+    }
 }
 
 /// What a finished attempt shows a person's browser.
