@@ -344,18 +344,36 @@ class VoiceCaptureGate(private val keptIntervals: Int = 64) {
 data class RecordingReport(val source: Int, val silenced: Boolean)
 
 /**
- * What the system's active recordings say of this call's recording.
+ * What the system's lists of active recordings say of this call's recording.
  *
  * The call's recorder takes its audio from [callSource]. The system shows an application only a
- * stripped copy of the recordings of the others, so a recording of another application from the
- * same source that is silenced reads as ours: a break that did not happen, never one that was
- * hidden. No recording from [callSource] is a phone that reports none of ours, and is refused.
+ * stripped copy of the recordings of the others, so nothing in a list says which recording is this
+ * call's. What can be told is how many recordings from [callSource] there were before this call's
+ * audio device was turned on: those are other applications', and this call's recording is one more
+ * than they. A list with no more than that is a phone that reports none of ours, and is refused,
+ * as is a list that cannot be read as one of ours: an application's own recording from the same
+ * source, heard before ours, does not stand in for ours. A silenced recording among them is taken as
+ * ours: a break that did not happen, never one that was hidden. When another application's
+ * recording ends while ours runs, the count falls back and capture stays refused until the call ends.
  */
-fun recordingOf(reports: List<RecordingReport>, callSource: Int): VoiceCaptureGate.Recording {
-    val ours = reports.filter { it.source == callSource }
-    return when {
-        ours.isEmpty() -> VoiceCaptureGate.Recording.UNREPORTED
-        ours.any { it.silenced } -> VoiceCaptureGate.Recording.SILENCED
-        else -> VoiceCaptureGate.Recording.AUDIBLE
+class RecordingWatch(private val callSource: Int) {
+    /** How many recordings from the call's source were listed while its audio device was off. */
+    private var others = 0
+
+    /**
+     * Reads one list of the system's active recordings. [deviceOn] is whether this call's audio device
+     * runs, so whether this call's recording can be among them.
+     */
+    fun read(reports: List<RecordingReport>, deviceOn: Boolean): VoiceCaptureGate.Recording {
+        val matching = reports.filter { it.source == callSource }
+        if (!deviceOn) {
+            others = matching.size
+            return VoiceCaptureGate.Recording.UNREPORTED
+        }
+        return when {
+            matching.size <= others -> VoiceCaptureGate.Recording.UNREPORTED
+            matching.any { it.silenced } -> VoiceCaptureGate.Recording.SILENCED
+            else -> VoiceCaptureGate.Recording.AUDIBLE
+        }
     }
 }

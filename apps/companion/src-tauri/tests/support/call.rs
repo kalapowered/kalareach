@@ -79,6 +79,7 @@ impl Inner {
         let on = state == CaptureState::Capturing;
         if on && !self.record.on {
             self.record.openings += 1;
+            self.record.progress_age_ms = None;
         } else if !on && self.record.on {
             self.record.breaks += 1;
             self.record.progress_age_ms = None;
@@ -376,6 +377,8 @@ impl CallPlatform for ScriptedCalls {
             let call = CallId::next();
             let (sink, events) = event_queue(call.clone());
             inner.held = Some((call.clone(), sink, 0));
+            // A new call starts with an empty record, as native code's does.
+            inner.record = Record::default();
             if inner.open_fails_after_making_the_call {
                 return Err(CallFailure::new(
                     FailureKind::Engine,
@@ -523,20 +526,17 @@ impl CallPlatform for ScriptedCalls {
                 "capture_proof".to_owned()
             });
             self.gate("capture_proof").await;
-            self.named(call)?;
-            // The record is read and the marker put in the news in one step, as on a phone.
-            let token = {
-                let mut inner = self.inner();
-                barrier.then(|| {
-                    inner.record.markers += 1;
-                    inner.record.markers
-                })
-            };
-            if let Some(token) = token {
-                self.tell(CallEvent::Barrier { token });
+            // The record is read and the marker put in the news in one step, as on a phone, and the
+            // call is the one named when it is.
+            let mut inner = self.inner();
+            if !matches!(inner.held.as_ref(), Some((held, ..)) if held == call) {
+                return Err(CallFailure::new(FailureKind::Ended, "that call has ended"));
             }
-            let inner = self.inner();
-            Ok(CaptureProof {
+            let token = barrier.then(|| {
+                inner.record.markers += 1;
+                inner.record.markers
+            });
+            let proof = CaptureProof {
                 call: call.clone(),
                 state: inner.capture,
                 opened: inner.record.openings > 0,
@@ -544,7 +544,16 @@ impl CallPlatform for ScriptedCalls {
                 breaks: inner.record.breaks,
                 progress_age_ms: inner.record.progress_age_ms,
                 barrier: token,
-            })
+            };
+            if let (Some(token), Some((held, sink, seq))) = (token, inner.held.as_mut()) {
+                *seq += 1;
+                sink.deliver(EventFrame {
+                    call: held.clone(),
+                    seq: *seq,
+                    event: CallEvent::Barrier { token },
+                });
+            }
+            Ok(proof)
         })
     }
 }

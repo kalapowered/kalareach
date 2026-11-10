@@ -63,7 +63,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use companion_platform::call::{CallEvent, CallPlatform as _, CaptureState, FailureKind};
+use companion_platform::call::{CallEvent, CallPlatform as _, CaptureState, FailureKind, Mute};
 use companion_tauri::account::carrier::{Boxed, Carrier, Ending, Plan, Unavailable};
 use companion_tauri::account::{Account, AccountSlot};
 use companion_tauri::voice::{Calls, Kept, Service, Timings, managed_brokers};
@@ -1714,6 +1714,47 @@ async fn a_barrier_in_the_news_changes_nothing_the_owner_shows() {
     );
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
     scene.stop_host().await;
+}
+
+/// A call native code makes after another has ended starts with an empty record: the openings, the
+/// breaks and the markers of the earlier call are not the later call's.
+#[tokio::test]
+async fn a_second_call_starts_with_an_empty_capture_record() {
+    let platform = ScriptedCalls::new();
+    let first = platform.open().await.expect("a call");
+    assert!(
+        platform
+            .permit(&first.call, "voice-session-1", 1)
+            .await
+            .expect("a permit")
+    );
+    platform
+        .mute(&first.call, Mute::Microphone, true)
+        .await
+        .expect("a mute");
+    platform.show_a_gap_in_progress();
+    let earlier = platform
+        .capture_proof(&first.call, true)
+        .await
+        .expect("a proof");
+    assert_eq!(
+        (earlier.openings, earlier.breaks, earlier.barrier),
+        (1, 2, Some(1))
+    );
+    platform.stop(&first.call).await.expect("a stop");
+
+    let second = platform.open().await.expect("a second call");
+    let later = platform
+        .capture_proof(&second.call, true)
+        .await
+        .expect("a proof");
+
+    assert_eq!(
+        (later.openings, later.breaks, later.barrier),
+        (0, 0, Some(1)),
+        "{later:?}"
+    );
+    assert!(!later.opened);
 }
 
 /// KR-REQ-15.02: a voice call is not a shell session. The call is made over a session a worker

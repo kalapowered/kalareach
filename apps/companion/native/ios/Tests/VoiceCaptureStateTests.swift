@@ -788,6 +788,36 @@ final class VoiceCallControlTests: XCTestCase {
         XCTAssertEqual(answered?.proof.openings, 0)
     }
 
+    /// KR-REQ-15.36: a report of the audio session that was queued before the proof changes the gate in
+    /// its own block, and the capture news of that change is told in that block too, so it is told
+    /// before the marker of the proof queued after it, with the provider events around it.
+    func testCaptureNewsOfAnEarlierReportIsToldBeforeTheMarker() throws {
+        let queue = DispatchQueue(label: "test.voice-call")
+        let observer = Order()
+        let call = try VoiceCall(observer: observer, queue: queue)
+        defer { call.stop() }
+
+        let held = DispatchSemaphore(value: 0)
+        queue.async { held.wait() }
+        call.receive(providerEvent: Data([1]))
+        call.audioSessionInterruption(began: true, mayResume: true)
+        let read = XCTestExpectation(description: "the record was read")
+        var answered: (proof: VoiceCaptureGate.Proof, barrier: UInt64?)?
+        call.readCaptureProof(barrier: true) {
+            answered = $0
+            read.fulfill()
+        }
+        call.audioSessionRoute(changing: true, hasInput: true)
+        held.signal()
+
+        wait(for: [read], timeout: 10)
+        queue.sync {}
+        XCTAssertEqual(
+            observer.told, ["event 1", "capture idle", "barrier 1", "capture idle"],
+            "the interruption before the proof is told before the marker, the route change after it")
+        XCTAssertEqual(answered?.barrier, 1)
+    }
+
     /// Each marker has a number of its own, counted from 1 in the call; a proof that asks for none
     /// tells none; and a call that has ended answers nothing.
     func testEachMarkerHasItsOwnNumberAndAnEndedCallAnswersNone() throws {
@@ -878,25 +908,25 @@ final class VoiceRecorderWatchTests: XCTestCase {
 /// KR-REQ-15.36: a recorder that stalls for a few hundred milliseconds and goes on is told, though
 /// the quiet time of the recorder watch never sees it. The figures are test parameters.
 final class VoiceProgressWatchTests: XCTestCase {
-    /// Readings every 250 ms of a source that took in `seconds`, each answered `latencyMs` after it
-    /// was asked for, and the verdicts they gave.
+    /// Readings every 250 ms of a source that took in `seconds`, each read from the moment it was
+    /// asked for and answered `latencyMs` after it, and the verdicts they gave.
     private func verdicts(
         _ readings: [(requestedAtMs: UInt64, seconds: Double?)], latencyMs: UInt64 = 5
     ) -> [VoiceProgressWatch.Verdict] {
         var watch = VoiceProgressWatch()
         return readings.map {
             watch.observe(
-                capturedSeconds: $0.seconds, requestedAtMs: $0.requestedAtMs,
+                capturedSeconds: $0.seconds, readFromMs: $0.requestedAtMs,
                 answeredAtMs: $0.requestedAtMs + latencyMs)
         }
     }
 
     /// Audio that keeps pace with the clock is never a gap, however many readings are taken and
-    /// whatever the statistics' own delay is, up to the age of the oldest report they may serve.
+    /// whatever the statistics' own delay is, up to the shortfall the parameter allows.
     func testAudioThatKeepsPaceIsNeverAGap() {
         let readings = (0 ..< 40).map { (UInt64($0) * 250, Double($0) * 0.25) }
         XCTAssertEqual(
-            verdicts(readings.map { ($0.0, $0.1) }, latencyMs: 20),
+            verdicts(readings.map { ($0.0, $0.1) }, latencyMs: 80),
             Array(repeating: .progressing, count: 40))
     }
 
@@ -915,45 +945,76 @@ final class VoiceProgressWatchTests: XCTestCase {
         XCTAssertTrue(told.contains(.gap))
     }
 
-    /// The bound on the time that passed can only be too large: a gap that fits what the statistics
-    /// may have served stale is still told, a shortfall of the whole parameter or more.
+    /// The window is four readings back and no further: audio that kept pace over the last four
+    /// readings is not told for a stall that lies before them, and one inside them is.
+    func testTheWindowReachesBackFourReadings() {
+        var watch = VoiceProgressWatch(windowReadings: 4, gapMs: 100)
+        // Reading 0 is the baseline; readings 1 to 4 each took in 250 ms, so 1 s over four readings.
+        _ = watch.observe(capturedSeconds: 0, readFromMs: 0, answeredAtMs: 0)
+        for step in 1 ... 4 {
+            let at = UInt64(step) * 250
+            XCTAssertEqual(
+                watch.observe(capturedSeconds: Double(step) * 0.25, readFromMs: at, answeredAtMs: at), .progressing)
+        }
+        // Reading 5 is compared with reading 1 (four back), not with the baseline: 250 ms back at 1 s
+        // took in 1 s - 0.25 s = 0.75 s of the 1 s that passed, a shortfall of 250 ms.
+        XCTAssertEqual(watch.observe(capturedSeconds: 1.0, readFromMs: 1_250, answeredAtMs: 1_250), .gap)
+    }
+
+    /// A shortfall of the parameter or more is a gap, and less is not.
     func testAShortfallOfTheParameterIsAGapAndLessIsNot() {
         var watch = VoiceProgressWatch(windowReadings: 4, gapMs: 100)
-        XCTAssertEqual(watch.observe(capturedSeconds: 0, requestedAtMs: 0, answeredAtMs: 0), .progressing)
-        // 250 ms later the source took in 200 ms: with the 50 ms allowance, a shortfall of 100 ms.
-        XCTAssertEqual(watch.observe(capturedSeconds: 0.2, requestedAtMs: 250, answeredAtMs: 250), .gap)
+        XCTAssertEqual(watch.observe(capturedSeconds: 0, readFromMs: 0, answeredAtMs: 0), .progressing)
+        // 250 ms later the source took in 150 ms: a shortfall of 100 ms.
+        XCTAssertEqual(watch.observe(capturedSeconds: 0.15, readFromMs: 250, answeredAtMs: 250), .gap)
         var close = VoiceProgressWatch(windowReadings: 4, gapMs: 100)
-        XCTAssertEqual(close.observe(capturedSeconds: 0, requestedAtMs: 0, answeredAtMs: 0), .progressing)
-        XCTAssertEqual(close.observe(capturedSeconds: 0.201, requestedAtMs: 250, answeredAtMs: 250), .progressing)
+        XCTAssertEqual(close.observe(capturedSeconds: 0, readFromMs: 0, answeredAtMs: 0), .progressing)
+        XCTAssertEqual(close.observe(capturedSeconds: 0.151, readFromMs: 250, answeredAtMs: 250), .progressing)
+    }
+
+    /// A report that was read before its request, or an answer that came late, only makes the time
+    /// that passed larger: the earliest moment the figures can have been read is the report's own.
+    func testTheEarliestMomentTheFiguresWereReadIsTheReportsOwn() {
+        // Asked for at 1,000 ms and answered 5 ms later, from a report that was 60 ms old.
+        XCTAssertEqual(
+            VoiceProgressWatch.readFromMs(requestedAtMs: 1_000, answeredAtMs: 1_005, reportAgeMs: 60), 945)
+        // A report that was collected a second before it was answered was read a second before.
+        XCTAssertEqual(
+            VoiceProgressWatch.readFromMs(requestedAtMs: 1_000, answeredAtMs: 2_000, reportAgeMs: 1_000), 1_000)
+        // One that says nothing was read no earlier than the oldest report the statistics may serve.
+        XCTAssertEqual(
+            VoiceProgressWatch.readFromMs(requestedAtMs: 1_000, answeredAtMs: 1_005, reportAgeMs: nil), 950)
+        XCTAssertEqual(VoiceProgressWatch.readFromMs(requestedAtMs: 10, answeredAtMs: 12, reportAgeMs: nil), 0)
+        XCTAssertEqual(VoiceProgressWatch.readFromMs(requestedAtMs: 10, answeredAtMs: 12, reportAgeMs: 500), 0)
     }
 
     /// A reading that holds no figure tells nothing, and says so; the window starts afresh after it,
     /// so a figure after it is compared with nothing from before.
     func testAReadingWithNoFigureSaysSo() {
         var watch = VoiceProgressWatch()
-        XCTAssertEqual(watch.observe(capturedSeconds: 1, requestedAtMs: 0, answeredAtMs: 5), .progressing)
-        XCTAssertEqual(watch.observe(capturedSeconds: nil, requestedAtMs: 250, answeredAtMs: 255), .noFigure)
+        XCTAssertEqual(watch.observe(capturedSeconds: 1, readFromMs: 0, answeredAtMs: 5), .progressing)
+        XCTAssertEqual(watch.observe(capturedSeconds: nil, readFromMs: 250, answeredAtMs: 255), .noFigure)
         XCTAssertEqual(
-            watch.observe(capturedSeconds: 1.25, requestedAtMs: 500, answeredAtMs: 505), .progressing,
+            watch.observe(capturedSeconds: 1.25, readFromMs: 500, answeredAtMs: 505), .progressing,
             "the baseline is this reading")
     }
 
     /// After a gap the window starts at the reading that showed it, so audio that then keeps pace
-    /// is not told again.
+    /// after it is not told again.
     func testAGapIsToldOnceAndAudioThatKeepsPaceAfterItIsNot() {
         var watch = VoiceProgressWatch()
-        XCTAssertEqual(watch.observe(capturedSeconds: 0, requestedAtMs: 0, answeredAtMs: 5), .progressing)
-        XCTAssertEqual(watch.observe(capturedSeconds: 0.05, requestedAtMs: 250, answeredAtMs: 255), .gap)
-        XCTAssertEqual(watch.observe(capturedSeconds: 0.3, requestedAtMs: 500, answeredAtMs: 505), .progressing)
-        XCTAssertEqual(watch.observe(capturedSeconds: 0.55, requestedAtMs: 750, answeredAtMs: 755), .progressing)
+        XCTAssertEqual(watch.observe(capturedSeconds: 0, readFromMs: 0, answeredAtMs: 5), .progressing)
+        XCTAssertEqual(watch.observe(capturedSeconds: 0.05, readFromMs: 250, answeredAtMs: 255), .gap)
+        XCTAssertEqual(watch.observe(capturedSeconds: 0.3, readFromMs: 500, answeredAtMs: 505), .progressing)
+        XCTAssertEqual(watch.observe(capturedSeconds: 0.55, readFromMs: 750, answeredAtMs: 755), .progressing)
     }
 
     /// A reset, for a device that went off and came on, starts counting afresh.
     func testAResetComparesNothingFromBefore() {
         var watch = VoiceProgressWatch()
-        _ = watch.observe(capturedSeconds: 0, requestedAtMs: 0, answeredAtMs: 5)
+        _ = watch.observe(capturedSeconds: 0, readFromMs: 0, answeredAtMs: 5)
         watch.reset()
-        XCTAssertEqual(watch.observe(capturedSeconds: 50, requestedAtMs: 10_000, answeredAtMs: 10_005), .progressing)
+        XCTAssertEqual(watch.observe(capturedSeconds: 50, readFromMs: 10_000, answeredAtMs: 10_005), .progressing)
     }
 }
 
@@ -996,24 +1057,86 @@ final class VoiceRecorderReaderTests: XCTestCase {
     private func read(_ reader: VoiceRecorderReader, _ platform: Platform, _ readings: [(UInt64, Double)]) {
         for (at, seconds) in readings {
             platform.now = at
-            reader.reading(capturedSeconds: seconds, generation: reader.request()!, requestedAtMs: at, answeredAtMs: at)
+            reader.reading(capturedSeconds: seconds, generation: reader.request()!, requestedAtMs: at, answeredAtMs: at, reportAgeMs: nil)
         }
     }
 
     /// KR-REQ-15.36: the readings are stamped where they were asked for and answered, so a call
-    /// queue that runs them late says nothing of when the audio was taken in: a 300 ms stall is a
-    /// break in the record though every reading runs back to back at the same late moment.
-    func testAStallIsABreakWhateverTheQueueDelaysTheReadingsBy() {
+    /// queue that runs the older readings late says nothing of when the audio was taken in: the
+    /// first three readings run together at 1,600 ms, though they were asked for at 1,000, 1,250 and
+    /// 1,500 ms, and the source took in nothing from 1,250 ms to 1,550 ms. Stamps taken as the queue
+    /// ran them would find no gap in them, and the stamps the readings carry find one.
+    func testAStallIsABreakWhateverTheQueueDelaysTheOlderReadingsBy() {
         let (control, reader, platform, _) = permitted()
-        read(reader, platform, [(1_000, 0), (1_250, 0.25), (1_500, 0.5)])
-        XCTAssertEqual(control.captureProof().breaks, 0)
-        // The call's queue ran nothing for 800 ms: the next readings run together at 2_300 ms, though
-        // they were asked for and answered at their own moments, and the audio stalled in the gap.
-        platform.now = 2_300
+        platform.now = 1_600
         let generation = reader.request()!
-        reader.reading(capturedSeconds: 0.5, generation: generation, requestedAtMs: 1_750, answeredAtMs: 1_754)
-        reader.reading(capturedSeconds: 0.75, generation: generation, requestedAtMs: 2_000, answeredAtMs: 2_004)
-        XCTAssertGreaterThanOrEqual(control.captureProof().breaks, 1, "the stall at 1_750 ms is told")
+        reader.reading(
+            capturedSeconds: 0, generation: generation, requestedAtMs: 1_000, answeredAtMs: 1_004, reportAgeMs: nil)
+        reader.reading(
+            capturedSeconds: 0.25, generation: generation, requestedAtMs: 1_250, answeredAtMs: 1_254, reportAgeMs: nil)
+        XCTAssertEqual(control.captureProof().openings, 1, "the audio was seen arriving")
+        XCTAssertEqual(control.captureProof().breaks, 0)
+        reader.reading(
+            capturedSeconds: 0.25, generation: generation, requestedAtMs: 1_500, answeredAtMs: 1_504, reportAgeMs: nil)
+        XCTAssertEqual(control.captureProof().breaks, 1, "the stall from 1,250 ms is told")
+
+        // The readings after it run when they were asked for, and the audio is back.
+        platform.now = 1_750
+        reader.reading(
+            capturedSeconds: 0.45, generation: generation, requestedAtMs: 1_750, answeredAtMs: 1_754, reportAgeMs: nil)
+        platform.now = 2_000
+        reader.reading(
+            capturedSeconds: 0.7, generation: generation, requestedAtMs: 2_000, answeredAtMs: 2_004, reportAgeMs: nil)
+        platform.now = 2_250
+        reader.reading(
+            capturedSeconds: 0.95, generation: generation, requestedAtMs: 2_250, answeredAtMs: 2_254, reportAgeMs: nil)
+        XCTAssertLessThanOrEqual(control.captureProof().breaks, 2, "the tail of the stall is told at most once more")
+    }
+
+    /// KR-REQ-15.36: a report that was collected long before the callback ran is old when it is
+    /// read, and the record says so: its audio is vouched for from the moment it was collected, not
+    /// from the moment the callback ran, so the proof's age is the report's.
+    func testAReportDeliveredLateIsOldAtTheMomentItIsRead() {
+        let (control, reader, platform, _) = permitted()
+        let generation = reader.request()!
+        platform.now = 1_000
+        reader.reading(
+            capturedSeconds: 0, generation: generation, requestedAtMs: 1_000, answeredAtMs: 1_003, reportAgeMs: 1)
+        // The report that shows the first audio was collected at 1,250 ms and answered at 2,250 ms.
+        platform.now = 2_250
+        reader.reading(
+            capturedSeconds: 0.25, generation: generation, requestedAtMs: 1_250, answeredAtMs: 2_250,
+            reportAgeMs: 1_000)
+        let proof = control.captureProof()
+        XCTAssertEqual(proof.openings, 1)
+        XCTAssertEqual(proof.progressAgeMs, 1_000, "not 50: the figures are as old as the report")
+    }
+
+    /// KR-REQ-15.36: a report that was read before it was asked for, as a cached one is, is as old
+    /// as its timestamp says. The same audio over the same moments is a shortfall of 160 ms when the
+    /// first report was read 90 ms before its request, and one of 73 ms when it was read at once.
+    func testAReportThatWasReadBeforeItsRequestMakesAShortfallShow() {
+        func breaks(firstReportAgeMs: UInt64) -> UInt64 {
+            let (control, reader, platform, _) = permitted()
+            let generation = reader.request()!
+            platform.now = 1_003
+            reader.reading(
+                capturedSeconds: 0, generation: generation, requestedAtMs: 1_000, answeredAtMs: 1_003,
+                reportAgeMs: firstReportAgeMs)
+            // The audio is seen arriving, so capture is on when the third reading is compared.
+            platform.now = 1_253
+            reader.reading(
+                capturedSeconds: 0.25, generation: generation, requestedAtMs: 1_250, answeredAtMs: 1_253,
+                reportAgeMs: 3)
+            XCTAssertEqual(control.captureProof().openings, 1)
+            platform.now = 1_503
+            reader.reading(
+                capturedSeconds: 0.43, generation: generation, requestedAtMs: 1_500, answeredAtMs: 1_503,
+                reportAgeMs: 3)
+            return control.captureProof().breaks
+        }
+        XCTAssertEqual(breaks(firstReportAgeMs: 3), 0, "a shortfall of 73 ms is under the parameter")
+        XCTAssertEqual(breaks(firstReportAgeMs: 90), 1, "the old first report puts it at 160 ms")
     }
 
     /// KR-REQ-15.36: a reading with no figure is a break while capture is on, whatever the readings
@@ -1021,7 +1144,7 @@ final class VoiceRecorderReaderTests: XCTestCase {
     func testAReadingWithNoFigureIsABreakWhileCaptureIsOn() {
         let (control, reader, platform, _) = permitted()
         platform.now = 1_000
-        reader.reading(capturedSeconds: nil, generation: reader.request()!, requestedAtMs: 1_000, answeredAtMs: 1_003)
+        reader.reading(capturedSeconds: nil, generation: reader.request()!, requestedAtMs: 1_000, answeredAtMs: 1_003, reportAgeMs: nil)
         XCTAssertEqual(control.captureProof().openings, 0, "nothing has started the recorder yet")
         XCTAssertEqual(control.captureProof().breaks, 0, "capture is not on, so nothing is broken")
 
@@ -1034,7 +1157,7 @@ final class VoiceRecorderReaderTests: XCTestCase {
             platform.now = at
             seconds += 0.25
             let figure: Double? = step.isMultiple(of: 2) ? nil : seconds
-            reader.reading(capturedSeconds: figure, generation: reader.request()!, requestedAtMs: at, answeredAtMs: at + 3)
+            reader.reading(capturedSeconds: figure, generation: reader.request()!, requestedAtMs: at, answeredAtMs: at + 3, reportAgeMs: nil)
         }
         let proof = control.captureProof()
         XCTAssertEqual(proof.breaks, 3, "each of the three empty readings is a break: \(proof)")
@@ -1046,7 +1169,7 @@ final class VoiceRecorderReaderTests: XCTestCase {
         read(reader, platform, [(1_000, 0), (1_250, 0.25)])
         let seen = control.captureProof().progressAgeMs
         platform.now = 1_600
-        reader.reading(capturedSeconds: nil, generation: reader.request()!, requestedAtMs: 1_500, answeredAtMs: 1_503)
+        reader.reading(capturedSeconds: nil, generation: reader.request()!, requestedAtMs: 1_500, answeredAtMs: 1_503, reportAgeMs: nil)
         let later = try? XCTUnwrap(control.captureProof().progressAgeMs)
         XCTAssertNotNil(seen)
         XCTAssertGreaterThan(later ?? 0, (seen ?? 0) + 300, "the age grew with the clock: \(String(describing: later))")
@@ -1070,8 +1193,8 @@ final class VoiceRecorderReaderTests: XCTestCase {
         platform.now = 1_300
         reader.stopped()
         XCTAssertFalse(switches.microphoneOn)
-        reader.reading(capturedSeconds: 0.5, generation: before, requestedAtMs: 1_400, answeredAtMs: 1_400)
-        reader.reading(capturedSeconds: 0.75, generation: before, requestedAtMs: 1_450, answeredAtMs: 1_450)
+        reader.reading(capturedSeconds: 0.5, generation: before, requestedAtMs: 1_400, answeredAtMs: 1_400, reportAgeMs: nil)
+        reader.reading(capturedSeconds: 0.75, generation: before, requestedAtMs: 1_450, answeredAtMs: 1_450, reportAgeMs: nil)
         XCTAssertFalse(switches.microphoneOn, "readings asked for before the stop are dropped")
         read(reader, platform, [(1_500, 0.75), (1_750, 1.0)])
         XCTAssertTrue(switches.microphoneOn, "audio that came back is a start")
@@ -1082,7 +1205,7 @@ final class VoiceRecorderReaderTests: XCTestCase {
     func testASilentStopVouchesForNothingAfterTheLastAudio() {
         let (control, reader, platform, switches) = heardUntil1500()
         platform.now = 1_750
-        reader.reading(capturedSeconds: 0.5, generation: reader.request()!, requestedAtMs: 1_750, answeredAtMs: 1_750)
+        reader.reading(capturedSeconds: 0.5, generation: reader.request()!, requestedAtMs: 1_750, answeredAtMs: 1_750, reportAgeMs: nil)
         XCTAssertTrue(switches.microphoneOn, "the stop is not noticed yet")
         XCTAssertTrue(control.couldHaveHeard(atMs: 1_400))
         XCTAssertFalse(control.couldHaveHeard(atMs: 1_600), "while the quiet time runs")
@@ -1157,7 +1280,7 @@ final class VoiceRecorderReaderTests: XCTestCase {
         reader.device(on: true)
         XCTAssertTrue(switches.microphoneOn)
         platform.now = 2_050
-        reader.reading(capturedSeconds: 0.75, generation: stale, requestedAtMs: 2_050, answeredAtMs: 2_050)
+        reader.reading(capturedSeconds: 0.75, generation: stale, requestedAtMs: 2_050, answeredAtMs: 2_050, reportAgeMs: nil)
         XCTAssertFalse(switches.microphoneOn)
     }
 
@@ -1169,8 +1292,8 @@ final class VoiceRecorderReaderTests: XCTestCase {
         XCTAssertNil(reader.request())
         reader.device(on: true)
         platform.now = 1_500
-        reader.reading(capturedSeconds: 0, generation: stale, requestedAtMs: 1_500, answeredAtMs: 1_500)
-        reader.reading(capturedSeconds: 5, generation: stale, requestedAtMs: 1_750, answeredAtMs: 1_750)
+        reader.reading(capturedSeconds: 0, generation: stale, requestedAtMs: 1_500, answeredAtMs: 1_500, reportAgeMs: nil)
+        reader.reading(capturedSeconds: 5, generation: stale, requestedAtMs: 1_750, answeredAtMs: 1_750, reportAgeMs: nil)
         XCTAssertFalse(switches.microphoneOn)
     }
 }

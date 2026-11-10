@@ -149,8 +149,11 @@ pub enum CallEvent {
     /// never news of its own.
     Lost,
     /// The marker a capture proof asked for. Native code puts it into the news in the same step
-    /// that reads the proof, behind every item of news the call had before that step, so a reader
-    /// that reaches it has read everything the proof saw. `token` is the one the proof answered.
+    /// that reads the proof, behind every provider event and every report of the system the call
+    /// had waiting before that step, so a reader that reaches it has read them. What the capture
+    /// state was, and how often it broke, is in the proof's own record and not in the news: a change
+    /// made while the proof is read is in the record and may be told after the marker. `token` is
+    /// the one the proof answered.
     Barrier {
         /// The marker's number in this call, counted from 1; not the news's own `seq`.
         token: u64,
@@ -659,9 +662,9 @@ pub trait CallPlatform: Send + Sync {
     /// Asks native code what its record of the call's capture shows now.
     ///
     /// With `barrier`, native code also puts a [`CallEvent::Barrier`] into the call's news in the
-    /// same step that reads the record, behind every item of news the call had before that step,
-    /// and says its number in the answer. A reader that has read the marker has read all the news
-    /// the record saw, a loss included.
+    /// same step that reads the record, behind every provider event and every loss the call had
+    /// waiting before that step, and says its number in the answer. A reader that has read that
+    /// marker has read them. The record, not the news, says what the capture state was.
     fn capture_proof<'a>(&'a self, call: &'a CallId, barrier: bool)
     -> CallFuture<'a, CaptureProof>;
 }
