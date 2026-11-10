@@ -3,6 +3,7 @@
 
 use std::io::{Cursor, Read};
 
+use kr_boundary_windows::events::{self, BLOCKED};
 use kr_boundary_windows::frame::{self, FrameError, Request, Response};
 use kr_boundary_windows::manifest::{InstallState, Manifest, ObjectKind, Prior, STORE_VERSION};
 use kr_boundary_windows::policy::{
@@ -354,4 +355,42 @@ fn only_a_proved_absence_is_not_installed() {
     }
     assert!(Verdict::NotInstalled.report().remedy.is_some());
     assert!(Verdict::Ready.report().remedy.is_none());
+}
+
+#[test]
+fn the_platforms_own_reports_are_read() {
+    // What the platform reported on the guest: an effective policy after one was set, the same
+    // before any was, a blocked-program event, and a policy-applied event.
+    let reported = include_str!("fixtures/effective-policy.xml");
+    let policy = Policy::parse(reported).expect("the effective policy is readable");
+    let exe = &policy.collections["Exe"];
+    assert_eq!(exe.mode, Mode::Enabled);
+    assert_eq!(exe.rules.len(), 2);
+    let deny = &exe.rules[RULE_CHECKOUT];
+    assert_eq!(deny.action, Action::Deny);
+    assert_eq!(deny.sid, "S-1-5-21-3148093232-3597522084-1273982340-1006");
+    assert!(
+        deny.exceptions
+            .contains(r"%programfiles%\git\mingw64\bin\git.exe")
+    );
+
+    let baseline = Policy::parse(include_str!("fixtures/effective-baseline.xml")).unwrap();
+    assert!(baseline.is_unconfigured());
+    // Not configured is what removal writes back, so the two forms compare equal.
+    let (after, kept) = policy.without_ours();
+    assert!(!kept);
+    assert!(after.differences(&baseline).is_empty());
+
+    let blocked = events::parse(include_str!("fixtures/events-8004.xml")).unwrap();
+    assert_eq!(blocked.len(), 1);
+    assert_eq!(blocked[0].id, BLOCKED);
+    assert_eq!(blocked[0].rule_id, RULE_CHECKOUT);
+    assert_eq!(blocked[0].user, deny.sid);
+    assert_eq!(blocked[0].path, r"C:\WINDOWS\System32\cmd.exe");
+
+    let applied = events::parse(include_str!("fixtures/events-8001.xml")).unwrap();
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0].id, 8001);
+    assert!(applied[0].rule_id.is_empty());
+    assert!(events::parse("<Event>").is_err());
 }
