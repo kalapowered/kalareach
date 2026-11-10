@@ -403,6 +403,53 @@ describe('what voice may do', () => {
     expect(controls.voiceAllows).toHaveLength(0)
   })
 
+  // And when the screen's read ends first, the entry's controls wait for its own read of the grant.
+  it('takes no change until its own read of the grant has ended', async () => {
+    const { controls, settled } = start((fake) => {
+      fake.speechReachesTheHost(true)
+    })
+    const entry = await screen.findByTestId('voice-grant-entry')
+    await userEvent.click(within(entry).getByRole('checkbox', { name: new RegExp(CLOSE_SENTENCE) }))
+    await settled()
+    const close = () => within(entry).getByRole('checkbox', { name: new RegExp(CLOSE_SENTENCE) })
+
+    const held = controls.hold('voicePrepare')
+    controls.standingVoiceGrant(['navigate'])
+    await userEvent.click(within(entry).getByTestId('voice-grant-entry-allow'))
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+    await act(async () => {
+      held.answer(0)
+      await Promise.resolve()
+    })
+    await waitFor(() => {
+      expect(held.count).toBe(3)
+    })
+    // The screen's read of what a call would be ends first, and is shown.
+    await act(async () => {
+      held.answer(1)
+      await Promise.resolve()
+    })
+    await waitFor(() => {
+      expect(screen.queryByText(STATUS_SENTENCE)).toBeNull()
+    })
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+
+    expect(close()).toBeDisabled()
+
+    await act(async () => {
+      held.release()
+      await Promise.resolve()
+    })
+    await waitFor(() => {
+      expect(close()).toBeEnabled()
+    })
+    expect(controls.voiceAllows).toHaveLength(0)
+  })
+
   // When the screen could not read what a call would be again, the entry says so in its own words,
   // takes no change, and offers the read again.
   it('says so, and offers the read again, when the screen could not read what a call would be', async () => {
