@@ -9785,8 +9785,8 @@ async fn storage_that_moves_between_the_managed_service_and_one_the_owner_runs_l
         Arc::ptr_eq(controller.storage_account(), controller.host_account()),
         "managed storage is served by the managed account"
     );
-    controller.backup().signals().work.notify_one();
     let mut passes = controller.backup_runtime().expect("a carrier").passes();
+    controller.backup().signals().work.notify_one();
     within("a pass of the carrier", async {
         passes.changed().await.expect("the carrier is running");
     })

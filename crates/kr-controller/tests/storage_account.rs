@@ -674,6 +674,33 @@ async fn a_sign_in_ends_a_waiting_sign_in_of_either_account_and_never_a_grant() 
     // Neither grant was touched.
     assert_eq!(managed_account.mark_at(managed.origin()), managed_mark);
     assert_eq!(storage_account.mark_at(storage.origin()), storage_mark);
+
+    // A sign-out of one account ends that account's waiting sign-in and no other: the storage
+    // account's sign-out leaves the managed account's sign-in waiting, and the managed account's
+    // own ends it.
+    storage_account
+        .sign_out()
+        .await
+        .expect("the storage account signs out");
+    assert!(
+        matches!(
+            managed_account.report().state,
+            AccountState::WaitingForBrowser { .. }
+        ),
+        "the other account's sign-in is still waiting"
+    );
+    assert_eq!(storage_account.mark_at(storage.origin()), None);
+    managed_account
+        .sign_out()
+        .await
+        .expect("the managed account signs out");
+    assert!(
+        !matches!(
+            managed_account.report().state,
+            AccountState::WaitingForBrowser { .. }
+        ),
+        "its own sign-out ends its waiting sign-in"
+    );
     host.stop().await;
 }
 
@@ -704,44 +731,34 @@ async fn the_managed_grant_keeps_its_scope_document_and_mark_through_the_daemon(
 
     let secrets = host.tree().environment().secrets_dir();
     let item = account_item_in(&secrets, "session");
-    let components: Vec<_> = item
+    let kept: Vec<_> = item
         .strip_prefix(&secrets)
         .expect("under the secret store")
         .components()
         .map(|component| component.as_os_str().to_string_lossy().into_owned())
         .collect();
-    let at = components
-        .iter()
-        .position(|component| component == "host-account")
-        .expect("the host-account scope");
+    let scope = format!("{}/host-account/{MANAGED_SCOPE_NAME}", host.environment_id);
     assert_eq!(
-        components[at + 1],
-        MANAGED_SCOPE_NAME,
-        "the scope is named by the digest of the managed origin: {components:?}"
+        kept.join("/"),
+        format!("{scope}/account/session"),
+        "the grant is kept under the scope the managed origin names, which the release before this one reads"
     );
 
+    // The stored document, byte for byte, with the identifier (drawn fresh for each grant) and the
+    // expiry (a time) read out of it.
     let text = std::fs::read_to_string(&item).expect("the grant is kept");
-    let mut document: serde_json::Value = serde_json::from_str(&text).expect("a grant document");
-    assert!(document["grantId"].is_string());
-    assert!(document["accessExpiresAtMs"].is_u64());
-    document["grantId"] = serde_json::Value::Null;
-    document["accessExpiresAtMs"] = serde_json::Value::Null;
+    let document: serde_json::Value = serde_json::from_str(&text).expect("a grant document");
+    let grant_id = document["grantId"].as_str().expect("an identifier");
+    let expiry = document["accessExpiresAtMs"].as_u64().expect("an expiry");
     assert_eq!(
-        document,
-        serde_json::json!({
-            "grantId": null,
-            "revision": 0,
-            "issuer": "https://reach.kala.to/auth",
-            "clientId": "kalareach-desktop",
-            "subject": "account-1",
-            "email": null,
-            "name": null,
-            "nonce": "a-nonce",
-            "refreshToken": "a-token-refresh",
-            "accessToken": "a-token",
-            "accessExpiresAtMs": null,
-            "scopes": ["openid", "voice"],
-        })
+        text.replacen(grant_id, "a-grant-id", 1)
+            .replacen(&expiry.to_string(), "1", 1),
+        concat!(
+            r#"{"grantId":"a-grant-id","revision":0,"issuer":"https://reach.kala.to/auth","#,
+            r#""clientId":"kalareach-desktop","subject":"account-1","email":null,"name":null,"#,
+            r#""nonce":"a-nonce","refreshToken":"a-token-refresh","accessToken":"a-token","#,
+            r#""accessExpiresAtMs":1,"scopes":["openid","voice"]}"#
+        )
     );
     assert_eq!(
         account
@@ -869,7 +886,12 @@ async fn a_shipped_controller_refuses_a_plain_http_storage_origin_before_it_send
             .spawn()
             .expect("the program starts");
         let waited = std::time::Instant::now();
+        let connected = |listener: &std::net::TcpListener| !matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock);
         let status = loop {
+            assert!(
+                !connected(&service) && !connected(&proxy_listener),
+                "the program sent something before it refused (proxy: {proxy})"
+            );
             if let Some(status) = child.try_wait().expect("the program's state is read") {
                 break status;
             }
@@ -897,7 +919,7 @@ async fn a_shipped_controller_refuses_a_plain_http_storage_origin_before_it_send
         );
         for (what, listener) in [("the service", &service), ("the proxy", &proxy_listener)] {
             assert!(
-                matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+                !connected(listener),
                 "nothing connected to {what} (proxy: {proxy})"
             );
         }

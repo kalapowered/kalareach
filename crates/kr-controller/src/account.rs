@@ -29,10 +29,11 @@
 //! transport that reaches it and the name its grant is kept under all come from that origin, so no
 //! account is paired with another origin's service.
 //!
-//! The managed host's configuration names a voice broker and may select a storage service; the
-//! host presents a token to each only when it is that service, and signs in when it presents to
-//! one. A host that selects no storage service of the managed origin and whose broker is another
-//! service, or none, signs in nowhere and presents nothing.
+//! The managed account presents a token to the voice broker, the relay lease service and the
+//! storage service only when each is the account service, and signs in when it presents to one. A
+//! host that selects no storage service of the managed origin and whose broker and relay lease
+//! service are other services, or none, has a managed account that signs in nowhere and presents
+//! nothing; a storage service the person runs has the account of its own.
 //!
 //! What the store holds is kept in a scope named by the service. A grant, and a revocation that
 //! waits to be sent, can therefore be read only through the service that issued them, and a host
@@ -130,8 +131,10 @@ pub struct Service {
 impl Service {
     /// The account service at `origin`, reached over `route`, where a sign-in asks for `scopes`.
     ///
-    /// The client checks every answer against `origin`'s own issuer, and the transport reaches that
-    /// origin and no other.
+    /// A callback and an ID token are checked against `origin`'s own issuer, a code or a stored
+    /// grant that names another issuer is neither exchanged nor refreshed at it, and the transport
+    /// reaches that origin and no other, so a revocation, an identity read and a usage read go there
+    /// too.
     #[must_use]
     pub fn at_origin(origin: &GatewayOrigin, scopes: Vec<&'static str>, route: Outbound) -> Self {
         let (transport, closed): (Arc<dyn AccountHttp>, Option<String>) = match route {
