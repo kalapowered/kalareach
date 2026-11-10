@@ -917,7 +917,8 @@ impl Host {
         let _ = clients.await;
         network.shutdown().await;
         // Each connection's task holds the daemon, and the daemon holds its environment's lock
-        // until the last of them ends. A suite closes its clients before it restarts.
+        // until the last of them ends. Ending the loops above ends the tasks, at the runtime's
+        // next turns, whether or not a client is still connected.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while Arc::strong_count(&controller) > 1 {
             assert!(

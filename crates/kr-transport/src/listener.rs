@@ -545,6 +545,9 @@ pub struct NetworkListener {
     endpoint: Endpoint,
     accept_loop: JoinHandle<()>,
     connections: Arc<ConnectionTasks>,
+    /// The runtime the listener was registered on, which closes the endpoint for a listener that is
+    /// dropped on a thread that is not one of its own.
+    runtime: tokio::runtime::Handle,
     /// The task that closes the endpoint once the connections have ended, when
     /// [`Self::end_connections`] started one, which [`Self::shutdown`] then waits for.
     winding_down: std::sync::Mutex<Option<JoinHandle<()>>>,
@@ -577,14 +580,12 @@ impl NetworkListener {
     /// the host handler for as long as its peer keeps the connection open. Each task is cancelled at
     /// its next turn on the runtime, not before, and its peer sees the connection close. The
     /// listener stays in place, so a [`Self::shutdown`] after this still waits for the endpoint's
-    /// close.
+    /// close. It can be called from any thread: the close runs on the runtime the listener was
+    /// registered on, and is lost only if that runtime has already ended.
     pub fn end_connections(&self) {
         self.accept_loop.abort();
-        if self.connections.end()
-            && !self.endpoint.is_closed()
-            && let Ok(runtime) = tokio::runtime::Handle::try_current()
-        {
-            let winding = runtime.spawn(wind_down(
+        if self.connections.end() && !self.endpoint.is_closed() {
+            let winding = self.runtime.spawn(wind_down(
                 self.endpoint.clone(),
                 Arc::clone(&self.connections),
             ));
@@ -692,6 +693,7 @@ pub async fn register_with_clock<H: HostHandler>(
         endpoint,
         accept_loop,
         connections,
+        runtime: tokio::runtime::Handle::current(),
         winding_down: std::sync::Mutex::new(None),
         windows,
     })

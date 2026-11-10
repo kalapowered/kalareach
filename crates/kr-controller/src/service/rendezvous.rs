@@ -77,13 +77,12 @@ impl Controller {
                  about a draft are accepted here",
             ));
         }
-        let outcome = self
-            .rendezvous_exchange(&mut reader, &mut writer, connection_id, &peer)
-            .await;
         // A rendezvous connection is one exchange. Its window goes with it rather than staying
-        // outstanding for the life of the daemon.
-        self.windows.retire_connection(connection_id);
-        outcome
+        // outstanding for the life of the daemon, whether the exchange finishes or its task is
+        // cancelled.
+        let _ends = super::local::EndsConnection::exchange(self, connection_id);
+        self.rendezvous_exchange(&mut reader, &mut writer, connection_id, &peer)
+            .await
     }
 
     async fn rendezvous_exchange(

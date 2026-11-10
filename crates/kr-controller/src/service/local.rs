@@ -153,6 +153,52 @@ where
     }
 }
 
+/// Takes a connection's authority away when its task ends, however it ends.
+///
+/// The task of a connection is cancelled, not finished, when the loop that serves it is ended, and
+/// code after its last await does not run then. A window that outlived its connection could
+/// first-admit a request through a connection that no longer exists, and a registration that
+/// outlived it would be an authority nothing can revoke, so both go from a destructor, which runs
+/// wherever the task is.
+pub(super) struct EndsConnection<'a> {
+    controller: &'a Controller,
+    connection_id: ConnectionId,
+    /// Whether the connection was registered in the authority store, which only a client
+    /// connection is: a rendezvous exchange holds a window and nothing else.
+    registered: bool,
+}
+
+impl<'a> EndsConnection<'a> {
+    /// A client connection, whose windows and registration go with it.
+    pub(super) const fn client(controller: &'a Controller, connection_id: ConnectionId) -> Self {
+        Self {
+            controller,
+            connection_id,
+            registered: true,
+        }
+    }
+
+    /// A rendezvous exchange, whose windows go with it.
+    pub(super) const fn exchange(controller: &'a Controller, connection_id: ConnectionId) -> Self {
+        Self {
+            controller,
+            connection_id,
+            registered: false,
+        }
+    }
+}
+
+impl Drop for EndsConnection<'_> {
+    fn drop(&mut self) {
+        self.controller
+            .windows
+            .retire_connection(self.connection_id);
+        if self.registered {
+            self.controller.deregister(self.connection_id);
+        }
+    }
+}
+
 /// Ends the daemon's network connections when the loop that serves its clients ends.
 struct StopsTheNetwork(Arc<Controller>);
 
@@ -553,14 +599,18 @@ impl Controller {
 
     /// Serves the client endpoint.
     ///
-    /// This loop is the daemon's serving life, and ending it is how a daemon is stopped: its owner
-    /// aborts it, as the binary and every suite do. Ending it ends every connection the daemon is
-    /// serving, local and network alike, and each peer sees its connection close. A connection
-    /// holds the daemon for as long as it lasts, and the daemon owns the network listener whose
-    /// tasks serve the network ones, so dropping the daemon's last handle while this loop runs
-    /// cannot release it; the stop is ending this loop, after which the daemon is released once
-    /// every task it ended has dropped its hold, at the next turn of the runtime, and its owner has
-    /// dropped its own.
+    /// A daemon is stopped by ending its serving loops, as the binary and every suite do: this one,
+    /// [`Self::serve_rendezvous`] and `transfer::serve_chunks`. Each loop ends the connections it
+    /// serves with it, and each peer sees its connection close. This loop also ends the network
+    /// connections: a connection holds the daemon for as long as it lasts, and the daemon owns the
+    /// network listener whose tasks serve the network ones, so dropping the daemon's last handle
+    /// while a loop runs cannot release it.
+    ///
+    /// Once the loops are ended the daemon is released at the next turns of the runtime, when the
+    /// tasks they ended have dropped their holds, and every other holder has let go. An operation
+    /// that has already started (a request's effect, the watch on a session's closure) keeps the
+    /// daemon until it ends, and the network listener, which this ends the connections of, is
+    /// ended once for good: a second loop on the same daemon would find its network gone.
     ///
     /// # Errors
     ///
@@ -617,16 +667,12 @@ impl Controller {
         kind: StreamKind,
     ) -> Result<()> {
         let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+        // A connection that ends takes its windows and its registration with it, whether its loop
+        // finishes or its task is cancelled.
+        let _ends = EndsConnection::client(self, connection_id);
         let (mut reader, mut writer) = split(connection, kind);
-        let outcome = self
-            .serve_client(&mut reader, &mut writer, connection_id, &peer, kind)
-            .await;
-        // A connection that ends takes its windows and its registration with it. A window that
-        // outlived its connection could first-admit a request through a connection that no longer
-        // exists, and a registration that outlived it would be an authority nothing can revoke.
-        self.windows.retire_connection(connection_id);
-        self.deregister(connection_id);
-        outcome
+        self.serve_client(&mut reader, &mut writer, connection_id, &peer, kind)
+            .await
     }
 
     async fn serve_client(
