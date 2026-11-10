@@ -3305,13 +3305,17 @@ device that may not read the session's receipts is told `OUTCOME_UNKNOWN`.
 
 A device holds at most 64 open drafts. A draft is open until a prompt sends it to a session or the
 session it targets closes: the closure of a session queues, on a task of its own, the write that
-orphans its drafts. A `draft.create` past the bound is refused `QUOTA_EXCEEDED` with the bound in the message, only after
-the service has asked the admission again, so a device whose authority has gone learns no count.
-The bound is one constant of this host, which an owner cannot change, and the person at this
-machine is held to none. A device cannot end a draft itself: this level has no method that discards
-one, so a prompt that sends it, or the end of its session, is how a place is freed. Sent and
-orphaned drafts stay in the journal, and each `draft.update` adds one row to the journal's events
-and a receipt that holds the updated draft for the de-duplication window.
+orphans its drafts, and a device at its bound has the closures the registry holds written first, so
+a draft stops counting when its session is recorded closed. A `draft.create` past the bound is
+refused `QUOTA_EXCEEDED` with the bound in the message, only after the service has asked the
+admission again, so a device whose authority has gone learns no count. The host keeps that refusal
+as the action's outcome, as it keeps every refusal of a service, so the same action asked again is
+given the same refusal even when a place is free, and a device that has freed a place takes a new
+action for its new attempt. The bound is one constant of this host, which an owner cannot change,
+and the person at this machine is held to none. A device cannot end a draft itself: this level has
+no method that discards one, so a prompt that sends it, or the end of its session, is how a place
+is freed. Sent and orphaned drafts stay in the journal, and each `draft.update` adds one row to the
+journal's events and a receipt that holds the updated draft for the de-duplication window.
 
 What a device is told of a failure passes one rule, applied where this host's words leave it for a
 device: the write boundary of an authorised connection, the refusal of a connection that is not

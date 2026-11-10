@@ -1097,6 +1097,17 @@ impl Store {
         Ok(uploads.saturating_add(snapshots))
     }
 
+    /// Returns how many drafts one principal holds open: the ones no prompt has sent to a session
+    /// and whose target session has not ended, which is what [`Self::insert_draft`] counts against
+    /// a bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the count cannot be read.
+    pub fn open_drafts(&self, actor_id: &ActorId) -> Result<u64> {
+        open_drafts(&self.connection, actor_id)
+    }
+
     fn count(&self, sql: &str, parameters: impl rusqlite::Params) -> Result<u64> {
         let count: i64 = self
             .connection

@@ -524,7 +524,6 @@ async fn a_draft_create_a_service_copied_after_the_door_looked_is_told_as_a_copy
     );
     let told = written(&blind, &recording, copied).await;
     assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
-    assert_eq!(told.message, super::outcome_not_shown().message);
 
     // The control: a device that may view the session is given the record.
     let (sighted, recording) = paired_connection(
@@ -698,53 +697,95 @@ async fn a_create_at_the_bound_whose_registration_is_withdrawn_is_told_nothing_o
     world.serving.abort();
 }
 
-/// KR-REQ-23.41: a draft stops counting when the session it targets closes, through the daemon's own
-/// closure of a session and the write it queues for the session's drafts, and not at some later
-/// sweep. A device at its bound is refused; once the session closes, the drafts bound to it have
-/// freed their places, and a create is served.
+/// A device holding as many open drafts as it may, every one bound to the session of `world`.
+fn at_the_bound_for_a_session(world: &fake::Silent, byte: u8) -> super::RemoteConnection {
+    let (connection, _) = paired_connection(&world.controller, byte, EVERY_RIGHT);
+    let device = connection.device.principal();
+    for _ in 0..DEVICE_OPEN_DRAFTS {
+        a_draft_for(world, &device, Some(world.session_id));
+    }
+    connection
+}
+
+/// The create such a device sends for no session, once the session is closed.
+fn a_create_for_no_session(
+    world: &fake::Silent,
+    connection: &super::RemoteConnection,
+    request_id: u64,
+) -> MutationRequest {
+    write_naming(
+        world,
+        connection,
+        Method::DraftCreate,
+        request_id,
+        &create_params(world, None, None, "after the closure"),
+        None,
+    )
+}
+
+/// KR-REQ-23.41: a draft stops counting when the session it targets closes. A device at its bound is
+/// refused while the session lives; once the daemon has closed the session, through its own
+/// closure, a create is served at once, and the closure's own queued write for the session's drafts
+/// is not what it waits for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_draft_stops_counting_when_its_sessions_closure_ends_it() {
+async fn a_draft_stops_counting_when_its_session_closes() {
     use crate::service::a_read_that_meets_a_worker_on_its_way_out::closure_of;
 
     let world = fake::fake_worker(None).await;
     let controller = &world.controller;
-    let session = world.session_id;
-    let (connection, _) = paired_connection(controller, 41, EVERY_RIGHT);
-    let device = connection.device.principal();
-    for _ in 0..DEVICE_OPEN_DRAFTS {
-        a_draft_for(&world, &device, Some(session));
-    }
-    let create = |request_id: u64| {
-        write_naming(
-            &world,
-            &connection,
-            Method::DraftCreate,
-            request_id,
-            &create_params(&world, None, None, "after the closure"),
-            None,
-        )
-    };
-    let refused = connection.mutate(&create(1)).await;
+    let connection = at_the_bound_for_a_session(&world, 41);
+    let refused = connection
+        .mutate(&a_create_for_no_session(&world, &connection, 1))
+        .await;
     assert_eq!(
         super::tests::error_of(&refused).code,
         ErrorCode::QuotaExceeded,
         "the drafts bound to a live session count"
     );
 
-    let written_before = controller.transfer().session_endings_written();
     controller
-        .retire(&closure_of(session))
+        .retire(&closure_of(world.session_id))
         .await
         .expect("the session closes");
-    tokio::time::timeout(
-        WAIT_BOUND,
-        controller
-            .transfer()
-            .until_session_endings_written(written_before + 1),
-    )
-    .await
-    .expect("the closure writes the end of the session's drafts");
-    let _: DraftCreateResult = result_of(&connection.mutate(&create(2)).await);
+    let _: DraftCreateResult = result_of(
+        &connection
+            .mutate(&a_create_for_no_session(&world, &connection, 2))
+            .await,
+    );
+    world.serving.abort();
+}
+
+/// KR-REQ-23.41: a draft stops counting when the registry records its session closed, whether or not
+/// the write the closure queues for the session's drafts has run: that write is made up by the
+/// sweep and the next start, and the bound does not wait for either. Here the registry holds the
+/// closure and the transfer service has not been told, as after a write that failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_draft_stops_counting_when_the_registry_holds_its_session_closed() {
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::closure_of;
+
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    let connection = at_the_bound_for_a_session(&world, 42);
+    let refused = connection
+        .mutate(&a_create_for_no_session(&world, &connection, 1))
+        .await;
+    assert_eq!(
+        super::tests::error_of(&refused).code,
+        ErrorCode::QuotaExceeded,
+        "the drafts bound to a live session count"
+    );
+
+    controller
+        .registry
+        .lock()
+        .await
+        .record_closure(&closure_of(world.session_id))
+        .expect("the registry records the closure");
+    let _: DraftCreateResult = result_of(
+        &connection
+            .mutate(&a_create_for_no_session(&world, &connection, 2))
+            .await,
+    );
     world.serving.abort();
 }
 

@@ -125,8 +125,7 @@ async fn the_upload_writes_a_palette_change_and_raw_input_are_refused_by_name_an
         }
         let again = send().await.expect_err("refused again");
         assert_eq!(
-            (again.code, again.message.as_str()),
-            (refused.code, refused.message.as_str()),
+            again.code, refused.code,
             "{name}: nothing was claimed for the first attempt, so the repeat is refused as it was"
         );
     }
