@@ -926,6 +926,19 @@ pub(super) fn refused_for_a_fence(error: &kr_protocol::error::ProtocolError) {
     assert!(error.message.contains("fence"), "{error:?}");
 }
 
+/// What the local door tells a copy a service read from its record and withheld, because the
+/// authority the copy arrived under no longer stands: that what became of the action is not shown,
+/// which says nothing of the record and nothing of the authority, since the refusal of the authority
+/// is a definite word and an earlier attempt may have carried the action out.
+fn told_as_not_shown(error: &kr_protocol::error::ProtocolError) {
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown, "{error:?}");
+    assert_eq!(
+        error.message,
+        crate::error::ControllerError::outcome_not_shown().to_string(),
+        "{error:?}"
+    );
+}
+
 /// KR-REQ-09.09, 09.12 and 26.16: a transfer action another attempt recorded after the local door's
 /// own lookup found nothing is not given back while this host owes a fence it could not raise, or
 /// to a connection whose registration is gone. The control: the same late attempt, with nothing
@@ -2188,8 +2201,9 @@ async fn a_fence_that_lands_after_a_bridge_has_answered_says_the_answer_was_not_
 
 /// KR-REQ-09.09, 09.12 and 26.16: a machine group step another attempt recorded is not given back
 /// to a late attempt, one that finds the claim after waiting for the step lock, while this host owes
-/// a fence it could not raise. The control: with nothing owed, the same late attempt is answered
-/// from the receipt, and is again once the fence is gone.
+/// a fence it could not raise: it is told that what became of the action is not shown. The control:
+/// with nothing owed, the same late attempt is answered from the receipt, and is again once the
+/// fence is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_machine_group_step_recorded_before_a_late_attempts_claim_is_not_given_back_while_a_fence_is_owed()
  {
@@ -2232,7 +2246,7 @@ async fn a_machine_group_step_recorded_before_a_late_attempts_claim_is_not_given
 
     controller.hold_fence(true);
     let refused = attempt().await;
-    refused_for_a_fence(refusal(&refused).unwrap_or_else(|| {
+    told_as_not_shown(refusal(&refused).unwrap_or_else(|| {
         panic!("a fence this host owes stops the retained answer: {refused:?}")
     }));
     controller.hold_fence(false);
@@ -2257,9 +2271,9 @@ async fn a_machine_group_step_recorded_before_a_late_attempts_claim_is_not_given
 /// attempt has waited for the lock and found its action recorded; the fence is raised with the
 /// lock held and the answer in hand, so only a check made after the record is found, and not one
 /// made before the lock was taken, sees it. It is raised twice: as a fence this host owes, and by
-/// a revocation of this host's authority that is acknowledged while the lock is held. The control:
-/// the same late attempt, with nothing raised while it is stopped there, is answered from the
-/// receipt.
+/// a revocation of this host's authority that is acknowledged while the lock is held. Each time the
+/// late attempt is told that what became of the action is not shown. The control: the same late
+/// attempt, with nothing raised while it is stopped there, is answered from the receipt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fence_that_lands_while_a_late_attempt_holds_the_step_lock_stops_the_answer_it_found() {
     use kr_protocol::machine::{MachineExpected, MachineSplitParams};
@@ -2326,7 +2340,7 @@ async fn a_fence_that_lands_while_a_late_attempt_holds_the_step_lock_stops_the_a
     controller.hold_fence(true);
     release.send(()).expect("the late attempt goes on");
     let refused = waiting.await.expect("the late attempt finishes");
-    refused_for_a_fence(refusal(&refused).unwrap_or_else(|| {
+    told_as_not_shown(refusal(&refused).unwrap_or_else(|| {
         panic!("a fence raised while the step lock was held stops the answer: {refused:?}")
     }));
     controller.hold_fence(false);
@@ -2356,12 +2370,7 @@ async fn a_fence_that_lands_while_a_late_attempt_holds_the_step_lock_stops_the_a
             "a revocation acknowledged while the step lock was held stops the answer: {refused:?}"
         )
     });
-    assert_eq!(withheld.code, ErrorCode::PermissionDenied, "{withheld:?}");
-    assert_eq!(
-        withheld.message,
-        crate::authority::AdmissionLapse::Deregistered.to_string(),
-        "the refusal is the withdrawn registration's, and not a fence this host owes"
-    );
+    told_as_not_shown(withheld);
     assert!(
         !controller.a_machine_step_holds_the_step_lock(),
         "the refused attempt let the lock go"
