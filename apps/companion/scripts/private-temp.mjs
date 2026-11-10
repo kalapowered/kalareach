@@ -23,6 +23,14 @@ export function privateTemporary(env = process.env) {
   return {
     directory,
     env: { ...env, TMPDIR: directory, TEMP: directory, TMP: directory },
-    remove: () => rmSync(directory, { recursive: true, force: true })
+    // A directory that cannot be removed is left for the system's cleanup, and does not change how
+    // the build ended.
+    remove: () => {
+      try {
+        rmSync(directory, { recursive: true, force: true })
+      } catch {
+        // Nothing to do: the directory holds only what the build's tools cached.
+      }
+    }
   }
 }

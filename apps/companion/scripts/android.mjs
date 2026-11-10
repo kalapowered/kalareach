@@ -138,7 +138,9 @@ const project = join(dirname(import.meta.dirname), 'src-tauri')
 // The build runs in a temporary directory of its own, which Gradle and the steps it starts inherit:
 // the command line tool shares its options with those steps through a file there, named for the
 // application, and a second build on the machine would otherwise read this one's file or have its
-// own read (see `private-temp.mjs`). It is removed however this command ends.
+// own read (see `private-temp.mjs`). It is removed when this command ends, whether the build
+// succeeded or not. A signal that ends the command first leaves the directory, which holds nothing
+// but a compile cache, for the system's own cleanup of the temporary directory.
 const temporary = privateTemporary()
 process.on('exit', temporary.remove)
 
