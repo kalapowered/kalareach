@@ -25,8 +25,14 @@ pub const FAILURE_CODES: &str = "failure_codes";
 /// One failure of a part as a code and what varies in it, the form a record publishes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Failure {
-    /// A paired device's `upload.begin` was refused with this code of the protocol.
-    UploadRefused(String),
+    /// A step of a paired device's upload was refused with this code of the protocol: `call` is
+    /// the step's method.
+    UploadRefused {
+        /// The method of the step the host refused.
+        call: &'static str,
+        /// The code of the protocol it refused with.
+        refused: String,
+    },
     /// A paired device's transfer was accepted, and the image given was not the one it
     /// transferred.
     UploadTransferredAnotherImage,
@@ -74,7 +80,9 @@ impl Failure {
     #[must_use]
     pub fn evidence(&self) -> Value {
         match self {
-            Self::UploadRefused(refused) => json!({ "code": "upload_refused", "refused": refused }),
+            Self::UploadRefused { call, refused } => {
+                json!({ "code": "upload_refused", "call": call, "refused": refused })
+            }
             Self::UploadTransferredAnotherImage => {
                 json!({ "code": "upload_transferred_another_image" })
             }
@@ -377,20 +385,26 @@ mod tests {
             json!({ "login_held": true }),
         )
         .with_failures(&[
-            Failure::UploadRefused("INVALID_ARGUMENT".to_owned()),
+            Failure::UploadRefused {
+                call: "upload.begin",
+                refused: "INVALID_ARGUMENT".to_owned(),
+            },
             Failure::LaunchNotDetected {
                 session: None,
                 cause: "not_one_instance",
                 announced: 0,
             },
         ])
-        .with_failures(&[Failure::UploadRefused("INVALID_ARGUMENT".to_owned())]);
+        .with_failures(&[Failure::UploadRefused {
+            call: "upload.begin",
+            refused: "INVALID_ARGUMENT".to_owned(),
+        }]);
         assert_eq!(
             outcome.evidence,
             json!({
                 "login_held": true,
                 "failure_codes": [
-                    { "code": "upload_refused", "refused": "INVALID_ARGUMENT" },
+                    { "code": "upload_refused", "call": "upload.begin", "refused": "INVALID_ARGUMENT" },
                     { "code": "launch_not_detected", "session": null, "cause": "not_one_instance", "announced": 0 }
                 ]
             })
