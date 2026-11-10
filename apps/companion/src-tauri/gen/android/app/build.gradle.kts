@@ -132,11 +132,21 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     buildTypes {
+        // The rules a minified build is held to, for the release build and for a debug build that
+        // asks to be minified.
+        val minifierRules = fileTree(".") { include("**/*.pro") }
+            .plus(getDefaultProguardFile("proguard-android-optimize.txt"))
+            .toList().toTypedArray()
         getByName("debug") {
             manifestPlaceholders["usesCleartextTraffic"] = "true"
             isDebuggable = true
             isJniDebuggable = true
-            isMinifyEnabled = false
+            // A device run's subject is sometimes the application as the store ships it, and the
+            // minifier is what a debug build differs in most: `KR_MINIFY_DEBUG=1` runs it on the debug
+            // build, with the release build's rules, so that the same application can be started
+            // with the debug build's test hooks.
+            isMinifyEnabled = providers.environmentVariable("KR_MINIFY_DEBUG").orNull == "1"
+            if (isMinifyEnabled) proguardFiles(*minifierRules)
             packaging {                jniLibs.keepDebugSymbols.add("*/arm64-v8a/*.so")
                 jniLibs.keepDebugSymbols.add("*/armeabi-v7a/*.so")
                 jniLibs.keepDebugSymbols.add("*/x86/*.so")
@@ -145,11 +155,7 @@ android {
         }
         getByName("release") {
             isMinifyEnabled = true
-            proguardFiles(
-                *fileTree(".") { include("**/*.pro") }
-                    .plus(getDefaultProguardFile("proguard-android-optimize.txt"))
-                    .toList().toTypedArray()
-            )
+            proguardFiles(*minifierRules)
         }
     }
     kotlinOptions {

@@ -74,6 +74,12 @@
 # `QEMU_AUDIO_OUT_DRV`, `QEMU_WAV_PATH` and `QEMU_AUDIO_IN_DRV` through the environment. The input
 # driver should be `none` wherever it works, so that no microphone of this machine is opened.
 #
+# The Android application is the debug build, which is not minified. `KR_MINIFY_DEBUG=1` runs the
+# minifier on it, with the release build's rules, and keeps the debug build's test hooks: the call
+# then starts in an application whose classes the minifier has had its way with, which is what a
+# store ships. A native library that finds a class by name aborts the first call there when the
+# rules do not keep the class.
+#
 # A simulator or an emulator only inside the Mac's device lease, and the builds inside a build
 # slot:
 #
@@ -748,7 +754,7 @@ run_android() {
         return 3
     fi
 
-    say "building the debug application for the emulator"
+    say "building the debug application for the emulator${KR_MINIFY_DEBUG:+ (KR_MINIFY_DEBUG=$KR_MINIFY_DEBUG)}"
     mkdir -p "${artefacts_base:?}"
     ( cd "$companion" && pnpm android --debug --target aarch64 ) >"$artefacts_base/build.log" 2>&1 \
         || { say "the build failed; see $artefacts_base/build.log"; return 2; }
