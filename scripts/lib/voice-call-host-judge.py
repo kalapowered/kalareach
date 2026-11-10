@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Decides a voice call device run from the report the machine side wrote.
 
-    voice-call-host-judge.py <report.json> <mode> <platform> [--send-unmeasured]
+    voice-call-host-judge.py <report.json> <mode> <platform> [<leg>] [--send-unmeasured]
 
-`mode` is `native-failure` (the answer leads nowhere and native code ends the call) or `outage` (the
-answer is the phone's own peer, the call carries audio and then the voice service goes away).
-`platform` is `ios` or `android`. `--send-unmeasured` says the phone's own result could not measure
-the audio it sent, as a simulator with no microphone cannot, so a peer that heard nothing is no
-evidence against the call.
+`mode` is `native-failure` (the answer leads nowhere and native code ends the call), `outage` (the
+answer is the phone's own peer, the call carries audio and then the voice service goes away) or
+`delegating` (the call hands spoken requests to the host; `leg` says which of the legs the run
+played, and what the voice service carried to the model and what the host's sessions were sent is
+read against what that leg expects). `platform` is `ios` or `android`. `--send-unmeasured` says the
+phone's own result could not measure the audio it sent, as a simulator with no microphone cannot, so
+a peer that heard nothing is no evidence against the call.
 
 It prints one line per check, `== [voice-call-device] host check=<name> ok=<0, 1 or 2> detail=<text>`,
 and exits 0 when every check passed, 4 when every check that measured passed and some could not
@@ -132,19 +134,104 @@ def checks_for(report, mode, platform, send_unmeasured):
     return checks
 
 
+# What the model is told, by the kind of words, read from the front of each sentence.
+def told_kind(text):
+    if text.startswith("The person's computer read it."):
+        return "performed"
+    if text.startswith("This call can no longer act on what the person says"):
+        return "tainted"
+    if text.startswith("Nothing was done on the person's computer: what was said could not be used as a request"):
+        return "refused"
+    if text.startswith("Nothing was done on the person's computer: this version does not act on spoken requests"):
+        return "not_done"
+    return "other"
+
+
+# For each leg: whether the attach words say the phone can ask the host, what each delegation the
+# call answered was told (by identifier, in the order told), whether the call is tainted for good
+# (the model is told so once, as instructions), and how many requests the host was sent.
+LEGS = {
+    "production": dict(attach="cannot", told={"d-9": ["not_done"]}, tainted=False, at_host=0),
+    "positive": dict(attach="can", told={"d-0": ["refused"], "d-1": ["performed"]}, tainted=False, at_host=1),
+    "first_utterance": dict(attach="can", told={"d-1": ["refused"], "d-2": ["performed"]}, tainted=False, at_host=1),
+    "mute": dict(attach="can", told={"d-0": ["refused"], "d-1": ["performed"], "d-2": ["tainted"], "d-3": ["tainted"]}, tainted=True, at_host=1),
+    "gap": dict(attach="can", told={"d-0": ["refused"], "d-1": ["performed"], "d-2": ["tainted"]}, tainted=True, at_host=1),
+    "dtx": dict(attach="can", told={"d-1": ["tainted"]}, tainted=True, at_host=0),
+    "malformed": dict(attach="can", told={"d-0": ["refused"], "d-1": ["performed"], "d-2": ["tainted"]}, tainted=True, at_host=1),
+    "late_fragment": dict(attach="can", told={"d-0": ["refused"], "d-1": ["performed"], "d-2": ["tainted"]}, tainted=True, at_host=1),
+    "broker_disagrees": dict(attach="can", told={"d-0": ["refused"], "d-1": ["performed"], "d-2": ["refused"], "d-3": ["performed"]}, tainted=False, at_host=2),
+}
+
+
+def delegating_checks(report, leg, platform):
+    expected = "Bearer " + report["token"]
+    want = LEGS[leg]
+    sent = report.get("control_sent") or []
+    instructions = [each["content"] for each in sent if each.get("command") == "instructions" and each.get("delegation") is None and each.get("content")]
+    checks = [
+        ("the service created one call", int(report["creations"] == 1), report["creations"]),
+        (
+            "the control attached with the phone's token",
+            int(bool(report["control_tokens"]) and all(each == expected for each in report["control_tokens"])),
+            len(report["control_tokens"]),
+        ),
+    ]
+    peer = report.get("peer") or {}
+    checks.append((
+        "the peer answered the call's offer",
+        int(peer.get("answered", 0) >= 1 and not peer.get("errors")),
+        "answered %s of %s%s" % (peer.get("answered"), peer.get("relayed"), "; " + "; ".join(peer["errors"]) if peer.get("errors") else ""),
+    ))
+    can = [words for words in instructions if "can ask the person's computer" in words]
+    cannot = [words for words in instructions if "cannot act on the person's computer" in words]
+    if want["attach"] == "can":
+        attach_ok = bool(can) and not cannot
+    else:
+        attach_ok = bool(cannot) and not can
+    checks.append((
+        "the model was told on attaching what the phone can do" if want["attach"] == "can" else "the model was told on attaching that the phone cannot act",
+        int(attach_ok),
+        "can-ask words %d, cannot-act words %d" % (len(can), len(cannot)),
+    ))
+    tainted_told = [words for words in instructions if told_kind(words) == "tainted"]
+    checks.append((
+        "the model was told once that the call can no longer act" if want["tainted"] else "the model was never told the call can no longer act",
+        int(len(tainted_told) == 1 if want["tainted"] else not tainted_told),
+        "%d times" % len(tainted_told),
+    ))
+    for delegation, kinds in want["told"].items():
+        got = [told_kind(each["content"]) for each in sent if each.get("delegation") == delegation and each.get("content")]
+        checks.append((
+            "the model was told what became of %s" % delegation,
+            int(got == kinds),
+            "told %s, expected %s" % (",".join(got) or "nothing", ",".join(kinds)),
+        ))
+    stray = sorted({each["delegation"] for each in sent if each.get("delegation") and each["delegation"] not in want["told"]})
+    checks.append(("the model was told of no delegation the leg did not make", int(not stray), ",".join(stray)))
+    return checks
+
+
 def main():
     arguments = [argument for argument in sys.argv[1:] if not argument.startswith("--")]
     flags = [argument for argument in sys.argv[1:] if argument.startswith("--")]
-    if len(arguments) != 3 or any(flag != "--send-unmeasured" for flag in flags):
+    if len(arguments) not in (3, 4) or any(flag != "--send-unmeasured" for flag in flags):
         print(__doc__, file=sys.stderr)
         return 2
-    path, mode, platform = arguments
-    if mode not in ("native-failure", "outage") or platform not in ("ios", "android"):
+    path, mode, platform = arguments[:3]
+    leg = arguments[3] if len(arguments) == 4 else None
+    if mode not in ("native-failure", "outage", "delegating") or platform not in ("ios", "android"):
+        print(__doc__, file=sys.stderr)
+        return 2
+    if (mode == "delegating") != (leg is not None) or (leg is not None and leg not in LEGS):
         print(__doc__, file=sys.stderr)
         return 2
     report = json.load(open(path, encoding="utf-8"))
     status = 0
-    for name, verdict, detail in checks_for(report, mode, platform, "--send-unmeasured" in flags):
+    if mode == "delegating":
+        found = delegating_checks(report, leg, platform)
+    else:
+        found = checks_for(report, mode, platform, "--send-unmeasured" in flags)
+    for name, verdict, detail in found:
         print("== [voice-call-device] host check=%s ok=%d detail=%s" % (name, verdict, detail))
         if verdict == 0:
             status = 2
