@@ -7440,3 +7440,27 @@ async fn a_session_the_phone_cannot_name_in_time_is_not_asked_about() {
     hang_up(&scene);
     scene.stop_host().await;
 }
+
+/// A host's answer about another session than the one the confirmation is for asks nobody: the
+/// number in it names a session the signature does not cover, so the person is not asked to confirm
+/// on the strength of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_number_read_for_another_session_is_not_put_to_the_person() {
+    let mut scene = closing().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    scene
+        .link
+        .answer_the_next_session_read_for_another_session();
+    let end = say_close(&scene, 6_000).await;
+    ask(&scene, "d-1", end - 200).await;
+
+    let row = row_reaching(&scene, "d-1", "cancelled").await;
+
+    assert_eq!(row["cause"], "session_not_named", "{row}");
+    assert!(scene.ceremony.asked().is_empty(), "nobody was asked");
+    assert_eq!(at_the_host(&scene), 1, "no signature was sent");
+    assert!(!scene.is_closed().await);
+    hang_up(&scene);
+    scene.stop_host().await;
+}

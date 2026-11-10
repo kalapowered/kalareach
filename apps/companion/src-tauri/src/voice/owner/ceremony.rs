@@ -174,7 +174,11 @@ impl Owner {
                         &params,
                     );
                     match tokio::time::timeout(shared.timings.session_name_within, read).await {
-                        Ok(Ok(read)) => Some(read.session.display_number.get()),
+                        // The number names the session the signature covers only when the host
+                        // answered for that session.
+                        Ok(Ok(read)) if read.session.session_id == session_id => {
+                            Some(read.session.display_number.get())
+                        }
                         _ => None,
                     }
                 }

@@ -1096,6 +1096,9 @@ struct LinkState {
     /// Whether the next `voice.delegate` is answered with a receipt, as a host that held the action
     /// and said no more would, and not with the method's result.
     receipting_delegate: bool,
+    /// Whether the next answer to a `session.read` is for another session than the one asked for,
+    /// as a host at fault would give.
+    answering_read_for_another: bool,
     /// The method of the requests whose answer is replaced by a result nothing can read as that
     /// method's result: the host answers, and the caller is handed something else.
     garbling_answer_to: Option<String>,
@@ -1270,6 +1273,16 @@ impl LinkControl {
     /// all the same, and the caller is handed the receipt.
     pub fn answer_the_next_delegation_with_a_receipt(&self) {
         self.state.lock().expect("the record").receipting_delegate = true;
+    }
+
+    /// Makes the next answer to a `session.read`, once, a read of another session than the one
+    /// asked for: the host answers, and the caller is handed the answer with that session's
+    /// identity replaced by a session the caller did not ask about.
+    pub fn answer_the_next_session_read_for_another_session(&self) {
+        self.state
+            .lock()
+            .expect("the record")
+            .answering_read_for_another = true;
     }
 
     /// Makes the answer to every request of `method`, on any connection to the host, a result that
@@ -1499,6 +1512,33 @@ impl LinkControl {
             )
         };
         change(&mut result, &params);
+        let mut response = response.clone();
+        response.outcome = kr_protocol::envelope::Outcome::Ok(
+            kr_protocol::envelope::ParamsValue::from_typed(&result).ok()?,
+        );
+        Some(response)
+    }
+
+    /// `response` with its session replaced by another, taking the change, when it is the answer to
+    /// a `session.read` and the test asked for the next one to be changed.
+    fn session_read_changed(
+        &self,
+        response: &kr_protocol::envelope::Response,
+    ) -> Option<kr_protocol::envelope::Response> {
+        let kr_protocol::envelope::Outcome::Ok(value) = &response.outcome else {
+            return None;
+        };
+        let mut result: kr_protocol::session::SessionReadResult = value.to_typed().ok()?;
+        if !std::mem::take(
+            &mut self
+                .state
+                .lock()
+                .expect("the record")
+                .answering_read_for_another,
+        ) {
+            return None;
+        }
+        result.session.session_id = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
         let mut response = response.clone();
         response.outcome = kr_protocol::envelope::Outcome::Ok(
             kr_protocol::envelope::ParamsValue::from_typed(&result).ok()?,
@@ -1922,7 +1962,11 @@ impl kr_client::transport::ControlTransport for Tapped {
                         Some((request_id, action_id)) => {
                             ControlFrame::Receipt(Box::new(receipt_for(request_id, action_id)))
                         }
-                        None => match self.control.challenge_changed(&response) {
+                        None => match self
+                            .control
+                            .challenge_changed(&response)
+                            .or_else(|| self.control.session_read_changed(&response))
+                        {
                             Some(changed) => ControlFrame::Response(changed),
                             None => ControlFrame::Response(response),
                         },
