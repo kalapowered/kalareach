@@ -21,7 +21,8 @@ import WebRTC
 /// What a running call tells the application about.
 ///
 /// Everything is reported on the call's own queue, never on WebRTC's thread: a call that ended itself
-/// from a report would otherwise close the connection that is reporting to it.
+/// from a report would otherwise close the connection that is reporting to it. A change of what the
+/// microphone is doing is the one exception, told where it is made: see `captureChanged`.
 public protocol VoiceCallObserver: AnyObject {
     /// The connection's own state changed.
     func voiceCall(_ call: VoiceCall, connectionChanged state: RTCPeerConnectionState)
@@ -30,9 +31,9 @@ public protocol VoiceCallObserver: AnyObject {
     /// Audio was played out of the device for the first time. An estimate from the connection's
     /// statistics, told once: see ``PlayoutWatch``.
     func voiceCallPlayedAudio(_ call: VoiceCall)
-    /// What the microphone is doing changed: the call's gate decided it. A change made by a report
-    /// that is already running on the call's queue is told at once, while the call's control holds
-    /// its lock, so an observer must not call back into the call from here.
+    /// What the microphone is doing changed: the call's gate decided it. Told at once, on the thread
+    /// that made the change and while the call's control holds its lock, so that the news is told in
+    /// the order of the changes: an observer queues it and must not call back into the call from here.
     func voiceCall(_ call: VoiceCall, captureChanged state: VoiceCaptureState)
     /// The call ended, whatever ended it, and its audio is given back.
     func voiceCallEnded(_ call: VoiceCall)
@@ -83,9 +84,6 @@ public final class VoiceCall: NSObject {
     private var playbackSwitchesSeen: UInt64 = 0
     /// The call's own queue: its timer, and every report from the audio session and WebRTC.
     private let queue: DispatchQueue
-    /// Marks the call's own queue, so work that is already on it is told at once and not queued
-    /// behind what is waiting there.
-    private let queueMark = DispatchSpecificKey<Void>()
     /// How many barriers this call has told its observer of. Queue only.
     private var barriers: UInt64 = 0
     /// The provider's events channel, which this end creates before the offer and only reads.
@@ -178,7 +176,6 @@ public final class VoiceCall: NSObject {
         // carries nothing until the control lets it.
         microphone.isEnabled = false
         self.queue = queue
-        queue.setSpecific(key: queueMark, value: ())
         self.observer = observer
         super.init()
         // Before the control exists: building it sets every switch off, and a call that does not
@@ -249,14 +246,13 @@ public final class VoiceCall: NSObject {
             playout.playbackChanged()
         }
         let playbackAtRequest = control.isPlaybackOn
-        // Stamped just before the request and, below, in WebRTC's callback before the hop to the
-        // queue: this queue also carries data-channel events and capture news, so the time it runs
-        // the answer at says nothing of when the report was made.
-        let requestedAtMs = VoiceCall.nowMs()
         connection.statistics { [weak self] report in
+            // Stamped in WebRTC's callback, before the hop to the queue: this queue also carries
+            // data-channel events and capture news, so the time it runs the answer at says nothing
+            // of when the report was made. A report carries the moment its collection began, in UTC
+            // microseconds: how old it was when it was answered, whatever the connection's cache or
+            // a slow collection did.
             let answeredAtMs = VoiceCall.nowMs()
-            // A report carries the moment its collection began, in UTC microseconds: how old it was
-            // when it was answered, whatever the connection's cache or a slow collection did.
             let reportAgeMs = VoiceCall.ageMs(ofReportAt: report.timestamp_us)
             let source = report.statistics.values.first {
                 $0.type == "media-source" && ($0.values["kind"] as? String) == "audio"
@@ -268,7 +264,6 @@ public final class VoiceCall: NSObject {
                 self.recorderReader.reading(
                     capturedSeconds: seconds,
                     generation: generation,
-                    requestedAtMs: requestedAtMs,
                     answeredAtMs: answeredAtMs,
                     reportAgeMs: reportAgeMs
                 )
@@ -286,10 +281,11 @@ public final class VoiceCall: NSObject {
     /// What this call's record of capture shows now, or nil when the call has ended.
     ///
     /// With `barrier`, the observer is also told a marker in the same block on the call's own
-    /// queue that reads the record. Provider events and capture news reach the observer through
-    /// this queue, so an item the call had waiting before this block ran is told before the
-    /// marker, and the observer's own path to the news (the adapter's queue, then the news queue)
-    /// carries the marker behind it in the order it was told.
+    /// queue that reads the record. Provider events reach the observer through this queue, so one
+    /// the call had waiting before this block ran is told before the marker; a change of what the
+    /// microphone is doing is told when it is made, so one made before the record was read is told
+    /// before the marker. The observer's own path to the news (the adapter's queue, then the news
+    /// queue) carries the marker behind both in the order they were told.
     public func captureProof(barrier: Bool) async -> (proof: VoiceCaptureGate.Proof, barrier: UInt64?)? {
         await withCheckedContinuation { continuation in
             readCaptureProof(barrier: barrier) { continuation.resume(returning: $0) }
@@ -479,12 +475,15 @@ public final class VoiceCall: NSObject {
     /// This device's monotonic clock, in milliseconds. The gate's deadlines are on it.
     fileprivate static func nowMs() -> UInt64 { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
 
-    /// How old a statistics report is now, from its own timestamp in UTC microseconds, or nil when it
-    /// has none. A timestamp in the future reads as no age.
-    static func ageMs(ofReportAt timestampUs: Double) -> UInt64? {
-        guard timestampUs > 0 else { return nil }
-        let nowUs = Date().timeIntervalSince1970 * 1_000_000
-        return UInt64(max(0, (nowUs - timestampUs) / 1_000))
+    /// How old a statistics report is at `nowUs`, from its own timestamp in UTC microseconds, rounded
+    /// up to a whole millisecond so that the moment it was made is never taken as later than it was.
+    /// Nil when the timestamp cannot be trusted: none, or one in the future, as after the wall clock
+    /// stepped back. A figure from such a report cannot be placed in time and counts as no figure.
+    static func ageMs(ofReportAt timestampUs: Double, nowUs: Double = Date().timeIntervalSince1970 * 1_000_000)
+        -> UInt64?
+    {
+        guard timestampUs > 0, timestampUs <= nowUs else { return nil }
+        return UInt64(((nowUs - timestampUs) / 1_000).rounded(.up))
     }
 
     /// The platform, as the control sees it.
@@ -517,17 +516,13 @@ public final class VoiceCall: NSObject {
 
         func publish(_ state: VoiceCaptureState, mutedByPerson: Bool) {
             AudioSession.shared.publish(state, for: call)
-            // Told on the call's own queue, not on the thread that changed it: the control calls
-            // this under its lock, and what an observer does must not wait for that thread. A change
-            // made by a report that is already running on that queue is told there at once, so the
-            // news of it is not queued behind a proof read after it, and its marker.
-            let call = call
+            // Told at once, on the thread that changed it and under the control's lock, so capture
+            // news is told in the order the control changed its state, and a change made before a
+            // proof was read is told before the proof's marker. A hop to the call's queue would let
+            // a change made on another thread overtake, or be overtaken by, one made on the queue.
+            // The observer queues what it is told and never calls back into the call.
             call.lockScreen.follow(mutedByPerson: mutedByPerson)
-            if DispatchQueue.getSpecific(key: call.queueMark) != nil {
-                call.observer?.voiceCall(call, captureChanged: state)
-            } else {
-                call.queue.async { call.observer?.voiceCall(call, captureChanged: state) }
-            }
+            call.observer?.voiceCall(call, captureChanged: state)
         }
 
         func ended() {
