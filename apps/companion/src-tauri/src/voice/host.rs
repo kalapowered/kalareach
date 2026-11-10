@@ -348,7 +348,14 @@ pub(super) async fn hand_over(handover: Handover) -> Exchange {
     if lost.load(Ordering::SeqCst) {
         return nothing(Cause::HostLost, Some(composed));
     }
-    let sent = tokio::time::timeout(within, host.session.send_before(&composed, not_after)).await;
+    // Written only while the call can still hand a request over, and while the proof is young:
+    // both are looked at once the connection holds the right to write.
+    let wanted = || !lost.load(Ordering::SeqCst);
+    let sent = tokio::time::timeout(
+        within,
+        host.session.send_before(&composed, not_after, &wanted),
+    )
+    .await;
     let delivered = match sent {
         Ok(Ok(Settled::Result(value))) => {
             host.session.settle(action_id).await;
@@ -359,7 +366,11 @@ pub(super) async fn hand_over(handover: Handover) -> Exchange {
             }
         }
         Ok(Ok(Settled::Receipt(_))) => Delivered::Receipt,
-        Ok(Err(ClientError::Withheld)) => Delivered::Withheld(Cause::StaleProof),
+        Ok(Err(ClientError::Withheld)) => Delivered::Withheld(if lost.load(Ordering::SeqCst) {
+            Cause::HostLost
+        } else {
+            Cause::StaleProof
+        }),
         Ok(Err(ClientError::Host(_))) => {
             host.session.settle(action_id).await;
             Delivered::Refused
