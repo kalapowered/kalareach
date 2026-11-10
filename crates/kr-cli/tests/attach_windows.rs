@@ -1885,6 +1885,10 @@ async fn the_console_an_attachment_ran_in_is_given_the_mouse_while_the_applicati
         )
         .await;
 
+    // The probe says what it reads of the console's mode in a file: the console it runs in is
+    // repainted by the command at the same time, and a line the probe printed there can be painted
+    // over before the console's own output carries it out.
+    let report = gates.path().join("probe-report");
     // At the session's size, so that the session is not resized for it and the typist goes on
     // seeing what the session writes.
     let mut probe = Probe::start_in(
@@ -1901,13 +1905,14 @@ async fn the_console_an_attachment_ran_in_is_given_the_mouse_while_the_applicati
             ),
             ("KR_PROBE_SESSION", session_id.to_string()),
             ("KR_PROBE_KR", kr().display().to_string()),
+            ("KR_PROBE_REPORT", report.display().to_string()),
             // A terminal that says what it is is sent the modes it can use, the mouse's among them.
             ("TERM", "xterm-256color".to_owned()),
         ],
         u16::try_from(dimensions.rows.get()).expect("a console's rows"),
         u16::try_from(dimensions.columns.get()).expect("a console's columns"),
     );
-    probe.waits_for("kr-probe:inside:");
+    probe_reports(&report, "kr-probe:inside:", &mut typist, &mut probe).await;
     // The command draws the session's screen in the console, so it is attached to the session once
     // the console shows what the application has written.
     probe.waits_for("kr-asker-waiting");
@@ -1915,9 +1920,9 @@ async fn the_console_an_attachment_ran_in_is_given_the_mouse_while_the_applicati
     typist
         .shown("kr-asker-asking", "the application asked for the mouse")
         .await;
-    probe.waits_for("kr-probe:asked:");
+    probe_reports(&report, "kr-probe:asked:", &mut typist, &mut probe).await;
     std::fs::write(gates.path().join("stop"), b"stop").expect("the file the application waits for");
-    probe.waits_for("kr-probe:released:");
+    probe_reports(&report, "kr-probe:released:", &mut typist, &mut probe).await;
     typist
         .shown(
             "kr-asker-stopped",
@@ -1931,9 +1936,8 @@ async fn the_console_an_attachment_ran_in_is_given_the_mouse_while_the_applicati
         String::from_utf8_lossy(&closed.stdout),
         String::from_utf8_lossy(&closed.stderr)
     );
-    probe.waits_for("kr-probe:end");
-    probe.report();
-    let shown = probe.shown();
+    let shown = probe_reports(&report, "kr-probe:end", &mut typist, &mut probe).await;
+    println!("{shown}");
     let before = probed_modes(&shown, "kr-probe:before:");
     let asked = probed_modes(&shown, "kr-probe:asked:");
     let released = probed_modes(&shown, "kr-probe:released:");
@@ -1999,16 +2003,28 @@ fn mouse_asker_in_the_session() {
 
 /// The console half of the test of the console's mouse, run in a console of its own: waits for the
 /// input mode to say what the console does with the mouse, each time the application changes what
-/// it asks, and prints the mode it reads.
+/// it asks, and says the mode it reads in the file the variable `KR_PROBE_REPORT` names.
 fn mouse_mode_probe_in_the_console() {
     use kr_cli::platform::ControllingTerminal;
 
-    let console = ControllingTerminal::open().expect("this process has a console");
-    let before = console.modes().expect("the console's modes");
-    println!("kr-probe:before:{:x}:{:x}", before.input, before.output);
     let variable = |name: &str| {
         std::env::var_os(name).unwrap_or_else(|| panic!("{name} is set for the probe"))
     };
+    let report = PathBuf::from(variable("KR_PROBE_REPORT"));
+    let say = |line: String| {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&report)
+            .expect("the probe's report");
+        writeln!(file, "{line}").expect("writes the probe's report");
+    };
+    let console = ControllingTerminal::open().expect("this process has a console");
+    let before = console.modes().expect("the console's modes");
+    say(format!(
+        "kr-probe:before:{:x}:{:x}",
+        before.input, before.output
+    ));
     let mut attach = std::process::Command::new(variable("KR_PROBE_KR"))
         .arg("attach")
         .arg(variable("KR_PROBE_SESSION"))
@@ -2040,27 +2056,60 @@ fn mouse_mode_probe_in_the_console() {
     let inside = waits_for(&mut attach, "the console taken over", &|input| {
         input & ENABLE_MOUSE_INPUT == 0
     });
-    println!("kr-probe:inside:{:x}:{:x}", inside.input, inside.output);
+    say(format!(
+        "kr-probe:inside:{:x}:{:x}",
+        inside.input, inside.output
+    ));
     let asked = waits_for(
         &mut attach,
         "the mouse reported while the application asks for it",
         &|input| input & ENABLE_MOUSE_INPUT != 0,
     );
-    println!("kr-probe:asked:{:x}:{:x}", asked.input, asked.output);
+    say(format!(
+        "kr-probe:asked:{:x}:{:x}",
+        asked.input, asked.output
+    ));
     let released = waits_for(
         &mut attach,
         "the mouse given back after the application stopped asking",
         &|input| input & ENABLE_MOUSE_INPUT == 0,
     );
-    println!(
+    say(format!(
         "kr-probe:released:{:x}:{:x}",
         released.input, released.output
-    );
+    ));
     let status = attach.wait().expect("kr attach ends");
     let after = console.modes().expect("the console's modes");
-    println!(
+    say(format!(
         "kr-probe:after:{:x}:{:x}:attach {status}",
         after.input, after.output
-    );
-    println!("kr-probe:end");
+    ));
+    say("kr-probe:end".to_owned());
+}
+
+/// Waits until the report file of the mouse mode probe holds `what`, while the typist goes on
+/// reading what the session writes, and returns what the file holds. The probe says nothing in its
+/// console, which the command repaints as the application writes.
+async fn probe_reports(
+    report: &std::path::Path,
+    what: &str,
+    typist: &mut WorkerTerminal,
+    probe: &mut Probe,
+) -> String {
+    let started = Instant::now();
+    loop {
+        let text = std::fs::read_to_string(report).unwrap_or_default();
+        if text.contains(what) {
+            return text;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the probe did not report {what:?} in {:?}: it reported {text:?}; {}; the end of what \
+             its console showed: {:?}",
+            started.elapsed(),
+            standing_of("the probe", &mut probe.child),
+            end_of(&probe.shown())
+        );
+        typist.watch(Duration::from_millis(100)).await;
+    }
 }
