@@ -464,6 +464,23 @@ enum Stage {
     },
 }
 
+impl Stage {
+    /// Whether the set can be frozen at `now`: the proof's record and its marker are in hand, the
+    /// news was read up to the marker, and the time the news may be read until has not come. A
+    /// completion that is handled at or after that time is none, whichever of it and the deadline
+    /// the owner handles first: the set is then refused as not drained.
+    fn may_freeze(&self, barriers: &VecDeque<u64>, now: Instant) -> bool {
+        matches!(
+            self,
+            Self::Draining {
+                token: Some(token),
+                record: Some(_),
+                until,
+            } if barriers.contains(token) && now < *until
+        )
+    }
+}
+
 /// A request written to the host whose answer did not come.
 struct Attempt {
     /// The connection that wrote it.
@@ -2064,17 +2081,11 @@ impl Owner {
     /// Freezes the first collection's set once its proof's record and the news up to its marker are
     /// both in hand: everything native code had told before the proof was read has been read.
     fn try_finish(&mut self) {
-        let ready = matches!(
-            self.collections.front(),
-            Some(Collection {
-                stage: Stage::Draining {
-                    token: Some(token),
-                    record: Some(_),
-                    until,
-                },
-                ..
-            }) if self.barriers.contains(token) && Instant::now() < *until
-        );
+        let now = Instant::now();
+        let ready = self
+            .collections
+            .front()
+            .is_some_and(|collection| collection.stage.may_freeze(&self.barriers, now));
         if !ready {
             return;
         }
@@ -2746,6 +2757,43 @@ mod tests {
         ] {
             assert!(!may_have_been_carried_out(state), "{state}");
         }
+    }
+
+    /// A set whose proof and marker are in hand is frozen only before the time the news may be read
+    /// until: handled at that time or after it, with the owner's deadline due as well, the
+    /// completion is none and the set is refused as not drained.
+    #[test]
+    fn a_completion_handled_at_or_after_the_deadline_freezes_nothing() {
+        let record = Record {
+            openings: 1,
+            breaks: 0,
+            capturing: true,
+        };
+        let stage = |until: Instant| Stage::Draining {
+            token: Some(7),
+            record: Some(record),
+            until,
+        };
+        let read = VecDeque::from([7_u64]);
+        let now = Instant::now();
+        let later = now + Duration::from_millis(1);
+        assert!(stage(later).may_freeze(&read, now), "before the deadline");
+        assert!(!stage(now).may_freeze(&read, now), "at the deadline");
+        assert!(!stage(now).may_freeze(&read, later), "after the deadline");
+        assert!(
+            !stage(later).may_freeze(&VecDeque::new(), now),
+            "no marker read"
+        );
+        assert!(
+            !Stage::Draining {
+                token: Some(7),
+                record: None,
+                until: later,
+            }
+            .may_freeze(&read, now),
+            "no proof"
+        );
+        assert!(!Stage::Waiting.may_freeze(&read, now), "still waiting");
     }
 
     /// What the host says of a delegation is what the row and the model are told: a request the host
