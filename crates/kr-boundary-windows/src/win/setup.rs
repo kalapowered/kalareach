@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use super::install::{self, Entry, Options, Paths};
 
-const USAGE: &str = "usage: kr-boundary-setup install|repair [--payload DIRECTORY] [--person SID]\n       kr-boundary-setup remove\n       kr-boundary-setup status";
+const USAGE: &str = "usage: kr-boundary-setup install|repair --payload DIRECTORY [--person SID]\n       kr-boundary-setup remove\n       kr-boundary-setup status";
 
 fn options(arguments: &[String]) -> Result<Options, String> {
     let mut payload = None;
@@ -36,14 +36,10 @@ fn options(arguments: &[String]) -> Result<Options, String> {
         }
         index += 1;
     }
-    let payload = match payload {
-        Some(payload) => payload,
-        None => std::env::current_exe()
-            .map_err(|error| error.to_string())?
-            .parent()
-            .ok_or("the setup program has no directory")?
-            .join("bin"),
-    };
+    // The directory with the broker and the credential helper is named by whoever starts the setup
+    // program, which knows where its release keeps them.
+    let payload =
+        payload.ok_or("--payload names the directory with the broker and the credential helper")?;
     Ok(Options { payload, person })
 }
 
