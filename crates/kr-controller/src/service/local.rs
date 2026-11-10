@@ -128,6 +128,40 @@ impl DoorReply {
     }
 }
 
+/// Serves each connection `listener` accepts on a task of its own, until accepting fails or `serve`
+/// declines a connection by answering `None`.
+///
+/// The tasks belong to this future and not to the runtime: when it ends, or is dropped because its
+/// owner stopped the daemon, every connection it is serving ends with it, and its peer sees the
+/// connection close. A task left to run alone would keep what it holds, the daemon among it, for as
+/// long as its peer stayed connected.
+pub(crate) async fn serve_each<S, T>(listener: &Listener, mut serve: S) -> Result<()>
+where
+    S: FnMut(Connection, PeerIdentity) -> Option<T>,
+    T: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut serving = tokio::task::JoinSet::new();
+    loop {
+        let (connection, peer) = listener.accept().await?;
+        // Connections that have ended are collected as the next one arrives, so the set holds no
+        // more than those being served and those that ended since the last arrival.
+        while serving.try_join_next().is_some() {}
+        let Some(task) = serve(connection, peer) else {
+            return Ok(());
+        };
+        serving.spawn(task);
+    }
+}
+
+/// Ends the daemon's network connections when the loop that serves its clients ends.
+struct StopsTheNetwork(Arc<Controller>);
+
+impl Drop for StopsTheNetwork {
+    fn drop(&mut self) {
+        self.0.end_network_connections();
+    }
+}
+
 impl Controller {
     /// Makes this daemon's local connections write unasked at the pace given, and wait for their
     /// peer for `write_bound`, from the next connection on.
@@ -519,18 +553,35 @@ impl Controller {
 
     /// Serves the client endpoint.
     ///
+    /// This loop is the daemon's serving life, and ending it is how a daemon is stopped: its owner
+    /// aborts it, as the binary and every suite do. Ending it ends every connection the daemon is
+    /// serving, local and network alike, and each peer sees its connection close. A connection
+    /// holds the daemon for as long as it lasts, and the daemon owns the network listener whose
+    /// tasks serve the network ones, so dropping the daemon's last handle while this loop runs
+    /// cannot release it; the stop is ending this loop, after which the daemon is released once
+    /// every task it ended has dropped its hold, at the next turn of the runtime, and its owner has
+    /// dropped its own.
+    ///
     /// # Errors
     ///
     /// Returns an error when accepting fails.
     pub async fn serve_clients(self: Arc<Self>, listener: Listener) -> Result<()> {
-        loop {
-            let (connection, peer) = listener.accept().await?;
+        let _stops = StopsTheNetwork(Arc::clone(&self));
+        serve_each(&listener, |connection, peer| {
             let controller = Arc::clone(&self);
-            tokio::spawn(async move {
+            Some(async move {
                 let _ = controller
                     .client(connection, peer, StreamKind::Control)
                     .await;
-            });
+            })
+        })
+        .await
+    }
+
+    /// Ends every connection the daemon's network listener is serving, and stops it accepting.
+    fn end_network_connections(&self) {
+        if let Some(network) = self.network.get() {
+            network.end_connections();
         }
     }
 

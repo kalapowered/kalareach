@@ -1463,22 +1463,19 @@ pub fn bind_chunk_endpoint(paths: &kr_ipc::paths::EnvironmentPaths) -> Result<Li
 /// The listener belongs to this task, which means the address is released when whoever spawned it
 /// stops it and not before.
 pub async fn serve_chunks(controller: Weak<Controller>, listener: Listener) {
-    loop {
-        let Ok((connection, peer)) = listener.accept().await else {
-            return;
-        };
-        let Some(controller) = controller.upgrade() else {
-            return;
-        };
-        tokio::spawn(async move {
+    // The connections belong to this loop: ending it ends the ones being served.
+    let _ = crate::service::serve_each(&listener, |connection, peer| {
+        let controller = controller.upgrade()?;
+        Some(async move {
             // The frame bound is the only difference from a control connection. Everything else —
             // the hello, the peer check, the authority registration, the action window and its
             // renewals — is the same code, which is what keeps the two from drifting.
             let _ = controller
                 .client(connection, peer, StreamKind::AttachmentChunks)
                 .await;
-        });
-    }
+        })
+    })
+    .await;
 }
 
 /// Sweeps expired transfers until the daemon goes.

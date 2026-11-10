@@ -52,15 +52,16 @@ impl Controller {
     ///
     /// Returns an error when accepting fails.
     pub async fn serve_rendezvous(self: Arc<Self>, listener: Listener) -> Result<()> {
-        loop {
-            let (connection, peer) = listener.accept().await?;
+        // The exchanges belong to this loop: ending it ends the ones under way.
+        super::serve_each(&listener, |connection, peer| {
             let controller = Arc::clone(&self);
-            tokio::spawn(async move {
+            Some(async move {
                 if let Err(error) = controller.rendezvous(connection, peer).await {
                     eprintln!("kr-controller: a worker rendezvous failed: {error}");
                 }
-            });
-        }
+            })
+        })
+        .await
     }
 
     async fn rendezvous(&self, connection: Connection, peer: PeerIdentity) -> Result<()> {

@@ -463,11 +463,62 @@ pub struct AuthorisedSession {
     pub authorised_under: AuthorityRevision,
 }
 
+/// The tasks that serve a listener's connections, which the listener ends with itself.
+///
+/// A connection's task holds the host handler, and what the handler holds, for as long as its peer
+/// keeps the connection open and answers the keepalive. Left to run by themselves they would keep a
+/// host whose listener has gone alive for as long as any device stayed connected, so the listener
+/// owns them: ending the listener ends every one, and its peer sees the connection close.
+#[derive(Debug, Default)]
+struct ConnectionTasks {
+    serving: std::sync::Mutex<Serving>,
+}
+
+#[derive(Debug, Default)]
+struct Serving {
+    tasks: tokio::task::JoinSet<()>,
+    /// Set once the listener has ended, so that a connection the accept loop took in the same
+    /// moment is not served after the rest were ended.
+    ended: bool,
+}
+
+impl ConnectionTasks {
+    /// Serves one connection on a task of its own, unless the listener has ended.
+    fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
+        let mut serving = self
+            .serving
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Connections that have already ended are collected as the next one arrives, so the set
+        // holds no more than the connections being served and those that ended since the last
+        // arrival.
+        while serving.tasks.try_join_next().is_some() {}
+        if !serving.ended {
+            serving.tasks.spawn(task);
+        }
+    }
+
+    /// Ends every task and every one that would be spawned from now on.
+    ///
+    /// Each task is cancelled at its next turn on the runtime, where it drops what it holds: a
+    /// connection that was authorised closes with the code a lost control stream gives, a
+    /// connection still in its handshake or its pairing exchange closes as it is dropped.
+    fn end(&self) {
+        let mut serving = self
+            .serving
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        serving.ended = true;
+        serving.tasks.abort_all();
+    }
+}
+
 /// A running listener.
 #[derive(Debug)]
 pub struct NetworkListener {
     endpoint: Endpoint,
     accept_loop: JoinHandle<()>,
+    connections: Arc<ConnectionTasks>,
     windows: Arc<ActionWindowIssuer>,
 }
 
@@ -490,20 +541,24 @@ impl NetworkListener {
         &self.windows
     }
 
-    /// Stops accepting and closes the endpoint.
+    /// Stops accepting, ends every connection being served and closes the endpoint.
     pub async fn shutdown(self) {
         self.accept_loop.abort();
+        self.connections.end();
         self.endpoint.close().await;
     }
 }
 
 impl Drop for NetworkListener {
     fn drop(&mut self) {
-        // A listener nobody holds accepts nothing. The accept loop owns a handle on the host, so a
-        // detached loop would keep that host, its database and its connections alive for as long
-        // as the process ran; a shutdown that can await the endpoint's close is the orderly end,
-        // and this is the one that happens either way.
+        // A listener nobody holds accepts nothing and serves nobody. The accept loop and each
+        // connection's task own a handle on the host, so detached ones would keep that host, its
+        // database and its connections alive for as long as the process ran, and a device that
+        // stayed connected would keep them for as long as it answered the keepalive. A shutdown
+        // that can await the endpoint's close is the orderly end, and this is the one that happens
+        // either way. Every task is cancelled at its next turn on the runtime, not before.
         self.accept_loop.abort();
+        self.connections.end();
     }
 }
 
@@ -554,21 +609,26 @@ pub async fn register_with_clock<H: HostHandler>(
         config.unauthorised_burst,
         config.unauthorised_refill,
     ));
-    let accept_loop = tokio::spawn(accept_loop(AcceptLoop {
-        endpoint: endpoint.clone(),
-        config: Arc::new(config),
-        identity,
-        handler,
-        clock,
-        windows: Arc::clone(&windows),
-        challenges,
-        admission,
-        rate,
-    }));
+    let connections = Arc::new(ConnectionTasks::default());
+    let accept_loop = tokio::spawn(accept_loop(
+        AcceptLoop {
+            endpoint: endpoint.clone(),
+            config: Arc::new(config),
+            identity,
+            handler,
+            clock,
+            windows: Arc::clone(&windows),
+            challenges,
+            admission,
+            rate,
+        },
+        Arc::clone(&connections),
+    ));
 
     Ok(NetworkListener {
         endpoint,
         accept_loop,
+        connections,
         windows,
     })
 }
@@ -603,7 +663,7 @@ impl<H: HostHandler> AcceptLoop<H> {
     }
 }
 
-async fn accept_loop<H: HostHandler>(loop_state: AcceptLoop<H>) {
+async fn accept_loop<H: HostHandler>(loop_state: AcceptLoop<H>, connections: Arc<ConnectionTasks>) {
     while let Some(incoming) = loop_state.endpoint.accept().await {
         // Concurrency alone does not bound a peer that connects, spends a small budget and
         // reconnects, so admissions are rate limited across the whole host as well.
@@ -632,7 +692,7 @@ async fn accept_loop<H: HostHandler>(loop_state: AcceptLoop<H>) {
             }
         };
         let state = loop_state.clone_state();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             if let Err(error) = serve_connection(state, connecting, slot).await {
                 tracing::debug!(%error, "a connection ended");
             }
