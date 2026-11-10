@@ -515,14 +515,108 @@ attachment frame and leaves the control reserve intact, so a budget that could n
 transfer is refused at registration rather than at the first attachment. The floors on the three
 frame lengths and on outstanding mutations apply to the negotiated result only.
 
+### Taking streams from a device
+
+A registered host takes the streams a device opens without code of its own. Once a connection is
+authorised, the listener starts one task that takes each new stream from the connection and gives it
+to a task of its own, which reads the stream's header. A device that sends half a header therefore
+holds one place until the header deadline passes, and the stream behind it is taken meanwhile. A
+connection has four places for streams that are waiting for their headers
+(`streams::MAX_PENDING_HEADERS`). The task waits for a free place before it takes another stream, and
+the stream waits in QUIC until it does.
+
+A stream passes these steps in order, and one that fails any of them is reset with nothing counted
+against the connection: no bulk slot, no registry entry.
+
+1. The stream did not carry QUIC early data. A data stream exists only on an authorised connection,
+   and authorisation cannot complete in 0-RTT.
+2. The whole header arrives within the header deadline.
+3. The header names this connection, and its resource fits its kind.
+4. The kind is one the host accepts. `ListenerConfig::accepted_kinds` lists them and is empty by
+   default, so a host that asks for none takes none and resets every stream after its header.
+5. A bulk stream finds a free slot among the connection's bulk streams.
+
+A stream that passes goes to the host through `AuthorisedSession::data_streams`, a queue of four
+(`listener::DATA_STREAM_QUEUE_DEPTH`). A full queue and a receiver that was dropped each reset the
+stream, so a host that never reads the queue holds nothing for a device that opens streams. What a header names beyond this, the environment, the transfer and the
+right to use it, is the host's to decide when it receives the stream. A lookup it makes for that runs
+under the admission deadline, which the session carries as `AuthorisedSession::deadlines`.
+
+`StreamRegistry::accept_pending` and `PendingStream::open` are the two steps the listener's task is
+made of, for a caller that takes streams itself. `StreamRegistry::accept` runs both for one stream
+and accepts every kind.
+
+A stream the host hands on is scheduled as its kind is: an attachment stream's frames and answers go
+out at the bulk priority, behind control and receipts, on the host's side as on the device's.
+
+`DataStream::split` gives the half that reads and the half that writes to different tasks, so one
+can wait for the next frame while the other writes the answer to the last. The halves share the
+stream's revocation handle, and the stream stays registered and keeps its bulk slot until both are
+dropped. `write_message_while` writes a frame on either as `FrameWriter::write_message_while` does:
+the write is held to the caller's check at every attempt to hand bytes to the stream, to the queue
+budget, to the write deadline and to revocation. A revocation, a deadline or a refused reservation
+ends it with an error, never with `Ok(false)`, which means only that the caller's own check refused.
+A host that takes a data stream builds a `ReceivedFrame` for each frame it reads with
+`ReceivedFrame::read`, using the connection's clock, so that a frame from either stream goes through
+the same door.
+
+### Deadlines on a data stream
+
+Each wait on a device has an end:
+
+| Deadline | What it bounds | Default |
+| --- | --- | --- |
+| `header` | Reading a stream's header | 5 s |
+| `admission` | The host's lookup that admits a stream, once it has the header | 10 s |
+| `idle` | The wait for the next frame to begin | 60 s |
+| `stall` | Each piece of a frame, once it has begun | 30 s |
+| `write` | Writing one frame to a device that has to read it | 30 s |
+
+`ListenerConfig::deadlines` supplies them. A deadline is a future that resolves when it has passed,
+and `deadlines::Deadlines` is where those futures come from. `TimerDeadlines` makes them from timers.
+`ManualDeadlines`, compiled only with the `testing` feature, makes futures that resolve when a test
+fires their kind, so a case about a deadline waits on what the host is doing and never on a clock.
+
+The stall deadline is a bound on progress. The codec reads a frame as the connection delivers it
+and starts a fresh stall deadline for each piece, so a frame of any size is never cut for taking
+long on a slow link, and a device that stops sending part way through one is. The idle deadline
+covers only the wait before the first byte of a frame.
+
+A deadline that passes ends the operation with `TransportError::Deadline`, stops the stream's
+receiving side and revokes the stream. Revocation resets each half when it is dropped, so the host
+ends a stream it cut by dropping it, and the device sees a reset, never a clean end. A registry made
+without deadlines, which is how a client opens its streams, waits for its peer as long as the peer
+takes.
+
+### Stream limits
+
+A connection lets its peer open no unidirectional stream, since the product uses none, and at most
+as many bidirectional streams as the control stream, the bulk streams the host allows, the places
+for streams that are waiting for their headers and one more: 10 with the default of four bulk
+streams. The library's default is a hundred of each kind, and a connection that is not yet
+authorised could otherwise hold them. A host that raises `SendLimits::max_bulk_streams` raises the
+bound with it.
+
+What a connection holds in memory is at most that many streams, each up to the library's per-stream
+receive window of 1.25 MB, plus one decoded frame of 1 MiB + 4 KiB for each stream whose frame is
+being read. The connection-wide receive window is not limited. If one is ever set, it has to stay
+above that bound, or a stalled data stream could take the credit the control stream needs.
+
 ### Revocation
 
 Closing or failing the control stream revokes every data stream it authorised and stops remote lease
 renewal. Revocation reaches an operation that is already waiting: a read or write on a revoked
 stream returns at once rather than waiting for a peer that will never send, and the stream is reset
 rather than finished, so the peer sees that it was taken away instead of a clean end it might read
-as completion. The connection's action windows are retired at the same moment, so none of them can
+as completion. A stream that was handed over and is held in a task of its own is revoked in the same
+way: its owner sees the revocation on the next read or write, and the stream is reset when the owner
+drops it. The connection's action windows are retired at the same moment, so none of them can
 first-admit a request through a connection that no longer exists.
+
+The loss is acted on where it is declared. When the control stream's reader ends or a write to the
+control stream fails, the streams are revoked on the task that saw it, so a host that learns of the
+loss from a failed write finds its streams already revoked when the write returns. The connection's
+cleanup revokes them again, which does nothing.
 
 The cleanup runs on every way a connection can end, including a failed keepalive write, a panic in
 the host's handler and a cancelled task, because it is a guard the connection owns rather than a
@@ -838,6 +932,13 @@ request that still waits in the connection's queue). Everything between an incom
 (the handshake, the pairing surface, the keepalive, the window renewal and the revocation that
 follows a lost control stream) happens inside the call. A host that owns a qualified platform time
 adapter uses `register_with_clock` and supplies it.
+
+A host that takes streams from devices names the kinds in `ListenerConfig::accepted_kinds` and reads
+`AuthorisedSession::data_streams` on a task the connection owns, never in the loop that answers
+control requests: that loop stays inside one request for as long as its effect takes, and a stream
+that waits there waits for a request that has nothing to do with it. The listener reads each stream's
+header and checks it against the connection and the kind before the host sees the stream (see
+"Taking streams from a device").
 
 ### How the control daemon keeps them
 
