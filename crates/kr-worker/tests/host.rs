@@ -1847,26 +1847,30 @@ async fn a_worker_that_cannot_reach_its_controller_says_why_and_ends_whatever_it
 /// KR-REQ-05.08: an idle session that has been asked to run nothing is its worker and its root
 /// shell, and no backend, Wasm instance or model is created for it. This case shows the part of
 /// the sentence that a creation shows, on a Unix host, once the session has ended and the daemon
-/// has finished with it:
+/// has let it go:
 ///
-/// - The daemon asked its supervisor to start the worker and nothing else: no plugin runtime or
-///   other separately supervised service, which is the one process that runs a Wasm instance,
-///   lazily or otherwise.
+/// - The daemon asked its supervisor to start the worker and nothing else, published no plugin
+///   host (the one process that runs a Wasm instance), and was asked for none by the worker. The
+///   daemon counts a request for the plugin host as it takes the request up, before it checks the
+///   worker, so none can be admitted after the count is read. This holds for a daemon that had no
+///   plugin host running already.
 /// - The record that the places named below write before they create a process holds the root
 ///   shell, once, and platform questions asked by the worker with the program and arguments the
 ///   platform's own list names, and nothing else. The places are the worker's root shell, backend
 ///   server, backend probe, platform question and desktop check, and the daemon's description
 ///   process, which is the one process that loads a model. The record is read when the worker has
-///   ended, the daemon has dropped the session, and the description host has taken everything
-///   posted to it, so nothing those places were asked for is still to come. Nothing in it depends
-///   on when a process ran or on its name alone.
+///   ended, the daemon has let the session go (the last step of its closure) and the description
+///   host has taken everything posted to it, so nothing those places were asked for before the
+///   session went is still to come. Nothing in it depends on when a process ran or on its name
+///   alone.
 /// - The description process is shown only for a host with no model files to load, as this host
 ///   is: with one held, whether a description is queued for an idle session is not shown here.
-/// - What the record does not hold is shown only as far as a process table read beside the
-///   session reaches (what a process leaves in its parent, its directory or its environment while
-///   it runs, over about a second of idling that no case controls): the daemon's other starts
-///   (service-manager calls, vendor bridge helpers, power and desktop queries, git, terminal
-///   windows), and every start on Windows. A Wasm instance or a model in the worker's or the
+/// - What no place writes is not shown by the record: the daemon's other starts (service-manager
+///   calls, vendor bridge helpers, power and desktop queries, git, terminal windows), which are
+///   not children of the worker, and every start on Windows. The process table read beside the
+///   session finds what the worker's own processes leave in their parent, their directory or their
+///   environment while they run, over the time the reads take (about a second on Linux, several
+///   seconds on macOS), which no case controls. A Wasm instance or a model in the worker's or the
 ///   daemon's own process is shown by what neither links (`trusted_core.rs`).
 ///
 /// On Windows the case reads the worker's children by their recorded parent, which leaves the
@@ -1887,10 +1891,9 @@ async fn an_idle_session_runs_nothing_beside_its_shell() {
     #[cfg(unix)]
     let worker = worker_of(&host, created.session.session_id);
     close(&mut client, &host, created.session.session_id).await;
-    // What the daemon starts for a session, it starts before it has let the session go, and its
-    // description host takes the posts about the session in order. So once the worker has ended,
-    // the daemon has let the session go and the description host has taken what was posted, the
-    // daemon's supervisor and the record have all there will be.
+    // Read once the worker has ended (it creates nothing more), the daemon has let the session go
+    // (it asks for nothing more for it, and a request for the plugin host that comes later is
+    // refused) and its description host has taken what was posted about the session, in order.
     #[cfg(unix)]
     until("the worker to end", || {
         (kr_ipc::identity::process_state(&worker) == kr_ipc::identity::ProcessState::Ended)
@@ -1918,6 +1921,11 @@ async fn an_idle_session_runs_nothing_beside_its_shell() {
         .expect("reads the plugin host's descriptor")
         .is_none(),
         "no plugin runtime was published for a session that asked for none"
+    );
+    assert_eq!(
+        daemon.controller.plugin_runtime_requests(),
+        0,
+        "the worker of an idle session asked the daemon for the plugin runtime"
     );
     #[cfg(unix)]
     only_the_root_shell_and_platform_questions_were_created(

@@ -3,9 +3,11 @@
 //! A test that shows nothing ran beside an idle session cannot look at the process table for it: a
 //! process that has ended, one that started after the last look, and one that gave up its parent,
 //! its directory and its environment are not in a table read at one moment. This is the other
-//! way: every place that creates a process for a session writes one line here before it creates
-//! it, so a creation that fails is a line too, and the test reads the lines once the worker has
-//! ended, when nothing more can be added.
+//! way: the places that create a process for a session (the worker's root shell, backend server,
+//! backend probe, platform questions and desktop checks, and the daemon's description process)
+//! write one line here before they create it, so a creation that fails is a line too. Other
+//! places, and every start on Windows, write none. A test reads the lines once it can say, by a
+//! condition of its own, that those places have nothing more to be asked for.
 //!
 //! The record is a file in the environment's state directory, so the daemon and every worker of
 //! the environment write to the one list. It exists only where a test made it ([`begin`]); a

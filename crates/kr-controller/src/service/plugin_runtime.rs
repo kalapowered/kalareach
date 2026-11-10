@@ -170,6 +170,10 @@ pub struct PluginRuntime {
     /// Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     window_held: std::sync::Mutex<Option<Instant>>,
+    /// How many workers' requests for the runtime this daemon has taken up, counted as the request
+    /// is taken up and before the worker is checked. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    asked: std::sync::atomic::AtomicU64,
     /// How long a failure is answered from memory.
     failure_memory: Duration,
 }
@@ -204,6 +208,8 @@ impl PluginRuntime {
             budget: std::sync::Mutex::new(StartBudget::default()),
             #[cfg(feature = "testing")]
             window_held: std::sync::Mutex::new(None),
+            #[cfg(feature = "testing")]
+            asked: std::sync::atomic::AtomicU64::new(0),
             failure_memory: FAILURE_MEMORY,
         }
     }
@@ -522,6 +528,20 @@ impl Controller {
         self.plugin_runtime.hold_window();
     }
 
+    /// How many workers' requests for the plugin runtime this daemon has taken up, whether it
+    /// admitted them or not. The runtime is started only to answer one that is admitted, and the
+    /// count is made before the worker is checked, so a count of none read after the daemon has let
+    /// a session go says that no start is owed to that session's worker: a request that comes after
+    /// is refused, and one that came before was counted. For this host's own tests. Compiled away in
+    /// every shipped build.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn plugin_runtime_requests(&self) -> u64 {
+        self.plugin_runtime
+            .asked
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Checks that a request on the rendezvous endpoint comes from the process this daemon recorded
     /// for the session it names, as the kernel names that process, and from no other.
     ///
@@ -567,6 +587,10 @@ impl Controller {
         wanted: PluginRuntimeWanted,
         peer: &PeerIdentity,
     ) -> PluginRuntimeState {
+        #[cfg(feature = "testing")]
+        self.plugin_runtime
+            .asked
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         match self.recorded_worker(wanted.session_id, peer).await {
             Err(refusal) => unavailable(refusal.reason(), NOT_RECORDED_RETRY),
             Ok(()) => self.plugin_runtime.request().await,
