@@ -43,7 +43,8 @@ use kr_client::services::AccountTokenSource;
 use kr_client::services::account::{AccountStatus, SignedInAccount};
 use kr_client::services::voice::{VOICE_SCOPE, VoiceCommand, same_origin};
 use kr_client::services::voice_control::{
-    ControlEnd, ControlEvents, ControlNews, ControlTarget, VoiceControl,
+    ControlEnd, ControlEvents, ControlNews, ControlTarget, OpeningContextSent, SendError,
+    VoiceControl,
 };
 use kr_client::session::ComposedMutation;
 use kr_protocol::ids::{ActionId, VoiceSessionId};
@@ -108,13 +109,32 @@ enum Opened {
     Given,
     /// The host did not give the selection.
     NotRead,
-    /// The voice service took `accepted` of the `total` parts of it, and not the next.
-    Sent { accepted: usize, total: usize },
+    /// The voice service confirmed `accepted` of the `total` parts of it, and the next was
+    /// refused or not sent, or, when `uncertain`, was sent and never answered: the service may or
+    /// may not have taken it.
+    Sent {
+        accepted: usize,
+        total: usize,
+        uncertain: bool,
+    },
     /// The call ended before it was all given.
     Cut,
 }
 
 impl Opened {
+    /// What giving the context came to, from what the control sent of it.
+    fn of(sent: &OpeningContextSent) -> Self {
+        let Some(stopped_by) = &sent.stopped_by else {
+            return Self::Given;
+        };
+        Self::Sent {
+            accepted: sent.accepted,
+            total: sent.total,
+            // An answer that never came is not a refusal: the part may have reached the model.
+            uncertain: matches!(stopped_by, SendError::Lost | SendError::Unanswered),
+        }
+    }
+
     /// What is logged and what a person is told when the call was not given all of the context,
     /// and nothing when it was.
     fn problem(&self) -> Option<(&'static str, String)> {
@@ -126,13 +146,27 @@ impl Opened {
                  not give it."
                     .to_owned(),
             )),
+            Self::Sent {
+                accepted,
+                total,
+                uncertain: true,
+            } => Some((
+                "the voice service did not say whether it took the next part",
+                format!(
+                    "This call may not have been given all of the host's context for its session: \
+                     the voice service confirmed {accepted} of its {total} parts, and did not say \
+                     whether it took the next."
+                ),
+            )),
             Self::Sent { accepted: 0, .. } => Some((
                 "the voice service did not take any of it",
                 "This call was not given all of the host's context for its session: the voice \
                  service did not take any of it."
                     .to_owned(),
             )),
-            Self::Sent { accepted, total } => Some((
+            Self::Sent {
+                accepted, total, ..
+            } => Some((
                 "the voice service took part of it",
                 format!(
                     "This call was given part of the host's context for its session: the voice \
@@ -1343,17 +1377,7 @@ impl Owner {
             )
             .await
             {
-                Ok(Ok(read)) => {
-                    let sent = control.send_call_start_context(&read.selection).await;
-                    if sent.stopped_by.is_none() {
-                        Opened::Given
-                    } else {
-                        Opened::Sent {
-                            accepted: sent.accepted,
-                            total: sent.total,
-                        }
-                    }
-                }
+                Ok(Ok(read)) => Opened::of(&control.send_call_start_context(&read.selection).await),
                 _ => Opened::NotRead,
             };
             let _ = internal.send(Internal::Opened(opened));
@@ -1958,6 +1982,45 @@ mod tests {
         let came = what_the_opening_came_to(&mut opening, &mut internal).await;
 
         assert!(matches!(came.as_slice(), [Opened::Cut]));
+    }
+
+    /// A service that confirmed some parts of the opening context and never said whether it took
+    /// the next has not refused it: what the person reads says how many it confirmed and that it did
+    /// not say, and says nothing of a refusal. A refusal is still one.
+    #[test]
+    fn a_part_the_service_never_answered_is_not_said_to_have_been_refused() {
+        let stopped = |stopped_by| OpeningContextSent {
+            accepted: 1,
+            total: 3,
+            stopped_by: Some(stopped_by),
+        };
+        for lost in [SendError::Lost, SendError::Unanswered] {
+            let Opened::Sent { uncertain, .. } = Opened::of(&stopped(lost)) else {
+                panic!("a part stopped it");
+            };
+            assert!(uncertain);
+        }
+        let Opened::Sent {
+            uncertain: refused, ..
+        } = Opened::of(&stopped(SendError::Busy))
+        else {
+            panic!("a part stopped it");
+        };
+        assert!(!refused, "control: a request turned away is not uncertain");
+
+        let (_, words) = Opened::of(&stopped(SendError::Lost))
+            .problem()
+            .expect("a problem");
+        assert!(words.contains("confirmed 1 of its 3 parts"), "{words}");
+        assert!(words.contains("did not say whether it took"), "{words}");
+        assert!(!words.contains("and not the next"), "{words}");
+        let (_, refused_words) = Opened::of(&stopped(SendError::Busy))
+            .problem()
+            .expect("a problem");
+        assert!(
+            refused_words.contains("and not the next"),
+            "{refused_words}"
+        );
     }
 
     /// Nobody is left waiting on an owner that is done: what its inbox holds is answered, and a
