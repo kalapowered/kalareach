@@ -553,8 +553,9 @@ pub trait Registrar: Send + Sync {
     /// the host cannot answer, so a look makes none and leaves the decision to the person.
     fn can_ask(&self, host: DeviceId, action: ActionId) -> bool;
 
-    /// Drops whatever this registrar keeps for `host`, which the person forgot or whose account
-    /// was deleted: the request it would send again holds a credential nothing will ask about.
+    /// Drops whatever this registrar keeps for `host`, which the person forgot, whose account was
+    /// deleted or whose registration the gateway replaced the credential of without the new one
+    /// being kept: the request it would send again holds a credential nothing will ask about.
     /// Nothing a task that began before this keeps for the host after it.
     fn forgotten(&self, _host: DeviceId) {}
 }
@@ -1746,6 +1747,11 @@ impl PushDesk {
     /// Keeps the registration the run is about to send, before it is sent, so that nothing that
     /// happens to the application after it can lose that it was. Fails, in words, when the run no
     /// longer holds its host or the record cannot be written: nothing is sent then.
+    ///
+    /// The gateway has issued for this registration by now, which replaced the credential every
+    /// earlier registration of the host was sent with, so one whose outcome was not known is no
+    /// longer one a look could read as the host being on: when the record cannot be written it is
+    /// not put back, and what the registrar kept to ask the host about it goes too.
     fn sending(
         &self,
         host: DeviceId,
@@ -1759,13 +1765,14 @@ impl PushDesk {
         let Some(kept) = state.record.hosts.get_mut(&host.to_string()) else {
             return Err(forgotten_host());
         };
-        let before = kept.unsettled.replace(unsettled);
+        kept.unsettled = Some(unsettled);
         if self.keep_checked(&state.record) {
             return Ok(());
         }
         if let Some(kept) = state.record.hosts.get_mut(&host.to_string()) {
-            kept.unsettled = before;
+            kept.unsettled = None;
         }
+        self.registrar.forgotten(host);
         Err(NOT_KEPT_BEFORE_SENDING.to_owned().into())
     }
 

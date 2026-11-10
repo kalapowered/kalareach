@@ -5276,6 +5276,73 @@ async fn a_look_that_could_not_ask_the_host_leaves_the_earlier_unknown_result_in
     );
 }
 
+/// KR-REQ-23.24: the gateway's issue for the registration the person asked for replaces the
+/// credential the earlier registration was sent with, so that registration is no longer one a look
+/// can read as the host being on. When the record then cannot be written before the new one is sent,
+/// the earlier one is not put back: a look reads nothing of it, and the registration is made again
+/// as a registration that was never sent.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_registration_replaced_at_the_gateway_is_not_put_back_when_its_successor_cannot_be_kept()
+{
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (_host, phone, reference, action) = a_phone_whose_registration_has_no_known_outcome().await;
+    let directory = phone._phone.data.path().join("push");
+    let issued = phone.gateway.issue_requests();
+    phone.gateway.hold_issue(true);
+    phone
+        .desk
+        .enable(&reference, Some(&action))
+        .expect("the person asks again");
+    eventually("the gateway was asked to issue again", || {
+        phone.gateway.issue_requests() == issued + 1
+    })
+    .await;
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
+        .expect("the directory is made unwritable");
+    if std::fs::write(directory.join("probe"), b"").is_ok() {
+        eprintln!(
+            "a_registration_replaced_at_the_gateway: skipped, this account writes where it was refused"
+        );
+        phone.gateway.hold_issue(false);
+        return;
+    }
+
+    // The gateway answers: the credential of the earlier registration is replaced, and the record
+    // of the registration that is about to be sent cannot be written.
+    phone.gateway.hold_issue(false);
+    phone.until_words("could not keep a record").await;
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+        .expect("the directory is made writable again");
+
+    assert_eq!(
+        unknown_of(&phone),
+        None,
+        "the earlier registration is retired"
+    );
+    assert_eq!(
+        actions_sent(&phone),
+        std::slice::from_ref(&action),
+        "nothing was sent"
+    );
+
+    // A look that could read the earlier registration as taken would turn the host on for a
+    // credential the gateway no longer takes.
+    phone.registered.lock().expect("the script").read_says = Some(RegistrationRead::Taken);
+    phone.let_time_pass();
+    look(&phone.desk).await;
+    phone.until(|states| states == [PushState::On]).await;
+    assert_eq!(
+        actions_read(&phone),
+        std::slice::from_ref(&action),
+        "the earlier registration was read only when the person asked"
+    );
+    let sent = actions_sent(&phone);
+    assert_eq!(sent.len(), 2, "registered again: {sent:?}");
+    assert_ne!(sent[1], action);
+}
+
 /// The host's refusal is no unknown outcome: it is the words, and the next look registers again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_registration_the_host_refused_is_retried_by_the_next_look_as_before() {
