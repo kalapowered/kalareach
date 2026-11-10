@@ -11,7 +11,12 @@
 //!
 //! The record is a file in the environment's state directory, so the daemon and every worker of
 //! the environment write to the one list. It exists only where a test made it ([`begin`]); a
-//! creation where there is none writes nothing. Each line holds the process that wrote it, the
+//! creation where there is none writes nothing. A worker is told where the record is when it
+//! starts ([`here`]). A daemon a test runs in its own process is found by the runtime it runs on:
+//! the helpers it shares with the worker (a platform question, a backend's probe) write to the
+//! record of the runtime that is current, from any task or blocking thread of it, so a call from
+//! a place nobody listed is recorded too. A thread the daemon makes outside its runtime is not
+//! found, and writes nothing unless it names the state directory ([`note_in`]). Each line holds the process that wrote it, the
 //! kind of creation, the program and its arguments, separated by tabs, with a tab, a line end and
 //! a backslash in a field written as a backslash and a letter.
 //!
@@ -20,7 +25,7 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 /// The name of the record, in an environment's state directory.
 pub const FILE: &str = "created-processes";
@@ -41,8 +46,14 @@ pub struct Created {
 /// The record of the process this is, once it has been told where it is.
 static HERE: OnceLock<PathBuf> = OnceLock::new();
 
+/// The record of each runtime a test made one on. A test runs one environment's daemon on the
+/// runtime it is run by, so the runtime says which environment a call of the daemon's belongs to.
+static BY_RUNTIME: Mutex<Vec<(tokio::runtime::Id, PathBuf)>> = Mutex::new(Vec::new());
+
 /// Makes the environment's record, empty, owner-only: from here on what the daemon and its
-/// workers create is written to it.
+/// workers create is written to it. Called from the runtime that runs the environment's daemon,
+/// it is also the record of every call that runtime's tasks and blocking threads make; a runtime
+/// has one record, the last one made on it.
 ///
 /// # Errors
 ///
@@ -56,7 +67,13 @@ pub fn begin(state_dir: &Path) -> std::io::Result<()> {
 
         options.mode(0o600);
     }
-    options.open(state_dir.join(FILE)).map(drop)
+    options.open(state_dir.join(FILE))?;
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        let mut made = BY_RUNTIME.lock().unwrap_or_else(PoisonError::into_inner);
+        made.retain(|(id, _)| *id != runtime.id());
+        made.push((runtime.id(), state_dir.join(FILE)));
+    }
+    Ok(())
 }
 
 /// Tells this process where its environment's record is. The first telling is the one that counts:
@@ -66,15 +83,25 @@ pub fn here(state_dir: &Path) {
 }
 
 /// Writes that this process is about to create `command`, as `what`, to the record this process
-/// was told of by [`here`]. Nothing is written where it was told of none.
+/// was told of by [`here`], or else to the record of the runtime the call is made on. Nothing is
+/// written where there is neither.
 ///
 /// # Panics
 ///
 /// Panics when a record that exists cannot be written: a creation that is not in the record
 /// would pass for one that did not happen.
 pub fn note_here(what: &str, command: &std::process::Command) {
-    if let Some(file) = HERE.get() {
-        append(file, what, command);
+    let file = HERE.get().cloned().or_else(|| {
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        BY_RUNTIME
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|(id, _)| *id == runtime.id())
+            .map(|(_, file)| file.clone())
+    });
+    if let Some(file) = file {
+        append(&file, what, command);
     }
 }
 
@@ -192,6 +219,40 @@ fn unescape(field: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A call on the runtime a record was made on, from one of its tasks or one of its blocking
+    /// threads, is written to that record; a call on a thread that has no runtime, and one on
+    /// another runtime with no record of its own, is written to none.
+    #[tokio::test]
+    async fn a_call_is_written_to_the_record_of_the_runtime_it_is_made_on() {
+        let host = crate::testing::TempHost::create();
+        let state = host.environment().state_dir().to_path_buf();
+        begin(&state).expect("makes the record");
+        let named = |name: &str| std::process::Command::new(name);
+        note_here("task", &named("on-the-runtime"));
+        tokio::task::spawn_blocking(|| {
+            note_here("blocking", &std::process::Command::new("blocking"))
+        })
+        .await
+        .expect("the blocking thread ends");
+        std::thread::spawn(|| note_here("thread", &std::process::Command::new("no-runtime")))
+            .join()
+            .expect("the thread ends");
+        std::thread::spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("another runtime")
+                .block_on(async { note_here("other", &std::process::Command::new("elsewhere")) });
+        })
+        .join()
+        .expect("the thread ends");
+        let written: Vec<String> = read(&state)
+            .expect("reads the record")
+            .into_iter()
+            .map(|created| created.program)
+            .collect();
+        assert_eq!(written, ["on-the-runtime", "blocking"]);
+    }
 
     /// A record that was made is read back as it was written, whatever a field holds, and a
     /// creation where no record was made is not written anywhere.

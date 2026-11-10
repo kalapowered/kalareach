@@ -1936,6 +1936,7 @@ async fn an_idle_session_runs_nothing_beside_its_shell() {
     only_the_root_shell_and_platform_questions_were_created(
         &host.creations(),
         u32::try_from(worker.pid.get()).expect("a process identifier"),
+        std::process::id(),
     );
 }
 
@@ -1953,34 +1954,50 @@ async fn until_the_daemon_has_let_the_session_go(host: &Host, session_id: Sessio
 }
 
 /// What a daemon and its worker created for an idle session, from the record they wrote: the root
-/// shell, once, and questions to the platform, and nothing else.
+/// shell, once, by the worker, and questions to the platform, by the worker or by the daemon (which
+/// runs in this test's process), and nothing else.
 ///
 /// A question is told from another process that has the same program by its arguments. What is
 /// written under any other name is a creation the session has no use for: a backend, a probe of
 /// one, a check of the desktop or the description process.
+///
+/// The daemon asks its platform while it makes a session, through the helper it shares with the
+/// worker, so a question of the daemon's is in the record of every run: the control that a call
+/// the daemon makes through a helper of the worker's is recorded at all. A record with none says
+/// the daemon's calls do not reach it, and the case then shows nothing of what the daemon starts
+/// through those helpers.
 #[cfg(unix)]
 fn only_the_root_shell_and_platform_questions_were_created(
     created: &[kr_ipc::testing::created::Created],
     worker: u32,
+    daemon: u32,
 ) {
+    let is_a_question = |made: &kr_ipc::testing::created::Created| {
+        made.what == "question" && is_a_platform_question(&made.program, &made.arguments)
+    };
     let strangers: Vec<_> = created
         .iter()
         .filter(|made| {
-            !(made.by == worker
-                && (made.what == "shell"
-                    || (made.what == "question"
-                        && is_a_platform_question(&made.program, &made.arguments))))
+            !((made.by == worker && made.what == "shell")
+                || ((made.by == worker || made.by == daemon) && is_a_question(made)))
         })
         .collect();
     assert!(
         strangers.is_empty(),
         "an idle session's worker and daemon created more than its root shell and the questions \
-         the worker asks its platform: {strangers:?} of {created:?}"
+         the worker and the daemon ask their platform: {strangers:?} of {created:?}"
     );
     assert_eq!(
         created.iter().filter(|made| made.what == "shell").count(),
         1,
         "the worker created the root shell once: {created:?}"
+    );
+    assert!(
+        created
+            .iter()
+            .any(|made| made.by == daemon && is_a_question(made)),
+        "no question of the daemon's is in the record, so what it starts through the helpers it \
+         shares with the worker is not seen: {created:?}"
     );
 }
 
