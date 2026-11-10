@@ -425,13 +425,38 @@ final class VoiceCallControlTests: XCTestCase {
 
         XCTAssertTrue(control.permit(voiceSessionId: "voice-session-1", closesAtEpochMs: platform.closesIn(60)))
         XCTAssertTrue(switches.deviceOn, "the device runs for a permitted call")
-        XCTAssertFalse(switches.microphoneOn, "a recorder start from before the device came on does not count")
-        XCTAssertEqual(control.displayed(), .unavailable)
+        XCTAssertTrue(switches.microphoneOn, "the track is on once the call is permitted: the recorder starts only while it is")
+        XCTAssertEqual(control.displayed(), .unavailable, "a recorder start from before the device came on does not count")
 
         control.recorder(running: true)
         XCTAssertTrue(switches.microphoneOn)
         XCTAssertEqual(control.displayed(), .capturing)
         XCTAssertEqual(platform.shown.last, .capturing)
+    }
+
+    /// KR-REQ-15.35 and KR-REQ-15.36: a phone's recorder can stop with the microphone track, because
+    /// the voice stack stops recording once nothing is being sent, and it starts again only once the
+    /// track is on. The person's unmute turns the track on again, which is what lets the recorder
+    /// start; capture comes back as a second opening and nothing is shown as capturing before the
+    /// recorder reports.
+    func testAnUnmuteTurnsTheTrackOnThoughTheRecorderStoppedWithIt() {
+        let (control, _, switches) = running()
+        XCTAssertTrue(switches.microphoneOn)
+
+        control.setMutedByPerson(true)
+        control.recorder(running: false)
+        XCTAssertFalse(switches.microphoneOn)
+        XCTAssertEqual(control.displayed(), .unavailable)
+
+        control.setMutedByPerson(false)
+        XCTAssertTrue(switches.microphoneOn, "the track is on again, so that the recorder can start")
+        XCTAssertEqual(control.displayed(), .unavailable, "nothing is shown as capturing before the recorder reports")
+
+        control.recorder(running: true)
+        XCTAssertEqual(control.displayed(), .capturing)
+        let proof = control.captureProof()
+        XCTAssertEqual(proof.openings, 2)
+        XCTAssertEqual(proof.breaks, 1)
     }
 
     /// KR-REQ-15.34: a refused audio session ends the call, and nothing reopens it.
@@ -549,7 +574,9 @@ final class VoiceCallControlTests: XCTestCase {
                                 let shown = platform.shown.last!
                                 let label = "muted=\(muted) interrupted=\(interrupted) changing=\(changing) "
                                     + "input=\(input) recording=\(recording) silenced=\(silenced)"
-                                XCTAssertEqual(shown.speechCouldHaveBeenHeard, switches.microphoneOn, label)
+                                XCTAssertEqual(shown.speechCouldHaveBeenHeard, switches.microphoneOn && recording, label)
+                                // The track follows the person and the call, never the recorder.
+                                XCTAssertEqual(switches.microphoneOn, !muted && !interrupted && !changing && input, label)
                                 XCTAssertEqual(shown, control.displayed(), label)
                                 XCTAssertTrue(switches.deviceOn, label)
                                 XCTAssertEqual(switches.playbackOn, !silenced && !interrupted, label)
@@ -1189,31 +1216,32 @@ final class VoiceRecorderReaderTests: XCTestCase {
     /// WebRTC's stop, and audio that comes back within the quiet time: the microphone opens again,
     /// and readings asked for before the stop are not taken as news, however they grow.
     func testAudioResumingAfterAStopOpensTheMicrophoneAgain() {
-        let (_, reader, platform, switches) = permitted()
+        let (control, reader, platform, switches) = permitted()
         read(reader, platform, [(1_000, 0), (1_250, 0.25)])
-        XCTAssertTrue(switches.microphoneOn)
+        XCTAssertEqual(control.displayed(), .capturing)
         let before = reader.request()!
         platform.now = 1_300
         reader.stopped()
-        XCTAssertFalse(switches.microphoneOn)
+        XCTAssertNotEqual(control.displayed(), .capturing)
+        XCTAssertTrue(switches.microphoneOn, "the track stays on: the recorder starts only while it is")
         reader.reading(capturedSeconds: 0.5, generation: before, answeredAtMs: 1_400, reportAgeMs: 50)
         reader.reading(capturedSeconds: 0.75, generation: before, answeredAtMs: 1_450, reportAgeMs: 50)
-        XCTAssertFalse(switches.microphoneOn, "readings asked for before the stop are dropped")
+        XCTAssertNotEqual(control.displayed(), .capturing, "readings asked for before the stop are dropped")
         read(reader, platform, [(1_500, 0.75), (1_750, 1.0)])
-        XCTAssertTrue(switches.microphoneOn, "audio that came back is a start")
+        XCTAssertEqual(control.displayed(), .capturing, "audio that came back is a start")
     }
 
     /// Audio that stops with no word from WebRTC: nothing after the last reading that saw audio
     /// arrive is vouched for, while the quiet time runs and after the stop is noticed.
     func testASilentStopVouchesForNothingAfterTheLastAudio() {
-        let (control, reader, platform, switches) = heardUntil1500()
+        let (control, reader, platform, _) = heardUntil1500()
         platform.now = 1_750
         reader.reading(capturedSeconds: 0.5, generation: reader.request()!, answeredAtMs: 1_750, reportAgeMs: 50)
-        XCTAssertTrue(switches.microphoneOn, "the stop is not noticed yet")
+        XCTAssertEqual(control.displayed(), .capturing, "the stop is not noticed yet")
         XCTAssertTrue(control.couldHaveHeard(atMs: 1_400))
         XCTAssertFalse(control.couldHaveHeard(atMs: 1_600), "while the quiet time runs")
         read(reader, platform, [(2_000, 0.5), (2_250, 0.5)])
-        XCTAssertFalse(switches.microphoneOn)
+        XCTAssertNotEqual(control.displayed(), .capturing)
         XCTAssertTrue(control.couldHaveHeard(atMs: 1_400))
         XCTAssertFalse(control.couldHaveHeard(atMs: 1_500))
         XCTAssertFalse(control.couldHaveHeard(atMs: 2_000))
@@ -1289,7 +1317,7 @@ final class VoiceRecorderReaderTests: XCTestCase {
 
     /// A reading while the device is off, or one from before it came on, is not taken.
     func testReadingsOutsideTheDevicesTimeAreDropped() {
-        let (_, reader, platform, switches) = permitted()
+        let (control, reader, platform, _) = permitted()
         let stale = reader.request()!
         reader.device(on: false)
         XCTAssertNil(reader.request())
@@ -1297,6 +1325,6 @@ final class VoiceRecorderReaderTests: XCTestCase {
         platform.now = 1_500
         reader.reading(capturedSeconds: 0, generation: stale, answeredAtMs: 1_500, reportAgeMs: 50)
         reader.reading(capturedSeconds: 5, generation: stale, answeredAtMs: 1_750, reportAgeMs: 50)
-        XCTAssertFalse(switches.microphoneOn)
+        XCTAssertNotEqual(control.displayed(), .capturing)
     }
 }
