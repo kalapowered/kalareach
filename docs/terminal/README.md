@@ -1555,8 +1555,9 @@ The remainder of the matrix in section 27 (Ghostty, WezTerm, VS Code's terminal,
 Windows Terminal) has not been compared with the grid here. `QUALIFIED_TERMINALS` stays a list of
 `TERM` names the client reports: a `TERM` names an entry, not a build or a configuration, and these
 records show that two builds that both report `xterm-256color` disagree with each other and with the
-grid on rules a direct attachment depends on. What the restoration asks of each terminal on the list
-is in "The terminals the host hands the stream".
+grid on rules a direct attachment depends on. A Windows console that sets no `TERM` declares
+`windows-console`, which is not on the list, so it is always shown a viewport. What the restoration
+asks of each terminal on the list is in "The terminals the host hands the stream".
 
 ### The terminals the host hands the stream
 

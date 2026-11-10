@@ -547,7 +547,8 @@ async fn a_console_that_names_no_terminal_holds_the_input_lease_and_types() {
     assert_eq!(
         attached.presentation_reason,
         Some(kr_protocol::attachment::PresentationReason::UnqualifiedTerminalProfile),
-        "the host has qualified no console to be sent the session's stream, so it is shown a viewport"
+        "the host has qualified no console to be sent the session's stream, so it is shown a \
+         viewport"
     );
     console.press(b"\x1b[13;28;13;1;16;1_");
     let seen = typist
