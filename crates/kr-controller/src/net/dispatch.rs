@@ -68,6 +68,7 @@ mod opening;
 mod output;
 mod overtaking;
 mod routes;
+mod writes;
 
 pub use acting::GRANT_WATCH;
 pub use decision::Answered;
@@ -441,6 +442,9 @@ mod a_copy_a_service_withheld;
 
 #[cfg(test)]
 mod a_copy_from_a_services_record;
+
+#[cfg(test)]
+mod a_draft_a_device_writes;
 
 #[cfg(test)]
 mod an_answer_that_cannot_be_recorded;

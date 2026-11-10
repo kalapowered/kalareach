@@ -60,7 +60,7 @@ pub(super) fn mutation_of(
 /// The first copy is stopped before its effect, once the door has found no record of the action.
 /// The second then goes through the door whole: it performs the action and records what it came
 /// to. The first is let go and its service finds that record.
-async fn two_copies(
+pub(super) async fn two_copies(
     controller: &Arc<Controller>,
     connection: &super::RemoteConnection,
     mutation: &MutationRequest,
@@ -69,7 +69,7 @@ async fn two_copies(
 }
 
 /// As [`two_copies`], the first copy stopped at the place `armed` names.
-async fn two_copies_stopped_at(
+pub(super) async fn two_copies_stopped_at(
     (arrived, go): (
         tokio::sync::oneshot::Receiver<()>,
         tokio::sync::oneshot::Sender<()>,
@@ -243,7 +243,7 @@ async fn a_refusal_copied_where_the_first_copy_is_stopped(
 /// (see [`two_copies`]). Both copies are given the result the one that performed recorded, and the
 /// door holds only the copy that read it from the record as a kept answer, which a device that may
 /// not read the record is told as unknown; the copy that performed is a fresh answer.
-async fn a_result_copied_from_the_record_is_held_as_kept(
+pub(super) async fn a_result_copied_from_the_record_is_held_as_kept(
     method: Method,
     byte: u8,
     params: impl FnOnce(&fake::Silent) -> ParamsValue,

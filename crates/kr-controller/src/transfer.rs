@@ -31,6 +31,7 @@
 //! binds the same address, and only the owner of the task that holds it can release it at a known
 //! moment. A task this module spawned and abandoned could not be.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use kr_ipc::endpoint::Listener;
@@ -46,6 +47,7 @@ use kr_transfer::service::{Action, RetainedOutcome, Subject};
 use kr_transfer::{Sweep, TransferService};
 
 use crate::error::{ControllerError, Result};
+use crate::given::Given;
 use crate::service::Controller;
 
 /// How often the daemon sweeps expired transfers.
@@ -53,6 +55,17 @@ use crate::service::Controller;
 /// Every window the sweep enforces is measured in hours or days, so an hour is frequent enough to
 /// keep the staging area honest and rare enough that it costs nothing.
 pub const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// How many open drafts one paired device may hold.
+///
+/// A draft is open until a prompt sends it to a session or its target session ends, and the
+/// service counts it against the device's own principal. The page makes one draft for each session
+/// it attaches files in, and another for each eight files, so the bound is several times what a
+/// person works in at once; at most this many drafts of up to
+/// [`kr_protocol::transfer::MAX_TRANSFER_RESULT_BYTES`] of text are held for one device. The
+/// person at this machine has no bound, and nothing a device sends changes it: the limit is a
+/// constant of this host, which an owner cannot change.
+pub const DEVICE_OPEN_DRAFTS: u64 = 64;
 
 /// What a transfer call answers with: the method's result, or the refusal the service decided.
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
@@ -128,6 +141,10 @@ pub struct TransferModule {
     /// the one it makes as it starts. Compiled only into this crate's tests.
     #[cfg(test)]
     sweeps_ended: tokio::sync::watch::Sender<u64>,
+    /// How many ends of a closed session's insertions have been written, for this crate's tests to
+    /// wait for the one a session's closure queues. Compiled only into this crate's tests.
+    #[cfg(test)]
+    session_endings: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
 /// The admission one transfer mutation arrived under, as the transfer service asks about it.
@@ -146,6 +163,9 @@ pub struct TransferAdmission {
     /// claimed and may begin nothing.
     settling: bool,
     refusal: std::sync::Mutex<Option<ProtocolError>>,
+    /// Whether the service asked this admission where it begins an effect: it did not answer from
+    /// its record, so what it returned is what this attempt performed.
+    reached: AtomicBool,
 }
 
 impl TransferAdmission {
@@ -158,6 +178,7 @@ impl TransferAdmission {
             carried,
             settling: false,
             refusal: std::sync::Mutex::new(None),
+            reached: AtomicBool::new(false),
         })
     }
 
@@ -180,6 +201,7 @@ impl TransferAdmission {
             },
             settling: true,
             refusal: std::sync::Mutex::new(None),
+            reached: AtomicBool::new(false),
         })
     }
 
@@ -208,24 +230,6 @@ impl TransferAdmission {
             .map_err(|error| error.to_protocol_error())
     }
 
-    /// What a look at the record found, with the conflict a reused identifier meets given back
-    /// only under the check a retained answer is owed: it names no answer, but it is the host's word
-    /// about another attempt's use of the identifier, which the network door shows only to a caller
-    /// that is still registered. Any other refusal of the look says nothing of another attempt and
-    /// is given back as it is.
-    fn retained_under_the_check<T>(
-        &self,
-        found: std::result::Result<T, ProtocolError>,
-    ) -> std::result::Result<T, ProtocolError> {
-        match found {
-            Err(error) if error.code == ErrorCode::IdConflict => {
-                self.check_retained()?;
-                Err(error)
-            }
-            found => found,
-        }
-    }
-
     fn refused(&self, error: &ControllerError) -> ProtocolError {
         let refusal = error.to_protocol_error();
         self.refusal
@@ -233,6 +237,12 @@ impl TransferAdmission {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get_or_insert_with(|| refusal.clone());
         refusal
+    }
+
+    /// Whether the service reached the place it begins an effect, which a service that answers an
+    /// action from its own record never does.
+    fn reached(&self) -> bool {
+        self.reached.load(Ordering::Acquire)
     }
 
     /// The first refusal the check gave, when it gave one.
@@ -246,6 +256,7 @@ impl TransferAdmission {
 
 impl kr_transfer::service::AdmissionHook for TransferAdmission {
     fn ask(&self) -> std::result::Result<(), ProtocolError> {
+        self.reached.store(true, Ordering::Release);
         if self.settling {
             return Err(self.refused(&Self::without_freshness()));
         }
@@ -253,6 +264,7 @@ impl kr_transfer::service::AdmissionHook for TransferAdmission {
     }
 
     fn run(&self, commit: &mut dyn FnMut()) -> std::result::Result<(), ProtocolError> {
+        self.reached.store(true, Ordering::Release);
         if self.settling {
             return Err(self.refused(&Self::without_freshness()));
         }
@@ -407,6 +419,8 @@ impl TransferModule {
             after_a_claim: Arc::new(crate::attention::Pause::default()),
             #[cfg(test)]
             sweeps_ended: tokio::sync::watch::channel(0).0,
+            #[cfg(test)]
+            session_endings: Arc::new(tokio::sync::watch::channel(0).0),
         })
     }
 
@@ -543,12 +557,16 @@ impl TransferModule {
     ) -> impl Future<Output = Result<()>> + Send + use<> {
         let daemon = Weak::clone(daemon);
         let service = Arc::clone(&self.service);
+        #[cfg(test)]
+        let endings = Arc::clone(&self.session_endings);
         let ended = tokio::task::spawn_blocking(move || {
             let Some(owner) = daemon.upgrade() else {
                 return Ok(0);
             };
             let ended =
                 service.end_session_insertions(&std::collections::BTreeSet::from([session_id]));
+            #[cfg(test)]
+            endings.send_modify(|written| *written += 1);
             #[cfg(test)]
             if let Some(pause) = pause {
                 pause.wait();
@@ -853,9 +871,10 @@ impl TransferModule {
         frame(request.request_id, self.read(actor_id, request).await)
     }
 
-    /// Serves one transfer mutation and returns the frame it answers with.
+    /// Serves one transfer mutation and returns the frame it answers with, and whether the service
+    /// read it from the record of an earlier submission of the action.
     ///
-    /// `admission` is as [`Self::write`].
+    /// `admission` and `draft_limit` are as [`Self::write`].
     #[must_use]
     pub(crate) async fn write_frame(
         &self,
@@ -863,11 +882,11 @@ impl TransferModule {
         mutation: &MutationRequest,
         method: Method,
         admission: Arc<TransferAdmission>,
-    ) -> ControlFrame {
-        frame(
-            mutation.request_id,
-            self.write(actor_id, mutation, method, admission).await,
-        )
+        draft_limit: Option<u64>,
+    ) -> Given<ControlFrame> {
+        self.write(actor_id, mutation, method, admission, draft_limit)
+            .await
+            .map(|answer| frame(mutation.request_id, answer))
     }
 
     /// Checks that a mutation's envelope names the subject its stored object belongs to.
@@ -980,6 +999,15 @@ impl TransferModule {
     /// it again, inside its own lock, at each place the mutation begins an effect and around each
     /// commit that makes one durable ([`TransferAdmission`]).
     ///
+    /// `draft_limit` is how many open drafts the caller may hold, which only a paired device is
+    /// held to: `None` is the person at this machine, whose drafts have no bound.
+    ///
+    /// The answer says whether the service read it from the record of an earlier submission of the
+    /// action. A copy goes back only under the authority this attempt arrived under, asked once the
+    /// copy is in hand ([`Given::checked`]): the check's refusal replaces the copy, and is given as
+    /// a copy that was withheld. The conflict of a reused identifier is no copy and is held to the
+    /// same check.
+    ///
     /// # Errors
     ///
     /// Returns the refusal the service decided, under the service's own code, or the admission's
@@ -990,9 +1018,20 @@ impl TransferModule {
         mutation: &MutationRequest,
         method: Method,
         admission: Arc<TransferAdmission>,
-    ) -> Answer<ParamsValue> {
-        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
-            .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
+        draft_limit: Option<u64>,
+    ) -> Given<Answer<ParamsValue>> {
+        let digest = match kr_protocol::digest::mutation_digest(mutation, actor_id) {
+            Ok(digest) => digest,
+            Err(error) => {
+                return Given::Fresh(Err(ProtocolError::new(
+                    ErrorCode::InvalidArgument,
+                    error.to_string(),
+                )));
+            }
+        };
+        let copied = Arc::new(AtomicBool::new(false));
+        let found = Arc::clone(&copied);
+        let standing = Arc::clone(&admission);
         let service = Arc::clone(&self.service);
         let actor = actor_id.clone();
         let params = mutation.params.clone();
@@ -1000,14 +1039,11 @@ impl TransferModule {
         let name = method.as_str();
         #[cfg(feature = "testing")]
         let after_the_outer_check = Arc::clone(&self.after_the_outer_check);
-        blocking(move || {
-            if let Some(retained) = admission
-                .retained_under_the_check(kept(&service, &actor, action_id, name, digest))?
-            {
-                // Found here, after the lookup the local door made before it considered a first
-                // admission: another attempt may have recorded it since. It goes back under the
-                // same check, asked once the answer is in hand.
-                admission.check_retained()?;
+        let answer = blocking(move || {
+            if let Some(retained) = kept(&service, &actor, action_id, name, digest)? {
+                // Found here, after the lookup the door made before it considered a first
+                // admission: another attempt may have recorded it since.
+                found.store(true, Ordering::Release);
                 return answer_of(retained);
             }
             // Nothing retained, so this is a first admission and it is about to act. The admission
@@ -1032,10 +1068,8 @@ impl TransferModule {
                 // A claim moves from open to settled and never back, so one that is not open
                 // now and was when the lookup above found it open has been settled since, and
                 // what it was settled with is the answer.
-                if let Some(retained) = admission
-                    .retained_under_the_check(kept(&service, &actor, action_id, name, digest))?
-                {
-                    admission.check_retained()?;
+                if let Some(retained) = kept(&service, &actor, action_id, name, digest)? {
+                    found.store(true, Ordering::Release);
                     return answer_of(retained);
                 }
                 return Err(admission.refused(&TransferAdmission::without_freshness()));
@@ -1087,7 +1121,7 @@ impl TransferModule {
                     ),
                     Method::DraftCreate => encode(
                         &service
-                            .draft_create(&actor, &typed(&params)?, Some(&performed), None)
+                            .draft_create(&actor, &typed(&params)?, Some(&performed), draft_limit)
                             .map_err(&told)?,
                     ),
                     Method::DraftUpdate => encode(
@@ -1161,7 +1195,7 @@ impl TransferModule {
                 Err(_) => {
                     return match service.retained_action(&actor, action_id, name, digest) {
                         Ok(Some(retained)) => {
-                            admission.check_retained()?;
+                            found.store(true, Ordering::Release);
                             answer_of(retained)
                         }
                         Ok(None) => Err(ControllerError::refusal_not_recorded()),
@@ -1174,15 +1208,29 @@ impl TransferModule {
             };
             match recorded {
                 None => outcome,
-                // Another copy recorded first. What it recorded goes back under the check any
-                // retained answer is owed, asked once the answer is in hand.
+                // The record is the answer both callers get. A method that records its own action in
+                // the transaction that performs it leaves a record of this attempt's own, which
+                // is no copy when the service reached the place it begins an effect and this
+                // attempt succeeded; any other record was written by another copy.
                 Some(retained) => {
-                    admission.check_retained()?;
+                    let performed_here = outcome.is_ok()
+                        && name != Method::UploadChunk.as_str()
+                        && admission.reached();
+                    if !performed_here {
+                        found.store(true, Ordering::Release);
+                    }
                     answer_of(retained)
                 }
             }
         })
-        .await
+        .await;
+        let copied = copied.load(Ordering::Acquire);
+        // The answer first, then the authority it is owed: a refusal replaces what the record
+        // held, and is given as a copy that was withheld.
+        let reused = answer
+            .as_ref()
+            .is_err_and(|refusal| refusal.code == ErrorCode::IdConflict);
+        Given::checked(answer, copied, reused, || standing.check_retained())
     }
 
     /// Expires everything whose retention has run out, under the archive's view of its sessions.
@@ -1211,6 +1259,21 @@ impl TransferModule {
             #[cfg(test)]
             None,
         )
+    }
+
+    /// How many ends of a closed session's insertions have been written so far.
+    #[cfg(test)]
+    pub(crate) fn session_endings_written(&self) -> u64 {
+        *self.session_endings.borrow()
+    }
+
+    /// Waits until `count` ends of a closed session's insertions have been written: the write a
+    /// session's closure queues on a task of its own, so a test that closes a session through the
+    /// daemon's own closure can wait for exactly that write.
+    #[cfg(test)]
+    pub(crate) async fn until_session_endings_written(&self, count: u64) {
+        let mut written = self.session_endings.subscribe();
+        let _ = written.wait_for(|written| *written >= count).await;
     }
 
     /// Waits until the daemon's own sweep loop has ended a sweep, which is the one it makes as it
