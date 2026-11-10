@@ -12,7 +12,13 @@ interface VoiceMediaSwitches {
     /** Whether the platform's audio device runs at all: the recorder, and the player beside it. */
     fun setAudioDevice(on: Boolean)
 
-    /** Whether what the recorder hears is carried to the provider. */
+    /**
+     * Whether the call's microphone track is on. The person's mute and the state of the call decide
+     * it ([VoiceCaptureGate.microphoneWanted]), never the recorder, which runs only while the track
+     * is on. What the recorder hands the provider is decided buffer by buffer by
+     * [VoiceCallControl.carries], which also asks the recorder and the system's report of the
+     * call's own recording.
+     */
     fun setMicrophone(on: Boolean)
 
     /** Whether the provider's voice comes out of this device. */
