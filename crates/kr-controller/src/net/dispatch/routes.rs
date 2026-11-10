@@ -18,6 +18,7 @@ use crate::given::{Given, Origin};
 use super::super::Retained;
 use super::decision::{Answered, Asked, unserved_change_set_method};
 use super::forwarding::{OwnClaim, RouteRefusal};
+use super::writes::DeviceWrite;
 use super::{RemoteConnection, failure, outcome_not_shown, outcome_unknown};
 
 /// How long a caller waits for an effect the daemon owns before it is told the outcome is unknown.
@@ -172,7 +173,7 @@ impl DeviceRead {
     }
 }
 
-/// Why this host refuses a paired device a read the method table admits for one.
+/// Why this host refuses a paired device a method the method table admits for one, by name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Unserved {
     /// `upload.status`, `download.begin` and `download.chunk`. A transfer's chunks travel on an
@@ -180,21 +181,55 @@ pub(super) enum Unserved {
     /// opens no such stream on a network connection, so no transfer with a device can complete: a
     /// download begun for one would stage a copy nothing can read.
     Transfer,
+    /// `upload.chunk`. A chunk is as large as a control frame may be, and travels on an
+    /// attachment-chunk stream, which this host accepts none of on a network connection.
+    Chunk,
+    /// `upload.begin`, `upload.finish` and `upload.cancel`. A device's upload could not carry a
+    /// chunk, so none could finish, and a begin that no chunk can follow would only hold the
+    /// device's reservation until it expired.
+    Upload,
+    /// `terminal.palette.set`, which no part of this host performs for a paired device.
+    Palette,
+    /// `input.write` sent as a mutation. Raw input is an ordered stream with no action identity,
+    /// so it travels as a request.
+    RawInput,
 }
 
 impl Unserved {
-    /// The refusal a device is given, naming the read and saying why.
-    fn refusal(self, entry: &MethodEntry) -> ProtocolError {
-        let why = match self {
-            Self::Transfer => {
-                "a transfer's chunks travel on an attachment-chunk stream, and this host opens \
-                 none on a network connection"
-            }
-        };
-        ProtocolError::new(
-            ErrorCode::UnsupportedCapability,
-            format!("{} is not served to a paired device: {why}", entry.name),
-        )
+    /// The refusal a device is given, naming the method and saying why.
+    pub(super) fn refusal(self, entry: &MethodEntry) -> ProtocolError {
+        let name = entry.name;
+        match self {
+            Self::Transfer => ProtocolError::new(
+                ErrorCode::UnsupportedCapability,
+                format!(
+                    "{name} is not served to a paired device: a transfer's chunks travel on an \
+                     attachment-chunk stream, and this host opens none on a network connection"
+                ),
+            ),
+            Self::Chunk => ProtocolError::new(
+                ErrorCode::UnsupportedCapability,
+                format!(
+                    "{name} is not served to a paired device: a transfer's chunks travel on an \
+                     attachment-chunk stream, and this host accepts none on a network connection"
+                ),
+            ),
+            Self::Upload => ProtocolError::new(
+                ErrorCode::UnsupportedCapability,
+                format!(
+                    "{name} is not served to a paired device by this host yet: a device's upload \
+                     could not carry a chunk here, so none could finish"
+                ),
+            ),
+            Self::Palette => ProtocolError::new(
+                ErrorCode::UnsupportedCapability,
+                format!("{name} is not served to a paired device by this host yet"),
+            ),
+            Self::RawInput => ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                format!("{name} is raw input: it travels as a request and carries no action"),
+            ),
+        }
     }
 }
 
@@ -644,6 +679,23 @@ impl RemoteConnection {
         };
         *asked = Some(decided.clone());
         let rights = decided.decision.decided.permitted.rights.clone();
+        // One decision per method, and it is [`DeviceWrite::of`]'s: every write the method table
+        // admits for a paired device is served below or refused by name, and a test walks the
+        // table to hold it so. Only a method the table does not admit for a device has no
+        // decision, and the registry and the effect check above have refused every such method
+        // already.
+        let Some(route) = DeviceWrite::of(entry.method) else {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                format!("{} is not a mutation this host serves", entry.name),
+            ));
+        };
+        // A method this host refuses by name is refused here: after the device's rights are asked,
+        // so a device that holds none is told so first, and before anything is recorded for it,
+        // so the refusal claims no route, looks up no record and stages nothing.
+        if let DeviceWrite::Refused(unserved) = route {
+            return Err(unserved.refusal(entry));
+        }
         // Every store that retains an action is asked in turn, in the order the local ingress asks
         // them: the daemon's own reservations first, then the project service's own record. A
         // project mutation's receipt lives with the project service, so a retry of one that lost
@@ -662,6 +714,15 @@ impl RemoteConnection {
             held = self
                 .controller
                 .project
+                .retained(&actor_id, mutation, entry.method)
+                .await;
+        }
+        // A draft write's record is the transfer service's own, written in the transaction that
+        // performed it, so a device that lost its reply is answered from it.
+        if held.is_none() && route == DeviceWrite::Transfer {
+            held = self
+                .controller
+                .transfer
                 .retained(&actor_id, mutation, entry.method)
                 .await;
         }
@@ -810,11 +871,11 @@ impl RemoteConnection {
         // submission of the action, which the device is then told as it is told any such answer,
         // or read that record and withheld it, which the device is told it is not shown.
         let mut origin = Origin::Fresh;
-        let answer = match entry.method {
+        let answer = match route {
             // The daemon's own effects. They run on a task that outlives this connection, because
             // dropping a future is a cancellation and a durable commit cannot be left half done
             // because a peer went away.
-            Method::SessionCreate => {
+            DeviceWrite::SessionCreate => {
                 // A create claims the same action identity every other mutation claims, with this
                 // host named as the owner of what it produces. Without it, an identifier spent on
                 // a create would be free for a mutation on a worker, and section 9 makes
@@ -858,7 +919,7 @@ impl RemoteConnection {
             // that stopped answering a close would otherwise hold that connection. Opening the
             // link is also what asks the worker for the acknowledgement a dispatch lease needs,
             // which a device closing a session it never attached to has not caused yet.
-            Method::SessionClose => {
+            DeviceWrite::SessionClose => {
                 // A close opens a link of its own to the worker, so the route is refused here,
                 // before it claims an action, on a connection that serves the host alone.
                 self.check_worker_route()?;
@@ -961,7 +1022,7 @@ impl RemoteConnection {
             // effect: no session owns them, so they go to the project service rather than to a
             // worker proxy, and the admission travels with them so the service can ask about it
             // again after the waiting it does of its own.
-            _ if crate::project::ProjectModule::serves(entry.method) => {
+            DeviceWrite::Project => {
                 self.check_project_authority(entry.method, mutation)?;
                 // A project mutation claims its action identity the way every other mutation
                 // does, with this host named as the owner of what it produces. Storage that
@@ -1009,7 +1070,7 @@ impl RemoteConnection {
             // connection's admission, so a grant withdrawn while it waits leaves nothing behind.
             // What a device may ask for is a version inside its grant, and what it is told is the
             // materialisation without the host path of its directory.
-            Method::ChangesetMaterialize => {
+            DeviceWrite::Materialisation => {
                 self.check_materialisation(mutation).await?;
                 if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
                     return Err(refusal.into_error());
@@ -1046,7 +1107,7 @@ impl RemoteConnection {
             // told the caller is bounded by that grant, so nothing the request carries can make
             // it the owner. This replaces the refusal these three were given whatever the host
             // and the grant.
-            Method::ChangesetCapture | Method::DiffApply | Method::DiffRevert => {
+            DeviceWrite::WorkingTree => {
                 self.check_working_tree_request(
                     entry.method,
                     &mutation.params,
@@ -1088,13 +1149,13 @@ impl RemoteConnection {
             }
             // A change-set mutation the registry lists without a route above is refused rather
             // than handed to a worker, which does not own it.
-            _ if crate::changeset::ChangeSetModule::serves(entry.method) => {
+            DeviceWrite::ChangeSet => {
                 return Err(unserved_change_set_method(entry.method));
             }
             // The ten catalogue and plugin mutations. They are the daemon's own effect: a catalogue
             // and an installed package belong to the environment, so no worker owns them and the
             // module performs them under its own lock.
-            _ if crate::catalogue::CatalogueModule::serves(entry.method) => {
+            DeviceWrite::Catalogue => {
                 // The route is claimed before the effect, the way a project mutation claims its
                 // own. It is this host's `(verified actor, action)` uniqueness check, and it is
                 // what a device that lost its connection has left to say the daemon owns the
@@ -1151,7 +1212,7 @@ impl RemoteConnection {
             // The review and attention group's mutations are this host's own store's actions, like
             // a project's: no worker owns them, and the admission travels with them into the
             // store's transaction.
-            _ if crate::attention::AttentionModule::serves(entry.method) => {
+            DeviceWrite::Attention => {
                 if let Err(error) =
                     crate::attention::AttentionModule::check_subject(entry.method, mutation)
                 {
@@ -1188,7 +1249,7 @@ impl RemoteConnection {
             // session belongs to this host rather than to one terminal session, and the
             // coordinator decides each one against the voice grant and this device's ordinary
             // grant, intersected at the moment of the decision.
-            _ if crate::voice::VoiceModule::serves(entry.method) => {
+            DeviceWrite::Voice => {
                 // The deadline this mutation was admitted under, checked last: everything between
                 // the envelope check and here can wait, and an action whose deadline passed while
                 // it queued does not go on to write. A retry of a completed voice change is
@@ -1244,7 +1305,7 @@ impl RemoteConnection {
             // daemon's store, and the effect runs on a task that outlives this connection and keeps
             // what it came to under the claim before it is answered, so a retry is answered from
             // that record.
-            Method::SessionRename => {
+            DeviceWrite::Rename => {
                 if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
                     return Err(refusal.into_error());
                 }
@@ -1334,7 +1395,7 @@ impl RemoteConnection {
             // route names this host as the owner of the receipt, and the redemption is claimed,
             // committed with its answer and answered on a task that outlives this connection, so
             // a retry is answered from that record.
-            Method::GrantRedeem => {
+            DeviceWrite::Redemption => {
                 if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
                     return Err(refusal.into_error());
                 }
@@ -1371,7 +1432,7 @@ impl RemoteConnection {
             // for the device that sends them and decided under a share: a pairing grant is not a
             // grant to delegate from, and the grant a delegation is made from is the one it acts
             // under.
-            Method::GrantCreate | Method::GrantRevoke => {
+            DeviceWrite::Delegation => {
                 if decided.acting.held != super::acting::Held::Share {
                     return Err(ProtocolError::new(
                         ErrorCode::PermissionDenied,
@@ -1446,7 +1507,7 @@ impl RemoteConnection {
             // another environment. The route names this host as the owner of the receipt, and the
             // step is claimed, written and its receipt kept on a task that outlives this
             // connection, so a retry is answered from that record.
-            Method::MachineJoin | Method::MachineMerge | Method::MachineSplit => {
+            DeviceWrite::MachineGroup => {
                 if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
                     return Err(refusal.into_error());
                 }
@@ -1478,7 +1539,7 @@ impl RemoteConnection {
             // the fence it may owe published on a task that outlives this connection, so a
             // connection that ends does not cut a presentation between its policy write and its
             // fence; the device that was not answered presents the same lease again.
-            Method::MembershipPresent => {
+            DeviceWrite::Membership => {
                 if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
                     return Err(refusal.into_error());
                 }
@@ -1506,7 +1567,7 @@ impl RemoteConnection {
                 });
                 settled(request_id, self.controller.within_effect_wait(effect).await)
             }
-            Method::DevicePreviewKeyUpdate => {
+            DeviceWrite::PreviewKey => {
                 if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
                     return Err(refusal.into_error());
                 }
@@ -1559,7 +1620,7 @@ impl RemoteConnection {
             // registration is answered before the call is admitted, on a later connection and
             // after its window has closed. What reaches this arm is a first request or a copy of
             // one still running, which the claim in `push_register_action` answers.
-            Method::DevicePushRegister => {
+            DeviceWrite::PushRegistration => {
                 if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
                     return Err(refusal.into_error());
                 }
@@ -1589,7 +1650,7 @@ impl RemoteConnection {
             // connection authenticated as. The admission travels with the declaration, so the
             // transaction that writes the keys asks about it again and records the outcome beside
             // them, which is what a retry of this action is answered from.
-            Method::DeviceKeysComplete => {
+            DeviceWrite::KeysComplete => {
                 if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
                     return Err(refusal.into_error());
                 }
@@ -1612,7 +1673,7 @@ impl RemoteConnection {
             // the workflow journal's own transaction, and the device reaches only the workflows
             // that act under the grant it holds, so a workflow cannot give it rights its grant
             // does not carry.
-            _ if crate::automation::AutomationModule::serves(entry.method) => {
+            DeviceWrite::Automation => {
                 if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
                     return Err(refusal.into_error());
                 }
@@ -1647,7 +1708,7 @@ impl RemoteConnection {
             // The pairing and owner-confirmation mutations. An owner device completes the
             // confirmations it signed; `pair.confirm` and `pair.cancel` are the issuing owner's,
             // and a device never issued an invitation, so the pairing service refuses them.
-            _ if super::super::methods::serves(entry.method) => {
+            DeviceWrite::Pairing => {
                 // A pairing mutation claims its action identity the way every other mutation does,
                 // with this host named as the owner of what it produces.
                 if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
@@ -1697,8 +1758,23 @@ impl RemoteConnection {
                         .map(|answer| framed(mutation.request_id, answer)),
                 )
             }
-            // Everything else belongs to the worker that owns the session.
-            _ => {
+            // A draft write is the transfer service's, performed under this device's own principal.
+            DeviceWrite::Transfer => self
+                .transfer_write(
+                    mutation,
+                    entry.method,
+                    actor_id,
+                    validated,
+                    &accepted,
+                    own_claim,
+                )
+                .await
+                .map(|given| noting(&mut origin, given))?,
+            // A method this host refuses by name was refused above, before anything was recorded.
+            DeviceWrite::Refused(unserved) => return Err(unserved.refusal(entry)),
+            // Everything else the worker's own table lists belongs to the worker that owns the
+            // session.
+            DeviceWrite::Worker => {
                 return self
                     .proxied_mutation(
                         mutation,

@@ -796,6 +796,129 @@ async fn every_read_the_method_table_admits_for_a_device_is_served_or_refused_by
     world.serving.abort();
 }
 
+/// KR-REQ-23.41: every write the method table admits for a paired device is served by the daemon,
+/// forwarded to a worker that lists it, or refused by name with the reason. None reaches the
+/// refusal the routing keeps for a method the table does not admit for a device, which names no
+/// reason, and none reaches a worker that does not list it.
+///
+/// The routing's decision is walked over the whole table: every write a paired device may make has
+/// one, and no other method does; the worker is its decision only where the worker's own table
+/// lists the method. Then each write is sent through a paired device's own connection, naming the
+/// session this host's worker serves, by a device whose grant admits every one of them, so what
+/// answers is the routing rather than the grant. The worker records every frame the daemon
+/// forwards, and none names a method its table does not list; a write refused by name answers
+/// with its reason, and its method is not among the recorded frames.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_write_the_method_table_admits_for_a_device_is_served_or_refused_by_name() {
+    use std::sync::Arc;
+
+    use kr_protocol::actor::ActorIngress;
+    use kr_protocol::authority::EffectClass;
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::error::ErrorCode;
+
+    use super::writes::DeviceWrite;
+    use crate::service::a_close_a_worker_never_answers as fake;
+
+    let mut undecided = Vec::new();
+    let mut unlisted = Vec::new();
+    for method in Method::ALL {
+        let entry = method.entry();
+        let admitted = entry.effect == EffectClass::Write
+            && entry.ingress.contains(&ActorIngress::PairedDevice);
+        let route = DeviceWrite::of(*method);
+        if route.is_some() != admitted {
+            undecided.push((entry.name, admitted));
+        }
+        if route == Some(DeviceWrite::Worker) && !kr_protocol::worker_surface::serves(*method) {
+            unlisted.push(entry.name);
+        }
+    }
+    assert!(
+        undecided.is_empty(),
+        "methods whose routing decision does not match whether the method table admits them \
+         as a paired device's mutation, with that admission: {undecided:?}"
+    );
+    assert!(
+        unlisted.is_empty(),
+        "methods routed to a worker whose table does not list them: {unlisted:?}"
+    );
+
+    let recorded: fake::Recorded = Arc::default();
+    let world = fake::fake_worker(Some(Arc::clone(&recorded))).await;
+    let controller = &world.controller;
+    fake::acknowledged(controller, world.session_id);
+    let device = paired_with_every_right(controller, 9);
+    let connection = super::RemoteConnection::for_test(controller, device);
+
+    let mut writes = 0_u64;
+    let mut unrouted = Vec::new();
+    let mut unnamed = Vec::new();
+    for method in Method::ALL {
+        let entry = method.entry();
+        let Some(route) = DeviceWrite::of(*method) else {
+            continue;
+        };
+        writes += 1;
+        let answer = connection
+            .mutate(&device_mutation(
+                &world,
+                &connection,
+                *method,
+                writes,
+                ParamsValue::empty(),
+            ))
+            .await;
+        let ControlFrame::Response(kr_protocol::envelope::Response {
+            outcome: kr_protocol::envelope::Outcome::Error(error),
+            ..
+        }) = &answer
+        else {
+            continue;
+        };
+        if error.code == ErrorCode::InvalidArgument
+            && error.message == format!("{} is not a mutation this host serves", entry.name)
+        {
+            unrouted.push(entry.name);
+        }
+        if matches!(route, DeviceWrite::Refused(_))
+            && !(error.message.starts_with(entry.name)
+                && matches!(
+                    error.code,
+                    ErrorCode::UnsupportedCapability | ErrorCode::InvalidArgument
+                ))
+        {
+            unnamed.push((entry.name, error.code));
+        }
+    }
+    assert!(writes > 0, "the method table admits writes for a device");
+    assert!(
+        unrouted.is_empty(),
+        "writes the method table admits for a paired device that reach the refusal kept for \
+         methods it does not admit: {unrouted:?}"
+    );
+    assert!(
+        unnamed.is_empty(),
+        "writes this host refuses by name that are not refused with their name: {unnamed:?}"
+    );
+    let reached: Vec<&'static str> = recorded
+        .lock()
+        .expect("the worker's record")
+        .iter()
+        .filter_map(|frame| match frame {
+            ControlFrame::Mutation(mutation) => mutation.method.method(),
+            _ => None,
+        })
+        .filter(|method| !kr_protocol::worker_surface::serves(*method))
+        .map(|method| method.as_str())
+        .collect();
+    assert!(
+        reached.is_empty(),
+        "writes forwarded to a worker whose table does not list them: {reached:?}"
+    );
+    world.serving.abort();
+}
+
 /// What a test's worker answers a forwarded read with, by the request; `None` refuses it.
 type Answers =
     std::sync::Arc<dyn Fn(&kr_protocol::envelope::Request) -> Option<ParamsValue> + Send + Sync>;
@@ -2985,7 +3108,7 @@ fn a_published_attachment(
 }
 
 /// Publishes one small attachment for `actor`, begun for `session_id` where there is one.
-fn a_published_attachment_for(
+pub(super) fn a_published_attachment_for(
     controller: &crate::service::Controller,
     environment_id: kr_protocol::ids::EnvironmentId,
     actor: &kr_protocol::ids::ActorId,
@@ -3089,7 +3212,7 @@ fn bound_to_a_draft(
 }
 
 /// A new draft that names no session and holds nothing.
-fn an_empty_draft(
+pub(super) fn an_empty_draft(
     controller: &crate::service::Controller,
     environment_id: kr_protocol::ids::EnvironmentId,
     actor: &kr_protocol::ids::ActorId,

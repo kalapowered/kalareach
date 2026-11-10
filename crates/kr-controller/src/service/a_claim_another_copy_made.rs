@@ -228,8 +228,10 @@ async fn a_transfers_conflict_is_not_told_while_a_fence_is_owed() {
                 request,
                 Method::DraftCreate,
                 crate::transfer::TransferAdmission::new(Arc::clone(&controller), admission),
+                None,
             )
             .await
+            .into_answer()
     };
     write(&mutation).await.expect("the first attempt records");
 
