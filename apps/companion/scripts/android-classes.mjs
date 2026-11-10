@@ -185,17 +185,31 @@ function members(handle, size) {
   throw new Error('not a zip archive: no end-of-central-directory record')
 }
 
-/** One member's bytes. */
-function contents(handle, member) {
+/**
+ * One member's bytes, in full or not at all: a member that the archive ends inside, or whose bytes
+ * are not the size its directory gives, is refused, since what was read would be a part of it.
+ */
+function contents(handle, member, archiveSize) {
   const header = readAt(handle, member.headerAt, 30)
   if (header.length !== 30 || header.readUInt32LE(0) !== 0x04034b50) {
     throw new Error(`${member.name}: no local header`)
   }
   const dataAt = member.headerAt + 30 + header.readUInt16LE(26) + header.readUInt16LE(28)
+  // Before anything is allocated for it: a directory can claim a member of four gigabytes.
+  if (dataAt + member.compressedSize > archiveSize) {
+    throw new Error(`${member.name}: the archive ends inside this member`)
+  }
   const raw = readAt(handle, dataAt, member.compressedSize)
-  if (member.method === 0) return raw
-  if (member.method === 8) return inflateRawSync(raw)
-  throw new Error(`${member.name}: compression method ${member.method} is not read here`)
+  let bytes
+  if (member.method === 0) bytes = raw
+  else if (member.method === 8) bytes = inflateRawSync(raw)
+  else throw new Error(`${member.name}: compression method ${member.method} is not read here`)
+  if (bytes.length !== member.uncompressedSize) {
+    throw new Error(
+      `${member.name}: the member is ${bytes.length} bytes, and its directory gives ${member.uncompressedSize}`
+    )
+  }
+  return bytes
 }
 
 // -- the dex ----------------------------------------------------------------------------------
@@ -434,7 +448,8 @@ export function definedNatives(dex) {
 export function withArchive(path, visit) {
   const handle = openSync(path, 'r')
   try {
-    return visit(members(handle, statSync(path).size), (member) => contents(handle, member))
+    const size = statSync(path).size
+    return visit(members(handle, size), (member) => contents(handle, member, size))
   } finally {
     closeSync(handle)
   }
@@ -505,7 +520,16 @@ export function nativeNames(path) {
     if (dexes.length === 0) throw new Error('the artefact carries no application dex file')
     const declared = new Map()
     for (const member of dexes) {
-      for (const [name, natives] of definedNatives(read(member))) {
+      // A member that cannot be read says so by name; a file that reads and is not a dex file this
+      // reads is named here.
+      const bytes = read(member)
+      let found
+      try {
+        found = definedNatives(bytes)
+      } catch (failure) {
+        throw new Error(`${member.name}: ${failure.message}`, { cause: failure })
+      }
+      for (const [name, natives] of found) {
         declared.set(name, [...(declared.get(name) ?? []), ...natives])
       }
     }
@@ -523,8 +547,8 @@ export function nativeNames(path) {
     for (const member of files.sort((a, b) => (a.name < b.name ? -1 : 1))) {
       let classes
       let natives
+      const bytes = read(member)
       try {
-        const bytes = read(member)
         classes = libraryClassNames(bytes)
         natives = libraryNatives(bytes)
       } catch (failure) {

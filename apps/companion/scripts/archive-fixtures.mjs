@@ -3,6 +3,7 @@
 // shared library that carries its dynamic symbols and whatever bytes a case puts in it, and a
 // stored zip. They are not archives any runtime would accept.
 import { Buffer } from 'node:buffer'
+import { deflateRawSync } from 'node:zlib'
 
 /** A uleb128 of a small value. */
 export function uleb(value) {
@@ -303,29 +304,39 @@ export function elf({
   return Buffer.concat([header, body, dynstr.bytes, dynsym, shstr.bytes, sections])
 }
 
-/** A zip of `members` ({name, bytes}), stored, with an optional archive comment. */
+/**
+ * A zip of `members` ({name, bytes}), stored, with an optional archive comment.
+ *
+ * A member with `deflate: true` is compressed. `claimCompressed` and `claimUncompressed` are the
+ * sizes the central directory gives for it when they are not the true ones, which is how a member
+ * that the archive cannot give in full is made.
+ */
 export function zip(members, comment = Buffer.alloc(0)) {
   const pieces = []
   const directory = []
   let at = 0
   for (const member of members) {
     const name = Buffer.from(member.name, 'utf8')
+    const data = member.deflate ? deflateRawSync(member.bytes) : member.bytes
+    const method = member.deflate ? 8 : 0
     const local = Buffer.alloc(30)
     local.writeUInt32LE(0x04034b50, 0)
     local.writeUInt16LE(20, 4)
-    local.writeUInt32LE(member.bytes.length, 18)
+    local.writeUInt16LE(method, 8)
+    local.writeUInt32LE(data.length, 18)
     local.writeUInt32LE(member.bytes.length, 22)
     local.writeUInt16LE(name.length, 26)
-    pieces.push(local, name, member.bytes)
+    pieces.push(local, name, data)
     const entry = Buffer.alloc(46)
     entry.writeUInt32LE(0x02014b50, 0)
     entry.writeUInt16LE(20, 6)
-    entry.writeUInt32LE(member.bytes.length, 20)
-    entry.writeUInt32LE(member.bytes.length, 24)
+    entry.writeUInt16LE(method, 10)
+    entry.writeUInt32LE(member.claimCompressed ?? data.length, 20)
+    entry.writeUInt32LE(member.claimUncompressed ?? member.bytes.length, 24)
     entry.writeUInt16LE(name.length, 28)
     entry.writeUInt32LE(at, 42)
     directory.push(entry, name)
-    at += 30 + name.length + member.bytes.length
+    at += 30 + name.length + data.length
   }
   const body = Buffer.concat(pieces)
   const central = Buffer.concat(directory)

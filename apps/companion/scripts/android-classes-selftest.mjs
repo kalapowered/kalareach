@@ -1051,6 +1051,49 @@ held(
   String(lostLibrary.said.includes('library libother.so (in arm64-v8a, not in x86_64)'))
 )
 
+// -- a member the archive cannot give in full -----------------------------------------------------
+// A member whose bytes the archive does not hold, or whose size is not the one its directory gives,
+// is not the member it names: reading what is there and going on would check a part of it.
+
+const FULL = mediaLibrary().length
+const PAST = 10_000_000
+expectNames(
+  'a stored library that the archive ends inside is refused, not read as the bytes that are there',
+  'members-cut-library.apk',
+  [
+    application(),
+    { ...library(), claimCompressed: FULL + PAST, claimUncompressed: FULL + PAST }
+  ],
+  `refused: ${MEDIA}: the archive ends inside this member`
+)
+expect(
+  'a stored dex that the archive ends inside is refused',
+  'members-cut-dex.apk',
+  zip([
+    filler,
+    { name: 'classes.dex', bytes: code, claimCompressed: code.length + PAST, claimUncompressed: code.length + PAST }
+  ]),
+  'refused: classes.dex: the archive ends inside this member'
+)
+expectNames(
+  'a stored member whose directory gives another size than the bytes it holds is refused',
+  'members-misdeclared-stored.apk',
+  [application(), { ...library(), claimUncompressed: FULL + 1 }],
+  `refused: ${MEDIA}: the member is ${FULL} bytes, and its directory gives ${FULL + 1}`
+)
+expectNames(
+  'a compressed member that inflates to another size than its directory gives is refused',
+  'members-misdeclared-deflated.apk',
+  [application(), { ...library(), deflate: true, claimUncompressed: FULL + 1 }],
+  `refused: ${MEDIA}: the member is ${FULL} bytes, and its directory gives ${FULL + 1}`
+)
+expectNames(
+  'a compressed member whose directory is right is read',
+  'members-deflated.apk',
+  [{ ...application(), deflate: true }, { ...library(), deflate: true }],
+  'nothing'
+)
+
 // -- a dex file that cannot be read in full ------------------------------------------------------
 // An offset, an index or a count that runs off the end of the file reads as zeros, and a class
 // whose data reads as zeros declares no natives: the reader has to refuse the file by name.
