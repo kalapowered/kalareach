@@ -634,8 +634,10 @@ service, for backup storage and nothing else. `kr account sign-in --storage` sta
 (`account.storage_sign_in`), `kr account sign-out --storage` ends it (`account.storage_sign_out`),
 and `kr account show` also reads where it stands (`account.storage_status`). The three are served
 on the local socket alone and ask for host management, as the managed account's are. Each acts on
-the storage account and never on the managed one. A host whose `storage.origin` is unset or names
-the managed account service refuses all three with `HOST_NOT_CONFIGURED`, naming `storage.origin`.
+the storage account and never on the managed one. Both accounts sign in through the one loopback
+address, so a sign-in of either ends a sign-in of the other that still waits for the browser, and
+never a grant that is held. A host whose `storage.origin` is unset or names the managed account
+service refuses all three with `HOST_NOT_CONFIGURED`, naming `storage.origin`.
 
 The browser signs in at the managed account service, and the code it brings back is redeemable there
 and nowhere else, so the exchange, every refresh and every revocation go to that one service. The

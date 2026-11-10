@@ -217,7 +217,13 @@ async fn the_storage_sign_in_names_its_service_before_the_browser_opens_and_sign
     )
     .await;
 
-    let output = host.kr(&["account", "sign-in", "--storage"]);
+    // The browser's address goes to this command's own standard output here, so that the order of
+    // what the command says and what it does is the order of the lines it prints.
+    let output = run_kr(
+        &host.temp,
+        &["account", "sign-in", "--storage"],
+        Some(Path::new("/dev/fd/1")),
+    );
     assert_eq!(output.status.code(), Some(0), "{}", said(&output));
     let printed = String::from_utf8_lossy(&output.stdout).into_owned();
     let lines: Vec<&str> = printed.lines().collect();
@@ -227,21 +233,30 @@ async fn the_storage_sign_in_names_its_service_before_the_browser_opens_and_sign
         .unwrap_or_else(|| {
             panic!("a line names the service and says it is not the managed one: {printed}")
         });
-    let address_line = lines
+    // A line that is only an address is the browser's.
+    let browser_lines: Vec<usize> = lines
         .iter()
-        .position(|line| line.contains("/auth/oauth2/authorize"))
-        .unwrap_or_else(|| panic!("a line gives the address to open: {printed}"));
-    assert!(
-        origin_line < address_line,
-        "the service is named before the address is given: {printed}"
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("http") && line.contains("/auth/oauth2/authorize"))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        browser_lines.len(),
+        1,
+        "the browser was given one address: {printed}"
     );
-    let opened = host.opened();
-    assert_eq!(opened.len(), 1, "one address was opened: {opened:?}");
-    let url = url::Url::parse(&opened[0]).expect("an address");
+    assert!(
+        origin_line < browser_lines[0],
+        "the service is named before the browser is opened: {printed}"
+    );
+    let opened = lines[browser_lines[0]];
+    let url = url::Url::parse(opened).expect("an address");
     assert_eq!(url.origin().ascii_serialization(), storage.origin());
     assert!(
-        printed.contains(&opened[0]),
-        "the address opened is the address printed"
+        lines
+            .iter()
+            .any(|line| line.contains("Open this address") && line.contains(opened)),
+        "the address opened is the address printed: {printed}"
     );
     let asked: Vec<String> = url
         .query_pairs()
@@ -273,7 +288,38 @@ async fn the_storage_sign_in_names_its_service_before_the_browser_opens_and_sign
     let (_, shown) = host.json(&["account", "show"]);
     assert_eq!(shown["storage_account"]["state"], "signed_out", "{shown}");
     assert_eq!(shown["state"], "signed_out", "{shown}");
-    assert_eq!(host.opened().len(), 1, "no second address was opened");
+
+    // As JSON, the one document on standard output names the service only after the browser has
+    // opened, so the notice that it is not the managed service goes on standard error first. The
+    // browser's address is written there too, for the order to show.
+    let output = run_kr(
+        &host.temp,
+        &["--json", "account", "sign-in", "--storage"],
+        Some(Path::new("/dev/fd/2")),
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", said(&output));
+    let errors = String::from_utf8_lossy(&output.stderr).into_owned();
+    let lines: Vec<&str> = errors.lines().collect();
+    let notice = lines
+        .iter()
+        .position(|line| line.contains("not the managed"))
+        .unwrap_or_else(|| panic!("a line says it is not the managed service: {errors}"));
+    let browser = lines
+        .iter()
+        .position(|line| line.starts_with("http") && line.contains("/auth/oauth2/authorize"))
+        .unwrap_or_else(|| panic!("the browser was given an address: {errors}"));
+    assert!(
+        notice < browser,
+        "the notice comes before the browser is opened: {errors}"
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("one document");
+    assert_eq!(document["service"], storage.origin(), "{document}");
+
+    assert!(
+        host.opened().is_empty(),
+        "no other command opened an address: {:?}",
+        host.opened()
+    );
 }
 
 /// KR-REQ-20.19: a host with no storage service of its own refuses `--storage` by name, whether
@@ -342,12 +388,13 @@ async fn a_host_with_one_account_shows_it_in_the_document_it_always_had() {
     }
 }
 
-/// A scripted daemon on `temp`'s endpoint that answers `answer` for the one method it lists and
-/// refuses every other method as a daemon refuses a method it does not list:
-/// `PERMISSION_DENIED`.
+/// A scripted daemon on `temp`'s endpoint that answers the methods it lists and refuses every other
+/// method as a daemon refuses a method it does not list: `PERMISSION_DENIED`. A connection is
+/// answered `account.status` that many times, and refused it after: a membership that lapsed.
 fn scripted_daemon(
     temp: &kr_ipc::testing::TempHost,
     listed: &'static [&'static str],
+    status_answers: usize,
 ) -> tokio::task::JoinHandle<()> {
     let endpoint = temp
         .environment()
@@ -393,6 +440,7 @@ fn scripted_daemon(
             {
                 continue;
             }
+            let mut status_answered = 0_usize;
             while let Ok(frame) = reader.read_message::<ControlFrame>().await {
                 let (request_id, method) = match &frame {
                     ControlFrame::Request(request) => {
@@ -403,7 +451,11 @@ fn scripted_daemon(
                     }
                     _ => continue,
                 };
-                let outcome = if listed.contains(&method.as_str()) {
+                if method == "account.status" {
+                    status_answered += 1;
+                }
+                let lapsed = method == "account.status" && status_answered > status_answers;
+                let outcome = if listed.contains(&method.as_str()) && !lapsed {
                     let report = AccountReport {
                         service: Nullable::some("https://reach.kala.to".to_owned()),
                         unavailable: Nullable::null(),
@@ -441,7 +493,7 @@ async fn a_daemon_that_does_not_list_the_storage_methods_is_said_to_predate_stor
     host.environment()
         .create()
         .expect("the environment's directories");
-    let serving = scripted_daemon(&host, &["account.status"]);
+    let serving = scripted_daemon(&host, &["account.status"], usize::MAX);
     for line in [
         ["account", "sign-in", "--storage"],
         ["account", "sign-out", "--storage"],
@@ -465,7 +517,7 @@ async fn a_daemon_that_does_not_list_the_storage_methods_is_said_to_predate_stor
         .environment()
         .create()
         .expect("the environment's directories");
-    let serving = scripted_daemon(&denied, &[]);
+    let serving = scripted_daemon(&denied, &[], usize::MAX);
     let (status, refused) = json(&denied, &["account", "sign-in", "--storage"], None);
     assert_ne!(status, Some(0), "{refused}");
     assert_eq!(refused["code"], "PERMISSION_DENIED", "{refused}");
@@ -476,5 +528,59 @@ async fn a_daemon_that_does_not_list_the_storage_methods_is_said_to_predate_stor
             .contains("predates"),
         "{refused}"
     );
+    serving.abort();
+}
+
+/// KR-REQ-20.19: a fence this host owes refuses the storage sign-in and sign-out as it refuses every
+/// method that takes no admission, `PERMISSION_DENIED`, and the refusal is shown as the daemon gave
+/// it, naming `kr doctor`: a daemon that lists the storage methods and answers their status is not
+/// one that predates them. The control is the same host with nothing owed, which signs in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_storage_command_refused_for_a_fence_is_shown_as_that_refusal() {
+    let managed = serve().await;
+    let storage = serve().await;
+    let host = Host::start(
+        &document(Some(managed.origin()), Some(storage.origin())),
+        Some(managed.origin()),
+    )
+    .await;
+    host._controller.hold_fence(true);
+    for line in [
+        ["account", "sign-in", "--storage"],
+        ["account", "sign-out", "--storage"],
+    ] {
+        let (status, refused) = host.json(&line);
+        assert_ne!(status, Some(0), "{refused}");
+        assert_eq!(refused["code"], "PERMISSION_DENIED", "{refused}");
+        assert!(
+            refused["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("kr doctor")),
+            "the refusal is the fence's: {refused}"
+        );
+    }
+    assert!(host.opened().is_empty(), "no browser was opened");
+    host._controller.hold_fence(false);
+    let output = host.kr(&["account", "sign-in", "--storage"]);
+    assert_eq!(output.status.code(), Some(0), "{}", said(&output));
+}
+
+/// KR-REQ-20.19: `kr account show` that is refused the storage account's status after the managed
+/// account's status was answered reads a daemon that does not list the method, or a membership that
+/// lapsed between the two reads. It asks the managed account's status again: answered, the host has
+/// one account and the command succeeds; refused, the command fails with that refusal and does not
+/// report a host with one account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn show_does_not_hide_a_refusal_that_arrives_between_its_two_reads() {
+    let host = kr_ipc::testing::TempHost::create();
+    host.environment()
+        .create()
+        .expect("the environment's directories");
+    // The managed account's status is answered once, and refused after: the lease lapsed.
+    let serving = scripted_daemon(&host, &["account.status"], 1);
+    let (status, refused) = json(&host, &["account", "show"], None);
+    assert_ne!(status, Some(0), "{refused}");
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["code"], "PERMISSION_DENIED", "{refused}");
     serving.abort();
 }
