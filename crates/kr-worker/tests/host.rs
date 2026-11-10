@@ -1846,23 +1846,28 @@ async fn a_worker_that_cannot_reach_its_controller_says_why_and_ends_whatever_it
 
 /// KR-REQ-05.08: an idle session that has been asked to run nothing is its worker and its root
 /// shell, and no backend, Wasm instance or model is created for it. This case shows the part of
-/// the sentence that a creation shows, on a Unix host:
+/// the sentence that a creation shows, on a Unix host, once the session has ended and the daemon
+/// has finished with it:
 ///
-/// - The daemon asks its supervisor to start the worker and nothing else: no plugin runtime or
+/// - The daemon asked its supervisor to start the worker and nothing else: no plugin runtime or
 ///   other separately supervised service, which is the one process that runs a Wasm instance,
 ///   lazily or otherwise.
-/// - Every process the worker and the daemon created for the environment is in a record that each
-///   place that creates one writes before it does (a root shell, a backend server, a backend's
-///   probe, a platform question, a desktop check, the description process, which is the one
-///   process that loads a model). The record is read once the worker has ended, when nothing more
-///   can be added, and holds the root shell and platform questions asked by the program and the
-///   arguments the platform's own list names, and nothing else. Nothing in it depends on when a
-///   process ran or on its name alone.
-/// - A process table read beside the session is the backstop for a creation the record does not
-///   hold: the part of the sentence about a Wasm instance or a model is shown by what neither the
-///   worker nor the daemon links (`trusted_core.rs`), and a creation by a place that does not
-///   write the record is shown only as far as that read reaches, which is what a process leaves
-///   in its parent, its directory or its environment while it runs.
+/// - The record that the places named below write before they create a process holds the root
+///   shell, once, and platform questions asked by the worker with the program and arguments the
+///   platform's own list names, and nothing else. The places are the worker's root shell, backend
+///   server, backend probe, platform question and desktop check, and the daemon's description
+///   process, which is the one process that loads a model. The record is read when the worker has
+///   ended, the daemon has dropped the session, and the description host has taken everything
+///   posted to it, so nothing those places were asked for is still to come. Nothing in it depends
+///   on when a process ran or on its name alone.
+/// - The description process is shown only for a host with no model files to load, as this host
+///   is: with one held, whether a description is queued for an idle session is not shown here.
+/// - What the record does not hold is shown only as far as a process table read beside the
+///   session reaches (what a process leaves in its parent, its directory or its environment while
+///   it runs, over about a second of idling that no case controls): the daemon's other starts
+///   (service-manager calls, vendor bridge helpers, power and desktop queries, git, terminal
+///   windows), and every start on Windows. A Wasm instance or a model in the worker's or the
+///   daemon's own process is shown by what neither links (`trusted_core.rs`).
 ///
 /// On Windows the case reads the worker's children by their recorded parent, which leaves the
 /// pseudo-console's host and nothing else, and does not see a process that a child of the worker
@@ -1872,13 +1877,32 @@ async fn an_idle_session_runs_nothing_beside_its_shell() {
     let host = Host::create().recording_launches();
     #[cfg(unix)]
     let host = host.marking_workers().recording_creations();
-    let _controller = host.start().await;
+    let daemon = host.start().await;
     let mut client = host.client().await;
     let created = create(&mut client, &host).await;
     #[cfg(unix)]
     nothing_the_worker_started_beside_the_shell_runs(&host, &created).await;
     #[cfg(windows)]
     only_the_pseudo_console_runs_beside_the_shell(&host, &created);
+    #[cfg(unix)]
+    let worker = worker_of(&host, created.session.session_id);
+    close(&mut client, &host, created.session.session_id).await;
+    // What the daemon starts for a session, it starts before it has let the session go, and its
+    // description host takes the posts about the session in order. So once the worker has ended,
+    // the daemon has let the session go and the description host has taken what was posted, the
+    // daemon's supervisor and the record have all there will be.
+    #[cfg(unix)]
+    until("the worker to end", || {
+        (kr_ipc::identity::process_state(&worker) == kr_ipc::identity::ProcessState::Ended)
+            .then_some(())
+    })
+    .await;
+    until_the_daemon_has_let_the_session_go(&host, created.session.session_id).await;
+    daemon
+        .controller
+        .descriptions()
+        .until_host_has_taken_what_was_posted()
+        .await;
     // Everything the daemon asked the platform to run for this environment, over the whole of it.
     let launched = host.launches();
     assert_eq!(
@@ -1896,22 +1920,23 @@ async fn an_idle_session_runs_nothing_beside_its_shell() {
         "no plugin runtime was published for a session that asked for none"
     );
     #[cfg(unix)]
-    let worker = worker_of(&host, created.session.session_id);
-    close(&mut client, &host, created.session.session_id).await;
-    // The worker has created all it will once it has ended, so the record is read then and not
-    // before.
-    #[cfg(unix)]
-    {
-        until("the worker to end", || {
-            (kr_ipc::identity::process_state(&worker) == kr_ipc::identity::ProcessState::Ended)
-                .then_some(())
-        })
-        .await;
-        only_the_root_shell_and_platform_questions_were_created(
-            &host.creations(),
-            u32::try_from(worker.pid.get()).expect("a process identifier"),
-        );
-    }
+    only_the_root_shell_and_platform_questions_were_created(
+        &host.creations(),
+        u32::try_from(worker.pid.get()).expect("a process identifier"),
+    );
+}
+
+/// Waits until the daemon has let the session's worker go: its last step of a closure, the removal
+/// of the worker's published descriptor, comes after the removal of the worker from the daemon's
+/// directory and after everything else that the closure tidies.
+async fn until_the_daemon_has_let_the_session_go(host: &Host, session_id: SessionId) {
+    until("the daemon to let the closed session's worker go", || {
+        kr_ipc::descriptor::read(&host.paths(), session_id)
+            .expect("the descriptor directory reads")
+            .is_none()
+            .then_some(())
+    })
+    .await;
 }
 
 /// What a daemon and its worker created for an idle session, from the record they wrote: the root
@@ -2080,24 +2105,39 @@ impl BesideTheShell {
     }
 }
 
-/// The program and the arguments a running process was started with, as `ps` prints them, or
-/// nothing when `identity` is no longer the process that holds its number. A question's arguments
-/// hold no space, so the printed line is split where it has one.
+/// What `ps` says a noted process runs.
 #[cfg(unix)]
-fn command_of(
-    identity: &kr_protocol::identity::ProcessStartIdentity,
-) -> Option<(String, Vec<String>)> {
+enum RunsNow {
+    /// It is still the process that was noted, and runs this program with these arguments.
+    Command(String, Vec<String>),
+    /// The kernel says it has ended, so what `ps` printed, if anything, is not about it.
+    Ended,
+}
+
+/// The program and the arguments a noted process runs, as `ps` prints them, a question's arguments
+/// holding no space so that the printed line is split where it has one. A process that the kernel
+/// will not describe, or that it says still runs and `ps` prints nothing for, is not one that has
+/// ended, and stops the case.
+#[cfg(unix)]
+fn command_of(identity: &kr_protocol::identity::ProcessStartIdentity) -> RunsNow {
     let output = std::process::Command::new("ps")
         .args(["-ww", "-o", "args=", "-p", &identity.pid.get().to_string()])
         .output()
         .expect("runs ps");
     let printed = String::from_utf8_lossy(&output.stdout);
     let mut words = printed.split_whitespace().map(str::to_owned);
-    // `ps` prints nothing, and fails, for a process that has gone.
-    let program = words.next()?;
-    // What it printed is about the noted process only if that is still the one that runs.
-    (kr_ipc::identity::process_state(identity) == kr_ipc::identity::ProcessState::Running)
-        .then(|| (program, words.collect()))
+    let program = words.next();
+    // Asked after `ps`, so that a process that ended meanwhile is told from one `ps` could not read.
+    match (kr_ipc::identity::process_state(identity), program) {
+        (kr_ipc::identity::ProcessState::Ended, _) => RunsNow::Ended,
+        (kr_ipc::identity::ProcessState::Running, Some(program)) => {
+            RunsNow::Command(program, words.collect())
+        }
+        (state, program) => panic!(
+            "what the worker started as {identity:?} could not be read: the kernel says {state:?} \
+             and ps printed {program:?}"
+        ),
+    }
 }
 
 /// The backstop of the record: a process table read beside an idle session finds nothing the
@@ -2136,7 +2176,7 @@ async fn nothing_the_worker_started_beside_the_shell_runs(
             match read_process(&identity) {
                 ProcessReading::Running(_) => {
                     // Gone since it was read: it was not staying.
-                    let Some((program, arguments)) = command_of(&identity) else {
+                    let RunsNow::Command(program, arguments) = command_of(&identity) else {
                         continue;
                     };
                     assert!(
@@ -2869,15 +2909,8 @@ async fn a_create_retried_after_its_session_ended_starts_no_worker(ending: Endin
             close(&mut client, &host, session_id).await;
             // The list says Closed while the daemon still lists the worker, and a retry that comes
             // then is a different case (the daemon's answer carries no endpoint for a worker that
-            // says it has closed). This one is the retry once the daemon has let the session go,
-            // which its last step of the closure, the removal of the worker's descriptor, says.
-            until("the daemon to let the closed session's worker go", || {
-                kr_ipc::descriptor::read(&host.paths(), session_id)
-                    .expect("the descriptor directory reads")
-                    .is_none()
-                    .then_some(())
-            })
-            .await;
+            // says it has closed). This one is the retry once the daemon has let the session go.
+            until_the_daemon_has_let_the_session_go(&host, session_id).await;
         }
         Ending::Crashed => {
             crash(&worker_of(&host, session_id));
