@@ -270,6 +270,9 @@ pub(super) struct Gate {
     last_offset: Option<u64>,
     /// The largest offset of a set that was frozen.
     frozen_to: Option<u64>,
+    /// The largest offset of a set that was dropped before it froze: what is said at or before it,
+    /// and arrives later, is spent as it arrives.
+    spent_to: Option<u64>,
 }
 
 impl Gate {
@@ -286,6 +289,7 @@ impl Gate {
             seen: VecDeque::new(),
             last_offset: None,
             frozen_to: None,
+            spent_to: None,
         }
     }
 
@@ -390,10 +394,13 @@ impl Gate {
         if self.taint.is_some() {
             self.kept.clear();
         } else {
+            let used = self
+                .spent_to
+                .is_some_and(|spent| fragment.start_ms <= spent);
             self.kept.push_back(Kept {
                 ordinal,
                 fragment,
-                used: false,
+                used,
             });
             self.prune();
             if self.kept.len() > KEPT_MAX {
@@ -451,6 +458,36 @@ impl Gate {
         Told::Delegation { id, offset_ms }
     }
 
+    /// The fragments kept that a set at `offset_ms` reads: what starts at or before it, no more than
+    /// the look-back before it, and no earlier set used.
+    fn reach(&self, offset_ms: u64) -> Vec<usize> {
+        self.kept
+            .iter()
+            .enumerate()
+            .filter(|(_, kept)| {
+                let start = kept.fragment.start_ms;
+                !kept.used && start <= offset_ms && offset_ms - start <= VOICE_LOOK_BACK_MS
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// The delegation at `offset_ms` will never be read: its set was dropped before it froze, because
+    /// the path to the host was lost, native code gave no proof or the news was not read up to the
+    /// marker in time. What the set would have held is spent, as a refused set's is, and so is what
+    /// is said at or before its offset and arrives later: a delegation announced afterwards, at this
+    /// offset or beyond it, answers only what is said after this one. What is spent stays kept, for
+    /// the checks of what lies beside a set.
+    pub(super) fn abandon(&mut self, offset_ms: u64) {
+        for index in self.reach(offset_ms) {
+            self.kept[index].used = true;
+        }
+        self.spent_to = Some(
+            self.spent_to
+                .map_or(offset_ms, |spent| spent.max(offset_ms)),
+        );
+    }
+
     /// Freezes the set of the delegation at `offset_ms`, once native code's news has been read up to
     /// the marker of the proof whose record is `record`. `announced` is the offset the voice service
     /// announced for the same identifier, when it announced one.
@@ -470,16 +507,7 @@ impl Gate {
         if let Some(cause) = self.taint {
             return Frozen::Refused(cause);
         }
-        let chosen: Vec<usize> = self
-            .kept
-            .iter()
-            .enumerate()
-            .filter(|(_, kept)| {
-                let start = kept.fragment.start_ms;
-                !kept.used && start <= offset_ms && offset_ms - start <= VOICE_LOOK_BACK_MS
-            })
-            .map(|(index, _)| index)
-            .collect();
+        let chosen = self.reach(offset_ms);
         // Whatever becomes of the set, what it held is spent: a later delegation answers what was
         // said after it.
         for index in &chosen {
@@ -843,6 +871,49 @@ mod tests {
             gate.freeze(6_100, CLEAN, Some(6_100)),
             Frozen::Refused(Cause::Empty),
             "what the refused set held is not read again"
+        );
+    }
+
+    /// A set dropped before it froze is spent as a refused one is, and so is what arrives for it
+    /// later: a delegation announced after it, at its offset or beyond, answers only what is said
+    /// after it. What is spent stays kept, so a set that lies beside it is still refused.
+    #[test]
+    fn a_set_dropped_before_it_froze_is_spent_and_so_is_what_arrives_for_it_later() {
+        let mut gate = open();
+        gate.provider(said(0, 200));
+        delegating(&mut gate, "first", 0);
+        let _ = gate.freeze(0, CLEAN, Some(0));
+        // A command, and a delegation for it that reaches further than the words that have arrived.
+        for start in [6_000, 6_200] {
+            gate.provider(said(start, start + 200));
+        }
+        delegating(&mut gate, "a", 9_000);
+        gate.abandon(9_000);
+        // The last of its words arrives after the set was dropped: spent as it arrives.
+        assert_eq!(gate.provider(said(8_800, 9_000)), Told::Nothing);
+        delegating(&mut gate, "b", 9_000);
+        assert_eq!(
+            gate.freeze(9_000, CLEAN, Some(9_000)),
+            Frozen::Refused(Cause::Empty),
+            "none of what the dropped set would have read answers another delegation"
+        );
+        // What was spent is still kept: words that follow it within the gap are the second half of
+        // what it was a part of, and their set is refused.
+        gate.provider(said(9_500, 9_700));
+        delegating(&mut gate, "c", 9_500);
+        assert_eq!(
+            gate.freeze(9_500, CLEAN, Some(9_500)),
+            Frozen::Refused(Cause::Excluded)
+        );
+        // What is said after a pause is a set of its own, and holds only that.
+        gate.provider(said(16_000, 16_200));
+        delegating(&mut gate, "d", 16_000);
+        let Frozen::Set(set) = gate.freeze(16_000, CLEAN, Some(16_000)) else {
+            panic!("what is said after the pause is a set");
+        };
+        assert_eq!(
+            set.iter().map(|each| each.start_ms).collect::<Vec<_>>(),
+            [16_000]
         );
     }
 

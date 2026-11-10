@@ -1949,6 +1949,7 @@ impl Owner {
             return;
         }
         if self.host_lost {
+            self.gate.abandon(offset_ms);
             self.not_sent(&id, Why::HostLost);
             return;
         }
@@ -2006,6 +2007,7 @@ impl Owner {
             }
             Stage::Draining { until, .. } if now >= until => {
                 if let Some(late) = self.collections.pop_front() {
+                    self.gate.abandon(late.offset_ms);
                     self.refuse(&late.id, Why::NotDrained);
                 }
             }
@@ -2042,6 +2044,7 @@ impl Owner {
             }
             _ => {
                 if let Some(collection) = self.collections.remove(position) {
+                    self.gate.abandon(collection.offset_ms);
                     self.refuse(&collection.id, Why::NoProof);
                 }
                 self.arm_collection();
@@ -2290,6 +2293,7 @@ impl Owner {
         self.unsent.store(true, Ordering::SeqCst);
         let waiting: Vec<Collection> = self.collections.drain(..).collect();
         for collection in waiting {
+            self.gate.abandon(collection.offset_ms);
             self.not_sent(&collection.id, Why::HostLost);
         }
         self.arm_collection();

@@ -60,6 +60,9 @@ struct Inner {
     /// leaves.
     news_held: bool,
     held_news: Vec<Option<CallEvent>>,
+    /// Whether the proof that completes a set, with a marker, fails as one does when native code
+    /// cannot read its record.
+    marker_proofs_fail: bool,
 }
 
 /// What native code's record of the call's capture holds, as the capture proof answers it.
@@ -125,6 +128,7 @@ impl ScriptedCalls {
                 answer_uses_dtx: false,
                 news_held: false,
                 held_news: Vec::new(),
+                marker_proofs_fail: false,
             }),
             freed: tokio::sync::Notify::new(),
         })
@@ -260,6 +264,12 @@ impl ScriptedCalls {
     /// it is `None`.
     pub fn show_progress_age(&self, age_ms: Option<u64>) {
         self.inner().record.progress_age_ms = age_ms;
+    }
+
+    /// The proof that completes a set, the one with a marker, fails from now on, as one does when
+    /// native code cannot read its record; or stops failing.
+    pub fn fail_the_proof_that_completes_a_set(&self, fail: bool) {
+        self.inner().marker_proofs_fail = fail;
     }
 
     /// What native code's record of capture holds: openings and breaks.
@@ -592,6 +602,12 @@ impl CallPlatform for ScriptedCalls {
             let mut inner = self.inner();
             if !matches!(inner.held.as_ref(), Some((held, ..)) if held == call) {
                 return Err(CallFailure::new(FailureKind::Ended, "that call has ended"));
+            }
+            if barrier && inner.marker_proofs_fail {
+                return Err(CallFailure::new(
+                    FailureKind::Engine,
+                    "native code cannot read its record of capture",
+                ));
             }
             let token = barrier.then(|| {
                 inner.record.markers += 1;
