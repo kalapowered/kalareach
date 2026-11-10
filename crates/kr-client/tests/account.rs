@@ -2771,6 +2771,12 @@ fn a_request_at_an_origin_names_that_origin_and_exactly_its_parameters() {
         "http://owner.example",
         "https://owner.example/auth",
         "ftp://owner.example",
+        // Another spelling of an origin that is accepted, and so another signing input for it: a
+        // trailing slash, an upper-case host, the default port written out, and a query.
+        "https://owner.example/",
+        "https://OWNER.example",
+        "https://owner.example:443",
+        "https://owner.example?next=1",
         // Spelled as an origin is, and not an address: its punycode label does not decode.
         "https://a.b.c.xn--pokxncvks",
     ] {
