@@ -596,10 +596,14 @@ impl NetworkListener {
         }
     }
 
-    /// Stops accepting, ends every connection being served and closes the endpoint.
+    /// Stops accepting, ends every connection being served and closes the endpoint, and returns
+    /// once the endpoint is closed.
+    ///
+    /// The close is started, on a task of its own, before anything is waited for, so a shutdown
+    /// that is cancelled while it waits has left the close under way and does not leave the
+    /// endpoint open.
     pub async fn shutdown(self) {
-        self.accept_loop.abort();
-        self.connections.end();
+        self.end_connections();
         let winding = self
             .winding_down
             .lock()
@@ -608,7 +612,6 @@ impl NetworkListener {
         if let Some(winding) = winding {
             let _ = winding.await;
         }
-        wind_down(self.endpoint.clone(), Arc::clone(&self.connections)).await;
     }
 }
 

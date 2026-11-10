@@ -204,7 +204,8 @@ pub struct NetworkGuard {
     ///
     /// The guard is recorded on the daemon before the listener exists, because a revocation has to
     /// be able to reach a connection from the moment one can be admitted. Dropping a listener
-    /// stops it accepting; a shutdown also closes its endpoint, which is the orderly end.
+    /// stops it accepting, ends the connections it serves and starts the close of its endpoint on a
+    /// task; a shutdown also waits for the endpoint to be closed, which is the orderly end.
     listener: std::sync::Mutex<Option<kr_transport::listener::NetworkListener>>,
     /// The tasks this host runs for itself, rather than for one connection.
     tasks: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
@@ -346,7 +347,8 @@ impl Drop for NetworkGuard {
     fn drop(&mut self) {
         // Whichever way this goes: a shutdown that awaited the endpoint, a registration that
         // failed after the tasks had started, or a daemon that was simply dropped. Nothing here
-        // can await, and dropping the listener is what stops it accepting.
+        // can await, and dropping the listener is what stops it accepting, ends its connections
+        // and starts the close of its endpoint.
         self.stop_tasks();
     }
 }

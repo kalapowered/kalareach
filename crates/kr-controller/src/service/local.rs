@@ -599,7 +599,8 @@ impl Controller {
 
     /// Serves the client endpoint.
     ///
-    /// A daemon is stopped by ending its serving loops, as the binary and every suite do: this one,
+    /// A daemon is stopped by ending its serving loops, as every suite does by aborting them and
+    /// the binary does when its process ends and its runtime drops them: this one,
     /// [`Self::serve_rendezvous`] and `transfer::serve_chunks`. Each loop ends the connections it
     /// serves with it, and each peer sees its connection close. This loop also ends the network
     /// connections: a connection holds the daemon for as long as it lasts, and the daemon owns the
@@ -992,11 +993,14 @@ impl Controller {
     /// this connection.
     ///
     /// This door awaits the call in line, so the end of the control stream does not cancel it: the
-    /// connection, and its registration, are retired only after the call has ended. The effect runs
-    /// in its own task all the same, because dropping a future is a cancellation, destructors run
-    /// and nothing after an outstanding `await` finishes, and a durable commit cannot be left half
-    /// done by a task that is dropped. Dropping the handle this awaits does not stop that task; it
-    /// only stops this connection hearing the answer.
+    /// connection, and its registration, are retired only after the call has ended. A stop of the
+    /// daemon does cancel it: the loop that serves the connection ends its task at this wait, and
+    /// the connection's windows and registration are withdrawn at once, so an effect that has not
+    /// yet committed is refused at its next check of the registration. The effect runs in its own
+    /// task all the same, because dropping a future is a cancellation, destructors run and nothing
+    /// after an outstanding `await` finishes, and a durable commit cannot be left half done by a
+    /// task that is dropped. Dropping the handle this awaits does not stop that task; it only stops
+    /// this connection hearing the answer.
     ///
     /// The reply says which it is: a refusal made before anything ran, which carries no result, or
     /// an answer, which does.
