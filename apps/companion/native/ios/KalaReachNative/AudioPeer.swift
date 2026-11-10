@@ -147,6 +147,8 @@ final class SyntheticAudioDevice: NSObject, RTCAudioDevice {
         var tone = [Int16](repeating: 0, count: Self.frames)
         var drain = [Int16](repeating: 0, count: Self.frames)
         let step = 2 * Double.pi * 440 / Double(Self.rate)
+        let period = Double(Self.frames) / Double(Self.rate)
+        var due = ProcessInfo.processInfo.systemUptime
         while !Thread.current.isCancelled {
             let (delegate, recording, playing) = locked { (self.delegate, self.recording, self.playing) }
             guard let delegate else { break }
@@ -195,7 +197,15 @@ final class SyntheticAudioDevice: NSObject, RTCAudioDevice {
                 }
                 locked { playedFrames += Self.frames }
             }
-            Thread.sleep(forTimeInterval: 0.01)
+            // Keeps time: each frame is due one period after the last was due, so a thread that woke
+            // late catches up, and the audio taken in keeps pace with the clock as a real recorder's
+            // does (a sleep of one period after each frame delivers a fifth too little on a busy
+            // machine, which the call's own progress watch reads as a gap). Audio a drop took away is
+            // not made up for, and a thread that fell far behind starts again from now.
+            let now = ProcessInfo.processInfo.systemUptime
+            due += period
+            if !recording || Date() < silentUntil || now - due > 0.5 { due = now + period }
+            if due > now { Thread.sleep(forTimeInterval: due - now) }
         }
     }
 
