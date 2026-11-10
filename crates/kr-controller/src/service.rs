@@ -730,6 +730,11 @@ pub struct Controller {
     /// correction of the clock can land in between. Compiled away in every shipped build.
     #[cfg(test)]
     after_the_answers_clock_is_proven: BlockingPause,
+    /// Where this host's own tests stop a start of the disclosed checks that holds its registration
+    /// and the checks' lock, before it looks in the record of answers, so that a fence can land in
+    /// between. Compiled away in every shipped build.
+    #[cfg(test)]
+    before_a_capability_check_looks: BlockingPause,
     /// The step this host's own tests have made stop where a crash would, if one is armed
     /// ([`StopPoint`]). Compiled away in every shipped build.
     #[cfg(test)]

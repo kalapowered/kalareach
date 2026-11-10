@@ -173,6 +173,43 @@ fn cancellation(temp: &kr_ipc::testing::TempHost) -> MutationRequest {
     )
 }
 
+/// An adoption with no label, under a fresh action identifier. The service refuses it before it
+/// reads the record of its action, and keeps the refusal as the action's answer.
+fn adoption_without_a_label(temp: &kr_ipc::testing::TempHost) -> MutationRequest {
+    mutation_of(
+        temp,
+        Method::ProjectAdopt,
+        ParamsValue::from_typed(&kr_protocol::project::ProjectAdoptParams {
+            destination: kr_protocol::project::DestinationRequest {
+                environment_id: temp.environment_id(),
+                parent: kr_protocol::project::DestinationParent::Host {
+                    path: "/".to_owned(),
+                },
+                name: "nothing".to_owned(),
+            },
+            label: String::new(),
+            flow: kr_protocol::project::AdoptionFlow::ExistingCheckout,
+        })
+        .expect("encodes"),
+    )
+}
+
+/// The clearing of the binding of a repository nobody made, under a fresh action identifier. It
+/// needs no owner's confirmation, so it reaches the service's decision path for location
+/// decisions with no owner; the service refuses it and keeps the refusal as the action's answer.
+fn clearing_a_binding(temp: &kr_ipc::testing::TempHost) -> MutationRequest {
+    mutation_of(
+        temp,
+        Method::ProjectLocationAttach,
+        ParamsValue::from_typed(&kr_protocol::project::ProjectLocationAttachParams {
+            project_repository_id: kr_protocol::ids::ProjectRepositoryId::new(kr_ipc::new_uuid()),
+            location_id: Nullable::null(),
+            owner_confirmation: Nullable::null(),
+        })
+        .expect("encodes"),
+    )
+}
+
 /// The project service's answer to `mutation`, asked as the daemon asks it: `begin` is the check a
 /// first admission begins under, and the check a recorded answer is owed is the daemon's own.
 async fn project_answer(
@@ -187,7 +224,10 @@ async fn project_answer(
         .write(
             actor_id,
             mutation,
-            Method::ProjectOperationCancel,
+            mutation
+                .method
+                .method()
+                .expect("a method this daemon serves"),
             begin,
             controller.retained_in_service(admission),
             None,
@@ -217,7 +257,7 @@ fn plant_a_project_refusal(
         .record_action(
             actor_id,
             mutation.action_id.get(),
-            Method::ProjectOperationCancel.as_str(),
+            mutation.method.as_str(),
             digest,
             &the_planted_refusal(),
         )
@@ -232,34 +272,31 @@ fn a_deadline_that_passed() -> ProtocolError {
     .to_protocol_error()
 }
 
-/// KR-REQ-09.09, the project service's first look: an action another copy recorded after the door's
-/// own lookup is given back only under the authority the late copy arrived under, asked with the
-/// record in hand. The control: with nothing owed the late copy is given the record as a copy.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_project_action_recorded_before_a_late_attempts_look_is_not_given_back_while_a_fence_is_owed()
- {
-    let (temp, controller, _clock) = daemon().await;
-    let (connection_id, actor_id) = admitted(&controller).await;
-    let mutation = cancellation(&temp);
-    let admission = carried(&controller, connection_id);
+/// What a late copy of `mutation` is given when the project service refused the first copy and kept
+/// the refusal: the control (the record, as a copy), a fence owed, and a registration gone.
+async fn a_late_copy_of_a_kept_refusal(
+    controller: &Arc<Controller>,
+    connection_id: kr_protocol::ids::ConnectionId,
+    actor_id: &ActorId,
+    mutation: &MutationRequest,
+) {
+    let admission = carried(controller, connection_id);
     let first = project_answer(
-        &controller,
-        &actor_id,
-        &mutation,
+        controller,
+        actor_id,
+        mutation,
         admission,
         controller.admission_in_service(admission),
     )
     .await;
     assert!(!first.is_copied(), "the first copy answers for itself");
-    let first = first
-        .into_answer()
-        .expect_err("an operation nobody started is refused");
+    let first = first.into_answer().expect_err("the service refuses it");
 
     let late = async || {
         project_answer(
-            &controller,
-            &actor_id,
-            &mutation,
+            controller,
+            actor_id,
+            mutation,
             admission,
             controller.admission_in_service(admission),
         )
@@ -267,9 +304,9 @@ async fn a_project_action_recorded_before_a_late_attempts_look_is_not_given_back
         .into_answer()
     };
     let control = project_answer(
-        &controller,
-        &actor_id,
-        &mutation,
+        controller,
+        actor_id,
+        mutation,
         admission,
         controller.admission_in_service(admission),
     )
@@ -281,8 +318,37 @@ async fn a_project_action_recorded_before_a_late_attempts_look_is_not_given_back
         "it is given what the first copy was told"
     );
 
-    refused_for_the_fence(&controller, late).await;
-    refused_for_the_registration(&controller, connection_id, late).await;
+    refused_for_the_fence(controller, late).await;
+    refused_for_the_registration(controller, connection_id, late).await;
+}
+
+/// KR-REQ-09.09, the project service's first look: an action another copy recorded after the door's
+/// own lookup is given back only under the authority the late copy arrived under, asked with the
+/// record in hand. The control: with nothing owed the late copy is given the record as a copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_project_action_recorded_before_a_late_attempts_look_is_not_given_back_while_a_fence_is_owed()
+ {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    a_late_copy_of_a_kept_refusal(&controller, connection_id, &actor_id, &cancellation(&temp))
+        .await;
+}
+
+/// KR-REQ-09.09, the project service's look for a location decision: the clearing of a binding
+/// needs no owner's confirmation, and its answer, a refusal here, is kept like any action's. A
+/// repeat of it, found by the decision path's own look after the door's, is given back only under
+/// the authority the repeat arrived under. The control: with nothing owed it is given the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cleared_binding_another_copy_recorded_is_not_given_back_while_a_fence_is_owed() {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    a_late_copy_of_a_kept_refusal(
+        &controller,
+        connection_id,
+        &actor_id,
+        &clearing_a_binding(&temp),
+    )
+    .await;
 }
 
 /// KR-REQ-09.09, the project service's admission: a copy whose admission refuses (the deadline has
@@ -384,7 +450,7 @@ async fn a_project_action_whose_claim_is_open_is_not_told_while_a_fence_is_owed(
                     rusqlite::params![
                         actor_id.as_str(),
                         mutation.action_id.get().as_bytes().to_vec(),
-                        Method::ProjectOperationCancel.as_str(),
+                        mutation.method.as_str(),
                         digest.as_bytes().to_vec(),
                     ],
                 )
@@ -441,7 +507,7 @@ async fn a_project_action_another_copy_recorded_while_it_ran_is_not_given_back_w
         }
     };
 
-    let mutation = cancellation(&temp);
+    let mutation = adoption_without_a_label(&temp);
     let control = project_answer(
         &controller,
         &actor_id,
@@ -462,7 +528,7 @@ async fn a_project_action_another_copy_recorded_while_it_ran_is_not_given_back_w
         "planted"
     );
 
-    let mutation = cancellation(&temp);
+    let mutation = adoption_without_a_label(&temp);
     controller.hold_fence(true);
     let refused = project_answer(
         &controller,
@@ -510,7 +576,7 @@ async fn a_project_action_whose_record_cannot_be_written_is_given_the_other_copy
         }
     };
 
-    let mutation = cancellation(&temp);
+    let mutation = adoption_without_a_label(&temp);
     let control = project_answer(
         &controller,
         &actor_id,
@@ -531,7 +597,7 @@ async fn a_project_action_whose_record_cannot_be_written_is_given_the_other_copy
         "planted"
     );
 
-    let mutation = cancellation(&temp);
+    let mutation = adoption_without_a_label(&temp);
     controller.hold_fence(true);
     let refused = project_answer(
         &controller,
@@ -624,35 +690,41 @@ async fn a_change_set_action_recorded_before_a_late_attempts_look_is_not_given_b
     refused_for_the_registration(&controller, connection_id, late).await;
 }
 
-/// KR-REQ-09.09, the change-set service's claim: a copy that meets a claim another copy holds, with
-/// nothing recorded yet, is told that what became of the action is not known only under the
-/// authority it arrived under, asked with the answer in hand. A fence that lands once the copy has
-/// the answer stops it. The control: with nothing owed the copy is told so.
+/// KR-REQ-09.09, the change-set service's claim: a copy whose first look finds nothing and that
+/// meets a claim another copy made where it claims is told that what became of the action is not
+/// known only under the authority it arrived under, asked with the answer in hand. The other copy
+/// makes its claim inside the late copy's own claim write, which a trigger of the store arranges, so
+/// the first look cannot have found it. A fence that lands once the copy has the answer stops it.
+/// The control: with nothing owed the copy is told so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_change_set_action_whose_claim_another_copy_holds_is_not_told_after_a_fence_lands() {
     let (temp, controller, _clock) = daemon().await;
     let (connection_id, actor_id) = admitted(&controller).await;
     let admission = carried(&controller, connection_id);
-    let claimed_by_another_copy = |mutation: &MutationRequest| {
-        let digest = kr_protocol::digest::mutation_digest(mutation, &actor_id).expect("a digest");
-        assert!(
-            controller
-                .changesets()
-                .service()
-                .claim_action(
-                    &actor_id,
-                    mutation.action_id.get(),
-                    Method::ChangesetMaterialize.as_str(),
-                    digest,
-                    None,
-                )
-                .expect("the claim is written"),
-            "the first claim of an action is the one that makes it"
-        );
-    };
+    let store = rusqlite::Connection::open(
+        kr_changeset::service::ChangeSetService::root_of(&controller.paths)
+            .join(kr_changeset::store::STORE_FILE_NAME),
+    )
+    .expect("the change-set store opens beside the service's own handle");
+    store
+        .busy_timeout(Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    // Every claim a copy writes meets another copy's claim for the same request, made an instant
+    // before: the first look has already found nothing.
+    store
+        .execute_batch(
+            "CREATE TRIGGER another_copy_claims_first BEFORE INSERT ON actions
+             WHEN NEW.result IS NULL AND NEW.error_code IS NULL
+             BEGIN
+                 INSERT OR IGNORE INTO actions (actor_id, action_id, method, payload_digest,
+                                                result, error_code, error_detail, recorded_at_ms)
+                 VALUES (NEW.actor_id, NEW.action_id, NEW.method, NEW.payload_digest,
+                         NULL, NULL, NULL, 1);
+             END;",
+        )
+        .expect("another copy is made to claim first");
 
     let mutation = materialisation(&temp);
-    claimed_by_another_copy(&mutation);
     let control = changeset_answer(&controller, &actor_id, &mutation, admission).await;
     assert!(control.is_copied(), "the copy meets the other copy's claim");
     assert_eq!(
@@ -665,7 +737,6 @@ async fn a_change_set_action_whose_claim_another_copy_holds_is_not_told_after_a_
 
     // The copy has met the claim and read the answer when the fence lands.
     let mutation = materialisation(&temp);
-    claimed_by_another_copy(&mutation);
     let (arrived, release) = controller.pause_retained_lookup();
     let mut late = tokio::spawn({
         let (controller, actor_id, mutation) =
@@ -695,6 +766,9 @@ async fn a_change_set_action_whose_claim_another_copy_holds_is_not_told_after_a_
         .expect_err("a fence that landed once the copy had the answer stops it");
     refused_for_a_fence(&refused);
     controller.hold_fence(false);
+    store
+        .execute_batch("DROP TRIGGER another_copy_claims_first;")
+        .expect("the store is whole again");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -806,20 +880,12 @@ async fn a_catalogue_receipt_kept_before_a_late_attempts_claim_is_not_given_back
 // The attention store
 // ---------------------------------------------------------------------------------------------
 
-/// KR-REQ-09.09, the attention store's record: an action another copy recorded, returned by the
-/// store before it asks the admission, is given back only under the authority the late copy arrived
-/// under, asked with the record in hand. The control: with nothing owed the late copy is given the
-/// record as a copy. A fence that lands once the entry check has passed and the late copy is at the
-/// store stops it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_attention_action_recorded_before_a_late_attempts_look_is_not_given_back_after_a_fence_lands()
- {
+/// A quiet-hours window to set, under a fresh action identifier.
+fn setting_quiet_hours(temp: &kr_ipc::testing::TempHost) -> MutationRequest {
     use kr_protocol::attention::{AttentionQuietHoursParams, QuietHours};
 
-    let (temp, controller, _clock) = daemon().await;
-    let (connection_id, actor_id) = admitted(&controller).await;
-    let mutation = mutation_of(
-        &temp,
+    mutation_of(
+        temp,
         Method::AttentionQuietHours,
         ParamsValue::from_typed(&AttentionQuietHoursParams {
             quiet_hours: Nullable::some(QuietHours {
@@ -829,46 +895,44 @@ async fn an_attention_action_recorded_before_a_late_attempts_look_is_not_given_b
             }),
         })
         .expect("encodes"),
-    );
-    let admission = carried(&controller, connection_id);
-    let attempt = || {
-        controller.attention().write(
-            &controller,
+    )
+}
+
+/// The attention store's answer to `mutation`, as the daemon asks it.
+async fn attention_answer(
+    controller: &Arc<Controller>,
+    actor_id: &ActorId,
+    mutation: &MutationRequest,
+    admission: AdmittedMutation,
+) -> Given<Result<ParamsValue, ProtocolError>> {
+    controller
+        .attention()
+        .write(
+            controller,
             &crate::attention::Caller::Owner,
-            &actor_id,
-            &mutation,
+            actor_id,
+            mutation,
             Method::AttentionQuietHours,
             &admission,
         )
-    };
-    let first = attempt().await;
-    assert!(!first.is_copied(), "the first copy answers for itself");
-    let first = first.into_answer().expect("the window is set");
+        .await
+}
 
-    let control = attempt().await;
-    assert!(control.is_copied(), "the late copy reads the record");
-    assert_eq!(
-        control.into_answer().expect("the record's answer"),
-        first,
-        "it is given what the first copy was told"
-    );
-
-    // The late copy has passed the entry check and is at the store when the fence lands.
+/// What a late copy is given when it has passed the entry check and is at the store, where the
+/// record is found, and a fence lands there when `fence` says so.
+async fn a_late_attention_copy_at_the_store(
+    controller: &Arc<Controller>,
+    actor_id: &ActorId,
+    mutation: &MutationRequest,
+    admission: AdmittedMutation,
+    fence: bool,
+) -> Result<ParamsValue, ProtocolError> {
     let (arrived, release) = controller.attention().pause_before_store();
     let mut late = tokio::spawn({
         let (controller, actor_id, mutation) =
-            (Arc::clone(&controller), actor_id.clone(), mutation.clone());
+            (Arc::clone(controller), actor_id.clone(), mutation.clone());
         async move {
-            controller
-                .attention()
-                .write(
-                    &controller,
-                    &crate::attention::Caller::Owner,
-                    &actor_id,
-                    &mutation,
-                    Method::AttentionQuietHours,
-                    &admission,
-                )
+            attention_answer(&controller, &actor_id, &mutation, admission)
                 .await
                 .into_answer()
         }
@@ -883,14 +947,81 @@ async fn an_attention_action_recorded_before_a_late_attempts_look_is_not_given_b
         }
         answered = &mut late => panic!("the late copy was answered before the store: {answered:?}"),
     }
-    controller.hold_fence(true);
+    if fence {
+        controller.hold_fence(true);
+    }
     release.send(()).expect("the late copy goes on");
-    let refused = late
-        .await
-        .expect("the late copy finishes")
-        .expect_err("a fence that landed at the store stops the record it returns");
-    refused_for_a_fence(&refused);
+    let answered = late.await.expect("the late copy finishes");
     controller.hold_fence(false);
+    answered
+}
+
+/// KR-REQ-09.09, the attention store's record: an action another copy recorded, returned by the
+/// store before it asks the admission, is given back only under the authority the late copy arrived
+/// under, asked with the record in hand. The control: with nothing owed the late copy is given the
+/// record as a copy. A fence that lands once the entry check has passed and the late copy is at the
+/// store stops it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attention_action_recorded_before_a_late_attempts_look_is_not_given_back_after_a_fence_lands()
+ {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let mutation = setting_quiet_hours(&temp);
+    let admission = carried(&controller, connection_id);
+    let first = attention_answer(&controller, &actor_id, &mutation, admission).await;
+    assert!(!first.is_copied(), "the first copy answers for itself");
+    let first = first.into_answer().expect("the window is set");
+
+    let control = attention_answer(&controller, &actor_id, &mutation, admission).await;
+    assert!(control.is_copied(), "the late copy reads the record");
+    assert_eq!(
+        control.into_answer().expect("the record's answer"),
+        first,
+        "it is given what the first copy was told"
+    );
+
+    let refused =
+        a_late_attention_copy_at_the_store(&controller, &actor_id, &mutation, admission, true)
+            .await
+            .expect_err("a fence that landed at the store stops the record it returns");
+    refused_for_a_fence(&refused);
+}
+
+/// KR-REQ-09.09, the attention store's record that cannot be read: that a record exists is what the
+/// caller would be told, so it is held to the same check. The control: with nothing owed the late
+/// copy is told that what became of the action is not known. A fence that lands once the late copy
+/// is at the store is the answer instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attention_record_that_cannot_be_read_is_not_told_after_a_fence_lands() {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let mutation = setting_quiet_hours(&temp);
+    let admission = carried(&controller, connection_id);
+    attention_answer(&controller, &actor_id, &mutation, admission)
+        .await
+        .into_answer()
+        .expect("the window is set");
+    let store =
+        rusqlite::Connection::open(temp.environment().state_dir().join("attention.sqlite3"))
+            .expect("opens the attention store");
+    store
+        .busy_timeout(Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    store
+        .execute("UPDATE attention_actions SET answer = x'ff'", [])
+        .expect("the answer cannot be decoded");
+
+    let told =
+        a_late_attention_copy_at_the_store(&controller, &actor_id, &mutation, admission, false)
+            .await
+            .expect_err("an answer that cannot be decoded does not answer the repeat");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+
+    let refused =
+        a_late_attention_copy_at_the_store(&controller, &actor_id, &mutation, admission, true)
+            .await
+            .expect_err("a fence that landed at the store is the answer");
+    refused_for_a_fence(&refused);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1059,6 +1190,73 @@ async fn an_automation_action_another_copy_recorded_is_not_given_back_after_a_fe
         .expect("the late copy finishes")
         .expect_err("a fence that landed before the journal stops the record it gives back");
     refused_for_a_fence(&refused);
+    controller.hold_fence(false);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The disclosed checks
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-09.09, the disclosed checks: a request for them that another copy answered is read back
+/// inside the start's own hold on the connection's registration, and the hold keeps a revocation
+/// out but not the publication of a fence this host owes. The late copy has passed the registration
+/// check and holds the lock of the checks when a fence lands before it reads the record of
+/// answers; the fence is asked again with the answer in hand. The control: with nothing owed the
+/// late copy is given what the first was told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capability_check_another_copy_answered_is_not_given_back_after_a_fence_lands() {
+    use kr_protocol::desktop::EnvironmentCapabilitiesCheckParams;
+
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let mutation = mutation_of(
+        &temp,
+        Method::EnvironmentCapabilitiesCheck,
+        ParamsValue::from_typed(&EnvironmentCapabilitiesCheckParams {
+            environment_id: temp.environment_id(),
+            authorised_file: Nullable::null(),
+        })
+        .expect("encodes"),
+    );
+    let admission = carried(&controller, connection_id);
+    let first = controller
+        .start_capability_checks(&actor_id, &mutation, admission)
+        .await
+        .expect("the first copy is answered");
+
+    let control = controller
+        .start_capability_checks(&actor_id, &mutation, admission)
+        .await
+        .expect("with nothing owed the late copy is answered from the record");
+    assert_eq!(control, first, "it is given what the first copy was told");
+
+    let (arrived, release) = controller.before_a_capability_check_looks.arm();
+    let mut late = tokio::spawn({
+        let (controller, actor_id, mutation) =
+            (Arc::clone(&controller), actor_id.clone(), mutation.clone());
+        async move {
+            controller
+                .start_capability_checks(&actor_id, &mutation, admission)
+                .await
+        }
+    });
+    let reached =
+        tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)));
+    tokio::select! {
+        reached = reached => {
+            reached
+                .expect("the wait finishes")
+                .expect("the late copy reaches the place it is stopped at");
+        }
+        answered = &mut late => panic!("the late copy was answered before it read the record: {answered:?}"),
+    }
+    controller.hold_fence(true);
+    release.send(()).expect("the late copy goes on");
+    let refused = late
+        .await
+        .expect("the late copy finishes")
+        .expect_err("a fence that landed before the record was read stops the answer");
+    refused_for_a_fence(&refused.to_protocol_error());
     controller.hold_fence(false);
 }
 

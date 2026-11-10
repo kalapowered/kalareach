@@ -1262,6 +1262,8 @@ impl Controller {
             #[cfg(test)]
             after_the_answers_clock_is_proven: BlockingPause::default(),
             #[cfg(test)]
+            before_a_capability_check_looks: BlockingPause::default(),
+            #[cfg(test)]
             stopped_at: std::sync::Mutex::new(None),
             boot_identity: setup.boot_identity,
             boot_epoch,

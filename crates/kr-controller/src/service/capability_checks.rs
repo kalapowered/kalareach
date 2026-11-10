@@ -411,12 +411,21 @@ impl Controller {
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         let begun = self.under_registration(&carried, || {
             let mut checks = self.checks.lock().unwrap_or_else(PoisonError::into_inner);
+            #[cfg(test)]
+            self.before_a_capability_check_looks.wait();
             // The lookup before admission and this are two looks: a request of the same actor and
             // action that was answered between them is answered here again, or refused as a reused
-            // identifier, under the one hold that also starts a run.
+            // identifier, under the one hold that also starts a run. The hold keeps a revocation
+            // and a withdrawn registration out until the closure ends, but not the publication of
+            // a fence this host owes, and the check above came before the lock on the checks and
+            // the read of the record. So the fence is asked again with the answer in hand.
             match self.capability_answers.recall(actor_id, mutation.action_id) {
-                Ok(Some(held)) if held.digest == digest => return Ok(held.answer),
+                Ok(Some(held)) if held.digest == digest => {
+                    self.check_fence()?;
+                    return Ok(held.answer);
+                }
                 Ok(Some(_)) => {
+                    self.check_fence()?;
                     return Err(ControllerError::IdConflict {
                         token: mutation.action_id.to_string(),
                     });
