@@ -1306,7 +1306,7 @@ fn windows() -> Vec<Step> {
             &["test", "--locked", "-p", "kr-flush"],
         ),
         qualified_only(
-            "each store waits for the holder that is letting go of it",
+            "each store opens and reads what the previous holder committed while it still maps the index",
             &[
                 "test",
                 "--locked",

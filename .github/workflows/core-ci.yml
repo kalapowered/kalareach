@@ -679,8 +679,9 @@ jobs:
       #     `catalogue::launch_probes`, `agent_tools`, `machine`, `registry` and `singleton`, and
       #     the `agent_tools`, `contact_skill`, `catalogue`, `voice_broker` (the sign-in cases),
       #     `archive`, `project`, `network_project`, `shell`, `privacy` and `descriptions` suites;
-      #   - the stores' wait for the holder that is letting go of them, across `kr-controller`,
-      #     `kr-changeset`, `kr-delivery`, `kr-describe` and `kr-automation`;
+      #   - the stores' open, and what they read, while the holder that is letting go of them still
+      #     maps their index, across `kr-controller`, `kr-changeset`, `kr-delivery`, `kr-describe`
+      #     and `kr-automation`;
       #   - the automation engine: `kr-automation`'s refusal of a command node where no command can
       #     be run (`definitions`), and its `causal_budget` cases, that a descendant keeps its causal
       #     root, depth and parent and that a workflow does not retrigger on its own descendants by
@@ -1041,7 +1042,7 @@ jobs:
       # the plugin catalogue's, the project and transfer stores', and the worker's journal in the
       # persistence suite); this step runs the rest, in the daemon's library and the libraries of
       # the stores' crates.
-      - name: Test that each store waits for the holder that is letting go of it
+      - name: Test that each store opens and reads what the previous holder committed while it still maps the index
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-controller -p kr-changeset -p kr-delivery -p kr-describe -p kr-automation --lib a_previous_holder_that_is_letting_go
 
