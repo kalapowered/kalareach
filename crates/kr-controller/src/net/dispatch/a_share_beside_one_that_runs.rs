@@ -743,6 +743,68 @@ async fn kr_req_23_24_a_share_written_under_earlier_identities_is_not_called_unp
     );
 }
 
+/// KR-REQ-23.24: a share under the earlier identities that cannot be read is not called
+/// unperformed either. Nothing is under the identities the actor derives now, so the share is
+/// absent there, and its grant sits under the earlier identities as a row that cannot be decoded:
+/// the repeat is told that what became of the action is not known, not that nothing was shared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_23_24_a_share_under_earlier_identities_that_cannot_be_read_is_not_called_unperformed()
+ {
+    let (world, _holding) = world(Holding::default(), holds_question_reads()).await;
+    let owner = owner();
+    let first = viewing(&world, world.session_id, recipient(), 0x71);
+    starting(&world, &owner, AuthorityCaller::Owner, &first)
+        .await
+        .await
+        .into_answer()
+        .expect("the share is written");
+
+    let (grant_id, invitation_id) =
+        kr_protocol::sharing::share_identities(&owner, first.action_id.get());
+    let (earlier_grant, earlier_invitation) = earlier_identities(first.action_id.get());
+    let registry = beside(&world);
+    registry
+        .execute(
+            "UPDATE grants SET grant_id = ?1, grant = X'00' WHERE grant_id = ?2",
+            rusqlite::params![
+                earlier_grant.get().as_bytes().as_slice(),
+                grant_id.get().as_bytes().as_slice()
+            ],
+        )
+        .expect("the grant keeps the identity an earlier build gave it, and cannot be decoded");
+    registry
+        .execute(
+            "UPDATE session_invitations SET invitation_id = ?1, grant_id = ?2
+              WHERE invitation_id = ?3",
+            rusqlite::params![
+                earlier_invitation.get().as_bytes().as_slice(),
+                earlier_grant.get().as_bytes().as_slice(),
+                invitation_id.get().as_bytes().as_slice()
+            ],
+        )
+        .expect("the invitation keeps the identity an earlier build gave it");
+    registry
+        .execute(
+            "UPDATE authority_receipts SET result = NULL, recorded_at_ms = NULL
+              WHERE actor_id = ?1 AND action_id = ?2",
+            rusqlite::params![owner.as_str(), first.action_id.get().as_bytes().as_slice()],
+        )
+        .expect("the claim never recorded its answer");
+    drop(registry);
+
+    let told = refusal_in(
+        world
+            .controller
+            .retained_authority_answer(&owner, &first)
+            .await,
+    );
+    assert_eq!(
+        told.code,
+        ErrorCode::OutcomeUnknown,
+        "a share that cannot be read is not one that was not made: {told:?}"
+    );
+}
+
 /// KR-REQ-23.24: a share that is there and cannot be read back is not called unperformed. The grant
 /// is read and its invitation is not, so what the repeat finds says nothing of whether the share was
 /// written: it is told that what became of the action is not known, and once the invitation can be
