@@ -2016,6 +2016,16 @@ impl Owner {
 
     /// Native code answered the proof the first collection asked for.
     fn on_proof(&mut self, id: &str, result: std::result::Result<CaptureProof, CallFailure>) {
+        // What a proof of this call shows of capture taints the call at once, whether or not the
+        // delegation that asked for it still waits, and before the news is read up to its marker:
+        // a request waiting for the connection's turn under an earlier, clean proof is then never
+        // written. The marker is what a set is accepted by, not what a break is refused by.
+        if let Ok(proof) = &result
+            && Some(&proof.call) == self.call.as_ref()
+        {
+            let told = self.gate.note_record(Record::of(proof));
+            self.after_gate(told);
+        }
         let Some(position) = self.collections.iter().position(|collection| {
             collection.id == id && matches!(collection.stage, Stage::Draining { .. })
         }) else {
@@ -2026,11 +2036,7 @@ impl Owner {
                 if let Stage::Draining { token, record, .. } = &mut self.collections[position].stage
                 {
                     *token = proof.barrier;
-                    *record = Some(Record {
-                        openings: proof.openings,
-                        breaks: proof.breaks,
-                        capturing: proof.state == CaptureState::Capturing,
-                    });
+                    *record = Some(Record::of(&proof));
                 }
                 self.try_finish();
             }

@@ -202,6 +202,17 @@ pub(super) struct Record {
     pub capturing: bool,
 }
 
+impl Record {
+    /// What a capture proof's record shows.
+    pub(super) fn of(proof: &CaptureProof) -> Self {
+        Self {
+            openings: proof.openings,
+            breaks: proof.breaks,
+            capturing: proof.state == CaptureState::Capturing,
+        }
+    }
+}
+
 /// What a frozen set came to.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Frozen {
@@ -292,6 +303,20 @@ impl Gate {
         // A call that can no longer act has no use for what it heard.
         self.kept.clear();
         Told::Tainted(cause)
+    }
+
+    /// What a capture proof for this call shows of capture, as the owner reads it. An opening that
+    /// is not the only one, or a break, taints the call at once, so that nothing waiting to be
+    /// written is written after it; the news read up to the proof's marker is still what a set is
+    /// vouched for by, and this only ever stops one.
+    pub(super) fn note_record(&mut self, record: Record) -> Told {
+        if record.openings != 1 {
+            self.taint_with(Cause::Openings)
+        } else if record.breaks != 0 || !record.capturing {
+            self.taint_with(Cause::CaptureBreak)
+        } else {
+            Told::Nothing
+        }
     }
 
     /// The owner read news that capture is on.
@@ -441,11 +466,7 @@ impl Gate {
             self.frozen_to
                 .map_or(offset_ms, |frozen| frozen.max(offset_ms)),
         );
-        if record.openings != 1 {
-            self.taint_with(Cause::Openings);
-        } else if record.breaks != 0 || !record.capturing {
-            self.taint_with(Cause::CaptureBreak);
-        }
+        self.note_record(record);
         if let Some(cause) = self.taint {
             return Frozen::Refused(cause);
         }

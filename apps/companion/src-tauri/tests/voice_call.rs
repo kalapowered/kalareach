@@ -5682,6 +5682,43 @@ async fn a_capture_change_while_the_request_waits_for_the_writer_stops_the_write
     scene.stop_host().await;
 }
 
+/// A proof that shows a break stops what waits to be written at once, and not when the news up to
+/// its marker has been read: the first request was composed under a clean proof and waits for the
+/// connection's turn, a second delegation's proof shows a gap that no news told, and the news behind
+/// that proof's marker is never read. The first request is never written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proof_that_shows_a_break_stops_a_request_waiting_for_the_writer() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    let first = speak(&scene, 6_000, "what is the status");
+    scene.link.hold_next_request(HostMethod::VoiceDelegate);
+    ask(&scene, "d-1", first - 200).await;
+    scene.link.until_request_held().await;
+    let second = speak(&scene, 12_000, "status");
+    scene.platform.hold("capture_proof");
+    ask(&scene, "d-2", second - 200).await;
+    until_proofs_are_asked(&scene, 3).await;
+    scene.platform.hold_news();
+    scene.platform.show_a_gap_in_progress();
+    scene.platform.release("capture_proof");
+    until_proof_handled(&scene, "d-2").await;
+    scene.link.release_request();
+    scene.link.until_the_held_request_has_passed().await;
+
+    assert_eq!(at_the_host(&scene), 0, "nothing reached the host");
+    let row = row_settled(&scene, "d-1").await;
+    assert_eq!(row["state"], "not_sent", "{row}");
+    assert_eq!(row["cause"], "capture_break");
+    let later = row_settled(&scene, "d-2").await;
+    assert_eq!(later["state"], "refused", "{later}");
+    assert_eq!(later["cause"], "capture_break");
+    assert!(kinds_of(&scene.state()).contains(&"spoken_requests".to_owned()));
+    scene.platform.release_news();
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
 /// A gap the capture record shows when the proof is taken just before the write, with the recorder
 /// still delivering and no news of it, stops the write: the proof's own fields are read, and not
 /// only how young it is.
