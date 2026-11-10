@@ -1452,6 +1452,10 @@ mod the_fence_at_every_effect;
 #[cfg(test)]
 mod a_peer_that_stops_reading;
 
+/// A local connection whose serving loop is ended while the daemon is still held.
+#[cfg(test)]
+mod a_connection_cut_off_with_its_loop;
+
 /// What a local caller is told when the local owner's lease ends before its mutation's answer is
 /// written.
 #[cfg(test)]

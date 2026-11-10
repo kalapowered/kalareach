@@ -207,8 +207,7 @@ async fn a_registered_host_serves_an_authorised_connection_and_ends_it_cleanly()
 /// close, the handle's release), never a length of time: a task is cancelled at the runtime's next
 /// turn, so the case gives the runtime its turns until the condition holds. The bound only stops a
 /// hang.
-#[tokio::test]
-async fn a_listener_that_goes_ends_the_connections_it_serves() {
+async fn a_listener_that_goes(let_go: impl FnOnce(NetworkListener)) {
     let (host, client) = paired_pair().await;
     let handler = Arc::new(TestHandler::new(client.record));
     let held = Arc::downgrade(&handler);
@@ -232,7 +231,7 @@ async fn a_listener_that_goes_ends_the_connections_it_serves() {
         }
         // From here only the listener's tasks hold the handler.
         drop(handler);
-        drop(listener);
+        let_go(listener);
         let closed = connection.closed().await;
         while held.upgrade().is_some() {
             tokio::task::yield_now().await;
@@ -249,6 +248,24 @@ async fn a_listener_that_goes_ends_the_connections_it_serves() {
         ),
         "the peer was closed as a lost control stream is: {ended:?}"
     );
+}
+
+#[tokio::test]
+async fn a_listener_that_goes_ends_the_connections_it_serves() {
+    a_listener_that_goes(drop).await;
+}
+
+/// The same when the listener is dropped on a thread that is not the runtime's, which a host that
+/// is let go by synchronous code does while its runtime is still running.
+#[tokio::test]
+async fn a_listener_dropped_outside_the_runtime_ends_the_connections_it_serves_and_tells_its_peers()
+{
+    a_listener_that_goes(|listener| {
+        std::thread::spawn(move || drop(listener))
+            .join()
+            .expect("the listener is dropped");
+    })
+    .await;
 }
 
 /// KR-REQ-23.18: losing the control stream alone is enough. With the connection itself left open,
