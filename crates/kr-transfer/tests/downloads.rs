@@ -1114,6 +1114,7 @@ fn an_upload_stays_outside_repositories_and_is_reached_through_a_narrow_grant() 
                 text: "look".to_owned(),
             },
             None,
+            None,
         )
         .expect("creates the draft")
         .draft;

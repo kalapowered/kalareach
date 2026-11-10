@@ -47,6 +47,7 @@ fn draft(harness: &Harness) -> kr_protocol::transfer::DraftRecord {
                 text: "have a look at this".to_owned(),
             },
             None,
+            None,
         )
         .expect("creates the draft")
         .draft
@@ -593,6 +594,7 @@ fn a_binding_needs_one_principal_and_one_session() {
                 text: "not this session".to_owned(),
             },
             None,
+            None,
         )
         .expect("creates the draft")
         .draft;
@@ -625,6 +627,7 @@ fn a_binding_needs_one_principal_and_one_session() {
                 application_instance_id: Nullable::null(),
                 text: "someone else's draft".to_owned(),
             },
+            None,
             None,
         )
         .expect("creates their draft")
@@ -660,6 +663,7 @@ fn a_binding_needs_one_principal_and_one_session() {
                 application_instance_id: Nullable::null(),
                 text: "this session".to_owned(),
             },
+            None,
             None,
         )
         .expect("creates the draft")
@@ -839,6 +843,7 @@ fn ending_a_session_fails_only_the_insertions_its_agent_never_confirmed() {
                     text: "for the session".to_owned(),
                 },
                 None,
+                None,
             )
             .expect("creates the draft")
             .draft
@@ -855,6 +860,7 @@ fn ending_a_session_fails_only_the_insertions_its_agent_never_confirmed() {
                     application_instance_id: Nullable::null(),
                     text: "no session yet".to_owned(),
                 },
+                None,
                 None,
             )
             .expect("creates the draft")
@@ -1056,6 +1062,7 @@ fn ending_a_session_fails_an_insertion_whose_upload_it_owns_though_the_draft_nam
                 text: "names no session".to_owned(),
             },
             None,
+            None,
         )
         .expect("creates the draft")
         .draft;
@@ -1166,6 +1173,7 @@ fn ending_a_session_fails_its_unconfirmed_insertion_and_leaves_a_full_draft_read
                 application_instance_id: Nullable::null(),
                 text: "for a session that is gone".to_owned(),
             },
+            None,
             None,
         )
         .expect_err("a draft for an ended session is refused");
@@ -1304,6 +1312,7 @@ fn ending_a_session_fails_an_insertion_by_its_draft_when_its_upload_names_no_ses
                     application_instance_id: Nullable::null(),
                     text: "a draft".to_owned(),
                 },
+                None,
                 None,
             )
             .expect("creates the draft")
@@ -1517,6 +1526,7 @@ fn a_draft_for_another_application_is_a_conflict_and_a_wrong_session_keeps_its_o
                     text: "have a look at this".to_owned(),
                 },
                 None,
+                None,
             )
             .expect("creates the draft")
             .draft
@@ -1548,4 +1558,187 @@ fn a_draft_for_another_application_is_a_conflict_and_a_wrong_session_keeps_its_o
     // A draft that names no application is sent by a prompt for any.
     let open = create(Nullable::null());
     record(&open, session, elsewhere).expect("a draft that names no application goes to any");
+}
+
+/// A draft for no session, made for `actor` with at most `limit` open drafts.
+fn a_sessionless_draft(
+    harness: &Harness,
+    actor: &kr_protocol::ids::ActorId,
+    limit: Option<u64>,
+) -> Result<kr_protocol::transfer::DraftRecord, kr_transfer::TransferError> {
+    harness
+        .service
+        .draft_create(
+            actor,
+            &DraftCreateParams {
+                environment_id: harness.environment_id(),
+                device_id: Nullable::null(),
+                session_id: Nullable::null(),
+                application_instance_id: Nullable::null(),
+                text: "an open draft".to_owned(),
+            },
+            None,
+            limit,
+        )
+        .map(|created| created.draft)
+}
+
+/// KR-REQ-23.41: the drafts a principal holds open are bounded when the caller asks for a bound,
+/// and the refusal is the service's quota code in words that name the bound. The control is the
+/// same creates with no bound, which are all served: the person at this machine is not held to
+/// one.
+#[test]
+fn a_create_past_the_bound_is_refused_under_the_quota_code_naming_the_bound() {
+    let harness = Harness::create();
+    let device = kr_protocol::ids::ActorId::new("device:bounded").expect("a principal");
+    for _ in 0..3 {
+        a_sessionless_draft(&harness, &device, Some(3)).expect("a place is free");
+    }
+    let refused = a_sessionless_draft(&harness, &device, Some(3)).expect_err("no place is free");
+    assert_eq!(refused.code(), ErrorCode::QuotaExceeded);
+    assert!(
+        refused.to_string().contains("3 of the 3"),
+        "the words name the bound: {refused}"
+    );
+
+    for _ in 0..6 {
+        a_sessionless_draft(&harness, &harness.actor, None).expect("no bound");
+    }
+}
+
+/// KR-REQ-23.41: a draft counts against the principal that made it and no other, and every one
+/// of them is counted whichever session it targets.
+#[test]
+fn one_principals_open_drafts_are_not_counted_against_another() {
+    let harness = Harness::create();
+    let first = kr_protocol::ids::ActorId::new("device:first").expect("a principal");
+    let second = kr_protocol::ids::ActorId::new("device:second").expect("a principal");
+    for _ in 0..2 {
+        a_sessionless_draft(&harness, &first, Some(2)).expect("a place is free");
+    }
+    a_sessionless_draft(&harness, &first, Some(2)).expect_err("the first device is at its bound");
+    for _ in 0..2 {
+        a_sessionless_draft(&harness, &second, Some(2))
+            .expect("the second device holds none of the first's places");
+    }
+}
+
+/// KR-REQ-23.41: a draft stops counting when a prompt sends it to a session, which is how a device
+/// ends one, and the places it frees are the ones it held: a draft that was not sent still counts.
+#[test]
+fn a_draft_a_prompt_has_sent_stops_counting_against_the_bound() {
+    let harness = Harness::create();
+    let device = kr_protocol::ids::ActorId::new("device:sending").expect("a principal");
+    let session = SessionId::new(Uuid::from_bytes([4; 16]));
+    let first = a_sessionless_draft(&harness, &device, Some(2)).expect("a place is free");
+    a_sessionless_draft(&harness, &device, Some(2)).expect("a place is free");
+    a_sessionless_draft(&harness, &device, Some(2)).expect_err("at the bound");
+
+    assert_eq!(
+        harness
+            .service
+            .record_prompt(
+                &device,
+                first.draft_id,
+                session,
+                crate::support::an_application(),
+                &Admission::none(),
+            )
+            .expect("the prompt sends the draft"),
+        0,
+        "no attachment moves with it"
+    );
+    a_sessionless_draft(&harness, &device, Some(2)).expect("the sent draft's place is free");
+    a_sessionless_draft(&harness, &device, Some(2)).expect_err("and only that one");
+}
+
+/// KR-REQ-23.41: a draft stops counting when the session it targets ends, whether or not it holds
+/// anything, and a draft for another session still counts.
+#[test]
+fn a_draft_whose_session_has_ended_stops_counting_against_the_bound() {
+    let harness = Harness::create();
+    let device = kr_protocol::ids::ActorId::new("device:ending").expect("a principal");
+    let ending = SessionId::new(Uuid::from_bytes([5; 16]));
+    let staying = SessionId::new(Uuid::from_bytes([6; 16]));
+    let create_for = |session: SessionId, limit: Option<u64>| {
+        harness.service.draft_create(
+            &device,
+            &DraftCreateParams {
+                environment_id: harness.environment_id(),
+                device_id: Nullable::null(),
+                session_id: Nullable::some(session),
+                application_instance_id: Nullable::null(),
+                text: "for a session".to_owned(),
+            },
+            None,
+            limit,
+        )
+    };
+    create_for(ending, Some(2)).expect("a place is free");
+    create_for(staying, Some(2)).expect("a place is free");
+    create_for(staying, Some(2)).expect_err("at the bound");
+
+    harness
+        .service
+        .end_session_insertions(&std::collections::BTreeSet::from([ending]))
+        .expect("the session's end is recorded");
+    create_for(staying, Some(2)).expect("the ended session's draft stopped counting");
+    create_for(staying, Some(2)).expect_err("the draft for the other session still counts");
+}
+
+/// KR-REQ-23.41 and section 9: a repeat of the create that took the last place is answered with the
+/// draft it made, and is not refused for the bound it filled; a create under a new identifier is
+/// refused, and that refusal writes no record, so the identifier it carried is free for a create
+/// that has a place.
+#[test]
+fn a_repeat_of_the_create_that_took_the_last_place_is_answered_from_its_record() {
+    let harness = Harness::create();
+    let device = kr_protocol::ids::ActorId::new("device:repeating").expect("a principal");
+    let action_for = |payload: &[u8]| Action {
+        actor_id: device.clone(),
+        action_id: kr_ipc::new_uuid(),
+        method: "draft.create".to_owned(),
+        payload_digest: support::digest(payload),
+        admission: Admission::none(),
+    };
+    let params = DraftCreateParams {
+        environment_id: harness.environment_id(),
+        device_id: Nullable::null(),
+        session_id: Nullable::null(),
+        application_instance_id: Nullable::null(),
+        text: "the last place".to_owned(),
+    };
+    let last = action_for(b"the last place");
+    let made = harness
+        .service
+        .draft_create(&device, &params, Some(&last), Some(1))
+        .expect("the one place is free");
+    let again = harness
+        .service
+        .draft_create(&device, &params, Some(&last), Some(1))
+        .expect("the repeat is answered from the record");
+    assert_eq!(again, made, "one action, one draft");
+
+    let refused_action = action_for(b"the last place");
+    let refused = harness
+        .service
+        .draft_create(&device, &params, Some(&refused_action), Some(1))
+        .expect_err("a new action finds no place");
+    assert_eq!(refused.code(), ErrorCode::QuotaExceeded);
+
+    // Taking the place back, the identifier the refusal carried makes its draft.
+    harness
+        .service
+        .record_prompt(
+            &device,
+            made.draft.draft_id,
+            SessionId::new(Uuid::from_bytes([7; 16])),
+            crate::support::an_application(),
+            &Admission::none(),
+        )
+        .expect("the prompt sends the draft");
+    harness
+        .service
+        .draft_create(&device, &params, Some(&refused_action), Some(1))
+        .expect("the refusal wrote no record, so the identifier is free");
 }

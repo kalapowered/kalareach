@@ -1930,16 +1930,25 @@ impl TransferService {
 
     /// Creates a durable draft.
     ///
+    /// `open_limit` is how many open drafts `actor` may hold, `None` for an actor with no bound. A
+    /// draft is open until a prompt sends it to a session or its target session ends. The count
+    /// and the write are one transaction, taken after the host has been asked about the action's
+    /// admission, so an actor whose admission no longer stands is told that and never how many
+    /// drafts it holds. A repeat of a create this service already performed is answered from its
+    /// record, before the count.
+    ///
     /// # Errors
     ///
     /// Returns [`TransferError::WrongEnvironment`] for another environment,
-    /// [`TransferError::SessionEnded`] when the draft targets a session that has ended, or
+    /// [`TransferError::SessionEnded`] when the draft targets a session that has ended,
+    /// [`TransferError::QuotaExceeded`] when `actor` already holds `open_limit` open drafts, or
     /// [`TransferError::StoreUnavailable`] when the write fails.
     pub fn draft_create(
         &self,
         actor: &ActorId,
         params: &DraftCreateParams,
         action: Option<&Action>,
+        open_limit: Option<u64>,
     ) -> Result<DraftCreateResult> {
         self.check_environment(params.environment_id)?;
         let now = self.clock.now_ms();
@@ -1977,7 +1986,9 @@ impl TransferService {
             return Ok(answered);
         }
         ask_admission(action)?;
-        let outcome = commit_admitted(action, || store.insert_draft(&row, retained.as_ref()))?;
+        let outcome = commit_admitted(action, || {
+            store.insert_draft(&row, retained.as_ref(), open_limit)
+        })?;
         drop(store);
         match outcome {
             // The guard above is dropped with the statement, so reading the retained record does

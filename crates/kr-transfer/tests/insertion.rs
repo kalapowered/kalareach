@@ -56,6 +56,7 @@ fn draft_for(harness: &Harness, session: Option<SessionId>) -> DraftRecord {
                 text: "a private draft, never shown to a worker".to_owned(),
             },
             None,
+            None,
         )
         .expect("creates the draft")
         .draft
@@ -1349,6 +1350,7 @@ fn a_draft_is_not_made_for_a_session_that_has_ended() {
                 application_instance_id: Nullable::null(),
                 text: "for a session that is gone".to_owned(),
             },
+            None,
             None,
         )
         .expect_err("a session that has ended");

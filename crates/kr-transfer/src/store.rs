@@ -2321,18 +2321,39 @@ impl Store {
 
     /// Records a new draft and the event that announces it, in one transaction.
     ///
+    /// `open_limit` is how many open drafts the actor may hold. The count and the insert are one
+    /// write transaction, which takes the journal's write lock when it begins, so no other write
+    /// can come between them: two creates that each find one place left cannot both take it. An
+    /// action this journal already holds is answered before the count, because the draft it made
+    /// is one of those counted.
+    ///
     /// # Errors
     ///
-    /// Returns [`TransferError::SessionEnded`] when the draft targets a session that has ended, and
+    /// Returns [`TransferError::SessionEnded`] when the draft targets a session that has ended,
+    /// [`TransferError::QuotaExceeded`] when the actor already holds `open_limit` open drafts, and
     /// [`TransferError::StoreUnavailable`] when the write fails.
     pub fn insert_draft(
         &mut self,
         row: &DraftRow,
         action: Option<&RetainedAction>,
+        open_limit: Option<u64>,
     ) -> Result<ActionOutcome> {
         let transaction = self.begin()?;
         if claim_action(&transaction, action)? == ActionOutcome::AlreadyPerformed {
             return Ok(ActionOutcome::AlreadyPerformed);
+        }
+        if let Some(limit) = open_limit {
+            let open = open_drafts(&transaction, &row.actor_id)?;
+            if open >= limit {
+                // Dropping the transaction takes the action's claim back with it, so a refused
+                // create leaves no record and no draft.
+                return Err(TransferError::QuotaExceeded {
+                    detail: format!(
+                        "this device holds {open} of the {limit} drafts it may keep open: a draft \
+                         stops counting when a prompt sends it or its session ends"
+                    ),
+                });
+            }
         }
         transaction
             .execute(
@@ -3205,6 +3226,24 @@ fn refuse_ended_session(
     } else {
         Ok(())
     }
+}
+
+/// How many drafts an actor holds open: the ones no prompt has sent to a session and whose target
+/// session has not ended. A sent draft belongs to its session from then on, and a draft whose
+/// target ended is orphaned in the same transaction that records the end, so neither can be
+/// written to again and neither takes a place.
+fn open_drafts(connection: &Connection, actor_id: &ActorId) -> Result<u64> {
+    let open: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM drafts
+              WHERE actor_id = ?1 AND state <> 'orphaned'
+                AND NOT EXISTS (SELECT 1 FROM draft_prompts
+                                 WHERE draft_prompts.draft_id = drafts.draft_id)",
+            params![actor_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(TransferError::store)?;
+    Ok(from_i64(open))
 }
 
 /// Whether a session a draft targets, was sent to, or whose upload it holds has ended.
@@ -4137,6 +4176,7 @@ mod tests {
                     created_at_ms: TimestampMs::new(1000),
                     updated_at_ms: TimestampMs::new(1000),
                 },
+                None,
                 None,
             )
             .expect("writes");

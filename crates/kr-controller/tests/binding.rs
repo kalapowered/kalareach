@@ -563,6 +563,7 @@ impl Hosted {
                     text: "have a look at this".to_owned(),
                 },
                 None,
+                None,
             )
             .expect("creates the draft")
             .draft;
