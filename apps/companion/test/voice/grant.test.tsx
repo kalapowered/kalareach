@@ -385,6 +385,37 @@ describe('allowing voice for the first time', () => {
     }
   })
 
+  // A connection that drops while the sessions are read leaves the step saying so, and not that it
+  // is still reading; the person reads them again.
+  it('says the sessions could not be read, and reads them again', async () => {
+    const { port } = fakeHost()
+    let asked = 0
+    const dropping: HostPort = {
+      ...port,
+      connectionState: async () => {
+        asked += 1
+        const state = await port.connectionState()
+        // The connection is down when the list has been read, and up again by the next read.
+        return asked === 2 ? { ...state, connected: false } : state
+      }
+    }
+    render(
+      <VoiceGrantStep port={dropping} refusal={null} named={[]} moves={() => 0} onAllowed={vi.fn()} />
+    )
+
+    expect(await screen.findByTestId('voice-sessions-failure')).toBeInTheDocument()
+    expect(screen.queryByText(/Reading the host/)).toBeNull()
+    expect(screen.getByTestId('voice-allow')).toBeDisabled()
+
+    await userEvent.click(screen.getByTestId('voice-sessions-reread'))
+
+    expect((await screen.findAllByRole('checkbox')).length).toBeGreaterThan(0)
+    await waitFor(() => {
+      expect(screen.getByTestId('voice-allow')).toBeEnabled()
+    })
+    expect(screen.queryByTestId('voice-sessions-failure')).toBeNull()
+  })
+
   // The sessions the person allowed on one host are not asked about on the next: the voice screen
   // asks the host it was moved to about what it shows, and names none the person chose elsewhere.
   it('asks about none of the sessions allowed on a host the connection has left', async () => {

@@ -98,6 +98,12 @@ export function VoiceGrantStep({
   const [allowedIds, setAllowedIds] = useState<readonly string[] | null>(null)
   /** The count of moves the held grant was submitted under. */
   const [allowedUnder, setAllowedUnder] = useState(0)
+  /** Why the host's sessions could not be read, until they are, and how often they were asked for. */
+  const [listFailed, setListFailed] = useState<{ readonly reads: number; readonly words: string } | null>(
+    null
+  )
+  const [reads, setReads] = useState(0)
+  const listFailure = listFailed?.reads === reads ? listFailed.words : null
   const continueButton = useRef<HTMLButtonElement | null>(null)
   /** Whether the step is still shown: an answer that comes after it is gone is nobody's. */
   const mounted = useRef(true)
@@ -122,7 +128,7 @@ export function VoiceGrantStep({
       (read) => {
         if (!current) return
         if (read === null) {
-          setFailure(HOST_CHANGED_WORDS)
+          setListFailed({ reads, words: HOST_CHANGED_WORDS })
           return
         }
         const listed = read.choices
@@ -137,13 +143,13 @@ export function VoiceGrantStep({
         )
       },
       (error: unknown) => {
-        if (current) setFailure(failureMessage(error))
+        if (current) setListFailed({ reads, words: failureMessage(error) })
       }
     )
     return () => {
       current = false
     }
-  }, [named, port])
+  }, [named, port, reads])
 
   // The result is read before the call is shown, and the way on is the one control left to press.
   useEffect(() => {
@@ -237,7 +243,25 @@ export function VoiceGrantStep({
       <section className="kr-voice__panel" aria-labelledby={`${id}-sessions`}>
         <h2 id={`${id}-sessions`}>Which sessions it may reach</h2>
         {choices === null ? (
-          <p className="kr-voice__note">Reading the host’s sessions…</p>
+          listFailure === null ? (
+            <p className="kr-voice__note">Reading the host’s sessions…</p>
+          ) : (
+            <>
+              <p className="kr-voice__refusal" role="status" data-testid="voice-sessions-failure">
+                {listFailure}
+              </p>
+              <button
+                type="button"
+                className="kr-voice__start"
+                onClick={() => {
+                  setReads((count) => count + 1)
+                }}
+                data-testid="voice-sessions-reread"
+              >
+                Read the sessions again
+              </button>
+            </>
+          )
         ) : choices.length === 0 ? (
           <p className="kr-voice__note" data-testid="voice-no-sessions">
             This host has no sessions yet. Start one, then come back.

@@ -124,8 +124,9 @@ pub(super) enum Cause {
     /// in time, a refusal, or an answer for another session), so nobody was asked: a confirmation
     /// the person cannot tell the target of is not asked for.
     SessionNotNamed,
-    /// The call ended while the confirmation was open: while the person was being asked, or after
-    /// they confirmed and before the signature was sent.
+    /// The call ended while the confirmation was open: while the session's number was being read,
+    /// while the person was being asked, or after they confirmed and before the signature was
+    /// sent.
     CallEnded,
 }
 
