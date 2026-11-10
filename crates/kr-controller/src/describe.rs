@@ -369,7 +369,7 @@ impl DescribeModule {
     /// Waits until the host has taken everything posted to it so far and published the turn that
     /// took it, for as long as the host takes: the bound is the caller's, a limit on a host that
     /// never answers and not on one that is slow, which the product's own deadline for an answer
-    /// to a client ([`SETTINGS_WAIT`]) would fail. Returns whether the host answered, which a host
+    /// to a client (`SETTINGS_WAIT`) would fail. Returns whether the host answered, which a host
     /// that does not run, or that stops while it is waited for, does as it has nothing more to
     /// take; `false` says only that the bound passed first. For this crate's own tests.
     #[cfg(feature = "testing")]
