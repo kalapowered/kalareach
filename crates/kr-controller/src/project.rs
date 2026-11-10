@@ -842,7 +842,10 @@ fn kept(
 /// it is then no word about an action that never began: the first attempt did. What the journal
 /// holds is read once, after the refusal: a claim still open tells the copy that what became of the
 /// action is not known, a claim the first attempt has settled since is the copy's answer, and no
-/// claim leaves the refusal as it is, as for any first action.
+/// claim leaves the refusal as it is, as for any first action. What the journal holds goes back
+/// only under the authority the copy arrived under: a claim still open is told only while
+/// `retained` says it stands, and a settled record is a copy, which [`ProjectModule::write`]
+/// holds to the same check.
 #[expect(
     clippy::too_many_arguments,
     reason = "the action's identity, the two questions its admission answers and the flag that \
