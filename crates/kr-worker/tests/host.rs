@@ -1844,8 +1844,7 @@ async fn a_worker_that_cannot_reach_its_controller_says_why_and_ends_whatever_it
 
 /// KR-REQ-05.08: an idle session that has been asked to run nothing is its worker and its root
 /// shell, and no backend, Wasm instance or model is created for it. This case shows the part of
-/// the sentence that a creation shows, on a Unix host, once the session has ended and the daemon
-/// has let it go:
+/// the sentence that a creation shows, once the session has ended and the daemon has let it go:
 ///
 /// - The daemon asked its supervisor to start the worker and nothing else, published no plugin
 ///   host (the one process that runs a Wasm instance), and was asked for none by the worker. The
@@ -1865,15 +1864,20 @@ async fn a_worker_that_cannot_reach_its_controller_says_why_and_ends_whatever_it
 ///   is: with one held, whether a description is queued for an idle session is not shown here.
 /// - What no place writes is not shown by the record: the daemon's other starts (service-manager
 ///   calls, vendor bridge helpers, power and desktop queries, git, terminal windows), which are
-///   not children of the worker, and every start on Windows. The process table read beside the
-///   session finds what the worker's own processes leave in their parent, their directory or their
-///   environment while they run, over the time the reads take (about a second on Linux, several
-///   seconds on macOS), which no case controls. A Wasm instance or a model in the worker's or the
-///   daemon's own process is shown by what neither links (`trusted_core.rs`).
+///   not children of the worker. The process table read beside the session finds what the
+///   worker's own processes leave in their parent, their directory or their environment while
+///   they run, over the time the reads take (about a second on Linux, several seconds on macOS),
+///   which no case controls. A Wasm instance or a model in the worker's or the daemon's own
+///   process is shown by what neither links (`trusted_core.rs`).
 ///
-/// On Windows the case reads the worker's children by their recorded parent, which leaves the
-/// pseudo-console's host and nothing else, and does not see a process that a child of the worker
-/// left running, nor a creation: the record is not written there.
+/// On Windows the places that write are the worker's root shell (the start of the shell in its
+/// pseudo-console), its backend probe, the check of the kernel's clock it makes the first time it
+/// orders a start, and its query of the time service; the description process is the daemon's, as
+/// on Unix. The worker asks its platform no question there and runs no backend server, which is
+/// run only on a Unix host, so the record holds the root shell once and the clock check at most
+/// once, and nothing else. The worker's children are read as well, by their recorded parent, which
+/// leaves the pseudo-console's host and nothing else, and does not see a process that a child of
+/// the worker left running.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_idle_session_runs_nothing_beside_its_shell() {
     let host = Host::create().recording_launches().recording_creations();
