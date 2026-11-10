@@ -86,8 +86,8 @@ export interface VoiceSurfaceProps {
   /** The turn a cancellation would name, when the host has published one. */
   readonly currentTurn: CurrentTurn | null
   /**
-   * Why no turn is offered, when the screen knows a reason other than the host not having said
-   * which turn the agent is on. Without one the screen says that.
+   * Why no turn is offered, when the screen knows. Without one the screen says that it has not
+   * yet read which turn the agent is on.
    */
   readonly noTurnBecause?: string | null
   /** True while a request this screen made is in flight. */
@@ -769,7 +769,7 @@ function CallScreen({
         {!currentTurn && (
           <p className="kr-voice__note">
             {noTurnBecause ??
-              'The host has not said which turn the agent is on, so there is no turn to cancel from here.'}
+              'The screen has not yet read which turn the agent is on, so there is no turn to cancel from here.'}
           </p>
         )}
         {confirmingCancel ? (

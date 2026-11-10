@@ -141,19 +141,32 @@ function cancellationAnswerWords(answer: Answer): string {
 const SEVERAL_SESSIONS_WORDS =
   'This call reaches more than one session, so there is no one turn to cancel from here.'
 
+/** What the screen says when the read found no live agent in the session. */
+const NO_AGENT_WORDS = 'No agent is running in this session, so there is no turn to cancel from here.'
+
+/** What the screen says when the agent is on no turn. */
+const NO_TURN_WORDS = 'The agent is not running a turn, so there is no turn to cancel from here.'
+
+/** What the screen says when it could not read the agent. */
+const UNREAD_WORDS =
+  'The screen could not read which turn the agent is on, so there is no turn to cancel from here.'
+
 /**
- * The turn a cancellation names, and the reason none is offered when the agent is on one.
+ * The turn a cancellation names, and the reason none is offered.
  *
  * A turn is offered on the rule the composer offers its interrupt by: the binding is one the host
- * verified, the agent's cancel capability is usable now, and this device holds the right. Where
- * the agent is on no turn there is nothing to say beyond that the host named none.
+ * verified, the agent's cancel capability is usable now, and this device holds the right. Each
+ * way there is none says which it is: no live agent, an agent on no turn, a read that failed, or
+ * the composer's reason.
  */
 function cancellationFrom(
   sessionId: string,
-  read: AgentRead | null,
+  read: AgentRead | 'none' | 'failed',
   rights: readonly ActionRight[] | null
 ): { readonly turn: CurrentTurn | null; readonly because: string | null } {
-  if (read === null || read.binding.turn_id === null) return { turn: null, because: null }
+  if (read === 'none') return { turn: null, because: NO_AGENT_WORDS }
+  if (read === 'failed') return { turn: null, because: UNREAD_WORDS }
+  if (read.binding.turn_id === null) return { turn: null, because: NO_TURN_WORDS }
   const offer = composerOffers({
     known: true,
     binding: read.binding,
@@ -359,7 +372,7 @@ export function VoiceRoute({
   const turnSession = reached.length === 1 ? (reached[0] ?? null) : null
   const [turnRead, setTurnRead] = useState<{
     readonly session: string
-    readonly read: AgentRead | null
+    readonly read: AgentRead | 'none' | 'failed'
   } | null>(null)
   const cancellation = useMemo(
     () =>
@@ -380,10 +393,10 @@ export function VoiceRoute({
       if (newest === null) return Promise.resolve()
       return ask(() => readAgent(port, session))
         .then((read) => {
-          if (newest()) setTurnRead({ session, read })
+          if (newest()) setTurnRead({ session, read: read ?? 'none' })
         })
         .catch(() => {
-          if (newest()) setTurnRead({ session, read: null })
+          if (newest()) setTurnRead({ session, read: 'failed' })
         })
     }, AGENT_READ_CADENCE_MS)
     watching = watch(

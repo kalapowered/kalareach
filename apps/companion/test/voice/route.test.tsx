@@ -694,7 +694,7 @@ describe('while a call is running', () => {
     await waitFor(() => {
       expect(askToCancel()).toBeEnabled()
     })
-    expect(screen.queryByText(/has not said which turn the agent is on/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/no turn to cancel from here/)).not.toBeInTheDocument()
 
     const cancelled = vi.spyOn(port, 'composerInterrupt')
     await person.click(askToCancel())
@@ -842,7 +842,7 @@ describe('while a call is running', () => {
       expect(askToCancel()).toBeDisabled()
     })
     expect(screen.queryByRole('button', { name: 'Cancel this turn' })).not.toBeInTheDocument()
-    expect(screen.getByText(/has not said which turn the agent is on/)).toBeInTheDocument()
+    expect(screen.getByText(/could not read which turn the agent is on/)).toBeInTheDocument()
 
     unreadable.mockRestore()
     await readAgain()
@@ -868,6 +868,7 @@ describe('while a call is running', () => {
       expect(reads.count).toBe(1)
     })
     expect(askToCancel()).toBeDisabled()
+    expect(screen.getByText(/not yet read which turn the agent is on/)).toBeInTheDocument()
 
     reads.release()
     await waitFor(() => {
@@ -982,7 +983,7 @@ describe('while a call is running', () => {
 
     expect(askToCancel()).toBeDisabled()
     expect(screen.getByText(/reaches more than one session/)).toBeInTheDocument()
-    expect(screen.queryByText(/has not said which turn the agent is on/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/no turn to cancel from here/)).not.toBeInTheDocument()
   })
 
   // KR-REQ-15.22: the screen offers a cancellation on the rule the composer offers its interrupt
@@ -1024,7 +1025,7 @@ describe('while a call is running', () => {
 
     expect(await screen.findByText(words)).toBeInTheDocument()
     expect(askToCancel()).toBeDisabled()
-    expect(screen.queryByText(/has not said which turn the agent is on/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/no turn to cancel from here/)).not.toBeInTheDocument()
   })
 
   // KR-REQ-15.22: a session whose agent has ended has no instance to name, and the screen takes the
@@ -1044,7 +1045,7 @@ describe('while a call is running', () => {
     await waitFor(() => {
       expect(askToCancel()).toBeDisabled()
     })
-    expect(screen.getByText(/has not said which turn the agent is on/)).toBeInTheDocument()
+    expect(screen.getByText(/No agent is running in this session/)).toBeInTheDocument()
   })
 
   // KR-REQ-15.22: a cancellation is a typed request to the host naming the turn the agent is on.
@@ -1060,7 +1061,7 @@ describe('while a call is running', () => {
     await waitFor(() => {
       expect(askToCancel()).toBeDisabled()
     })
-    expect(screen.getByText(/has not said which turn the agent is on/)).toBeInTheDocument()
+    expect(screen.getByText(/not running a turn/)).toBeInTheDocument()
 
     controls.setConnected(false)
 

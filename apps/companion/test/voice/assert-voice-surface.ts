@@ -782,7 +782,7 @@ async function assertNoTurnToCancel(page: Page, base: string, target: Target): P
     heading(page, 'Voice session'),
     canPress(page, ['Cancel the current turn']),
     hostEndsItsTurn(page),
-    shows(page, 'has not said which turn the agent is on'),
+    shows(page, 'The agent is not running a turn'),
     cannotPress(page, 'Cancel the current turn'),
     inOwnSection(page, 'Cancel the current turn', 'Cancel what the agent is doing')
   ])

@@ -230,22 +230,27 @@ The call controls keep them strictly separated:
 The screen reads the instance, the revision and the turn from the session's worker while a call
 runs: first the session's live instance, then that instance's binding and capabilities
 (`agent.capabilities`). It reads again on the agent's cadence, when the host is reached again, and
-after each cancellation. The control is offered on the rule the composer offers its interrupt by: the
-agent is on a turn, the binding is one the host verified, the agent's cancel capability is usable
-now, and this device holds the right. When the agent is on a turn and one of the last three does not
-hold, the screen says which. Otherwise the control stays off with the words that the host has not
-said which turn the agent is on: the agent is on no turn, the session has no live instance, or the
-read failed. A call that reaches more than one session names no turn, and the screen says so rather
-than pick one.
+after each cancellation. The control is offered on the rule the composer offers its interrupt by:
+the agent is on a turn, the binding is one the host verified, the agent's cancel capability is
+usable now, and this device holds the right. Whenever the control is off, the screen says why: the
+agent is on no turn, the session has no live instance, the read failed, or, for a turn the agent is
+on, which of the last three does not hold. Before the first read has answered it says that it has
+not yet read the turn. A call that reaches more than one session names no turn, and the screen says
+so rather than pick one.
 
 The confirmation keeps the turn and revision it was opened on. The question is discarded, and has
-to be asked again, when a read shows another turn, revision or instance, no turn, or no answer, and
-when the offer is taken back: the binding is no longer verified, the cancel capability is no longer
-usable, or the connection no longer says this device holds the right, as when contact with the host
-is lost. When the host moved on before the screen read it, the request still names what the person
-was shown. The host refuses it, and the screen shows the host's words. The screen never reads the
-turn at the moment a person confirms. The host's answer to a cancellation is told only while the
-call it was asked on is still on screen.
+to be asked again, when a read shows another turn, revision or instance, or no turn, when a read
+fails, and when the offer is taken back: the binding is no longer verified, the cancel capability
+is no longer usable, or the connection no longer says this device holds the right, as when contact
+with the host is lost. When the host moved on before the screen read it, the request still names
+what the person was shown. The host refuses it, and the screen shows the host's words. The screen
+never reads the turn at the moment a person confirms.
+
+The screen tells the host's answer as it came. A cancellation the host took reads as asked. A
+refusal shows what the host said. An answer that carries no receipt and no result reads as not
+known: the screen does not say whether the turn was cancelled. The answer is told only while the
+call it was asked on is still on screen, and the same holds for the reply to a read of what the host
+selected.
 
 ## Device runs
 
