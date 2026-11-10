@@ -185,6 +185,10 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let paths = HostPaths::new(&arguments.runtime_dir, &arguments.state_dir)?;
     let environment = paths.environment(environment_id);
     environment.create()?;
+    // Where a test that asks what this worker created reads it. Without the feature there is no
+    // such record.
+    #[cfg(feature = "testing")]
+    kr_ipc::testing::created::here(environment.state_dir());
 
     let boot_identity = kr_ipc::identity::boot_identity()?;
     // The host's one reading of UTC in this boot, which the control daemon created before it asked

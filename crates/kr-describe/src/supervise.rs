@@ -875,6 +875,8 @@ impl Driver {
         if hold {
             kr_ipc::memory_limit::start_held(&mut command);
         }
+        #[cfg(feature = "testing")]
+        kr_ipc::testing::created::note_in(&self.launch.working_directory, "description", &command);
         let mut child = command.spawn().map_err(|error| {
             eprintln!(
                 "kr-describe: {} could not be started: {error}",

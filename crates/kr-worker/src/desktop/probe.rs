@@ -1325,13 +1325,16 @@ fn bounded(check: Check, program: &'static str, arguments: &[&str], plan: &Plan)
         // stream ends may be inheritable.
         #[cfg(windows)]
         let _inheriting = crate::windows::launch::inheriting();
-        std::process::Command::new(program)
+        let mut command = std::process::Command::new(program);
+        command
             .args(arguments)
             .current_dir(&plan.scratch)
             .stdin(std::process::Stdio::null())
             .stdout(out)
-            .stderr(err)
-            .spawn()
+            .stderr(err);
+        #[cfg(feature = "testing")]
+        kr_ipc::testing::created::note_here("check", &command);
+        command.spawn()
     };
     let Ok(mut child) = spawned else {
         return Run {

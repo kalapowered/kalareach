@@ -245,12 +245,15 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
     let started = {
         #[cfg(feature = "testing")]
         let program = probe_program(program);
-        std::process::Command::new(program)
+        let mut command = std::process::Command::new(program);
+        command
             .args(arguments)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::from(to_out))
-            .stderr(std::process::Stdio::from(to_err))
-            .spawn()
+            .stderr(std::process::Stdio::from(to_err));
+        #[cfg(feature = "testing")]
+        kr_ipc::testing::created::note_here("question", &command);
+        command.spawn()
     };
     let Ok(mut child) = started else {
         let _ = std::fs::remove_dir_all(&directory);

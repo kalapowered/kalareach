@@ -361,6 +361,8 @@ impl Server {
                 command.env(name, value);
             }
         }
+        #[cfg(feature = "testing")]
+        kr_ipc::testing::created::note_here("backend", command.as_std());
         let mut child = command.spawn().map_err(|error| {
             format!(
                 "{} could not be started: {error}",

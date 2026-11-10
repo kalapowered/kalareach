@@ -171,15 +171,18 @@ impl Process {
     fn start(executable: &Path, arguments: &[String], directory: &Path) -> std::io::Result<Self> {
         use std::os::unix::process::CommandExt as _;
 
-        let child = std::process::Command::new(executable)
+        let mut command = std::process::Command::new(executable);
+        command
             .args(arguments)
             .current_dir(directory)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             // A group of its own, so ending the probe ends what it started.
-            .process_group(0)
-            .spawn()?;
+            .process_group(0);
+        #[cfg(feature = "testing")]
+        kr_ipc::testing::created::note_here("backend-probe", &command);
+        let child = command.spawn()?;
         Ok(Self { child })
     }
 

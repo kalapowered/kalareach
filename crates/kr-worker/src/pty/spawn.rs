@@ -166,6 +166,8 @@ pub(super) fn start(
             kr_ipc::inheritance::mark_close_on_exec(&mut room)
         });
     }
+    #[cfg(feature = "testing")]
+    kr_ipc::testing::created::note_here("shell", &process);
     process.spawn()
 }
 
