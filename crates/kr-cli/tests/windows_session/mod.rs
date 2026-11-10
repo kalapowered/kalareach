@@ -211,7 +211,9 @@ pub async fn root_process_of(
     Ok(snapshot_of(environment, session_id)
         .await?
         .session
-        .root_process)
+        .root_process
+        .as_ref()
+        .cloned())
 }
 
 /// The attachments the session's worker lists now, in the order they joined. The error is
