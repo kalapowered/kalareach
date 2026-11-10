@@ -451,16 +451,17 @@ const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x200;
 // platform and its cases run wherever the tests do. The Windows build holds them to the system's.
 #[cfg(windows)]
 const _: () = {
-    use windows_sys::Win32::System::Console as system;
-
-    assert!(ENABLE_PROCESSED_INPUT == system::ENABLE_PROCESSED_INPUT);
-    assert!(ENABLE_LINE_INPUT == system::ENABLE_LINE_INPUT);
-    assert!(ENABLE_ECHO_INPUT == system::ENABLE_ECHO_INPUT);
-    assert!(ENABLE_WINDOW_INPUT == system::ENABLE_WINDOW_INPUT);
-    assert!(ENABLE_MOUSE_INPUT == system::ENABLE_MOUSE_INPUT);
-    assert!(ENABLE_QUICK_EDIT_MODE == system::ENABLE_QUICK_EDIT_MODE);
-    assert!(ENABLE_EXTENDED_FLAGS == system::ENABLE_EXTENDED_FLAGS);
-    assert!(ENABLE_VIRTUAL_TERMINAL_INPUT == system::ENABLE_VIRTUAL_TERMINAL_INPUT);
+    assert!(ENABLE_PROCESSED_INPUT == windows_sys::Win32::System::Console::ENABLE_PROCESSED_INPUT);
+    assert!(ENABLE_LINE_INPUT == windows_sys::Win32::System::Console::ENABLE_LINE_INPUT);
+    assert!(ENABLE_ECHO_INPUT == windows_sys::Win32::System::Console::ENABLE_ECHO_INPUT);
+    assert!(ENABLE_WINDOW_INPUT == windows_sys::Win32::System::Console::ENABLE_WINDOW_INPUT);
+    assert!(ENABLE_MOUSE_INPUT == windows_sys::Win32::System::Console::ENABLE_MOUSE_INPUT);
+    assert!(ENABLE_QUICK_EDIT_MODE == windows_sys::Win32::System::Console::ENABLE_QUICK_EDIT_MODE);
+    assert!(ENABLE_EXTENDED_FLAGS == windows_sys::Win32::System::Console::ENABLE_EXTENDED_FLAGS);
+    assert!(
+        ENABLE_VIRTUAL_TERMINAL_INPUT
+            == windows_sys::Win32::System::Console::ENABLE_VIRTUAL_TERMINAL_INPUT
+    );
 };
 
 /// The console input mode a record reader needs, made from `saved`, the mode the console had.
@@ -931,10 +932,8 @@ mod tests {
 
     #[cfg(windows)]
     const _: () = {
-        use windows_sys::Win32::System::Console as system;
-
-        assert!(ENABLE_INSERT_MODE == system::ENABLE_INSERT_MODE);
-        assert!(ENABLE_AUTO_POSITION == system::ENABLE_AUTO_POSITION);
+        assert!(ENABLE_INSERT_MODE == windows_sys::Win32::System::Console::ENABLE_INSERT_MODE);
+        assert!(ENABLE_AUTO_POSITION == windows_sys::Win32::System::Console::ENABLE_AUTO_POSITION);
     };
 
     /// The flags of the console's input mode that are private: set only through the extended flags,
