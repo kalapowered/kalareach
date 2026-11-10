@@ -860,31 +860,23 @@ public struct VoiceRecorderWatch: Sendable {
 /// tells: a word can be lost in that gap. Over a window of up to `windowReadings` readings the audio
 /// that was taken in is compared with the time that passed, and a shortfall of `gapMs` or more is a
 /// gap. The time that passed is a bound that cannot be too small: from the earliest moment the older
-/// reading's figures can have been read (see ``readFromMs(requestedAtMs:answeredAtMs:reportAgeMs:)``)
-/// to the moment the newer one was answered, both on the monotonic clock and stamped where the
-/// request was made and in the platform's callback, not on the queue the answer later runs on. The
-/// statistics are read on a queue that also carries other news, so a slow queue only makes the bound
-/// larger and the gap larger, which is a false gap and never a hidden one: audio `G` taken in over a
-/// window of true length `E <= E_max` hides a gap `g` only if `E_max - G < g`, and `E_max - G >= g`
-/// always. A reading with no figure tells nothing, and says so. Not thread-safe: the reader uses it on
-/// the call's own queue only. The figures are test parameters, not safety bounds.
+/// reading's figures can have been read (see ``readFromMs(answeredAtMs:reportAgeMs:)``) to the moment
+/// the newer one was answered, both on the monotonic clock and stamped in the platform's callback, not
+/// on the queue the answer later runs on. The stamps are whole milliseconds, taken down, so one is
+/// added to the newer one: the time that passed is never counted short. The statistics are read on a
+/// queue that also carries other news, so a slow queue only makes the bound larger and the gap
+/// larger, which is a false gap and never a hidden one: audio `G` taken in over a window of true
+/// length `E <= E_max` hides a gap `g` only if `E_max - G < g`, and `E_max - G >= g` always. A reading
+/// with no figure tells nothing, and says so. Not thread-safe: the reader uses it on the call's own
+/// queue only. The figures are test parameters, not safety bounds.
 public struct VoiceProgressWatch: Sendable {
-    /// The age of the oldest report the connection's statistics may serve, in milliseconds, for a
-    /// report that does not say how old it is. WebRTC's statistics collector answers from a report up
-    /// to 50 ms old.
-    public static let staleReportMs: UInt64 = 50
-
     /// The earliest moment the figures of a reading can have been read, on the monotonic clock.
     ///
-    /// A report carries the moment its collection began, so a report that says how old it was when the
-    /// answer came (`reportAgeMs`) was read no earlier than that, whatever the connection's cache or a
-    /// slow collection did. One that says nothing was read no earlier than the oldest report the
-    /// statistics may serve, at the request.
-    public static func readFromMs(requestedAtMs: UInt64, answeredAtMs: UInt64, reportAgeMs: UInt64?) -> UInt64 {
-        guard let age = reportAgeMs else {
-            return requestedAtMs > staleReportMs ? requestedAtMs - staleReportMs : 0
-        }
-        return answeredAtMs > age ? answeredAtMs - age : 0
+    /// A report carries the moment its collection began, and the figures are read after it, so they
+    /// were read no earlier than the report's age before the answer, whatever the connection's cache
+    /// or a slow collection did.
+    public static func readFromMs(answeredAtMs: UInt64, reportAgeMs: UInt64) -> UInt64 {
+        answeredAtMs > reportAgeMs ? answeredAtMs - reportAgeMs : 0
     }
 
     /// What a reading showed about the audio keeping pace.
@@ -918,7 +910,7 @@ public struct VoiceProgressWatch: Sendable {
             return .noFigure
         }
         if let oldest = window.first {
-            let passed = Double(max(answeredAtMs, oldest.readFromMs) - oldest.readFromMs)
+            let passed = Double(max(answeredAtMs, oldest.readFromMs) - oldest.readFromMs) + 1
             let taken = (seconds - oldest.seconds) * 1_000
             if passed - taken >= gapMs {
                 window = [(readFromMs, seconds)]
@@ -969,31 +961,28 @@ public final class VoiceRecorderReader {
     public func request() -> UInt64? { on ? generation : nil }
 
     /// A reading asked for in `generation`: the source's total captured seconds, nil when the
-    /// report had none. It was asked for at `requestedAtMs` and answered at `answeredAtMs`, both
-    /// on the monotonic clock and stamped where the request was made and in the platform's
-    /// callback, not on the queue the answer ran on after, and the report said it was `reportAgeMs`
-    /// old when the answer came, when it said so. Every reading reaches the call, one that shows
-    /// nothing new or comes too late included, so the first reading after the deadline ends the call
-    /// however late its timer is.
+    /// report had none. It was answered at `answeredAtMs` on the monotonic clock, stamped in the
+    /// platform's callback and not on the queue the answer ran on after, and the report said it was
+    /// `reportAgeMs` old when the answer came. A report that cannot say so (nil) cannot be placed in
+    /// time, so its figure counts as none. Every reading reaches the call, one that shows nothing new
+    /// or comes too late included, so the first reading after the deadline ends the call however late
+    /// its timer is.
     ///
     /// A gap in the audio taken in, and a reading with no figure, are breaks in the call's record
     /// while capture is on. Audio is vouched for only from the earliest moment the figures can have
     /// been read, so the record never claims more than the reading showed, however late the answer.
-    public func reading(
-        capturedSeconds: Double?, generation: UInt64, requestedAtMs: UInt64, answeredAtMs: UInt64,
-        reportAgeMs: UInt64?
-    ) {
+    public func reading(capturedSeconds: Double?, generation: UInt64, answeredAtMs: UInt64, reportAgeMs: UInt64?) {
         guard on, generation == self.generation else {
             control.recorderUnchanged()
             return
         }
-        let seenAtMs = VoiceProgressWatch.readFromMs(
-            requestedAtMs: requestedAtMs, answeredAtMs: answeredAtMs, reportAgeMs: reportAgeMs)
-        switch progress.observe(capturedSeconds: capturedSeconds, readFromMs: seenAtMs, answeredAtMs: answeredAtMs) {
+        let figure = reportAgeMs == nil ? nil : capturedSeconds
+        let seenAtMs = VoiceProgressWatch.readFromMs(answeredAtMs: answeredAtMs, reportAgeMs: reportAgeMs ?? 0)
+        switch progress.observe(capturedSeconds: figure, readFromMs: seenAtMs, answeredAtMs: answeredAtMs) {
         case .gap, .noFigure: control.progressBroke()
         case .progressing: break
         }
-        switch watch.observe(capturedSeconds: capturedSeconds, atMs: seenAtMs) {
+        switch watch.observe(capturedSeconds: figure, atMs: seenAtMs) {
         case let .started(at)?:
             control.recorder(running: true)
             control.recorderHeard(atMs: at)
