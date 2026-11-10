@@ -77,9 +77,7 @@ pub mod interpret;
 pub mod seams;
 pub mod session;
 
-pub use crate::confirm::{
-    ConfirmationLedger, issue_confirmation, sign_confirmation, verify_confirmation,
-};
+pub use crate::confirm::{ConfirmationLedger, issue_confirmation, verify_confirmation};
 pub use crate::context::{
     ITEM_FRAMING_BYTES, OPENING_FRAMING_BYTES, SecretPatterns, Selection, select_context,
     token_bound,

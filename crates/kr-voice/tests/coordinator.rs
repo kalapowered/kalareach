@@ -11,6 +11,7 @@ use kr_client::services::voice::{
     ManagedVoiceService, VoiceClosure, VoiceHold, VoiceMetadata, VoiceRateQuote, VoiceSession,
     VoiceSessionRequest, VoiceStart, VoiceStartLatency,
 };
+use kr_client::services::voice_confirm::sign_voice_confirmation;
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_protocol::grant::{EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector};
 use kr_protocol::ids::{
@@ -33,7 +34,7 @@ use kr_voice::seams::{
 };
 use kr_voice::{
     Coordinator, DelegationInterpreter, GrammarInterpreter, Interpretation, Misread, Proposal,
-    SpokenDestination, VerifiedApprovalAnswer, VoiceGrantPlan, sign_confirmation,
+    SpokenDestination, VerifiedApprovalAnswer, VoiceGrantPlan,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -2920,7 +2921,7 @@ async fn a_challenge_gives_the_identifier_back_and_the_signed_delegation_spends_
         panic!("the challenge is the answer");
     };
     params.confirmation =
-        Nullable::some(sign_confirmation(&fixture.key, &request).expect("the device signs"));
+        Nullable::some(sign_voice_confirmation(&fixture.key, &request).expect("the device signs"));
     let signed = fixture
         .coordinator
         .delegate(device(PHONE), action(1), &params, 11_100, &unbounded())
@@ -3187,7 +3188,7 @@ async fn the_challenge_comes_back_and_the_delegation_survives_it() {
 
     // The device signs the challenge this host issued and submits the same delegation again.
     params.confirmation =
-        Nullable::some(sign_confirmation(&fixture.key, &request).expect("a proof"));
+        Nullable::some(sign_voice_confirmation(&fixture.key, &request).expect("a proof"));
     let performed = fixture
         .coordinator
         .delegate(device(PHONE), action(1), &params, 11_050, &unbounded())
@@ -3261,7 +3262,7 @@ async fn provider_text_cannot_create_a_confirmation() {
         .confirmation_challenge(device(PHONE), &plan, action(3), 11_000)
         .expect("a challenge");
     params.confirmation =
-        Nullable::some(sign_confirmation(&fixture.key, &challenge).expect("a proof"));
+        Nullable::some(sign_voice_confirmation(&fixture.key, &challenge).expect("a proof"));
     let result = fixture
         .coordinator
         .delegate(device(PHONE), action(3), &params, 11_100, &unbounded())
@@ -3294,7 +3295,7 @@ async fn a_confirmation_for_one_action_does_not_authorise_another() {
             11_000,
         )
         .expect("a challenge");
-    let proof = sign_confirmation(&fixture.key, &challenge).expect("a proof");
+    let proof = sign_voice_confirmation(&fixture.key, &challenge).expect("a proof");
 
     // The same proof, presented for a different action.
     let mut other = delegate_params(
@@ -3336,7 +3337,7 @@ async fn an_action_this_host_has_no_effect_for_is_refused_even_when_confirmed() 
         )
         .expect("a challenge");
     params.confirmation =
-        Nullable::some(sign_confirmation(&fixture.key, &challenge).expect("a proof"));
+        Nullable::some(sign_voice_confirmation(&fixture.key, &challenge).expect("a proof"));
     let result = fixture
         .coordinator
         .delegate(device(PHONE), action(1), &params, 11_100, &unbounded())
@@ -3612,7 +3613,7 @@ async fn a_confirmation_for_one_utterance_does_not_confirm_another() {
             11_000,
         )
         .expect("a challenge");
-    let proof = sign_confirmation(&fixture.key, &challenge).expect("a proof");
+    let proof = sign_voice_confirmation(&fixture.key, &challenge).expect("a proof");
 
     let mut said_second = delegate_params(call, delegation("one"), VoiceAction::ShellInput);
     said_second.fragments = fixture.script.says(
