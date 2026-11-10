@@ -87,6 +87,9 @@ async function startACall(setup?: (controls: FakeHostControls) => void) {
   return { person, ...started }
 }
 
+/** What a started call hands the test: the person, the host's port and the host's controls. */
+type StartedCall = Awaited<ReturnType<typeof startACall>>
+
 /** The control that asks whether to cancel the agent's current turn. */
 function askToCancel(): HTMLElement {
   return screen.getByRole('button', { name: 'Cancel the current turn' })
@@ -697,6 +700,48 @@ describe('while a call is running', () => {
     })
     expect(await screen.findByText(/asked to cancel that turn/)).toBeInTheDocument()
   })
+
+  // KR-REQ-15.22: only a cancellation the host took reads as asked. An answer that carries neither
+  // a receipt nor a result is an outcome nobody knows, and a receipt that refuses is a refusal:
+  // the screen says each for what it is, never that the host was asked.
+  it.each([
+    {
+      answer: 'an outcome it never confirmed',
+      host: ({ controls }: StartedCall) => {
+        controls.leaveNextSendUnconfirmed()
+      },
+      words: /not known whether the turn was cancelled/
+    },
+    {
+      answer: 'a refusal receipt',
+      host: ({ port }: StartedCall) => {
+        vi.spyOn(port, 'composerInterrupt').mockResolvedValue({
+          receipt: {
+            state: 'refused',
+            error: { code: 'PERMISSION_DENIED', message: 'The host will not cancel that turn.' }
+          } as never,
+          value: null,
+          action_id: 'a-1'
+        })
+      },
+      words: /The host will not cancel that turn/
+    }
+  ])(
+    'does not say the host was asked to cancel when it answered with $answer',
+    async ({ host, words }) => {
+      const started = await startACall()
+      await waitFor(() => {
+        expect(askToCancel()).toBeEnabled()
+      })
+      host(started)
+
+      await started.person.click(askToCancel())
+      await started.person.click(screen.getByRole('button', { name: 'Cancel this turn' }))
+
+      expect(await screen.findByText(words)).toBeInTheDocument()
+      expect(screen.queryByText(/was asked to cancel that turn/)).not.toBeInTheDocument()
+    }
+  )
 
   // KR-REQ-15.22: a question is about the turn it was asked on. When the screen reads that the host
   // has moved to another conversation and turn, the question is gone and the next one names the

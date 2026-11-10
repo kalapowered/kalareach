@@ -46,6 +46,7 @@ import {
 import type { HostPort, VoiceCallState, VoiceClosure, Watch } from '../host/port'
 import type { Surface } from '../mobile/platform'
 import { capabilityRecords, composerOffers, liveInstance, subjectOf } from '../model/agent'
+import { answeredState, type Answer } from '../model/receipts'
 
 /** The message to show for a failure, whatever shape it arrived in. */
 function failureMessage(value: unknown): string {
@@ -109,6 +110,30 @@ async function readAgent(port: HostPort, sessionId: string): Promise<AgentRead |
     instanceId,
     binding: facts.binding,
     capabilities: capabilityRecords(facts.capabilities.records)
+  }
+}
+
+/**
+ * What the screen says of the host's answer to a cancellation. Only a cancellation the host took
+ * reads as asked: an answer that carries no receipt and no result is an outcome nobody knows, and
+ * a receipt that refuses says what the host said.
+ */
+function cancellationAnswerWords(answer: Answer): string {
+  const state = answeredState(answer)
+  switch (state) {
+    case 'applied':
+      return 'The host was asked to cancel that turn.'
+    case 'refused':
+    case 'rejected':
+    case 'not_taken':
+      return answer.receipt?.error
+        ? failureMessage(answer.receipt.error)
+        : `The host ${state === 'rejected' ? 'rejected' : 'would not take'} the request to cancel that turn.`
+    case 'queued':
+    case 'sent':
+      return 'The host has the request to cancel that turn and has not said what it did.'
+    case 'unknown':
+      return 'It is not known whether the turn was cancelled: the host did not confirm what became of the request.'
   }
 }
 
@@ -807,9 +832,9 @@ export function VoiceRoute({
             turn_id: turn.turnId
           })
         )
-          .then(() => {
+          .then((answer) => {
             if (!stillOnIt()) return
-            setNotice('The host was asked to cancel that turn. The voice keeps talking.')
+            setNotice(cancellationAnswerWords(answer))
           })
           .catch((error: unknown) => {
             if (stillOnIt()) setNotice(failureMessage(error))
