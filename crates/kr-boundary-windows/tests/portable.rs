@@ -394,3 +394,37 @@ fn the_platforms_own_reports_are_read() {
     assert!(applied[0].rule_id.is_empty());
     assert!(events::parse("<Event>").is_err());
 }
+
+#[test]
+fn removal_takes_out_only_our_rules_and_leaves_the_rest_as_written() {
+    let reported = include_str!("fixtures/effective-policy.xml").trim();
+    // Ours only: the collection goes back to not configured.
+    let none = policy::strip(reported, &[RULE_ALLOW_ALL, RULE_CHECKOUT, RULE_CONNECT]).unwrap();
+    let after = Policy::parse(&none).unwrap();
+    assert!(after.is_unconfigured());
+    assert!(
+        after
+            .differences(&Policy::parse(include_str!("fixtures/effective-baseline.xml")).unwrap())
+            .is_empty()
+    );
+
+    // Beside an administrator's publisher rule, which this crate does not model: the deny rule goes,
+    // and the publisher rule survives with its own name and text.
+    let theirs = r#"<FilePublisherRule Id="33333333-3333-3333-3333-333333333333" Name="Contoso &amp; sons" Description="d" UserOrGroupSid="S-1-1-0" Action="Allow"><Conditions><FilePublisherCondition PublisherName="O=CONTOSO" ProductName="*" BinaryName="*"><BinaryVersionRange LowSection="*" HighSection="*" /></FilePublisherCondition></Conditions></FilePublisherRule>"#;
+    let shared = reported.replace("</RuleCollection>", &format!("{theirs}</RuleCollection>"));
+    let kept = policy::strip(&shared, &[RULE_CHECKOUT, RULE_CONNECT]).unwrap();
+    assert!(kept.contains(theirs));
+    let parsed = Policy::parse(&kept).unwrap();
+    let exe = &parsed.collections["Exe"];
+    assert_eq!(exe.mode, Mode::Enabled);
+    let ids: Vec<&str> = exe.rules.keys().map(String::as_str).collect();
+    assert_eq!(
+        ids,
+        ["33333333-3333-3333-3333-333333333333", RULE_ALLOW_ALL]
+    );
+    assert_eq!(
+        exe.rules["33333333-3333-3333-3333-333333333333"].kind,
+        Kind::Publisher
+    );
+    assert!(policy::strip("not a policy", &[]).is_err());
+}
