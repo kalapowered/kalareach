@@ -996,13 +996,65 @@ impl Assembled {
             Ok((packed, digest))
         });
         let (packed, digest) = packed.as_ref().unwrap_or_else(|why| panic!("{why}"));
-        std::fs::copy(packed, archive).expect("a copy of the archive");
-        if let Err(unequal) = held_to(packed, *digest, archive) {
-            panic!(
-                "the copy at {} is not the archive packed at {}: {unequal}",
-                archive.display(),
-                packed.display()
-            );
+        if let Err(refused) = copy_held_to(
+            packed,
+            *digest,
+            archive,
+            &mut copy_by_writing,
+            &mut held_to,
+            &mut std::io::stderr(),
+        ) {
+            panic!("{refused}");
+        }
+    }
+}
+
+/// The line that says a copy of a packed archive read wrong and was made again. It begins every
+/// such line, so that a job's log can be searched for it and every incident counted.
+const COPY_MADE_AGAIN: &str =
+    "update-harness: a copy of the packed archive read wrong and was made again";
+
+/// Gives `copy` the bytes of the archive packed at `packed`, which read as `digest` when it was
+/// packed, with `make`, and holds it to `digest` with `held`.
+fn copy_held_to(
+    packed: &Path,
+    digest: [u8; 32],
+    copy: &Path,
+    make: &mut dyn FnMut(&Path, &Path),
+    held: &mut dyn FnMut(&Path, [u8; 32], &Path) -> Result<(), Unequal>,
+    report: &mut dyn std::io::Write,
+) -> Result<(), String> {
+    let _ = report;
+    make(packed, copy);
+    held(packed, digest, copy).map_err(|unequal| {
+        format!(
+            "the copy at {} is not the archive packed at {}: {unequal}",
+            copy.display(),
+            packed.display()
+        )
+    })
+}
+
+/// Writes `copy` with the bytes of the file at `packed`, by reading the one and writing the other.
+///
+/// Neither `read` nor `write_all` can give the copy a clone of the packed archive's blocks or move
+/// the bytes inside the kernel. `std::fs::copy` can do both: it clones on APFS and copies in the
+/// kernel on Linux. A copy written here is made of the bytes this process read from the packed
+/// archive and wrote, so a copy that reads wrong can be made again from the same source.
+fn copy_by_writing(packed: &Path, copy: &Path) {
+    use std::io::Read as _;
+
+    let mut source = std::fs::File::open(packed).expect("the packed archive to copy");
+    let mut written = std::fs::File::create(copy).expect("a file for the copy of the archive");
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        match source.read(&mut buffer) {
+            Ok(0) => return,
+            Ok(read) => written
+                .write_all(&buffer[..read])
+                .unwrap_or_else(|error| panic!("{} is not written: {error}", copy.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => panic!("{} is not read: {error}", packed.display()),
         }
     }
 }

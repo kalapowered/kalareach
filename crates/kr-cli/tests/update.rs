@@ -109,6 +109,210 @@ fn a_copy_that_is_not_the_packed_archive_says_which_of_the_two_differs() {
     );
 }
 
+/// A packed archive of bytes a case can make a copy of, longer than the 1 MiB the digest reads at a
+/// time, with the digest it reads as and the byte a damaged copy of it differs at.
+fn a_packed_archive_in(directory: &Path) -> (PathBuf, Vec<u8>, [u8; 32], usize) {
+    let packed = directory.join("release.tar.gz");
+    let bytes: Vec<u8> = (0..3_000_000_u32)
+        .map(|number| u8::try_from(number % 251).expect("a byte"))
+        .collect();
+    std::fs::write(&packed, &bytes).expect("a packed archive");
+    let digest = file_digest(&packed);
+    (packed, bytes, digest, 1_500_000)
+}
+
+/// Makes the copies of a packed archive a case gives, in order: each `Some(position)` is a copy that
+/// differs from the archive at that byte, and `None` is a copy that is the archive. A copy is made
+/// the way the suite makes one, and damaged after it is made.
+fn copies_that_differ_at(
+    positions: &[Option<usize>],
+    made: &mut usize,
+) -> impl FnMut(&Path, &Path) {
+    move |packed, copy| {
+        let position = positions[*made];
+        if *made > 0 {
+            assert!(
+                !copy.exists(),
+                "the copy that read wrong is removed before the next is made"
+            );
+        }
+        *made += 1;
+        copy_by_writing(packed, copy);
+        if let Some(position) = position {
+            let mut bytes = std::fs::read(copy).expect("the copy");
+            bytes[position] ^= 0xff;
+            std::fs::write(copy, bytes).expect("the copy is damaged");
+        }
+    }
+}
+
+/// A copy of a packed archive that reads wrong is removed and made once more, and the case goes on
+/// when the copy made again is right, after one line on standard error that begins as every such line
+/// does and says how the first copy differed: where it first differs, its length and its digest, and
+/// the archive's length and digest.
+#[test]
+fn a_copy_that_reads_wrong_is_made_again_and_the_case_goes_on_after_one_line() {
+    use sha2::Digest as _;
+
+    let directory = tempfile::tempdir().expect("a directory");
+    let (packed, bytes, digest, at) = a_packed_archive_in(directory.path());
+    let copy = directory.path().join("copy.tar.gz");
+
+    // The copy the suite makes is the archive, written as a file of its own.
+    copy_by_writing(&packed, &copy);
+    assert!(held_to(&packed, digest, &copy).is_ok());
+    std::fs::remove_file(&copy).expect("the copy goes");
+
+    // The first copy differs at one byte and the second is the archive.
+    let mut damaged = bytes.clone();
+    damaged[at] ^= 0xff;
+    let damaged_digest: [u8; 32] = sha2::Sha256::digest(&damaged).into();
+    let mut made = 0;
+    let mut said = Vec::new();
+    let outcome = copy_held_to(
+        &packed,
+        digest,
+        &copy,
+        &mut copies_that_differ_at(&[Some(at), None], &mut made),
+        &mut held_to,
+        &mut said,
+    );
+    assert_eq!(outcome, Ok(()));
+    assert_eq!(made, 2, "the copy is made once more and no more");
+    assert_eq!(
+        file_digest(&copy),
+        digest,
+        "the copy that is kept is the archive"
+    );
+    let said = String::from_utf8(said).expect("text");
+    assert_eq!(said.lines().count(), 1, "{said}");
+    assert!(said.starts_with(COPY_MADE_AGAIN), "{said}");
+    for fact in [
+        format!("byte {at}"),
+        format!("{} bytes", bytes.len()),
+        hex_of(&digest),
+        hex_of(&damaged_digest),
+    ] {
+        assert!(said.contains(&fact), "{fact} is in {said}");
+    }
+
+    // A copy that read as other bytes once and as the archive when it was read again is made again
+    // as a copy that differs is.
+    std::fs::remove_file(&copy).expect("the copy goes");
+    let (mut made, mut judged, mut said) = (0, 0, Vec::new());
+    let outcome = copy_held_to(
+        &packed,
+        digest,
+        &copy,
+        &mut copies_that_differ_at(&[None, None], &mut made),
+        &mut |packed: &Path, digest, copy: &Path| {
+            judged += 1;
+            if judged == 1 {
+                Err(Unequal::ReadsDifferently { first: [7; 32] })
+            } else {
+                held_to(packed, digest, copy)
+            }
+        },
+        &mut said,
+    );
+    assert_eq!(outcome, Ok(()));
+    assert_eq!(made, 2);
+    assert!(
+        String::from_utf8(said)
+            .expect("text")
+            .starts_with(COPY_MADE_AGAIN)
+    );
+}
+
+/// A copy made again that reads wrong too fails the case, and the failure names both copies: where
+/// each first differs and the digest each read as.
+#[test]
+fn two_copies_that_read_wrong_fail_naming_both() {
+    use sha2::Digest as _;
+
+    let directory = tempfile::tempdir().expect("a directory");
+    let (packed, bytes, digest, at) = a_packed_archive_in(directory.path());
+    let copy = directory.path().join("copy.tar.gz");
+    let later = at + 12_345;
+    let digest_of = |position: usize| {
+        let mut damaged = bytes.clone();
+        damaged[position] ^= 0xff;
+        let digest: [u8; 32] = sha2::Sha256::digest(&damaged).into();
+        hex_of(&digest)
+    };
+
+    let mut made = 0;
+    let mut said = Vec::new();
+    let outcome = copy_held_to(
+        &packed,
+        digest,
+        &copy,
+        &mut copies_that_differ_at(&[Some(at), Some(later)], &mut made),
+        &mut held_to,
+        &mut said,
+    );
+    let failure = outcome.expect_err("two copies that read wrong fail");
+    assert_eq!(made, 2, "the copy is made once more and no more");
+    for fact in [
+        format!("byte {at}"),
+        format!("byte {later}"),
+        digest_of(at),
+        digest_of(later),
+    ] {
+        assert!(failure.contains(&fact), "{fact} is in {failure}");
+    }
+}
+
+/// A packed archive that is not what it was packed as is not made again: the copy of it would be
+/// no more the archive, and the failure says it is the packed archive that differs.
+#[test]
+fn a_packed_archive_that_changed_fails_at_once_without_a_second_copy() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let (packed, mut bytes, digest, at) = a_packed_archive_in(directory.path());
+    let copy = directory.path().join("copy.tar.gz");
+    bytes[at] ^= 0xff;
+    std::fs::write(&packed, &bytes).expect("the packed archive changes");
+
+    let mut made = 0;
+    let mut said = Vec::new();
+    let outcome = copy_held_to(
+        &packed,
+        digest,
+        &copy,
+        &mut copies_that_differ_at(&[None, None], &mut made),
+        &mut held_to,
+        &mut said,
+    );
+    let failure = outcome.expect_err("a changed packed archive fails");
+    assert!(
+        failure.contains("the packed archive has changed"),
+        "{failure}"
+    );
+    assert_eq!(made, 1, "no second copy is made");
+    assert!(said.is_empty());
+
+    // The packed archive that read as other bytes twice, and as different bytes each time, is the
+    // same: no second copy.
+    let mut made = 0;
+    let outcome = copy_held_to(
+        &packed,
+        digest,
+        &copy,
+        &mut copies_that_differ_at(&[None, None], &mut made),
+        &mut |_: &Path, _, _: &Path| {
+            Err(Unequal::PackedReadsDifferently {
+                first: [1; 32],
+                second: [2; 32],
+                copy: [3; 32],
+            })
+        },
+        &mut said,
+    );
+    assert!(outcome.is_err());
+    assert_eq!(made, 1, "no second copy is made");
+    assert!(said.is_empty());
+}
+
 /// A program that is older than a source it was built from, one built from another checkout's sources,
 /// and one whose list names a source that is gone are each refused by name, and a program newer than
 /// every source it lists, one with no list and one with a list older than itself are not. This is the
