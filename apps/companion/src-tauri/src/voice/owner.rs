@@ -1375,24 +1375,8 @@ impl Owner {
     /// awaited first, so that what it reported is in the channel and nothing follows it; then what
     /// was reported is taken, and a task that had not reported was cut short by the end.
     async fn settle_the_opening(&mut self) {
-        let running = match self.opening.take() {
-            Some(task) => {
-                task.abort();
-                // Cancelled or finished: either way it is over when this returns.
-                let _ = task.await;
-                true
-            }
-            None => false,
-        };
-        let mut reported = false;
-        while let Ok(message) = self.internal.try_recv() {
-            if let Internal::Opened(opened) = message {
-                self.note_the_opening(&opened);
-                reported = true;
-            }
-        }
-        if running && !reported {
-            self.note_the_opening(&Opened::Cut);
+        for opened in what_the_opening_came_to(&mut self.opening, &mut self.internal).await {
+            self.note_the_opening(&opened);
         }
     }
 
@@ -1767,6 +1751,37 @@ fn hold_until(host_closes_ms: u64, requested_seconds: u32, now_ms: u64) -> Optio
     Some(host_closes_ms.min(latest))
 }
 
+/// What the opening task came to as the call ends, in the order to note it: what it reported, or,
+/// when it was still running and reported nothing, that the end cut it short.
+///
+/// A running task is stopped and awaited before the channel is read, so that a report it makes in
+/// the poll the stop cannot cut is in the channel and is the one that stands; read first, that
+/// report would be missed and the call said to have been cut short that was given all of it.
+async fn what_the_opening_came_to(
+    opening: &mut Option<tokio::task::JoinHandle<()>>,
+    internal: &mut mpsc::UnboundedReceiver<Internal>,
+) -> Vec<Opened> {
+    let running = match opening.take() {
+        Some(task) => {
+            task.abort();
+            // Cancelled or finished: either way it is over when this returns.
+            let _ = task.await;
+            true
+        }
+        None => false,
+    };
+    let mut came = Vec::new();
+    while let Ok(message) = internal.try_recv() {
+        if let Internal::Opened(opened) = message {
+            came.push(opened);
+        }
+    }
+    if running && came.is_empty() {
+        came.push(Opened::Cut);
+    }
+    came
+}
+
 /// How many ticks the host path is left alone after the host refused to vouch for the call.
 const PROBE_PAUSE_TICKS: u32 = 6;
 
@@ -1896,6 +1911,53 @@ mod tests {
         assert_eq!(hold_until(NOW - 5_000, 600, NOW), Some(NOW - 5_000));
         // One that closed longer ago than clocks differ is not a call to carry.
         assert_eq!(hold_until(NOW - MAX_CLOCK_SKEW_MS, 600, NOW), None);
+    }
+
+    /// The call ends while the opening task is inside a poll, before it publishes what it came to:
+    /// the poll cannot be cut, so the task publishes as the end waits for it, and the report is not
+    /// lost to a call that says it was cut short. The task is held where it stands by a channel the
+    /// test lets it go through after the end has been polled once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_report_the_opening_task_publishes_as_the_call_ends_is_not_recorded_as_cut_short() {
+        let (internal_tx, mut internal) = mpsc::unbounded_channel();
+        let (entered_tx, entered) = oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let mut opening = Some(tokio::spawn(async move {
+            entered_tx.send(()).expect("the test waits");
+            // Inside this poll until the test lets it go: abort takes effect at the next await.
+            released.recv().expect("the test lets it go");
+            let _ = internal_tx.send(Internal::Opened(Opened::Given));
+        }));
+        entered.await.expect("the task is inside its poll");
+
+        let mut settling = std::pin::pin!(what_the_opening_came_to(&mut opening, &mut internal));
+        let early = tokio::select! {
+            biased;
+            came = &mut settling => Some(came),
+            () = async {} => None,
+        };
+        release.send(()).expect("the task waits");
+        let came = match early {
+            Some(came) => came,
+            None => settling.await,
+        };
+
+        assert!(
+            matches!(came.as_slice(), [Opened::Given]),
+            "the report the task made as the call ended is the one that stands: {}",
+            came.len()
+        );
+    }
+
+    /// An opening task that never reports was cut short by the end, and says so once.
+    #[tokio::test]
+    async fn an_opening_task_that_never_reports_is_recorded_as_cut_short() {
+        let (_internal_tx, mut internal) = mpsc::unbounded_channel();
+        let mut opening = Some(tokio::spawn(std::future::pending::<()>()));
+
+        let came = what_the_opening_came_to(&mut opening, &mut internal).await;
+
+        assert!(matches!(came.as_slice(), [Opened::Cut]));
     }
 
     /// Nobody is left waiting on an owner that is done: what its inbox holds is answered, and a
