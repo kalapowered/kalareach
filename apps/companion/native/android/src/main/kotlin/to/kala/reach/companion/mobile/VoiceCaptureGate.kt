@@ -238,6 +238,22 @@ class VoiceCaptureGate(private val keptIntervals: Int = 64) {
     }
 
     /**
+     * Whether the call's microphone track may be on: a permit is running, and neither the person nor
+     * the system has closed the microphone.
+     *
+     * Unlike [captureEnabled] it never asks whether the recorder runs or whether the system lists the
+     * call's recording. The recorder runs only while the track is on, so a track that waited for the
+     * recorder would stay off once the recorder stopped with it, and nothing, the person's unmute
+     * included, would bring capture back. What the recorder hands the call is still carried only
+     * while [captureEnabled] holds.
+     */
+    @Synchronized
+    fun microphoneWanted(nowMs: Long): Boolean {
+        settle(nowMs)
+        return microphoneIsOpen(nowMs)
+    }
+
+    /**
      * What a person is told about the microphone now.
      *
      * [VoiceCaptureState.CAPTURING] exactly when [captureEnabled] is true, so the display and the
@@ -295,17 +311,19 @@ class VoiceCaptureGate(private val keptIntervals: Int = 64) {
         return !stopped && nowMs < held.deadlineMs
     }
 
-    private fun enabled(nowMs: Long): Boolean {
+    /** What the person and the system leave open, whatever the recorder is doing. */
+    private fun microphoneIsOpen(nowMs: Long): Boolean {
         val held = permit ?: return false
         return !stopped &&
             nowMs < held.deadlineMs &&
             !mutedByPerson &&
             taken == Taken.NONE &&
             !routeChanging &&
-            inputAvailable &&
-            recorderRunning &&
-            recording == Recording.AUDIBLE
+            inputAvailable
     }
+
+    private fun enabled(nowMs: Long): Boolean =
+        microphoneIsOpen(nowMs) && recorderRunning && recording == Recording.AUDIBLE
 
     /** Opens or closes the interval capture is in, to match what is true now. */
     private fun settle(nowMs: Long) {

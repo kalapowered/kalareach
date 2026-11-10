@@ -88,6 +88,11 @@ interface VoiceCallPlatform {
  * 3. The platform's recorder reports itself running ([recorder]). Only then may capture carry
  *    speech.
  *
+ * The microphone track follows the person's mute and the state of the call alone
+ * ([VoiceCaptureGate.microphoneWanted]): the recorder runs only while the track is on, so the track
+ * cannot wait for the recorder, and a recorder that stopped with the track would never be asked to
+ * start again.
+ *
  * Every change ends in `apply`, the one place a switch is set. Whatever takes this control's lock
  * after the deadline, whether a change, a second permit or the service's report, first ends the
  * call, including one still waiting for its service, so a late timer never leaves the microphone
@@ -307,7 +312,7 @@ class VoiceCallControl(
         }
         val shown = gate.displayed(now)
         switches.setAudioDevice(live)
-        switches.setMicrophone(gate.captureEnabled(now))
+        switches.setMicrophone(gate.microphoneWanted(now))
         playbackOn = live && !playbackMuted && !focusLost
         switches.setPlayback(playbackOn)
         publishLocked(shown)

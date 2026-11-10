@@ -199,13 +199,14 @@ class VoiceCallControlTest {
 
         control.servicePromoted()
         assertTrue("the device runs once the service holds the foreground", switches.deviceOn)
-        assertFalse("a recorder start from before the device came on does not count", switches.microphoneOn)
+        assertFalse("a recorder start from before the device came on does not count", control.carries())
         assertEquals(VoiceCaptureState.UNAVAILABLE, control.displayed())
 
         control.recorder(true)
-        assertFalse("the system has not reported the recording yet", switches.microphoneOn)
+        assertFalse("the system has not reported the recording yet", control.carries())
         control.recording(heard)
         assertTrue(switches.microphoneOn)
+        assertTrue(control.carries())
         assertEquals(VoiceCaptureState.CAPTURING, control.displayed())
         assertEquals(VoiceCaptureState.CAPTURING, platform.notified.last())
     }
@@ -224,7 +225,7 @@ class VoiceCallControlTest {
 
         control.recording(silenced)
 
-        assertFalse(switches.microphoneOn)
+        assertTrue("the track stays on: the recorder runs only while it is", switches.microphoneOn)
         assertEquals(VoiceCaptureState.SUSPENDED_BY_SYSTEM, control.displayed())
         assertEquals(VoiceCaptureState.SUSPENDED_BY_SYSTEM, platform.shown.last())
         assertEquals(VoiceCaptureState.SUSPENDED_BY_SYSTEM, platform.notified.last())
@@ -264,8 +265,7 @@ class VoiceCallControlTest {
         control.recorder(true)
 
         control.recording(listOf(theirs))
-        assertFalse("the system lists theirs and nothing more", switches.microphoneOn)
-        assertFalse(control.carries())
+        assertFalse("the system lists theirs and nothing more", control.carries())
         assertEquals(VoiceCaptureState.UNAVAILABLE, control.displayed())
 
         control.recording(platform.listed)
@@ -305,9 +305,39 @@ class VoiceCallControlTest {
         assertEquals(0L, control.captureProof().breaks)
 
         control.recording(listOf(ours.copy(silenced = true)))
-        assertFalse("the system silenced ours", switches.microphoneOn)
+        assertFalse("the system silenced ours", control.carries())
         assertEquals(VoiceCaptureState.SUSPENDED_BY_SYSTEM, control.displayed())
         assertEquals(1L, control.captureProof().breaks)
+    }
+
+    /**
+     * KR-REQ-15.35 and KR-REQ-15.36: the recorder runs only while the microphone track is on, so a
+     * mute stops it and the system stops listing its recording. The person's unmute turns the track
+     * on again, which is what lets the recorder start and the system list it; capture comes back as a
+     * second opening and nothing is carried before it does.
+     */
+    @Test
+    fun an_unmute_turns_the_track_on_though_the_recorder_stopped_with_it() {
+        val (control, _, switches) = running()
+        assertTrue(switches.microphoneOn)
+
+        control.setMutedByPerson(true)
+        control.recorder(false)
+        control.recording(emptyList())
+        assertFalse(switches.microphoneOn)
+        assertEquals(VoiceCaptureState.UNAVAILABLE, control.displayed())
+
+        control.setMutedByPerson(false)
+        assertTrue("the track is on again, so that the recorder can start", switches.microphoneOn)
+        assertFalse("nothing is carried before the recorder reports", control.carries())
+
+        control.recorder(true)
+        control.recording(heard)
+        assertEquals(VoiceCaptureState.CAPTURING, control.displayed())
+        assertTrue(control.carries())
+        val proof = control.captureProof()
+        assertEquals(2L, proof.openings)
+        assertEquals(1L, proof.breaks)
     }
 
     /** KR-REQ-15.36: a frame from the recorder is carried only while the gate is on, and a gap in them is a break. */
@@ -516,7 +546,9 @@ class VoiceCallControlTest {
                                 val shown = platform.shown.last()
                                 val case = "muted=$muted focusLost=$focusLost changing=$changing " +
                                     "input=$input recording=$recording silenced=$silenced"
-                                assertEquals(case, shown.speechCouldHaveBeenHeard, switches.microphoneOn)
+                                assertEquals(case, shown.speechCouldHaveBeenHeard, control.carries())
+                                // The track follows the person and the call, never the recorder.
+                                assertEquals(case, !muted && !focusLost && !changing && input, switches.microphoneOn)
                                 assertEquals(case, shown, control.displayed())
                                 assertEquals(case, shown, platform.notified.last())
                                 assertTrue(case, switches.deviceOn)
