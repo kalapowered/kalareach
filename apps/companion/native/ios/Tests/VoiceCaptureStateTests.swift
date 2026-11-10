@@ -297,15 +297,16 @@ final class VoiceCaptureGateTests: XCTestCase {
             ("the end of the call", { $0.stop(nowMs: 2_000) }),
             ("the deadline", { _ = $0.captureEnabled(nowMs: 61_000) }),
         ]
-        for (name, close) in closes {
+        // Each proof is read just after its close, well before the permit's deadline, which closes
+        // capture by itself: only the deadline's own case is read at the deadline.
+        let failed = closes.compactMap { name, close -> String? in
             let (gate, _) = permitted()
             close(gate)
-            let proof = gate.proof(nowMs: 61_000)
-            XCTAssertEqual(proof.openings, 1, name)
-            XCTAssertEqual(proof.breaks, 1, name)
-            XCTAssertTrue(proof.opened, name)
-            XCTAssertNotEqual(proof.state, .capturing, name)
+            let proof = gate.proof(nowMs: name == "the deadline" ? 61_000 : 2_000)
+            let closedOnce = proof.openings == 1 && proof.breaks == 1 && proof.opened && proof.state != .capturing
+            return closedOnce ? nil : "\(name): \(proof)"
         }
+        XCTAssertEqual(failed, [], "these did not close capture as one break")
     }
 
     /// KR-REQ-15.36: a gap in what the recorder delivered, or a reading with no figure to tell by,

@@ -252,15 +252,17 @@ class VoiceCaptureGateTest {
             "the end of the call" to { it.stop(2_000) },
             "the deadline" to { it.captureEnabled(61_000) },
         )
-        for ((name, close) in closes) {
+        // Each proof is read just after its close, well before the permit's deadline, which closes
+        // capture by itself: only the deadline's own case is read at the deadline.
+        val failed = closes.mapNotNull { (name, close) ->
             val (gate, _) = permitted()
             close(gate)
-            val proof = gate.proof(61_000)
-            assertEquals(name, 1L, proof.openings)
-            assertEquals(name, 1L, proof.breaks)
-            assertTrue(name, proof.opened)
-            assertTrue(name, proof.state != VoiceCaptureState.CAPTURING)
+            val proof = gate.proof(if (name == "the deadline") 61_000 else 2_000)
+            val closedOnce = proof.openings == 1L && proof.breaks == 1L && proof.opened &&
+                proof.state != VoiceCaptureState.CAPTURING
+            if (closedOnce) null else "$name: $proof"
         }
+        assertEquals("these did not close capture as one break", emptyList<String>(), failed)
     }
 
     /**

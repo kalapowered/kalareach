@@ -26,7 +26,11 @@ class VoiceCallControlTest {
         var deviceEverOn = false
         var microphoneEverOn = false
 
+        /** Run when the audio device goes from off to on, as the platform's recorder then starts. */
+        var whenTheDeviceComesOn: () -> Unit = {}
+
         override fun setAudioDevice(on: Boolean) {
+            if (on && !deviceOn) whenTheDeviceComesOn()
             deviceOn = on
             deviceEverOn = deviceEverOn || on
         }
@@ -234,7 +238,9 @@ class VoiceCallControlTest {
      * KR-REQ-15.36: another application's recording from the call's source, held by the system when
      * the call's audio device is turned on, is not the call's own: the microphone carries nothing for
      * it, and carries once the system lists one more. The system never reported a change in the list
-     * to the call before the device came on: the call takes the list itself, as the device comes on.
+     * to the call before the device came on: the call takes the list itself, as the device comes on,
+     * not earlier (an application that records while the foreground service is being promoted is
+     * still another's) and not later (once the device records, the call's own recording is listed).
      */
     @Test
     fun another_applications_recording_does_not_open_the_microphone() {
@@ -242,8 +248,12 @@ class VoiceCallControlTest {
         val switches = Switches()
         val control = VoiceCallControl(platform, switches)
         val theirs = RecordingReport(VoiceCallControl.RECORDER_SOURCE, silenced = false)
-        platform.listed = listOf(theirs)
+        val ours = RecordingReport(VoiceCallControl.RECORDER_SOURCE, silenced = false)
+        // The call's own recording is listed from the moment its device is turned on.
+        switches.whenTheDeviceComesOn = { platform.listed = platform.listed + ours }
         assertTrue(control.permit("voice-session-1", platform.closesIn(60)))
+        // Another application starts recording while the service is being promoted.
+        platform.listed = listOf(theirs)
         control.servicePromoted()
         control.recorder(true)
 
@@ -252,7 +262,8 @@ class VoiceCallControlTest {
         assertFalse(control.carries())
         assertEquals(VoiceCaptureState.UNAVAILABLE, control.displayed())
 
-        control.recording(listOf(theirs, theirs))
+        control.recording(platform.listed)
+        assertEquals("theirs and ours", listOf(theirs, ours), platform.listed)
         assertTrue(switches.microphoneOn)
         assertTrue(control.carries())
         assertEquals(1L, control.captureProof().openings)
