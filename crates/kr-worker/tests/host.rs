@@ -1872,12 +1872,13 @@ async fn a_worker_that_cannot_reach_its_controller_says_why_and_ends_whatever_it
 ///
 /// On Windows the places that write are the worker's root shell (the start of the shell in its
 /// pseudo-console), its backend probe, the check of the kernel's clock it makes the first time it
-/// orders a start, and its query of the time service; the description process is the daemon's, as
-/// on Unix. The worker asks its platform no question there and runs no backend server, which is
-/// run only on a Unix host, so the record holds the root shell once and the clock check at most
-/// once, and nothing else. The worker's children are read as well, by their recorded parent, which
-/// leaves the pseudo-console's host and nothing else, and does not see a process that a child of
-/// the worker left running.
+/// orders a start (a process created suspended and ended at once), and its query of the time
+/// service, which is that platform's question (`w32tm /query /status`, asked by the worker and by
+/// the daemon); the description process is the daemon's, as on Unix. No backend server runs there,
+/// since a server is run only on a Unix host. The record holds the root shell once, the clock
+/// check at most once and the questions, and nothing else. The worker's children are read as well,
+/// by their recorded parent, which leaves the pseudo-console's host and nothing else, and does not
+/// see a process that a child of the worker left running.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_idle_session_runs_nothing_beside_its_shell() {
     let host = Host::create().recording_launches().recording_creations();
@@ -1932,16 +1933,10 @@ async fn an_idle_session_runs_nothing_beside_its_shell() {
         0,
         "the worker of an idle session asked the daemon for the plugin runtime"
     );
-    #[cfg(unix)]
     only_the_root_shell_and_platform_questions_were_created(
         &host.creations(),
         u32::try_from(worker.pid.get()).expect("a process identifier"),
         std::process::id(),
-    );
-    #[cfg(windows)]
-    only_the_root_shell_and_the_clock_check_were_created(
-        &host.creations(),
-        u32::try_from(worker.pid.get()).expect("a process identifier"),
     );
 }
 
@@ -1971,7 +1966,10 @@ async fn until_the_daemon_has_let_the_session_go(host: &Host, session_id: Sessio
 /// the daemon makes through a helper of the worker's is recorded at all. A record with none says
 /// the daemon's calls do not reach it, and the case then shows nothing of what the daemon starts
 /// through those helpers.
-#[cfg(unix)]
+///
+/// On Windows the worker also creates, once, a process that it ends at once, to check that the
+/// kernel's record of when a process started can be believed: it is the one creation there that is
+/// neither the root shell nor a question, and it is a process that never runs.
 fn only_the_root_shell_and_platform_questions_were_created(
     created: &[kr_ipc::testing::created::Created],
     worker: u32,
@@ -1984,7 +1982,8 @@ fn only_the_root_shell_and_platform_questions_were_created(
         .iter()
         .filter(|made| {
             !((made.by == worker && made.what == "shell")
-                || ((made.by == worker || made.by == daemon) && is_a_question(made)))
+                || ((made.by == worker || made.by == daemon) && is_a_question(made))
+                || (cfg!(windows) && made.by == worker && made.what == "clock"))
         })
         .collect();
     assert!(
@@ -1998,43 +1997,15 @@ fn only_the_root_shell_and_platform_questions_were_created(
         "the worker created the root shell once: {created:?}"
     );
     assert!(
+        created.iter().filter(|made| made.what == "clock").count() <= 1,
+        "the worker checked the kernel's clock at most once: {created:?}"
+    );
+    assert!(
         created
             .iter()
             .any(|made| made.by == daemon && is_a_question(made)),
         "no question of the daemon's is in the record, so what it starts through the helpers it \
          shares with the worker is not seen: {created:?}"
-    );
-}
-
-/// What a worker created for an idle session on Windows, from the record it wrote: its root shell,
-/// once, and the check of the kernel's clock it makes the first time it orders a start (a process
-/// created suspended and ended at once, which is not a backend, a Wasm instance or a model), and
-/// nothing else. The worker asks its platform no question there: it reads the login session
-/// through the operating system's own interface, so a question in the record is a creation the
-/// session has no use for. The daemon creates nothing here at idle that a helper of the worker's
-/// writes, so the record holds what the worker wrote.
-#[cfg(windows)]
-fn only_the_root_shell_and_the_clock_check_were_created(
-    created: &[kr_ipc::testing::created::Created],
-    worker: u32,
-) {
-    let strangers: Vec<_> = created
-        .iter()
-        .filter(|made| !(made.by == worker && (made.what == "shell" || made.what == "clock")))
-        .collect();
-    assert!(
-        strangers.is_empty(),
-        "an idle session's worker created more than its root shell and the check of the kernel's \
-         clock: {strangers:?} of {created:?}"
-    );
-    assert_eq!(
-        created.iter().filter(|made| made.what == "shell").count(),
-        1,
-        "the worker created the root shell once: {created:?}"
-    );
-    assert!(
-        created.iter().filter(|made| made.what == "clock").count() <= 1,
-        "the worker checked the kernel's clock at most once: {created:?}"
     );
 }
 
@@ -2077,6 +2048,18 @@ fn is_a_platform_question(program: &str, arguments: &[String]) -> bool {
         ("loginctl", ["show-session", _, properties @ ..]) => properties == LOGIN_PROPERTIES,
         _ => false,
     }
+}
+
+/// See the list for macOS above. On Windows the worker and the daemon ask the time service for its
+/// status, which is the one program either starts to read the platform; the login session is read
+/// through the system's own interface and starts none.
+#[cfg(windows)]
+fn is_a_platform_question(program: &str, arguments: &[String]) -> bool {
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    matches!(
+        (program, arguments.as_slice()),
+        ("w32tm", ["/query", "/status"])
+    )
 }
 
 /// What the worker started that is running now beside the root shell, on a Unix host: a process

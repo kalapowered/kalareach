@@ -6,11 +6,11 @@
 //! way: the places that create a process for a session (the worker's root shell, backend server,
 //! backend probe, platform questions and desktop checks, and the daemon's description process)
 //! write one line here before they create it, so a creation that fails is a line too. On Windows
-//! the same places write, and so do the worker's check of the kernel's clock and its query of the
-//! time service, the starts that are made through the system's own create rather than through
-//! [`std::process::Command`] naming their words ([`note_words_here`]). Other places write none. A
-//! test reads the lines once it can say, by a condition of its own, that those places have nothing
-//! more to be asked for.
+//! the same places write, and so do the worker's check of the kernel's clock and, as a platform
+//! question, its query of the time service (the starts that are made through the system's own
+//! create rather than through [`std::process::Command`] name their words, [`note_words_here`]).
+//! Other places write none. A test reads the lines once it can say, by a condition of its own, that
+//! those places have nothing more to be asked for.
 //!
 //! The record is a file in the environment's state directory, so the daemon and every worker of
 //! the environment write to the one list. It exists only where a test made it ([`begin`]); a

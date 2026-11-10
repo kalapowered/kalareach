@@ -479,7 +479,7 @@ mod windows {
     pub fn query() -> Option<String> {
         #[cfg(feature = "testing")]
         kr_ipc::testing::created::note_words_here(
-            "time",
+            "question",
             "w32tm",
             &["/query".to_owned(), "/status".to_owned()],
         );
