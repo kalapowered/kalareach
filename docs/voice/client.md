@@ -193,12 +193,13 @@ the call's news, reads the news up to that marker, and only then decides:
   backwards or overlap; a delegation whose offset is below an earlier one's; a fragment that
   arrives after the set it belongs to was read; a fragment that arrives before capture first
   opened; native code's own record of capture showing more than one opening or any break (a
-  mute, an interruption, a route change, a suspension, a recorder gap or a silenced recording);
-  an answer that turns discontinuous transmission on; and the provider's own acknowledgement of a
-  mute after capture opened. A call that starts muted and whose provider acknowledges the mute
-  after the microphone first opens is tainted by it for the rest of the call. So does a flow of
-  more fragments than the gate keeps (4,096 within five minutes); a call that is tainted keeps none
-  of what it hears.
+  mute, an interruption, a route change, a suspension, a recorder gap or a silenced recording),
+  which taints the call when the proof is read, without waiting for the news up to its marker, so
+  that a request still waiting to be written is never written; an answer that turns discontinuous
+  transmission on; and the provider's own acknowledgement of a mute after capture opened. A call
+  that starts muted and whose provider acknowledges the mute after the microphone first opens is
+  tainted by it for the rest of the call. So does a flow of more fragments than the gate keeps
+  (4,096 within five minutes); a call that is tainted keeps none of what it hears.
 - **The first fragment.** The device cannot hear what was said before capture first opened, and a
   person can say "do not" before it. A set that holds the first fragment the call delivered, or
   the first one that arrived after the opening, never authorises: the first thing a person says in
@@ -211,7 +212,9 @@ the call's news, reads the news up to that marker, and only then decides:
   fragment refuses the set, since it may be the first half of the same instruction. The gate keeps
   what was said in the last five minutes; a delegation whose reach goes back to a fragment it
   forgot, which could be one of those, is refused as too old. A set that is refused is spent all
-  the same: what it held answers no later delegation.
+  the same: what it held answers no later delegation. So is a set that is dropped before it
+  freezes, because the path to the host was lost, native code gave no proof or the news was not
+  read up to the marker in time, and so is what arrives later at or before its offset.
 
 The 30 seconds, the 2 seconds, the wait after a delegation, the 40 ms and 100 ms capture-gap
 thresholds and the 500 ms age of a proof are parameters of the device's reading, not safety bounds,
