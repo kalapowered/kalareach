@@ -2908,11 +2908,11 @@ async fn an_id_token_is_accepted_for_its_own_origins_issuer_and_for_no_other() {
     }
 }
 
-/// A code and its verifier go to the service the request was made for, and a refresh token to the
-/// service that issued it, and to no other: nothing is sent, and a grant that is not the service's is
-/// kept as it was.
+/// A code and its verifier are exchanged only at the service the request was made for, and a stored
+/// grant is refreshed only at the service that issued it: at another, the call is refused and nothing
+/// is sent.
 #[tokio::test]
-async fn a_code_or_a_refresh_token_is_sent_only_to_the_service_that_issued_it() {
+async fn a_code_is_not_exchanged_and_a_grant_is_not_refreshed_at_another_services_issuer() {
     let client = Client::Desktop;
     let managed_code = granted(client, Redirect::Loopback);
     let owner_code = granted_at(OWNER);
@@ -2928,7 +2928,7 @@ async fn a_code_or_a_refresh_token_is_sent_only_to_the_service_that_issued_it() 
             &owner_code,
         ),
     ] {
-        let http = Scripted::answering(vec![]);
+        let http = Scripted::answering(vec![(200, serde_json::json!({}))]);
         let error = service_at(&http, origin)
             .exchange(code)
             .await
@@ -2959,7 +2959,7 @@ async fn a_code_or_a_refresh_token_is_sent_only_to_the_service_that_issued_it() 
             grant_of(OWNER),
         ),
     ] {
-        let http = Scripted::answering(vec![]);
+        let http = Scripted::answering(vec![(200, serde_json::json!({}))]);
         let error = service_at(&http, origin)
             .refresh(&kept)
             .await

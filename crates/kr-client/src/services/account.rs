@@ -627,14 +627,18 @@ impl AuthorisationRequest {
         redirect: Redirect,
         resources: &[&str],
     ) -> Result<Self> {
-        let Some(authorise) = GatewayOrigin::new(origin)
-            .ok()
-            .and_then(|_| Url::parse(origin).ok())
-            .and_then(|origin| origin.join(AUTHORIZE_PATH).ok())
-        else {
+        if GatewayOrigin::new(origin).is_err() {
             return Err(local(
                 "an account service's origin is a scheme, a host and an optional port, and plain \
                  http only for a loopback host",
+            ));
+        }
+        let Some(authorise) = Url::parse(origin)
+            .ok()
+            .and_then(|origin| origin.join(AUTHORIZE_PATH).ok())
+        else {
+            return Err(local(
+                "an account service's origin is not an address this client can open",
             ));
         };
         if !client.owns(redirect) {
@@ -1184,8 +1188,9 @@ impl ManagedAccountService {
 
     /// The account service at another origin: a service the owner runs, or a test server. The
     /// issuer an ID token is checked against is that origin's own, `<origin>/auth` ([`issuer_of`]),
-    /// so an ID token that names the managed issuer, or any other, is refused. A code or a stored
-    /// grant that names another issuer is never sent to it.
+    /// so an ID token that names the managed issuer, or any other, is refused. A code that names
+    /// another issuer is not exchanged at it, and a stored grant that names another is not
+    /// refreshed at it.
     #[must_use]
     pub fn at_origin(
         origin: impl Into<String>,
@@ -1289,9 +1294,10 @@ impl ManagedAccountService {
 
     /// Checks an ID token's payload and returns its subject.
     ///
-    /// Its signature is not checked: it came straight from the token endpoint this service was made
-    /// for, over TLS (or over plain http to a loopback host, which only a deployment on this
-    /// machine is reached by), which OpenID Connect Core section 3.1.3.7 accepts in place of one.
+    /// Its signature is not checked: it came over TLS straight from the token endpoint this service
+    /// was made for, which OpenID Connect Core section 3.1.3.7 accepts in place of one. A
+    /// deployment on a loopback host is reached over plain http, with no such assurance; for it the
+    /// issuer, audience, nonce and expiry checks are all there is.
     fn checked_subject(&self, token: &str, expected: &Expected<'_>) -> Option<String> {
         let claims = id_token_claims(token)?;
         let text = |name: &str| claims.get(name).and_then(serde_json::Value::as_str);
