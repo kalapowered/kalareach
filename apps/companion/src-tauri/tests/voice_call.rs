@@ -5116,11 +5116,14 @@ async fn a_named_stop_after_the_unlock_settles_the_entry_the_file_held() {
 use kr_protocol::method::Method as HostMethod;
 
 /// Timings of a call that hands spoken delegations to the host: a wait for what was said before a
-/// delegation that the voice service's announcement, which comes on another path, is read within,
-/// and a capture proof that stays young long enough that a loaded machine does not age it.
+/// delegation that the voice service's announcement, which comes on another path than the
+/// provider's data channel, is read within, and a capture proof that stays young long enough that a
+/// loaded machine does not age it. Nothing a case asserts depends on how long the wait is, only on
+/// the announcement being read inside it: the wait is long enough that a machine that is busy
+/// reads a message that was told first before one that was told after it.
 fn delegating_timings() -> Timings {
     Timings {
-        delegation_wait: Duration::from_millis(400),
+        delegation_wait: Duration::from_millis(1_500),
         proof_age: Duration::from_secs(10),
         ..quick()
     }
@@ -5228,25 +5231,63 @@ async fn row_reaching(scene: &Scene, id: &str, wanted: &str) -> serde_json::Valu
     row_of(&state, id).expect("the row")
 }
 
+/// Waits until the delegation `id` is no longer being collected or asked about, and returns its row:
+/// a case that wants to say what became of it reads it here, so that a call that did the wrong thing
+/// fails on what it did and does not wait for what it never did.
+async fn row_settled(scene: &Scene, id: &str) -> serde_json::Value {
+    let state = scene
+        .state_where(&format!("{id} settled"), |state| {
+            row_of(state, id)
+                .is_some_and(|row| !matches!(row["state"].as_str(), Some("collecting" | "asking")))
+        })
+        .await;
+    row_of(&state, id).expect("the row")
+}
+
 /// What the host was sent of `voice.delegate`.
 fn at_the_host(scene: &Scene) -> usize {
     scene.link.sent(HostMethod::VoiceDelegate)
 }
 
-/// Waits until the call has asked native code for a capture proof with a marker.
-async fn until_the_proof_is_asked(scene: &Scene) {
+/// Waits until the call has asked native code for `count` capture proofs with a marker.
+async fn until_proofs_are_asked(scene: &Scene, count: usize) {
     tokio::time::timeout(WATCHDOG, async {
-        while !scene
+        while scene
             .platform
             .commands()
             .iter()
-            .any(|command| command == "capture_proof:barrier")
+            .filter(|command| *command == "capture_proof:barrier")
+            .count()
+            < count
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("the call asks native code for a capture proof");
+    .expect("the call asks native code for its proofs");
+}
+
+/// Waits until the call has asked native code for the proof it takes just before a write.
+async fn until_a_proof_is_asked_at_use(scene: &Scene) {
+    tokio::time::timeout(WATCHDOG, async {
+        while !scene
+            .platform
+            .commands()
+            .iter()
+            .any(|command| command == "capture_proof")
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the request is composed and its proof asked for");
+}
+
+/// Gives an owner time to act on a proof's answer before the news behind it is told, so that an
+/// owner that did not wait for the marker would act on it. Nothing a case asserts depends on how
+/// long this is: it can only make a case that should fail fail more surely.
+async fn let_the_owner_act() {
+    tokio::time::sleep(Duration::from_millis(300)).await;
 }
 
 /// What the model was told of the delegation `id`, in the order it was told.
@@ -5380,7 +5421,7 @@ async fn a_capture_change_before_the_set_is_complete_refuses_it_and_every_later_
         scene.platform.hold("capture_proof");
         let end = speak(&scene, 6_000, "what is the status");
         ask(&scene, "d-1", end - 200);
-        until_the_proof_is_asked(&scene).await;
+        until_proofs_are_asked(&scene, 2).await;
         scene.platform.tell(CallEvent::Capture { state });
         scene.platform.release("capture_proof");
 
@@ -5402,49 +5443,227 @@ async fn a_capture_change_before_the_set_is_complete_refuses_it_and_every_later_
     }
 }
 
-/// News lost while the proof is held is read before the marker, whatever it was: the call is
-/// tainted and the set refused.
+/// What native code had waiting in an earlier queue when the proof was read is told after the
+/// proof's answer, and before its marker: a set is frozen at the marker and not at the answer. The
+/// last word of the request waits that way, and the host reads the whole of it. The owner is given
+/// time to act on the answer before the news is told, so that an owner that did not wait for the
+/// marker would freeze a set without the word.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn news_lost_behind_the_completion_refuses_the_set() {
+async fn events_waiting_in_an_earlier_queue_are_read_before_the_set_is_frozen() {
+    let timings = Timings {
+        drain_within: Duration::from_secs(5),
+        ..delegating_timings()
+    };
+    let mut scene = delegating_with(timings, 1).await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    let end = speak(&scene, 6_000, "what is the");
+    ask(&scene, "d-1", end);
+    scene.platform.hold_news();
+    scene
+        .platform
+        .tell_provider(&fragment(end, end + 200, " status"));
+    until_proofs_are_asked(&scene, 2).await;
+    let_the_owner_act().await;
+    scene.platform.release_news();
+
+    let row = row_settled(&scene, "d-1").await;
+
+    assert_eq!(row["state"], "performed", "{row}");
+    assert_eq!(at_the_host(&scene), 1);
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// News lost in an earlier queue is read before the marker: the call is tainted and the set refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn news_lost_in_an_earlier_queue_is_read_before_the_marker_and_refuses_the_set() {
     let mut scene = delegating().await;
     calling(&scene).await;
     chatter(&scene).await;
-    scene.platform.hold("capture_proof");
     let end = speak(&scene, 6_000, "what is the status");
     ask(&scene, "d-1", end - 200);
-    until_the_proof_is_asked(&scene).await;
+    scene.platform.hold_news();
     scene.platform.lose_some_news();
-    scene.platform.release("capture_proof");
+    until_proofs_are_asked(&scene, 2).await;
+    let_the_owner_act().await;
+    scene.platform.release_news();
 
-    let row = row_reaching(&scene, "d-1", "refused").await;
+    let row = row_settled(&scene, "d-1").await;
 
+    assert_eq!(row["state"], "refused", "{row}");
     assert_eq!(row["cause"], "lost_news");
     assert_eq!(at_the_host(&scene), 0);
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
     scene.stop_host().await;
 }
 
-/// What the provider sent before the deadline and the owner had not yet read is read before the
-/// set is frozen: the last word of the request, told while the proof is held, is in the set and
-/// the host reads the whole of it.
+/// A marker that was never read in time refuses the set as not drained, and the marker that comes
+/// later, from the proof that was abandoned, stands for no other set: the next request waits for
+/// its own marker, which comes behind the word that waits with it. A set frozen at the abandoned
+/// proof's marker would lack the word.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn events_pending_at_the_deadline_are_in_the_set() {
+async fn a_marker_that_never_came_refuses_the_set_and_a_late_one_stands_for_no_other() {
+    let timings = Timings {
+        drain_within: Duration::from_secs(2),
+        ..delegating_timings()
+    };
+    let mut scene = delegating_with(timings, 1).await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    // A delegation with nothing said for it: the proof's marker is held behind the news, and never
+    // read in time.
+    ask(&scene, "d-1", 5_000);
+    scene.platform.hold_news();
+    let not_drained = row_settled(&scene, "d-1").await;
+    assert_eq!(not_drained["state"], "refused", "{not_drained}");
+    assert_eq!(not_drained["cause"], "not_drained");
+    assert_eq!(at_the_host(&scene), 0);
+    // The marker of the abandoned proof arrives late.
+    scene.platform.release_news();
+
+    let second = speak(&scene, 12_000, "what is the");
+    ask(&scene, "d-2", second);
+    scene.platform.hold_news();
+    scene
+        .platform
+        .tell_provider(&fragment(second, second + 200, " status"));
+    until_proofs_are_asked(&scene, 3).await;
+    let_the_owner_act().await;
+    scene.platform.release_news();
+
+    let row = row_settled(&scene, "d-2").await;
+
+    assert_eq!(row["state"], "performed", "{row}");
+    assert_eq!(at_the_host(&scene), 1);
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// The voice service has to announce a delegation within the wait: an announcement read after the
+/// wait is over does not vouch for the set, even when it is read before the set is frozen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_announcement_read_after_the_wait_does_not_vouch_for_the_set() {
+    let timings = Timings {
+        drain_within: Duration::from_secs(5),
+        ..delegating_timings()
+    };
+    let mut scene = delegating_with(timings, 1).await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    let end = speak(&scene, 6_000, "what is the status");
+    scene
+        .platform
+        .tell_provider(&delegation_event("d-1", end - 200));
+    scene.platform.hold_news();
+    until_proofs_are_asked(&scene, 2).await;
+    // The wait is over. The service announces the delegation now, and the owner reads it while the
+    // news is still being read up to the marker.
+    scene.stand_in.control().announce("d-1", end - 200);
+    let_the_owner_act().await;
+    scene.platform.release_news();
+
+    let row = row_settled(&scene, "d-1").await;
+
+    assert_eq!(row["state"], "refused", "{row}");
+    assert_eq!(row["cause"], "broker_disagrees");
+    assert_eq!(at_the_host(&scene), 0);
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// The capture record, and not the news, says whether capture broke: a gap native code's record
+/// shows and tells no news of refuses the set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_break_the_record_shows_and_the_news_does_not_refuses_the_set() {
     let mut scene = delegating().await;
     calling(&scene).await;
     chatter(&scene).await;
     scene.platform.hold("capture_proof");
-    let end = speak(&scene, 6_000, "what is the");
-    ask(&scene, "d-1", end);
-    until_the_proof_is_asked(&scene).await;
-    scene
-        .platform
-        .tell_provider(&fragment(end, end + 200, " status"));
+    let end = speak(&scene, 6_000, "what is the status");
+    ask(&scene, "d-1", end - 200);
+    until_proofs_are_asked(&scene, 2).await;
+    scene.platform.show_a_gap_in_progress();
     scene.platform.release("capture_proof");
 
-    let row = row_reaching(&scene, "d-1", "performed").await;
+    let row = row_settled(&scene, "d-1").await;
 
-    assert_eq!(row["state"], "performed");
+    assert_eq!(row["state"], "refused", "{row}");
+    assert_eq!(row["cause"], "capture_break");
+    assert_eq!(at_the_host(&scene), 0);
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// The proof taken just before the write is read as the one that completes a set is: a break that
+/// came after the set was read and before the write taints the call, and nothing is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_break_after_the_set_was_read_and_before_the_write_stops_the_write() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    scene.platform.hold("capture_proof_at_use");
+    let end = speak(&scene, 6_000, "what is the status");
+    ask(&scene, "d-1", end - 200);
+    until_a_proof_is_asked_at_use(&scene).await;
+    scene.platform.tell(CallEvent::Capture {
+        state: CaptureState::Interrupted,
+    });
+    scene.platform.release("capture_proof_at_use");
+
+    let row = row_settled(&scene, "d-1").await;
+
+    assert_eq!(row["state"], "not_sent", "{row}");
+    assert_eq!(row["cause"], "capture_break");
+    assert!(kinds_of(&scene.state()).contains(&"spoken_requests".to_owned()));
+    assert_eq!(at_the_host(&scene), 0);
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// A taint that comes while the request waits for the writer stops the write: the call that is
+/// tainted submits nothing, however young the proof still is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_taint_that_comes_while_the_request_waits_for_the_writer_stops_the_write() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    let end = speak(&scene, 6_000, "what is the status");
+    scene.link.hold_next_request(HostMethod::VoiceDelegate);
+    ask(&scene, "d-1", end - 200);
+    scene.link.until_request_held().await;
+    scene.platform.lose_some_news();
+    scene
+        .state_where("the call tainted", |state| {
+            kinds_of(state).contains(&"spoken_requests".to_owned())
+        })
+        .await;
+    scene.link.release_request();
+
+    let row = row_settled(&scene, "d-1").await;
+
+    assert_eq!(row["state"], "not_sent", "{row}");
+    assert_eq!(row["cause"], "lost_news");
+    assert_eq!(at_the_host(&scene), 0, "nothing reached the host");
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// A request the host refuses is shown as its refusal and not as one this device made, and the
+/// call is not tainted by it: a request for a session the call does not reach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_the_host_refuses_is_shown_as_the_hosts_refusal() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    let end = speak(&scene, 6_000, "what is the status of session seven");
+    ask(&scene, "d-1", end - 200);
+
+    let row = row_reaching(&scene, "d-1", "host_refused").await;
+
+    assert!(row["cause"].is_string(), "{row}");
     assert_eq!(at_the_host(&scene), 1);
+    assert!(!kinds_of(&scene.state()).contains(&"spoken_requests".to_owned()));
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
     scene.stop_host().await;
 }
@@ -5859,7 +6078,7 @@ async fn a_delegation_waiting_when_the_host_is_lost_is_discarded() {
     scene.platform.hold("capture_proof");
     let end = speak(&scene, 6_000, "what is the status");
     ask(&scene, "d-1", end - 200);
-    until_the_proof_is_asked(&scene).await;
+    until_proofs_are_asked(&scene, 2).await;
     lose_the_host(&scene);
     scene
         .state_where("the host lost", |state| state["host"] == "lost")
@@ -5908,6 +6127,117 @@ async fn a_request_composed_and_not_written_when_the_host_is_lost_is_not_written
     assert_eq!(at_the_host(&scene), 0);
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
     scene.stop_host().await;
+}
+
+/// A request that waits for the connection's turn to be written is not written once the call is
+/// ending: the end stops what has not been written before it waits for the media or the host, so a
+/// request let go meanwhile reaches nobody.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_waiting_for_the_writer_is_not_written_once_the_call_is_ending() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    let end = speak(&scene, 6_000, "what is the status");
+    scene.link.hold_next_request(HostMethod::VoiceDelegate);
+    ask(&scene, "d-1", end - 200);
+    scene.link.until_request_held().await;
+    scene.platform.hold("stop");
+    let _holding = scene.platform.release_when_done("stop");
+    let stopping = scene
+        .phone
+        .companion
+        .start_call("voice_stop", json!({ "voiceSessionId": null }));
+    // The end has begun once native code is asked to stop and has not returned.
+    tokio::time::timeout(WATCHDOG, async {
+        while scene.platform.count("stop") == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the call is ending");
+    scene.link.release_request();
+    let_the_owner_act().await;
+
+    assert_eq!(
+        at_the_host(&scene),
+        0,
+        "nothing was written once the end began"
+    );
+    scene.platform.release("stop");
+    let _ = stopping.await;
+    assert_eq!(at_the_host(&scene), 0);
+    scene.stop_host().await;
+}
+
+/// A call whose owner fails while a request waits for the connection's turn leaves nothing that
+/// writes it afterwards, and says in the end that a request may or may not have been carried out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_waiting_for_the_writer_is_not_written_once_the_owner_has_failed() {
+    let mut scene = delegating().await;
+    let prepared = scene.prepared().await;
+    let reach = failing_reach(&scene, FailsAt::Pairing, 0);
+    let calls = scene.phone.companion.app.state::<Calls>();
+    calls
+        .start(
+            request_of(&scene, &prepared),
+            Arc::clone(&reach) as Arc<dyn companion_tauri::voice::HostReach>,
+            Arc::clone(&scene.tokens),
+        )
+        .await
+        .expect("a call starts");
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    scene.platform.show_progress_age(Some(10));
+    chatter(&scene).await;
+    let end = speak(&scene, 6_000, "what is the status");
+    scene.link.hold_next_request(HostMethod::VoiceDelegate);
+    ask(&scene, "d-1", end - 200);
+    scene.link.until_request_held().await;
+
+    reach.told.store(1, Ordering::SeqCst);
+    let ended = scene
+        .state_where("the owner's failure", |state| {
+            state["ended"]["cause"] == "owner_failed" && state["setting_up"] == false
+        })
+        .await;
+    let words = ended["ended"]["words"].as_str().expect("words");
+    assert!(words.contains("may or may not"), "{words}");
+    scene.link.release_request();
+    let_the_owner_act().await;
+
+    assert_eq!(
+        at_the_host(&scene),
+        0,
+        "nothing was written for a call nobody holds"
+    );
+    scene.stop_host().await;
+}
+
+/// A call that may act stands on words, in the file that outlives the process, that say a request
+/// it made may or may not have been carried out; the words of a call that cannot act do not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_that_may_act_leaves_words_that_say_a_request_may_have_been_carried_out() {
+    for acting in [true, false] {
+        let mut scene = scene().await;
+        scene
+            .phone
+            .companion
+            .app
+            .state::<Calls>()
+            .accept_host_delegations(acting);
+        calling(&scene).await;
+        let file = kept_file_where(scene.phone.data.path(), |file| {
+            file["owed"].as_array().is_some_and(|owed| owed.len() == 1)
+        })
+        .await;
+        let words = file["owed"][0]["words"].as_str().expect("words");
+        assert_eq!(words.contains("may or may not"), acting, "{words}");
+        let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+        scene.stop_host().await;
+    }
 }
 
 /// With the constant off, which is every shipped build, transcript and delegation events on the

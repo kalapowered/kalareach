@@ -869,13 +869,14 @@ const REQUEST_WORDS: Readonly<Record<ContextRequest['outcome'], string>> = {
 const DELEGATION_WORDS: Readonly<Record<string, string>> = {
   not_done: 'Not done.',
   collecting: 'Reading what was said.',
-  asking: 'Sent to the computer, which has not answered.',
+  asking: 'Asking the computer, which has not answered.',
   refused: 'Not sent. What was said could not be used as a request.',
   not_sent: 'Not done. Nothing was sent to the computer.',
   performed: 'Done by the computer.',
   admitted: 'Taken by the computer. Whether it was carried out is not known.',
   confirmation_required: 'Not done. It needs a confirmation on this phone, unlocked.',
   host_refused: 'Not done. The computer refused it.',
+  cancelled: 'Not done. It was sent, and then dropped.',
   unknown: 'It is not known whether the computer did it.'
 }
 

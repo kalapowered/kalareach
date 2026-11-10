@@ -56,6 +56,10 @@ struct Inner {
     held_steps: Vec<&'static str>,
     /// Whether the provider's answer, once applied, turns discontinuous transmission on.
     answer_uses_dtx: bool,
+    /// Whether the news told is being kept, and what is kept, in order: an event, or the gap a loss
+    /// leaves.
+    news_held: bool,
+    held_news: Vec<Option<CallEvent>>,
 }
 
 /// What native code's record of the call's capture holds, as the capture proof answers it.
@@ -119,6 +123,8 @@ impl ScriptedCalls {
                 alive_refusal: None,
                 held_steps: Vec::new(),
                 answer_uses_dtx: false,
+                news_held: false,
+                held_news: Vec::new(),
             }),
             freed: tokio::sync::Notify::new(),
         })
@@ -270,6 +276,10 @@ impl ScriptedCalls {
         if let CallEvent::Capture { state } = &event {
             inner.capture_is(*state);
         }
+        if inner.news_held {
+            inner.held_news.push(Some(event));
+            return;
+        }
         if let Some((call, sink, seq)) = inner.held.as_mut() {
             *seq += 1;
             sink.deliver(EventFrame {
@@ -277,6 +287,35 @@ impl ScriptedCalls {
                 seq: *seq,
                 event,
             });
+        }
+    }
+
+    /// News told from now on is kept, in order, until [`Self::release_news`], and the marker of a
+    /// proof taken meanwhile is kept behind it: events that wait in an earlier queue of native code
+    /// when the proof is read. The record changes at once, as a phone's does; only the telling waits.
+    pub fn hold_news(&self) {
+        self.inner().news_held = true;
+    }
+
+    /// Tells the news kept, in the order it was told, and tells the rest as it comes.
+    pub fn release_news(&self) {
+        let mut inner = self.inner();
+        inner.news_held = false;
+        let held = std::mem::take(&mut inner.held_news);
+        if let Some((call, sink, seq)) = inner.held.as_mut() {
+            for item in held {
+                match item {
+                    None => *seq += 2,
+                    Some(event) => {
+                        *seq += 1;
+                        sink.deliver(EventFrame {
+                            call: call.clone(),
+                            seq: *seq,
+                            event,
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -316,6 +355,10 @@ impl ScriptedCalls {
     /// News that skips a number: what the reader is told as news that was lost.
     pub fn lose_some_news(&self) {
         let mut inner = self.inner();
+        if inner.news_held {
+            inner.held_news.push(None);
+            return;
+        }
         let inner = &mut *inner;
         if let Some((call, sink, seq)) = inner.held.as_mut().or(inner.ended_silently.as_mut()) {
             *seq += 2;
@@ -563,13 +606,17 @@ impl CallPlatform for ScriptedCalls {
                 progress_age_ms: inner.record.progress_age_ms,
                 barrier: token,
             };
-            if let (Some(token), Some((held, sink, seq))) = (token, inner.held.as_mut()) {
-                *seq += 1;
-                sink.deliver(EventFrame {
-                    call: held.clone(),
-                    seq: *seq,
-                    event: CallEvent::Barrier { token },
-                });
+            if let Some(token) = token {
+                if inner.news_held {
+                    inner.held_news.push(Some(CallEvent::Barrier { token }));
+                } else if let Some((held, sink, seq)) = inner.held.as_mut() {
+                    *seq += 1;
+                    sink.deliver(EventFrame {
+                        call: held.clone(),
+                        seq: *seq,
+                        event: CallEvent::Barrier { token },
+                    });
+                }
             }
             Ok(proof)
         })

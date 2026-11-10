@@ -124,7 +124,7 @@ const SPEECH_TAINTED_PERSON: &str = "This call can no longer act on spoken reque
 const DELEGATION_PERFORMED: &str = "The person's computer read it. Say what it reports:";
 
 /// What an end says of requests that may have been written and not answered.
-const REQUESTS_UNSETTLED: &str = "A request you spoke may or may not have been carried out: look \
+pub(super) const REQUESTS_UNSETTLED: &str = "A request you spoke may or may not have been carried out: look \
     at the session list.";
 
 /// What the model is told when the host is back and spoken requests may reach it: it does not say
@@ -421,9 +421,9 @@ pub(super) struct Owner {
     collection_due: Pin<Box<tokio::time::Sleep>>,
     /// The markers read in the news, newest last.
     barriers: VecDeque<u64>,
-    /// What the voice service announced of each delegation: the offset when it said, and none when
-    /// it only listed the identifier.
-    announced: VecDeque<(String, Option<u64>)>,
+    /// What the voice service announced of each delegation: the offset when it said, with the moment
+    /// this device read it, and none when it only listed the identifier.
+    announced: VecDeque<(String, Option<(u64, Instant)>)>,
     /// What was written to the host and not answered, by delegation, which a later look at the
     /// host asks about again.
     attempts: HashMap<String, Attempt>,
@@ -498,6 +498,14 @@ fn capture_word(state: CaptureState) -> String {
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_else(|| "unavailable".to_owned())
+}
+
+impl Drop for Owner {
+    /// An owner that is gone, however it went, hands nothing more to the host: a request still
+    /// waiting for the connection's turn to be written is not written for a call nobody holds.
+    fn drop(&mut self) {
+        self.unsent.store(true, Ordering::SeqCst);
+    }
 }
 
 impl Owner {
@@ -946,7 +954,13 @@ impl Owner {
         self.shared.stand_open(
             self.id,
             OwedView::revocation(
-                STANDING_WORDS.to_owned(),
+                // A process that stops while a call that may act runs cannot know whether a request
+                // was written, so what it left says so.
+                if self.accepting {
+                    format!("{STANDING_WORDS} {REQUESTS_UNSETTLED}")
+                } else {
+                    STANDING_WORDS.to_owned()
+                },
                 descriptor.voice_session_id,
                 owed_until(descriptor.closes_at_ms.get()),
                 &host,
@@ -1386,7 +1400,11 @@ impl Owner {
             // the host, and is not read at all otherwise.
             Some(Heard::Event(CallEvent::ProviderEvent { bytes })) => {
                 if self.accepting {
-                    let told = self.gate.provider(provider::read(&bytes));
+                    let read = provider::read(&bytes);
+                    if let provider::Provider::Other { kind } = &read {
+                        tracing::debug!(%kind, "the provider sent an event the gate does not read");
+                    }
+                    let told = self.gate.provider(read);
                     self.after_gate(told);
                 }
                 None
@@ -1866,25 +1884,32 @@ impl Owner {
 
     /// The voice service says it announced the delegation `id`, at `offset_ms` when it said where.
     fn announce(&mut self, id: String, offset_ms: Option<u64>) {
+        let now = Instant::now();
         if let Some(known) = self.announced.iter_mut().find(|(known, _)| *known == id) {
-            // A list that names no offset never takes one away.
-            if offset_ms.is_some() {
-                known.1 = offset_ms;
+            // A list that names no offset never takes one away, and the same offset said again is
+            // the one read first: it is not later for being said twice.
+            if let Some(offset) = offset_ms
+                && known.1.is_none_or(|(held, _)| held != offset)
+            {
+                known.1 = Some((offset, now));
             }
             return;
         }
-        self.announced.push_back((id, offset_ms));
+        self.announced
+            .push_back((id, offset_ms.map(|offset| (offset, now))));
         if self.announced.len() > ANSWERED {
             self.announced.pop_front();
         }
     }
 
-    /// The offset the voice service announced the delegation `id` at, when it did.
-    fn announced_offset(&self, id: &str) -> Option<u64> {
+    /// The offset the voice service announced the delegation `id` at, when it did so by `due`: an
+    /// announcement read after the wait ended is not one the set was vouched for within.
+    fn announced_offset(&self, id: &str, due: Instant) -> Option<u64> {
         self.announced
             .iter()
             .find(|(known, _)| known == id)
-            .and_then(|(_, offset)| *offset)
+            .and_then(|(_, said)| *said)
+            .and_then(|(offset, read)| (read <= due).then_some(offset))
     }
 
     /// The provider announced a delegation on its data channel: a row for it, and the wait for what
@@ -2031,22 +2056,22 @@ impl Owner {
         if let Some(Collection {
             id,
             offset_ms,
+            due,
             stage:
                 Stage::Draining {
                     record: Some(record),
                     ..
                 },
-            ..
         }) = self.collections.pop_front()
         {
-            self.finish(&id, offset_ms, record);
+            self.finish(&id, offset_ms, due, record);
         }
         self.arm_collection();
     }
 
     /// Freezes the set of the delegation `id`, and hands it to the host or refuses it.
-    fn finish(&mut self, id: &str, offset_ms: u64, record: Record) {
-        let announced = self.announced_offset(id);
+    fn finish(&mut self, id: &str, offset_ms: u64, due: Instant, record: Record) {
+        let announced = self.announced_offset(id, due);
         let frozen = self.gate.freeze(offset_ms, record, announced);
         self.note_taint();
         match frozen {
@@ -2243,7 +2268,7 @@ impl Owner {
     /// a confirmation for is not one to answer.
     fn cancel_challenges(&mut self) {
         for id in std::mem::take(&mut self.challenged) {
-            self.set_row(&id, "refused", Some(Why::LateFragment.word()));
+            self.set_row(&id, "cancelled", Some(Why::LateFragment.word()));
             self.tell_delegation(&id, DELEGATION_LATE.to_owned());
         }
     }
@@ -2258,7 +2283,7 @@ impl Owner {
                 .expect("the view lock is not poisoned")
                 .delegations
                 .iter()
-                .any(|row| row.state == "asking" || row.state == "unknown")
+                .any(|row| may_have_been_carried_out(&row.state))
     }
 
     /* ------------------------------------------------------------------------------------- */
@@ -2281,6 +2306,8 @@ impl Owner {
     pub(super) async fn end(&mut self, cause: Cause) -> Closed {
         let timings = self.shared.timings;
         let id = self.id;
+        // Nothing not yet written to the host is written from here on.
+        self.unsent.store(true, Ordering::SeqCst);
         // What the opening context came to is in the record before the call is said to have ended,
         // so that a person who reads the end reads it too.
         self.settle_the_opening().await;
@@ -2351,7 +2378,6 @@ impl Owner {
         // A request written to the host and not answered may have been carried out, and the aftermath
         // never says nothing was done.
         let unsettled = self.accepting && self.requests_unsettled();
-        self.unsent.store(true, Ordering::SeqCst);
         self.view(|state| {
             state.running = false;
             state.session = None;
@@ -2483,6 +2509,13 @@ impl Owner {
         }
         "not_confirmed"
     }
+}
+
+/// Whether a row in this state is a request that was, or may have been, written to the host and has
+/// no answer that says it was done or not done: the host took it and said no more, or what became of
+/// it is not known.
+fn may_have_been_carried_out(state: &str) -> bool {
+    matches!(state, "asking" | "admitted" | "unknown")
 }
 
 /// What the host's result says of a delegation: the state its row takes, the cause when the host
@@ -2671,6 +2704,26 @@ mod tests {
     /// What the host says of a delegation is what the row and the model are told: a request the host
     /// only accepted is never told as done, a refusal carries the host's reason, and what the host
     /// performed is told with its own summary.
+    /// A request the host took and did not say it carried out is one the end cannot say nothing was
+    /// done for, as one it asked about and was not answered, or has not yet written.
+    #[test]
+    fn a_request_the_host_took_and_did_not_carry_out_is_not_one_nothing_was_done_for() {
+        for state in ["asking", "admitted", "unknown"] {
+            assert!(may_have_been_carried_out(state), "{state}");
+        }
+        for state in [
+            "collecting",
+            "refused",
+            "not_sent",
+            "cancelled",
+            "performed",
+            "host_refused",
+            "confirmation_required",
+        ] {
+            assert!(!may_have_been_carried_out(state), "{state}");
+        }
+    }
+
     #[test]
     fn what_the_host_answers_is_told_as_it_answered() {
         let action_id = ActionId::new(kr_ipc::new_uuid());
