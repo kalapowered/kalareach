@@ -202,16 +202,39 @@ function contents(handle, member) {
 // A dex file's `class_defs` table names every class the file *defines*. The string table also
 // holds every class it merely mentions, which is why the table is read rather than the strings.
 
-/** Reads one unsigned LEB128 at `at`, answering the value and the next offset. */
+// The file is read as untrusted: every offset, index and count it holds is checked against what
+// the file holds before it is followed, and a dex file that cannot be read in full is refused by
+// name. An offset that the reader let run off the end would read as zeros, and a table read as
+// zeros declares no natives, which is a class with nothing to ask for.
+
+/** A 32-bit field of the file at `at`, refused when the file ends before it does. */
+function u32(dex, at) {
+  if (at < 0 || at + 4 > dex.length) throw new Error('a dex file with an offset past its end')
+  return dex.readUInt32LE(at)
+}
+
+/** A 16-bit field of the file at `at`, refused when the file ends before it does. */
+function u16(dex, at) {
+  if (at < 0 || at + 2 > dex.length) throw new Error('a dex file with an offset past its end')
+  return dex.readUInt16LE(at)
+}
+
+/**
+ * Reads one unsigned LEB128 at `at`, answering the value and the next offset. The format gives a
+ * value at most five bytes and 32 bits, so a number that goes on longer, or past the file, is
+ * refused.
+ */
 function leb128(dex, at) {
   let value = 0
-  let shift = 0
-  for (;;) {
+  for (let place = 0; ; place += 1) {
+    if (at >= dex.length) throw new Error('a dex file cut short inside a number')
     const byte = dex[at]
     at += 1
-    value |= (byte & 0x7f) << shift
+    // The fifth byte holds the last four bits of a 32-bit value and ends it: a byte that goes on, or
+    // that holds more, is a number of more than five bytes or 32 bits, and the loop ends here.
+    if (place === 4 && (byte & 0xf0) !== 0) throw new Error('a dex file with a number larger than 32 bits')
+    value |= (byte & 0x7f) << (place * 7)
     if ((byte & 0x80) === 0) return [value >>> 0, at]
-    shift += 7
   }
 }
 
@@ -230,16 +253,83 @@ function requireDex(dex) {
   }
 }
 
-/** The string a dex file's string table holds at `stringIndex`. */
-function stringAt(dex, stringIndex) {
-  const dataAt = dex.readUInt32LE(dex.readUInt32LE(0x3c) + stringIndex * 4)
-  // A string_data_item is its length in UTF-16 units, then modified UTF-8 up to a NUL. The
-  // modified encoding differs from UTF-8 only for the NUL byte, which terminates here anyway,
-  // and for characters outside the basic plane, which a Java identifier may hold but which no
-  // name this check looks for does.
-  const [, textAt] = leb128(dex, dataAt)
-  const end = dex.indexOf(0, textAt)
-  return dex.subarray(textAt, end).toString('utf8')
+/**
+ * The offset of entry `index` of a table of entries `size` bytes long, refused when the index is
+ * past the table.
+ */
+function place(table, index, size) {
+  if (index >= table.count) throw new Error('a dex file with an index past its table')
+  return table.at + index * size
+}
+
+/**
+ * Reads the tables a dex file keeps its strings, types, prototypes, methods and classes in, and
+ * answers them with a reader of one string and of one type's descriptor. A table that does not lie
+ * within the file is refused, which also refuses a count larger than the data there is to hold it.
+ */
+function reader(dex) {
+  requireDex(dex)
+  const table = (what, countAt, offsetAt, size) => {
+    const count = u32(dex, countAt)
+    const at = u32(dex, offsetAt)
+    if (at + count * size > dex.length) throw new Error(`a dex file whose ${what} table is not within it`)
+    return { count, at }
+  }
+  const strings = table('string', 0x38, 0x3c, 4)
+  const types = table('type', 0x40, 0x44, 4)
+  const protos = table('prototype', 0x48, 0x4c, 12)
+  const methods = table('method', 0x58, 0x5c, 8)
+  const classes = table('class', 0x60, 0x64, 32)
+  const string = (index) => {
+    const [length, textAt] = leb128(dex, u32(dex, place(strings, index, 4)))
+    return modifiedUtf8(dex, textAt, length)
+  }
+  const descriptor = (typeIndex) => string(u32(dex, place(types, typeIndex, 4)))
+  return { strings, protos, methods, classes, string, descriptor }
+}
+
+/** The text of a string's data at `at`, in UTF-16 units. */
+function modifiedUtf8(dex, at, units) {
+  const text = []
+  let chunk = []
+  const flush = () => {
+    text.push(String.fromCharCode(...chunk))
+    chunk = []
+  }
+  // A string is its units in modified UTF-8, which writes each UTF-16 unit on its own, so that a
+  // character outside the basic plane is two three-byte groups, and the NUL as a two-byte one; the
+  // byte 0 ends the string.
+  for (let next = at; ; ) {
+    if (next >= dex.length) throw new Error('a dex file with a string that has no end')
+    const first = dex[next]
+    if (first === 0) break
+    let unit
+    if (first < 0x80) {
+      unit = first
+      next += 1
+    } else if ((first & 0xe0) === 0xc0 && next + 1 < dex.length && (dex[next + 1] & 0xc0) === 0x80) {
+      unit = ((first & 0x1f) << 6) | (dex[next + 1] & 0x3f)
+      next += 2
+    } else if (
+      (first & 0xf0) === 0xe0 &&
+      next + 2 < dex.length &&
+      (dex[next + 1] & 0xc0) === 0x80 &&
+      (dex[next + 2] & 0xc0) === 0x80
+    ) {
+      unit = ((first & 0x0f) << 12) | ((dex[next + 1] & 0x3f) << 6) | (dex[next + 2] & 0x3f)
+      next += 3
+    } else {
+      throw new Error('a dex file with a string that is not modified UTF-8')
+    }
+    chunk.push(unit)
+    if (chunk.length === 4096) flush()
+  }
+  flush()
+  const result = text.join('')
+  if (result.length !== units) {
+    throw new Error('a dex file with a string whose length is not the one it declares')
+  }
+  return result
 }
 
 /**
@@ -247,28 +337,23 @@ function stringAt(dex, stringIndex) {
  * carries. A name the code merely mentions is here as well as one it defines.
  */
 export function definedStrings(dex) {
-  requireDex(dex)
-  const count = dex.readUInt32LE(0x38)
-  const strings = []
-  for (let index = 0; index < count; index += 1) strings.push(stringAt(dex, index))
-  return strings
+  const { strings, string } = reader(dex)
+  const found = []
+  for (let index = 0; index < strings.count; index += 1) found.push(string(index))
+  return found
 }
 
 /** Every class a dex file defines, in source form (`a.b.C`, with `$` for a nested class). */
 export function definedClasses(dex) {
-  requireDex(dex)
-  const typeIdsAt = dex.readUInt32LE(0x44)
-  const classDefsCount = dex.readUInt32LE(0x60)
-  const classDefsAt = dex.readUInt32LE(0x64)
-  const descriptor = (typeIndex) => stringAt(dex, dex.readUInt32LE(typeIdsAt + typeIndex * 4))
-  const classes = []
-  for (let index = 0; index < classDefsCount; index += 1) {
-    const type = descriptor(dex.readUInt32LE(classDefsAt + index * 32))
+  const { classes, descriptor } = reader(dex)
+  const found = []
+  for (let index = 0; index < classes.count; index += 1) {
+    const type = descriptor(u32(dex, classes.at + index * 32))
     if (type.startsWith('L') && type.endsWith(';')) {
-      classes.push(type.slice(1, -1).replaceAll('/', '.'))
+      found.push(type.slice(1, -1).replaceAll('/', '.'))
     }
   }
-  return classes
+  return found
 }
 
 /** The access flag of a method the runtime binds to native code. */
@@ -282,33 +367,30 @@ const ACC_NATIVE = 0x100
  * lists the methods the code merely calls as well as the ones a class declares.
  */
 export function definedNatives(dex) {
-  requireDex(dex)
-  const typeIdsAt = dex.readUInt32LE(0x44)
-  const protoIdsAt = dex.readUInt32LE(0x4c)
-  const methodIdsAt = dex.readUInt32LE(0x5c)
-  const classDefsCount = dex.readUInt32LE(0x60)
-  const classDefsAt = dex.readUInt32LE(0x64)
-  const descriptor = (typeIndex) => stringAt(dex, dex.readUInt32LE(typeIdsAt + typeIndex * 4))
+  const { protos, methods, classes, string, descriptor } = reader(dex)
   /** The argument types of the method at `methodIndex`, from its prototype's type list. */
   const argumentsOf = (methodIndex) => {
-    const proto = dex.readUInt16LE(methodIdsAt + methodIndex * 8 + 2)
-    const listAt = dex.readUInt32LE(protoIdsAt + proto * 12 + 8)
+    const proto = u16(dex, place(methods, methodIndex, 8) + 2)
+    const listAt = u32(dex, place(protos, proto, 12) + 8)
     if (listAt === 0) return ''
+    const count = u32(dex, listAt)
+    if (listAt + 4 + count * 2 > dex.length) throw new Error('a dex file with a type list past its end')
     let types = ''
-    for (let each = 0; each < dex.readUInt32LE(listAt); each += 1) {
-      types += descriptor(dex.readUInt16LE(listAt + 4 + each * 2))
+    for (let each = 0; each < count; each += 1) {
+      types += descriptor(u16(dex, listAt + 4 + each * 2))
     }
     return types
   }
-  const classes = new Map()
-  for (let index = 0; index < classDefsCount; index += 1) {
-    const classDef = classDefsAt + index * 32
-    const type = descriptor(dex.readUInt32LE(classDef))
+  const found = new Map()
+  for (let index = 0; index < classes.count; index += 1) {
+    const classDef = classes.at + index * 32
+    const type = descriptor(u32(dex, classDef))
     if (!type.startsWith('L') || !type.endsWith(';')) continue
     const natives = []
-    classes.set(type.slice(1, -1).replaceAll('/', '.'), natives)
-    const dataAt = dex.readUInt32LE(classDef + 24)
+    found.set(type.slice(1, -1).replaceAll('/', '.'), natives)
+    const dataAt = u32(dex, classDef + 24)
     if (dataAt === 0) continue
+    if (dataAt >= dex.length) throw new Error('a dex file with class data past its end')
     // The counts of the four lists, then the fields, which are skipped, then the two lists of methods.
     let at = dataAt
     const sizes = []
@@ -316,6 +398,11 @@ export function definedNatives(dex) {
       const [size, next] = leb128(dex, at)
       sizes.push(size)
       at = next
+    }
+    // A field is two numbers and a method three, each at least a byte, so a list that counts more
+    // than the file has left to hold counts what is not there.
+    if ((sizes[0] + sizes[1]) * 2 + (sizes[2] + sizes[3]) * 3 > dex.length - at) {
+      throw new Error('a dex file whose class data counts more than it holds')
     }
     for (let skipped = 0; skipped < sizes[0] + sizes[1]; skipped += 1) {
       at = leb128(dex, leb128(dex, at)[1])[1]
@@ -330,14 +417,14 @@ export function definedNatives(dex) {
         methodIndex += step
         if ((flags & ACC_NATIVE) !== 0) {
           natives.push({
-            name: stringAt(dex, dex.readUInt32LE(methodIdsAt + methodIndex * 8 + 4)),
+            name: string(u32(dex, place(methods, methodIndex, 8) + 4)),
             signature: jniMangled(argumentsOf(methodIndex))
           })
         }
       }
     }
   }
-  return classes
+  return found
 }
 
 /**

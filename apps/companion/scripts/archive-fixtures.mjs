@@ -17,6 +17,21 @@ export function uleb(value) {
 }
 
 /**
+ * A string as a dex file holds it: in modified UTF-8, which writes each UTF-16 unit on its own, so
+ * that a character outside the basic plane is two three-byte groups, and writes the NUL as two bytes.
+ */
+export function modifiedUtf8(text) {
+  const bytes = []
+  for (let at = 0; at < text.length; at += 1) {
+    const unit = text.charCodeAt(at)
+    if (unit !== 0 && unit < 0x80) bytes.push(unit)
+    else if (unit < 0x800) bytes.push(0xc0 | (unit >> 6), 0x80 | (unit & 0x3f))
+    else bytes.push(0xe0 | (unit >> 12), 0x80 | ((unit >> 6) & 0x3f), 0x80 | (unit & 0x3f))
+  }
+  return Buffer.from(bytes)
+}
+
+/**
  * A dex file that defines `defined` and names `referenced` without defining it.
  *
  * Both sets reach the string table, which is the point: a reader that searched the strings for a
@@ -113,7 +128,7 @@ export function dex({ defined = [], referenced = [], constants = [], methods = {
   let at = dataAt
   strings.forEach((text, index) => {
     stringIds.writeUInt32LE(at, index * 4)
-    const item = Buffer.concat([uleb(text.length), Buffer.from(text, 'utf8'), Buffer.from([0])])
+    const item = Buffer.concat([uleb(text.length), modifiedUtf8(text), Buffer.from([0])])
     data.push(item)
     at += item.length
   })

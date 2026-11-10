@@ -28,6 +28,8 @@ import { dex, elf, zip } from './archive-fixtures.mjs'
 import { libraryClassNames } from './android-native-names.mjs'
 import { privateTemporary } from './private-temp.mjs'
 import {
+  definedClasses,
+  definedNatives,
   definedStrings,
   missingFrom,
   nativeNames,
@@ -1047,6 +1049,147 @@ held(
   'and says which library and which ABI lacks it',
   'true',
   String(lostLibrary.said.includes('library libother.so (in arm64-v8a, not in x86_64)'))
+)
+
+// -- a dex file that cannot be read in full ------------------------------------------------------
+// An offset, an index or a count that runs off the end of the file reads as zeros, and a class
+// whose data reads as zeros declares no natives: the reader has to refuse the file by name.
+
+/** What reading `bytes` with `read` answered: `read`, or the message it refused with. */
+function readAs(read, bytes) {
+  try {
+    read(bytes)
+    return 'read'
+  } catch (failure) {
+    return failure.message
+  }
+}
+
+/** A dex file with one class that declares one native method, and the place of its class data. */
+function classWithData() {
+  const bytes = Buffer.from(
+    dex({
+      defined: [FACTORY],
+      methods: { [FACTORY]: [{ name: 'nativeCreate', native: true }] }
+    })
+  )
+  const classDef = bytes.readUInt32LE(0x64)
+  return { bytes, classDef, data: bytes.readUInt32LE(classDef + 24) }
+}
+{
+  const refuses = (what, read, mutate, why) => {
+    const { bytes, classDef, data } = classWithData()
+    mutate(bytes, classDef, data)
+    held(what, why, readAs(read, bytes))
+  }
+  refuses(
+    'a class whose data lies past the end of the file is refused, not read as a class with no natives',
+    definedNatives,
+    (bytes, classDef) => bytes.writeUInt32LE(bytes.length + 10, classDef + 24),
+    'a dex file with class data past its end'
+  )
+  refuses(
+    'a number of more than five bytes is refused',
+    definedNatives,
+    (bytes, classDef, data) => bytes.set([0x80, 0x80, 0x80, 0x80, 0x80, 0x01], data),
+    'a dex file with a number larger than 32 bits'
+  )
+  refuses(
+    'a number whose fifth byte holds more than the last four bits of a 32-bit value is refused',
+    definedNatives,
+    (bytes, classDef, data) => bytes.set([0x80, 0x80, 0x80, 0x80, 0x10], data),
+    'a dex file with a number larger than 32 bits'
+  )
+  refuses(
+    'a number that the end of the file cuts is refused',
+    definedNatives,
+    (bytes, classDef) => {
+      bytes[bytes.length - 1] = 0x80
+      bytes.writeUInt32LE(bytes.length - 1, classDef + 24)
+    },
+    'a dex file cut short inside a number'
+  )
+  refuses(
+    'a class that counts more fields than the file has room for is refused',
+    definedNatives,
+    (bytes, classDef, data) => bytes.set([0xff, 0x7f], data),
+    'a dex file whose class data counts more than it holds'
+  )
+  refuses(
+    'a class that counts more methods than the file has room for is refused',
+    definedNatives,
+    (bytes, classDef, data) => bytes.set([0xff, 0x7f], data + 3),
+    'a dex file whose class data counts more than it holds'
+  )
+  refuses(
+    'a string table that is not within the file is refused',
+    definedNatives,
+    (bytes) => bytes.writeUInt32LE(bytes.length + 8, 0x3c),
+    'a dex file whose string table is not within it'
+  )
+  refuses(
+    'a class table that counts more classes than the file holds is refused',
+    definedNatives,
+    (bytes) => bytes.writeUInt32LE(100000, 0x60),
+    'a dex file whose class table is not within it'
+  )
+  refuses(
+    'a class whose type is past the type table is refused',
+    definedClasses,
+    (bytes, classDef) => bytes.writeUInt32LE(5000, classDef),
+    'a dex file with an index past its table'
+  )
+  refuses(
+    'a prototype whose type list lies past the end of the file is refused',
+    definedNatives,
+    (bytes) => bytes.writeUInt32LE(bytes.length + 20, bytes.readUInt32LE(0x4c) + 8),
+    'a dex file with an offset past its end'
+  )
+  const plain = Buffer.from(dex({ defined: [FACTORY] }))
+  const stringAtIndex = (bytes, index) => bytes.readUInt32LE(bytes.readUInt32LE(0x3c) + index * 4)
+  const endless = Buffer.from(plain)
+  endless[endless.length - 1] = 0x41
+  held(
+    'a string with no NUL before the end of the file is refused, not read to the last byte but one',
+    'a dex file with a string that has no end',
+    readAs(definedStrings, endless)
+  )
+  const misdeclared = Buffer.from(plain)
+  misdeclared[stringAtIndex(misdeclared, 0)] = 0x7f
+  held(
+    'a string whose length differs from the one it declares is refused',
+    'a dex file with a string whose length is not the one it declares',
+    readAs(definedStrings, misdeclared)
+  )
+  const marked = Buffer.from(dex({ constants: ['\u0001\u0001\u0001\u0001'] }))
+  const markedAt = marked.indexOf(Buffer.from([4, 1, 1, 1, 1, 0])) + 1
+  held('the marked string is found', 'true', String(markedAt > 0))
+  for (const [what, bytes] of [
+    ['a four-byte UTF-8 character, which modified UTF-8 does not have,', [0xf0, 0x9f, 0x98, 0x80]],
+    ['a three-byte group that a byte cuts short', [0xe2, 0x82, 0x01, 0x01]],
+    ['a lead byte with no byte after it that continues it', [0xc3, 0x01, 0x01, 0x01]]
+  ]) {
+    const damaged = Buffer.from(marked)
+    damaged.set(bytes, markedAt)
+    held(`${what} is refused`, 'a dex file with a string that is not modified UTF-8', readAs(definedStrings, damaged))
+  }
+  const written = definedStrings(
+    dex({ constants: ['a\u0000b', 'café', '€', '\u{1f600}'] })
+  )
+  held(
+    'strings in modified UTF-8 are read as they are written: the NUL as two bytes, a character outside the basic plane as two units',
+    'true',
+    String(['a\u0000b', 'café', '€', '\u{1f600}'].every((text) => written.includes(text)))
+  )
+}
+expectNames(
+  'a native method whose name has a character outside the basic plane is bound by the symbol of its two units',
+  'natives-astral-method.apk',
+  [
+    application(mediaDex([], { [FACTORY]: [{ name: 'm\u{1f600}', native: true }] })),
+    library(elf({ exports: ['Java_org_webrtc_PeerConnectionFactory_m_0d83d_0de00'] }))
+  ],
+  'nothing'
 )
 
 // -- the build's own temporary directory -------------------------------------------------------
