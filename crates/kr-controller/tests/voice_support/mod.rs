@@ -339,8 +339,8 @@ impl StandIn {
     /// made to it was never carried out. [`Self::go_down`] is the other way down: the service takes
     /// the connection and ends it, so a request may have been carried out.
     ///
-    /// Returns once the port refuses a connection, so that the next request made to it is refused
-    /// and never taken.
+    /// Returns once the port refuses a connection, so that the port is closed when a request comes
+    /// to it, and is not still taken by a socket that is closing.
     pub async fn refuse_connections(&self) {
         let task = self.task.lock().expect("the stand-in's task").take();
         if let Some(task) = task {
@@ -355,13 +355,13 @@ impl StandIn {
 
     /// Returns once a connection to the port is refused.
     ///
-    /// A socket goes on listening until the last copy of it is closed, and a process that is being
-    /// started in this one holds a copy of every socket the program has open, from the fork until
-    /// the new program replaces it, which on a busy machine is longer than the close. Until then
-    /// the port takes a connection and nothing accepts it: a request made to it is written, and
-    /// ended when the last copy goes, which says nothing of whether it was carried out. It is a
-    /// condition to wait for, and the wait ends when the port refuses; the minute it is given only
-    /// ends a hang.
+    /// A socket goes on listening until the last copy of it is closed. On Linux and macOS a process
+    /// that is being started in this one holds a copy of every socket the program has open, from
+    /// the fork until the new program replaces it, which on a busy machine is longer than the
+    /// close. Until then the port takes a connection and nothing accepts it: a request made to it
+    /// is written, and ended when the last copy goes, which says nothing of whether it was carried
+    /// out. It is a condition to wait for, and the wait ends when the port refuses; the minute it
+    /// is given only ends a hang. Where sockets are not inherited the first probe is refused.
     async fn until_refused(&self) {
         tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
