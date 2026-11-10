@@ -1121,6 +1121,122 @@ pub struct Build {
     pub no_newer: Option<String>,
 }
 
+impl Account {
+    /// The words the entry types after the command and gives on its command line (its arguments,
+    /// then its switches, `{run}` and `{work}` filled in) as keys of the agent's configuration file,
+    /// each a dotted key and the text of its value: `-c key=value` is that key and value, `--disable
+    /// name` and `--enable name` the key `features.name` set to false and to true, and `-a` and `-s`
+    /// the keys `approval_policy` and `sandbox_mode`. A key the words give twice with one value is
+    /// kept once.
+    ///
+    /// A launch that types an option is not one a command integration serves, so a driver that
+    /// starts the agent through one types the command alone and gives the agent these keys in its
+    /// file instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns the word that no key stands for, or the key the words give two values.
+    pub fn switches_as_keys(
+        &self,
+        root: &str,
+        work: &str,
+    ) -> Result<Vec<(String, String)>, String> {
+        let words: Vec<String> = self
+            .arguments
+            .iter()
+            .cloned()
+            .chain(
+                self.switches
+                    .iter()
+                    .map(|switch| switch.replace("{run}", root).replace("{work}", work)),
+            )
+            .collect();
+        let mut keys: Vec<(String, String)> = Vec::new();
+        let mut put = |key: String, value: String| -> Result<(), String> {
+            match keys.iter().find(|(existing, _)| *existing == key) {
+                Some((_, earlier)) if *earlier == value => Ok(()),
+                Some(_) => Err(format!("the words give {key} two values")),
+                None => {
+                    keys.push((key, value));
+                    Ok(())
+                }
+            }
+        };
+        let mut words = words.iter();
+        while let Some(word) = words.next() {
+            let mut value = || {
+                words
+                    .next()
+                    .ok_or_else(|| format!("{word:?} is the last word, and it takes a value"))
+            };
+            match word.as_str() {
+                "-c" | "--config" => {
+                    let setting = value()?;
+                    let (key, text) = setting
+                        .split_once('=')
+                        .ok_or_else(|| format!("{setting:?} is not key=value"))?;
+                    put(key.trim().to_owned(), text.trim().to_owned())?;
+                }
+                "--disable" | "--enable" => {
+                    let feature = value()?;
+                    put(
+                        format!("features.{feature}"),
+                        (word.as_str() == "--enable").to_string(),
+                    )?;
+                }
+                "-a" | "--ask-for-approval" => {
+                    put("approval_policy".to_owned(), format!("{:?}", value()?))?;
+                }
+                "-s" | "--sandbox" => {
+                    put("sandbox_mode".to_owned(), format!("{:?}", value()?))?;
+                }
+                other => {
+                    return Err(format!(
+                        "{other:?} is typed for the agent, and no key of its configuration file \
+                         stands for it"
+                    ));
+                }
+            }
+        }
+        Ok(keys)
+    }
+
+    /// The files of the agent's configuration directory with the keys of [`Account::switches_as_keys`]
+    /// written at the top of `file`, before any table the file already holds. The result is read as
+    /// TOML, so a key the file already has, or a value that is not TOML, is named.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the entry has no such file, a word has no key, or the result is not TOML.
+    pub fn configuration_with_switches(
+        &self,
+        file: &str,
+        root: &str,
+        work: &str,
+    ) -> Result<BTreeMap<String, String>, String> {
+        let mut files = self
+            .config_directory
+            .as_ref()
+            .map(|directory| directory.files.clone())
+            .ok_or_else(|| {
+                "the entry gives the agent no configuration directory of the run's own".to_owned()
+            })?;
+        let own = files
+            .get(file)
+            .ok_or_else(|| format!("the entry's configuration directory has no {file}"))?;
+        let mut text = String::new();
+        for (key, value) in self.switches_as_keys(root, work)? {
+            text.push_str(&format!("{key} = {value}\n"));
+        }
+        text.push('\n');
+        text.push_str(own);
+        text.parse::<toml_edit::DocumentMut>()
+            .map_err(|error| format!("{file} with the entry's switches is not TOML: {error}"))?;
+        files.insert(file.to_owned(), text);
+        Ok(files)
+    }
+}
+
 impl Build {
     /// The pinned file, absolute.
     #[must_use]
@@ -1544,6 +1660,102 @@ mod tests {
             Ok(())
         );
         assert_eq!(claude.refusal(), "d");
+    }
+
+    /// An entry that types options is not served by a command integration, so its words are the keys
+    /// of the agent's own configuration file instead: each key once, the file still TOML.
+    #[test]
+    fn an_entrys_typed_options_are_the_keys_of_the_configuration_file_the_agent_reads() {
+        let account = |arguments: &[&str], switches: &[&str]| -> Account {
+            serde_json::from_value(serde_json::json!({
+                "login": "l", "stored": "s", "home": "run", "budget": "b", "turns": 3,
+                "conversations": "sessions/{date}", "prompt_line": "p", "ready": "r",
+                "composer": "c", "submit": "\r", "clear": "x", "reply_line": "x",
+                "decision_line": "y", "busy": "b", "slash": { "input": "/p", "shows": "p" },
+                "interrupt": { "input": "e", "shows": "i" },
+                "approval": { "shows": "a", "allow": "y", "deny": "n" },
+                "resume": ["resume", "{conversation}"], "image": "paste",
+                "arguments": arguments, "switches": switches,
+                "config_directory": { "variable": "HOME_DIRECTORY", "files": {
+                    "config.toml": "model_provider = \"local\"\n\n[model_providers.local]\nname = \"local\"\n"
+                } }
+            }))
+            .expect("an account")
+        };
+        // The words of the Codex entry's launch, as the build list gives them.
+        let codex = account(
+            &["-a", "on-request", "-s", "read-only"],
+            &[
+                "-c",
+                "approval_policy=\"on-request\"",
+                "-c",
+                "sandbox_mode=\"read-only\"",
+                "-c",
+                "check_for_update_on_startup=false",
+                "-c",
+                "tui.whimsy=false",
+                "-c",
+                "notify=[]",
+                "-c",
+                "log_dir=\"{run}/codex-log\"",
+                "-c",
+                "projects={\"{work}\"={trust_level=\"untrusted\"}}",
+                "--disable",
+                "hooks",
+                "--disable",
+                "plugins",
+            ],
+        );
+        let keys = codex.switches_as_keys("/run", "/work").expect("keys");
+        let named = |key: &str| keys.iter().filter(|(name, _)| name == key).count();
+        assert_eq!(
+            named("approval_policy"),
+            1,
+            "-a and -c give one key once: {keys:?}"
+        );
+        assert_eq!(named("sandbox_mode"), 1, "{keys:?}");
+        let files = codex
+            .configuration_with_switches("config.toml", "/run", "/work")
+            .expect("a configuration");
+        let document: toml_edit::DocumentMut = files["config.toml"].parse().expect("TOML");
+        assert_eq!(document["approval_policy"].as_str(), Some("on-request"));
+        assert_eq!(document["sandbox_mode"].as_str(), Some("read-only"));
+        assert_eq!(
+            document["check_for_update_on_startup"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(document["tui"]["whimsy"].as_bool(), Some(false));
+        assert_eq!(document["log_dir"].as_str(), Some("/run/codex-log"));
+        assert_eq!(document["features"]["hooks"].as_bool(), Some(false));
+        assert_eq!(document["features"]["plugins"].as_bool(), Some(false));
+        assert_eq!(
+            document["projects"]["/work"]["trust_level"].as_str(),
+            Some("untrusted")
+        );
+        // What the file held before is still there, after the keys and its own table.
+        assert_eq!(document["model_provider"].as_str(), Some("local"));
+        assert_eq!(
+            document["model_providers"]["local"]["name"].as_str(),
+            Some("local")
+        );
+        // The entry's installs-off switch is a key of the file.
+        assert!(files["config.toml"].contains("check_for_update_on_startup = false"));
+        // A word no key stands for, two values for one key, and a value that is not TOML are named.
+        let refused = account(&["--model", "x"], &[]).switches_as_keys("/r", "/w");
+        assert!(
+            refused
+                .expect_err("an option with no key")
+                .contains("--model")
+        );
+        let refused = account(&["-a", "never"], &["-c", "approval_policy=\"on-request\""])
+            .switches_as_keys("/r", "/w");
+        assert!(refused.expect_err("two values").contains("approval_policy"));
+        let refused = account(&[], &["-c", "notify=["]).configuration_with_switches(
+            "config.toml",
+            "/r",
+            "/w",
+        );
+        assert!(refused.expect_err("not TOML").contains("not TOML"));
     }
 
     /// The entry's switches against what the agent is given: each must be given, with its value, and
