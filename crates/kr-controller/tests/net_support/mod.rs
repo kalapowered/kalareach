@@ -1328,6 +1328,16 @@ impl Host {
         self.network.shutdown().await;
         drop(self.controller);
     }
+
+    /// Stops the daemon as a host that only lets it go does: the loop that serves its clients is
+    /// ended and every handle the suite held is dropped, with the network not shut down.
+    ///
+    /// Returns once the loop has ended and the handles are dropped. The connections the daemon was
+    /// serving end at the next turns of the runtime, and the daemon with them.
+    pub async fn dropped(self) {
+        self.clients.abort();
+        let _ = self.clients.await;
+    }
 }
 
 /// A daemon a suite shut down, and what the next one on its environment tree starts from.
