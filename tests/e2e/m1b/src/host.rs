@@ -808,6 +808,9 @@ const RESTART_ATTEMPTS: usize = 5;
 /// it stayed held. It ends a hang: the wait is over when the address can be bound.
 const ADDRESS_FREE: Duration = Duration::from_secs(20);
 
+/// How long the wait for a daemon's address pauses between two tries to bind it.
+const ADDRESS_ASK_AGAIN: Duration = Duration::from_millis(200);
+
 /// Returns once a socket can be bound to `address`, and lets it go again. The daemon that stood on
 /// the address or the program that took it after it has not always let it go.
 ///
@@ -815,7 +818,7 @@ const ADDRESS_FREE: Duration = Duration::from_secs(20);
 ///
 /// Panics when the address stays held for [`ADDRESS_FREE`], or cannot be bound for another reason.
 fn until_the_address_is_free(address: std::net::SocketAddr) {
-    let free = Deadline::after(ADDRESS_FREE).poll(ADDRESS_FREE, ASK_AGAIN, |_| {
+    let free = Deadline::after(ADDRESS_FREE).poll(ADDRESS_FREE, ADDRESS_ASK_AGAIN, |_| {
         match std::net::UdpSocket::bind(address) {
             Ok(socket) => {
                 drop(socket);
