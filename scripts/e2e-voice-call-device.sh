@@ -76,9 +76,10 @@
 #
 # The Android application is the debug build, which is not minified. `KR_MINIFY_DEBUG=1` runs the
 # minifier on it, with the release build's rules, and keeps the debug build's test hooks: the call
-# then starts in an application whose classes the minifier has had its way with, which is what a
-# store ships. A native library that finds a class by name aborts the first call there when the
-# rules do not keep the class.
+# then starts in an application whose unreached classes the minifier has removed and renamed, as it
+# does the store's (in R8's debug mode, which does not optimise across the classes that are left).
+# A native library that finds a class by name aborts the first call there when the rules do not
+# keep the class. Any value of the variable other than 1 stops the run.
 #
 # A simulator or an emulator only inside the Mac's device lease, and the builds inside a build
 # slot:
@@ -754,6 +755,10 @@ run_android() {
         return 3
     fi
 
+    case "${KR_MINIFY_DEBUG:-}" in
+        "" | 1) ;;
+        *) say "KR_MINIFY_DEBUG is $KR_MINIFY_DEBUG, and the build reads only 1"; return 2 ;;
+    esac
     say "building the debug application for the emulator${KR_MINIFY_DEBUG:+ (KR_MINIFY_DEBUG=$KR_MINIFY_DEBUG)}"
     mkdir -p "${artefacts_base:?}"
     ( cd "$companion" && pnpm android --debug --target aarch64 ) >"$artefacts_base/build.log" 2>&1 \
