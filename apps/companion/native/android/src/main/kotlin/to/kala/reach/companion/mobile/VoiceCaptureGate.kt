@@ -340,44 +340,47 @@ class VoiceCaptureGate(private val keptIntervals: Int = 64) {
     }
 }
 
-/** What the system reports of one recording: where its audio comes from, and whether it is silenced. */
-data class RecordingReport(val source: Int, val silenced: Boolean)
+/**
+ * What the system reports of one recording: where its audio comes from, whether it is silenced, and
+ * the audio session of the application that records it.
+ */
+data class RecordingReport(val source: Int, val silenced: Boolean, val session: Int)
 
 /**
  * What the system's lists of active recordings say of this call's recording.
  *
- * The call's recorder takes its audio from [callSource]. The system shows an application only a
- * stripped copy of the recordings of the others, so nothing in a list says which recording is this
- * call's. What can be told is how many recordings from [callSource] the system held when this
- * call's audio device was turned on: those are other applications', and this call's recording is one
- * more than they. A list with no more than that is a phone that reports none of ours, and is
- * refused, as is a list that cannot be read as one of ours: an application's own recording from the
- * same source, started before ours, does not stand in for ours. A silenced recording among them is
- * taken as ours: a break that did not happen, never one that was hidden.
+ * The call's recorder takes its audio from [callSource]. The system shows an application a stripped
+ * copy of the recordings of the others, which still carries the audio session of each, so the
+ * recordings from [callSource] that the system held when this call's audio device was turned on are
+ * told by their sessions: they belong to other applications and are left out, silenced or not, so
+ * one that ends later, or that the system silences, says nothing of this call. Any other recording
+ * from [callSource] is this call's. A list with none is a phone that reports none of ours, and is
+ * refused. A silenced recording among ours is a break that did not happen, never one that was hidden.
  *
- * What the count cannot tell, and leaves open for a physical phone: another application that starts
- * recording from the same source after this call's device is on and before the system lists this
- * call's own recording reads as this call's, and another application's recording that ends while
- * ours runs makes the count fall short, so capture stays refused until the call ends.
+ * What a session cannot tell, and leaves open for a physical phone: another application that starts
+ * recording from the same source after this call's device is on, and before the system lists this
+ * call's own recording, has a session that is not in the baseline and reads as this call's; the call
+ * does not know its own recorder's session. A phone whose lists give every recording the same session
+ * would refuse this call whenever another application records at the baseline.
  */
 class RecordingWatch(private val callSource: Int) {
-    /** How many recordings from the call's source the system held when the call's audio device came on. */
-    private var others = 0
+    /** The sessions of the recordings from the call's source the system held when its device came on. */
+    private var otherSessions: Set<Int> = emptySet()
 
     /**
      * Takes the system's list of active recordings at the moment this call's audio device is turned
      * on, before it records: every recording from the call's source in it belongs to another application.
      */
     fun deviceComesOn(reports: List<RecordingReport>) {
-        others = reports.count { it.source == callSource }
+        otherSessions = reports.filter { it.source == callSource }.map { it.session }.toSet()
     }
 
     /** Reads one list of the system's active recordings while this call's audio device runs. */
     fun read(reports: List<RecordingReport>): VoiceCaptureGate.Recording {
-        val matching = reports.filter { it.source == callSource }
+        val ours = reports.filter { it.source == callSource && it.session !in otherSessions }
         return when {
-            matching.size <= others -> VoiceCaptureGate.Recording.UNREPORTED
-            matching.any { it.silenced } -> VoiceCaptureGate.Recording.SILENCED
+            ours.isEmpty() -> VoiceCaptureGate.Recording.UNREPORTED
+            ours.any { it.silenced } -> VoiceCaptureGate.Recording.SILENCED
             else -> VoiceCaptureGate.Recording.AUDIBLE
         }
     }

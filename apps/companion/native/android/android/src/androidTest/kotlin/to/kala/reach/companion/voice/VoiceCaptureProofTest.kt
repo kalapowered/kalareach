@@ -133,7 +133,7 @@ class VoiceCaptureProofTest {
         val manager = context.getSystemService(AudioManager::class.java)
         val watch = RecordingWatch(VoiceCallControl.RECORDER_SOURCE)
         fun reports(configs: List<AudioRecordingConfiguration>) =
-            configs.map { RecordingReport(it.clientAudioSource, it.isClientSilenced) }
+            configs.map { RecordingReport(it.clientAudioSource, it.isClientSilenced, it.clientAudioSessionId) }
         // What is recording before this call's recorder runs belongs to others.
         watch.deviceComesOn(reports(manager.activeRecordingConfigurations))
         val seen = LinkedBlockingQueue<VoiceCaptureGate.Recording>()
@@ -159,6 +159,10 @@ class VoiceCaptureProofTest {
                 reports += seen.poll(SECONDS, TimeUnit.SECONDS) ?: break
             }
             assertTrue("the system reported the recording heard: $reports", VoiceCaptureGate.Recording.AUDIBLE in reports)
+            assertTrue(
+                "the system lists the recording with the audio session of its recorder",
+                record.audioSessionId in manager.activeRecordingConfigurations.map { it.clientAudioSessionId },
+            )
         } finally {
             record.stop()
             record.release()

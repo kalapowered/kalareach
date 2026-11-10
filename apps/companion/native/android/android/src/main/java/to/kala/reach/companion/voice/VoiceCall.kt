@@ -547,15 +547,17 @@ class VoiceCall private constructor(
 
     /**
      * Tells the control what the system says of this call's recording, each time the system's list
-     * of active recordings changes. The control tells this call's recording from the others by
-     * counting the recordings from this call's source (see [RecordingWatch]), and it is silenced when
-     * another application holds the microphone. Reported on this call's own thread.
+     * of active recordings changes. The control tells this call's recording from the others by the
+     * audio session of each (see [RecordingWatch]), and it is silenced when another application holds
+     * the microphone. Reported on this call's own thread.
      */
     private fun watchRecording() {
         val manager = context.getSystemService(AudioManager::class.java) ?: return
         val callback = object : AudioManager.AudioRecordingCallback() {
             override fun onRecordingConfigChanged(configs: List<AudioRecordingConfiguration>) {
-                control.recording(configs.map { RecordingReport(it.clientAudioSource, it.isClientSilenced) })
+                control.recording(
+                    configs.map { RecordingReport(it.clientAudioSource, it.isClientSilenced, it.clientAudioSessionId) },
+                )
             }
         }
         synchronized(lock) { recordingCallback = callback }
@@ -571,7 +573,7 @@ class VoiceCall private constructor(
         override fun activeRecordings(): List<RecordingReport> =
             context.getSystemService(AudioManager::class.java)
                 ?.activeRecordingConfigurations
-                ?.map { RecordingReport(it.clientAudioSource, it.isClientSilenced) }
+                ?.map { RecordingReport(it.clientAudioSource, it.isClientSilenced, it.clientAudioSessionId) }
                 ?: emptyList()
 
         override fun answerApplied(): Boolean = answerIsApplied

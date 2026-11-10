@@ -126,8 +126,14 @@ class VoiceCallControlTest {
     }
 
     /** What the system lists when this call's recording runs and reaches the call, and when it is silenced. */
-    private val heard = listOf(RecordingReport(VoiceCallControl.RECORDER_SOURCE, silenced = false))
-    private val silenced = listOf(RecordingReport(VoiceCallControl.RECORDER_SOURCE, silenced = true))
+    private val heard = listOf(RecordingReport(VoiceCallControl.RECORDER_SOURCE, silenced = false, session = OURS))
+    private val silenced = listOf(RecordingReport(VoiceCallControl.RECORDER_SOURCE, silenced = true, session = OURS))
+
+    private companion object {
+        /** The audio sessions of this call's recording and of another application's. */
+        const val OURS = 2
+        const val THEIRS = 1
+    }
 
     private fun running(
         platform: Platform = Platform(),
@@ -247,8 +253,8 @@ class VoiceCallControlTest {
         val platform = Platform()
         val switches = Switches()
         val control = VoiceCallControl(platform, switches)
-        val theirs = RecordingReport(VoiceCallControl.RECORDER_SOURCE, silenced = false)
-        val ours = RecordingReport(VoiceCallControl.RECORDER_SOURCE, silenced = false)
+        val theirs = RecordingReport(VoiceCallControl.RECORDER_SOURCE, silenced = false, session = THEIRS)
+        val ours = RecordingReport(VoiceCallControl.RECORDER_SOURCE, silenced = false, session = OURS)
         // The call's own recording is listed from the moment its device is turned on.
         switches.whenTheDeviceComesOn = { platform.listed = platform.listed + ours }
         assertTrue(control.permit("voice-session-1", platform.closesIn(60)))
@@ -267,6 +273,41 @@ class VoiceCallControlTest {
         assertTrue(switches.microphoneOn)
         assertTrue(control.carries())
         assertEquals(1L, control.captureProof().openings)
+    }
+
+    /**
+     * KR-REQ-15.36: what happens to another application's recording says nothing of this call's. The
+     * system silencing it, and its ending, are neither a break in this call nor a reason to refuse it,
+     * and this call's own recording being silenced is.
+     */
+    @Test
+    fun what_becomes_of_another_applications_recording_does_not_change_this_calls_capture() {
+        val platform = Platform()
+        val switches = Switches()
+        val control = VoiceCallControl(platform, switches)
+        val theirs = RecordingReport(VoiceCallControl.RECORDER_SOURCE, silenced = false, session = THEIRS)
+        val ours = RecordingReport(VoiceCallControl.RECORDER_SOURCE, silenced = false, session = OURS)
+        platform.listed = listOf(theirs)
+        switches.whenTheDeviceComesOn = { platform.listed = platform.listed + ours }
+        assertTrue(control.permit("voice-session-1", platform.closesIn(60)))
+        control.servicePromoted()
+        control.recorder(true)
+        control.recording(platform.listed)
+        assertTrue(switches.microphoneOn)
+
+        control.recording(listOf(theirs.copy(silenced = true), ours))
+        assertTrue("the system silenced theirs, not ours", switches.microphoneOn)
+        assertEquals(VoiceCaptureState.CAPTURING, control.displayed())
+
+        control.recording(listOf(ours))
+        assertTrue("theirs ended", switches.microphoneOn)
+        assertEquals(VoiceCaptureState.CAPTURING, control.displayed())
+        assertEquals(0L, control.captureProof().breaks)
+
+        control.recording(listOf(ours.copy(silenced = true)))
+        assertFalse("the system silenced ours", switches.microphoneOn)
+        assertEquals(VoiceCaptureState.SUSPENDED_BY_SYSTEM, control.displayed())
+        assertEquals(1L, control.captureProof().breaks)
     }
 
     /** KR-REQ-15.36: a frame from the recorder is carried only while the gate is on, and a gap in them is a break. */
