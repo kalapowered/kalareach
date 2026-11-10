@@ -1,0 +1,63 @@
+[package]
+name = "kr-boundary-windows"
+description = "The Windows execution boundary's administrator installation and its removal, the resident broker that starts Git as the two boundary accounts, and the checks that tell whether the boundary is in force"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+hex.workspace = true
+quick-xml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# The calls the installation and the broker make: accounts and their rights, the service manager,
+# the registry, logon tokens, job objects, pipes and the signature check on the programs.
+windows-sys = { workspace = true, features = [
+    "Win32_NetworkManagement_NetManagement",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_Services",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_SystemServices",
+    "Win32_UI_Shell",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# The setup program asks for an administrator prompt in its own manifest, which the build script
+# sets for it alone.
+[[bin]]
+name = "kr-boundary-setup"
+path = "src/bin/kr-boundary-setup.rs"
+
+[[bin]]
+name = "kr-boundary-broker"
+path = "src/bin/kr-boundary-broker.rs"
+
+[[bin]]
+name = "kr-boundary-credential"
+path = "src/bin/kr-boundary-credential.rs"
+
+# The workspace forbids unsafe code, which a crate that asks the operating system for accounts,
+# services, logon tokens and processes cannot honour. This crate denies it instead and allows it in
+# the modules of `win` that own those calls. Nothing else in this crate may relax the rule.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

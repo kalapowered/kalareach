@@ -1,0 +1,357 @@
+//! The parts of the boundary that build everywhere, held to real bytes and real files: the policy in
+//! its two forms, the two records, the pipe protocol's limits and the doctor's grading.
+
+use std::io::{Cursor, Read};
+
+use kr_boundary_windows::frame::{self, FrameError, Request, Response};
+use kr_boundary_windows::manifest::{InstallState, Manifest, ObjectKind, Prior, STORE_VERSION};
+use kr_boundary_windows::policy::{
+    self, Action, Kind, Mode, Policy, RULE_ALLOW_ALL, RULE_CHECKOUT, RULE_CONNECT,
+};
+use kr_boundary_windows::state::{Status, Verdict};
+
+const CHECKOUT_SID: &str = "S-1-5-21-111-222-333-1001";
+const CONNECT_SID: &str = "S-1-5-21-111-222-333-1002";
+
+fn installed() -> Policy {
+    Policy::installed(CHECKOUT_SID, CONNECT_SID)
+}
+
+#[test]
+fn the_policy_is_read_back_as_it_was_written() {
+    let written = installed();
+    let read = Policy::parse(&written.render()).expect("the written policy is readable");
+    assert_eq!(read, written);
+    assert!(read.differences(&written).is_empty());
+}
+
+#[test]
+fn the_installed_policy_limits_each_account_to_its_own_list() {
+    let policy = installed();
+    let exe = &policy.collections[policy::EXE];
+    assert_eq!(exe.mode, Mode::Enabled);
+    assert_eq!(exe.rules.len(), 3);
+    let allow = &exe.rules[RULE_ALLOW_ALL];
+    assert_eq!(
+        (allow.action, allow.sid.as_str()),
+        (Action::Allow, "S-1-1-0")
+    );
+    let checkout = &exe.rules[RULE_CHECKOUT];
+    let connect = &exe.rules[RULE_CONNECT];
+    assert_eq!(checkout.sid, CHECKOUT_SID);
+    assert_eq!(connect.sid, CONNECT_SID);
+    assert_eq!(checkout.action, Action::Deny);
+    assert_eq!(connect.action, Action::Deny);
+    // The connection account runs what the checkout account runs, and more, and only it runs the
+    // credential helper.
+    assert!(checkout.exceptions.is_subset(&connect.exceptions));
+    assert!(connect.exceptions.len() > checkout.exceptions.len());
+    let helper = format!(r"{}\{}", policy::BOUNDARY_DIR, policy::HELPER).to_lowercase();
+    assert!(connect.exceptions.contains(&helper));
+    assert!(!checkout.exceptions.contains(&helper));
+    // No shell is on the checkout list: a checkout runs no program but Git.
+    assert!(
+        checkout
+            .exceptions
+            .iter()
+            .all(|path| path.ends_with(r"\git.exe"))
+    );
+}
+
+#[test]
+fn a_change_to_an_installed_policy_is_named() {
+    let mut changed = installed();
+    let exe = changed.collections.get_mut(policy::EXE).unwrap();
+    exe.rules
+        .get_mut(RULE_CONNECT)
+        .unwrap()
+        .exceptions
+        .insert(r"%programfiles%\git\mingw64\libexec\git-core\scalar.exe".to_owned());
+    let differences = changed.differences(&installed());
+    assert_eq!(differences.len(), 1);
+    assert!(differences[0].contains(RULE_CONNECT) && differences[0].contains("exceptions"));
+
+    let mut foreign = installed();
+    foreign
+        .collections
+        .get_mut(policy::EXE)
+        .unwrap()
+        .rules
+        .insert(
+            "11111111-1111-1111-1111-111111111111".to_owned(),
+            policy::Rule {
+                id: "11111111-1111-1111-1111-111111111111".to_owned(),
+                kind: Kind::Publisher,
+                sid: "S-1-1-0".to_owned(),
+                action: Action::Allow,
+                conditions: Default::default(),
+                exceptions: Default::default(),
+            },
+        );
+    assert_eq!(foreign.foreign_exe_rules().len(), 1);
+    assert!(!foreign.differences(&installed()).is_empty());
+
+    let mut audit = installed();
+    audit.collections.get_mut(policy::EXE).unwrap().mode = Mode::AuditOnly;
+    assert!(!audit.differences(&installed()).is_empty());
+}
+
+#[test]
+fn an_effective_policy_is_read_whatever_its_layout() {
+    // Attribute order, braces round the identifier, upper-case paths, comments and collections the
+    // installation does not write: the form the platform reports, not the form this crate writes.
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<AppLockerPolicy Version="1">
+  <!-- reported by the platform -->
+  <RuleCollection EnforcementMode="NotConfigured" Type="Dll" />
+  <RuleCollection EnforcementMode="Enabled" Type="Exe">
+    <FilePathRule Action="Allow" UserOrGroupSid="s-1-1-0" Id="{{{allow}}}" Name="n" Description="d">
+      <Conditions><FilePathCondition Path="*"/></Conditions>
+    </FilePathRule>
+  </RuleCollection>
+</AppLockerPolicy>"#,
+        allow = RULE_ALLOW_ALL.to_uppercase()
+    );
+    let policy = Policy::parse(&xml).expect("readable");
+    let exe = &policy.collections["Exe"];
+    assert_eq!(exe.mode, Mode::Enabled);
+    let rule = &exe.rules[RULE_ALLOW_ALL];
+    assert_eq!(rule.sid, "S-1-1-0");
+    assert!(rule.conditions.contains("*"));
+    assert!(!policy.is_unconfigured());
+    assert!(
+        Policy::parse("<AppLockerPolicy Version=\"1\" />")
+            .unwrap()
+            .is_unconfigured()
+    );
+    assert!(Policy::parse("not a policy").is_err());
+    assert!(Policy::parse("<AppLockerPolicy><RuleCollection").is_err());
+}
+
+#[test]
+fn removal_keeps_the_allow_all_rule_beside_an_administrators_rule() {
+    // Alone, the installation's rules all go and the collection is not configured again.
+    let (alone, kept) = installed().without_ours();
+    assert!(!kept);
+    assert!(alone.is_unconfigured());
+
+    // Beside another rule of the executable collection the two deny rules go, and the allow-all
+    // rule and the collection's mode stay, so the other rule does not become a block for everyone.
+    let mut shared = installed();
+    let theirs = "22222222-2222-2222-2222-222222222222".to_owned();
+    shared
+        .collections
+        .get_mut(policy::EXE)
+        .unwrap()
+        .rules
+        .insert(
+            theirs.clone(),
+            policy::Rule {
+                id: theirs.clone(),
+                kind: Kind::Path,
+                sid: "S-1-5-32-544".to_owned(),
+                action: Action::Allow,
+                conditions: ["c:\\tools\\*".to_owned()].into(),
+                exceptions: Default::default(),
+            },
+        );
+    let (after, kept) = shared.without_ours();
+    assert!(kept);
+    let exe = &after.collections["Exe"];
+    assert_eq!(exe.mode, Mode::Enabled);
+    let ids: Vec<&str> = exe.rules.keys().map(String::as_str).collect();
+    assert!(ids.contains(&RULE_ALLOW_ALL) && ids.contains(&theirs.as_str()));
+    assert!(!ids.contains(&RULE_CHECKOUT) && !ids.contains(&RULE_CONNECT));
+}
+
+#[test]
+fn the_manifest_is_a_store_that_refuses_what_it_does_not_know() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("manifest.json");
+    let mut manifest = Manifest::begin();
+    manifest.record(
+        ObjectKind::Account,
+        "krb-checkout",
+        Some("S-1-5-21-1-2-3-1001"),
+    );
+    manifest.record(ObjectKind::Service, "KalaReachBoundary", None);
+    manifest.record(
+        ObjectKind::Account,
+        "KRB-CHECKOUT",
+        Some("S-1-5-21-1-2-3-1009"),
+    );
+    manifest.persons.push("S-1-5-21-1-2-3-1000".to_owned());
+    manifest.save(&path).unwrap();
+    let read = Manifest::load(&path).unwrap();
+    assert_eq!(read, manifest);
+    assert_eq!(
+        read.objects.len(),
+        2,
+        "an object is recorded once, by its name"
+    );
+    assert_eq!(read.state, InstallState::InProgress);
+    assert_eq!(
+        read.find(ObjectKind::Account, "krb-checkout")
+            .unwrap()
+            .detail
+            .as_deref(),
+        Some("S-1-5-21-1-2-3-1009")
+    );
+
+    let unknown_kind = br#"{"store":1,"state":"installed","objects":[{"kind":"wfp-filter","id":"x"}],"persons":[]}"#;
+    assert!(
+        Manifest::parse(unknown_kind).is_err(),
+        "a program that meets an unknown kind refuses"
+    );
+    let unknown_field = br#"{"store":1,"state":"installed","objects":[],"persons":[],"extra":1}"#;
+    assert!(Manifest::parse(unknown_field).is_err());
+    let other_version = br#"{"store":2,"state":"installed","objects":[],"persons":[]}"#;
+    assert!(Manifest::parse(other_version).is_err());
+    assert_eq!(STORE_VERSION, 1);
+}
+
+#[test]
+fn the_earlier_state_is_written_once_and_never_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("prior.json");
+    let first = Prior {
+        store: STORE_VERSION,
+        appid_start_type: 3,
+        appid_running: false,
+        policy_xml: "<AppLockerPolicy Version=\"1\" />".to_owned(),
+    };
+    assert!(first.write_once(&path).unwrap());
+    let second = Prior {
+        appid_start_type: 2,
+        appid_running: true,
+        ..first.clone()
+    };
+    assert!(
+        !second.write_once(&path).unwrap(),
+        "a repair keeps the first baseline"
+    );
+    assert_eq!(Prior::load(&path).unwrap(), first);
+}
+
+/// A reader that counts the bytes taken from it, so a test can say how much a read consumed.
+struct Counting<R> {
+    inner: R,
+    taken: usize,
+}
+
+impl<R: Read> Read for Counting<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        self.taken += count;
+        Ok(count)
+    }
+}
+
+#[test]
+fn a_frame_is_bounded_before_its_body_is_read() {
+    let mut wire = Vec::new();
+    frame::write(
+        &mut wire,
+        &Request::Hello {
+            version: frame::VERSION,
+        },
+    )
+    .unwrap();
+    frame::write(&mut wire, &Request::Maintenance { on: true }).unwrap();
+    let mut reader = Cursor::new(wire);
+    assert_eq!(
+        frame::read::<_, Request>(&mut reader).unwrap(),
+        Request::Hello {
+            version: frame::VERSION
+        }
+    );
+    assert_eq!(
+        frame::read::<_, Request>(&mut reader).unwrap(),
+        Request::Maintenance { on: true }
+    );
+    assert!(matches!(
+        frame::read::<_, Request>(&mut reader),
+        Err(FrameError::Closed)
+    ));
+
+    // A length over the limit is refused after its four bytes, with the body untouched.
+    let mut oversize = u32::try_from(frame::MAX_FRAME + 1)
+        .unwrap()
+        .to_le_bytes()
+        .to_vec();
+    oversize.extend(std::iter::repeat_n(b'x', frame::MAX_FRAME + 1));
+    let mut counting = Counting {
+        inner: Cursor::new(oversize),
+        taken: 0,
+    };
+    assert!(matches!(
+        frame::read::<_, Request>(&mut counting),
+        Err(FrameError::TooLong(length)) if length == frame::MAX_FRAME + 1
+    ));
+    assert_eq!(counting.taken, 4);
+
+    // A connection that ends inside a frame is a failure, not a clean end.
+    let mut cut = 10_u32.to_le_bytes().to_vec();
+    cut.extend_from_slice(b"{\"req");
+    assert!(matches!(
+        frame::read::<_, Request>(&mut Cursor::new(cut)),
+        Err(FrameError::Io(_))
+    ));
+    let mut half = vec![5_u8, 0];
+    assert!(matches!(
+        frame::read::<_, Request>(&mut Cursor::new(half.split_off(0))),
+        Err(FrameError::Io(_))
+    ));
+
+    // A message that is not of this protocol, and one that carries a field it does not name.
+    let mut junk = 7_u32.to_le_bytes().to_vec();
+    junk.extend_from_slice(b"{\"a\":1}");
+    assert!(matches!(
+        frame::read::<_, Request>(&mut Cursor::new(junk)),
+        Err(FrameError::Malformed(_))
+    ));
+    let body = br#"{"request":"status","pid":4}"#;
+    let mut with_pid = u32::try_from(body.len()).unwrap().to_le_bytes().to_vec();
+    with_pid.extend_from_slice(body);
+    assert!(
+        matches!(
+            frame::read::<_, Request>(&mut Cursor::new(with_pid)),
+            Err(FrameError::Malformed(_))
+        ),
+        "a message names no process"
+    );
+
+    // A message too long to send is refused before any byte is written.
+    let mut sink = Vec::new();
+    let huge = Response::Proof {
+        ready: false,
+        detail: "y".repeat(frame::MAX_FRAME),
+    };
+    assert!(matches!(
+        frame::write(&mut sink, &huge),
+        Err(FrameError::TooLong(_))
+    ));
+    assert!(sink.is_empty());
+}
+
+#[test]
+fn only_a_proved_absence_is_not_installed() {
+    let grade = |verdict: Verdict| verdict.report().status;
+    assert_eq!(grade(Verdict::Ready), Status::Ok);
+    assert_eq!(grade(Verdict::NotInstalled), Status::Warning);
+    for failing in [
+        Verdict::Partial("x".into()),
+        Verdict::Foreign("x".into()),
+        Verdict::Altered("x".into()),
+        Verdict::NotInForce("x".into()),
+        Verdict::BrokerUnreachable("x".into()),
+        Verdict::GitFails("x".into()),
+        Verdict::CleanupFailed("x".into()),
+        Verdict::Unreadable("x".into()),
+    ] {
+        assert_eq!(grade(failing), Status::Failed);
+    }
+    assert!(Verdict::NotInstalled.report().remedy.is_some());
+    assert!(Verdict::Ready.report().remedy.is_none());
+}

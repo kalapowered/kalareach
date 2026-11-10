@@ -6,6 +6,7 @@ members = [
     "apps/companion/native/preview",
     "crates/kr-attention",
     "crates/kr-automation",
+    "crates/kr-boundary-windows",
     "crates/kr-cbor",
     "crates/kr-changeset",
     "crates/kr-cli",
@@ -130,6 +131,7 @@ jiff = { version = "=0.2.37", features = ["serde"] }
 keyring = "=4.2.0"
 kr-attention = { path = "crates/kr-attention", version = "=0.1.0" }
 kr-automation = { path = "crates/kr-automation", version = "=0.1.0" }
+kr-boundary-windows = { path = "crates/kr-boundary-windows", version = "=0.1.0" }
 kr-cbor = { path = "crates/kr-cbor", version = "=0.1.0" }
 kr-changeset = { path = "crates/kr-changeset", version = "=0.1.0" }
 kr-cli = { path = "crates/kr-cli", version = "=0.1.0" }
