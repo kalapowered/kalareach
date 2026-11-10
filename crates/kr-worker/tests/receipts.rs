@@ -4825,8 +4825,13 @@ fn recovery_rejects_an_accepted_intent_and_frees_what_it_held() {
     assert_eq!(rejected.reason.as_ref(), Some(&RejectionReason::Expired));
 }
 
-/// KR-REQ-23.46: a caller holding the outstanding limit can still cancel and still stop the
-/// session, because those are what release the capacity the limit counts.
+/// KR-REQ-23.46, a caller's own undispatched intent only: while the caller holds the outstanding
+/// limit, its cancellation of one of its own admitted intents is answered Ok. Not shown here: a
+/// refusal of another actor's intent or of one already dispatched, and the host owner's authority
+/// over another actor's intent. The stop the case also admits is no clause of 23.46.
+///
+/// A caller holding the outstanding limit can still cancel and still stop the session, because
+/// those are what release the capacity the limit counts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_limit_never_stops_a_caller_getting_back_under_it() {
     let host = host().await;
