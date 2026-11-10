@@ -271,10 +271,10 @@ impl<'r> Host<'r> {
         };
         // The port was free when it was chosen, and it is bound when the daemon starts: other legs
         // choose theirs meanwhile, on this machine and on a shared one, and two can choose alike.
-        // A daemon that exited because it could not bind the address it was given served nothing
-        // (it did record its own start in its state, which nothing here reads), so another port is
-        // chosen and the daemon started again; nothing holds the old address yet, because no
-        // device has paired.
+        // A daemon that exited because it could not bind the sockets for the address it was given
+        // served nothing (it did record its own start in its state, which nothing here reads), so
+        // another port is chosen and the daemon started again; nothing holds the old address yet,
+        // because no device has paired.
         for attempt in 1..=PORT_ATTEMPTS {
             match host.start_daemon_once() {
                 Ok(()) => return host,
@@ -296,13 +296,15 @@ impl<'r> Host<'r> {
     ///
     /// A host that keeps its address cannot take another port, because a device dials the one it
     /// has, and the port is free only until another program binds it. A daemon that exited because
-    /// it could not bind that address is started again once the address can be bound, for as many
-    /// starts as `RESTART_ATTEMPTS` allows in all.
+    /// it could not bind the sockets for that address is started again once the address can be
+    /// bound, for as many starts as `RESTART_ATTEMPTS` allows in all. A daemon that exits for any
+    /// other reason fails the start at once.
     ///
     /// # Panics
     ///
     /// Panics when it does not answer within [`LIVENESS`], or exits before it does, or when the
-    /// address stays held for the whole of `ADDRESS_FREE`.
+    /// address stays held for the whole of `ADDRESS_FREE`, or when it cannot be bound in any of the
+    /// starts.
     pub fn start_daemon(&self) {
         let kept = self
             .configured_address()
@@ -312,7 +314,12 @@ impl<'r> Host<'r> {
                 return;
             };
             match kept {
-                Some(address) if attempt < RESTART_ATTEMPTS && address_was_taken(&said) => {
+                Some(address) if address_was_taken(&said) => {
+                    assert!(
+                        attempt < RESTART_ATTEMPTS,
+                        "the control daemon could not bind {address} in {RESTART_ATTEMPTS} \
+                         starts, each after the address could be bound: {said}"
+                    );
                     until_the_address_is_free(address);
                 }
                 _ => panic!("the control daemon exited before it answered: {said}"),
@@ -845,10 +852,17 @@ fn free_loopback_port() -> u16 {
         .port()
 }
 
-/// Whether what a daemon wrote says it exited because it could not bind its configured address.
-/// The daemon does not say why: a port another leg chose is the reason this harness knows of.
+/// What the transport says when the sockets of its endpoint cannot be bound, which is the one way a
+/// taken address makes a bind fail. Its other bind failures (the QUIC endpoint, the network
+/// monitor, the TLS configuration) are not words of a taken address.
+const SOCKETS_NOT_BOUND: &str = "Failed to bind sockets";
+
+/// Whether what a daemon wrote says it exited because it could not bind the sockets for its
+/// configured address. A port another leg chose is the reason this harness knows of.
 fn address_was_taken(said: &str) -> bool {
-    said.contains("network.bind_address") && said.contains("could not be bound")
+    said.contains("network.bind_address")
+        && said.contains("could not be bound")
+        && said.contains(SOCKETS_NOT_BOUND)
 }
 
 /// Writes the environment's configuration document: this host joins the network on loopback, with
