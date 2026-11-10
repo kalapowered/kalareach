@@ -492,7 +492,7 @@ build_app() {
     arguments+=(--config '{"build":{"frontendDist":"../dist-harness","beforeBuildCommand":"pnpm build:harness"},"app":{"windows":[{"label":"main","create":false,"title":"KalaReach","width":1180,"height":800,"minWidth":480,"minHeight":480,"dragDropEnabled":true,"titleBarStyle":"Transparent","hiddenTitle":true,"url":"harness.html"}]}}')
   fi
   rm -rf "${apple:?}/build"
-  ( cd "$companion" && pnpm tauri ios build "${arguments[@]}" ) || die "the build failed"
+  ( cd "$companion" && pnpm ios build "${arguments[@]}" ) || die "the build failed"
   local built
   if [ "$target" = device ]; then
     built=$(ls -d "$apple"/build/*.xcarchive/Products/Applications/*.app 2>/dev/null | head -1)

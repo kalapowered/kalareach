@@ -141,7 +141,7 @@ build() {
         unset_arguments+=(-u "$name")
     done < <(compgen -e | grep -E '^(APPLE_|IOS_)' || true)
     ( cd "$companion" && kr_store_official_run env ${unset_arguments[@]+"${unset_arguments[@]}"} \
-        pnpm tauri ios build --ci --target aarch64 --archive-only --no-sign \
+        pnpm ios build --ci --target aarch64 --archive-only --no-sign \
         --config "{\"bundle\":{\"iOS\":{\"bundleVersion\":\"$number\"}}}" ) \
         || { kr_store_say "the archive failed"; return 2; }
     local archive="$apple/build/companion-tauri_iOS.xcarchive"

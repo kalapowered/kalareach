@@ -84,7 +84,7 @@ fi
 wrote_local=1
 printf 'KR_GOOGLE_SERVICE_INFO = %s\n' "$artefacts/GoogleService-Info.plist" >"$local_config" \
     || { say "could not write $local_config"; exit 2; }
-( cd "$companion" && pnpm tauri ios build --ci --target aarch64-sim ) >"$artefacts/build.log" 2>&1 \
+( cd "$companion" && pnpm ios build --ci --target aarch64-sim ) >"$artefacts/build.log" 2>&1 \
     || { say "the build failed; see $artefacts/build.log"; exit 2; }
 app="$apple/build/arm64-sim/KalaReach.app"
 [ -d "$app" ] || { say "the build left no application"; exit 2; }

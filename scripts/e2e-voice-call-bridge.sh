@@ -131,7 +131,7 @@ run_ios() {
     # No push: the build names no Firebase configuration.
     printf 'KR_GOOGLE_SERVICE_INFO =\n' >"$companion/src-tauri/gen/apple/Local.xcconfig"
     rm -rf "${companion:?}/src-tauri/gen/apple/build"
-    ( cd "$companion" && pnpm tauri ios build --debug --ci --target aarch64-sim ) >"$artefacts/build.log" 2>&1 \
+    ( cd "$companion" && pnpm ios build --debug --ci --target aarch64-sim ) >"$artefacts/build.log" 2>&1 \
         || { say "the build failed; see $artefacts/build.log"; return 2; }
     local app="$companion/src-tauri/gen/apple/build/arm64-sim/KalaReach.app"
     [ -d "$app" ] || { say "the build left no application"; return 2; }
