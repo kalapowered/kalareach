@@ -205,30 +205,48 @@ for leg in mute gap dtx malformed late_fragment; do
 done
 
 # An attempt of a leg is played again only when the recorder's own break is the only thing that failed
-# in it: a complete result whose every failed check names the break, and no host check failed but the
-# ones an early stop always fails. Anything else fails the leg at once.
+# in it: a complete result whose every failed check names the break, a host judge that gave a verdict,
+# and no host check failed but the ones an early stop or the break itself makes fail (a delegation never
+# answered or answered as a tainted call, and the taint told once). Anything else fails the leg at once,
+# a wrong or doubled reply to a delegation included.
 replay_result="$dir/replay-result.txt"
 replay_log="$dir/replay-run.log"
+replay_rc="$dir/replay-host.rc"
 broke="check=the recorder delivered without a break before the leg began ok=0 detail=openings 1 breaks 2; the recorder broke by itself"
-told="== [voice-call-device] host check=the model was told what became of d-1 ok=0 detail=told nothing, expected performed"
-attach="== [voice-call-device] host check=the model was told on attaching what the phone can do ok=0 detail=can-ask words 0, cannot-act words 1"
-replay_case() { # <name> <expected status> <result lines, one per argument after the log line>
-    local name=$1 want=$2 hostline=$3 status=0
-    shift 3
+host() { printf '== [voice-call-device] host check=%s\n' "$1"; }
+replay_case() { # <name> <expected status> <host judge status, or none> <host lines, one per line, or none> <result lines...>
+    local name=$1 want=$2 rc=$3 hostlines=$4 status=0
+    shift 4
     printf '%s\n' "$@" >"$replay_result"
-    printf '%s\n' "== [voice-call-device] host check=the service created one call ok=1 detail=1" ${hostline:+"$hostline"} >"$replay_log"
-    leg_is_replayable "$replay_result" "$replay_log" || status=$?
+    { host "the service created one call ok=1 detail=1"; [ "$hostlines" = none ] || printf '%s\n' "$hostlines"; } >"$replay_log"
+    if [ "$rc" = none ]; then rm -f "$replay_rc"; else printf '%s\n' "$rc" >"$replay_rc"; fi
+    leg_is_replayable "$replay_result" "$replay_log" "$replay_rc" || status=$?
     if [ "$status" != "$want" ]; then
         echo "FAILED: the replay case $name decided $status, expected $want"
         failed=1
     fi
 }
-replay_case "the recorder's break alone" 0 "$told" "check=open ok=1 detail=fine" "$broke" "done=1"
-replay_case "a break and a failed revocation" 1 "$told" "$broke" "check=the host revoked the grant ok=0 detail=host revoked" "done=1"
-replay_case "a break and a result that never says done" 1 "$told" "check=open ok=1 detail=fine" "$broke"
-replay_case "a break and a wrong word told on attaching" 1 "$attach" "$broke" "done=1"
-replay_case "a failure that is not a break" 1 "" "check=open ok=0 detail=nothing" "done=1"
-replay_case "no failure" 1 "" "check=open ok=1 detail=fine" "done=1"
+never="$(host "the model was told what became of d-1 ok=0 detail=told nothing, expected performed")"
+tainted="$(host "the model was told what became of d-0 ok=0 detail=told tainted, expected refused")"
+once="$(host "the model was never told the call can no longer act ok=0 detail=1 times")"
+attach="$(host "the model was told on attaching what the phone can do ok=0 detail=can-ask words 0, cannot-act words 1")"
+doubled="$(host "the model was told what became of d-1 ok=0 detail=told performed,performed, expected performed")"
+wrong="$(host "the model was told what became of d-1 ok=0 detail=told refused, expected performed")"
+stray="$(host "the model was told of no delegation the leg did not make ok=0 detail=d-8")"
+revoked="check=the host revoked the grant ok=0 detail=host revoked"
+replay_case "the recorder's break alone, the host judged it failed" 0 2 "$never" "check=open ok=1 detail=fine" "$broke" "done=1"
+replay_case "the break and its two consequences at the host" 0 2 "$tainted"$'\n'"$once" "$broke" "done=1"
+replay_case "the break alone, the host judged it passed" 0 0 none "check=open ok=1 detail=fine" "$broke" "done=1"
+replay_case "a break and a failed revocation" 1 2 "$never" "$broke" "$revoked" "done=1"
+replay_case "a break and a result that never says done" 1 2 "$never" "check=open ok=1 detail=fine" "$broke"
+replay_case "a break and a wrong word told on attaching" 1 2 "$attach" "$broke" "done=1"
+replay_case "a break and a host that wrote no report" 1 none none "$broke" "done=1"
+replay_case "a break and a host judge that stopped" 1 1 none "$broke" "done=1"
+replay_case "a break and a doubled reply to a delegation" 1 2 "$doubled" "$broke" "done=1"
+replay_case "a break and a wrong reply to a delegation" 1 2 "$wrong" "$broke" "done=1"
+replay_case "a break and a stray delegation" 1 2 "$stray" "$broke" "done=1"
+replay_case "a failure that is not a break" 1 2 none "check=open ok=0 detail=nothing" "done=1"
+replay_case "no failure" 1 0 none "check=open ok=1 detail=fine" "done=1"
 
 [ "$failed" = 0 ] && echo "the judges decide every case as they should"
 exit "$failed"

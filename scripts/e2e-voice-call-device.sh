@@ -58,7 +58,8 @@
 # gap between two recorder buffers fires when a loaded machine stalls the emulator at the call's
 # start) ends that attempt, which the script keeps under its own name and plays again on a new call,
 # up to `KR_LEG_ATTEMPTS` (three attempts in all), when that break is the only thing that failed in
-# it. A leg that breaks by itself on every attempt fails.
+# it. A leg that breaks by itself on every attempt fails, and a leg that passed only on a replay ends
+# with exit 4, partial, naming each attempt's failure: a rerun is not a pass.
 #
 # `delegating` with no leg runs them all, one after another, with one build and one device. The
 # simulator has no recorder, so a run with the peer's file naming a synthetic recorder gives the call
@@ -86,8 +87,9 @@
 #
 # Exit codes: 0 every check passed, 2 bad usage or a failed check, 3 the device is not available,
 # 4 every check that measured passed and some check could not measure (a direction of audio that
-# nothing counted, a lock screen the peer heard no call to have published); the run says which, and
-# is partial evidence. A run of several legs exits with the worst of theirs.
+# nothing counted, a lock screen the peer heard no call to have published), or a leg passed only on a
+# replay; the run says which, and is partial evidence. A run of several legs exits with the worst of
+# theirs, so exit 0 of `delegating` says that every leg passed on its first attempt.
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -478,6 +480,10 @@ judge() { # <result file>
 
 # Reads what the stand-in and the host saw, and decides whether it is what the run leaves.
 judge_host() {
+    # The judge's own exit status is kept beside the report, so that a run which never got a verdict
+    # from it (no report, or a judge that stopped) is never taken for one that failed only on the
+    # recorder's break.
+    rm -f "${artefacts:?}/host-judge.rc"
     # The application's lines go to the machine side first, which reads the figure of the first
     # audio from them when it finishes.
     [ ! -s "$artefacts/$result_name" ] || cp "$artefacts/$result_name" "$harness/figures.txt"
@@ -497,6 +503,7 @@ judge_host() {
     python3 "$here/scripts/lib/voice-call-host-judge.py" "$artefacts/host-report.json" "$mode" "$platform" \
         ${leg:+"$leg"} ${flags[@]+"${flags[@]}"} | tee -a "$log"
     local rc=${PIPESTATUS[0]}
+    printf '%s\n' "$rc" >"$artefacts/host-judge.rc"
     case "$rc" in
         0) say "every host check passed" ;;
         4) say "every host check that measured passed, and some could not measure" ;;
@@ -538,11 +545,13 @@ note_verdict() { # <leg> <status> [<attempts>]
 # is busy with its own start (the emulator on a loaded machine does). The attempt counts for nothing,
 # is kept under its own name with the failed checks it lists, and the leg's verdict is its last
 # attempt's. An attempt in which anything else failed (the revocation of the grant, the end of the
-# call, what the host was told on attaching, a result that never says done) fails the leg at once, so
-# that a later clean attempt never hides it. A leg whose recorder breaks by itself on every attempt
-# fails, and says so.
+# call, a wrong or doubled reply to a delegation, a host that gave no verdict, a result that never says
+# done) fails the leg at once, so that a later clean attempt never hides it. A leg whose recorder
+# breaks by itself on every attempt fails, and says so. A rerun is not a pass: a leg that passed only
+# on a later attempt ends with exit 4, "partial", naming the leg and what failed in each attempt, so
+# that exit 0 of the script says every leg passed on its first attempt.
 play_leg() { # <leg> <runner> <runner arguments...>
-    local each=$1 runner=$2 rc attempt=1 attempts="${KR_LEG_ATTEMPTS:-3}" kept
+    local each=$1 runner=$2 rc attempt=1 attempts="${KR_LEG_ATTEMPTS:-3}" kept history=""
     shift 2
     while :; do
         begin_run "$each"
@@ -550,8 +559,9 @@ play_leg() { # <leg> <runner> <runner arguments...>
         "$runner" "$@" || rc=$?
         end_run
         [ "$rc" != 0 ] || break
-        leg_is_replayable "$artefacts/$result_name" "$log" || break
-        say "== leg ${each:-the call} attempt $attempt of $attempts: $(grep -h ' ok=0 detail=' "$artefacts/$result_name" | cut -c1-200 | tr '\n' ' ')"
+        leg_is_replayable "$artefacts/$result_name" "$log" "$artefacts/host-judge.rc" || break
+        history="$history attempt $attempt: $(grep -h ' ok=0 detail=' "$artefacts/$result_name" | cut -c1-200 | tr '\n' ' ')"
+        say "== leg ${each:-the call} attempt $attempt of $attempts: the recorder broke by itself"
         if [ "$attempt" -ge "$attempts" ]; then
             say "== leg ${each:-the call}: the recorder broke by itself on all $attempts attempts, so the leg fails"
             break
@@ -561,6 +571,10 @@ play_leg() { # <leg> <runner> <runner arguments...>
         mv "$artefacts" "$kept" || break
         attempt=$((attempt + 1))
     done
+    if [ "$rc" = 0 ] && [ "$attempt" -gt 1 ]; then
+        say "== leg ${each:-the call} passed only on attempt $attempt, so the run is partial; what failed before:$history"
+        rc=4
+    fi
     note_verdict "$each" "$rc" "$attempt"
 }
 

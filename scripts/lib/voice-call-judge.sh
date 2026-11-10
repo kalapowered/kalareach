@@ -57,17 +57,21 @@ judge_voice_call_result() {
 }
 
 # Whether a leg's attempt may be played again on a new call: its result is complete (it says done), every
-# check it failed names the call's own recorder as having broken by itself, and no host check failed
-# but the ones an early stop of the leg always fails (what the model was told of a delegation, and of a
-# call that can no longer act). Anything else failed in the attempt is not the recorder's, and a later
-# clean attempt must not hide it.
-leg_is_replayable() { # <result file> <run log>
-    local result=$1 runlog=$2 failed marked independent
+# check it failed names the call's own recorder as having broken by itself, the host judge gave a verdict
+# (its exit status is 0, 2 or 4: a missing report or a judge that stopped leaves none), and every host
+# check that failed is one an early stop or the break itself makes fail: a delegation never answered
+# ("told nothing") or answered as a tainted call ("told tainted"), and the telling of the taint, once.
+# A wrong or doubled reply to a delegation, a stray delegation, the attach words, the call, the token
+# and the peer's answer are not the break's, and a later clean attempt must not hide them.
+leg_is_replayable() { # <result file> <run log> <host judge status file>
+    local result=$1 runlog=$2 hostrc=$3 failed marked verdict independent
     grep -q '^done=1$' "$result" 2>/dev/null || return 1
     failed=$(grep -c ' ok=0 detail=' "$result" 2>/dev/null)
     marked=$(grep -c ' ok=0 detail=.*the recorder broke by itself' "$result" 2>/dev/null)
     { [ "${marked:-0}" -gt 0 ] && [ "${failed:-0}" = "$marked" ]; } || return 1
+    verdict=$(cat "$hostrc" 2>/dev/null)
+    case "$verdict" in 0 | 2 | 4) ;; *) return 1 ;; esac
     independent=$(grep -h ' host check=.* ok=0 ' "$runlog" 2>/dev/null |
-        grep -c -v -E 'host check=the model was (told what became of|told once that the call can no longer act|never told the call can no longer act)')
+        grep -c -v -E 'host check=the model was told what became of d-[0-9]+ ok=0 detail=told (nothing|tainted), expected |host check=the model was told once that the call can no longer act ok=0 detail=0 times|host check=the model was never told the call can no longer act ok=0 detail=1 times')
     [ "${independent:-0}" = 0 ]
 }
