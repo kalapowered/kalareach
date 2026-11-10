@@ -276,20 +276,6 @@ public final class VoiceCaptureGate: @unchecked Sendable {
         }
     }
 
-    /// Whether the call's microphone track may be on: a permit is running, and neither the person
-    /// nor the system has closed the microphone.
-    ///
-    /// Unlike ``captureEnabled(nowMs:)`` it never asks whether the recorder runs. A recorder can run
-    /// only while the track is on, so a track that waited for the recorder would stay off once the
-    /// recorder stopped with it, and nothing, the person's unmute included, would bring capture back.
-    /// What the recorder hands the call is still carried only while ``captureEnabled(nowMs:)`` holds.
-    public func microphoneWanted(nowMs: UInt64) -> Bool {
-        locked {
-            settle(nowMs)
-            return microphoneIsOpen(nowMs)
-        }
-    }
-
     /// What a person is told about the microphone now.
     ///
     /// `.capturing` exactly when ``captureEnabled(nowMs:)`` is true, so the display and the refusal
@@ -341,15 +327,10 @@ public final class VoiceCaptureGate: @unchecked Sendable {
         }
     }
 
-    /// What the person and the system leave open, whatever the recorder is doing.
-    private func microphoneIsOpen(_ nowMs: UInt64) -> Bool {
+    private func enabled(_ nowMs: UInt64) -> Bool {
         guard let held = permit else { return false }
         return !stopped && nowMs < held.deadlineMs && !mutedByPerson && taken == .none
-            && !routeChanging && inputAvailable
-    }
-
-    private func enabled(_ nowMs: UInt64) -> Bool {
-        microphoneIsOpen(nowMs) && recorderRunning
+            && !routeChanging && inputAvailable && recorderRunning
     }
 
     /// Opens or closes the interval capture is in, to match what is true now.
@@ -444,11 +425,6 @@ public protocol VoiceCallPlatform: AnyObject {
 ///    that moment on the call's own queue.
 /// 2. The platform's recorder reports itself running (``recorder(running:)``). Only then may
 ///    capture carry speech.
-///
-/// The microphone track follows the person's mute and the state of the call alone
-/// (``VoiceCaptureGate/microphoneWanted(nowMs:)``): the recorder runs only while the track is on, so
-/// the track cannot wait for the recorder, and a recorder that stopped with the track would never be
-/// asked to start again.
 ///
 /// Every change ends in `apply`, the one place a switch is set. Every way into the control, whether
 /// a change, a report from the recorder, a second permit or a question, first ends a call whose
@@ -660,7 +636,7 @@ public final class VoiceCallControl: @unchecked Sendable {
         }
         let shown = gate.displayed(nowMs: now)
         switches.setAudioDevice(live)
-        switches.setMicrophone(gate.microphoneWanted(nowMs: now))
+        switches.setMicrophone(gate.captureEnabled(nowMs: now))
         let playback = live && !playbackMuted && !interrupted
         if playback != playbackOn { playbackChanges &+= 1 }
         playbackOn = playback
