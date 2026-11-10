@@ -1268,10 +1268,13 @@ async fn a_stop_that_meets_the_other_copys_record_where_it_claims(
 /// KR-REQ-09.09, the voice claim race, the authority part: a stop that found no record of its action
 /// at the early look and meets one where it claims the action, because another copy of the stop
 /// claimed it in between and recorded what it came to, is given that record only under the
-/// authority it arrived under, asked with the record in hand. The control: with nothing owed the
-/// late copy is given the answer the other recorded, as one read from the record. While this host
-/// owes a fence it could not raise, or once the registration the late copy arrived on is gone, the
-/// record is not given back.
+/// authority it arrived under. The control: with nothing owed the late copy is given the answer the
+/// other recorded, as one read from the record. While this host owes a fence it could not raise, or
+/// once the registration the late copy arrived on is gone, the record is not given back.
+///
+/// Not shown here: whether that authority is asked before or after the claim reads the record. The
+/// fence is raised and the registration removed while the late copy is held before its claim, so
+/// either order gives these answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stop_recorded_by_another_copy_before_its_claim_is_given_back_only_under_its_authority() {
     // The control.

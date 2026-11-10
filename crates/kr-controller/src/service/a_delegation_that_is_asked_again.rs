@@ -375,11 +375,16 @@ async fn a_delegations_receipt_goes_back_only_to_a_device_that_is_still_paired()
     assert_eq!(refused.code(), ErrorCode::PermissionDenied);
 }
 
-/// KR-REQ-09.09, the voice claim race for a delegation, the identity part: a delegation that found
-/// no record of its action at the early look and meets one where it claims the action, because
-/// another copy kept a receipt in between, is given that receipt as the early look gives one back,
-/// to a device that is still paired and to nobody once it is not. The control: with the device
-/// paired, the late copy is given the receipt as one read from the record.
+/// KR-REQ-09.09, the voice claim race for a delegation, the authority part, shown as the device's
+/// pairing: a delegation that found no record of its action at the early look and meets one where
+/// it claims the action, because another copy kept a receipt in between, is given that receipt as
+/// the early look gives one back, to a device that is still paired and to nobody once it is not.
+/// The control: with the device paired, the late copy is given the receipt as one read from the
+/// record.
+///
+/// Not shown here: a read of the session the delegation named (the receipt kept here is an admitted
+/// one, which is given back as kept and reads no session), and the voice grant's expiry or
+/// narrowing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_receipt_another_copy_kept_before_a_delegations_claim_goes_back_only_to_a_paired_device()
 {
