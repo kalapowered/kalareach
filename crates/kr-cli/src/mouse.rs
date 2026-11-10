@@ -77,10 +77,10 @@ pub enum Tracking {
 /// It reads the output as a terminal reads it, a byte at a time, so a mode setting cut in two
 /// between one write and the next is read whole.
 ///
-/// The three tracking modes are three settings of their own, as the session's screen keeps them, and
-/// what the application asked for is the widest of those that are set. A frame drawn from the screen
-/// writes every mode it tracks, the ones that are off among them, so a mode that is reset says
-/// nothing of the others.
+/// The three tracking modes are three settings of their own, as the session's screen keeps them,
+/// and what the application asked for is the widest of those that are set. A frame drawn from the
+/// screen writes every mode it tracks, the ones that are off among them, so a mode that is reset
+/// says nothing of the others.
 #[derive(Debug, Default)]
 pub struct MouseReporting {
     clicks: bool,
@@ -243,13 +243,24 @@ impl MouseReporting {
 /// Spells the console's mouse records as reports.
 ///
 /// It remembers which buttons the console last said were down, because a record says which are down
-/// and a report says which one went down or came up.
+/// and a report says which one went down or came up. It also keeps the part of a notch of the wheel
+/// that no report has been sent for, because a console with a finely turning wheel reports less
+/// than a notch at a time.
 #[derive(Debug, Default)]
 pub struct MouseSpeller {
     held: u32,
+    /// The wheel's turn that is not yet a whole notch, in the direction it turned.
+    wheel: i32,
 }
 
 impl MouseSpeller {
+    /// Forgets the buttons that were down and the part of a notch that was turned. A console that
+    /// reports no mouse says nothing of a button let go of meanwhile, so what was down before is
+    /// not known to be down when it reports again.
+    pub fn forget_the_buttons(&mut self) {
+        *self = Self::default();
+    }
+
     /// The bytes that tell the application of `record`, or none when it asked for nothing the
     /// record is.
     ///
@@ -302,18 +313,25 @@ impl MouseSpeller {
     fn actions(&mut self, record: MouseRecord) -> Vec<MouseAction> {
         if record.flags & MOUSE_WHEELED != 0 {
             let high = u16::try_from(record.buttons >> 16).unwrap_or(0);
-            let amount = i16::from_ne_bytes(high.to_ne_bytes());
-            let direction = if amount > 0 {
+            let amount = i32::from(i16::from_ne_bytes(high.to_ne_bytes()));
+            // A turn the other way leaves nothing of the turn before it.
+            if (amount > 0) != (self.wheel > 0) {
+                self.wheel = 0;
+            }
+            self.wheel += amount;
+            let notches = self.wheel / i32::from(WHEEL_DELTA);
+            self.wheel -= notches * i32::from(WHEEL_DELTA);
+            let direction = if notches > 0 {
                 WheelDirection::Up
             } else {
                 WheelDirection::Down
             };
-            let notches = (amount.unsigned_abs() / WHEEL_DELTA.unsigned_abs()).max(1);
-            return (0..notches)
+            return (0..notches.unsigned_abs())
                 .map(|_| MouseAction::Wheel(direction))
                 .collect();
         }
-        // A wheel that turns sideways is a report this encoding has no button for.
+        // A wheel that turns sideways is not told: the reports of this crate's encoder have no
+        // button for it.
         if record.flags & !(MOUSE_MOVED | DOUBLE_CLICK) != 0 {
             return Vec::new();
         }
@@ -418,8 +436,8 @@ mod tests {
         assert_eq!(reporting.encoding(), kr_keys::MouseEncoding::X10);
     }
 
-    /// A frame drawn from the session's screen writes every mouse mode it tracks, the ones that are off
-    /// after the one that is on, and the application has still asked for what it set.
+    /// A frame drawn from the session's screen writes every mouse mode it tracks, the ones that are
+    /// off after the one that is on, and the application has still asked for what it set.
     #[test]
     fn a_mode_that_is_reset_after_one_that_is_set_leaves_what_was_asked_for() {
         let mut reporting = MouseReporting::default();
@@ -517,6 +535,70 @@ mod tests {
         assert_eq!(
             told(b"\x1b[?1000h\x1b[?1006h", &[up, down, two_down]),
             b"\x1b[<64;1;1M\x1b[<65;1;1M\x1b[<65;1;1M\x1b[<65;1;1M".to_vec()
+        );
+    }
+
+    /// A wheel that turns finely reports less than a notch at a time: a notch is told once the
+    /// turns add up to one, the rest of a turn is kept for the next, and a turn the other way
+    /// starts again.
+    #[test]
+    fn a_wheel_that_turns_less_than_a_notch_at_a_time_is_told_when_it_has_turned_one() {
+        let up = |amount: i16| {
+            record(
+                0,
+                0,
+                u32::from(u16::from_ne_bytes(amount.to_ne_bytes())) << 16,
+                MOUSE_WHEELED,
+            )
+        };
+        let reporting = {
+            let mut reporting = MouseReporting::default();
+            reporting.observe(b"\x1b[?1000h\x1b[?1006h");
+            reporting
+        };
+        let mut speller = MouseSpeller::default();
+        let mut spelled = |record| speller.spell(record, &reporting, (0, 0));
+        assert_eq!(spelled(up(60)), Vec::<u8>::new(), "half a notch");
+        assert_eq!(
+            spelled(up(60)),
+            b"\x1b[<64;1;1M".to_vec(),
+            "the second half"
+        );
+        assert_eq!(
+            spelled(up(200)),
+            b"\x1b[<64;1;1M".to_vec(),
+            "a notch and 80 over"
+        );
+        assert_eq!(
+            spelled(up(40)),
+            b"\x1b[<64;1;1M".to_vec(),
+            "the 80 and 40 more"
+        );
+        assert_eq!(spelled(up(100)), Vec::<u8>::new(), "100 of the next");
+        assert_eq!(
+            spelled(up(-60)),
+            Vec::<u8>::new(),
+            "the other way, where nothing of the turn before is left"
+        );
+        assert_eq!(spelled(up(-60)), b"\x1b[<65;1;1M".to_vec());
+    }
+
+    /// A button that was down when the application stopped asking for the mouse is not known to be
+    /// down when it asks again: the console said nothing of the release in between, so the next
+    /// press is a press.
+    #[test]
+    fn a_button_let_go_of_while_the_mouse_was_not_asked_for_is_pressed_again_when_it_is() {
+        let mut reporting = MouseReporting::default();
+        reporting.observe(b"\x1b[?1000h\x1b[?1006h");
+        let mut speller = MouseSpeller::default();
+        assert_eq!(
+            speller.spell(record(0, 0, LEFT, 0), &reporting, (0, 0)),
+            b"\x1b[<0;1;1M".to_vec()
+        );
+        speller.forget_the_buttons();
+        assert_eq!(
+            speller.spell(record(0, 0, LEFT, 0), &reporting, (0, 0)),
+            b"\x1b[<0;1;1M".to_vec()
         );
     }
 

@@ -36,7 +36,7 @@
 //! | [`attach`] | Attaching a terminal, forwarding bytes, and the restoration guard |
 //! | [`session`] | Driving one attachment's input, output and connection in a single loop |
 //! | [`render`] | Drawing a projected session into this terminal, at canonical cell positions |
-//! | [`mouse`] | A Windows console's mouse records, spelled as the reports the session's application asked for |
+//! | [`mouse`] | A Windows console's mouse, spelled as the reports the application asked for |
 //! | [`terminal`] | Raw mode, terminal size and the saved state the guard holds |
 //! | [`platform`] | The one place this crate calls the operating system directly |
 //! | [`shell`] | `kr shell`: the guarded startup entries and what the integration resolved to |

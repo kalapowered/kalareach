@@ -428,15 +428,20 @@ every move, and 1006 for the SGR encoding. The three tracking modes are settings
 the widest one that is set counts. A screen the command draws writes every mode it tracks, the ones
 that are off among them, so a mode that is reset says nothing of the others.
 
-While the application asks, the command asks the console for mouse records, which takes the mouse
-away from the console's text selection. It gives the mouse back when the application stops asking
-and when the attachment ends. Each record the console reports in between goes to the application as
-the report it asked for, sent as input bytes at the cell the pointer is over, counted from the
-console's window. That is a press or release of each button, the wheel a notch at a time, a move
-with a button held in mode 1002, and a move with none in mode 1003. A position the original
+While the application asks and this attachment may send input, the command asks the console for
+mouse records, which takes the mouse away from the console's text selection. It gives the mouse back
+when the application stops asking, when the attachment can no longer send input, and when the
+attachment ends. Each record the console reports in between goes to the application as the report it
+asked for, sent as input bytes at the cell the pointer is over, counted from the console's window.
+That is a press or release of each button, the wheel a notch at a time (a wheel that turns less than
+a notch at a time is counted until it has turned one), a move with a button held in mode 1002, and a
+move with none in mode 1003. A record that is none of the events the application asked for is
+dropped, although the console no longer selects text with the mouse. The command spells the original
+encoding and the SGR encoding (mode 1006) and does not read modes 1005 and 1015, so an application
+that asks for either of them without 1006 is sent the original encoding. A position the original
 encoding has no room for (past column or row 223, with mode 1006 off) is not reported as another
-cell. Until the application asks, and for anything it did not ask for, the console keeps the mouse
-and nothing is sent.
+cell, and a wheel that turns sideways is not reported. Until the application asks, and in an
+attachment that may not send input, the console keeps the mouse and nothing is sent.
 
 Bracketed paste is the one piece of context the command keeps, and it keeps it by watching the
 bytes as they go past rather than by holding any of them: a start delimiter opens a paste and an

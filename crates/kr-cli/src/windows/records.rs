@@ -488,9 +488,9 @@ pub const fn record_input_mode(saved: u32) -> u32 {
 ///
 /// While it asks, the console reports the mouse as records and no longer uses it to select text,
 /// which takes the flag that says the extended flags are set as well as the removal of quick edit.
-/// When it stops, the console has the mouse again: quick edit comes back if `saved`, the mode the
-/// console had before the attachment, had it on. Nothing else of `current` changes, so a console that
-/// has been asked to spell its keys itself goes on spelling them.
+/// When it stops, the console has the mouse again: quick edit comes back if `saved`, the console's
+/// mode when the mouse was first asked for, had it on. Nothing else of `current` changes, so a
+/// console that has been asked to spell its keys itself goes on spelling them.
 #[must_use]
 pub const fn mouse_input_mode(current: u32, saved: u32, asked: bool) -> u32 {
     use windows_sys::Win32::System::Console::{

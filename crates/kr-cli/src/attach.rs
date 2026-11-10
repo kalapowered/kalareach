@@ -1206,9 +1206,9 @@ pub enum TerminalInput {
     /// A run of key records, in the order the console reported them, for the session to spell as
     /// its terminal asked for. Only a Windows console reports keys this way.
     Keys(Vec<kr_term::win32::KeyRecord>),
-    /// A mouse record, which the console reports only while it has been asked for the mouse. It is
-    /// spelled as the report the session's application asked for, and is sent as bytes. Only a
-    /// Windows console reports the mouse this way.
+    /// A mouse record, which a console window reports only while it has been asked for the mouse.
+    /// It is spelled as the report the session's application asked for, and is sent as bytes. Only
+    /// a Windows console reports the mouse this way.
     Mouse(crate::mouse::MouseRecord),
 }
 

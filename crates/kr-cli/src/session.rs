@@ -2092,6 +2092,15 @@ impl Write {
         }
     }
 
+    /// A write of the reports of a console's mouse, which are not what the person typed.
+    const fn pointer(sequence: u64) -> Self {
+        Self {
+            sequence,
+            typed: false,
+            keys: false,
+        }
+    }
+
     /// A write of console key records.
     fn keys(sequence: u64, records: &[kr_term::win32::KeyRecord]) -> Self {
         Self {
@@ -2171,12 +2180,13 @@ fn resizes_not_owed(
 
 /// What an attachment does about its console's mouse.
 ///
-/// A Windows console reports the mouse as records, and only once it has been asked to. The
-/// application in the session asks to be told of the mouse by what it writes, so this learns of
-/// that from the output, has the console report the mouse while the application asks and gives it
-/// back to the console when it stops, and spells the records the console reports as the reports the
-/// application asked for. On other platforms the terminal sends the reports itself, and this does
-/// nothing of the kind.
+/// A Windows console reports the mouse as records. A console window reports them only once it has
+/// been asked to, and keeps the mouse for selecting text until then; a pseudo console turns the
+/// mouse reports it is sent into records whatever its input mode is. The application in the session
+/// asks to be told of the mouse by what it writes, so this learns of that from the output, has the
+/// console report the mouse while the application asks and gives it back to the console when it
+/// stops, and spells the records the console reports as the reports the application asked for. On
+/// other platforms the terminal sends the reports itself, and this does nothing of the kind.
 #[derive(Debug, Default)]
 struct ConsoleMouse {
     reporting: crate::mouse::MouseReporting,
@@ -2187,15 +2197,25 @@ struct ConsoleMouse {
 
 impl ConsoleMouse {
     /// Reads output that is about to be shown on the console, and gives the mouse to the
-    /// application or back to the console as what it asked for changes. `may_type` says whether this terminal
-    /// may send input to the session, which is what the mouse would be.
+    /// application or back to the console as what it asked for changes. `may_type` says whether
+    /// this terminal may send input to the session, which is what the mouse would be.
     fn shown(&mut self, output: &[u8], terminal: &ControllingTerminal, may_type: bool) {
         self.reporting.observe(output);
+        self.update(terminal, may_type);
+    }
+
+    /// Gives the mouse to the application or back to the console to match what the application has
+    /// asked for and whether this terminal may send it input. A console that will not change its
+    /// mode keeps the mouse as it is, and is asked again whenever the output, a mouse record or the
+    /// lease gives a reason to look.
+    fn update(&mut self, terminal: &ControllingTerminal, may_type: bool) {
         let asked = may_type && self.reporting.tracking() != crate::mouse::Tracking::Off;
-        // A console that will not change its mode keeps the mouse as it is, and is asked again at
-        // the next change.
         if asked != self.given && report_mouse(terminal, asked) {
             self.given = asked;
+        }
+        if !asked {
+            // A console that reports no mouse says nothing of a button let go of meanwhile.
+            self.speller.forget_the_buttons();
         }
     }
 
@@ -2204,7 +2224,11 @@ impl ConsoleMouse {
         &mut self,
         record: crate::mouse::MouseRecord,
         terminal: &ControllingTerminal,
+        may_type: bool,
     ) -> Vec<u8> {
+        // A record that comes while the console should no longer be reporting is the reason to ask
+        // again for the mouse to be given back.
+        self.update(terminal, may_type);
         self.speller
             .spell(record, &self.reporting, window_origin(terminal))
     }
@@ -2761,16 +2785,16 @@ async fn drive(
                                 // console is asked to spell its keys itself, as a terminal does,
                                 // and what it spells goes as bytes from then on. The host took no
                                 // sequence number for the refused write, so the next is sent under
-                                // it, and the writes sent as records behind it are of no further
-                                // use: whatever the host answers them, they are not read. What
-                                // the person typed in them is lost, and so is what is dropped
-                                // below, which the line afterwards says.
+                                // it, and the writes sent behind it, as records or as the reports
+                                // of the mouse, are of no further use: whatever the host answers
+                                // them, they are not read. What the person typed in them is lost,
+                                // and so is what is dropped below, which the line afterwards says.
                                 Refused::KeysIncompatible => {
                                     sequence = write.sequence;
                                     fallback.typed_keys_lost |= write.typed;
                                     for what in outstanding.values_mut() {
                                         if let Outstanding::Input(sent) = what
-                                            && sent.keys
+                                            && (sent.keys || sent.sequence > write.sequence)
                                         {
                                             fallback.typed_keys_lost |= sent.typed;
                                             *what = Outstanding::Ignored;
@@ -2784,6 +2808,10 @@ async fn drive(
                                         // at: the lease is handed back and the attachment watches.
                                         fallback.how = Some(Spelling::Watching);
                                         if let Some(held) = epoch.take() {
+                                            // A terminal that may not type has no use for the
+                                            // mouse: the console has it back at once, and does not
+                                            // wait for the application's next output.
+                                            console_mouse.update(terminal, false);
                                             let request_id =
                                                 kr_protocol::ids::RequestId::new(next_request);
                                             next_request += 1;
@@ -2941,13 +2969,14 @@ async fn drive(
                     };
                     continue;
                 }
+                let from_the_mouse = matches!(read, TerminalInput::Mouse(_));
                 let bytes = match read {
                     TerminalInput::Bytes(bytes) => bytes,
                     // A console reports the mouse as records, and the mouse is a virtual-terminal
                     // operation in this protocol: the application that asked to be told of it is
                     // sent the report it asked for, as bytes, and goes on from here like any other.
                     TerminalInput::Mouse(record) => {
-                        let report = console_mouse.spelled(record, terminal);
+                        let report = console_mouse.spelled(record, terminal, epoch.is_some());
                         if report.is_empty() {
                             continue;
                         }
@@ -3146,7 +3175,12 @@ async fn drive(
                         "the connection ended while input was being sent",
                     ));
                 }
-                outstanding.insert(request_id, Outstanding::Input(Write::bytes(sequence)));
+                let write = if from_the_mouse {
+                    Write::pointer(sequence)
+                } else {
+                    Write::bytes(sequence)
+                };
+                outstanding.insert(request_id, Outstanding::Input(write));
                 sequence += 1;
             }
         }
@@ -3607,6 +3641,11 @@ mod tests {
 
             /// The session says something: a batch of output on its stream, the `sequence`th.
             pub fn says_output(&self, sequence: u64) {
+                self.says_output_bytes(sequence, b"x");
+            }
+
+            /// The session writes `bytes`, as the `sequence`th batch of output on its stream.
+            pub fn says_output_bytes(&self, sequence: u64, bytes: &[u8]) {
                 self.answers
                     .send(ControlFrame::Notification(Notification {
                         stream_id: StreamId::new("session").expect("a stream"),
@@ -3614,7 +3653,7 @@ mod tests {
                         event_type: EventType::new("session.output").expect("an event type"),
                         payload: ParamsValue::from_typed(&kr_protocol::recovery::OutputEvent {
                             cursor: kr_protocol::scalars::U64::new(sequence),
-                            bytes: kr_protocol::scalars::Bytes::new(b"x".to_vec()),
+                            bytes: kr_protocol::scalars::Bytes::new(bytes.to_vec()),
                         })
                         .expect("an output event"),
                     }))
@@ -4412,6 +4451,60 @@ mod tests {
             CliError::Refused(refusal(ErrorCode::InputIncompatible, Shown::said(""))).exit_code()
         );
         assert!(outcome.detail().as_str().contains("--no-probe"));
+    }
+
+    /// The report of a click that is sent behind console keys the session refuses is no more read
+    /// than the keys behind them are: the host cannot place it under the number it was sent with
+    /// and says so, which is no reason to end the attachment once the console spells its keys.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_click_sent_behind_console_keys_the_session_refuses_does_not_end_the_attachment() {
+        use kr_protocol::input::InputContent;
+
+        let ran = wire::run_switched(true, true, |mut case| async move {
+            // The application has asked for clicks, and a key and a click are on their way when the
+            // host refuses the key.
+            case.says_output_bytes(0, b"\x1b[?1000h\x1b[?1006h");
+            let key = case.types(key_down(b'A')).await;
+            let click = case
+                .types(crate::attach::TerminalInput::Mouse(
+                    crate::mouse::MouseRecord {
+                        column: 1,
+                        row: 1,
+                        buttons: 1,
+                        control_keys: 0,
+                        flags: 0,
+                    },
+                ))
+                .await;
+            assert_eq!((key.sequence, click.sequence), (0, 1));
+            assert!(matches!(click.content, InputContent::Bytes { .. }));
+            case.refuses(&key, ErrorCode::InputIncompatible);
+            case.refuses(&click, ErrorCode::InvalidArgument);
+            assert_eq!(case.waits_for_the_console_to_be_asked().await, 1);
+
+            let typed = case
+                .types(crate::attach::TerminalInput::Bytes(b"c".to_vec()))
+                .await;
+            assert_eq!(
+                typed.sequence, key.sequence,
+                "the refused write took no number"
+            );
+            case.takes(&typed);
+            case.hangs_up();
+        })
+        .await;
+        assert!(
+            matches!(ran.outcome, AttachOutcome::Detached),
+            "{:?}",
+            ran.outcome
+        );
+        assert_eq!(ran.said.len(), 1, "{:?}", ran.said);
+        assert!(
+            ran.said[0].as_str().contains("were lost"),
+            "the key typed when the session refused the records is the only loss: {:?}",
+            ran.said[0]
+        );
     }
 
     /// The session cannot spell the records of a console whose application has negotiated an
