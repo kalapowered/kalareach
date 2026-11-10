@@ -3700,8 +3700,8 @@ async fn the_application_printed(runtime: &kr_worker::runtime::SessionRuntime, t
 ///
 /// The install releases the lease in one step of the input domain, and what that queued for the
 /// terminal's writer, the notice that the lease moved, goes to the writer with the install and not
-/// with whatever writes next. The application here prints nothing after the paste opened, so there
-/// is no later write to carry it.
+/// with whatever writes next. The application here is `exec tee`, which prints the paste back; that
+/// text holds no query, so no reply follows and there is no later write to carry it.
 ///
 /// KR-REQ-08.49, source loss with no successor only: the lease a revision takes while a paste is
 /// open ends the paste at the application, with no reply and no new actor behind it. Not shown
@@ -3774,7 +3774,8 @@ async fn a_revision_that_takes_a_lease_with_a_paste_open_has_the_paste_closed_at
         "the install took the lease"
     );
 
-    // Nothing is typed and nothing is printed from here: the end of the paste is the install's.
+    // Nothing more is typed, and what the application prints back holds no query: the end of the
+    // paste is the install's.
     let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while !handed(false).ends_with(b"\x1b[201~") {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
