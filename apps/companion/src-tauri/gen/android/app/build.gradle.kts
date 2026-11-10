@@ -179,7 +179,8 @@ dependencies {
     // WebView's `getUserMedia`. The constraint is strict rather than a plain version: a checksum
     // verifies bytes, and only a strict constraint stops conflict resolution raising the version
     // that is fetched. This artefact's PT_LOAD segments align to 16 KiB, which is what Android 15
-    // and later require.
+    // and later require. Its native code finds the library's Java classes by name, which the
+    // minifier would remove: `proguard-rules.pro` keeps them.
     implementation("io.github.webrtc-sdk:android") { version { strictly("150.7871.01") } }
     // The device-owner ceremony an unlocked-screen confirmation needs, with the device-credential
     // fallback for a device that has no biometric enrolled.
