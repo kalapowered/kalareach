@@ -452,7 +452,7 @@ fn lines(report: &AccountReport, which: Which) -> Vec<Line> {
             )),
             (_, Some(SignInUnavailable::BrokerIsAnotherService)) => lines.push(stdout_line!(
                 "This host's voice.broker_origin names another service than the managed account \
-                 service, so it signs in nowhere and presents no account."
+                 service, so its managed account signs in nowhere and presents no account."
             )),
             (_, Some(SignInUnavailable::NotUsable)) => lines.push(stdout_line!(
                 "This host cannot reach the managed account service the way its configuration \

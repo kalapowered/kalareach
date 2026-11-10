@@ -626,3 +626,53 @@ async fn a_membership_renewed_between_the_reads_is_not_an_old_daemon() {
     assert_eq!(shown["storage_account"]["state"], "signed_out", "{shown}");
     serving.abort();
 }
+
+/// KR-REQ-20.19: a host whose voice broker and storage service are the same service its owner runs
+/// has a managed account that signs in nowhere, and a storage account that is signed in. `kr
+/// account show` says of the managed account that it signs in nowhere and presents no account, and
+/// does not say that of the host while it lists the storage account that does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn show_limits_what_it_says_of_no_managed_account_to_that_account() {
+    use kr_client::services::AccountToken;
+    use kr_client::services::account::{IssuedGrant, RefreshToken};
+
+    let managed = serve().await;
+    let owner = serve().await;
+    let host = Host::start(
+        &document(Some(owner.origin()), Some(owner.origin())),
+        Some(managed.origin()),
+    )
+    .await;
+    host._controller
+        .storage_account()
+        .keep_for_test(IssuedGrant {
+            access_token: AccountToken::new("the-owner-access-token").expect("a token"),
+            expires_in_seconds: 3600,
+            refresh_token: RefreshToken::new("the-owner-refresh-token").expect("a token"),
+            scopes: vec!["openid".to_owned(), "backup.write".to_owned()],
+            subject: "account-1".to_owned(),
+        })
+        .await;
+    let (status, shown) = host.json(&["account", "show"]);
+    assert_eq!(status, Some(0), "{shown}");
+    assert_eq!(shown["storage_account"]["state"], "signed_in", "{shown}");
+    let output = host.kr(&["account", "show"]);
+    assert_eq!(output.status.code(), Some(0), "{}", said(&output));
+    let printed = String::from_utf8_lossy(&output.stdout).into_owned();
+    let nowhere = printed
+        .lines()
+        .find(|line| line.contains("presents no account"))
+        .unwrap_or_else(|| {
+            panic!("a line says the managed account presents no account: {printed}")
+        });
+    assert!(
+        nowhere.contains("managed account"),
+        "what is said of no account is said of the managed one: {printed}"
+    );
+    assert!(
+        printed
+            .lines()
+            .any(|line| line.contains("storage account") && line.contains(owner.origin())),
+        "the storage account is listed at its service: {printed}"
+    );
+}
