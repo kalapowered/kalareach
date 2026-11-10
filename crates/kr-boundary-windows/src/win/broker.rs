@@ -167,10 +167,21 @@ fn refuse(reason: Refusal, detail: &str) -> Response {
 
 /// Serves one connection until it ends.
 fn answer(mut connection: Connection, state: &State) {
-    let Ok(identity) = connection.identity() else {
-        return;
+    // The platform lets a server take on a client's identity only after it has read from the pipe,
+    // so the first message is read before the caller is identified. Nothing is done with it until
+    // the caller is known.
+    let first = frame::read::<_, Request>(&mut connection);
+    let identity = match connection.identity() {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = frame::write(
+                &mut connection,
+                &refuse(Refusal::Failed, &error.to_string()),
+            );
+            return;
+        }
     };
-    match frame::read::<_, Request>(&mut connection) {
+    match first {
         Ok(Request::Hello { version }) if version == frame::VERSION => {
             if frame::write(
                 &mut connection,
