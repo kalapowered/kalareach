@@ -96,6 +96,8 @@ pub mod provenance;
 pub mod stage;
 #[cfg(unix)]
 pub mod stub;
+#[cfg(unix)]
+pub mod transfer;
 
 /// The variable naming the JSON file that describes the build under test.
 pub const BUILD_VARIABLE: &str = "KR_AGENTS_BUILD";
