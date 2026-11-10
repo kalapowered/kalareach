@@ -301,6 +301,9 @@ pub(super) struct Handover {
     pub within: Duration,
     /// Set by the owner when the path to the host is lost: nothing is written after it.
     pub lost: Arc<AtomicBool>,
+    /// Set when what was said can no longer be acted on, by the owner or by the task that reads a
+    /// capture proof: nothing is written after it, on whatever connection.
+    pub tainted: Arc<AtomicBool>,
 }
 
 /// Hands one delegation to the host, once: the request is composed once and kept whole, a capture
@@ -320,6 +323,7 @@ pub(super) async fn hand_over(handover: Handover) -> Exchange {
         age_bound,
         within,
         lost,
+        tainted,
     } = handover;
     let action_id = action_id.unwrap_or_else(|| ActionId::new(kr_ipc::new_uuid()));
     let session = Arc::clone(&host.session);
@@ -356,7 +360,7 @@ pub(super) async fn hand_over(handover: Handover) -> Exchange {
                 // A request waiting for the connection's turn is stopped here, by the task that
                 // read the proof, and not when the owner next handles a message: no other write
                 // leaves in between.
-                lost.store(true, Ordering::SeqCst);
+                tainted.store(true, Ordering::SeqCst);
                 return Exchange {
                     session,
                     composed: Some(composed),
@@ -373,12 +377,15 @@ pub(super) async fn hand_over(handover: Handover) -> Exchange {
         return nothing(Cause::StaleProof, Some(composed));
     }
     let not_after = asked + (age_bound - age);
+    if tainted.load(Ordering::SeqCst) {
+        return nothing(Cause::CaptureBreak, Some(composed));
+    }
     if lost.load(Ordering::SeqCst) {
         return nothing(Cause::HostLost, Some(composed));
     }
     // Written only while the call can still hand a request over, and while the proof is young:
     // both are looked at once the connection holds the right to write.
-    let wanted = || !lost.load(Ordering::SeqCst);
+    let wanted = || !lost.load(Ordering::SeqCst) && !tainted.load(Ordering::SeqCst);
     let sent = tokio::time::timeout(
         within,
         host.session.send_before(&composed, not_after, &wanted),
@@ -394,7 +401,9 @@ pub(super) async fn hand_over(handover: Handover) -> Exchange {
             }
         }
         Ok(Ok(Settled::Receipt(_))) => Delivered::Receipt,
-        Ok(Err(ClientError::Withheld)) => Delivered::Withheld(if lost.load(Ordering::SeqCst) {
+        Ok(Err(ClientError::Withheld)) => Delivered::Withheld(if tainted.load(Ordering::SeqCst) {
+            Cause::CaptureBreak
+        } else if lost.load(Ordering::SeqCst) {
             Cause::HostLost
         } else {
             Cause::StaleProof

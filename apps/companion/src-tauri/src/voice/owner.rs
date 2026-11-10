@@ -483,9 +483,19 @@ pub(super) struct Owner {
     /// The number the next confirmation is given, so that what a ceremony or a proof says of one
     /// that was dropped is not taken for what it says of the one that followed.
     next_confirmation: u64,
-    /// Set when nothing not yet written may be written: the path to the host was lost, or the call
-    /// can no longer hand a request over. A fresh one is made when the host is back.
+    /// Set when nothing not yet written may be written over this connection: the path to the host
+    /// was lost, or the call can no longer hand a request over. A fresh one is made when the host
+    /// is back, and a request keeps the one it was made under, which stays set once it is.
     unsent: Arc<AtomicBool>,
+    /// Set when what was said can no longer be acted on: the gate says the call is tainted, or a
+    /// capture proof shows a break. The tasks that read a proof set it before they tell the owner,
+    /// so that no request waiting for the connection's turn leaves in between. It outlives every
+    /// connection: a host that comes back does not clear it.
+    tainted: Arc<AtomicBool>,
+    /// The connection's flag each delegation was handed over under, which a challenge answered
+    /// later is read against: one answered after the path to the host was lost is not put to the
+    /// person, whatever the path is by then.
+    sent_under: HashMap<String, Arc<AtomicBool>>,
     /// Whether the person and the model were told the call is tainted.
     taint_told: bool,
 }
@@ -576,6 +586,7 @@ impl Drop for Owner {
     /// waiting for the connection's turn to be written is not written for a call nobody holds.
     fn drop(&mut self) {
         self.unsent.store(true, Ordering::SeqCst);
+        self.tainted.store(true, Ordering::SeqCst);
     }
 }
 
@@ -641,6 +652,8 @@ impl Owner {
             signed: HashSet::new(),
             next_confirmation: 0,
             unsent: Arc::new(AtomicBool::new(false)),
+            tainted: Arc::new(AtomicBool::new(false)),
+            sent_under: HashMap::new(),
             taint_told: false,
         }
     }
@@ -1773,6 +1786,8 @@ impl Owner {
                 outcome,
             } => {
                 self.on_ceremony(&id, generation, outcome);
+                #[cfg(any(test, feature = "testing"))]
+                self.shared.handled.ceremony(&id);
                 None
             }
             Internal::SealProof {
@@ -1829,7 +1844,7 @@ impl Owner {
         if self.accepting {
             // What was not written before the loss stays unwritten; what may have been is asked
             // about again, now that there is a connection to ask on.
-            self.unsent = Arc::new(AtomicBool::new(self.gate.taint().is_some()));
+            self.unsent = Arc::new(AtomicBool::new(false));
             self.tell_model(VoiceCommand::Instructions, None, HOST_BACK_ACCEPTING);
             self.ask_after_attempts();
         } else {
@@ -1905,7 +1920,7 @@ impl Owner {
         let Some(why) = self.gate.taint() else {
             return;
         };
-        self.unsent.store(true, Ordering::SeqCst);
+        self.tainted.store(true, Ordering::SeqCst);
         let waiting: Vec<Collection> = self.collections.drain(..).collect();
         for collection in waiting {
             self.refuse(&collection.id, why);
@@ -2238,7 +2253,10 @@ impl Owner {
             age_bound: self.shared.timings.proof_age,
             within: self.shared.timings.host_within,
             lost: Arc::clone(&self.unsent),
+            tainted: Arc::clone(&self.tainted),
         };
+        self.sent_under
+            .insert(id.to_owned(), Arc::clone(&self.unsent));
         let (internal, id) = (self.internal_tx.clone(), id.to_owned());
         tokio::spawn(async move {
             let exchange = hand_over(handover).await;
@@ -2431,6 +2449,7 @@ impl Owner {
         let id = self.id;
         // Nothing not yet written to the host is written from here on.
         self.unsent.store(true, Ordering::SeqCst);
+        self.tainted.store(true, Ordering::SeqCst);
         // What the opening context came to is in the record before the call is said to have ended,
         // so that a person who reads the end reads it too.
         self.settle_the_opening().await;

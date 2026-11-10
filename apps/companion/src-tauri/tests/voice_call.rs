@@ -5177,6 +5177,7 @@ fn delegating_timings() -> Timings {
         proof_age: Duration::from_secs(10),
         drain_within: WATCHDOG,
         host_within: WATCHDOG,
+        session_name_within: WATCHDOG,
         ..quick()
     }
 }
@@ -5327,6 +5328,20 @@ async fn row_settled(scene: &Scene, id: &str) -> serde_json::Value {
 /// What the host was sent of `voice.delegate`.
 fn at_the_host(scene: &Scene) -> usize {
     scene.link.sent(HostMethod::VoiceDelegate)
+}
+
+/// Waits until the owner has read the answer of the ceremony the confirmation of the delegation `id`
+/// asked for, and acted on it or dropped it: what a case says was not signed after a late answer is
+/// said after this.
+async fn until_the_ceremony_is_handled(scene: &Scene, id: &str) {
+    let calls = scene.phone.companion.app.state::<Calls>();
+    tokio::time::timeout(WATCHDOG, async {
+        while !calls.has_handled_ceremony(id) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the owner reads the ceremony's answer");
 }
 
 /// Waits until the call has asked native code for `count` capture proofs with a marker.
@@ -6732,11 +6747,11 @@ fn hang_up(scene: &Scene) {
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
 }
 
-/// The host answered the first submission with a challenge, the phone asked the person on the
-/// unlocked screen, and the same delegation came back under the same action with the person's
-/// signature: the host's worker closed the session. The person is asked once, about this session on
-/// this host; the model is told a confirmation is being asked for and then what the host did. This is
-/// the control every case below is read beside.
+/// KR-REQ-15.13: the host answered the first submission with a challenge, the phone asked the
+/// person on the unlocked screen, and the same delegation came back under the same action with the
+/// person's signature: the host's worker closed the session. The person is asked once, about this
+/// session on this host; the model is told a confirmation is being asked for and then what the host
+/// did. This is the control every case below is read beside.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_close_said_aloud_is_confirmed_on_the_phone_and_closes_the_session() {
     let mut scene = closing().await;
@@ -7040,6 +7055,7 @@ async fn more_said_while_the_person_is_asked_drops_the_confirmation() {
     let row = row_reaching(&scene, "d-1", "cancelled").await;
     assert_eq!(row["cause"], "late_fragment");
     scene.ceremony.release();
+    until_the_ceremony_is_handled(&scene, "d-1").await;
     assert_eq!(at_the_host(&scene), 1, "no signature was sent");
     assert!(!scene.is_closed().await);
     hang_up(&scene);
@@ -7233,11 +7249,19 @@ async fn a_confirmation_waiting_for_the_person_is_dropped_when_the_host_is_lost(
     ask(&scene, "d-1", end - 200).await;
     scene.ceremony.until_asked(1).await;
 
+    scene.link.unreachable(true);
     lose_the_host(&scene);
 
     let row = row_reaching(&scene, "d-1", "cancelled").await;
     assert_eq!(row["cause"], "host_lost");
+    // The host is back before the person answers: what the phone dropped with the path is not
+    // signed for a connection that came after it.
+    scene.link.unreachable(false);
+    scene
+        .state_where("the host back", |state| state["host"] == "reachable")
+        .await;
     scene.ceremony.release();
+    until_the_ceremony_is_handled(&scene, "d-1").await;
     assert_eq!(at_the_host(&scene), 1, "no signature was sent");
     assert!(!scene.is_closed().await);
     hang_up(&scene);

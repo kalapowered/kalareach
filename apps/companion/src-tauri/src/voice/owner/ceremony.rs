@@ -22,7 +22,7 @@
 //! as it was composed, on another connection, and never sent again as new.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use companion_platform::call::{CallFailure, CaptureProof};
@@ -41,16 +41,21 @@ use super::{
 };
 use crate::voice::confirm::{Challenge, Known, reason};
 
-/// How long the number of the session is waited for, so the dialog can name it. A courtesy: the
-/// confirmation does not depend on it.
-const SESSION_NAME_WITHIN: Duration = Duration::from_secs(3);
-
 /// A challenge the person is being asked about.
 pub(super) struct Confirming {
     challenge: Challenge,
     /// Which confirmation this is, so that a ceremony's answer or a proof is taken for the one it
     /// was asked for and for no later one.
     generation: u64,
+    /// Cleared when the confirmation is dropped, however it is: the task that is to ask the person
+    /// looks at it once more before it does.
+    open: Arc<AtomicBool>,
+}
+
+impl Drop for Confirming {
+    fn drop(&mut self) {
+        self.open.store(false, Ordering::SeqCst);
+    }
 }
 
 /// A confirmation whose ceremony is done and whose news is being read up to a marker.
@@ -104,6 +109,16 @@ impl Owner {
             self.cancel_row(id, why);
             return;
         }
+        // The request was handed over on a connection whose path was lost since: nothing handed
+        // over before a loss is carried on after it, whether or not the host is back by now.
+        if self
+            .sent_under
+            .get(id)
+            .is_some_and(|lost| lost.load(Ordering::SeqCst))
+        {
+            self.cancel_row(id, Why::HostLost);
+            return;
+        }
         let (Some(unsigned), Some(host), Some(descriptor)) =
             (composed, self.host.as_ref(), self.descriptor.as_ref())
         else {
@@ -136,7 +151,8 @@ impl Owner {
         let (ceremony, internal) = (Arc::clone(&self.shared.ceremony), self.internal_tx.clone());
         let (session, name) = (host.session.clone(), host.paired.name.clone());
         let (action, session_id) = (challenge.request.action, challenge.result.session_id.0);
-        let within = Duration::from_millis(expires - now);
+        let (shared, open) = (Arc::clone(&self.shared), Arc::new(AtomicBool::new(true)));
+        let still_open = Arc::clone(&open);
         self.set_row(id, "confirmation_required", None);
         self.tell_delegation(id, DELEGATION_CONFIRMATION.to_owned());
         self.confirming.insert(
@@ -144,6 +160,7 @@ impl Owner {
             Confirming {
                 challenge,
                 generation,
+                open,
             },
         );
         let id = id.to_owned();
@@ -155,16 +172,30 @@ impl Owner {
                         Method::SessionRead,
                         &params,
                     );
-                    match tokio::time::timeout(SESSION_NAME_WITHIN, read).await {
+                    match tokio::time::timeout(shared.timings.session_name_within, read).await {
                         Ok(Ok(read)) => Some(read.session.display_number.get()),
                         _ => None,
                     }
                 }
                 None => None,
             };
-            let outcome = ceremony
-                .verify(&reason(action, number, name.as_deref()), within)
-                .await;
+            // The wait for the session's number took time: the person is asked only if the
+            // confirmation is still open and the phone's clock does not say it has run out, and
+            // for what is left of it.
+            if !still_open.load(Ordering::SeqCst) {
+                return;
+            }
+            let now = shared.confirmation_now_ms();
+            let outcome = if now >= expires {
+                CeremonyOutcome::NotConfirmed
+            } else {
+                ceremony
+                    .verify(
+                        &reason(action, number, name.as_deref()),
+                        Duration::from_millis(expires - now),
+                    )
+                    .await
+            };
             let _ = internal.send(Internal::Ceremony {
                 id,
                 generation,
@@ -185,8 +216,17 @@ impl Owner {
         }
         match outcome {
             CeremonyOutcome::NotConfirmed => {
+                // A dialog that ended because the challenge ran out is the challenge's end.
+                let ran_out = self.confirmation_ran_out(id);
                 self.confirming.remove(id);
-                self.cancel_row(id, Why::NotConfirmed);
+                self.cancel_row(
+                    id,
+                    if ran_out {
+                        Why::ConfirmationExpired
+                    } else {
+                        Why::NotConfirmed
+                    },
+                );
             }
             CeremonyOutcome::Unavailable => {
                 self.confirming.remove(id);
@@ -220,10 +260,10 @@ impl Owner {
             self.cancel_row(id, Why::NotComposed);
             return;
         };
-        let (platform, internal, unsent) = (
+        let (platform, internal, tainted) = (
             self.platform(),
             self.internal_tx.clone(),
-            Arc::clone(&self.unsent),
+            Arc::clone(&self.tainted),
         );
         self.sealing.push(Sealing {
             id: id.to_owned(),
@@ -243,7 +283,7 @@ impl Owner {
                 && proof.call == call
                 && Record::of(proof).ends_authority()
             {
-                unsent.store(true, Ordering::SeqCst);
+                tainted.store(true, Ordering::SeqCst);
             }
             let _ = internal.send(Internal::SealProof {
                 id,
@@ -353,6 +393,9 @@ impl Owner {
         };
         if let Some(why) = self.gate.taint() {
             self.cancel_row(id, why);
+        } else if self.tainted.load(Ordering::SeqCst) {
+            // A proof showed a break that the owner has still to read: the gate will say which.
+            self.cancel_row(id, Why::CaptureBreak);
         } else if self.unsent.load(Ordering::SeqCst) {
             self.cancel_row(id, Why::HostLost);
         } else if self.shared.confirmation_now_ms() >= open.challenge.request.expires_at_ms.get() {
@@ -389,6 +432,7 @@ impl Owner {
             age_bound: self.shared.timings.proof_age,
             within: self.shared.timings.host_within,
             lost: Arc::clone(&self.unsent),
+            tainted: Arc::clone(&self.tainted),
         };
         let (internal, id) = (self.internal_tx.clone(), id.to_owned());
         tokio::spawn(async move {
