@@ -220,20 +220,21 @@ pub async fn sign_in(selector: &EnvironmentSelector, json: bool, storage: bool) 
         return Ok(());
     };
     // The service is named before the browser opens: a `storage.origin` that was mistyped opens a
-    // sign-in at whatever service it names, and the person can still stop it here. As JSON,
-    // standard output is the one document, which comes after the browser has opened, so the line
-    // goes on standard error, and it is the same line.
-    if let (Which::Storage, Some(service)) = (which, report.service.as_ref()) {
-        let line = stdout_line!(
+    // sign-in at whatever service it names, and the person can still stop it here.
+    if let (Which::Storage, Some(service), false) = (which, report.service.as_ref(), json) {
+        output::line(&stdout_line!(
             "This host's storage account signs in at {}, the service its storage.origin names. It \
              is not the managed account service.",
             Asked::location(Request::Account, service)
-        );
-        if json {
-            crate::report::say_line(&line);
-        } else {
-            output::line(&line);
-        }
+        ));
+    } else if which == Which::Storage && json {
+        // Standard output is the one document, which names the service after the browser has
+        // opened, and a service's origin is said only there. The notice that this is not the
+        // managed service goes on standard error before it opens.
+        crate::report::say(&shown::Shown::said(
+            "kr: this host's storage account signs in at the service its storage.origin names, \
+             which is not the managed account service; the document that follows names it",
+        ));
     }
     // Opened here, on the machine the person is at, and printed whether or not it opened: a host
     // with no display has nobody to open it for.

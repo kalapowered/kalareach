@@ -290,8 +290,8 @@ async fn the_storage_sign_in_names_its_service_before_the_browser_opens_and_sign
     assert_eq!(shown["state"], "signed_out", "{shown}");
 
     // As JSON, the one document on standard output names the service only after the browser has
-    // opened, so the line that names it and says it is not the managed service goes on standard
-    // error first. The browser's address is written there too, for the order to show.
+    // opened, so the notice that it is not the managed service goes on standard error first. The
+    // browser's address is written there too, for the order to show.
     let output = run_kr(
         &host.temp,
         &["--json", "account", "sign-in", "--storage"],
@@ -302,10 +302,8 @@ async fn the_storage_sign_in_names_its_service_before_the_browser_opens_and_sign
     let lines: Vec<&str> = errors.lines().collect();
     let notice = lines
         .iter()
-        .position(|line| line.contains(storage.origin()) && line.contains("not the managed"))
-        .unwrap_or_else(|| {
-            panic!("a line names the service and says it is not the managed one: {errors}")
-        });
+        .position(|line| line.contains("not the managed"))
+        .unwrap_or_else(|| panic!("a line says it is not the managed service: {errors}"));
     let browser = lines
         .iter()
         .position(|line| line.starts_with("http") && line.contains("/auth/oauth2/authorize"))
