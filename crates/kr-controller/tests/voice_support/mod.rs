@@ -144,11 +144,13 @@ pub struct StandIn {
 /// A connection the service made to its own port and kept, so that the port stays the service's
 /// while nothing listens on it.
 ///
-/// The accepted end of the connection is bound to the port. While it lives, no program that binds
-/// the port by number can have it, no program that asks for any port is given it, and the system
-/// makes no connection from it. A connection made to the port meanwhile finds no listener and is
-/// refused outright, as one to a closed port is. The service's own listeners share the port with
-/// the connection by setting `SO_REUSEPORT`, which no other program here sets.
+/// The accepted end of the connection is bound to the port. While it lives, a connection made to
+/// the port finds no listener and is refused outright, as one to a closed port is; no program that
+/// asks the system for any port is given this one, and the system makes no connection from it.
+/// What else it keeps off the port depends on the system. On Linux a program that binds the port
+/// by number is refused as well, unless it sets `SO_REUSEPORT` as the service's own listeners do.
+/// On macOS one that binds it by number with `SO_REUSEADDR` or `SO_REUSEPORT` is not. Where there
+/// is no `set_reuseport` (Windows) the service holds nothing, as below.
 #[cfg(unix)]
 struct Anchor {
     _made: TcpStream,
@@ -161,6 +163,11 @@ struct Anchor {
 type Anchor = ();
 
 /// A listener on `address` that can share the port with an `Anchor`.
+///
+/// It sets `SO_REUSEPORT` and not `SO_REUSEADDR`, which is what std's and tokio's own `bind` set on
+/// unix: with `SO_REUSEADDR` the connection that holds the port would let a program that binds it
+/// by number share it on Linux too, and a listener made by those would be refused beside the
+/// anchor there.
 fn listen_on(address: std::net::SocketAddr) -> std::io::Result<TcpListener> {
     let socket = tokio::net::TcpSocket::new_v4()?;
     #[cfg(unix)]
@@ -392,8 +399,8 @@ impl StandIn {
     /// made to it was never carried out. [`Self::go_down`] is the other way down: the service takes
     /// the connection and ends it, so a request may have been carried out.
     ///
-    /// No other program listens on the port meanwhile: the service keeps hold of it, so what
-    /// refuses the connection is the closed port, and never a program that took the port.
+    /// The service keeps hold of its port meanwhile (see `Anchor`), so that what refuses the
+    /// connection is the closed port, and not a program that was given the port in the meantime.
     pub async fn refuse_connections(&self) {
         let task = self.task.lock().expect("the stand-in's task").take();
         if let Some(task) = task {
