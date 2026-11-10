@@ -31,7 +31,7 @@ use crate::clock::{ContinuousClock, ContinuousInstant, SystemContinuousClock};
 use crate::codec::{FrameReader, FrameWriter};
 use crate::config::EndpointConfig;
 use crate::deadlines::{Deadlines, TimerDeadlines};
-use crate::endpoint::{KEEPALIVE, bind_listener_for};
+use crate::endpoint::{KEEPALIVE, allow_data_streams, bind_listener};
 use crate::error::{Result, TransportError};
 use crate::handshake::{Admitted, HostEpochs, LocalIdentity, PairedDirectory};
 use crate::preauth::{PairingSurface, PreAuthLimits};
@@ -79,8 +79,10 @@ pub struct ListenerConfig {
     pub unauthorised_refill: Duration,
     /// The stream kinds this host takes from a device. A stream a device opens whose header names
     /// any other kind is reset before it takes a bulk slot or a place in the registry. A host that
-    /// names none takes none: every data stream a device opens is reset once its header is read,
-    /// which is what a host that never reads [`AuthorisedSession::data_streams`] gets.
+    /// names none takes none, and a device can open no stream but the control stream on its
+    /// connections: a connection starts with room for that one stream, and is raised to the room
+    /// the bulk streams need only when this names a kind, so a device that tries to open a second
+    /// stream waits for credit that does not come.
     pub accepted_kinds: Vec<StreamKind>,
     /// The deadlines a data stream is held to: the header a device sends, each frame it sends and
     /// each answer it is sent. A host that does not choose them gets [`TimerDeadlines`]; a test
@@ -732,12 +734,7 @@ pub async fn register_with_clock<H: HostHandler>(
     clock: Arc<dyn ContinuousClock>,
 ) -> Result<NetworkListener> {
     config.send_limits.check()?;
-    let endpoint = bind_listener_for(
-        &config.endpoint,
-        transport_key,
-        config.send_limits.max_bulk_streams,
-    )
-    .await?;
+    let endpoint = bind_listener(&config.endpoint, transport_key).await?;
     let windows = Arc::new(ActionWindowIssuer::new(
         Arc::clone(&clock),
         config.action_window_validity,
@@ -1013,6 +1010,13 @@ async fn serve_authorised<H: HostHandler>(
         issuing: Arc::clone(&issuing),
     }));
 
+    // The connection started with room for one stream, the one the control stream is. A host that
+    // takes data streams has the connection raised to the limit its bulk streams and header places
+    // need; a host that takes none leaves it at one, so a device's second stream waits for credit
+    // that does not come.
+    if !state.config.accepted_kinds.is_empty() {
+        allow_data_streams(&connection, state.config.send_limits.max_bulk_streams);
+    }
     // The streams the device opens are taken here, on a task the guard owns beside the keepalive
     // and the control reader, and never by the host's handler: a handler that is answering a
     // control request must not be what decides whether a stream waits.

@@ -67,7 +67,7 @@ use std::sync::Arc;
 use support::conditions::{
     Host, MAX_STOLEN_SHARE, SchedulingProbe, StolenSample, StolenTime, report,
 };
-use support::{OneDevice, Side, direct_addr, epochs, ledger, paired_pair, windows};
+use support::{OneDevice, Side, allow_streams, direct_addr, epochs, ledger, paired_pair, windows};
 
 /// One input round trip, and the payload it carried.
 const INPUT_PAYLOAD: &[u8] = b"\x1b[A";
@@ -177,6 +177,7 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
             .expect("an incoming connection")
             .await
             .expect("a connection");
+        allow_streams(&connection);
         let clock = ManualClock::new();
         let challenges = ledger();
         let issuer = windows(&clock);
@@ -503,6 +504,7 @@ async fn a_reconnect_reaches_usable_state_within_two_seconds() {
             let identity = Arc::clone(&identity);
             let directory = Arc::clone(&directory);
             tokio::spawn(async move {
+                allow_streams(&connection);
                 let clock = ManualClock::new();
                 let challenges = ledger();
                 let issuer = windows(&clock);
