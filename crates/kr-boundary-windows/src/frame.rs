@@ -121,6 +121,12 @@ pub enum Request {
         /// The account to prove.
         class: Class,
     },
+    /// Proves that a program the policy refused runs again for a class's token, which is how
+    /// removal shows that the boundary is released. An administrator only.
+    Release {
+        /// The account to prove.
+        class: Class,
+    },
 }
 
 /// Why the broker refused a request.

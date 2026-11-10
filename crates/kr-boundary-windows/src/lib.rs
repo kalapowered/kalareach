@@ -14,6 +14,7 @@
 //! | [`notice`] | The plain notice a person reads before the installation, shown in one place |
 //! | [`policy`] | The application-control policy: its three rules, its writing, and the reading of an effective policy back into one form |
 //! | [`manifest`] | The record of what the installation laid down, and the record of what was there before |
+//! | [`events`] | What the platform's application-control log says about a program it refused |
 //! | [`frame`] | The broker's pipe protocol: framed messages with limits, and the requests and answers |
 //! | [`state`] | What the doctor says in each state of the installation |
 //!
@@ -28,6 +29,7 @@
 //! start a program they were not given. An administrator can change the rules; the boundary guards
 //! against a hostile repository and a misbehaving Git, not against an administrator.
 
+pub mod events;
 pub mod frame;
 pub mod manifest;
 pub mod notice;
