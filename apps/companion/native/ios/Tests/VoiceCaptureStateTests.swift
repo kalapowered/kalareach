@@ -253,7 +253,94 @@ final class VoiceCaptureGateTests: XCTestCase {
             }
         }
     }
+
+    private typealias Proof = VoiceCaptureGate.Proof
+
+    /// KR-REQ-15.36: the gate counts every opening and every break of capture itself, under its own
+    /// lock, so whether capture was unbroken is read from this record and not from news told after
+    /// the moment it is about.
+    func testTheRecordCountsEveryOpeningAndEveryBreak() {
+        let gate = VoiceCaptureGate()
+        XCTAssertEqual(
+            gate.proof(nowMs: 500),
+            Proof(state: .idle, opened: false, openings: 0, breaks: 0, progressAgeMs: nil))
+        gate.permit(voiceSessionId: "voice-session-1", deadlineMs: 61_000, nowMs: 1_000)
+        XCTAssertEqual(gate.proof(nowMs: 1_000).openings, 0, "a permit alone opens nothing")
+        gate.recorder(running: true, nowMs: 1_200)
+        XCTAssertEqual(
+            gate.proof(nowMs: 1_200),
+            Proof(state: .capturing, opened: true, openings: 1, breaks: 0, progressAgeMs: nil))
+
+        gate.setMutedByPerson(true, nowMs: 2_000)
+        XCTAssertEqual(
+            gate.proof(nowMs: 2_000),
+            Proof(state: .mutedByPerson, opened: true, openings: 1, breaks: 1, progressAgeMs: nil))
+        gate.setMutedByPerson(true, nowMs: 2_100)
+        XCTAssertEqual(gate.proof(nowMs: 2_100).breaks, 1, "a change that changes nothing is no break")
+        gate.setMutedByPerson(false, nowMs: 3_000)
+        XCTAssertEqual(
+            gate.proof(nowMs: 3_000),
+            Proof(state: .capturing, opened: true, openings: 2, breaks: 1, progressAgeMs: nil))
+    }
+
+    /// KR-REQ-15.36: whatever takes capture off after it opened is one break, whichever way it goes:
+    /// the person, the system, a route, the recorder, a withdrawn permit, the end and the deadline.
+    func testEveryWayCaptureGoesOffAfterAnOpeningIsOneBreak() {
+        let closes: [(String, (VoiceCaptureGate) -> Void)] = [
+            ("the person's mute", { $0.setMutedByPerson(true, nowMs: 2_000) }),
+            ("an interruption", { $0.taken(.interrupted, nowMs: 2_000) }),
+            ("a suspension", { $0.taken(.suspended, nowMs: 2_000) }),
+            ("a route in change", { $0.route(changing: true, inputAvailable: true, nowMs: 2_000) }),
+            ("a missing input", { $0.route(changing: false, inputAvailable: false, nowMs: 2_000) }),
+            ("the recorder stopping", { $0.recorder(running: false, nowMs: 2_000) }),
+            ("a withdrawn permit", { _ = $0.revoke(generation: 1, nowMs: 2_000) }),
+            ("the end of the call", { $0.stop(nowMs: 2_000) }),
+            ("the deadline", { _ = $0.captureEnabled(nowMs: 61_000) }),
+        ]
+        for (name, close) in closes {
+            let (gate, _) = permitted()
+            close(gate)
+            let proof = gate.proof(nowMs: 61_000)
+            XCTAssertEqual(proof.openings, 1, name)
+            XCTAssertEqual(proof.breaks, 1, name)
+            XCTAssertTrue(proof.opened, name)
+            XCTAssertNotEqual(proof.state, .capturing, name)
+        }
+    }
+
+    /// KR-REQ-15.36: a gap in what the recorder delivered, or a reading with no figure to tell by,
+    /// is a break while capture is on, and nothing while it is not on: nothing is carried then.
+    func testAGapInProgressIsABreakOnlyWhileCaptureIsOn() {
+        let gate = VoiceCaptureGate()
+        XCTAssertFalse(gate.progressBroke(nowMs: 500), "no permit")
+        gate.permit(voiceSessionId: "voice-session-1", deadlineMs: 61_000, nowMs: 1_000)
+        XCTAssertFalse(gate.progressBroke(nowMs: 1_100), "the recorder has not started")
+        gate.recorder(running: true, nowMs: 1_200)
+        XCTAssertTrue(gate.progressBroke(nowMs: 1_300))
+        XCTAssertEqual(gate.proof(nowMs: 1_300).breaks, 1)
+        gate.setMutedByPerson(true, nowMs: 1_400)
+        XCTAssertFalse(gate.progressBroke(nowMs: 1_500), "capture is off")
+        XCTAssertEqual(gate.proof(nowMs: 1_500).breaks, 2, "the mute is the second break and the gap while muted is none")
+    }
+
+    /// KR-REQ-15.36: the proof says how long ago audio was last seen arriving since capture last
+    /// opened, nothing before any was, and nothing again once capture closed and opened again.
+    func testTheProofSaysHowLongAgoAudioWasSeen() {
+        let gate = VoiceCaptureGate(hearingConfirmedByReadings: true)
+        gate.permit(voiceSessionId: "voice-session-1", deadlineMs: 61_000, nowMs: 1_000)
+        gate.recorder(running: true, nowMs: 1_200)
+        XCTAssertNil(gate.proof(nowMs: 1_300).progressAgeMs, "none has been seen")
+        gate.recorderHeard(atMs: 1_250, nowMs: 1_300)
+        XCTAssertEqual(gate.proof(nowMs: 1_300).progressAgeMs, 50)
+        XCTAssertEqual(gate.proof(nowMs: 1_900).progressAgeMs, 650, "it ages with the clock")
+        gate.recorderHeard(atMs: 1_800, nowMs: 1_900)
+        XCTAssertEqual(gate.proof(nowMs: 1_900).progressAgeMs, 100)
+        gate.setMutedByPerson(true, nowMs: 2_000)
+        gate.setMutedByPerson(false, nowMs: 2_100)
+        XCTAssertNil(gate.proof(nowMs: 2_100).progressAgeMs, "a new opening starts with none seen")
+    }
 }
+
 
 /// A call's hold on the microphone, driven through the same control the application runs, with the
 /// platform replaced by a record of what was asked of it.
@@ -633,6 +720,7 @@ final class VoiceCallControlTests: XCTestCase {
             func voiceCall(_: VoiceCall, connectionChanged _: RTCPeerConnectionState) {}
             func voiceCall(_: VoiceCall, receivedProviderEvent _: Data) {}
             func voiceCallPlayedAudio(_: VoiceCall) {}
+            func voiceCall(_: VoiceCall, barrier _: UInt64) {}
         }
         let observer = Silent()
         var first: VoiceCall? = try VoiceCall(observer: observer)
@@ -645,6 +733,88 @@ final class VoiceCallControlTests: XCTestCase {
         second.stop()
         let third = try VoiceCall(observer: observer)
         third.stop()
+    }
+
+    /// What a call told its observer, in order, with the call's queue given by the test.
+    private final class Order: VoiceCallObserver {
+        private let lock = NSLock()
+        private var kept: [String] = []
+        var told: [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            return kept
+        }
+
+        private func note(_ what: String) {
+            lock.lock()
+            kept.append(what)
+            lock.unlock()
+        }
+
+        func voiceCall(_: VoiceCall, connectionChanged _: RTCPeerConnectionState) {}
+        func voiceCall(_: VoiceCall, receivedProviderEvent data: Data) { note("event \(data.count)") }
+        func voiceCallPlayedAudio(_: VoiceCall) {}
+        func voiceCall(_: VoiceCall, captureChanged state: VoiceCaptureState) { note("capture \(state)") }
+        func voiceCall(_: VoiceCall, barrier token: UInt64) { note("barrier \(token)") }
+    }
+
+    /// KR-REQ-15.36: the record is read and the marker told in one block on the call's own queue, so
+    /// the provider events the call had waiting ahead of that block are told ahead of the marker,
+    /// and an event that comes after it is told after it.
+    func testTheMarkerIsToldBehindWhatTheCallHadWaiting() throws {
+        let queue = DispatchQueue(label: "test.voice-call")
+        let observer = Order()
+        let call = try VoiceCall(observer: observer, queue: queue)
+        defer { call.stop() }
+
+        let held = DispatchSemaphore(value: 0)
+        queue.async { held.wait() }
+        call.receive(providerEvent: Data([1]))
+        call.receive(providerEvent: Data([1, 2]))
+        let read = XCTestExpectation(description: "the record was read")
+        var answered: (proof: VoiceCaptureGate.Proof, barrier: UInt64?)?
+        call.readCaptureProof(barrier: true) {
+            answered = $0
+            read.fulfill()
+        }
+        call.receive(providerEvent: Data([1, 2, 3]))
+        held.signal()
+
+        wait(for: [read], timeout: 10)
+        queue.sync {}
+        XCTAssertEqual(observer.told, ["event 1", "event 2", "barrier 1", "event 3"])
+        XCTAssertEqual(answered?.barrier, 1)
+        XCTAssertEqual(answered?.proof.state, .idle, "a call that was not permitted captures nothing")
+        XCTAssertEqual(answered?.proof.openings, 0)
+    }
+
+    /// Each marker has a number of its own, counted from 1 in the call; a proof that asks for none
+    /// tells none; and a call that has ended answers nothing.
+    func testEachMarkerHasItsOwnNumberAndAnEndedCallAnswersNone() throws {
+        let queue = DispatchQueue(label: "test.voice-call")
+        let observer = Order()
+        let call = try VoiceCall(observer: observer, queue: queue)
+        func proof(_ barrier: Bool) -> (proof: VoiceCaptureGate.Proof, barrier: UInt64?)?? {
+            var answered: (proof: VoiceCaptureGate.Proof, barrier: UInt64?)??
+            let done = DispatchSemaphore(value: 0)
+            call.readCaptureProof(barrier: barrier) {
+                answered = .some($0)
+                done.signal()
+            }
+            done.wait()
+            return answered
+        }
+        XCTAssertEqual(proof(true)??.barrier, 1)
+        XCTAssertNil(proof(false)??.barrier)
+        XCTAssertEqual(proof(true)??.barrier, 2)
+        XCTAssertEqual(observer.told, ["barrier 1", "barrier 2"])
+
+        call.stop()
+        queue.sync {}
+        let after = proof(true)
+        XCTAssertNotNil(after)
+        XCTAssertNil(after!, "a call that has ended reads no record and tells no marker")
+        XCTAssertFalse(observer.told.contains("barrier 3"))
     }
 
     /// KR-REQ-15.35: the end of a call is final, and the second end does nothing.
@@ -705,6 +875,88 @@ final class VoiceRecorderWatchTests: XCTestCase {
     }
 }
 
+/// KR-REQ-15.36: a recorder that stalls for a few hundred milliseconds and goes on is told, though
+/// the quiet time of the recorder watch never sees it. The figures are test parameters.
+final class VoiceProgressWatchTests: XCTestCase {
+    /// Readings every 250 ms of a source that took in `seconds`, each answered `latencyMs` after it
+    /// was asked for, and the verdicts they gave.
+    private func verdicts(
+        _ readings: [(requestedAtMs: UInt64, seconds: Double?)], latencyMs: UInt64 = 5
+    ) -> [VoiceProgressWatch.Verdict] {
+        var watch = VoiceProgressWatch()
+        return readings.map {
+            watch.observe(
+                capturedSeconds: $0.seconds, requestedAtMs: $0.requestedAtMs,
+                answeredAtMs: $0.requestedAtMs + latencyMs)
+        }
+    }
+
+    /// Audio that keeps pace with the clock is never a gap, however many readings are taken and
+    /// whatever the statistics' own delay is, up to the age of the oldest report they may serve.
+    func testAudioThatKeepsPaceIsNeverAGap() {
+        let readings = (0 ..< 40).map { (UInt64($0) * 250, Double($0) * 0.25) }
+        XCTAssertEqual(
+            verdicts(readings.map { ($0.0, $0.1) }, latencyMs: 20),
+            Array(repeating: .progressing, count: 40))
+    }
+
+    /// A 300 ms stall with the audio coming back is a gap, told by the first reading that shows it:
+    /// the recorder watch's 750 ms of quiet never sees it, and nothing else in the call does.
+    func testAStallOf300MillisecondsWithTheAudioComingBackIsAGap() {
+        // The source stops taking audio in at 500 ms and goes on at 800 ms.
+        let taken: (UInt64) -> Double = { at in
+            let ms = Double(at)
+            return (ms <= 500 ? ms : ms <= 800 ? 500 : ms - 300) / 1_000
+        }
+        let readings = (0 ..< 8).map { (UInt64($0) * 250, taken(UInt64($0) * 250)) }
+        let told = verdicts(readings.map { ($0.0, $0.1) })
+        XCTAssertEqual(told[0 ..< 3], [.progressing, .progressing, .progressing])
+        XCTAssertEqual(told[3], .gap, "the reading at 750 ms shows the stall")
+        XCTAssertTrue(told.contains(.gap))
+    }
+
+    /// The bound on the time that passed can only be too large: a gap that fits what the statistics
+    /// may have served stale is still told, a shortfall of the whole parameter or more.
+    func testAShortfallOfTheParameterIsAGapAndLessIsNot() {
+        var watch = VoiceProgressWatch(windowReadings: 4, gapMs: 100)
+        XCTAssertEqual(watch.observe(capturedSeconds: 0, requestedAtMs: 0, answeredAtMs: 0), .progressing)
+        // 250 ms later the source took in 200 ms: with the 50 ms allowance, a shortfall of 100 ms.
+        XCTAssertEqual(watch.observe(capturedSeconds: 0.2, requestedAtMs: 250, answeredAtMs: 250), .gap)
+        var close = VoiceProgressWatch(windowReadings: 4, gapMs: 100)
+        XCTAssertEqual(close.observe(capturedSeconds: 0, requestedAtMs: 0, answeredAtMs: 0), .progressing)
+        XCTAssertEqual(close.observe(capturedSeconds: 0.201, requestedAtMs: 250, answeredAtMs: 250), .progressing)
+    }
+
+    /// A reading that holds no figure tells nothing, and says so; the window starts afresh after it,
+    /// so a figure after it is compared with nothing from before.
+    func testAReadingWithNoFigureSaysSo() {
+        var watch = VoiceProgressWatch()
+        XCTAssertEqual(watch.observe(capturedSeconds: 1, requestedAtMs: 0, answeredAtMs: 5), .progressing)
+        XCTAssertEqual(watch.observe(capturedSeconds: nil, requestedAtMs: 250, answeredAtMs: 255), .noFigure)
+        XCTAssertEqual(
+            watch.observe(capturedSeconds: 1.25, requestedAtMs: 500, answeredAtMs: 505), .progressing,
+            "the baseline is this reading")
+    }
+
+    /// After a gap the window starts at the reading that showed it, so audio that then keeps pace
+    /// is not told again.
+    func testAGapIsToldOnceAndAudioThatKeepsPaceAfterItIsNot() {
+        var watch = VoiceProgressWatch()
+        XCTAssertEqual(watch.observe(capturedSeconds: 0, requestedAtMs: 0, answeredAtMs: 5), .progressing)
+        XCTAssertEqual(watch.observe(capturedSeconds: 0.05, requestedAtMs: 250, answeredAtMs: 255), .gap)
+        XCTAssertEqual(watch.observe(capturedSeconds: 0.3, requestedAtMs: 500, answeredAtMs: 505), .progressing)
+        XCTAssertEqual(watch.observe(capturedSeconds: 0.55, requestedAtMs: 750, answeredAtMs: 755), .progressing)
+    }
+
+    /// A reset, for a device that went off and came on, starts counting afresh.
+    func testAResetComparesNothingFromBefore() {
+        var watch = VoiceProgressWatch()
+        _ = watch.observe(capturedSeconds: 0, requestedAtMs: 0, answeredAtMs: 5)
+        watch.reset()
+        XCTAssertEqual(watch.observe(capturedSeconds: 50, requestedAtMs: 10_000, answeredAtMs: 10_005), .progressing)
+    }
+}
+
 /// KR-REQ-15.36 and KR-ACC-014: what the call's adapter hands over about its audio source, taken
 /// through the reader into the real control and gate, which vouch only for time up to the last
 /// reading that saw audio arrive.
@@ -744,8 +996,60 @@ final class VoiceRecorderReaderTests: XCTestCase {
     private func read(_ reader: VoiceRecorderReader, _ platform: Platform, _ readings: [(UInt64, Double)]) {
         for (at, seconds) in readings {
             platform.now = at
-            reader.reading(capturedSeconds: seconds, generation: reader.request()!, atMs: at)
+            reader.reading(capturedSeconds: seconds, generation: reader.request()!, requestedAtMs: at, answeredAtMs: at)
         }
+    }
+
+    /// KR-REQ-15.36: the readings are stamped where they were asked for and answered, so a call
+    /// queue that runs them late says nothing of when the audio was taken in: a 300 ms stall is a
+    /// break in the record though every reading runs back to back at the same late moment.
+    func testAStallIsABreakWhateverTheQueueDelaysTheReadingsBy() {
+        let (control, reader, platform, _) = permitted()
+        read(reader, platform, [(1_000, 0), (1_250, 0.25), (1_500, 0.5)])
+        XCTAssertEqual(control.captureProof().breaks, 0)
+        // The call's queue ran nothing for 800 ms: the next readings run together at 2_300 ms, though
+        // they were asked for and answered at their own moments, and the audio stalled in the gap.
+        platform.now = 2_300
+        let generation = reader.request()!
+        reader.reading(capturedSeconds: 0.5, generation: generation, requestedAtMs: 1_750, answeredAtMs: 1_754)
+        reader.reading(capturedSeconds: 0.75, generation: generation, requestedAtMs: 2_000, answeredAtMs: 2_004)
+        XCTAssertGreaterThanOrEqual(control.captureProof().breaks, 1, "the stall at 1_750 ms is told")
+    }
+
+    /// KR-REQ-15.36: a reading with no figure is a break while capture is on, whatever the readings
+    /// either side of it showed, and counts nothing before capture opens.
+    func testAReadingWithNoFigureIsABreakWhileCaptureIsOn() {
+        let (control, reader, platform, _) = permitted()
+        platform.now = 1_000
+        reader.reading(capturedSeconds: nil, generation: reader.request()!, requestedAtMs: 1_000, answeredAtMs: 1_003)
+        XCTAssertEqual(control.captureProof().openings, 0, "nothing has started the recorder yet")
+        XCTAssertEqual(control.captureProof().breaks, 0, "capture is not on, so nothing is broken")
+
+        read(reader, platform, [(1_250, 0.25), (1_500, 0.5)])
+        XCTAssertEqual(control.captureProof().openings, 1)
+        // Every second reading has no figure, and the readings between them keep pace.
+        var seconds = 0.5
+        for step in 1 ... 6 {
+            let at = 1_500 + UInt64(step) * 250
+            platform.now = at
+            seconds += 0.25
+            let figure: Double? = step.isMultiple(of: 2) ? nil : seconds
+            reader.reading(capturedSeconds: figure, generation: reader.request()!, requestedAtMs: at, answeredAtMs: at + 3)
+        }
+        let proof = control.captureProof()
+        XCTAssertEqual(proof.breaks, 3, "each of the three empty readings is a break: \(proof)")
+    }
+
+    /// KR-REQ-15.36: an empty reading does not make the freshest sign of recording fresh.
+    func testAnEmptyReadingDoesNotMakeProgressFresh() {
+        let (control, reader, platform, _) = permitted()
+        read(reader, platform, [(1_000, 0), (1_250, 0.25)])
+        let seen = control.captureProof().progressAgeMs
+        platform.now = 1_600
+        reader.reading(capturedSeconds: nil, generation: reader.request()!, requestedAtMs: 1_500, answeredAtMs: 1_503)
+        let later = try? XCTUnwrap(control.captureProof().progressAgeMs)
+        XCTAssertNotNil(seen)
+        XCTAssertGreaterThan(later ?? 0, (seen ?? 0) + 300, "the age grew with the clock: \(String(describing: later))")
     }
 
     /// Audio seen arriving up to 1,500 ms, then nothing.
@@ -766,8 +1070,8 @@ final class VoiceRecorderReaderTests: XCTestCase {
         platform.now = 1_300
         reader.stopped()
         XCTAssertFalse(switches.microphoneOn)
-        reader.reading(capturedSeconds: 0.5, generation: before, atMs: 1_400)
-        reader.reading(capturedSeconds: 0.75, generation: before, atMs: 1_450)
+        reader.reading(capturedSeconds: 0.5, generation: before, requestedAtMs: 1_400, answeredAtMs: 1_400)
+        reader.reading(capturedSeconds: 0.75, generation: before, requestedAtMs: 1_450, answeredAtMs: 1_450)
         XCTAssertFalse(switches.microphoneOn, "readings asked for before the stop are dropped")
         read(reader, platform, [(1_500, 0.75), (1_750, 1.0)])
         XCTAssertTrue(switches.microphoneOn, "audio that came back is a start")
@@ -778,7 +1082,7 @@ final class VoiceRecorderReaderTests: XCTestCase {
     func testASilentStopVouchesForNothingAfterTheLastAudio() {
         let (control, reader, platform, switches) = heardUntil1500()
         platform.now = 1_750
-        reader.reading(capturedSeconds: 0.5, generation: reader.request()!, atMs: 1_750)
+        reader.reading(capturedSeconds: 0.5, generation: reader.request()!, requestedAtMs: 1_750, answeredAtMs: 1_750)
         XCTAssertTrue(switches.microphoneOn, "the stop is not noticed yet")
         XCTAssertTrue(control.couldHaveHeard(atMs: 1_400))
         XCTAssertFalse(control.couldHaveHeard(atMs: 1_600), "while the quiet time runs")
@@ -853,7 +1157,7 @@ final class VoiceRecorderReaderTests: XCTestCase {
         reader.device(on: true)
         XCTAssertTrue(switches.microphoneOn)
         platform.now = 2_050
-        reader.reading(capturedSeconds: 0.75, generation: stale, atMs: 2_050)
+        reader.reading(capturedSeconds: 0.75, generation: stale, requestedAtMs: 2_050, answeredAtMs: 2_050)
         XCTAssertFalse(switches.microphoneOn)
     }
 
@@ -865,8 +1169,8 @@ final class VoiceRecorderReaderTests: XCTestCase {
         XCTAssertNil(reader.request())
         reader.device(on: true)
         platform.now = 1_500
-        reader.reading(capturedSeconds: 0, generation: stale, atMs: 1_500)
-        reader.reading(capturedSeconds: 5, generation: stale, atMs: 1_750)
+        reader.reading(capturedSeconds: 0, generation: stale, requestedAtMs: 1_500, answeredAtMs: 1_500)
+        reader.reading(capturedSeconds: 5, generation: stale, requestedAtMs: 1_750, answeredAtMs: 1_750)
         XCTAssertFalse(switches.microphoneOn)
     }
 }

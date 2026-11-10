@@ -18,6 +18,7 @@ private final class Silent: VoiceCallObserver {
     func voiceCall(_: VoiceCall, connectionChanged _: RTCPeerConnectionState) {}
     func voiceCall(_: VoiceCall, receivedProviderEvent _: Data) {}
     func voiceCallPlayedAudio(_: VoiceCall) {}
+    func voiceCall(_: VoiceCall, barrier _: UInt64) {}
 }
 
 final class AudioReceiveTests: XCTestCase {

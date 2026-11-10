@@ -34,6 +34,9 @@ public protocol VoiceCallObserver: AnyObject {
     func voiceCall(_ call: VoiceCall, captureChanged state: VoiceCaptureState)
     /// The call ended, whatever ended it, and its audio is given back.
     func voiceCallEnded(_ call: VoiceCall)
+    /// The marker a capture proof asked for. Told on the call's own queue in the step that read the
+    /// proof, so everything the call told before that step was told before it.
+    func voiceCall(_ call: VoiceCall, barrier token: UInt64)
 }
 
 extension VoiceCallObserver {
@@ -78,6 +81,8 @@ public final class VoiceCall: NSObject {
     private var playbackSwitchesSeen: UInt64 = 0
     /// The call's own queue: its timer, and every report from the audio session and WebRTC.
     private let queue: DispatchQueue
+    /// How many barriers this call has told its observer of. Queue only.
+    private var barriers: UInt64 = 0
     /// The provider's events channel, which this end creates before the offer and only reads.
     private var events: RTCDataChannel?
     /// What the provider's answer was read to say, once it was applied; guarded by ``negotiation``.
@@ -124,7 +129,11 @@ public final class VoiceCall: NSObject {
     /// - Throws: ``VoiceAudioError/callAlreadyRunning`` while another call holds the audio,
     ///   ``VoiceAudioError/answerNotApplicable(_:)`` when the connection cannot be made, and
     ///   ``VoiceAudioError/eventChannelNotOpened`` when the provider's channel cannot be made.
-    public init(observer: VoiceCallObserver, remote: RemoteControlSurface = SystemRemoteControls()) throws {
+    public init(
+        observer: VoiceCallObserver,
+        remote: RemoteControlSurface = SystemRemoteControls(),
+        queue: DispatchQueue = DispatchQueue(label: "to.kala.reach.voice-call")
+    ) throws {
         // Before the factory or any connection exists, so the audio unit cannot start by itself.
         AudioSession.shared.holdAudioUntilACallTurnsItOn()
 
@@ -163,7 +172,7 @@ public final class VoiceCall: NSObject {
         // Off until the control turns it on. The offer describes a track, and a described track
         // carries nothing until the control lets it.
         microphone.isEnabled = false
-        queue = DispatchQueue(label: "to.kala.reach.voice-call")
+        self.queue = queue
         self.observer = observer
         super.init()
         // Before the control exists: building it sets every switch off, and a call that does not
@@ -234,7 +243,12 @@ public final class VoiceCall: NSObject {
             playout.playbackChanged()
         }
         let playbackAtRequest = control.isPlaybackOn
+        // Stamped just before the request and, below, in WebRTC's callback before the hop to the
+        // queue: this queue also carries data-channel events and capture news, so the time it runs
+        // the answer at says nothing of when the report was made.
+        let requestedAtMs = VoiceCall.nowMs()
         connection.statistics { [weak self] report in
+            let answeredAtMs = VoiceCall.nowMs()
             let source = report.statistics.values.first {
                 $0.type == "media-source" && ($0.values["kind"] as? String) == "audio"
             }
@@ -242,7 +256,12 @@ public final class VoiceCall: NSObject {
             let reading = VoiceCall.reading(from: report)
             self?.queue.async { [weak self] in
                 guard let self else { return }
-                self.recorderReader.reading(capturedSeconds: seconds, generation: generation, atMs: VoiceCall.nowMs())
+                self.recorderReader.reading(
+                    capturedSeconds: seconds,
+                    generation: generation,
+                    requestedAtMs: requestedAtMs,
+                    answeredAtMs: answeredAtMs
+                )
                 if self.playout.reading(
                     reading,
                     playbackOnAtRequest: playbackAtRequest,
@@ -251,6 +270,40 @@ public final class VoiceCall: NSObject {
                     self.observer?.voiceCallPlayedAudio(self)
                 }
             }
+        }
+    }
+
+    /// What this call's record of capture shows now, or nil when the call has ended.
+    ///
+    /// With `barrier`, the observer is also told a marker in the same block on the call's own
+    /// queue that reads the record. Provider events and capture news reach the observer through
+    /// this queue, so an item the call had waiting before this block ran is told before the
+    /// marker, and the observer's own path to the news (the adapter's queue, then the news queue)
+    /// carries the marker behind it in the order it was told.
+    public func captureProof(barrier: Bool) async -> (proof: VoiceCaptureGate.Proof, barrier: UInt64?)? {
+        await withCheckedContinuation { continuation in
+            readCaptureProof(barrier: barrier) { continuation.resume(returning: $0) }
+        }
+    }
+
+    /// Puts the reading of the record, and the marker if one was asked for, on this call's queue
+    /// as one block, and gives the answer to `done` from there. The block is queued before this
+    /// returns, so what was queued ahead of it, a provider event or a report of the audio session,
+    /// is handled ahead of the marker.
+    func readCaptureProof(
+        barrier: Bool,
+        then done: @escaping ((proof: VoiceCaptureGate.Proof, barrier: UInt64?)?) -> Void
+    ) {
+        queue.async {
+            guard !self.control.isStopped else { return done(nil) }
+            let proof = self.control.captureProof()
+            var token: UInt64?
+            if barrier {
+                self.barriers += 1
+                token = self.barriers
+                self.observer?.voiceCall(self, barrier: self.barriers)
+            }
+            done((proof, token))
         }
     }
 
@@ -543,9 +596,13 @@ extension VoiceCall: RTCDataChannelDelegate {
     public func dataChannelDidChangeState(_: RTCDataChannel) {}
 
     public func dataChannel(_: RTCDataChannel, didReceiveMessageWith buffer: RTCDataBuffer) {
-        // Handed up as bytes. What is a known event and what is not is decided by the frozen
-        // provider profile, one level above this file, and an unknown one is dropped there.
-        let data = buffer.data
+        receive(providerEvent: buffer.data)
+    }
+
+    /// Hands a provider event up on this call's queue. Handed up as bytes: what is a known event
+    /// and what is not is decided by the frozen provider profile, one level above this file, and an
+    /// unknown one is dropped there.
+    func receive(providerEvent data: Data) {
         queue.async { [weak self] in
             guard let self else { return }
             self.observer?.voiceCall(self, receivedProviderEvent: data)
