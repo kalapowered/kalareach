@@ -296,23 +296,23 @@ impl<'r> Host<'r> {
     ///
     /// A host that keeps its address cannot take another port, because a device dials the one it
     /// has, and the port is free only until another program binds it. A daemon that exited because
-    /// it could not bind that address is started again once the address can be bound, for five
-    /// starts in all.
+    /// it could not bind that address is started again once the address can be bound, for as many
+    /// starts as `RESTART_ATTEMPTS` allows in all.
     ///
     /// # Panics
     ///
     /// Panics when it does not answer within [`LIVENESS`], or exits before it does, or when the
-    /// address stays held for twenty seconds.
+    /// address stays held for the whole of `ADDRESS_FREE`.
     pub fn start_daemon(&self) {
         let kept = self
             .configured_address()
             .filter(|address| address.port() != 0);
-        for attempt in 1..=PORT_ATTEMPTS {
+        for attempt in 1..=RESTART_ATTEMPTS {
             let Err(said) = self.start_daemon_once() else {
                 return;
             };
             match kept {
-                Some(address) if attempt < PORT_ATTEMPTS && address_was_taken(&said) => {
+                Some(address) if attempt < RESTART_ATTEMPTS && address_was_taken(&said) => {
                     until_the_address_is_free(address);
                 }
                 _ => panic!("the control daemon exited before it answered: {said}"),
@@ -798,6 +798,11 @@ impl Drop for Host<'_> {
 /// How many times a host with a stable address is given a port before the daemon's refusal of it is
 /// reported. It ends a hang: each refusal is taken to be a port another leg chose at the same moment.
 const PORT_ATTEMPTS: usize = 5;
+
+/// How many times a daemon is started on the address a paired device keeps, and cannot change, before
+/// the daemon's refusal of it is reported. It ends a hang: each refusal is taken to be a program that
+/// holds the address for a moment, and the address is waited for before the next start.
+const RESTART_ATTEMPTS: usize = 5;
 
 /// How long a daemon's address is waited for when another program holds it, before the leg is told
 /// it stayed held. It ends a hang: the wait is over when the address can be bound.
