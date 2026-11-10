@@ -908,11 +908,16 @@ impl ReaderStop {
     /// counted. A request to cancel a read is said as well, since the console gives its next key to
     /// a read that was cancelled.
     pub fn stop(self) -> Stopped {
+        self.stop_within(STOP_WAIT)
+    }
+
+    /// As [`Self::stop`], waiting up to `wait` for the thread to end.
+    fn stop_within(self, wait: std::time::Duration) -> Stopped {
         self.stopped
             .store(true, std::sync::atomic::Ordering::SeqCst);
         (self.wake)();
         let started = std::time::Instant::now();
-        let deadline = started + STOP_WAIT;
+        let deadline = started + wait;
         let cancel_from = started + CANCEL_AFTER;
         let mut cancel_asked = false;
         while !self.thread.is_finished() {
@@ -1729,6 +1734,11 @@ mod reader {
     /// What the thread asked of the console, in order.
     type Steps = Arc<Mutex<Vec<&'static str>>>;
 
+    /// How long a stop waits for a thread that a case expects to end, a bound that no case reaches
+    /// when the code is right, so that a case that fails ends with a message and not with a hang.
+    /// Whether the thread ends is decided by the thread, and never by how much of this has passed.
+    const LIVENESS: std::time::Duration = std::time::Duration::from_secs(60);
+
     /// A console that answers a wait with what the case sent it, hands over the key records the
     /// case scripted, and hands over the bytes the case sends. A request goes ahead of the input
     /// the console holds only when the reader says it should.
@@ -1991,9 +2001,14 @@ mod reader {
             }
         }
 
-        /// Makes the stop, which returns once the thread has ended or the wait is over.
+        /// Makes the stop of a thread the case expects to end, which returns once it has: the wait
+        /// is a liveness bound. A case about a thread that does not end makes the stop with the
+        /// product's wait, `ReaderStop::stop`.
         fn stops(&mut self) -> Stopped {
-            self.stop.take().expect("the stop is made once").stop()
+            self.stop
+                .take()
+                .expect("the stop is made once")
+                .stop_within(LIVENESS)
         }
 
         /// Ends the thread, and returns what it asked of the console.
@@ -2246,7 +2261,7 @@ mod reader {
         let mut run = Run::paused("wait", vec![vec![vec![down]]], Vec::new());
         run.has_input();
         run.held.recv().expect("the reader is held after its wait");
-        let stopped = run.stops();
+        let stopped = run.stop.take().expect("the stop is made once").stop();
         assert!(
             stopped.still_running,
             "a reader held inside a call has not ended when the wait is over"
@@ -2268,7 +2283,7 @@ mod reader {
         let mut run = Run::paused("records", vec![vec![vec![down]]], Vec::new());
         run.has_input();
         run.held.recv().expect("the reader is held after its read");
-        let stopped = run.stops();
+        let stopped = run.stop.take().expect("the stop is made once").stop();
         assert!(stopped.still_running);
         run.release.send(()).expect("the reader is held");
         let (handed, _) = run.handed_on_until_it_ends();
@@ -2278,22 +2293,25 @@ mod reader {
         );
     }
 
-    /// A reader that ends within the wait is seen to end, and what it had read and not sent is
-    /// what the stop has of it, so that it can be counted.
+    /// A reader that ends while the stop waits for it is seen to end, and what it had read and not
+    /// sent is what the stop has of it, so that it can be counted.
     #[test]
-    fn a_reader_that_ends_within_the_wait_leaves_what_it_read_and_did_not_send() {
+    fn a_reader_that_ends_while_the_stop_waits_leaves_what_it_read_and_did_not_send() {
         let down = key(u16::from(b'A'), u16::from(b'a'), true);
         let mut run = Run::paused("records", vec![vec![vec![down]]], Vec::new());
         run.has_input();
         run.held.recv().expect("the reader is held after its read");
         let stop = run.stop.take().expect("the stop is made once");
         let stopped = std::thread::scope(|scope| {
-            let stopping = scope.spawn(move || stop.stop());
+            let stopping = scope.spawn(move || stop.stop_within(LIVENESS));
             run.stopping.recv().expect("the stop woke the reader");
             run.release.send(()).expect("the reader is held");
             stopping.join().expect("the stop ended")
         });
-        assert!(!stopped.still_running, "the reader ended within the wait");
+        assert!(
+            !stopped.still_running,
+            "the reader ended while the stop waited"
+        );
         assert_eq!(stopped.left, vec![TerminalInput::Keys(vec![down])]);
         let (handed, _) = run.handed_on_until_it_ends();
         assert!(handed.is_empty(), "something was handed on: {handed:?}");
@@ -2371,7 +2389,7 @@ mod reader {
         run.held.recv().expect("the reader is held after its read");
         let stop = run.stop.take().expect("the stop is made once");
         let stopped = std::thread::scope(|scope| {
-            let stopping = scope.spawn(move || stop.stop());
+            let stopping = scope.spawn(move || stop.stop_within(LIVENESS));
             run.stopping.recv().expect("the stop woke the reader");
             run.release.send(()).expect("the reader is held");
             stopping.join().expect("the stop ended")
@@ -2438,7 +2456,7 @@ mod reader {
         run.held.recv().expect("the reader is held after its read");
         let stop = run.stop.take().expect("the stop is made once");
         let stopped = std::thread::scope(|scope| {
-            let stopping = scope.spawn(move || stop.stop());
+            let stopping = scope.spawn(move || stop.stop_within(LIVENESS));
             run.cancelled
                 .recv()
                 .expect("the stop asked to cancel a read");
@@ -2459,7 +2477,7 @@ mod reader {
         run.held.recv().expect("the reader is held after its read");
         let stop = run.stop.take().expect("the stop is made once");
         let stopped = std::thread::scope(|scope| {
-            let stopping = scope.spawn(move || stop.stop());
+            let stopping = scope.spawn(move || stop.stop_within(LIVENESS));
             run.cancelled
                 .recv()
                 .expect("the stop asked to cancel a read");
