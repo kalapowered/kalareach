@@ -210,7 +210,9 @@ impl DataStream {
     /// [`DataStream::write_message`], and the write is made as
     /// [`FrameWriter::write_message_while`] makes it: `admits` is asked at every attempt to hand
     /// bytes to the stream, and a frame it refuses leaves the stream reset. A revocation ends the
-    /// write at once with an error, and so does a refused reservation, never with `Ok(false)`.
+    /// write with an error, and so does a refused reservation, never with `Ok(false)`: the
+    /// stream's revoked state is asked at each attempt before `admits` is, so no byte goes after
+    /// a revocation.
     ///
     /// # Errors
     ///
@@ -380,6 +382,11 @@ impl DataWriter {
 
     /// Writes one message for as long as `admits` holds, and says whether it went.
     ///
+    /// The stream's revoked state is asked in the same poll as `admits`, before it, at each attempt
+    /// to hand bytes to the stream, so nothing is written after a revocation even when the
+    /// stream is writable at the moment it is revoked: the write ends with
+    /// [`TransportError::ControlLost`] and the stream is reset.
+    ///
     /// # Errors
     ///
     /// As [`DataStream::write_message`].
@@ -392,8 +399,26 @@ impl DataWriter {
         let handle = self.handle.clone();
         let unless = UnlessFinished::new(&handle);
         let mut deadline = Deadline::start(self.deadlines.as_ref(), DeadlineKind::Write);
+        // A race between the write and the revocation can be won by the write when both are ready,
+        // so the revoked state is part of what each attempt asks. The host's own refusal and this
+        // one both stop the frame; only the host's is `Ok(false)`.
+        let revoked_at_an_attempt = std::sync::atomic::AtomicBool::new(false);
+        let admits_while_not_revoked = |attempt: &mut dyn FnMut()| {
+            if handle.is_revoked() {
+                revoked_at_an_attempt.store(true, std::sync::atomic::Ordering::Relaxed);
+                return false;
+            }
+            admits(attempt)
+        };
         let outcome = tokio::select! {
-            outcome = self.writer.write_payload_while(&payload, admits) => outcome,
+            outcome = self.writer.write_payload_while(&payload, &admits_while_not_revoked) => {
+                match outcome {
+                    Ok(false) if revoked_at_an_attempt.load(std::sync::atomic::Ordering::Relaxed) => {
+                        Err(TransportError::ControlLost)
+                    }
+                    other => other,
+                }
+            }
             () = handle.revoked() => Err(TransportError::ControlLost),
             () = &mut deadline => Err(TransportError::Deadline(DeadlineKind::Write)),
         };
