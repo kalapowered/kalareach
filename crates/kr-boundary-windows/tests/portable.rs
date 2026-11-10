@@ -380,6 +380,8 @@ fn the_platforms_own_reports_are_read() {
     let (after, kept) = policy.without_ours();
     assert!(!kept);
     assert!(after.differences(&baseline).is_empty());
+    assert_eq!(after, baseline);
+    assert_ne!(after, installed());
 
     let blocked = events::parse(include_str!("fixtures/events-8004.xml")).unwrap();
     assert_eq!(blocked.len(), 1);

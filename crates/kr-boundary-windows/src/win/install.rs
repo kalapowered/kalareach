@@ -1101,7 +1101,14 @@ pub fn residue(prior: &Prior, paths: &Paths) -> Result<Vec<String>, Error> {
     let (_, effective) = Channel::new(&paths.staging).effective()?;
     let baseline =
         Policy::parse(&prior.policy_xml).map_err(|error| Error::Failed(error.to_string()))?;
-    left.extend(effective.differences(&baseline));
+    // Where an administrator's rule has since joined the executable collection, the removal keeps the
+    // allow-all rule and the collection's mode beside it on purpose; everything else of ours is gone.
+    let expected = if effective.foreign_exe_rules().is_empty() {
+        baseline
+    } else {
+        effective.without_ours().0
+    };
+    left.extend(effective.differences(&expected));
     for name in [CHECKOUT, CONNECT] {
         if account::find(name).is_some() {
             left.push(format!("the account {name} is still there"));
