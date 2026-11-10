@@ -1085,6 +1085,8 @@ struct LinkState {
     losing_answer_to: Option<String>,
     /// How many requests of that method are sent whole before the answers begin to be lost.
     losing_answer_after: usize,
+    /// Whether only the request after the first `losing_answer_after` is answered by loss.
+    losing_only_one: bool,
     /// What to do to the host's next answer that is a challenge for a spoken request's
     /// confirmation, once: the host answers, and the caller is handed the answer as this changed it.
     altering_challenge: Option<ChallengeChange>,
@@ -1236,6 +1238,16 @@ impl LinkControl {
         let mut state = self.state.lock().expect("the record");
         state.losing_answer_to = Some(method.as_str().to_owned());
         state.losing_answer_after = skip;
+        state.losing_only_one = false;
+    }
+
+    /// As [`Self::lose_the_answer_to_after`], for the one request after the first `skip` of that
+    /// method alone: the ones after it are answered, whenever they are sent.
+    pub fn lose_only_the_answer_after(&self, skip: usize, method: kr_protocol::method::Method) {
+        let mut state = self.state.lock().expect("the record");
+        state.losing_answer_to = Some(method.as_str().to_owned());
+        state.losing_answer_after = skip;
+        state.losing_only_one = true;
     }
 
     /// Changes the next challenge the host answers a spoken request with, once, before the caller
@@ -1440,7 +1452,12 @@ impl LinkControl {
             }
         }
         let sent = state.sent.get(method).copied().unwrap_or(0);
-        state.losing_answer_to.as_deref() == Some(method) && sent > state.losing_answer_after
+        state.losing_answer_to.as_deref() == Some(method)
+            && if state.losing_only_one {
+                sent == state.losing_answer_after + 1
+            } else {
+                sent > state.losing_answer_after
+            }
     }
 
     /// The action `frame` carries, when it is a `voice.delegate` whose answer is to be a receipt.

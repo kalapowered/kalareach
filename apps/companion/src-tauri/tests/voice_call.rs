@@ -7116,25 +7116,29 @@ async fn a_signed_request_whose_answer_is_lost_is_asked_about_again_and_reads_pe
     let mut scene = closing_with(timings).await;
     calling(&scene).await;
     chatter(&scene).await;
-    // The challenge is answered; the answer to what carries the signature is not.
+    // The challenge is answered; the answer to what carries the signature is lost, and no other
+    // answer is.
     scene
         .link
-        .lose_the_answer_to_after(1, HostMethod::VoiceDelegate);
+        .lose_only_the_answer_after(1, HostMethod::VoiceDelegate);
+    scene.ceremony.hold();
     let end = say_close(&scene, 6_000).await;
     ask(&scene, "d-1", end - 200).await;
-    tokio::time::timeout(WATCHDOG, async {
-        while at_the_host(&scene) < 2 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the signed request reaches the host");
-    scene.link.lose_the_answer_to(None);
+    scene.ceremony.until_asked(1).await;
+    // The signed request, and then the question about it, are each held at the writer, so that the
+    // question is asked only once the host has acted on the signed request.
+    scene.link.hold_next_request(HostMethod::VoiceDelegate);
+    scene.ceremony.release();
+    scene.link.until_request_held().await;
+    scene.link.release_request();
+    scene.link.hold_next_request(HostMethod::VoiceDelegate);
+    scene.link.until_request_held().await;
+    scene.until_closed().await;
+    scene.link.release_request();
 
     let row = row_reaching(&scene, "d-1", "performed").await;
 
     assert_eq!(row["state"], "performed");
-    scene.until_closed().await;
     let actions = scene.link.sent_actions(HostMethod::VoiceDelegate);
     assert!(actions.len() >= 3, "the host was asked again: {actions:?}");
     assert!(
