@@ -794,6 +794,10 @@ export function VoiceRoute({
       },
 
       cancelTask: (turn) => {
+        // The answer is told on the call the request was asked on: once that call has ended, what
+        // the screen says belongs to how it ended.
+        const asked = held.current?.voiceSessionId
+        const stillOnIt = () => asked !== undefined && held.current?.voiceSessionId === asked
         void ask(() =>
           port.composerInterrupt({
             target: {
@@ -804,10 +808,11 @@ export function VoiceRoute({
           })
         )
           .then(() => {
+            if (!stillOnIt()) return
             setNotice('The host was asked to cancel that turn. The voice keeps talking.')
           })
           .catch((error: unknown) => {
-            setNotice(failureMessage(error))
+            if (stillOnIt()) setNotice(failureMessage(error))
           })
           // The host's answer, either way, says where the agent is now.
           .finally(() => {

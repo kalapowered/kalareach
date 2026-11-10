@@ -238,11 +238,14 @@ said which turn the agent is on: the agent is on no turn, the session has no liv
 read failed. A call that reaches more than one session names no turn, and the screen says so rather
 than pick one.
 
-The confirmation keeps the turn and revision it was opened on. A later read that shows another turn,
-revision or instance, no turn, or no answer discards the question, and it has to be asked again.
-When the host moved on before the screen read it, the request still names what the person was shown.
-The host refuses it, and the screen shows the host's words. The screen never reads the turn at the
-moment a person confirms.
+The confirmation keeps the turn and revision it was opened on. The question is discarded, and has
+to be asked again, when a read shows another turn, revision or instance, no turn, or no answer, and
+when the offer is taken back: the binding is no longer verified, the cancel capability is no longer
+usable, or the connection no longer says this device holds the right, as when contact with the host
+is lost. When the host moved on before the screen read it, the request still names what the person
+was shown. The host refuses it, and the screen shows the host's words. The screen never reads the
+turn at the moment a person confirms. The host's answer to a cancellation is told only while the
+call it was asked on is still on screen.
 
 ## Device runs
 
