@@ -361,14 +361,20 @@ impl StandIn {
     /// close. Until then the port takes a connection and nothing accepts it: a request made to it
     /// is written, and ended when the last copy goes, which says nothing of whether it was carried
     /// out. It is a condition to wait for, and the wait ends when the port refuses; the minute it
-    /// is given only ends a hang. Where sockets are not inherited the first probe is refused.
+    /// is given only ends a hang, and the panic it ends in counts the probes and says how the last
+    /// one ended. Where sockets are not inherited the first probe is refused.
     async fn until_refused(&self) {
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        let last_took_its_connection = std::sync::atomic::AtomicBool::new(false);
         tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
+                probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                last_took_its_connection.store(false, std::sync::atomic::Ordering::Relaxed);
                 match TcpStream::connect(self.address).await {
                     Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => return,
                     Err(error) => panic!("the stand-in's port cannot be reached: {error}"),
                     Ok(taken) => {
+                        last_took_its_connection.store(true, std::sync::atomic::Ordering::Relaxed);
                         drop(taken);
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
@@ -377,7 +383,17 @@ impl StandIn {
         })
         .await
         .unwrap_or_else(|_| {
-            panic!("the stand-in's port still took connections a minute after it was closed")
+            let last = if last_took_its_connection.load(std::sync::atomic::Ordering::Relaxed) {
+                "took its connection"
+            } else {
+                "had no answer to its connect"
+            };
+            panic!(
+                "the stand-in's port {} did not refuse a connection in a minute after it was \
+                 closed: {} probes, the last {last}",
+                self.address,
+                probes.load(std::sync::atomic::Ordering::Relaxed)
+            )
         });
     }
 
