@@ -1295,9 +1295,11 @@ impl ManagedAccountService {
     /// Checks an ID token's payload and returns its subject.
     ///
     /// Its signature is not checked: it came over TLS straight from the token endpoint this service
-    /// was made for, which OpenID Connect Core section 3.1.3.7 accepts in place of one. A
-    /// deployment on a loopback host is reached over plain http, with no such assurance; for it the
-    /// issuer, audience, nonce and expiry checks are all there is.
+    /// was made for, which OpenID Connect Core section 3.1.3.7 accepts in place of one. The origin
+    /// check admits `https` for any host and `http` for a loopback host alone, so a deployment on a
+    /// loopback host is reached over either: over `https://localhost` the TLS assurance holds, and
+    /// over `http://localhost` there is none, and for that the issuer, audience, nonce and expiry
+    /// checks are all there is.
     fn checked_subject(&self, token: &str, expected: &Expected<'_>) -> Option<String> {
         let claims = id_token_claims(token)?;
         let text = |name: &str| claims.get(name).and_then(serde_json::Value::as_str);
