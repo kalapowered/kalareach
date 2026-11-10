@@ -294,11 +294,12 @@ impl DataReader {
             return Err(TransportError::ControlLost);
         }
         let handle = self.handle.clone();
+        let unless = UnlessFinished::new(&handle);
         let outcome = tokio::select! {
             outcome = self.reader.read_payload() => outcome,
             () = handle.revoked() => Err(TransportError::ControlLost),
         };
-        self.handle.revoke_if_cut(outcome)
+        self.handle.revoke_if_cut(unless.finish(outcome))
     }
 
     /// Reads one frame and deserialises it, or `None` when the peer ended the stream.
@@ -311,11 +312,12 @@ impl DataReader {
             return Err(TransportError::ControlLost);
         }
         let handle = self.handle.clone();
+        let unless = UnlessFinished::new(&handle);
         let outcome = tokio::select! {
             outcome = self.reader.read_message() => outcome,
             () = handle.revoked() => Err(TransportError::ControlLost),
         };
-        self.handle.revoke_if_cut(outcome)
+        self.handle.revoke_if_cut(unless.finish(outcome))
     }
 }
 
@@ -388,6 +390,7 @@ impl DataWriter {
     ) -> Result<bool> {
         let (payload, reservation) = self.encode(message)?;
         let handle = self.handle.clone();
+        let unless = UnlessFinished::new(&handle);
         let mut deadline = Deadline::start(self.deadlines.as_ref(), DeadlineKind::Write);
         let outcome = tokio::select! {
             outcome = self.writer.write_payload_while(&payload, admits) => outcome,
@@ -395,7 +398,12 @@ impl DataWriter {
             () = &mut deadline => Err(TransportError::Deadline(DeadlineKind::Write)),
         };
         drop(reservation);
-        self.handle.revoke_if_cut(outcome)
+        // A frame the caller's check refused leaves the stream reset, so the other half has
+        // nothing more to read from it either.
+        if matches!(outcome, Ok(false)) {
+            self.handle.revoke();
+        }
+        self.handle.revoke_if_cut(unless.finish(outcome))
     }
 
     /// Writes one already-canonical payload, reserving queue space for it first.
@@ -448,13 +456,14 @@ impl DataWriter {
         _reservation: QueueReservation,
     ) -> Result<()> {
         let handle = self.handle.clone();
+        let unless = UnlessFinished::new(&handle);
         let mut deadline = Deadline::start(self.deadlines.as_ref(), DeadlineKind::Write);
         let outcome = tokio::select! {
             outcome = self.writer.write_payload(payload) => outcome,
             () = handle.revoked() => Err(TransportError::ControlLost),
             () = &mut deadline => Err(TransportError::Deadline(DeadlineKind::Write)),
         };
-        self.handle.revoke_if_cut(outcome)
+        self.handle.revoke_if_cut(unless.finish(outcome))
     }
 }
 
@@ -463,6 +472,39 @@ impl Drop for DataWriter {
         // As the reading half: a revoked stream is reset, not finished.
         if self.handle.is_revoked() {
             self.writer.reset();
+        }
+    }
+}
+
+/// Revokes a stream whose read or write was dropped before it ended.
+///
+/// Part of a frame may have been taken or sent, and the stream can carry nothing more: its reader
+/// or writer refuses every later call. Revoking is what tells the other half and makes dropping the
+/// stream a reset.
+struct UnlessFinished {
+    handle: StreamHandle,
+    finished: bool,
+}
+
+impl UnlessFinished {
+    fn new(handle: &StreamHandle) -> Self {
+        Self {
+            handle: handle.clone(),
+            finished: false,
+        }
+    }
+
+    /// Passes `outcome` through, now that the operation ended by itself.
+    fn finish<T>(mut self, outcome: T) -> T {
+        self.finished = true;
+        outcome
+    }
+}
+
+impl Drop for UnlessFinished {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.handle.revoke();
         }
     }
 }
@@ -587,6 +629,8 @@ struct RegistryStreams {
     next_key: StreamKey,
     open: HashMap<StreamKey, (StreamKind, StreamHandle)>,
     revoked: bool,
+    /// Set when the revocation hook has run, which it does once.
+    hook_ran: bool,
 }
 
 /// The negotiated bound on a frame of one kind, never above the kind's own ceiling.
@@ -822,16 +866,28 @@ impl StreamRegistry {
         let (send, recv) = self.state.quic_until_revoked(connection.open_bi()).await?;
         let mut writer = FrameWriter::new(send, header.kind).with_max_payload(limit);
         writer.set_priority(priority_of(header.kind));
-        // The header is bytes handed to the connection like any other, so it is charged like any
-        // other.
-        let header_charge = self.state.budget.reserve(class, MAX_STREAM_HEADER_LEN)?;
-        self.state
-            .until_revoked(writer.write_header(&header))
-            .await?;
-        drop(header_charge);
-        let reader = FrameReader::new(recv, header.kind).with_max_payload(limit);
-        let (life, handle) = self.state.life(header.kind, bulk_slot)?;
-        Ok(self.state.stream(header, writer, reader, life, handle))
+        let mut reader = FrameReader::new(recv, header.kind).with_max_payload(limit);
+        let admitted = async {
+            // The header is bytes handed to the connection like any other, so it is charged like
+            // any other.
+            let header_charge = self.state.budget.reserve(class, MAX_STREAM_HEADER_LEN)?;
+            self.state
+                .until_revoked(writer.write_header(&header))
+                .await?;
+            drop(header_charge);
+            self.state.life(header.kind, bulk_slot)
+        }
+        .await;
+        match admitted {
+            Ok((life, handle)) => Ok(self.state.stream(header, writer, reader, life, handle)),
+            Err(error) => {
+                // A stream that failed to open is reset, never finished: the host must not
+                // admit one that ends with no frame.
+                writer.reset();
+                reader.stop();
+                Err(error)
+            }
+        }
     }
 
     /// Accepts a data stream the peer opened and reads its header, for a caller that takes one
@@ -902,30 +958,44 @@ impl StreamRegistry {
         })
     }
 
-    /// Revokes every data stream and stops remote lease renewal.
+    /// Revokes every data stream, without running the revocation hook.
     ///
-    /// Calling it twice is harmless; the hook runs once. A stream opened after this point is
-    /// refused, so nothing can slip in behind the revocation.
-    pub fn revoke_all(&self) {
-        let handles = {
+    /// Every handle is revoked before this returns, whichever call revoked the registry first, and
+    /// a stream opened after this point is refused. A host's hook is a statement about the whole
+    /// connection, which may have more to undo than its streams, so the listener runs it once the
+    /// connection's handler has gone ([`StreamRegistry::revoke_all`]) and revokes the streams as
+    /// soon as the loss is declared.
+    pub fn revoke_streams(&self) {
+        let first = {
             let mut state = self.state.lock();
             if state.revoked {
-                return;
+                false
+            } else {
+                state.revoked = true;
+                // Under the lock, so a second caller that finds the registry revoked finds every
+                // handle revoked too. A handle's revocation is a flag and a wake-up and takes no lock.
+                for (_, (_, handle)) in state.open.drain() {
+                    handle.revoke();
+                }
+                true
             }
-            state.revoked = true;
-            state
-                .open
-                .drain()
-                .map(|(_, (_, handle))| handle)
-                .collect::<Vec<_>>()
         };
-        for handle in handles {
-            handle.revoke();
+        if first {
+            // A stream that is still waiting to open or be accepted has no handle yet, so it waits
+            // on the registry itself.
+            self.state.ended.notify_waiters();
         }
-        // A stream that is still waiting to open or be accepted has no handle yet, so it waits on
-        // the registry itself.
-        self.state.ended.notify_waiters();
-        if let Some(hook) = &self.state.hook {
+    }
+
+    /// Revokes every data stream and stops remote lease renewal.
+    ///
+    /// Calling it twice is harmless; the hook runs once, on the first call that reaches it, and
+    /// whether or not the streams were revoked before ([`StreamRegistry::revoke_streams`]). A stream
+    /// opened after this point is refused, so nothing can slip in behind the revocation.
+    pub fn revoke_all(&self) {
+        self.revoke_streams();
+        let run = !std::mem::replace(&mut self.state.lock().hook_ran, true);
+        if run && let Some(hook) = &self.state.hook {
             hook.control_stream_lost(self.state.connection_id);
         }
     }

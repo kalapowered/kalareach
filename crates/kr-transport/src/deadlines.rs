@@ -95,7 +95,10 @@ pub struct TimerDeadlines {
     /// each piece and not on the frame, so a slow link is never cut for the size of a chunk, and a
     /// peer that stops sending is.
     pub stall: Duration,
-    /// How long a write of one frame may wait for the peer to read.
+    /// How long the write of one frame may take, counted from the start of the write and not
+    /// restarted by progress, as the stall deadline is. It suits an answer of a few hundred bytes.
+    /// A frame of a megabyte takes the whole of it, so a link slower than the frame's size over this
+    /// is cut.
     pub write: Duration,
 }
 
@@ -184,8 +187,9 @@ mod manual {
         /// The deadlines of each kind in force, by the number each was started with: started,
         /// not yet dropped.
         armed: [BTreeSet<u64>; 5],
-        /// How many deadlines of each kind have resolved.
-        resolved: [u64; 5],
+        /// The firing of each kind that each deadline resolved by, counting from one: a deadline
+        /// started after firing `n - 1` and resolved by firing `n` is recorded as `n`.
+        caused: [BTreeSet<u64>; 5],
         /// The number the next deadline started gets.
         next: u64,
     }
@@ -224,8 +228,18 @@ mod manual {
         /// Resolves every deadline of `kind` that is in force now. One started afterwards is not
         /// affected.
         pub fn fire(&self, kind: DeadlineKind) {
-            self.shared.lock().fired[kind.index()] += 1;
+            self.fire_counted(kind);
+        }
+
+        /// Fires `kind`, and returns the number of this firing and the deadlines it reached.
+        fn fire_counted(&self, kind: DeadlineKind) -> (u64, BTreeSet<u64>) {
+            let index = kind.index();
+            let mut state = self.shared.lock();
+            state.fired[index] += 1;
+            let reached = (state.fired[index], state.armed[index].clone());
+            drop(state);
             self.shared.changed.notify_waiters();
+            reached
         }
 
         /// How many deadlines of `kind` are in force: started, and neither resolved nor dropped.
@@ -250,23 +264,21 @@ mod manual {
         ///
         /// A host that is about to leave a wait drops its deadline without looking at it again, and
         /// a firing that lands then has resolved nothing. When every deadline that was in force at
-        /// the firing has gone without one resolving, this waits for the next to be started and
-        /// fires that, so that a case which has to cut one wait is not left holding a firing that
-        /// nobody saw.
+        /// the firing has gone without one resolving by it, this waits for the next to be started
+        /// and fires that, so that a case which has to cut one wait is not left holding a firing
+        /// that nobody saw. A deadline that an earlier firing reached and that resolves late does
+        /// not count.
         pub async fn fire_when_armed(&self, kind: DeadlineKind) {
             let index = kind.index();
             loop {
                 self.wait_armed(kind).await;
-                let (resolved_before, fired_at) = {
-                    let state = self.shared.lock();
-                    (state.resolved[index], state.armed[index].clone())
-                };
-                self.fire(kind);
+                let (firing, fired_at) = self.fire_counted(kind);
                 loop {
                     let changed = self.shared.changed.notified();
                     {
                         let state = self.shared.lock();
-                        if state.resolved[index] > resolved_before {
+                        // Resolved by this firing and not by an earlier one that it reached late.
+                        if state.caused[index].contains(&firing) {
                             return;
                         }
                         if state.armed[index].is_disjoint(&fired_at) {
@@ -303,7 +315,7 @@ mod manual {
                     {
                         let mut state = shared.lock();
                         if state.fired[index] > started_after {
-                            state.resolved[index] += 1;
+                            state.caused[index].insert(started_after + 1);
                             drop(state);
                             shared.changed.notify_waiters();
                             return;

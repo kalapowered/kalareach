@@ -766,7 +766,7 @@ fn fallback_nameservers() -> Vec<iroh::dns::NameserverConfig> {
 /// whose headers are being read ([`MAX_PENDING_HEADERS`]) and one more, so that a stream the
 /// peer opens as another ends is not refused for the moment the old one's end takes to reach it.
 const fn max_peer_bidi_streams(max_bulk_streams: usize) -> u32 {
-    let streams = 1u64 + max_bulk_streams as u64 + MAX_PENDING_HEADERS as u64 + 1;
+    let streams = (max_bulk_streams as u64).saturating_add(1 + MAX_PENDING_HEADERS as u64 + 1);
     if streams > u32::MAX as u64 {
         u32::MAX
     } else {
@@ -878,6 +878,17 @@ mod tests {
     #[test]
     fn the_alpn_is_the_stable_one() {
         assert_eq!(ALPN, b"kalareach");
+    }
+
+    /// A peer may open the control stream, the bulk streams the endpoint allows, the streams whose
+    /// headers are being read and one more, and a bound near the largest `usize` does not wrap to
+    /// a small one, which would leave the peer unable to open the control stream.
+    #[test]
+    fn the_stream_limit_is_the_control_stream_the_bulk_streams_and_the_header_places() {
+        assert_eq!(max_peer_bidi_streams(DEFAULT_MAX_BULK_STREAMS), 10);
+        assert_eq!(max_peer_bidi_streams(8), 14);
+        assert_eq!(max_peer_bidi_streams(usize::MAX), u32::MAX);
+        assert_eq!(max_peer_bidi_streams(usize::MAX - 3), u32::MAX);
     }
 
     /// KR-REQ-23.22: the transport configuration every connection is opened with carries the
