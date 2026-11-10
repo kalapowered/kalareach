@@ -507,25 +507,44 @@ pub struct AuthorisedSession {
 ///
 /// Dropping it resets every stream still queued, so a host that stops taking streams while its
 /// connection stands tells the device each of them was taken away, instead of letting each finish
-/// as though it had ended cleanly.
+/// as though it had ended cleanly. A stream whose send raced the drop is reset when the channel
+/// that holds it is dropped, which is when the connection's accept task ends at the latest.
 #[derive(Debug)]
 pub struct DataStreams {
-    queue: tokio::sync::mpsc::Receiver<DataStream>,
+    queue: tokio::sync::mpsc::Receiver<Queued>,
 }
 
 impl DataStreams {
     /// Returns the next admitted stream, or `None` once the connection has ended.
     pub async fn recv(&mut self) -> Option<DataStream> {
-        self.queue.recv().await
+        self.queue.recv().await.map(Queued::into_stream)
     }
 }
 
-impl Drop for DataStreams {
+/// A stream waiting in the queue to the host.
+///
+/// However it leaves the queue without being taken, because the queue is full, the receiver is
+/// dropped or the channel is dropped with a stream still in it, dropping it resets the stream:
+/// whatever drops the value, the device sees the stream taken away and never a clean end.
+#[derive(Debug)]
+struct Queued(Option<DataStream>);
+
+impl Queued {
+    fn new(stream: DataStream) -> Self {
+        Self(Some(stream))
+    }
+
+    /// The stream, which the host has taken.
+    fn into_stream(mut self) -> DataStream {
+        self.0
+            .take()
+            .expect("a queued stream is present until it is taken")
+    }
+}
+
+impl Drop for Queued {
     fn drop(&mut self) {
-        // Closed first, so a stream a header task sends from now on is refused and reset by that
-        // task, and then every stream already queued is reset here.
-        self.queue.close();
-        while let Ok(stream) = self.queue.try_recv() {
+        if let Some(stream) = self.0.take() {
             stream.reset();
         }
     }
@@ -1203,7 +1222,7 @@ async fn data_accept_loop(
     streams: Arc<StreamRegistry>,
     connection: Connection,
     accepted: Arc<[StreamKind]>,
-    admitted: tokio::sync::mpsc::Sender<DataStream>,
+    admitted: tokio::sync::mpsc::Sender<Queued>,
 ) {
     // Dropped with the loop, which aborts every header read that is still waiting and resets its
     // stream.
@@ -1218,18 +1237,15 @@ async fn data_accept_loop(
                 let admitted = admitted.clone();
                 headers.spawn(async move {
                     match pending.open(&accepted).await {
-                        Ok(stream) => match admitted.try_send(stream) {
-                            Ok(()) => {}
-                            Err(
-                                tokio::sync::mpsc::error::TrySendError::Full(stream)
-                                | tokio::sync::mpsc::error::TrySendError::Closed(stream),
-                            ) => {
+                        // A stream the queue refuses comes back inside the error and is reset as it
+                        // is dropped.
+                        Ok(stream) => {
+                            if admitted.try_send(Queued::new(stream)).is_err() {
                                 tracing::debug!(
                                     "a data stream was reset: the host is not taking more"
                                 );
-                                stream.reset();
                             }
-                        },
+                        }
                         Err(error) => tracing::debug!(%error, "a data stream was refused"),
                     }
                 });
