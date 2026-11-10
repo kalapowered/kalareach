@@ -945,20 +945,25 @@ final class VoiceProgressWatchTests: XCTestCase {
         XCTAssertTrue(told.contains(.gap))
     }
 
-    /// The window is four readings back and no further: audio that kept pace over the last four
-    /// readings is not told for a stall that lies before them, and one inside them is.
+    /// The window is four readings back and no further: a shortfall that lies before the last four
+    /// readings does not add to one inside them, and a shortfall inside them is told.
     func testTheWindowReachesBackFourReadings() {
         var watch = VoiceProgressWatch(windowReadings: 4, gapMs: 100)
-        // Reading 0 is the baseline; readings 1 to 4 each took in 250 ms, so 1 s over four readings.
-        _ = watch.observe(capturedSeconds: 0, readFromMs: 0, answeredAtMs: 0)
-        for step in 1 ... 4 {
-            let at = UInt64(step) * 250
+        // Reading 0 is the baseline. Reading 1 fell 90 ms short of the 250 ms that passed, under the
+        // parameter, and readings 2 to 4 kept pace: each is compared with reading 0 and falls 90 ms short.
+        XCTAssertEqual(watch.observe(capturedSeconds: 0, readFromMs: 0, answeredAtMs: 0), .progressing)
+        let early: [(at: UInt64, seconds: Double)] = [(250, 0.16), (500, 0.41), (750, 0.66), (1_000, 0.91)]
+        for reading in early {
             XCTAssertEqual(
-                watch.observe(capturedSeconds: Double(step) * 0.25, readFromMs: at, answeredAtMs: at), .progressing)
+                watch.observe(capturedSeconds: reading.seconds, readFromMs: reading.at, answeredAtMs: reading.at),
+                .progressing)
         }
-        // Reading 5 is compared with reading 1 (four back), not with the baseline: 250 ms back at 1 s
-        // took in 1 s - 0.25 s = 0.75 s of the 1 s that passed, a shortfall of 250 ms.
-        XCTAssertEqual(watch.observe(capturedSeconds: 1.0, readFromMs: 1_250, answeredAtMs: 1_250), .gap)
+        // Reading 5 is compared with reading 1, four back, and falls 50 ms short. Compared with the
+        // baseline, five back, it would fall 140 ms short and be told for a shortfall that was not in
+        // the window.
+        XCTAssertEqual(watch.observe(capturedSeconds: 1.11, readFromMs: 1_250, answeredAtMs: 1_250), .progressing)
+        // Reading 6 is compared with reading 2: 800 ms of audio in the 1,000 ms that passed.
+        XCTAssertEqual(watch.observe(capturedSeconds: 1.21, readFromMs: 1_500, answeredAtMs: 1_500), .gap)
     }
 
     /// A shortfall of the parameter or more is a gap, and less is not.
