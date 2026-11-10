@@ -79,7 +79,8 @@
 # then starts in an application whose unreached classes the minifier has removed and renamed, as it
 # does the store's (in R8's debug mode, which does not optimise across the classes that are left).
 # A native library that finds a class by name aborts the first call there when the rules do not
-# keep the class. Any value of the variable other than 1 stops the run.
+# keep the class. The variable is 1 or not set (the debug build is then not minified); any other
+# value stops the run.
 #
 # A simulator or an emulator only inside the Mac's device lease, and the builds inside a build
 # slot:

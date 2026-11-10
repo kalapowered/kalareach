@@ -139,8 +139,9 @@ const project = join(dirname(import.meta.dirname), 'src-tauri')
 // the command line tool shares its options with those steps through a file there, named for the
 // application, and a second build on the machine would otherwise read this one's file or have its
 // own read (see `private-temp.mjs`). It is removed when this command ends, whether the build
-// succeeded or not. A signal that ends the command first leaves the directory, which holds nothing
-// but a compile cache, for the system's own cleanup of the temporary directory.
+// succeeded or not. A signal that ends the command first leaves the directory, which holds what the
+// build's tools cached and the command line tool's options file that no other build reads, for the
+// system's own cleanup of the temporary directory.
 const temporary = privateTemporary()
 process.on('exit', temporary.remove)
 
