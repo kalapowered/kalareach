@@ -630,7 +630,7 @@ impl Controller {
         authority_revision: AuthorityRevision,
         carried: crate::authority::AdmittedMutation,
     ) -> Given<Result<ParamsValue>> {
-        let mut copied = false;
+        let mut origin = crate::given::Origin::Fresh;
         let answer = self
             .voice_change(
                 from,
@@ -638,13 +638,13 @@ impl Controller {
                 method,
                 authority_revision,
                 carried,
-                &mut copied,
+                &mut origin,
             )
             .await;
-        Given::of(answer, copied)
+        Given::from_origin(answer, origin)
     }
 
-    /// [`Self::voice_mutation`], setting `copied` when the answer is the record's.
+    /// [`Self::voice_mutation`], noting in `origin` when the answer is the record's.
     async fn voice_change(
         self: &Arc<Self>,
         from: VoiceIngress,
@@ -652,7 +652,7 @@ impl Controller {
         method: Method,
         authority_revision: AuthorityRevision,
         carried: crate::authority::AdmittedMutation,
-        copied: &mut bool,
+        origin: &mut crate::given::Origin,
     ) -> Result<ParamsValue> {
         let VoiceIngress {
             actor_id,
@@ -674,9 +674,8 @@ impl Controller {
         // What it finds goes back under the registration the repeat arrived under, a refusal it
         // kept as much as a result.
         if let Some(found) = self.voice_answered(&actor_id, mutation).await.transpose() {
-            *copied = true;
             return self
-                .retained_under_authority(&carried, async { found })
+                .retained_under_authority(&carried, origin, async { found })
                 .await;
         }
         // A first admission is asked before anything is claimed or created. A start asks the
@@ -694,15 +693,17 @@ impl Controller {
             Ok(claimed) => claimed,
             // Another copy claimed the action for another payload while this one waited: what that
             // says of its record goes back only under this copy's authority, as its answer does.
-            Err(error) => return Err(self.conflict_under_authority(&carried, error).await),
+            Err(error) => {
+                return Err(self.conflict_under_authority(&carried, origin, error).await);
+            }
         };
         let hold = match claimed {
             crate::grants::ActionClaim::Claimed { hold } => hold,
             crate::grants::ActionClaim::Recorded(record) => {
-                *copied = true;
                 return self
                     .retained_under_authority(
                         &carried,
+                        origin,
                         self.voice_recorded(&actor_id, mutation, record),
                     )
                     .await;

@@ -622,13 +622,13 @@ impl ProjectModule {
             .await;
         let copied = copied.load(Ordering::Acquire);
         // The answer first, then the authority it is owed: a refusal replaces what the record
-        // held, as the shared check replaces it everywhere a recorded answer goes back.
-        let answer = if copied && let Err(refusal) = retained() {
-            Err(refusal)
-        } else {
-            answer
-        };
-        Given::of(answer, copied)
+        // held, as the shared check replaces it everywhere a recorded answer goes back, and is
+        // given as a copy that was withheld. The conflict of a reused identifier is no copy, and is
+        // held to the same check.
+        let reused = answer
+            .as_ref()
+            .is_err_and(|refusal| refusal.code == ErrorCode::IdConflict);
+        Given::checked(answer, copied, reused, || retained())
     }
 
     /// [`Self::write`], setting `copied` when the answer is the record's.
@@ -670,7 +670,8 @@ impl ProjectModule {
             .await;
         }
         blocking(move || {
-            if let Some(retained) = kept(&service, &actor, action_id, name, digest)? {
+            if let Some(retained) = kept_noting(&service, &actor, action_id, name, digest, &copied)?
+            {
                 copied.store(true, Ordering::Release);
                 return recorded(retained);
             }
@@ -834,6 +835,27 @@ fn kept(
         .map_err(|error| ControllerError::found_unreadable_on_the_wire(error.into(), RECORDS))
 }
 
+/// [`kept`] for a mutation about to be performed, noting in `copied` when the lookup refuses
+/// because the record cannot be read.
+///
+/// A row that cannot be read says that a record exists, so what the lookup refuses with goes back as
+/// a copy does, under the authority the mutation arrived under. The conflict of a reused identifier
+/// is no copy, and [`ProjectModule::write`] holds it to the same check by its code.
+fn kept_noting(
+    service: &ProjectService,
+    actor: &ActorId,
+    action_id: kr_protocol::scalars::Uuid,
+    name: &str,
+    digest: kr_protocol::scalars::Digest256,
+    copied: &AtomicBool,
+) -> Answer<Option<RetainedOutcome>> {
+    kept(service, actor, action_id, name, digest).inspect_err(|refusal| {
+        if refusal.code != ErrorCode::IdConflict {
+            copied.store(true, Ordering::Release);
+        }
+    })
+}
+
 /// Asks the admission an action begins under, for an action that found no settled record, and
 /// says either that the action may begin or what answers it instead.
 ///
@@ -882,10 +904,15 @@ where
             copied.store(true, Ordering::Release);
             Err(recorded(found))
         }
-        Err(error) => Err(Err(ControllerError::found_unreadable_on_the_wire(
-            error.into(),
-            RECORDS,
-        ))),
+        // A record that cannot be read says that one exists, so it goes back as a copy does. The
+        // conflict of a reused identifier is no copy; `write` holds it to the check by its code.
+        Err(error) => {
+            let told = ControllerError::found_unreadable_on_the_wire(error.into(), RECORDS);
+            if told.code != ErrorCode::IdConflict {
+                copied.store(true, Ordering::Release);
+            }
+            Err(Err(told))
+        }
     }
 }
 
@@ -937,7 +964,7 @@ where
     // Only a settled answer comes back from here. A claim still open, which a submission in the
     // middle of its confirmation holds, is not an answer: the retry goes on into the service and
     // waits for that submission's transition there, then reads what it recorded.
-    if let Some(retained) = kept(service, actor, action_id, name, digest)? {
+    if let Some(retained) = kept_noting(service, actor, action_id, name, digest, copied)? {
         copied.store(true, Ordering::Release);
         return recorded(retained);
     }

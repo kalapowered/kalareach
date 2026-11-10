@@ -74,8 +74,10 @@ impl Controller {
             .retained(actor_id, mutation.action_id, &digest)
             .transpose()
         {
+            // This door tells every answer whole, so where the answer came from is not kept.
+            let mut origin = crate::given::Origin::Fresh;
             return self
-                .retained_under_authority(&carried, async { kept })
+                .retained_under_authority(&carried, &mut origin, async { kept })
                 .await;
         }
         // What either change can refuse without touching anything, refused here: the platform, the
@@ -317,12 +319,16 @@ impl Controller {
                 }
                 super::respond(mutation.request_id, answered)
             }
-            // Another attempt claimed the action for another payload while this one waited: the
-            // conflict goes back only under the authority this attempt arrived under, as a recorded
-            // answer does. Any other refusal names nothing of another attempt's record.
+            // Another attempt claimed the action for another payload while this one waited, or its
+            // record cannot be read (a refusal kept under a code this build cannot read among
+            // them): what that says goes back only under the authority this attempt arrived under,
+            // as a recorded answer does. Any other refusal names nothing of another attempt's
+            // record.
             Err(error) => {
-                if matches!(error, ControllerError::IdConflict { .. })
-                    && let Err(lapsed) = self.check_retained_answer(connection_id, admitted)
+                if matches!(
+                    error,
+                    ControllerError::IdConflict { .. } | ControllerError::Uncertain { .. }
+                ) && let Err(lapsed) = self.check_retained_answer(connection_id, admitted)
                 {
                     return super::error_reply(
                         mutation.request_id,

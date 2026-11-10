@@ -793,6 +793,25 @@ impl RemoteConnection {
         Ok(kept)
     }
 
+    /// What a device is told of a copy a service withheld: the service read the record of an
+    /// earlier submission and refused to give it back under the authority this request arrived
+    /// under.
+    ///
+    /// The service's own check found a fence this host owed, or a registration withdrawn or
+    /// replaced. This door's check, asked next, can pass: the fence is gone by then. The service's
+    /// refusal is no answer to the action, which an earlier submission may have carried out, and
+    /// told as a kept answer it would say the action did not happen to a device that has authority
+    /// now. So the device is told the outcome is not shown, as it is when this door's own check
+    /// refuses. `asked` is left holding the decision the answer would have been written under.
+    pub(super) fn withheld_answer(
+        &self,
+        decided: &Asked,
+        asked: &mut Option<Asked>,
+    ) -> ProtocolError {
+        *asked = Some(decided.clone().kept());
+        outcome_not_shown()
+    }
+
     /// The session of the reservation under a create's action, when that reservation holds this
     /// request, which is what the create's answer is about when it is read from the reservation.
     ///

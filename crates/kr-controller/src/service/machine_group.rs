@@ -334,11 +334,11 @@ impl Controller {
         expected: Expected,
         carried: crate::authority::AdmittedMutation,
     ) -> Given<Result<ParamsValue>> {
-        let mut copied = false;
+        let mut origin = crate::given::Origin::Fresh;
         let answer = self
-            .take_the_step(actor_id, mutation, movement, expected, carried, &mut copied)
+            .take_the_step(actor_id, mutation, movement, expected, carried, &mut origin)
             .await;
-        Given::of(answer, copied)
+        Given::from_origin(answer, origin)
     }
 
     async fn take_the_step(
@@ -348,7 +348,7 @@ impl Controller {
         movement: Move,
         expected: Expected,
         carried: crate::authority::AdmittedMutation,
-        copied: &mut bool,
+        origin: &mut crate::given::Origin,
     ) -> Result<ParamsValue> {
         let _serial = self.machine.steps.lock().await;
         // The step before this one may have written the record and ended before its receipt. Its
@@ -365,7 +365,9 @@ impl Controller {
             Ok(claimed) => claimed,
             // Another attempt claimed the action for another payload while this one waited for the
             // step lock: what that says of its record goes back only under this attempt's authority.
-            Err(error) => return Err(self.conflict_under_authority(&carried, error).await),
+            Err(error) => {
+                return Err(self.conflict_under_authority(&carried, origin, error).await);
+            }
         };
         let hold = match claimed {
             crate::grants::ActionClaim::Claimed { hold } => hold,
@@ -376,9 +378,8 @@ impl Controller {
                 // without the deadline a receipt outlives. The check is made here, with the answer
                 // in hand and the step lock held: a fence that lands while this attempt waited for
                 // the lock, or while it holds it, stops the answer.
-                *copied = true;
                 return self
-                    .retained_under_authority(&carried, async { recorded_answer(record) })
+                    .retained_under_authority(&carried, origin, async { recorded_answer(record) })
                     .await;
             }
         };

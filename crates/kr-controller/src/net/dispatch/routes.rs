@@ -13,7 +13,7 @@ use kr_protocol::method::Method;
 
 use super::super::proxy::Vouched;
 use crate::error::Result;
-use crate::given::Given;
+use crate::given::{Given, Origin};
 
 use super::super::Retained;
 use super::decision::{Answered, Asked, unserved_change_set_method};
@@ -807,8 +807,9 @@ impl RemoteConnection {
         #[cfg(test)]
         self.controller.before_the_effect.wait().await;
         // Whether the service that answered read its answer from the record of an earlier
-        // submission of the action, which the device is then told as it is told any such answer.
-        let mut copied = false;
+        // submission of the action, which the device is then told as it is told any such answer,
+        // or read that record and withheld it, which the device is told it is not shown.
+        let mut origin = Origin::Fresh;
         let answer = match entry.method {
             // The daemon's own effects. They run on a task that outlives this connection, because
             // dropping a future is a cancellation and a durable commit cannot be left half done
@@ -845,7 +846,7 @@ impl RemoteConnection {
                 // that attempt launched a session or failed to, and it says so. It is told as any
                 // answer read from a record is.
                 noting(
-                    &mut copied,
+                    &mut origin,
                     settled_by_a_service(
                         request_id,
                         tokio::time::timeout(crate::service::CREATE_WAIT, effect).await,
@@ -991,7 +992,7 @@ impl RemoteConnection {
                 });
                 match self.controller.within_effect_wait(effect).await {
                     Ok(Ok(given)) => noting(
-                        &mut copied,
+                        &mut origin,
                         given.map(|outcome| framed_protocol(request_id, outcome)),
                     ),
                     // The effect is still running, so a wait that ended says the outcome is not
@@ -1033,7 +1034,7 @@ impl RemoteConnection {
                 });
                 match self.controller.within_effect_wait(effect).await {
                     Ok(Ok(given)) => noting(
-                        &mut copied,
+                        &mut origin,
                         given.map(super::narrowing::shown_materialisation),
                     ),
                     Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
@@ -1077,7 +1078,7 @@ impl RemoteConnection {
                 });
                 match self.controller.within_effect_wait(effect).await {
                     Ok(Ok(given)) => noting(
-                        &mut copied,
+                        &mut origin,
                         given.map(|answer| {
                             super::narrowing::shown_working_tree_change(answer, method)
                         }),
@@ -1138,7 +1139,7 @@ impl RemoteConnection {
                 });
                 match self.controller.within_effect_wait(effect).await {
                     Ok(Ok(given)) => noting(
-                        &mut copied,
+                        &mut origin,
                         given.map(|outcome| framed_protocol(request_id, outcome)),
                     ),
                     // The effect is still running, so a wait that ended says the outcome is not
@@ -1179,7 +1180,7 @@ impl RemoteConnection {
                         .await
                 });
                 match self.controller.within_effect_wait(effect).await {
-                    Ok(Ok(given)) => noting(&mut copied, given),
+                    Ok(Ok(given)) => noting(&mut origin, given),
                     Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
                 }
             }
@@ -1234,7 +1235,7 @@ impl RemoteConnection {
                     )
                     .await;
                 noting(
-                    &mut copied,
+                    &mut origin,
                     given.map(|answer| framed(mutation.request_id, answer)),
                 )
             }
@@ -1334,7 +1335,7 @@ impl RemoteConnection {
                         .await
                 });
                 noting(
-                    &mut copied,
+                    &mut origin,
                     settled_by_a_service(
                         request_id,
                         self.controller.within_effect_wait(effect).await,
@@ -1409,7 +1410,7 @@ impl RemoteConnection {
                         .await
                 });
                 noting(
-                    &mut copied,
+                    &mut origin,
                     settled_by_a_service(
                         request_id,
                         self.controller.within_effect_wait(effect).await,
@@ -1440,7 +1441,7 @@ impl RemoteConnection {
                         .await
                 });
                 noting(
-                    &mut copied,
+                    &mut origin,
                     settled_by_a_service(
                         request_id,
                         self.controller.within_effect_wait(effect).await,
@@ -1520,7 +1521,7 @@ impl RemoteConnection {
                     deadline: Some(accepted.deadline),
                 };
                 noting(
-                    &mut copied,
+                    &mut origin,
                     self.controller
                         .preview_key_update_action(&actor_id, mutation, carried)
                         .await
@@ -1552,7 +1553,7 @@ impl RemoteConnection {
                     deadline: Some(accepted.deadline),
                 };
                 noting(
-                    &mut copied,
+                    &mut origin,
                     self.controller
                         .push_register_action(&actor_id, mutation, carried)
                         .await
@@ -1574,7 +1575,7 @@ impl RemoteConnection {
                     deadline: Some(accepted.deadline),
                 };
                 noting(
-                    &mut copied,
+                    &mut origin,
                     self.controller
                         .device_keys_declared(&actor_id, self.device.device_id, mutation, carried)
                         .await
@@ -1610,7 +1611,7 @@ impl RemoteConnection {
                 });
                 match self.controller.within_effect_wait(effect).await {
                     Ok(Ok(given)) => noting(
-                        &mut copied,
+                        &mut origin,
                         given.map(|outcome| framed_protocol(request_id, outcome)),
                     ),
                     // The run is still going, or its task ended without an answer. Whether the
@@ -1657,7 +1658,7 @@ impl RemoteConnection {
                     .controller
                     .pairing_standing(self.connection_id(), Some(validated));
                 noting(
-                    &mut copied,
+                    &mut origin,
                     self.controller
                         .pairing_write(
                             caller,
@@ -1687,12 +1688,14 @@ impl RemoteConnection {
                     .await;
             }
         };
-        if copied {
-            return self
-                .kept_answer(answer, entry.method, mutation, validated, &decided, asked)
-                .await;
+        match origin {
+            Origin::Fresh => Ok(answer),
+            Origin::Copied => {
+                self.kept_answer(answer, entry.method, mutation, validated, &decided, asked)
+                    .await
+            }
+            Origin::Withheld => Err(self.withheld_answer(&decided, asked)),
         }
-        Ok(answer)
     }
 }
 
@@ -1752,9 +1755,9 @@ fn framed_protocol(
     })
 }
 
-/// The frame of an answer a service gave, noting in `copied` when the service read it from a
-/// record.
-fn noting(copied: &mut bool, given: Given<ControlFrame>) -> ControlFrame {
-    *copied |= given.is_copied();
+/// The frame of an answer a service gave, noting in `origin` when the service read it from a
+/// record, or read the record and withheld it.
+fn noting(origin: &mut Origin, given: Given<ControlFrame>) -> ControlFrame {
+    origin.note(given.origin());
     given.into_answer()
 }

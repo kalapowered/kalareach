@@ -1509,6 +1509,7 @@ impl CatalogueModule {
     ) -> Given<Answer<ParamsValue>> {
         let mut catalogue = self.catalogue.lock().await;
         let mut copied = false;
+        let standing = Arc::clone(&admission);
         let answer = self
             .off_the_executor_async(self.write_locked(
                 &mut catalogue,
@@ -1521,7 +1522,11 @@ impl CatalogueModule {
                 &mut copied,
             ))
             .await;
-        Given::of(answer, copied)
+        // A receipt another attempt left goes back only under the authority this attempt arrived
+        // under, asked with the answer in hand, and its refusal is a copy that was withheld.
+        Given::checked(answer, copied, false, || {
+            standing.check_retained().map_err(ProtocolError::from)
+        })
     }
 
     /// Serves one catalogue or plugin mutation under the catalogue's lock: the claim, the change,
@@ -1548,10 +1553,27 @@ impl CatalogueModule {
             }),
             None => admission,
         };
-        admission.check().map_err(ProtocolError::from)?;
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
         let key = receipt_key(actor_id, mutation.action_id);
+        // A receipt outlives the window that admitted its action (section 9), so it is read before
+        // the admission's deadline is asked: a copy whose window passed while it waited for the
+        // catalogue's lock is given the receipt, under the authority half of the check that `write`
+        // asks of it. Only an action that has no receipt is held to the whole admission.
+        match catalogue.receipt(&key) {
+            Ok(Some(record)) => {
+                *copied = true;
+                return answered(&record, &digest, mutation.action_id);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // A receipt that cannot be read says that one exists. What it refuses with goes
+                // back only under the authority this attempt arrived under, as a receipt does.
+                *copied = true;
+                return Err(error.into());
+            }
+        }
+        admission.check().map_err(ProtocolError::from)?;
         let claim = ReceiptClaim {
             key: key.clone(),
             digest: digest.as_bytes().to_vec(),
@@ -1560,20 +1582,16 @@ impl CatalogueModule {
             deadline_ms: admission.accepted_deadline_ms(),
         };
         // Claimed before anything is performed, and durably: a claim this host cannot record is a
-        // refusal, because an action performed without one could be performed twice.
-        match catalogue
+        // refusal, because an action performed without one could be performed twice. The receipt
+        // was read above under this lock, so the claim finds none.
+        if let Claimed::Retained(record) = catalogue
             .claim(&claim, kr_ipc::now_ms().get())
             .map_err(ProtocolError::from)?
         {
-            Claimed::Retained(record) => {
-                *copied = true;
-                // Another attempt's receipt, found after the check above: it goes back only under
-                // the authority this attempt arrived under, asked with the answer in hand.
-                let kept = answered(&record, &digest, mutation.action_id);
-                admission.check_retained().map_err(ProtocolError::from)?;
-                return kept;
-            }
-            Claimed::Fresh => {}
+            // Another attempt's receipt, found by the claim: `write` gives it back only under the
+            // authority this attempt arrived under.
+            *copied = true;
+            return answered(&record, &digest, mutation.action_id);
         }
         // Every change the action makes commits through this recording, so what it left behind
         // when it stops is known rather than guessed.

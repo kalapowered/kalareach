@@ -43,6 +43,11 @@ use super::{Controller, parse};
 /// figure the worker is made to meet.
 pub(super) const CHECKS_WAIT: Duration = Duration::from_secs(150);
 
+/// The record of answers to the disclosed checks, as a repeat is told of it when it cannot be read:
+/// an earlier attempt may have started the checks, so the repeat is not told a transient word that
+/// says nothing took effect.
+const ANSWERS: &str = "answers to the disclosed checks";
+
 /// The capabilities a worker's findings may name.
 ///
 /// Synthetic input is not among them: it is never performed, and its record is the platform's.
@@ -356,7 +361,7 @@ impl Controller {
             Ok(Some(_)) => Err(ControllerError::IdConflict {
                 token: mutation.action_id.to_string(),
             }),
-            Err(error) => Err(error),
+            Err(error) => Err(error.found_unreadable(ANSWERS)),
         };
         Some(super::respond(mutation.request_id, outcome))
     }
@@ -371,8 +376,9 @@ impl Controller {
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::WindowExpired`] for an action that carries no freshness, the
-    /// admission's refusal, [`ControllerError::InvalidArgument`] for a request that is not for
+    /// Returns [`ControllerError::WindowExpired`] for a first start whose window has passed or that
+    /// carries no freshness (a copy of an action this host answered is given the answer whatever
+    /// its window), the admission's refusal, [`ControllerError::InvalidArgument`] for a request that is not for
     /// this environment, [`ControllerError::IdConflict`] for an identifier the record holds for
     /// another request, and the error of the registry or of the record of answers, which answers
     /// `STORAGE_UNAVAILABLE`, when either cannot be read or the answer cannot be written down.
@@ -382,13 +388,6 @@ impl Controller {
         mutation: &MutationRequest,
         carried: AdmittedMutation,
     ) -> Result<ParamsValue> {
-        if carried.deadline.is_none() {
-            return Err(ControllerError::WindowExpired {
-                detail: "this action carries no freshness, so it may be answered from what this \
-                         host holds and may not perform the disclosed checks"
-                    .to_owned(),
-            });
-        }
         let params: EnvironmentCapabilitiesCheckParams = parse(&mutation.params)?;
         if params.environment_id != self.paths.environment_id() {
             return Err(ControllerError::InvalidArgument(format!(
@@ -409,7 +408,7 @@ impl Controller {
         let taken = fingerprint_of(&evidence, worker.as_ref());
         let digest = mutation_digest(mutation, actor_id)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        let begun = self.under_registration(&carried, || {
+        let begun = self.under_registration_until_it_begins(&carried, |begin| {
             let mut checks = self.checks.lock().unwrap_or_else(PoisonError::into_inner);
             #[cfg(test)]
             self.before_a_capability_check_looks.wait();
@@ -435,9 +434,13 @@ impl Controller {
                 Ok(None) => {}
                 Err(error) => {
                     self.check_fence()?;
-                    return Err(error);
+                    return Err(error.found_unreadable(ANSWERS));
                 }
             }
+            // No record: this is a first start, which needs the window it was admitted under. A
+            // receipt outlives that window, so the deadline is asked only here, after the record
+            // was read, and a mutation that carries no freshness is refused here as well.
+            begin()?;
             // What the start comes to is worked out on a copy and written down before anything
             // is changed or started: a record that cannot be written refuses the start, with the
             // checks standing as they did, so that no run goes on without its action being the

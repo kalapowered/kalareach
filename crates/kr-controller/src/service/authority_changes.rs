@@ -1157,14 +1157,14 @@ impl Controller {
         method: Method,
         carried: crate::authority::AdmittedMutation,
     ) -> Given<Result<ParamsValue>> {
-        let mut copied = false;
+        let mut origin = crate::given::Origin::Fresh;
         let answer = self
-            .change_authority(actor_id, caller, mutation, method, carried, &mut copied)
+            .change_authority(actor_id, caller, mutation, method, carried, &mut origin)
             .await;
-        Given::of(answer, copied)
+        Given::from_origin(answer, origin)
     }
 
-    /// [`Self::authority_change`], setting `copied` when the answer is the record's.
+    /// [`Self::authority_change`], noting in `origin` when the answer is the record's.
     async fn change_authority(
         &self,
         actor_id: &ActorId,
@@ -1172,7 +1172,7 @@ impl Controller {
         mutation: &MutationRequest,
         method: Method,
         carried: crate::authority::AdmittedMutation,
-        copied: &mut bool,
+        origin: &mut crate::given::Origin,
     ) -> Result<ParamsValue> {
         // A device makes three of these: a share, its revocation and a redemption. The others are
         // the owner's at this machine, and their answers are written for the owner: a device is
@@ -1206,17 +1206,19 @@ impl Controller {
             // Another attempt claimed the action for another payload between the lookup that found
             // nothing and this claim: what that says of its record goes back only under this
             // attempt's authority, as its answer does.
-            Err(error) => return Err(self.conflict_under_authority(&carried, error).await),
+            Err(error) => {
+                return Err(self.conflict_under_authority(&carried, origin, error).await);
+            }
         };
         let hold = match claimed {
             crate::grants::ActionClaim::Claimed { hold } => hold,
             crate::grants::ActionClaim::Recorded(record) => {
                 // An earlier attempt recorded this action between the lookup that found nothing
                 // and this claim.
-                *copied = true;
                 return self
                     .retained_under_authority(
                         &carried,
+                        origin,
                         self.recorded_authority_change(actor_id, mutation, record),
                     )
                     .await;
@@ -2003,19 +2005,24 @@ impl Controller {
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
     ) -> Given<Result<ParamsValue>> {
+        let mut origin = crate::given::Origin::Fresh;
         let hold = match self.claim_authority_change(actor_id, mutation, kr_ipc::now_ms().get()) {
             Ok(crate::grants::ActionClaim::Claimed { hold }) => hold,
             Ok(crate::grants::ActionClaim::Recorded(record)) => {
-                return Given::Copied(
-                    self.retained_under_authority(
+                let answer = self
+                    .retained_under_authority(
                         &carried,
+                        &mut origin,
                         self.recorded_authority_change(actor_id, mutation, record),
                     )
-                    .await,
-                );
+                    .await;
+                return Given::from_origin(answer, origin);
             }
             Err(error) => {
-                return Given::Fresh(Err(self.conflict_under_authority(&carried, error).await));
+                let answer = self
+                    .conflict_under_authority(&carried, &mut origin, error)
+                    .await;
+                return Given::from_origin(Err(answer), origin);
             }
         };
         let outcome = self
@@ -2046,19 +2053,24 @@ impl Controller {
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
     ) -> Given<Result<ParamsValue>> {
+        let mut origin = crate::given::Origin::Fresh;
         let hold = match self.claim_authority_change(actor_id, mutation, kr_ipc::now_ms().get()) {
             Ok(crate::grants::ActionClaim::Claimed { hold }) => hold,
             Ok(crate::grants::ActionClaim::Recorded(record)) => {
-                return Given::Copied(
-                    self.retained_under_authority(
+                let answer = self
+                    .retained_under_authority(
                         &carried,
+                        &mut origin,
                         self.recorded_authority_change(actor_id, mutation, record),
                     )
-                    .await,
-                );
+                    .await;
+                return Given::from_origin(answer, origin);
             }
             Err(error) => {
-                return Given::Fresh(Err(self.conflict_under_authority(&carried, error).await));
+                let answer = self
+                    .conflict_under_authority(&carried, &mut origin, error)
+                    .await;
+                return Given::from_origin(Err(answer), origin);
             }
         };
         let outcome = self.device_push_register(actor_id, mutation, carried).await;
@@ -3952,8 +3964,9 @@ mod tests {
         release.send(()).expect("the repeat goes on");
         let refused = waiting.await.expect("the repeat finishes");
         assert!(
-            refused.is_copied(),
-            "the repeat found the first submission's record and did not register again"
+            refused.is_withheld(),
+            "the repeat found the first submission's record and did not register again, and the \
+             refusal is a copy the service withheld"
         );
         let withheld = refused
             .into_answer()

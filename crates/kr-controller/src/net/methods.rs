@@ -23,6 +23,7 @@ use kr_protocol::confirmation::{
     OwnerConfirmationPendingParams, OwnerConfirmationRequestParams, TransferControlPlan,
 };
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{AuthorityRevision, ConnectionId};
 use kr_protocol::invitation::{PairCancelParams, PairConfirmParams, PairInviteParams};
 use kr_protocol::method::Method;
@@ -271,13 +272,18 @@ impl Controller {
         let answer = self
             .write_pairing(caller, method, mutation, admission, guard, life, &copied)
             .await;
+        // Another request's use of the action's identifier, however the pairing store came to meet
+        // it, is no copy of a record, but it tells the caller of another attempt, so it goes back
+        // under the same check.
+        let reused = matches!(
+            &answer,
+            Err(ControllerError::Refused {
+                code: ErrorCode::IdConflict,
+                ..
+            } | ControllerError::IdConflict { .. })
+        );
         let copied = copied.load(Ordering::Acquire);
-        let answer = if copied && let Err(refusal) = retained() {
-            Err(refusal)
-        } else {
-            answer
-        };
-        Given::of(answer, copied)
+        Given::checked(answer, copied, reused, || retained())
     }
 
     /// [`Self::pairing_write`], setting `copied` when the answer is the one an earlier submission

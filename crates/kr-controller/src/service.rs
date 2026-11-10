@@ -1501,6 +1501,15 @@ mod a_recorded_answer_another_copy_wrote;
 #[cfg(test)]
 mod a_claim_another_copy_made;
 
+/// What a receipt is given back under once the window that admitted its action has passed.
+#[cfg(test)]
+mod a_receipt_after_its_window;
+
+/// What a refusal that names another attempt's record goes back under, where a service reads that
+/// record after a wait: a claim, a lookup, a store.
+#[cfg(test)]
+mod a_refusal_that_names_a_record;
+
 /// A transfer of control from a device that holds a grant the given-up grant was delegated from.
 #[cfg(test)]
 mod a_transfer_whose_giver_keeps_control;

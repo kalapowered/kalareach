@@ -2262,8 +2262,11 @@ impl AttentionModule {
     /// it, under the admission it carries.
     ///
     /// The admission is asked twice: by the daemon's guarded write before the store is reached,
-    /// and again inside the store's transaction before its first write, so a deadline that passes
-    /// while the write waits for the store refuses the action rather than letting it write.
+    /// without its deadline, and again inside the store's transaction before its first write, with
+    /// it, so a deadline that passes while the write waits for the store refuses the action rather
+    /// than letting it write. A receipt outlives the window that admitted its action, so the store
+    /// reads the action's record before the deadline is asked, and a copy whose window passed is
+    /// given the record; a mutation that carries no freshness is refused where it would write.
     ///
     /// An answer the store reads from the record of an earlier submission of the action is given
     /// as a copy.
@@ -2292,6 +2295,26 @@ impl AttentionModule {
                 &mut copied,
             )
             .await;
+        // The store returns a record before it asks the admission, and the guarded write that
+        // admitted this action ended before it was read. What an earlier submission recorded goes
+        // back only under the authority this attempt arrived under, asked with the answer, as the
+        // caller is shown it, in hand: a fence owed or a registration replaced since the entry
+        // check stops it, and the refusal is a copy that was withheld. A record that cannot be
+        // read is held to it as much as one that can, since that it exists is what the caller
+        // would be told.
+        let reused = answer
+            .as_ref()
+            .is_err_and(|refusal| refusal.code == ErrorCode::IdConflict);
+        if (copied || reused)
+            && let Err(refusal) = controller.check_retained_in_hand(carried).await
+        {
+            let refusal = Err(refusal.to_protocol_error());
+            return if copied {
+                Given::Withheld(refusal)
+            } else {
+                Given::Fresh(refusal)
+            };
+        }
         Given::of(answer, copied)
     }
 
@@ -2310,8 +2333,12 @@ impl AttentionModule {
         self.check_mutation(caller, actor, mutation, method)?;
         let key = action_key(actor, mutation, method)?;
         let reading = self.reading();
+        // Set when the store met a record of this action that it cannot read, which says that one
+        // exists, so what it refuses with goes back as a copy does. Another request's use of the
+        // identifier is no copy, and `write` holds it to the check by its code.
+        let found = std::sync::atomic::AtomicBool::new(false);
         let performed = controller
-            .enter_admitted(carried, |registry| {
+            .enter_with_a_record(carried, |registry| {
                 let registry: &crate::registry::Registry = registry;
                 #[cfg(feature = "testing")]
                 self.before_store.wait();
@@ -2324,7 +2351,7 @@ impl AttentionModule {
                     std::cell::RefCell::new(None);
                 let admit = || {
                     controller
-                        .check_admission(registry, carried)
+                        .check_first_admission(registry, carried)
                         .map_err(|error| {
                             let detail = error.to_string();
                             *lapsed.borrow_mut() = Some(error);
@@ -2430,6 +2457,7 @@ impl AttentionModule {
                     // passed the door with no record meets when the store fails before its write:
                     // an earlier copy may have been performed, so nothing is told a transient word.
                     Unperformed::Store(kr_attention::Error::ActionUnreadable { .. }) => {
+                        found.store(true, std::sync::atomic::Ordering::Release);
                         ControllerError::record_unreadable("attention actions")
                     }
                     Unperformed::Store(error) => lapsed
@@ -2438,37 +2466,27 @@ impl AttentionModule {
                         .unwrap_or_else(|| store_error(error)),
                 })
             })
-            .await
-            .map_err(|error| error.to_protocol_error())?;
+            .await;
+        if found.load(std::sync::atomic::Ordering::Acquire) {
+            *copied = true;
+        }
+        let performed = performed.map_err(|error| error.to_protocol_error())?;
         // A window change moves the next timer; the maintenance loop works it out again.
         self.wake.notify_one();
-        let (answer, kept) = match performed {
-            Performed::Done(answer) => (result_of(&answer, reading), false),
+        let answer = match performed {
+            Performed::Done(answer) => result_of(&answer, reading),
             Performed::Retained(record) => {
                 *copied = true;
-                (decode_answer(&record.answer), true)
+                decode_answer(&record.answer)
             }
         };
-        let shown = answer.and_then(|answer| {
+        answer.and_then(|answer| {
             if method == Method::VisitAcknowledge {
                 self.shown_visit(caller, actor, mutation, answer)
             } else {
                 Ok(answer)
             }
-        });
-        // The store returns a record before it asks the admission, and the guarded write that
-        // admitted this action ended before it was read. What an earlier submission recorded goes
-        // back only under the authority this attempt arrived under, asked with the answer, as the
-        // caller is shown it, in hand: a fence owed or a registration replaced since the entry
-        // check stops it. A record that cannot be read is held to it as much as one that can, since
-        // that it exists is what the caller would be told.
-        if kept {
-            controller
-                .check_retained_in_hand(carried)
-                .await
-                .map_err(|error| error.to_protocol_error())?;
-        }
-        shown
+        })
     }
 
     /// Writes the answer to a visit's acknowledgement in the numbers its caller is shown.

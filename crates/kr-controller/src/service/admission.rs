@@ -23,6 +23,16 @@ use super::authority_changes::{
 };
 use super::{Controller, net, parse};
 
+/// What a mutation that carries no freshness is refused with where it would be performed: it may
+/// be answered from what this host holds, and may not be performed.
+fn carries_no_freshness() -> ControllerError {
+    ControllerError::WindowExpired {
+        detail: "this action carries no freshness, so it may be answered from what this host \
+                 holds and may not be performed"
+            .to_owned(),
+    }
+}
+
 impl Controller {
     /// Validates a local caller's record and registers its connection in one step.
     ///
@@ -340,6 +350,79 @@ impl Controller {
         write(&mut registry)
     }
 
+    /// [`Self::enter_admitted`] for a service that reads the record of an action before it writes
+    /// anything, and gives back what it finds there.
+    ///
+    /// Section 9 keeps a receipt readable after the window that admitted its action is gone, so a
+    /// copy whose window passed while it waited for the registry is not refused for that before the
+    /// record is read: only the authority half of the admission is asked here, and the service
+    /// asks [`Self::check_first_admission`] where its action begins. A mutation that carries no
+    /// freshness is let in to be answered from the record and refused there if it would write.
+    ///
+    /// # Errors
+    ///
+    /// Returns the way the authority half of the admission lapsed, or whatever the closure returns.
+    pub async fn enter_with_a_record<T>(
+        &self,
+        admission: &crate::authority::AdmittedMutation,
+        write: impl FnOnce(&mut Registry) -> Result<T>,
+    ) -> Result<T> {
+        let mut registry = self.registry.lock().await;
+        self.check_admission(
+            &registry,
+            &crate::authority::AdmittedMutation {
+                deadline: None,
+                ..*admission
+            },
+        )?;
+        write(&mut registry)
+    }
+
+    /// The check a first admission begins under, for a caller that holds the registry: the whole
+    /// admission, and a mutation that carries no freshness is refused, because it may be answered
+    /// from what this host holds and may not be performed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::WindowExpired`] for a mutation with no deadline, and what
+    /// [`Self::check_admission`] returns otherwise.
+    pub fn check_first_admission(
+        &self,
+        registry: &Registry,
+        admission: &crate::authority::AdmittedMutation,
+    ) -> Result<()> {
+        if admission.deadline.is_none() {
+            return Err(carries_no_freshness());
+        }
+        self.check_admission(registry, admission)
+    }
+
+    /// The admission a service asks again from inside the work a mutation has begun, and where its
+    /// action begins.
+    ///
+    /// Every service that performs a mutation's effect after a wait is handed this one check, the
+    /// project service and the workflow journal alike: [`Self::check_registration`], which asks the
+    /// fence this host owes before the connection's registration and the accepted deadline. A
+    /// mutation that carries no freshness is refused, as [`Self::check_first_admission`] refuses
+    /// it, because it may be answered from what this host holds and may not be performed.
+    ///
+    /// A service that answers a copy from its record before it asks this one never reaches it for
+    /// that copy, so a receipt is given back after the window that admitted its action is gone.
+    pub(crate) fn admission_in_service(
+        self: &Arc<Self>,
+        carried: crate::authority::AdmittedMutation,
+    ) -> impl Fn() -> std::result::Result<(), ProtocolError> + Send + Sync + 'static {
+        let controller = Arc::clone(self);
+        move || {
+            if carried.deadline.is_none() {
+                return Err(carries_no_freshness().to_protocol_error());
+            }
+            controller
+                .check_registration(&carried)
+                .map_err(|error| error.to_protocol_error())
+        }
+    }
+
     /// Refuses a request on a connection whose registration has been withdrawn.
     pub(super) fn authorised(&self, connection_id: ConnectionId) -> Result<ActorId> {
         let admitted = self.admitted_read();
@@ -432,7 +515,9 @@ impl Controller {
     ///
     /// Section 9 returns a retained receipt to a duplicate only under authority that has not been
     /// withdrawn, so a fence this host owes, or a registration withdrawn or replaced while the
-    /// answer was read, stops it.
+    /// answer was read, stops it. `origin` says the answer was read from a record, and that it was
+    /// withheld when the check stops it, so that the door does not tell the refusal as the record's
+    /// answer.
     ///
     /// A service that finds its record itself, in asynchronous work, gives it back through here:
     /// the voice, machine group, authority change, installation and create services, whatever the
@@ -446,10 +531,12 @@ impl Controller {
     /// checks reads its record inside the hold on the registration, which keeps a revocation out,
     /// and asks the fence again once the record is read, whatever it holds (an answer, another
     /// request's identifier, a row that cannot be read). The conflict a reused identifier meets,
-    /// found by a claim or a look after a wait, goes back through
-    /// [`Self::conflict_under_authority`] in the voice, machine group and authority change
-    /// services, and through the same check in the transfer service and in the door's claim of an
-    /// action.
+    /// and a refusal that says what became of the action is not known, found by a claim or a look
+    /// after a wait, go back through [`Self::conflict_under_authority`] in the voice, machine group,
+    /// authority change and create services, and through the same check in the transfer service and
+    /// in the door's claim of an action. The project, change-set, attention, automation and pairing
+    /// services hold a reused identifier's conflict to it where their write ends, and a record they
+    /// cannot read goes back as a copy does.
     ///
     /// # Errors
     ///
@@ -457,10 +544,15 @@ impl Controller {
     pub(crate) async fn retained_under_authority(
         &self,
         carried: &crate::authority::AdmittedMutation,
+        origin: &mut crate::given::Origin,
         answer: impl std::future::Future<Output = Result<kr_protocol::envelope::ParamsValue>>,
     ) -> Result<kr_protocol::envelope::ParamsValue> {
         let answered = answer.await;
-        self.check_retained_in_hand(carried).await?;
+        origin.note(crate::given::Origin::Copied);
+        if let Err(refusal) = self.check_retained_in_hand(carried).await {
+            origin.note(crate::given::Origin::Withheld);
+            return Err(refusal);
+        }
         answered
     }
 
@@ -469,17 +561,32 @@ impl Controller {
     ///
     /// A reused identifier's conflict names no answer, but it is the host's word about another
     /// attempt's use of the identifier, and the network door shows it only to a caller that is
-    /// still registered, so it waits for the same check, asked once it is in hand. Any other
-    /// refusal says nothing of another attempt and is given back as it is.
+    /// still registered, so it waits for the same check, asked once it is in hand. A refusal that
+    /// says what became of the action is not known (`Uncertain`: a refusal kept under a code this
+    /// build cannot read, or a record that cannot be read) is about the record of an action this
+    /// copy may have repeated, so it is a copy of what is held, asked the same way: `origin` says
+    /// it is read from a record, and that it is withheld when the authority no longer stands. Any
+    /// other refusal says nothing of another attempt and is given back as it is.
     pub(crate) async fn conflict_under_authority(
         &self,
         carried: &crate::authority::AdmittedMutation,
+        origin: &mut crate::given::Origin,
         found: ControllerError,
     ) -> ControllerError {
-        if matches!(found, ControllerError::IdConflict { .. })
-            && let Err(lapsed) = self.check_retained_in_hand(carried).await
-        {
-            return lapsed;
+        match found {
+            ControllerError::IdConflict { .. } => {
+                if let Err(lapsed) = self.check_retained_in_hand(carried).await {
+                    return lapsed;
+                }
+            }
+            ControllerError::Uncertain { .. } => {
+                origin.note(crate::given::Origin::Copied);
+                if let Err(lapsed) = self.check_retained_in_hand(carried).await {
+                    origin.note(crate::given::Origin::Withheld);
+                    return lapsed;
+                }
+            }
+            _ => {}
         }
         found
     }
@@ -495,24 +602,6 @@ impl Controller {
         move || {
             controller
                 .check_retained_under(&carried)
-                .map_err(|error| error.to_protocol_error())
-        }
-    }
-
-    /// The admission a service asks again from inside the work a mutation has begun.
-    ///
-    /// Every service that performs a mutation's effect after a wait is handed this one check, the
-    /// project service, the transfer service and the workflow journal alike:
-    /// [`Self::check_registration`], which asks the fence this host owes before the connection's
-    /// registration and the accepted deadline.
-    pub(crate) fn admission_in_service(
-        self: &Arc<Self>,
-        carried: crate::authority::AdmittedMutation,
-    ) -> impl Fn() -> std::result::Result<(), ProtocolError> + Send + Sync + 'static {
-        let controller = Arc::clone(self);
-        move || {
-            controller
-                .check_registration(&carried)
                 .map_err(|error| error.to_protocol_error())
         }
     }
@@ -592,6 +681,46 @@ impl Controller {
         };
         let checked = self.check_registration_in(&self.admitted_read(), admission);
         checked.map(|()| commit())
+    }
+
+    /// [`Self::under_registration`] for a service that reads the record of an action under the
+    /// hold and gives back what it finds there.
+    ///
+    /// The registration is asked first, as everywhere: a fence this host owes, a registration
+    /// withdrawn or replaced. The deadline is not: a receipt outlives the window that admitted its
+    /// action (section 9). `commit` is given the check to ask where it begins something new, which
+    /// refuses a mutation that carries no freshness as well as one whose deadline has passed.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the registration check refuses with, in which case `commit` did not run.
+    pub(crate) fn under_registration_until_it_begins<T>(
+        &self,
+        admission: &crate::authority::AdmittedMutation,
+        commit: impl FnOnce(&dyn Fn() -> Result<()>) -> T,
+    ) -> Result<T> {
+        let _hold: CommitHold<'_> = Held {
+            guard: Some(
+                self.commit_hold
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+            controller: self,
+        };
+        self.check_registration_in(
+            &self.admitted_read(),
+            &crate::authority::AdmittedMutation {
+                deadline: None,
+                ..*admission
+            },
+        )?;
+        Ok(commit(&|| {
+            self.check_registration_in(&self.admitted_read(), admission)?;
+            if admission.deadline.is_none() {
+                return Err(carries_no_freshness());
+            }
+            Ok(())
+        }))
     }
 
     /// Returns the wall-clock deadline a mutation was accepted under, for the receipt it leaves.
