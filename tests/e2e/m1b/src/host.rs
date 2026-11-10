@@ -294,13 +294,38 @@ impl<'r> Host<'r> {
 
     /// Starts the daemon over the host tree.
     ///
+    /// A host that keeps its address cannot take another port, because a device dials the one it
+    /// has, and the port is free only until another program binds it. A daemon that exited because
+    /// it could not bind that address is started again once the address can be bound, for as many
+    /// as [`PORT_ATTEMPTS`] starts in all.
+    ///
     /// # Panics
     ///
-    /// Panics when it does not answer within [`LIVENESS`], or exits before it does.
+    /// Panics when it does not answer within [`LIVENESS`], or exits before it does, or when the
+    /// address is held for the whole of [`ADDRESS_FREE`].
     pub fn start_daemon(&self) {
-        if let Err(said) = self.start_daemon_once() {
-            panic!("the control daemon exited before it answered: {said}");
+        let kept = self
+            .configured_address()
+            .filter(|address| address.port() != 0);
+        for attempt in 1..=PORT_ATTEMPTS {
+            let Err(said) = self.start_daemon_once() else {
+                return;
+            };
+            match kept {
+                Some(address) if attempt < PORT_ATTEMPTS && address_was_taken(&said) => {
+                    until_the_address_is_free(address);
+                }
+                _ => panic!("the control daemon exited before it answered: {said}"),
+            }
         }
+        unreachable!("the last attempt returns or panics")
+    }
+
+    /// The address the host's configuration document gives its daemon to bind.
+    fn configured_address(&self) -> Option<std::net::SocketAddr> {
+        let path = kr_worker::config::document_path(&self.environment);
+        let document: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        document["network"]["bind_address"].as_str()?.parse().ok()
     }
 
     /// Starts the daemon over the host tree once, and returns what it wrote when it exited before
@@ -773,6 +798,34 @@ impl Drop for Host<'_> {
 /// How many times a host with a stable address is given a port before the daemon's refusal of it is
 /// reported. It ends a hang: each refusal is taken to be a port another leg chose at the same moment.
 const PORT_ATTEMPTS: usize = 5;
+
+/// How long a daemon's address is waited for when another program holds it, before the leg is told
+/// it stayed held. It ends a hang: the wait is over when the address can be bound.
+const ADDRESS_FREE: Duration = Duration::from_secs(20);
+
+/// Returns once a socket can be bound to `address`, and lets it go again. The daemon that stood on
+/// the address or the program that took it after it has not always let it go.
+///
+/// # Panics
+///
+/// Panics when the address stays held for [`ADDRESS_FREE`], or cannot be bound for another reason.
+fn until_the_address_is_free(address: std::net::SocketAddr) {
+    let free = Deadline::after(ADDRESS_FREE).poll(ADDRESS_FREE, ASK_AGAIN, |_| {
+        match std::net::UdpSocket::bind(address) {
+            Ok(socket) => {
+                drop(socket);
+                ControlFlow::Break(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                ControlFlow::Continue(error.to_string())
+            }
+            Err(error) => panic!("the daemon's address {address} cannot be bound: {error}"),
+        }
+    });
+    if let Err(heard) = free {
+        panic!("the daemon's address {address} stayed held for {ADDRESS_FREE:?}: {heard}");
+    }
+}
 
 /// A loopback port nothing holds now; the daemon binds it at each start, and the address a paired
 /// device holds stays the address the host answers on.
