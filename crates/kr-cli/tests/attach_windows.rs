@@ -1491,8 +1491,8 @@ enum Ending {
 
 /// A session with two attachments, a real `kr attach` in a console and a terminal this test holds,
 /// of which the first ends as `ending` says; and what that leaves: only that attachment gone, the
-/// session live, its worker and its root shell running, and the attachment that is left still
-/// typing into the shell and being answered.
+/// session live, its worker and its root shell running, and the attachment that is left, once it
+/// takes the keys the command had, typing into the shell and being answered.
 async fn only_the_attachment_that_ended_is_removed(ending: Ending) {
     let host = WorkerHost::start().await;
     let (session_id, dimensions) = host
@@ -1602,8 +1602,10 @@ async fn only_the_attachment_that_ended_is_removed(ending: Ending) {
             "{what} is still running after the attachment ended"
         );
     }
-    // The attachment that is left still holds the keys, and the shell answers it. The line the shell
-    // echoes holds the marker with a caret in it, so that only what the shell prints holds it whole.
+    // The attachment that is left takes the keys, which the command that ended had taken for itself,
+    // and the shell answers it. The line the shell echoes holds the marker with a caret in it, so that
+    // only what the shell prints holds it whole.
+    holder.take_the_keys().await;
     holder.type_line("echo kr-aft^er-the-ending").await;
     holder
         .shown(
@@ -1629,7 +1631,8 @@ async fn only_the_attachment_that_ended_is_removed(ending: Ending) {
 /// removes the attachment it names and nothing else.
 ///
 /// The `kr attach` that holds the attachment ends, and not as a failure; the session, its worker and
-/// its root shell go on, and the other attachment is still attached and still typing.
+/// its root shell go on, and the other attachment is still attached and, once it takes the keys the
+/// command had, types into the shell.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_detach_from_another_command_removes_only_the_attachment_it_names() {
     only_the_attachment_that_ended_is_removed(Ending::Detached).await;
@@ -1639,7 +1642,8 @@ async fn a_detach_from_another_command_removes_only_the_attachment_it_names() {
 /// closed is removed, and nothing else is.
 ///
 /// The console `kr attach` runs in is closed, which ends the command with it; the session, its
-/// worker and its root shell go on, and the other attachment is still attached and still typing.
+/// worker and its root shell go on, and the other attachment is still attached and, once it takes
+/// the keys the command had, types into the shell.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closing_the_console_an_attachment_runs_in_removes_only_that_attachment() {
     only_the_attachment_that_ended_is_removed(Ending::ConsoleClosed).await;
@@ -1650,7 +1654,7 @@ async fn closing_the_console_an_attachment_runs_in_removes_only_that_attachment(
 ///
 /// The `kr attach` process is ended where it stands, which is what a lost connection looks like to
 /// the worker; the session, its worker and its root shell go on, and the other attachment is still
-/// attached and still typing.
+/// attached and, once it takes the keys the command had, types into the shell.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_attachment_whose_connection_is_lost_is_removed_and_nothing_else_is() {
     only_the_attachment_that_ended_is_removed(Ending::ProcessKilled).await;

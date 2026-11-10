@@ -234,6 +234,7 @@ pub async fn attachments_of(
 /// session's root shell, and what the session writes reaches it.
 pub struct WorkerTerminal {
     client: LocalClient,
+    target: kr_protocol::envelope::ActionTarget,
     session_id: kr_protocol::ids::SessionId,
     attachment_id: kr_protocol::ids::AttachmentId,
     epoch: kr_protocol::ids::InputLeaseEpoch,
@@ -308,7 +309,7 @@ impl WorkerTerminal {
             .mutate(
                 Method::InputAcquire,
                 ActionId::new(kr_ipc::new_uuid()),
-                target,
+                target.clone(),
                 &kr_protocol::input::InputAcquireParams {
                     session_id,
                     attachment_id,
@@ -339,12 +340,46 @@ impl WorkerTerminal {
             .expect("the worker subscribes the terminal");
         Self {
             client,
+            target,
             session_id,
             attachment_id,
             epoch: lease.lease.epoch,
             sequence: 0,
             seen: String::new(),
         }
+    }
+
+    /// Takes the keys again, as a terminal does that finds another attachment has them.
+    ///
+    /// A command that attaches to the session takes the keys for itself, and they do not come back
+    /// when it goes: the attachment that is left asks for them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the worker does not hand this terminal the keys.
+    pub async fn take_the_keys(&mut self) {
+        use kr_protocol::ids::ActionId;
+        use kr_protocol::method::Method;
+
+        let lease: kr_protocol::input::InputAcquireResult = self
+            .client
+            .mutate(
+                Method::InputAcquire,
+                ActionId::new(kr_ipc::new_uuid()),
+                self.target.clone(),
+                &kr_protocol::input::InputAcquireParams {
+                    session_id: self.session_id,
+                    attachment_id: self.attachment_id,
+                    expected_epoch: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the worker hands this terminal the keys again")
+            .to_typed()
+            .expect("decodes");
+        self.epoch = lease.lease.epoch;
+        self.sequence = 0;
     }
 
     /// The attachment this terminal holds.
