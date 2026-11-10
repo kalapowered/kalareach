@@ -143,8 +143,10 @@ android {
             isJniDebuggable = true
             // A device run's subject is sometimes the application as the store ships it, and the
             // minifier is what a debug build differs in most: `KR_MINIFY_DEBUG=1` runs it on the debug
-            // build, with the release build's rules, so that the same application can be started
-            // with the debug build's test hooks.
+            // build, with the release build's rules, so that the application can be started with the
+            // debug build's test hooks. A debuggable build is minified in R8's debug mode, which removes
+            // and renames the classes no Java reaches, as the release build does, and does not
+            // optimise across the ones that are left.
             isMinifyEnabled = providers.environmentVariable("KR_MINIFY_DEBUG").orNull == "1"
             if (isMinifyEnabled) proguardFiles(*minifierRules)
             packaging {                jniLibs.keepDebugSymbols.add("*/arm64-v8a/*.so")
