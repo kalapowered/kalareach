@@ -12,14 +12,18 @@
 // A build given a temporary directory of its own, which its steps inherit, has a file of its own.
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 
 /**
  * Makes a temporary directory for one run and answers it, the environment that points a child
  * process at it (`TMPDIR` for Unix, `TEMP` and `TMP` for Windows), and the function that removes it.
+ *
+ * The directory is given by an absolute path, whatever the system's temporary directory was given
+ * as: the command line tool and Gradle each change directory, and a relative path would name a
+ * different directory for each.
  */
 export function privateTemporary(env = process.env) {
-  const directory = mkdtempSync(join(tmpdir(), 'kr-mobile-build-'))
+  const directory = mkdtempSync(join(resolve(tmpdir()), 'kr-mobile-build-'))
   return {
     directory,
     env: { ...env, TMPDIR: directory, TEMP: directory, TMP: directory },

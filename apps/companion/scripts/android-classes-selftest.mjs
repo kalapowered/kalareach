@@ -22,7 +22,7 @@
 import { Buffer } from 'node:buffer'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join, relative } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 import { dex, elf, zip } from './archive-fixtures.mjs'
 import { libraryClassNames } from './android-native-names.mjs'
@@ -1270,6 +1270,35 @@ held(
   'false',
   String(existsSync(first.directory) || existsSync(second.directory))
 )
+// The command line tool and Gradle each run in a directory of their own, so a directory given to
+// them by a relative path would be a different one for each.
+{
+  const here = process.cwd()
+  const was = process.env.TMPDIR
+  process.chdir(work)
+  mkdirSync('relative-tmp')
+  process.env.TMPDIR = 'relative-tmp'
+  let fromRelative
+  try {
+    fromRelative = privateTemporary()
+  } finally {
+    if (was === undefined) delete process.env.TMPDIR
+    else process.env.TMPDIR = was
+  }
+  const where = resolve('relative-tmp')
+  process.chdir(here)
+  held(
+    'a relative temporary directory of the environment is made absolute before it is given to a build',
+    'true',
+    String(
+      isAbsolute(fromRelative.directory) &&
+        dirname(fromRelative.directory) === where &&
+        fromRelative.env.TMPDIR === fromRelative.directory &&
+        existsSync(fromRelative.directory)
+    )
+  )
+  fromRelative.remove()
+}
 
 // What the success line counts: the different classes the libraries name (once, however many ABIs
 // carry the library), the native methods a symbol was asked for, and the classes not asked.
