@@ -83,12 +83,12 @@ async fn two_copies_with_a_fence_between_the_checks(
     (copied.expect("the first copy is answered"), fresh)
 }
 
-/// KR-REQ-09.09: a copy the service read from its record and withheld, because a fence this host
-/// owed stopped it at the service's check, is told the outcome is not shown, and not the service's
-/// refusal, when the fence is gone by the time the door asks its own check. The refusal is the
-/// service's word about authority at its check; told as the copy's kept answer to a device that has
-/// authority now, it would say the action did not happen when another copy carried it out. The
-/// control: with no fence owed, the copy is given the result the other copy recorded.
+/// What a copy the service read from its record and withheld is told, because a fence this host
+/// owed stopped it at the service's check, when the fence is gone by the time the door asks its own
+/// check: the outcome is not shown, and not the service's refusal. The refusal is the service's word
+/// about authority at its check; told as the copy's kept answer to a device that has authority now,
+/// it would say the action did not happen when another copy carried it out. The control: with no
+/// fence owed, the copy is given the result the other copy recorded.
 async fn a_copy_a_service_withheld_is_told_as_not_shown(
     method: Method,
     byte: u8,
@@ -139,15 +139,19 @@ async fn a_copy_a_service_withheld_is_told_as_not_shown(
     world.serving.abort();
 }
 
-/// KR-REQ-09.09: the machine group's steps, whose service gives a record back through the shared
-/// check.
+/// KR-REQ-09.09: a machine group step whose copy the service read from its record and withheld,
+/// because a fence this host owed stopped it at the service's check, is told the outcome is not
+/// shown when the fence is gone by the time the door asks its own check. The machine group's
+/// service gives a record back through the shared check.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_machine_group_step_a_service_withheld_is_told_as_not_shown() {
     a_copy_a_service_withheld_is_told_as_not_shown(Method::MachineJoin, 99, a_join).await;
 }
 
-/// KR-REQ-09.09: the attention group's mutations, whose store gives a record back through the
-/// check its write asks once the answer is in hand.
+/// KR-REQ-09.09: an attention change whose copy the store read from its record and withheld,
+/// because a fence this host owed stopped it at the store's check, is told the outcome is not shown
+/// when the fence is gone by the time the door asks its own check. The store gives a record back
+/// through the check its write asks once the answer is in hand.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_attention_change_a_service_withheld_is_told_as_not_shown() {
     a_copy_a_service_withheld_is_told_as_not_shown(Method::AttentionQuietHours, 100, |_| {
