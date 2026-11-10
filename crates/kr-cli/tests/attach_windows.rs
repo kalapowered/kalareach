@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use kr_ipc::identity::{ProcessState, process_state};
 use kr_protocol::session::Dimensions;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
@@ -23,7 +24,10 @@ mod teardown;
 mod windows_session;
 
 use support::kr;
-use windows_session::{LIVENESS_DEADLINE, WorkerHost, WorkerTerminal};
+use windows_session::{
+    LIVENESS_DEADLINE, WorkerHost, WorkerTerminal, attachments_until, ended, root_process_of,
+    snapshot_of, worker_of,
+};
 
 /// The Windows command shell, from the system directory.
 fn command_shell() -> String {
@@ -256,6 +260,37 @@ impl Attached {
             .try_wait()
             .expect("the command's state")
             .is_none()
+    }
+
+    /// Waits for the command to end, and says how it ended. It fails when the command is still
+    /// running at the liveness deadline, and says what the console shows then.
+    fn ends(&mut self, what: &str) -> portable_pty::ExitStatus {
+        let started = Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().expect("the command's state") {
+                return status;
+            }
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "{what}: kr attach was still running {:?} later; the console shows: {:?}",
+                started.elapsed(),
+                self.output.text()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Closes the console the command runs in, as closing its window does, and returns the command,
+    /// which the closing of its console ends.
+    fn close_the_console(self) -> Box<dyn portable_pty::Child + Send + Sync> {
+        let Self {
+            child,
+            output,
+            keyboard,
+            _master,
+        } = self;
+        drop((output, keyboard, _master));
+        child
     }
 }
 
@@ -1412,6 +1447,184 @@ fn restore_probe_in_the_console() {
         after.input, after.output
     );
     println!("kr-probe:end");
+}
+
+/// How an attachment of a session ends in the cases below.
+#[derive(Clone, Copy, Debug)]
+enum Ending {
+    /// `kr detach --attachment`, run from another command.
+    Detached,
+    /// The console the `kr attach` runs in is closed, as closing its window closes it.
+    ConsoleClosed,
+    /// The `kr attach` process is ended, as a lost connection ends it.
+    ProcessKilled,
+}
+
+/// A session with two attachments, a real `kr attach` in a console and a terminal this test holds,
+/// of which the first ends as `ending` says; and what that leaves: only that attachment gone, the
+/// session live, its worker and its root shell running, and the attachment that is left still
+/// typing into the shell and being answered.
+async fn only_the_attachment_that_ended_is_removed(ending: Ending) {
+    let host = WorkerHost::start().await;
+    let (session_id, dimensions) = host
+        .kr_new(&["--shell-mode", "native_compat", "--shell", &command_shell()])
+        .await
+        .session();
+    let environment = host.tree.environment();
+    let mut holder = WorkerTerminal::attach(&environment, session_id, dimensions).await;
+    let worker = worker_of(&environment, session_id);
+    let root = root_process_of(&environment, session_id)
+        .await
+        .expect("the worker is read")
+        .expect("the session has a root shell");
+
+    let mut console = Attached::start(&host, &session_id.to_string(), dimensions);
+    let joined = attachments_until(
+        &environment,
+        session_id,
+        |listed| listed.len() == 2,
+        "kr attach joins the session",
+    )
+    .await;
+    assert_eq!(
+        joined[0],
+        holder.attachment_id(),
+        "the terminal this test holds joined first"
+    );
+    let leaving = joined[1];
+
+    let mut ended_console = None;
+    match ending {
+        Ending::Detached => {
+            let said = host
+                .kr(
+                    &[
+                        "--json",
+                        "detach",
+                        &session_id.to_string(),
+                        "--attachment",
+                        &leaving.to_string(),
+                    ],
+                    &[],
+                )
+                .await;
+            let printed = format!(
+                "{}{}",
+                String::from_utf8_lossy(&said.stdout),
+                String::from_utf8_lossy(&said.stderr)
+            );
+            assert!(said.status.success(), "kr detach: {printed}");
+            let document: serde_json::Value = serde_json::from_slice(&said.stdout)
+                .unwrap_or_else(|error| panic!("kr detach printed no JSON ({error}): {printed}"));
+            assert_eq!(
+                document["detached"],
+                leaving.to_string(),
+                "the detach names the attachment it removed: {printed}"
+            );
+            assert_eq!(
+                document["remaining"], 1,
+                "and says one attachment remains: {printed}"
+            );
+            let status = console.ends("a detach ends the attachment it names");
+            assert!(
+                status.success(),
+                "a detach is not a failure of the command it ends ({status}): {:?}",
+                console.output.text()
+            );
+        }
+        Ending::ConsoleClosed => ended_console = Some(console.close_the_console()),
+        Ending::ProcessKilled => console.child.kill().expect("kr attach is ended"),
+    }
+
+    let left = attachments_until(
+        &environment,
+        session_id,
+        |listed| !listed.contains(&leaving),
+        "the attachment that ended is removed",
+    )
+    .await;
+    assert_eq!(
+        left,
+        vec![holder.attachment_id()],
+        "only the attachment that ended is gone, and the other is the one left"
+    );
+    let snapshot = snapshot_of(&environment, session_id)
+        .await
+        .expect("the worker is read");
+    assert_eq!(
+        snapshot.session.state,
+        kr_protocol::session::SessionState::Live,
+        "the session goes on"
+    );
+    let reported = host
+        .kr(&["status", &session_id.to_string(), "--json"], &[])
+        .await;
+    let status: serde_json::Value =
+        serde_json::from_slice(&reported.stdout).unwrap_or_else(|error| {
+            panic!(
+                "kr status printed no JSON ({error}): {}",
+                String::from_utf8_lossy(&reported.stdout)
+            )
+        });
+    assert_eq!(status["state"], "live", "and kr says it is live: {status}");
+    for (identity, what) in [(&worker, "the worker"), (&root, "the root shell")] {
+        assert!(
+            matches!(process_state(identity), ProcessState::Running),
+            "{what} is still running after the attachment ended"
+        );
+    }
+    // The attachment that is left still holds the keys, and the shell answers it. The line the shell
+    // echoes holds the marker with a caret in it, so that only what the shell prints holds it whole.
+    holder.type_line("echo kr-aft^er-the-ending").await;
+    holder
+        .shown(
+            "kr-after-the-ending",
+            "the shell answers the attachment that is left",
+        )
+        .await;
+
+    drop(ended_console);
+    drop(holder);
+    let closed = host
+        .kr(&["--json", "close", &session_id.to_string()], &[])
+        .await;
+    assert!(
+        closed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&closed.stdout)
+    );
+    ended(&worker, "the worker").await;
+}
+
+/// KR-REQ-07.52, the part about detaching: `kr detach --attachment`, run from another command,
+/// removes the attachment it names and nothing else.
+///
+/// The `kr attach` that holds the attachment ends, and not as a failure; the session, its worker and
+/// its root shell go on, and the other attachment is still attached and still typing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_from_another_command_removes_only_the_attachment_it_names() {
+    only_the_attachment_that_ended_is_removed(Ending::Detached).await;
+}
+
+/// KR-REQ-07.52, the part about closing a terminal window: the attachment of a console that is
+/// closed is removed, and nothing else is.
+///
+/// The console `kr attach` runs in is closed, which ends the command with it; the session, its
+/// worker and its root shell go on, and the other attachment is still attached and still typing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closing_the_console_an_attachment_runs_in_removes_only_that_attachment() {
+    only_the_attachment_that_ended_is_removed(Ending::ConsoleClosed).await;
+}
+
+/// KR-REQ-07.52, the part about connection loss: an attachment whose connection is lost is removed,
+/// and nothing else is.
+///
+/// The `kr attach` process is ended where it stands, which is what a lost connection looks like to
+/// the worker; the session, its worker and its root shell go on, and the other attachment is still
+/// attached and still typing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attachment_whose_connection_is_lost_is_removed_and_nothing_else_is() {
+    only_the_attachment_that_ended_is_removed(Ending::ProcessKilled).await;
 }
 
 /// `bytes` as lower-case hexadecimal.

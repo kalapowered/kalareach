@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use kr_ipc::identity::{ProcessState, process_state};
+use kr_ipc::identity::{Stop, Stopped, stop_process};
 use kr_protocol::identity::ProcessStartIdentity;
 use serde_json::Value;
 
@@ -22,7 +22,8 @@ mod teardown;
 mod windows_session;
 
 use windows_session::{
-    LIVENESS_DEADLINE, RootProcessError, WorkerHost, WorkerTerminal, at_step, root_process_of,
+    LIVENESS_DEADLINE, WorkerHost, WorkerReadError, WorkerTerminal, at_step, ended,
+    root_process_of, worker_of,
 };
 
 /// A program of the system directory.
@@ -89,27 +90,6 @@ async fn all_sessions(host: &WorkerHost) -> Vec<Value> {
         .clone()
 }
 
-/// Waits until the process the identity names is gone. It fails when it is still there after the
-/// liveness deadline, or when the kernel does not say.
-async fn ended(identity: &ProcessStartIdentity, what: &str) {
-    let started = Instant::now();
-    loop {
-        match process_state(identity) {
-            ProcessState::Ended => return,
-            ProcessState::Running => {}
-            ProcessState::Unknown { detail } => {
-                panic!("the kernel did not say whether {what} {identity:?} is there: {detail}")
-            }
-        }
-        assert!(
-            started.elapsed() < LIVENESS_DEADLINE,
-            "{what} {identity:?} was still there {:?} after the session closed",
-            started.elapsed()
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
 /// A session whose root program is `program`, with a terminal attached to it, the identity of the
 /// worker its descriptor records, and the identity of the root shell as the worker reports it.
 async fn opened(
@@ -126,13 +106,7 @@ async fn opened(
         .await
         .session();
     let environment = host.tree.environment();
-    let worker = kr_ipc::descriptor::read_all(&environment)
-        .expect("reads the runtime directory")
-        .into_iter()
-        .filter_map(|entry| entry.descriptor.ok())
-        .find(|descriptor| descriptor.session_id == session)
-        .expect("the session's descriptor is published")
-        .process_start_identity;
+    let worker = worker_of(&environment, session);
     let typist = WorkerTerminal::attach(&environment, session, dimensions).await;
     let root = root_process_of(&environment, session)
         .await
@@ -197,8 +171,8 @@ async fn nothing_started_the_closed_session_again(
         // The daemon had withdrawn the descriptor, or the connection could not be made or ended
         // before it was answered, and the kernel has now shown the worker ended. The read said
         // nothing then, and the kernel's word above is all this case holds of the root shell.
-        Err(RootProcessError::NoDescriptor | RootProcessError::Gone(_)) => {}
-        Err(RootProcessError::Failed(why)) => {
+        Err(WorkerReadError::NoDescriptor | WorkerReadError::Gone(_)) => {}
+        Err(WorkerReadError::Failed(why)) => {
             panic!("the worker was asked for its root shell again and the exchange failed: {why}")
         }
     }
@@ -259,7 +233,7 @@ fn only_a_connection_that_failed_is_no_answer_from_a_worker() {
         operation: "connect",
         source,
     };
-    let gone = |error: IpcError| matches!(at_step("a step", &error), RootProcessError::Gone(_));
+    let gone = |error: IpcError| matches!(at_step("a step", &error), WorkerReadError::Gone(_));
     for (what, error) in [
         (
             "a pipe that is not there",
@@ -366,6 +340,35 @@ async fn the_end_of_the_shells_input_closes_the_session_and_nothing_starts_it_ag
     let closed = closed_session(&host, &session.to_string()).await;
     assert_eq!(closed["closure"]["reason"], "root_exit", "{closed}");
     assert_eq!(closed["closure"]["exit_code"], 0, "{closed}");
+
+    nothing_started_the_closed_session_again(&host, (session, typist, worker, root), &closed).await;
+}
+
+/// KR-REQ-07.52: a root shell that is ended from outside, as a crash ends it, closes the session,
+/// and the shell is not started again.
+///
+/// The root shell is the Windows command shell at its prompt. The kernel is asked to end it by the
+/// identity the worker reports for it, which is neither the shell's own exit nor a request to close,
+/// so the worker finds the shell gone without having been told why. The session is then closed
+/// for the shell's ending and not for a request, the shell and the worker are gone, a second read
+/// of the worker says no other shell took the root's place, and a session opened and closed after
+/// it finds the first one closed, with its number, and nothing live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_root_shell_ended_from_outside_closes_the_session_and_nothing_starts_it_again() {
+    let host = WorkerHost::start().await;
+    let (session, typist, worker, root) = opened(&host, &system32("cmd.exe")).await;
+
+    assert_eq!(
+        stop_process(&root, Stop::Kill),
+        Stopped::Signalled,
+        "the root shell is ended from outside the session"
+    );
+    let closed = closed_session(&host, &session.to_string()).await;
+    let reason = closed["closure"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        matches!(reason, "root_exit" | "root_signal"),
+        "the shell's ending closed the session, and not a request: {closed}"
+    );
 
     nothing_started_the_closed_session_again(&host, (session, typist, worker, root), &closed).await;
 }

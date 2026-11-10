@@ -29,9 +29,9 @@ pub fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
 }
 
-/// Why a session's root shell could not be read from its worker.
+/// Why a session could not be read from its worker.
 #[derive(Debug)]
-pub enum RootProcessError {
+pub enum WorkerReadError {
     /// The session has no published descriptor that reads and checks: the worker never published
     /// one, or the daemon has withdrawn it (a file that is pending deletion or does not read is
     /// not told from that).
@@ -75,26 +75,103 @@ fn the_connection_failed(error: &kr_ipc::IpcError) -> bool {
 
 /// What an error of `step` of the exchange with a worker says: the connection ending, or the worker
 /// answering wrongly.
-pub fn at_step(step: &str, error: &kr_ipc::IpcError) -> RootProcessError {
+pub fn at_step(step: &str, error: &kr_ipc::IpcError) -> WorkerReadError {
     let said = format!("{step}: {error:?}");
     if the_connection_failed(error) {
-        RootProcessError::Gone(said)
+        WorkerReadError::Gone(said)
     } else {
-        RootProcessError::Failed(said)
+        WorkerReadError::Failed(said)
     }
 }
 
-/// The session's root shell as its worker reports it now, by the identity it was started under, or
-/// nothing when the worker reports none. The worker is reached on a connection of its own, through
-/// its descriptor, as a command would. The error says what the read met: a session with no
-/// published descriptor, and a connection that could not be made or ended before it was answered
-/// (whichever step it ended at), are what a worker that has ended shows; everything else is the
-/// worker or its answer being wrong.
-pub async fn root_process_of(
+/// The identity of the worker process the session's descriptor names, which the kernel can say is
+/// running or gone.
+///
+/// # Panics
+///
+/// Panics when the runtime directory is not read or no descriptor of the session is published.
+pub fn worker_of(
     environment: &kr_ipc::paths::EnvironmentPaths,
     session_id: kr_protocol::ids::SessionId,
-) -> Result<Option<kr_protocol::identity::ProcessStartIdentity>, RootProcessError> {
-    use RootProcessError::{Failed, NoDescriptor};
+) -> kr_protocol::identity::ProcessStartIdentity {
+    kr_ipc::descriptor::read_all(environment)
+        .expect("reads the runtime directory")
+        .into_iter()
+        .filter_map(|entry| entry.descriptor.ok())
+        .find(|descriptor| descriptor.session_id == session_id)
+        .expect("the session's descriptor is published")
+        .process_start_identity
+}
+
+/// Waits until the process the identity names is gone. It fails when it is still there after the
+/// liveness deadline, or when the kernel does not say.
+///
+/// # Panics
+///
+/// Panics as said.
+pub async fn ended(identity: &kr_protocol::identity::ProcessStartIdentity, what: &str) {
+    use kr_ipc::identity::{ProcessState, process_state};
+
+    let started = std::time::Instant::now();
+    loop {
+        match process_state(identity) {
+            ProcessState::Ended => return,
+            ProcessState::Running => {}
+            ProcessState::Unknown { detail } => {
+                panic!("the kernel did not say whether {what} {identity:?} is there: {detail}")
+            }
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "{what} {identity:?} was still there {:?} later",
+            started.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Waits until the session's worker lists attachments of which `wanted` says yes, and returns them
+/// in the order they joined. It fails when the worker cannot be read, and when the list is still
+/// not one `wanted` accepts at the liveness deadline.
+///
+/// # Panics
+///
+/// Panics as said.
+pub async fn attachments_until(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    session_id: kr_protocol::ids::SessionId,
+    wanted: impl Fn(&[kr_protocol::ids::AttachmentId]) -> bool,
+    what: &str,
+) -> Vec<kr_protocol::ids::AttachmentId> {
+    let started = std::time::Instant::now();
+    loop {
+        let listed = attachments_of(environment, session_id)
+            .await
+            .unwrap_or_else(|why| {
+                panic!("{what}: the worker is asked for its attachments: {why:?}")
+            });
+        if wanted(&listed) {
+            return listed;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "{what}: the worker lists {listed:?} {:?} later",
+            started.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// What the session's worker reports of it now: its state, its root shell and its attachments. The
+/// worker is reached on a connection of its own, through its descriptor, as a command would. The
+/// error says what the read met: a session with no published descriptor, and a connection that could
+/// not be made or ended before it was answered (whichever step it ended at), are what a worker that
+/// has ended shows; everything else is the worker or its answer being wrong.
+pub async fn snapshot_of(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    session_id: kr_protocol::ids::SessionId,
+) -> Result<kr_protocol::recovery::EventsSnapshotResult, WorkerReadError> {
+    use WorkerReadError::{Failed, NoDescriptor};
     let descriptor = kr_ipc::descriptor::read_all(environment)
         .map_err(|error| Failed(format!("the runtime directory is not read: {error:?}")))?
         .into_iter()
@@ -110,7 +187,7 @@ pub async fn root_process_of(
         .verify_worker(&descriptor)
         .await
         .map_err(|error| at_step("the descriptor's challenge", &error))?;
-    let snapshot: kr_protocol::recovery::EventsSnapshotResult = client
+    client
         .request(
             kr_protocol::method::Method::EventsSnapshot,
             &kr_protocol::recovery::EventsSnapshotParams {
@@ -122,8 +199,33 @@ pub async fn root_process_of(
         .map_err(|error| at_step("the snapshot call", &error))?
         .map_err(|error| Failed(format!("the worker refuses the snapshot: {error:?}")))?
         .to_typed()
-        .map_err(|error| Failed(format!("the snapshot is not decoded: {error:?}")))?;
-    Ok(snapshot.session.root_process.as_ref().cloned())
+        .map_err(|error| Failed(format!("the snapshot is not decoded: {error:?}")))
+}
+
+/// The session's root shell as its worker reports it now, by the identity it was started under, or
+/// nothing when the worker reports none. The error is [`snapshot_of`]'s.
+pub async fn root_process_of(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    session_id: kr_protocol::ids::SessionId,
+) -> Result<Option<kr_protocol::identity::ProcessStartIdentity>, WorkerReadError> {
+    Ok(snapshot_of(environment, session_id)
+        .await?
+        .session
+        .root_process)
+}
+
+/// The attachments the session's worker lists now, in the order they joined. The error is
+/// [`snapshot_of`]'s.
+pub async fn attachments_of(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    session_id: kr_protocol::ids::SessionId,
+) -> Result<Vec<kr_protocol::ids::AttachmentId>, WorkerReadError> {
+    Ok(snapshot_of(environment, session_id)
+        .await?
+        .attachments
+        .iter()
+        .map(|attachment| attachment.attachment_id)
+        .collect())
 }
 
 /// A terminal attached to a real worker's session, holding its keys: what it types reaches the
@@ -241,6 +343,11 @@ impl WorkerTerminal {
             sequence: 0,
             seen: String::new(),
         }
+    }
+
+    /// The attachment this terminal holds.
+    pub fn attachment_id(&self) -> kr_protocol::ids::AttachmentId {
+        self.attachment_id
     }
 
     /// Types one line into the session's root shell, ending it with the carriage return the Enter
