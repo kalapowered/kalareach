@@ -22,9 +22,9 @@ use kr_client::cursors::StreamCursors;
 use kr_e2e_agents::account::{
     AppendOnly, Guarded, Ledger, append_only_files, appended_since, borrow_login_keychain, changes,
     conversation_id, files_holding, files_holding_any, guarded_files, holds_any,
-    key_from_descriptor, keychain_item_modified, line_identity, now_ms, read_if_there,
-    record_guarded, record_key_scan, record_rewrites, remove_appended_lines, remove_created,
-    reported_rewrites, snapshot, which_hold,
+    keychain_item_modified, line_identity, now_ms, read_if_there, record_guarded, record_key_scan,
+    record_rewrites, remove_appended_lines, remove_created, reported_rewrites, snapshot,
+    which_hold,
 };
 use kr_e2e_agents::build::{
     Account, AccountHome, Action, Build, Confinement, Inputs, InstallSwitch, Launch, quote,
@@ -36,6 +36,11 @@ use kr_e2e_agents::detect::{
     Detection, Held, Launched, Shown, Surface, all_rejected, announced_now, backend_files,
     capabilities_of, check_detected, check_ended, check_observation_only, check_unchanged,
     checker_controls, detected_evidence, wait_for_detection, wait_for_no_instance,
+};
+use kr_e2e_agents::held::{
+    Absent, CONFIG_DIRECTORY, HeldKeys, ISOLATION_UNPROVEN, KEY_SEARCHES, PROXY_VARIABLES,
+    folder_of, holds_a_key, kept_clear, kept_panic_text, panic_text, recorded_text,
+    unsearchable_count,
 };
 use kr_e2e_agents::keychain::RunKeychain;
 use kr_e2e_agents::keys;
@@ -91,11 +96,6 @@ const SHOT: &str = "kalareach-shot.png";
 /// part that says so stops its agent.
 const LOGIN_UNPROVEN: &str = "the agent's login is not established:";
 
-/// How a part says it could not show that the agent loads none of the person's own servers. A
-/// part that says so stops its agent before it starts.
-const ISOLATION_UNPROVEN: &str =
-    "the agent's isolation from the person's own servers is not established:";
-
 /// How a part says its guards found what stops it while it ran: a file of the person's that no
 /// part may change changed, or the agent started a subagent. A part that says so does nothing
 /// more, and its agent stops.
@@ -146,10 +146,6 @@ fn guard_class(what: &str) -> &'static str {
         "guarded_file_changed"
     }
 }
-
-/// The directory of the run's own an agent keeps its configuration in, where its build list entry
-/// names one, in the run's directory.
-const CONFIG_DIRECTORY: &str = "agent-config";
 
 /// A one-pixel PNG.
 const PNG: &[u8] = &[
@@ -921,12 +917,6 @@ fn outside_of(view: &ProcessView, roots: &[u32]) -> Vec<u32> {
         .collect()
 }
 
-/// The run's folder as the agent sees it: its resolved path.
-fn folder_of(run: &Run) -> PathBuf {
-    std::fs::canonicalize(run.work())
-        .unwrap_or_else(|error| panic!("the run's folder as the system names it: {error}"))
-}
-
 /// The paths and the proxy port of a confined agent's sandbox, as the system resolves them.
 fn layout_of(stage: &Stage<'_, '_>) -> Layout {
     let login = stage.login.expect("a part with a login");
@@ -1606,180 +1596,6 @@ fn refusal_note(why: &str, shown: &str, key: &str, rows: &[String], secrets: &[&
     format!("{why}: a dialog showing {shown:?}, refused with {key:?}; {said}")
 }
 
-/// One element of a text read for a key: a character a key is made of, or a run that may be a
-/// colour code (`ESC [`, digits and semicolons, `m`) or may be characters of the key itself, which
-/// the reading takes either way, whole.
-enum Item {
-    Char(char),
-    Colour(Vec<char>),
-}
-
-/// `text` as the characters a key is made of (letters, digits, `-` and `_`) in order, the rest taken
-/// out: whitespace, the frame and block characters an agent draws around its rows, the escape
-/// character and what else sits between them. A whole colour-looking sequence is one [`Item::Colour`]
-/// holding its digits and its `m`, so that a key is found whichever of such sequences are colour and
-/// whichever are key characters.
-fn items_of(text: &str) -> Vec<Item> {
-    let characters: Vec<char> = text.chars().collect();
-    let mut items = Vec::new();
-    let mut at = 0;
-    while at < characters.len() {
-        let character = characters[at];
-        if character == '\u{1b}' {
-            if characters.get(at + 1) == Some(&'[') {
-                let mut end = at + 2;
-                while end < characters.len()
-                    && (characters[end].is_ascii_digit() || characters[end] == ';')
-                {
-                    end += 1;
-                }
-                if characters.get(end) == Some(&'m') {
-                    let inner: Vec<char> = characters[at + 2..=end]
-                        .iter()
-                        .copied()
-                        .filter(|inner| *inner != ';')
-                        .collect();
-                    items.push(Item::Colour(inner));
-                    at = end + 1;
-                    continue;
-                }
-            }
-        } else if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
-            items.push(Item::Char(character));
-        }
-        at += 1;
-    }
-    items
-}
-
-/// Whether `piece` is found in `items`, from some start, taking each [`Item::Colour`] whole or not
-/// at all (a start can fall inside one, which then is key characters). The search is a walk over
-/// states (item, offset inside a colour-looking run, characters of the piece matched), each taken
-/// once, with a stack of its own: its time and memory grow with the length of the text, not with
-/// the number of ways its colour codes can be read.
-fn piece_in(items: &[Item], piece: &[char]) -> bool {
-    let mut seen = std::collections::HashSet::new();
-    let mut stack: Vec<(usize, usize, usize)> = Vec::new();
-    for (item, element) in items.iter().enumerate() {
-        match element {
-            Item::Char(_) => stack.push((item, 0, 0)),
-            Item::Colour(inner) => stack.extend((0..inner.len()).map(|offset| (item, offset, 0))),
-        }
-    }
-    while let Some(state) = stack.pop() {
-        let (item, offset, matched) = state;
-        if matched == piece.len() {
-            return true;
-        }
-        if item >= items.len() || !seen.insert(state) {
-            continue;
-        }
-        match &items[item] {
-            Item::Char(character) => {
-                if *character == piece[matched] {
-                    stack.push((item + 1, 0, matched + 1));
-                }
-            }
-            Item::Colour(inner) => {
-                let rest = &inner[offset..];
-                let take = rest.len().min(piece.len() - matched);
-                if rest[..take] == piece[matched..matched + take] {
-                    stack.push((item + 1, 0, matched + take));
-                }
-                if offset == 0 {
-                    stack.push((item + 1, 0, matched));
-                }
-            }
-        }
-    }
-    false
-}
-
-/// The length of the pieces of a held key that no note may carry: a note holding eight characters
-/// of a random key in a row holds more of it than is safe, whole, wrapped over rows, clipped at a
-/// screen edge or between colour codes. (A key's fixed vendor prefix is as long and also stops a
-/// note, which costs a diagnostic and nothing else, since a failure is classed before its text is
-/// held to this.)
-const KEY_PIECE: usize = 8;
-
-thread_local! {
-    /// How many times this thread has searched a text for a piece of a key: what a text's recording
-    /// costs is counted in searches, which a test holds to a number the text's length cannot raise.
-    static KEY_SEARCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Whether `rows`, read as one run, hold a piece of eight characters of one of `secrets`, whichever
-/// of the colour-looking sequences in them are colour and whichever are characters of the key. A
-/// value of fewer than eight characters has no piece. An encoding of the key that changes its
-/// characters (base64, hex, a `\u` escape of each) is not covered; nor are pieces of fewer than
-/// eight characters kept apart by other letters or digits, or an escape sequence that is not a
-/// colour code and a terminal would draw nothing for, between pieces of seven.
-fn holds_a_key(rows: &[&str], secrets: &[&str]) -> bool {
-    KEY_SEARCHES.with(|searches| searches.set(searches.get() + 1));
-    let items: Vec<Item> = rows.iter().flat_map(|row| items_of(row)).collect();
-    secrets.iter().any(|secret| {
-        let secret: Vec<char> = items_of(secret)
-            .into_iter()
-            .flat_map(|item| match item {
-                Item::Char(character) => vec![character],
-                Item::Colour(inner) => inner,
-            })
-            .collect();
-        secret
-            .windows(KEY_PIECE)
-            .any(|piece| piece_in(&items, piece))
-    })
-}
-
-/// `text` as it is, or a line that says it is not kept where it holds a piece of a held key
-/// (`secrets`; see [`holds_a_key`]): the one place a text goes through before the part prints or
-/// keeps it.
-fn kept_clear(text: &str, secrets: &[&str]) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    if holds_a_key(&lines, secrets) {
-        "(the text holds a key, so it is not kept)".to_owned()
-    } else {
-        text.to_owned()
-    }
-}
-
-/// The values of the keys the part holds, for the panic hook: set when a part with a login is made.
-static HELD_FOR_PANICS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-
-/// Makes every panic of the part's threads go through [`kept_clear`] before it is printed, once for
-/// the process: a failure's message, which can hold a screen or an agent's output, never carries a
-/// piece of a held key into the part's log. The values are those of the part made last.
-fn gate_panics(secrets: &[String]) {
-    static INSTALLED: std::sync::Once = std::sync::Once::new();
-    *HELD_FOR_PANICS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = secrets.to_vec();
-    INSTALLED.call_once(|| {
-        let printed = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            let message = panic_text(info.payload());
-            let held = HELD_FOR_PANICS
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            let held: Vec<&str> = held.iter().map(String::as_str).collect();
-            if holds_a_key(&message.lines().collect::<Vec<_>>(), &held) {
-                let place = info
-                    .location()
-                    .map_or_else(String::new, |place| format!(" at {place}"));
-                let _ = std::io::Write::write_fmt(
-                    &mut std::io::stderr(),
-                    format_args!(
-                        "\nthread panicked{place}: the message holds a key, so it is not printed\n"
-                    ),
-                );
-            } else {
-                printed(info);
-            }
-        }));
-    });
-}
-
 /// The values of the keys the part holds: its login's own and the other keys the harness's shell
 /// holds, which a text the part keeps must not carry.
 fn held_keys(stage: &Stage<'_, '_>) -> Vec<String> {
@@ -2134,47 +1950,6 @@ fn stop_failures(stop: &[(&'static str, String)]) -> Vec<Failure> {
     failures
 }
 
-/// What a panic said, where it said anything, as it said it: the text a failure is classed by.
-fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
-    panic
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
-        .unwrap_or_else(|| "the part stopped without saying why".to_owned())
-}
-
-/// `text` as the part records or prints it: as it is, or, where it holds a piece of a held key
-/// (`secrets`), only its first words (up to the first colon or line break, the colon that ends the
-/// class a failure begins with), where those hold no piece of a key, and a line that says the rest
-/// is not kept.
-fn recorded_text(text: &str, secrets: &[&str]) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    if !holds_a_key(&lines, secrets) {
-        return text.to_owned();
-    }
-    // A longer head holds every piece a shorter one holds, so the first delimiter after the first
-    // character is the only one whose head can be free of a key: one search decides, and a head
-    // that holds a piece is discarded whatever follows it.
-    let head = text
-        .match_indices([':', '\n'])
-        .find(|(at, _)| *at > 0)
-        .filter(|(at, _)| !holds_a_key(&[&text[..*at]], secrets))
-        .map_or("", |(at, _)| &text[..=at.min(text.len() - 1)]);
-    let head = head.trim_end_matches('\n');
-    format!("{head} (the rest holds a key, so it is not kept)")
-}
-
-/// [`recorded_text`] with the values of the keys the part holds, which a part with a login sets at
-/// its start.
-fn kept_panic_text(text: &str) -> String {
-    let held = HELD_FOR_PANICS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    let held: Vec<&str> = held.iter().map(String::as_str).collect();
-    recorded_text(text, &held)
-}
-
 /// Runs one part on a stage of its own, closes the stage, and appends the part's outcome once the
 /// closing check has passed.
 ///
@@ -2202,41 +1977,11 @@ fn staged(
         let account = inputs.build.account.clone().unwrap_or_else(|| {
             panic!("part {part} needs a login, and the build list names none for this agent")
         });
-        let key = account.variable.as_ref().map(|name| {
-            let value = key_from_descriptor().unwrap_or_else(|why| {
-                panic!("part {part} carries {name}, and the harness gave no value for it: {why}")
-            });
-            (name.clone(), value)
-        });
-        // The other keys the harness's shell holds, whose values the part's data is searched for;
-        // the login's own value is searched for by the part's key scan.
-        let others: Vec<String> = keys::scan_values_from_descriptor()
-            .unwrap_or_else(|why| {
-                panic!(
-                    "part {part} searches its data for the keys the person's shell holds, and the \
-                     harness gave none: {why}"
-                )
-            })
-            .into_iter()
-            .filter(|value| key.as_ref().is_none_or(|(_, own)| own != value))
-            .collect();
-        // A value a result's own syntax could hide, because JSON writes it differently from the
-        // bytes the searches look for, cannot be held out or found in one: the part does not start.
-        // From here every panic's message goes through the held-key rule before it is printed.
-        gate_panics(
-            &others
-                .iter()
-                .cloned()
-                .chain(key.iter().map(|(_, value)| value.clone()))
-                .collect::<Vec<_>>(),
-        );
-        let unsearchable = unsearchable_count(key.as_ref().map(|(_, own)| own.as_str()), &others);
-        assert!(
-            unsearchable == 0,
-            "{ISOLATION_UNPROVEN} {unsearchable} key value(s), the login's own among them or the \
-             person's shell's other keys, have a quote, bracket, backslash or control character, so \
-             a result could not be searched for them: have them unset for the run, or use another key"
-        );
+        // The login's own key and the other keys the harness's shell holds, whose values the part's
+        // data is searched for. A value a result's own syntax could hide cannot be held out or found
+        // in one: the part does not start, and from here every panic's message goes through the
+        // held-key rule before it is printed.
+        let HeldKeys { key, others } = HeldKeys::read(&format!("part {part}"), &account);
         let person_home =
             PathBuf::from(std::env::var_os("HOME").expect("the person's home in HOME"));
         let mut account = account;
@@ -3624,19 +3369,6 @@ fn end_and_show(stage: &Stage<'_, '_>, agent: &Agent) -> (Launched, Shown) {
 /// A session's environment, variable by variable.
 type Variables = Vec<(String, String)>;
 
-/// The proxy variables a part without a login sets to a closed port. An agent with a login has
-/// none of them: it reaches its vendor.
-const PROXY_VARIABLES: [&str; 8] = [
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "ALL_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "all_proxy",
-    "NO_PROXY",
-    "no_proxy",
-];
-
 /// Links the build and prepares the run's home as a part without a login does, and returns the
 /// environment of the host's own steps and that of the agent's session: the login's home, the
 /// person's USER and LOGNAME, no proxy variable, and, where the login is a variable, that variable,
@@ -3817,6 +3549,19 @@ fn listed(paths: &[PathBuf]) -> String {
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The files the build list says must not exist before the agent starts, which `which` selects, with
+/// each template filled in for the part's run, the home the agent runs with and the person's own.
+fn absent_paths(stage: &Stage<'_, '_>, which: Absent) -> Vec<PathBuf> {
+    let login = stage.login.expect("a part with a login");
+    kr_e2e_agents::held::absent_paths(
+        login.account(),
+        stage.run,
+        &login_home(stage),
+        &login.person_home,
+        which,
+    )
 }
 
 /// The home the agent runs with in a part with a login.
@@ -4759,92 +4504,6 @@ fn switches_of(stage: &Stage<'_, '_>) -> Vec<String> {
         }
     }
     switches
-}
-
-/// The files the build list says must not exist before the agent starts, with `{config}` and
-/// `{work}` made the run's configuration and working directories, `{home}` the home the agent runs
-/// with, and `{user}` the account name the system has for the person, as `id -un` says it.
-/// Which of an entry's `absent` paths [`absent_paths`] gives.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Absent {
-    /// Every path, each `{ancestors}` entry expanded for every folder above the working folder.
-    All,
-    /// Only the `{ancestors}` entries, expanded: the files an agent searches for up the tree, which
-    /// must be known absent before any program of the agent runs.
-    Ancestors,
-    /// Every path, with an `{ancestors}` entry as its template, for the record.
-    Published,
-}
-
-/// The paths of the entry's `absent` list that `which` selects, with each template filled in.
-fn absent_paths(stage: &Stage<'_, '_>, which: Absent) -> Vec<PathBuf> {
-    let account = stage.login.expect("a part with a login").account();
-    let home = login_home(stage).display().to_string();
-    let config = stage
-        .run
-        .root()
-        .join(CONFIG_DIRECTORY)
-        .display()
-        .to_string();
-    let work = stage.run.work().display().to_string();
-    let person = stage
-        .login
-        .expect("a part with a login")
-        .person_home
-        .display()
-        .to_string();
-    // The account name as the system has it, as the agent itself reads it, not the environment's.
-    let user = std::process::Command::new("/usr/bin/id")
-        .arg("-un")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| {
-            panic!("{ISOLATION_UNPROVEN} the account name the system has cannot be read")
-        });
-    // `{ancestors}` stands for the working folder and each folder above it, as given and as the system
-    // resolves it, for a file an agent searches for up the tree.
-    let folders: Vec<String> = {
-        let mut seen = Vec::new();
-        for start in [stage.run.work(), folder_of(stage.run)] {
-            for folder in start.ancestors() {
-                let text = folder.display().to_string();
-                let text = if text == "/" { String::new() } else { text };
-                if !seen.contains(&text) {
-                    seen.push(text);
-                }
-            }
-        }
-        seen
-    };
-    account
-        .absent
-        .iter()
-        .filter(|path| which != Absent::Ancestors || path.contains("{ancestors}"))
-        .flat_map(|path| {
-            let expand = |path: &str| {
-                PathBuf::from(
-                    path.replace("{config}", &config)
-                        .replace("{work}", &work)
-                        .replace("{home}", &home)
-                        .replace("{person}", &person)
-                        .replace("{user}", &user),
-                )
-            };
-            if path.contains("{ancestors}") && which == Absent::Published {
-                vec![PathBuf::from(path)]
-            } else if path.contains("{ancestors}") {
-                folders
-                    .iter()
-                    .map(|folder| expand(&path.replace("{ancestors}", folder)))
-                    .collect::<Vec<_>>()
-            } else {
-                vec![expand(path)]
-            }
-        })
-        .collect()
 }
 
 /// A random number below `bound`, from the system's random source.
@@ -7637,20 +7296,6 @@ fn local_idle(stage: &Stage<'_, '_>, window: &Window, why: &str) -> Vec<String> 
         );
         std::thread::sleep(Duration::from_millis(100));
     }
-}
-
-/// How many of the values a part searches for cannot be held out of a result or found in one, the
-/// login's own value (`own`) and the other keys the person's shell holds (`others`), each counted
-/// once.
-fn unsearchable_count(own: Option<&str>, others: &[String]) -> usize {
-    let mut values: Vec<&str> = others.iter().map(String::as_str).collect();
-    values.extend(own);
-    values.sort_unstable();
-    values.dedup();
-    values
-        .into_iter()
-        .filter(|value| !confine::searchable(value))
-        .count()
 }
 
 /// The longest whitespace-separated word of `text`, without the punctuation at its ends (an agent

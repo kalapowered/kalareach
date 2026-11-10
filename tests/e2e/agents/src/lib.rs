@@ -79,6 +79,8 @@ pub mod conversation;
 #[cfg(unix)]
 pub mod detect;
 #[cfg(unix)]
+pub mod held;
+#[cfg(unix)]
 pub mod keychain;
 #[cfg(unix)]
 pub mod keys;
