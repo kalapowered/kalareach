@@ -9774,7 +9774,29 @@ async fn storage_that_moves_between_the_managed_service_and_one_the_owner_runs_l
         "the service the owner runs was shown only the account it issued"
     );
 
-    // Back to the managed service: the grant for the owner's service is presented to nothing.
+    // Back to the managed service: the grant for the owner's service is presented to nothing. The
+    // first daemon's carrier is still at work on the setup it just recorded, uploading the first
+    // generation there, so it is stopped after it has published that generation and ended a pass
+    // that began after: what reaches the service after that is the second daemon's.
+    let carrier = controller.backup_runtime().expect("a carrier");
+    let mut ended = carrier.passes();
+    within("the first generation at the owner's service", async {
+        while !controller
+            .backup()
+            .generations()
+            .expect("the store reads")
+            .iter()
+            .any(|record| {
+                record.archive_id == archive_two()
+                    && record.production == Production::Complete
+                    && record.remote == Remote::Published
+            })
+        {
+            ended.changed().await.expect("the carrier is running");
+        }
+    })
+    .await;
+    within("the carrier's pass after that", carrier.carry_now()).await;
     serving.abort();
     let _ = serving.await;
     drop(controller);
