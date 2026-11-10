@@ -178,16 +178,21 @@ export function dex({ defined = [], referenced = [], constants = [], methods = {
  * its string table and the section headers that find them -- and no code. `wide` is a 64-bit
  * library, as the ABIs the application ships are, and not wide a 32-bit one. `locals` and `hidden`
  * name defined symbols that are local and that are hidden, which no other library can find, and
- * `headers: false` leaves the section headers out.
+ * `weak` ones that are weak, which it can. `headers: false` leaves the section headers out,
+ * `dynamic: false` makes the symbol table an ordinary one, and `stringsLink` is the section the
+ * symbol table names as its strings (1 is the string table, 3 the table of section names).
  */
 export function elf({
   exports = [],
   imports = [],
   locals = [],
   hidden = [],
+  weak = [],
   blobs = [],
   wide = true,
-  headers = true
+  headers = true,
+  dynamic = true,
+  stringsLink = 1
 } = {}) {
   const sectionNames = ['', '.dynstr', '.dynsym', '.shstrtab']
   const text = (names) => {
@@ -203,14 +208,15 @@ export function elf({
     }
     return { offsets, bytes: Buffer.concat(parts) }
   }
-  const dynstr = text([...imports, ...exports, ...locals, ...hidden])
+  const dynstr = text([...imports, ...exports, ...locals, ...hidden, ...weak])
   const shstr = text(sectionNames)
   const symbolSize = wide ? 24 : 16
   const symbols = [
     ...imports.map((name) => [name, 0, 0x12, 0]),
     ...exports.map((name) => [name, 1, 0x12, 0]),
     ...locals.map((name) => [name, 1, 0x02, 0]),
-    ...hidden.map((name) => [name, 1, 0x12, 2])
+    ...hidden.map((name) => [name, 1, 0x12, 2]),
+    ...weak.map((name) => [name, 1, 0x22, 0])
   ]
   const dynsym = Buffer.alloc((1 + symbols.length) * symbolSize)
   symbols.forEach(([name, section, info, other], index) => {
@@ -263,7 +269,7 @@ export function elf({
     }
   }
   put(1, '.dynstr', 3, dynstrAt, dynstr.bytes.length, 0)
-  put(2, '.dynsym', 11, dynsymAt, dynsym.length, 1)
+  put(2, '.dynsym', dynamic ? 11 : 2, dynsymAt, dynsym.length, stringsLink)
   put(3, '.shstrtab', 3, shstrAt, shstr.bytes.length, 0)
   return Buffer.concat([header, body, dynstr.bytes, dynsym, shstr.bytes, sections])
 }

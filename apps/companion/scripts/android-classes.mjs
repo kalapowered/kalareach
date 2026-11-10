@@ -402,6 +402,9 @@ function and(items) {
  * A class is one the libraries are bound to when they export a native method for it. A class that
  * declares natives and has no export, such as the encoder of a codec the library was built without,
  * is not asked for symbols, and neither is a library that registers its methods and exports none.
+ * A class some of whose natives a library exports and the rest of which it registers is asked for
+ * all of them, and fails: nothing here overrides that, so such a library would need the check told
+ * about it.
  */
 export function nativeNames(path) {
   const kind = extname(path).toLowerCase()
@@ -775,14 +778,26 @@ export function verify(paths) {
       continue
     }
     whole = false
-    const shownProblems = reading.problems.slice(0, MOST_PROBLEMS)
-    const more = reading.problems.length - shownProblems.length
+    const classes = reading.problems.filter((problem) => problem.startsWith('class '))
+    const natives = reading.problems.filter((problem) => problem.startsWith('native method '))
+    const lines = (problems) => {
+      const first = problems.slice(0, MOST_PROBLEMS)
+      const more = problems.length - first.length
+      return first.map((problem) => `  ${problem}`).join('\n') + (more > 0 ? `\n  and ${more} more` : '')
+    }
     console.error(
-      `${shown}: its native libraries find ${reading.problems.length} names that its dex does not hold:\n` +
-        shownProblems.map((problem) => `  ${problem}`).join('\n') +
-        (more > 0 ? `\n  and ${more} more` : '') +
-        '\nNative code finds these by name, and a minifier that sees no Java reaching them removes or ' +
-        'renames them. Keep them in the rules of the library that carries them.'
+      `${shown}: its native libraries find names that its dex does not hold.` +
+        (classes.length > 0
+          ? `\n${classes.length} classes the libraries name, which the dex does not define under that ` +
+            `name:\n${lines(classes)}\nNative code finds a class by name, and a minifier that sees no ` +
+            'Java reaching it removes or renames it. Keep it in the rules of the library that carries it.'
+          : '') +
+        (natives.length > 0
+          ? `\n${natives.length} native methods the dex declares, in classes the libraries export natives ` +
+            `for, that no library exports:\n${lines(natives)}\nThe runtime binds a native method to the ` +
+            'symbol its class, name and arguments make. A method that has none was renamed, or its ' +
+            'library registers its natives and does not export them.'
+          : '')
     )
   }
   return whole

@@ -73,6 +73,7 @@ export function libraryClassNames(bytes, { chunk = CHUNK, overlap = OVERLAP } = 
 // -- the exported symbols ---------------------------------------------------------------------------
 
 const SHT_DYNSYM = 11
+const SHT_STRTAB = 3
 const SHN_UNDEF = 0
 const STB_GLOBAL = 1
 const STB_WEAK = 2
@@ -128,6 +129,11 @@ function exportedSymbols(bytes) {
     if (!strings || symbols.offset + symbols.size > bytes.length || strings.offset + strings.size > bytes.length) {
       throw new Error('an ELF library whose dynamic symbols are not within the file')
     }
+    // Names are read from the dynamic string table, and not from the table of section names or any
+    // other section a symbol table might be pointed at.
+    if (strings.type !== SHT_STRTAB || symbols.link === bytes.readUInt16LE(wide ? 0x3e : 0x32)) {
+      throw new Error('an ELF library whose dynamic symbols name no dynamic string table')
+    }
     for (let at = symbols.offset; at + symbolSize <= symbols.offset + symbols.size; at += symbolSize) {
       const shndx = bytes.readUInt16LE(at + (wide ? 6 : 14))
       if (shndx === SHN_UNDEF) continue
@@ -172,7 +178,7 @@ export function nativeMethodOf(symbol) {
       parts[parts.length - 1] += String.fromCharCode(parseInt(mangled.slice(at + 2, at + 6), 16))
       at += 5
     } else if (next === '_' && !/[0-3]/.test(mangled[at + 2] ?? '')) {
-      signature = mangled.slice(at + 2).toLowerCase()
+      signature = mangled.slice(at + 2)
       break
     } else parts.push('')
   }
@@ -182,7 +188,9 @@ export function nativeMethodOf(symbol) {
 
 /**
  * The runtime's mangling of the argument types of a method, as the tail of a long `Java_` name
- * (`ILjava/lang/String;` is `ILjava_lang_String_2`), in lower case as `nativeMethodOf` reads it.
+ * (`ILjava/lang/String;` is `ILjava_lang_String_2`). The runtime looks a symbol up by its exact
+ * spelling, so the case of a class name and of a hex digit counts: `call(URL)` and `call(Url)` have
+ * two names.
  */
 export function mangledArguments(descriptors) {
   let mangled = ''
@@ -194,7 +202,7 @@ export function mangledArguments(descriptors) {
     else if (/[A-Za-z0-9]/.test(char)) mangled += char
     else mangled += `_0${char.charCodeAt(0).toString(16).padStart(4, '0')}`
   }
-  return mangled.toLowerCase()
+  return mangled
 }
 
 /** The native methods a library is bound to by name: each exported `Java_` symbol, decoded. */
