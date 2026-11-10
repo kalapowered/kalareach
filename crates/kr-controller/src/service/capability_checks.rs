@@ -418,7 +418,9 @@ impl Controller {
             // identifier, under the one hold that also starts a run. The hold keeps a revocation
             // and a withdrawn registration out until the closure ends, but not the publication of
             // a fence this host owes, and the check above came before the lock on the checks and
-            // the read of the record. So the fence is asked again with the answer in hand.
+            // the read of the record. So the fence is asked again with what the record gave in
+            // hand, whether an answer, a reused identifier or a row that cannot be read: each tells
+            // the caller that a record exists.
             match self.capability_answers.recall(actor_id, mutation.action_id) {
                 Ok(Some(held)) if held.digest == digest => {
                     self.check_fence()?;
@@ -431,7 +433,10 @@ impl Controller {
                     });
                 }
                 Ok(None) => {}
-                Err(error) => return Err(error),
+                Err(error) => {
+                    self.check_fence()?;
+                    return Err(error);
+                }
             }
             // What the start comes to is worked out on a copy and written down before anything
             // is changed or started: a record that cannot be written refuses the start, with the

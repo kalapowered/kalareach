@@ -1197,43 +1197,45 @@ async fn an_automation_action_another_copy_recorded_is_not_given_back_after_a_fe
 // The disclosed checks
 // ---------------------------------------------------------------------------------------------
 
-/// KR-REQ-09.09, the disclosed checks: a request for them that another copy answered is read back
-/// inside the start's own hold on the connection's registration, and the hold keeps a revocation
-/// out but not the publication of a fence this host owes. The late copy has passed the registration
-/// check and holds the lock of the checks when a fence lands before it reads the record of
-/// answers; the fence is asked again with the answer in hand. The control: with nothing owed the
-/// late copy is given what the first was told.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_capability_check_another_copy_answered_is_not_given_back_after_a_fence_lands() {
+/// A request for the disclosed checks that names `authorised_file`, under a fixed action
+/// identifier when one is given.
+fn capability_request(
+    temp: &kr_ipc::testing::TempHost,
+    action_id: Option<ActionId>,
+    authorised_file: Option<&str>,
+) -> MutationRequest {
     use kr_protocol::desktop::EnvironmentCapabilitiesCheckParams;
 
-    let (temp, controller, _clock) = daemon().await;
-    let (connection_id, actor_id) = admitted(&controller).await;
-    let mutation = mutation_of(
-        &temp,
+    let mut request = mutation_of(
+        temp,
         Method::EnvironmentCapabilitiesCheck,
         ParamsValue::from_typed(&EnvironmentCapabilitiesCheckParams {
             environment_id: temp.environment_id(),
-            authorised_file: Nullable::null(),
+            authorised_file: authorised_file.map(str::to_owned).into(),
         })
         .expect("encodes"),
     );
-    let admission = carried(&controller, connection_id);
-    let first = controller
-        .start_capability_checks(&actor_id, &mutation, admission)
-        .await
-        .expect("the first copy is answered");
+    if let Some(action_id) = action_id {
+        request.action_id = action_id;
+    }
+    request
+}
 
-    let control = controller
-        .start_capability_checks(&actor_id, &mutation, admission)
-        .await
-        .expect("with nothing owed the late copy is answered from the record");
-    assert_eq!(control, first, "it is given what the first copy was told");
-
+/// A late copy of a request for the disclosed checks: it has passed the registration check and holds
+/// the lock of the checks, and is stopped before it reads the record of answers. While it is
+/// stopped this host owes a fence when `fence` is set; the copy then goes on and its answer is
+/// returned.
+async fn a_late_capability_copy_at_the_record(
+    controller: &Arc<Controller>,
+    actor_id: &ActorId,
+    mutation: &MutationRequest,
+    admission: AdmittedMutation,
+    fence: bool,
+) -> Result<ParamsValue, crate::error::ControllerError> {
     let (arrived, release) = controller.before_a_capability_check_looks.arm();
     let mut late = tokio::spawn({
         let (controller, actor_id, mutation) =
-            (Arc::clone(&controller), actor_id.clone(), mutation.clone());
+            (Arc::clone(controller), actor_id.clone(), mutation.clone());
         async move {
             controller
                 .start_capability_checks(&actor_id, &mutation, admission)
@@ -1250,14 +1252,120 @@ async fn a_capability_check_another_copy_answered_is_not_given_back_after_a_fenc
         }
         answered = &mut late => panic!("the late copy was answered before it read the record: {answered:?}"),
     }
-    controller.hold_fence(true);
+    controller.hold_fence(fence);
     release.send(()).expect("the late copy goes on");
-    let refused = late
-        .await
-        .expect("the late copy finishes")
-        .expect_err("a fence that landed before the record was read stops the answer");
-    refused_for_a_fence(&refused.to_protocol_error());
+    let answered = late.await.expect("the late copy finishes");
     controller.hold_fence(false);
+    answered
+}
+
+/// KR-REQ-09.09, the disclosed checks: a request for them that another copy answered is read back
+/// inside the start's own hold on the connection's registration, and the hold keeps a revocation
+/// out but not the publication of a fence this host owes. The late copy has passed the registration
+/// check and holds the lock of the checks when a fence lands before it reads the record of
+/// answers; the fence is asked again with the answer in hand. The control: with nothing owed the
+/// late copy is given what the first was told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capability_check_another_copy_answered_is_not_given_back_after_a_fence_lands() {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let mutation = capability_request(&temp, None, None);
+    let admission = carried(&controller, connection_id);
+    let first = controller
+        .start_capability_checks(&actor_id, &mutation, admission)
+        .await
+        .expect("the first copy is answered");
+
+    let control =
+        a_late_capability_copy_at_the_record(&controller, &actor_id, &mutation, admission, false)
+            .await
+            .expect("with nothing owed the late copy is answered from the record");
+    assert_eq!(control, first, "it is given what the first copy was told");
+
+    let refused =
+        a_late_capability_copy_at_the_record(&controller, &actor_id, &mutation, admission, true)
+            .await
+            .expect_err("a fence that landed before the record was read stops the answer");
+    refused_for_a_fence(&refused.to_protocol_error());
+}
+
+/// KR-REQ-09.09, the disclosed checks' reused identifier: a request that carries the identifier of
+/// another copy's answer but names another file is refused as a reused identifier, and what the
+/// record holds for that identifier is not disclosed to a caller whose authority has gone. The late
+/// copy reads the record under the start's hold, and a fence that lands before it does is the
+/// answer instead. The control: with nothing owed the late copy is told the identifier is reused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reused_capability_check_identifier_is_not_refused_as_a_conflict_after_a_fence_lands() {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let first = capability_request(&temp, None, None);
+    let admission = carried(&controller, connection_id);
+    controller
+        .start_capability_checks(&actor_id, &first, admission)
+        .await
+        .expect("the first copy is answered");
+    let reused = capability_request(&temp, Some(first.action_id), Some("/authorised.txt"));
+
+    let control =
+        a_late_capability_copy_at_the_record(&controller, &actor_id, &reused, admission, false)
+            .await
+            .expect_err("with nothing owed the identifier is refused as reused");
+    assert_eq!(
+        control.to_protocol_error().code,
+        ErrorCode::IdConflict,
+        "{control:?}"
+    );
+
+    let refused =
+        a_late_capability_copy_at_the_record(&controller, &actor_id, &reused, admission, true)
+            .await
+            .expect_err("a fence that landed before the record was read is the answer");
+    refused_for_a_fence(&refused.to_protocol_error());
+}
+
+/// KR-REQ-09.09, the disclosed checks' record that cannot be read: that a record exists for the
+/// identifier is what the caller would be told, so it is held to the same check. The late copy
+/// holds the lock of the checks and reads a record whose answer cannot be decoded. The control: with
+/// nothing owed the late copy is told the record of answers is unavailable. A fence that lands
+/// before it reads is the answer instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capability_check_answer_that_cannot_be_read_is_not_told_after_a_fence_lands() {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let mutation = capability_request(&temp, None, None);
+    let admission = carried(&controller, connection_id);
+    controller
+        .start_capability_checks(&actor_id, &mutation, admission)
+        .await
+        .expect("the first copy is answered");
+    let record = rusqlite::Connection::open(
+        temp.environment()
+            .state_dir()
+            .join(crate::capability_answers::CAPABILITY_ANSWERS_RECORD),
+    )
+    .expect("opens the record of answers");
+    record
+        .busy_timeout(Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    record
+        .execute("UPDATE capability_answers SET answer = 'not an answer'", [])
+        .expect("the answer cannot be decoded");
+
+    let told =
+        a_late_capability_copy_at_the_record(&controller, &actor_id, &mutation, admission, false)
+            .await
+            .expect_err("an answer that cannot be decoded does not answer the repeat");
+    assert_eq!(
+        told.to_protocol_error().code,
+        ErrorCode::StorageUnavailable,
+        "{told:?}"
+    );
+
+    let refused =
+        a_late_capability_copy_at_the_record(&controller, &actor_id, &mutation, admission, true)
+            .await
+            .expect_err("a fence that landed before the record was read is the answer");
+    refused_for_a_fence(&refused.to_protocol_error());
 }
 
 // ---------------------------------------------------------------------------------------------
