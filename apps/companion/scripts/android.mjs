@@ -19,6 +19,7 @@ import { dirname, join } from 'node:path'
 
 import { packagesOf, requestFrom, verify } from './android-classes.mjs'
 import { problemsInPackage, report } from './identifiers.mjs'
+import { privateTemporary } from './private-temp.mjs'
 import { toolPath } from './tools.mjs'
 
 /** Every Android target this build could be asked for. */
@@ -134,13 +135,20 @@ if (stale.length > 0) {
 // two the same tree.
 const project = join(dirname(import.meta.dirname), 'src-tauri')
 
+// The build runs in a temporary directory of its own, which Gradle and the steps it starts inherit:
+// the command line tool shares its options with those steps through a file there, named for the
+// application, and a second build on the machine would otherwise read this one's file or have its
+// own read (see `private-temp.mjs`). It is removed however this command ends.
+const temporary = privateTemporary()
+process.on('exit', temporary.remove)
+
 const result = spawnSync(
   process.execPath,
   [toolPath('@tauri-apps/cli'), 'android', 'build', ...process.argv.slice(2)],
   {
     stdio: 'inherit',
     env: {
-      ...process.env,
+      ...temporary.env,
       TAURI_APP_PATH: project,
       AR: join(tools, 'llvm-ar'),
       RANLIB: join(tools, 'llvm-ranlib'),
