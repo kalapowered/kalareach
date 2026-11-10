@@ -350,10 +350,11 @@ class VoiceCaptureGateTest {
 
     /**
      * What the system lists of the recordings, and which of them is this call's: those from its source
-     * that the system held when its audio device came on are other applications', and its own is one more.
+     * whose sessions the system held when its audio device came on are other applications', and any
+     * other from the source is its own.
      */
     @Test
-    fun the_recording_of_the_call_is_one_more_from_its_source_than_there_were_when_the_device_came_on() {
+    fun the_recording_of_the_call_is_the_one_from_its_source_that_was_not_there_when_the_device_came_on() {
         val call = 7
         val watch = RecordingWatch(call)
         watch.deviceComesOn(emptyList())
@@ -365,28 +366,30 @@ class VoiceCaptureGateTest {
         assertEquals(
             "another source's recording is not this call's",
             VoiceCaptureGate.Recording.UNREPORTED,
-            watch.read(listOf(RecordingReport(source = 1, silenced = false))),
+            watch.read(listOf(RecordingReport(source = 1, silenced = false, session = 9))),
         )
         assertEquals(
             VoiceCaptureGate.Recording.AUDIBLE,
-            watch.read(listOf(RecordingReport(1, true), RecordingReport(call, false))),
+            watch.read(listOf(RecordingReport(1, true, 9), RecordingReport(call, false, 2))),
         )
         assertEquals(
             VoiceCaptureGate.Recording.SILENCED,
-            watch.read(listOf(RecordingReport(call, true))),
+            watch.read(listOf(RecordingReport(call, true, 2))),
         )
     }
 
     /**
-     * KR-REQ-15.36: another application's audible recording from the call's source, held when the
-     * call's own recorder was turned on, does not stand in for the call's: with nothing more listed the
-     * call's recording is not reported, and it is reported only once there is one more.
+     * KR-REQ-15.36: another application's recording from the call's source, held when the call's own
+     * recorder was turned on, does not stand in for the call's, whatever becomes of it: with nothing
+     * else listed the call's recording is not reported, and what the system does to theirs, silencing
+     * it or ending it, does not change what is said of ours.
      */
     @Test
     fun another_applications_recording_from_the_same_source_is_not_the_calls_own() {
         val call = 7
         val watch = RecordingWatch(call)
-        val theirs = RecordingReport(call, silenced = false)
+        val theirs = RecordingReport(call, silenced = false, session = 1)
+        val ours = RecordingReport(call, silenced = false, session = 2)
         watch.deviceComesOn(listOf(theirs))
 
         assertEquals(
@@ -395,14 +398,29 @@ class VoiceCaptureGateTest {
             watch.read(listOf(theirs)),
         )
         assertEquals(
-            "theirs and one more",
-            VoiceCaptureGate.Recording.AUDIBLE,
-            watch.read(listOf(theirs, RecordingReport(call, false))),
+            "a silenced recording of theirs is not ours either",
+            VoiceCaptureGate.Recording.UNREPORTED,
+            watch.read(listOf(theirs.copy(silenced = true))),
         )
         assertEquals(
-            "theirs ending while ours runs leaves nothing to tell the two apart: refused",
-            VoiceCaptureGate.Recording.UNREPORTED,
-            watch.read(listOf(RecordingReport(call, false))),
+            "theirs and ours",
+            VoiceCaptureGate.Recording.AUDIBLE,
+            watch.read(listOf(theirs, ours)),
+        )
+        assertEquals(
+            "theirs silenced, ours not",
+            VoiceCaptureGate.Recording.AUDIBLE,
+            watch.read(listOf(theirs.copy(silenced = true), ours)),
+        )
+        assertEquals(
+            "theirs ended while ours runs",
+            VoiceCaptureGate.Recording.AUDIBLE,
+            watch.read(listOf(ours)),
+        )
+        assertEquals(
+            "ours silenced, theirs not",
+            VoiceCaptureGate.Recording.SILENCED,
+            watch.read(listOf(theirs, ours.copy(silenced = true))),
         )
     }
 }
