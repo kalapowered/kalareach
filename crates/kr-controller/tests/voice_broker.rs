@@ -1356,6 +1356,58 @@ async fn a_sign_in_never_changes_the_account_a_call_closes_under() {
     host.stop().await;
 }
 
+/// KR-REQ-17.23 and 15.17: the call watch is the managed account's. On a host that also holds an
+/// account at a storage service its owner runs, a sign-in of the managed account is refused while a
+/// call is open, and the storage account's sign-in is not held by the call: no call is made under
+/// it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_open_call_holds_the_managed_account_and_not_the_storage_account() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let mut document = document_naming(&broker.origin);
+    document.storage.origin = Nullable::some("https://owner.example".to_owned());
+    let host = net_support::Host::start_with_document(&owner, &document).await;
+    listen_for_sign_ins(&host);
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    let (_device, session, call) = start_a_call(&host, &owner).await;
+
+    let refused = host
+        .client()
+        .await
+        .mutate(
+            Method::AccountSignIn,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &AccountSignInParams {},
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("a call is open");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        "{refused:?}"
+    );
+
+    let storage = host.controller().storage_account();
+    storage.listen_on("127.0.0.1:0".parse().expect("an address"));
+    storage
+        .sign_in()
+        .await
+        .expect("the storage account's sign-in is not held by the call");
+
+    let _ = mutate(
+        &session,
+        host.environment_id,
+        Method::VoiceStop,
+        &VoiceStopParams {
+            voice_session_id: call.voice_session_id,
+        },
+    )
+    .await;
+    host.stop().await;
+}
+
 /// KR-REQ-17.23: signing the host out removes the grant at once and asks the service to end it, so
 /// a call after it presents no account; a revocation the service does not acknowledge is sent
 /// again when the daemon next starts; and signing out a host with no account changes nothing.
