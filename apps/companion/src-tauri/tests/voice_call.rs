@@ -2675,11 +2675,18 @@ fn asking_again() -> Timings {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_start_whose_answer_is_lost_continues_under_the_answer_a_repeat_brings() {
     let timings = Timings {
-        // The held question is not to give up on the host while the case waits for it.
+        // No bound of time decides this case: the start's answer is lost by the test's own control,
+        // and the held question is not to give up on the host while the case waits for it.
+        start_within: Duration::from_secs(600),
         host_within: Duration::from_secs(600),
         ..asking_again()
     };
     let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    // The answer to the first start is lost, and no other answer is. The question that follows is
+    // the second request of the method, and is held.
+    scene
+        .link
+        .lose_only_the_answer_after(0, HostMethod::VoiceStart);
     scene.link.hold_request_after(1, HostMethod::VoiceStart);
     let prepared = scene.prepared().await;
 
@@ -7175,12 +7182,24 @@ async fn a_signed_request_whose_answer_is_lost_is_asked_about_again_and_reads_pe
     scene.link.hold_next_request(HostMethod::VoiceDelegate);
     scene.link.release_request();
     scene.link.until_request_held().await;
-    scene.until_closed().await;
+    // The host has answered the challenge's delegation and then the signed request, whose answer
+    // the owner never hears: it has closed the session and recorded the result, and only then is
+    // the question let go.
+    scene
+        .link
+        .until_the_host_answers(2, HostMethod::VoiceDelegate)
+        .await;
+    assert_eq!(
+        scene.link.sent(HostMethod::VoiceDelegate),
+        2,
+        "the question waits for the host's answer to the signed request"
+    );
     scene.link.release_request();
 
     let row = row_reaching(&scene, "d-1", "performed").await;
 
     assert_eq!(row["state"], "performed");
+    scene.until_closed().await;
     let actions = scene.link.sent_actions(HostMethod::VoiceDelegate);
     assert!(actions.len() >= 3, "the host was asked again: {actions:?}");
     assert!(
