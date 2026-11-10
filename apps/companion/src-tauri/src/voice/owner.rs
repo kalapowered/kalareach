@@ -1226,7 +1226,11 @@ impl Owner {
                 });
                 None
             }
-            Some(Heard::Event(CallEvent::ProviderEvent { .. } | CallEvent::Lost)) => None,
+            // A barrier marks a place in the news for whoever asked for a capture proof, and the
+            // owner asks for none: it says nothing of the call.
+            Some(Heard::Event(
+                CallEvent::ProviderEvent { .. } | CallEvent::Lost | CallEvent::Barrier { .. },
+            )) => None,
             // News was lost, and what was lost can be the end of the call: ask native code what
             // it holds rather than carry on as if nothing had been missed.
             Some(Heard::Lost) => self.verify_native().await,

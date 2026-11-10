@@ -1202,7 +1202,7 @@ impl Calls {
 
 #[cfg(test)]
 mod tests {
-    use companion_platform::call::{Answered, CallFuture, Held, OpenedCall};
+    use companion_platform::call::{Answered, CallFuture, CaptureProof, Held, OpenedCall};
 
     use super::*;
 
@@ -1245,6 +1245,14 @@ mod tests {
 
         fn alive<'a>(&'a self, _call: &'a CallId) -> CallFuture<'a, Held> {
             Box::pin(async { unreachable!("no sign is given") })
+        }
+
+        fn capture_proof<'a>(
+            &'a self,
+            _call: &'a CallId,
+            _barrier: bool,
+        ) -> CallFuture<'a, CaptureProof> {
+            Box::pin(async { unreachable!("no proof is asked for") })
         }
     }
 
