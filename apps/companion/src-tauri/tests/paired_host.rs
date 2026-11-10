@@ -305,7 +305,11 @@ async fn a_voice_screen_opens_once_the_person_has_allowed_what_it_may_do() {
     let allowed = companion
         .call(
             "voice_allow",
-            json!({ "subject": {}, "params": { "session_ids": [session], "actions": null } }),
+            json!({ "subject": {}, "params": {
+                "session_ids": [session],
+                "actions": null,
+                "environment_id": host.environment_id.to_string(),
+            } }),
         )
         .expect("the person allows the default scope");
     let value = &allowed["value"];

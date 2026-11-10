@@ -5,8 +5,8 @@
  * sessions the person names: a call is bound to them. So before the voice screen can say what a
  * call would be, the person is shown what allowing voice permits, action by action, in the
  * sentences the protocol states them in, and chooses the sessions. Allowing sends exactly those
- * sessions and the default actions; the host answers with what it granted, and says plainly any
- * action this device's own authority could not carry.
+ * sessions and the default actions, for the host that listed them: the host answers with what it
+ * granted, and says plainly any action this device's own authority could not carry.
  *
  * The step holds no wording of its own for an action. The sentences come from native code, which
  * reads the protocol's table, so this screen cannot word an action more softly than the host does.
@@ -29,6 +29,37 @@ interface Choice {
   readonly name: string
 }
 
+/** What the step says when the connection did not stay with one host while the sessions were read. */
+const HOST_CHANGED_WORDS =
+  'The connection to the host was lost or changed while its sessions were read, so none are shown.'
+
+/**
+ * The sessions one host lists, and the environment of that host: the connection is the same one
+ * before and after the list, or nothing is returned.
+ */
+async function readSessions(
+  port: HostPort
+): Promise<{ readonly environmentId: string; readonly choices: readonly Choice[] } | null> {
+  const before = await port.connectionState()
+  const list = await port.sessionList({ environment_id: null, include_closed: false })
+  const after = await port.connectionState()
+  if (
+    !before.connected ||
+    !after.connected ||
+    before.environment_id === null ||
+    before.environment_id !== after.environment_id
+  ) {
+    return null
+  }
+  return {
+    environmentId: after.environment_id,
+    choices: list.sessions.map((session) => ({
+      id: session.session_id,
+      name: `Session ${session.display_number}`
+    }))
+  }
+}
+
 /** The step. */
 export function VoiceGrantStep({
   port,
@@ -47,6 +78,8 @@ export function VoiceGrantStep({
   const id = useId()
   const [scope, setScope] = useState<VoiceScope | null>(null)
   const [choices, setChoices] = useState<readonly Choice[] | null>(null)
+  /** The environment of the host the sessions were listed by, which allowing them is sent to. */
+  const [environmentId, setEnvironmentId] = useState<string | null>(null)
   const [chosen, setChosen] = useState<ReadonlySet<string>>(new Set())
   const [busy, setBusy] = useState(false)
   const [failure, setFailure] = useState<string | null>(null)
@@ -65,13 +98,15 @@ export function VoiceGrantStep({
         if (current) setFailure(failureMessage(error))
       }
     )
-    port.sessionList({ environment_id: null, include_closed: false }).then(
-      (list) => {
+    readSessions(port).then(
+      (read) => {
         if (!current) return
-        const listed = list.sessions.map((session) => ({
-          id: session.session_id,
-          name: `Session ${session.display_number}`
-        }))
+        if (read === null) {
+          setFailure(HOST_CHANGED_WORDS)
+          return
+        }
+        const listed = read.choices
+        setEnvironmentId(read.environmentId)
         setChoices(listed)
         setChosen(
           new Set(
@@ -96,11 +131,11 @@ export function VoiceGrantStep({
   }, [granted])
 
   const allow = () => {
-    if (busy || chosen.size === 0) return
+    if (busy || chosen.size === 0 || environmentId === null) return
     const sessionIds = [...chosen]
     setBusy(true)
     setFailure(null)
-    port.voiceAllow({ sessionIds, actions: null }, {}).then(
+    port.voiceAllow({ sessionIds, actions: null, environmentId }, {}).then(
       (settled) => {
         setBusy(false)
         // An answer with no result is a host that did not confirm: the grant may or may not stand,
@@ -257,7 +292,7 @@ export function VoiceGrantStep({
         type="button"
         className="kr-voice__start"
         onClick={allow}
-        disabled={busy || chosen.size === 0 || scope === null || granted !== null}
+        disabled={busy || chosen.size === 0 || environmentId === null || scope === null || granted !== null}
         data-testid="voice-allow"
       >
         {busy ? 'Allowing…' : 'Allow voice'}

@@ -567,7 +567,11 @@ async fn scene_replacing(
     scene
         .call(
             "voice_allow",
-            json!({ "subject": {}, "params": { "session_ids": [scene.session], "actions": standing.voice_actions } }),
+            json!({ "subject": {}, "params": {
+                "session_ids": [scene.session],
+                "actions": standing.voice_actions,
+                "environment_id": scene.host().environment_id.to_string(),
+            } }),
         )
         .expect("the person allows voice");
     scene
@@ -7373,8 +7377,8 @@ async fn a_confirmation_is_not_asked_once_the_call_is_ending() {
 
 /// A change of what voice may do that was shown for one host is sent only to that host: the command
 /// that replaces the grant is given the environment of the host the page read what it shows from,
-/// and refuses when the phone is connected to another now. Nothing reaches the host that was
-/// refused for; the same change, named for the host in use, is sent.
+/// and refuses when the phone is connected to another now, and when it is given none. Nothing
+/// reaches the host that was refused for; the same change, named for the host in use, is sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_change_shown_for_another_host_is_not_sent_to_this_one() {
     let mut scene = closing().await;
@@ -7398,6 +7402,17 @@ async fn a_change_shown_for_another_host_is_not_sent_to_this_one() {
         .expect_err("a change shown for another host is refused");
 
     assert_eq!(refused["code"], "PERMISSION_DENIED", "{refused}");
+    // A change that names no host is not sent to whichever one is in use.
+    let unnamed = scene
+        .call(
+            "voice_allow",
+            json!({
+                "subject": {},
+                "params": { "session_ids": [scene.session], "actions": ["navigate", "status"] }
+            }),
+        )
+        .expect_err("a change that names no host is refused");
+    assert_eq!(unnamed["code"], "INVALID_ARGUMENT", "{unnamed}");
     assert_eq!(
         scene.link.sent(HostMethod::VoiceGrant),
         before,

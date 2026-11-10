@@ -1059,10 +1059,10 @@ export interface VoiceAllowRequest {
   /** The actions to permit, or null for the default scope. */
   readonly actions: readonly VoiceAction[] | null
   /**
-   * The environment of the host what the person was shown was read from. When it is named, the
-   * change is sent only if the application is connected to that host now.
+   * The environment of the host what the person was shown was read from. The change is sent only
+   * if the application is connected to that host now.
    */
-  readonly environmentId?: string
+  readonly environmentId: string
 }
 
 /** Which of the two local silences a control acts on. */

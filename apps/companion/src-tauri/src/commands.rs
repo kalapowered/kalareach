@@ -2423,11 +2423,10 @@ struct VoiceAllow {
     session_ids: Vec<String>,
     /// The actions to permit. Absent takes the default scope of section 15 paragraph 13.
     actions: Option<Vec<kr_protocol::voice::VoiceAction>>,
-    /// The environment of the host the page read what it shows from. When it is named, the grant is
-    /// sent only if this application is connected to that host now: a change made for what one host
-    /// showed is never applied to another.
-    #[serde(default)]
-    environment_id: Option<String>,
+    /// The environment of the host the page read what it shows from. The grant is sent only if this
+    /// application is connected to that host now: a change made for what one host showed is never
+    /// applied to another.
+    environment_id: String,
 }
 
 /// What allowing voice came to: the sentences the grant states, what it could not carry, and what
@@ -2482,6 +2481,10 @@ fn without_the_names(
 /// permits, every one the device's own grant could not carry and the barrier of the fence the
 /// replacement owed without the names of the actions it named, and nothing else of what the host
 /// answered: the identity of the device stays here.
+///
+/// The page names the host that what it shows was read from, and the command refuses when this
+/// application is connected to another host now. It does not check that the grant is still the one
+/// that was shown: the request carries no precondition.
 #[tauri::command]
 pub async fn voice_allow(
     state: State<'_, AppState>,
@@ -2500,11 +2503,7 @@ pub async fn voice_allow(
     // One connection's identity, environment and session, so the grant cannot name a device of one
     // host and be sent to another.
     let (device_id, environment_id, session) = state.paired_snapshot()?;
-    if allowed
-        .environment_id
-        .as_deref()
-        .is_some_and(|shown| shown != environment_id.to_string())
-    {
+    if allowed.environment_id != environment_id.to_string() {
         return Err(CommandError::refused(
             "this was shown for another host than the one this application is connected to now: \
              read it again before changing it",

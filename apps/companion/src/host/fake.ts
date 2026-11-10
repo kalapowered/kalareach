@@ -2712,7 +2712,7 @@ export function fakeHost(
       }),
     voiceAllow: (request) => {
       requireConnection()
-      if (request.environmentId !== undefined && request.environmentId !== hostEnvironment) {
+      if (request.environmentId !== hostEnvironment) {
         refuse(
           'PERMISSION_DENIED',
           'this was shown for another host than the one this application is connected to now: read it again before changing it'

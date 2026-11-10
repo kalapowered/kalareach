@@ -8,12 +8,14 @@
  * host has granted what was allowed.
  */
 
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, type FakeHostControls } from '../../src/host/fake'
+import type { HostPort } from '../../src/host/port'
+import { VoiceGrantStep } from '../../src/voice/VoiceGrantStep'
 import { VoiceRoute } from '../../src/voice/VoiceRoute'
 
 afterEach(() => {
@@ -24,7 +26,13 @@ afterEach(() => {
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 const SESSION_BUILD = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
 
-function start(setup?: (controls: FakeHostControls) => void): { controls: FakeHostControls } {
+/** The environment of a host other than the one the fake host starts as. */
+const OTHER_HOST = '3f1a2c40-11aa-4b2c-9d3e-000000000002'
+
+function start(setup?: (controls: FakeHostControls) => void): {
+  controls: FakeHostControls
+  port: HostPort
+} {
   const { port, controls } = fakeHost()
   controls.requireVoiceGrant('PERMISSION_DENIED: name the sessions this voice session may reach')
   setup?.(controls)
@@ -33,7 +41,7 @@ function start(setup?: (controls: FakeHostControls) => void): { controls: FakeHo
       <VoiceRoute surface="ios" />
     </AppProvider>
   )
-  return { controls }
+  return { controls, port }
 }
 
 describe('allowing voice for the first time', () => {
@@ -60,7 +68,7 @@ describe('allowing voice for the first time', () => {
   // KR-REQ-15.21: allowing sends the sessions the person kept and the default scope, and only then
   // does the screen show the call the host describes.
   it('allows the sessions the person kept, and then shows what a call would be', async () => {
-    const { controls } = start()
+    const { controls, port } = start()
     const sessions = await screen.findAllByRole('checkbox')
     expect(sessions.length).toBeGreaterThan(1)
     expect(sessions.every((box) => (box as HTMLInputElement).checked)).toBe(true)
@@ -72,6 +80,8 @@ describe('allowing voice for the first time', () => {
     const asked = controls.voiceAllows[0]
     expect(asked.actions).toBeNull()
     expect(asked.sessionIds).toHaveLength(sessions.length - 1)
+    // The allowance is for the host that listed the sessions, and says which it is.
+    expect(asked.environmentId).toBe((await port.connectionState()).environment_id)
     expect(await screen.findByRole('button', { name: 'Start voice session' })).toBeInTheDocument()
   })
 
@@ -210,6 +220,42 @@ describe('allowing voice for the first time', () => {
     await userEvent.click(screen.getByTestId('voice-allow'))
     expect(await screen.findByRole('button', { name: 'Start voice session' })).toBeInTheDocument()
     expect(controls.voiceAllows).toHaveLength(2)
+  })
+
+  // The sessions listed are the host's that listed them: when the connection moves to another host
+  // while the step is open, allowing them is not sent over to it, whatever the screen around the
+  // step does about the change.
+  it('sends nothing when the host changed while the step was open', async () => {
+    const { port, controls } = fakeHost()
+    const onAllowed = vi.fn()
+    render(<VoiceGrantStep port={port} refusal={null} named={[]} onAllowed={onAllowed} />)
+    await screen.findAllByRole('checkbox')
+
+    act(() => {
+      controls.switchHost(OTHER_HOST)
+    })
+    await userEvent.click(screen.getByTestId('voice-allow'))
+
+    expect((await screen.findByTestId('voice-grant-failure')).textContent).toContain('another host')
+    expect(controls.voiceAllows).toHaveLength(0)
+    expect(onAllowed).not.toHaveBeenCalled()
+  })
+
+  // On the voice screen the step is shown again for the host the connection moved to: the sessions
+  // of the host that was left are gone, and what the new host lists is read before anything can be
+  // allowed.
+  it('is shown again for the new host when the connection moves while it is open', async () => {
+    const { controls } = start()
+    expect((await screen.findAllByRole('checkbox')).length).toBeGreaterThan(0)
+
+    act(() => {
+      controls.switchHost(OTHER_HOST)
+    })
+
+    expect(await screen.findByTestId('voice-no-sessions')).toBeInTheDocument()
+    expect(screen.queryAllByRole('checkbox')).toHaveLength(0)
+    expect(screen.getByTestId('voice-allow')).toBeDisabled()
+    expect(controls.voiceAllows).toHaveLength(0)
   })
 
   it('shows no question to a device the host already allowed', async () => {
