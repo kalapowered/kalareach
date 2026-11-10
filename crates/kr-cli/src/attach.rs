@@ -1737,7 +1737,7 @@ mod reader {
         pending: VecDeque<Woken>,
         /// Holds the reader back from its first wait until the case has queued what it wants.
         start: Option<mpsc::Receiver<()>>,
-        keys: VecDeque<Vec<Vec<KeyRecord>>>,
+        reads: VecDeque<Vec<ConsoleRead>>,
         held: Vec<KeyRecord>,
         bytes: mpsc::Receiver<Vec<u8>>,
         steps: Steps,
@@ -1798,13 +1798,7 @@ mod reader {
 
         fn records(&mut self) -> Result<Vec<ConsoleRead>> {
             self.steps.lock().expect("steps").push("records");
-            let read = self
-                .keys
-                .pop_front()
-                .unwrap_or_default()
-                .into_iter()
-                .map(ConsoleRead::Keys)
-                .collect();
+            let read = self.reads.pop_front().unwrap_or_default();
             self.paused_at("records");
             Ok(read)
         }
@@ -1821,6 +1815,13 @@ mod reader {
             self.paused_at("bytes");
             Ok(read)
         }
+    }
+
+    /// The reads of a console that reports key runs only.
+    fn as_reads(keys: Vec<Vec<Vec<KeyRecord>>>) -> Vec<Vec<ConsoleRead>> {
+        keys.into_iter()
+            .map(|runs| runs.into_iter().map(ConsoleRead::Keys).collect())
+            .collect()
     }
 
     /// The thread, and the ends of its console the case holds.
@@ -1859,7 +1860,7 @@ mod reader {
         ) -> Self {
             Self::built(
                 will_spell,
-                keys,
+                as_reads(keys),
                 held,
                 wake_reaches_the_reader,
                 held_back,
@@ -1867,14 +1868,20 @@ mod reader {
             )
         }
 
+        /// Starts the thread over a console whose reads are `reads`, in order, key runs and mouse
+        /// records as the console reported them.
+        fn reading(reads: Vec<Vec<ConsoleRead>>) -> Self {
+            Self::built(true, reads, Vec::new(), true, false, None)
+        }
+
         /// Starts the thread over a console that holds it inside its call `at`, once.
         fn paused(at: &'static str, keys: Vec<Vec<Vec<KeyRecord>>>, held: Vec<KeyRecord>) -> Self {
-            Self::built(true, keys, held, true, false, Some(at))
+            Self::built(true, as_reads(keys), held, true, false, Some(at))
         }
 
         fn built(
             will_spell: bool,
-            keys: Vec<Vec<Vec<KeyRecord>>>,
+            reads: Vec<Vec<ConsoleRead>>,
             held: Vec<KeyRecord>,
             wake_reaches_the_reader: bool,
             held_back: bool,
@@ -1903,7 +1910,7 @@ mod reader {
                 wakes: heard,
                 pending: VecDeque::new(),
                 start: held_back.then_some(start),
-                keys: keys.into(),
+                reads: reads.into(),
                 held,
                 bytes: spelled,
                 steps: Arc::clone(&steps),
@@ -2031,6 +2038,31 @@ mod reader {
             }
             (handed, self.steps.lock().expect("steps").clone())
         }
+    }
+
+    /// A mouse record the console reports is handed on as one read of its own kind, in the place it
+    /// came between the keys that went before and after it, and is never taken for a key.
+    #[test]
+    fn a_mouse_record_is_handed_on_in_the_place_the_console_reported_it() {
+        let (down, up) = (key(65, 97, true), key(65, 97, false));
+        let record = crate::mouse::MouseRecord {
+            column: 3,
+            row: 4,
+            buttons: 1,
+            control_keys: 0,
+            flags: 0,
+        };
+        let mut run = Run::reading(vec![vec![
+            ConsoleRead::Keys(vec![down]),
+            ConsoleRead::Mouse(record),
+            ConsoleRead::Keys(vec![up]),
+        ]]);
+        run.has_input();
+        assert_eq!(run.next(), TerminalInput::Keys(vec![down]));
+        assert_eq!(run.next(), TerminalInput::Mouse(record));
+        assert_eq!(run.next(), TerminalInput::Keys(vec![up]));
+        let steps = run.ends();
+        assert_eq!(steps, ["records"], "one read of the console held all three");
     }
 
     fn key(code: u16, unicode: u16, key_down: bool) -> KeyRecord {
