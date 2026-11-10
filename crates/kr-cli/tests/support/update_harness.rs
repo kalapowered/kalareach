@@ -947,6 +947,17 @@ impl Assembled {
     /// The packed archive is read back whole once, and each copy is held to the digest of the archive
     /// it was copied from. A packed archive or a copy that is bad then fails here, named, and not in
     /// whichever case unpacks it, as a failure of the unpacking.
+    ///
+    /// A copy is written by reading the packed archive and writing the copy: it is never a clone of
+    /// the packed archive's blocks or a copy made inside the kernel, so a copy that does not read as
+    /// the archive can be made again from the same file. It is removed and made once more, once, and
+    /// the case goes on when the copy made again is right, after one line on standard error that
+    /// begins "update-harness: a copy of the packed archive read wrong and was made again" and gives
+    /// where the first copy first differed, the lengths and the digests, so that every such copy can
+    /// be counted in a job's log. A second copy that reads wrong fails the case, naming both. A
+    /// packed archive that no longer reads as it did when it was packed fails at once, with no second
+    /// copy. None of this covers a wrong read of an archive after the comparison, while the command
+    /// under test unpacks it: that is still a failure of the unpacking.
     fn archive(&self, archive: &Path) {
         self.archive_signed(archive, &keys().targets);
     }
@@ -1015,7 +1026,13 @@ const COPY_MADE_AGAIN: &str =
     "update-harness: a copy of the packed archive read wrong and was made again";
 
 /// Gives `copy` the bytes of the archive packed at `packed`, which read as `digest` when it was
-/// packed, with `make`, and holds it to `digest` with `held`.
+/// packed: `make` makes the copy and `held` holds it to `digest`.
+///
+/// A copy that reads wrong (the copy differs, or it read as other bytes once and as the archive
+/// when it was read again) is removed and made once more. The line [`COPY_MADE_AGAIN`] begins goes
+/// to `report` first, with how the copy differed, and the copy made again is held as the first was.
+/// A second copy that reads wrong fails, and the failure names both. A packed archive that is not
+/// what it was packed as is not a fault of the copy: it fails at once, with no second copy.
 fn copy_held_to(
     packed: &Path,
     digest: [u8; 32],
@@ -1024,11 +1041,32 @@ fn copy_held_to(
     held: &mut dyn FnMut(&Path, [u8; 32], &Path) -> Result<(), Unequal>,
     report: &mut dyn std::io::Write,
 ) -> Result<(), String> {
-    let _ = report;
     make(packed, copy);
-    held(packed, digest, copy).map_err(|unequal| {
+    let first = match held(packed, digest, copy) {
+        Ok(()) => return Ok(()),
+        Err(first @ (Unequal::Copy { .. } | Unequal::ReadsDifferently { .. })) => first,
+        Err(unequal) => {
+            return Err(format!(
+                "the copy at {} is not the archive packed at {}: {unequal}",
+                copy.display(),
+                packed.display()
+            ));
+        }
+    };
+    std::fs::remove_file(copy).expect("the copy that read wrong goes");
+    // A write that fails is no reason to stop the case: the line is for the person reading the log.
+    let _ = writeln!(
+        report,
+        "{COPY_MADE_AGAIN}: the copy at {} is not the archive packed at {}, which reads as {}: {first}",
+        copy.display(),
+        packed.display(),
+        hex_of(&digest)
+    );
+    make(packed, copy);
+    held(packed, digest, copy).map_err(|second| {
         format!(
-            "the copy at {} is not the archive packed at {}: {unequal}",
+            "the copy at {} is not the archive packed at {}, and a copy made again is not either: \
+             the first copy: {first}; the copy made again: {second}",
             copy.display(),
             packed.display()
         )
