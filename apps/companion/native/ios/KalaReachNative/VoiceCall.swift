@@ -30,7 +30,9 @@ public protocol VoiceCallObserver: AnyObject {
     /// Audio was played out of the device for the first time. An estimate from the connection's
     /// statistics, told once: see ``PlayoutWatch``.
     func voiceCallPlayedAudio(_ call: VoiceCall)
-    /// What the microphone is doing changed: the call's gate decided it.
+    /// What the microphone is doing changed: the call's gate decided it. A change made by a report
+    /// that is already running on the call's queue is told at once, while the call's control holds
+    /// its lock, so an observer must not call back into the call from here.
     func voiceCall(_ call: VoiceCall, captureChanged state: VoiceCaptureState)
     /// The call ended, whatever ended it, and its audio is given back.
     func voiceCallEnded(_ call: VoiceCall)
