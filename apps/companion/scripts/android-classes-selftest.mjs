@@ -22,7 +22,7 @@
 import { Buffer } from 'node:buffer'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, relative } from 'node:path'
+import { dirname, join, relative } from 'node:path'
 
 import { dex, elf, zip } from './archive-fixtures.mjs'
 import { libraryClassNames } from './android-native-names.mjs'
@@ -1006,8 +1006,9 @@ expectNames(
 )
 
 /** What `verify` says and answers about one package, with its output kept out of this one's. */
-function verified(name, members) {
+function verified(name, members, outputsDirectory = undefined) {
   const path = join(work, name)
+  mkdirSync(dirname(path), { recursive: true })
   writeFileSync(path, zip(members))
   const output = []
   const { log, error } = console
@@ -1015,7 +1016,7 @@ function verified(name, members) {
   console.error = (text) => output.push(text)
   let whole
   try {
-    whole = verify([path])
+    whole = verify([path], outputsDirectory)
   } finally {
     console.log = log
     console.error = error
@@ -1315,6 +1316,94 @@ held(
       counted.said.includes('org.webrtc.Other')
   )
 )
+
+// -- the rule files the Rust build writes --------------------------------------------------------
+// The minifier takes its rule files when Gradle configures, and two of them are written by the Rust
+// build, which keep what the Rust library calls by name that no Java reaches. A minified build whose
+// merged rules do not name them left those classes to the minifier, whatever the check of the
+// libraries found: the library's own calls by name cannot be read from it.
+
+const RULES = 'outputs-rules'
+const section = (file) =>
+  `# The proguard configuration file for the following section is /build/${file}\n-keep class x.Y\n\n`
+const BOTH =
+  section('app/proguard-rules.pro') +
+  section('app/proguard-tauri.pro') +
+  section('app/src/main/java/to/kala/reach/generated/proguard-wry.pro')
+const passingPackage = withLibrary([JNI_ZERO, FACTORY, CANDIDATE, NESTED, RAW])
+
+/** Verifies a package placed in an outputs directory, with the merged rules its variant left. */
+function withRules(place, variant, configuration, members = passingPackage) {
+  const mapping = join(work, RULES, 'mapping', variant)
+  mkdirSync(mapping, { recursive: true })
+  const file = join(mapping, 'configuration.txt')
+  rmSync(file, { force: true })
+  if (configuration !== null) writeFileSync(file, configuration)
+  return verified(`${RULES}/${place}`, members, join(work, RULES))
+}
+const release = 'apk/universal/release/app-universal-release.apk'
+
+const named = withRules(release, 'universalRelease', BOTH)
+held('a minified release build whose merged rules name both generated files passes', 'true', String(named.whole))
+const noWry = withRules(
+  release,
+  'universalRelease',
+  section('app/proguard-rules.pro') + section('app/proguard-tauri.pro')
+)
+held('a release build whose merged rules lack the web view library\'s file fails', 'false', String(noWry.whole))
+held(
+  'and names that file, and not the other',
+  'true',
+  String(noWry.said.includes('proguard-wry.pro') && !noWry.said.includes('proguard-tauri.pro'))
+)
+const noGenerated = withRules(release, 'universalRelease', section('app/proguard-rules.pro'))
+held(
+  'a release build whose merged rules name neither fails, naming both',
+  'true',
+  String(
+    !noGenerated.whole &&
+      noGenerated.said.includes('proguard-tauri.pro') &&
+      noGenerated.said.includes('proguard-wry.pro')
+  )
+)
+const mentioned = withRules(
+  release,
+  'universalRelease',
+  section('app/proguard-rules.pro') +
+    '# written by the Rust build to /app/proguard-tauri.pro and /app/generated/proguard-wry.pro\n'
+)
+held('a mention of the files that is no section of the merged rules does not count', 'false', String(mentioned.whole))
+const noConfiguration = withRules(release, 'universalRelease', null)
+held('a release build that left no merged rules fails, since the release build is always minified', 'false', String(noConfiguration.whole))
+held(
+  'and says there is no merged configuration to read',
+  'true',
+  String(noConfiguration.said.includes('universalRelease') && noConfiguration.said.includes('configuration.txt'))
+)
+const debugPlain = withRules('apk/universal/debug/app-universal-debug.apk', 'universalDebug', null)
+held('a debug build that is not minified needs no merged rules', 'true', String(debugPlain.whole))
+process.env.KR_MINIFY_DEBUG = '1'
+try {
+  const debugMinified = withRules(
+    'apk/universal/debug/app-universal-debug.apk',
+    'universalDebug',
+    section('app/proguard-rules.pro')
+  )
+  held('a debug build that was asked to be minified is held to the same rules', 'false', String(debugMinified.whole))
+} finally {
+  delete process.env.KR_MINIFY_DEBUG
+}
+const bundle = withRules(
+  'bundle/universalRelease/app-universal-release.aab',
+  'universalRelease',
+  section('app/proguard-rules.pro'),
+  [
+    filler,
+    { name: 'base/dex/classes.dex', bytes: passingPackage[1].bytes },
+    library(mediaLibrary(), 'base/lib/arm64-v8a/libmedia.so')
+  ]
+)
+held('a bundle is held to the rules of its variant', 'false', String(bundle.whole))
 
 // -- which packages a build is checked against --------------------------------------------------
 // An outputs directory as a tree carries it after several builds. The ages are deliberately

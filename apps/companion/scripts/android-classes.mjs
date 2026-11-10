@@ -33,7 +33,7 @@ import {
   readdirSync,
   statSync
 } from 'node:fs'
-import { dirname, extname, join, relative, resolve } from 'node:path'
+import { dirname, extname, join, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import { jniMangled, libraryClassNames, libraryNatives, nativeSymbols } from './android-native-names.mjs'
@@ -852,6 +852,59 @@ export function missingFrom(path) {
   return REQUIRED.filter((name) => !classes.has(name))
 }
 
+/** The rule files the Rust build writes, which the minifier is given only if they exist by then. */
+const GENERATED_RULES = ['proguard-tauri.pro', 'proguard-wry.pro']
+
+/**
+ * The variant (`universalRelease`) of a package that lies where a build leaves it under `outputs`,
+ * or null for one from anywhere else, which says nothing of the build that made it.
+ */
+function variantOf(path, outputs) {
+  const parts = relative(outputs, path).split(sep)
+  if (parts[0] === 'apk' && parts.length === 4) return variantName(parts[1], parts[2])
+  if (parts[0] === 'bundle' && parts.length === 3) return parts[1]
+  return null
+}
+
+/**
+ * What is wrong with the rules the minifier was given for a package, or null when nothing is.
+ *
+ * The rules of a build are collected when Gradle configures it, and two files of them, the Tauri
+ * library's and the web view library's, are written by the Rust build. They keep the classes the Rust
+ * library calls by name and no Java reaches (the plugin manager, the web view's members), which the
+ * check of the libraries cannot see, since the library builds those names as it runs. The command line
+ * tool builds the Rust library before it starts Gradle, so a build through it has the files; a build
+ * that configured Gradle before they existed would pass every other check and fail at start. So the
+ * merged configuration the minifier wrote, `mapping/<variant>/configuration.txt`, must name both.
+ *
+ * A release build is always minified, and a debug build is when `KR_MINIFY_DEBUG=1` asked for it, as
+ * the Gradle project reads it. An unminified build has no rules to check.
+ */
+export function rulesProblem(path, outputs = OUTPUTS) {
+  const variant = variantOf(path, outputs)
+  if (variant === null) return null
+  if (!variant.endsWith('Release') && process.env.KR_MINIFY_DEBUG !== '1') return null
+  const file = join(outputs, 'mapping', variant, 'configuration.txt')
+  let text
+  try {
+    text = readFileSync(file, 'utf8')
+  } catch (failure) {
+    const why = failure.code === 'ENOENT' ? '' : `: ${failure.message}`
+    return `the ${variant} build is minified and left no merged configuration at ${file}${why}`
+  }
+  const sections = [...text.matchAll(/^# The proguard configuration file for the following section is (.*)$/gm)]
+  const lacking = GENERATED_RULES.filter(
+    (name) => !sections.some(([, section]) => section.endsWith(`/${name}`) || section.endsWith(`\\${name}`))
+  )
+  if (lacking.length === 0) return null
+  return (
+    `the merged rules of the ${variant} build (${file}) do not name ${and(lacking)}. The Rust build ` +
+    'writes them, and the minifier takes its rules when Gradle configures: a build that did so before ' +
+    'they existed left what the Rust library calls by name to the minifier. Build with `pnpm -C ' +
+    'apps/companion android`, which builds the Rust library before it starts Gradle.'
+  )
+}
+
 /**
  * Checks every artefact given, or, when given none, everything under `outputs`.
  *
@@ -859,15 +912,15 @@ export function missingFrom(path) {
  * tree carries; it reads every artefact it finds and reports each one. A build passes the packages
  * it asked for instead; see `packagesOf`.
  *
- * Answers true when every artefact carries every required class. Says which artefact was read and
- * what was missing, because "the build succeeded" is exactly the answer this check exists to
- * distrust.
+ * Answers true when every artefact carries every required class and is in order as `nativeNames`
+ * and `rulesProblem` read it. Says which artefact was read and what was missing, because "the build
+ * succeeded" is exactly the answer this check exists to distrust.
  */
-export function verify(paths) {
-  const found = paths.length > 0 ? paths : artefacts(OUTPUTS)
+export function verify(paths, outputs = OUTPUTS) {
+  const found = paths.length > 0 ? paths : artefacts(outputs)
   if (found.length === 0) {
     console.error(
-      `No packaged application to check under ${OUTPUTS}.\n` +
+      `No packaged application to check under ${outputs}.\n` +
         'Build one first: pnpm -C apps/companion android --debug --target aarch64'
     )
     return false
@@ -895,6 +948,11 @@ export function verify(paths) {
           missing.map((name) => `  ${name}`).join('\n') +
           `\nThe build is not compiling ${sourcesOf(missing).join(' and ')} into this application.`
       )
+    }
+    const rules = rulesProblem(path, outputs)
+    if (rules !== null) {
+      whole = false
+      console.error(`${shown}: ${rules}`)
     }
     if (reading.problems.length === 0) {
       console.log(
