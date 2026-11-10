@@ -750,7 +750,11 @@ fn show_the_plan(ready: &Ready) {
          at most once a day and when something has changed. A session that is still open is not \
          backed up until it closes.",
         "  - It encrypts everything on this host. The service holds ciphertext only.",
-        "  - It turns managed backup storage on for the account when it is off.",
+        if ready.storage {
+            "  - It turns backup storage on for the account at that service when it is off."
+        } else {
+            "  - It turns managed backup storage on for the account when it is off."
+        },
         "  - It reads nothing while privacy mode is on.",
         "  - It binds the backups to the account signed in now. If this host signs in as another \
          account, backups stop until it signs in as this one again or is set up again with \
