@@ -1025,6 +1025,10 @@ impl Assembled {
 const COPY_MADE_AGAIN: &str =
     "update-harness: a copy of the packed archive read wrong and was made again";
 
+/// What holds a copy to the digest of the archive packed at a path: [`held_to`], or what a case puts
+/// in its place to make the system give an outcome it cannot be made to give.
+type Held<'a> = dyn FnMut(&Path, [u8; 32], &Path) -> Result<(), Unequal> + 'a;
+
 /// Gives `copy` the bytes of the archive packed at `packed`, which read as `digest` when it was
 /// packed: `make` makes the copy and `held` holds it to `digest`.
 ///
@@ -1038,7 +1042,7 @@ fn copy_held_to(
     digest: [u8; 32],
     copy: &Path,
     make: &mut dyn FnMut(&Path, &Path),
-    held: &mut dyn FnMut(&Path, [u8; 32], &Path) -> Result<(), Unequal>,
+    held: &mut Held<'_>,
     report: &mut dyn std::io::Write,
 ) -> Result<(), String> {
     make(packed, copy);
