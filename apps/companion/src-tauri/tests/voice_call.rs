@@ -5425,8 +5425,9 @@ async fn a_capture_change_before_the_set_is_complete_refuses_it_and_every_later_
         scene.platform.tell(CallEvent::Capture { state });
         scene.platform.release("capture_proof");
 
-        let row = row_reaching(&scene, "d-1", "refused").await;
+        let row = row_settled(&scene, "d-1").await;
 
+        assert_eq!(row["state"], "refused", "{state:?}: {row}");
         assert_eq!(row["cause"], "capture_break", "{state:?}");
         // The microphone is back, and what was said now is as clear as it can be.
         scene.platform.tell(CallEvent::Capture {
@@ -5434,7 +5435,8 @@ async fn a_capture_change_before_the_set_is_complete_refuses_it_and_every_later_
         });
         let again = speak(&scene, 12_000, "status");
         ask(&scene, "d-2", again - 200);
-        let later = row_reaching(&scene, "d-2", "refused").await;
+        let later = row_settled(&scene, "d-2").await;
+        assert_eq!(later["state"], "refused", "{state:?}: {later}");
         assert_eq!(later["cause"], "capture_break", "{state:?}");
         assert_eq!(at_the_host(&scene), 0, "{state:?}");
         assert!(kinds_of(&scene.state()).contains(&"spoken_requests".to_owned()));
