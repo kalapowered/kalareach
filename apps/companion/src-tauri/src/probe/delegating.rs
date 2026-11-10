@@ -41,10 +41,6 @@ const ROW_WITHIN: Duration = Duration::from_secs(60);
 /// report that a hook ran.
 const SIGN_WITHIN: Duration = Duration::from_secs(30);
 
-/// How long a recorder is given to be seen stopping after the microphone track was turned off. A
-/// platform whose recorder keeps running does not show it, and the leg goes on with what it read.
-const STOP_WITHIN: Duration = Duration::from_secs(5);
-
 /// How long an HTTP exchange with the peer or the stand-in is given.
 const EXCHANGE_WITHIN: Duration = Duration::from_secs(20);
 
@@ -88,10 +84,11 @@ pub trait Driver: Send + Sync {
     /// that stands in for native code tells it here.
     fn after_a_mute(&self, muted: bool) -> DriverFuture<'_, ()>;
 
-    /// Whether the recorder this driver plays stops when the call's microphone track is turned off,
-    /// as a phone's does: the voice stack stops recording once nothing is being sent, and what the
-    /// recorder reports is native code's to tell, after the time its own watch needs. A driver that
-    /// stands in for native code has no recorder to stop.
+    /// Whether the recorder this driver plays is known to stop when the call's microphone track is
+    /// turned off: the voice stack stops recording once nothing is being sent, which the Android
+    /// voice stack does. Where it is, the mute leg waits for native code to say the recorder stopped
+    /// before it unmutes, and fails when that never comes. A driver that stands in for native code
+    /// has no recorder to stop, and a platform whose recorder is not known to stop is not waited on.
     fn recorder_stops_with_the_mute(&self) -> bool;
 }
 
@@ -115,7 +112,7 @@ pub enum Leg {
     Gap,
     /// The provider's answer turns discontinuous transmission on.
     Dtx,
-    /// A message on the data channel that is not an event.
+    /// A required event on the data channel that fails its schema: a member missing.
     Malformed,
     /// A fragment that belongs to a request arrives after the request was read.
     LateFragment,
@@ -314,7 +311,7 @@ impl Driver for PeerDriver {
     }
 
     fn recorder_stops_with_the_mute(&self) -> bool {
-        true
+        cfg!(target_os = "android")
     }
 }
 
@@ -489,10 +486,10 @@ impl<R: Runtime> Play<'_, R> {
         .await
     }
 
-    /// Waits up to `within` until the microphone's capture word is `word`.
-    async fn capture_is(&self, word: &str, within: Duration) -> bool {
+    /// Waits until the microphone's capture word is `word`.
+    async fn capture_is(&self, word: &str) -> bool {
         let app = self.app;
-        until(within, || async move {
+        until(SIGN_WITHIN, || async move {
             (call_state(app).await["capture"] == word).then_some(())
         })
         .await
@@ -613,7 +610,7 @@ pub(super) async fn run<R: Runtime>(
     // The microphone is carrying speech before anything is said: what the provider is sent before
     // the gate opens is a call the gate refuses for good, and a leg that began so would be about
     // that, not about its own subject.
-    let on = play.capture_is("capturing", SIGN_WITHIN).await;
+    let on = play.capture_is("capturing").await;
     let word = call_state(app).await["capture"].clone();
     checks.push(Check::found(
         "native code's capture is on",
@@ -833,15 +830,15 @@ async fn mute<R: Runtime>(play: &Play<'_, R>, checks: &mut Checks<'_>) -> Result
         commands::voice_set_muted(play.app.state(), commands::VoiceMute::Microphone, true).await;
     play.driver.after_a_mute(true).await?;
     let shown = play.mute_is_held().await;
-    // Where the recorder stops with the muted track, native code says so once it has seen it stop,
-    // and the unmute is made after that: a track that waited for the recorder would never be turned
-    // on again, which a person who stays muted for a while meets and one who unmutes at once does
-    // not. Where the recorder goes on, nothing is said, and the leg goes on after the bound.
-    let stopped = !play.driver.recorder_stops_with_the_mute()
-        || play.capture_is("unavailable", STOP_WITHIN).await;
+    // Where the recorder is known to stop with the muted track, native code says so once it has seen
+    // it stop, and the unmute is made after that, never before: a track that waited for the recorder
+    // would never be turned on again, which a person who stays muted for a while meets and one who
+    // unmutes at once does not. The leg fails where that is never said.
+    let stopped =
+        !play.driver.recorder_stops_with_the_mute() || play.capture_is("unavailable").await;
     checks.push(Check::found(
         "the person mutes between two parts of a command",
-        muted.is_ok() && shown.is_some(),
+        muted.is_ok() && shown.is_some() && stopped,
         format!(
             "mute ok {} held {shown:?} recorder stopped {stopped}",
             muted.is_ok()
@@ -850,7 +847,7 @@ async fn mute<R: Runtime>(play: &Play<'_, R>, checks: &mut Checks<'_>) -> Result
     let unmuted =
         commands::voice_set_muted(play.app.state(), commands::VoiceMute::Microphone, false).await;
     play.driver.after_a_mute(false).await?;
-    let back = play.capture_is("capturing", SIGN_WITHIN).await;
+    let back = play.capture_is("capturing").await;
     checks.push(Check::found(
         "the microphone is back to capturing after the unmute",
         unmuted.is_ok() && back,
@@ -928,7 +925,7 @@ async fn dtx<R: Runtime>(play: &Play<'_, R>, checks: &mut Checks<'_>) -> Result<
     Ok(())
 }
 
-/// A message on the data channel that is not an event taints the call.
+/// A required event on the data channel that fails its schema taints the call.
 async fn malformed<R: Runtime>(play: &Play<'_, R>, checks: &mut Checks<'_>) -> Result<(), String> {
     // The command after the message is refused at once, so it is announced ahead of the rows told
     // before it.
@@ -936,12 +933,19 @@ async fn malformed<R: Runtime>(play: &Play<'_, R>, checks: &mut Checks<'_>) -> R
     if !control(play, checks).await? {
         return Ok(());
     }
-    play.driver.provider(b"not json at all").await?;
+    // A fragment of what the caller said with the moment it ends missing.
+    let torn = json!({
+        "type": "session.input_transcript.delta",
+        "event_id": "event_torn",
+        "start_ms": 9_000,
+        "delta": "hello",
+    });
+    play.driver.provider(torn.to_string().as_bytes()).await?;
     status_announced(play, "d-2", 12_000).await?;
     let read = play.row_told("d-2").await;
     expect_row(
         checks,
-        "a message that is not an event refuses the next command",
+        "a required event that fails its schema refuses the next command",
         read,
         "refused",
         Some("unreadable_event"),

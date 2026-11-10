@@ -1060,10 +1060,10 @@ async fn the_dtx_leg_refuses_the_command_of_a_call_that_may_hold_back_quiet_spee
     stop(scene).await;
 }
 
-/// A message on the data channel that is not an event refuses the next command, after a read that
-/// was performed.
+/// A required event on the data channel that fails its schema refuses the next command, after a read
+/// that was performed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_malformed_leg_refuses_the_command_after_a_message_that_is_not_an_event() {
+async fn the_malformed_leg_refuses_the_command_after_a_required_event_that_fails_its_schema() {
     let (scene, checks) = play(Leg::Malformed, Before::default()).await;
 
     assert_leg(&scene, &checks, 1);

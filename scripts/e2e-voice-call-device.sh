@@ -49,7 +49,7 @@
 #   mute              a mute and an unmute between two parts of a command
 #   gap               the debug build's drop hook takes audio out of the recorder
 #   dtx               the peer's answer turns discontinuous transmission on
-#   malformed         a message on the data channel that is not an event
+#   malformed         a required event on the data channel that fails its schema
 #   late_fragment     a fragment of a request arrives after the request was read
 #   broker_disagrees  the service announces a delegation at another offset than the provider's
 #
@@ -410,7 +410,7 @@ set_required_checks() {
                     required_checks+=(
                         "the first utterance is refused"
                         "a status said before the break is performed"
-                        "a message that is not an event refuses the next command"
+                        "a required event that fails its schema refuses the next command"
                     )
                     ;;
                 late_fragment)
@@ -532,14 +532,16 @@ note_verdict() { # <leg> <status> [<attempts>]
 }
 
 # Plays one run of a leg, and plays it again on a new call, up to `KR_LEG_ATTEMPTS` (three) in all, when
-# its result says the call's own recorder broke by itself: a break in a part of the leg that is not
-# about one, which a phone's recorder can make when the device is busy with its own start (the emulator
-# on a loaded machine does). The leg's subject was never reached then, so the attempt counts for
-# nothing, is kept under its own name with the break it names, and the leg's verdict is its last
-# attempt's. A run that fails for any other reason fails at once, and a leg that breaks by itself on
-# every attempt fails, saying so.
+# every check its result failed names the call's own recorder as having broken by itself: a break in a
+# part of the leg that is not about one, which a phone's recorder can make when the device is busy with
+# its own start (the emulator on a loaded machine does). The leg's subject was never reached then, so
+# the attempt counts for nothing and is kept under its own name with the failed checks it lists, and
+# the leg's verdict is its last attempt's. A result that has any other failed check (the revocation of
+# the grant, the end of the call, a refusal with the wrong cause) fails at once, so that a later clean
+# attempt never hides it, and a leg whose recorder breaks by itself on every attempt fails, saying that
+# a call which never begins without a break is a finding and not the load of the machine.
 play_leg() { # <leg> <runner> <runner arguments...>
-    local each=$1 runner=$2 rc attempt=1 attempts="${KR_LEG_ATTEMPTS:-3}"
+    local each=$1 runner=$2 rc attempt=1 attempts="${KR_LEG_ATTEMPTS:-3}" failed marked
     shift 2
     while :; do
         begin_run "$each"
@@ -547,9 +549,14 @@ play_leg() { # <leg> <runner> <runner arguments...>
         "$runner" "$@" || rc=$?
         end_run
         [ "$rc" != 0 ] || break
-        grep -q 'the recorder broke by itself' "$artefacts/$result_name" 2>/dev/null || break
-        say "== leg ${each:-the call} attempt $attempt of $attempts: $(grep -h 'the recorder broke by itself' "$artefacts/$result_name" | cut -c1-160 | head -2 | tr '\n' ' ')"
-        [ "$attempt" -lt "$attempts" ] || break
+        failed=$(grep -c ' ok=0 detail=' "$artefacts/$result_name" 2>/dev/null)
+        marked=$(grep -c ' ok=0 detail=.*the recorder broke by itself' "$artefacts/$result_name" 2>/dev/null)
+        { [ "${marked:-0}" -gt 0 ] && [ "${failed:-0}" = "$marked" ]; } || break
+        say "== leg ${each:-the call} attempt $attempt of $attempts: $(grep -h ' ok=0 detail=' "$artefacts/$result_name" | cut -c1-200 | tr '\n' ' ')"
+        if [ "$attempt" -ge "$attempts" ]; then
+            say "== leg ${each:-the call}: the recorder broke by itself on all $attempts attempts, which is a finding about the call and not the load of the machine"
+            break
+        fi
         mv "$artefacts" "$artefacts-attempt-$attempt" || break
         attempt=$((attempt + 1))
     done
