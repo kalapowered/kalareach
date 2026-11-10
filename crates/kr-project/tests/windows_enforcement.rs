@@ -766,7 +766,14 @@ impl Case {
                     "{} is not in Git's helper directory",
                     path.display()
                 );
-                let launch = self.launch(who, name, &path, "", &directory);
+                // The daemon listens until it is ended when it has nothing to refuse, so it is asked for
+                // its usage, which it answers at once.
+                let arguments = if name == "git-daemon.exe" {
+                    "--help"
+                } else {
+                    ""
+                };
+                let launch = self.launch(who, name, &path, arguments, &directory);
                 if who == Who::Person {
                     self.expect(launch.outcome.ran(), || {
                         format!("{role}: {name} {}", launch.outcome)
