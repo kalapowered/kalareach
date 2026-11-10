@@ -2373,29 +2373,45 @@ pub struct VoiceScopeAction {
     pub needs_unlocked_screen: bool,
 }
 
-/// What allowing voice on this device permits by default.
+/// What allowing voice on this device permits by default, and what a person may add to it.
 #[derive(Debug, Serialize)]
 pub struct VoiceScope {
     /// The default actions, each in the sentence that states it.
     pub actions: Vec<VoiceScopeAction>,
+    /// The actions a person may add to the default grant, each in the sentence that states it.
+    /// Empty while no spoken request reaches the host: a person is not asked to allow what cannot
+    /// happen.
+    pub optional: Vec<VoiceScopeAction>,
+}
+
+fn scope_action(action: kr_protocol::voice::VoiceAction) -> VoiceScopeAction {
+    VoiceScopeAction {
+        action,
+        sentence: action.statement(),
+        needs_unlocked_screen: action.needs_unlocked_screen(),
+    }
 }
 
 /// What a voice grant permits when the person chooses nothing further, from the protocol's own
 /// table, so the surface that asks the question cannot word an action more softly than the host
-/// states it. It reaches nothing: the page asks before it allows, and allowing sends the same
-/// actions back for the host to check.
+/// states it, and what the person may add to it. It reaches nothing: the page asks before it
+/// allows, and allowing sends the same actions back for the host to check.
+///
+/// The one action a person may add is closing a session, which a spoken request reaches the host
+/// with only while this device hands spoken requests to the host at all.
 #[tauri::command]
-pub fn voice_scope() -> VoiceScope {
+pub fn voice_scope(calls: State<'_, crate::voice::Calls>) -> VoiceScope {
     VoiceScope {
         actions: kr_protocol::voice::VoiceAction::ALL
             .iter()
             .filter(|action| action.in_default_scope())
-            .map(|action| VoiceScopeAction {
-                action: *action,
-                sentence: action.statement(),
-                needs_unlocked_screen: action.needs_unlocked_screen(),
-            })
+            .map(|action| scope_action(*action))
             .collect(),
+        optional: if calls.hands_spoken_requests_to_the_host() {
+            vec![scope_action(kr_protocol::voice::VoiceAction::CloseSession)]
+        } else {
+            Vec::new()
+        },
     }
 }
 

@@ -15,6 +15,7 @@ use companion_platform::call::{CallId, CallPlatform};
 use kr_client::pairing::paired::PairedHost;
 use kr_client::session::ComposedMutation;
 use kr_client::{ClientError, Session, Settled};
+use kr_crypto::keys::AuthorisationKeyPair;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::ids::{ActionId, EnvironmentId, VoiceSessionId};
 use kr_protocol::method::Method;
@@ -68,6 +69,14 @@ pub trait HostReach: Send + Sync + 'static {
     /// Whether the commands of this application now go to a host other than `host`: another
     /// paired host, or this computer's own.
     fn another_host_in_use(&self, host: &PairedHost) -> bool;
+
+    /// The key this device signs a voice confirmation with: its own identity key for the host it
+    /// is paired with, the one that signs its authority-bearing requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns why there is none: this application holds no device identity.
+    fn authorisation_key(&self) -> Result<AuthorisationKeyPair>;
 }
 
 /// What this device's records say of a pairing.
@@ -161,6 +170,17 @@ impl<R: Runtime> HostReach for AppReach<R> {
         state
             .connection()
             .is_ok_and(|connection| matches!(connection.standing(), Standing::Owner))
+    }
+
+    fn authorisation_key(&self) -> Result<AuthorisationKeyPair> {
+        Ok(self
+            .app
+            .state::<AppState>()
+            .device()?
+            .identity()
+            .keys
+            .authorisation
+            .clone())
     }
 }
 
@@ -271,6 +291,9 @@ pub(super) struct Handover {
     pub host: CallHost,
     pub platform: Arc<dyn CallPlatform>,
     pub call: CallId,
+    /// The action the request goes out under: none for a first request, which takes a new one, and
+    /// the same action again for the request that carries a confirmation of the first.
+    pub action_id: Option<ActionId>,
     pub params: VoiceDelegateParams,
     /// How old a capture proof may be at the moment the request is written.
     pub age_bound: Duration,
@@ -292,12 +315,13 @@ pub(super) async fn hand_over(handover: Handover) -> Exchange {
         host,
         platform,
         call,
+        action_id,
         params,
         age_bound,
         within,
         lost,
     } = handover;
-    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let action_id = action_id.unwrap_or_else(|| ActionId::new(kr_ipc::new_uuid()));
     let session = Arc::clone(&host.session);
     let nothing = |cause: Cause, composed: Option<ComposedMutation>| Exchange {
         session: Arc::clone(&session),
@@ -329,6 +353,10 @@ pub(super) async fn hand_over(handover: Handover) -> Exchange {
         Ok(proof) => match usable(&proof, &call) {
             Ok(age) => age,
             Err(cause) if cause.taints() => {
+                // A request waiting for the connection's turn is stopped here, by the task that
+                // read the proof, and not when the owner next handles a message: no other write
+                // leaves in between.
+                lost.store(true, Ordering::SeqCst);
                 return Exchange {
                     session,
                     composed: Some(composed),

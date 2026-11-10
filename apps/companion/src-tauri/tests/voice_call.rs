@@ -83,15 +83,31 @@ use kr_crypto::store::MemoryStore;
 use kr_protocol::hostinfo::configuration::ConfigurationDocument;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Nullable;
+use kr_protocol::voice::{
+    VoiceAction, VoiceActionPlan, VoiceConfirmationRequest, VoiceDelegateParams,
+    VoiceDelegateResult, VoiceDelegationId, VoiceDelegationOutcome,
+};
 use net_support::Host;
 use serde_json::json;
 use support::call::{OFFER, ScriptedCalls};
 use support::{
-    Companion, LinkControl, NoOwner, Phone, StubIntake, WATCHDOG, govern, pair, pair_under, parts,
+    Companion, LinkControl, NoOwner, Phone, ScriptedCeremony, StubIntake, WATCHDOG, govern, pair,
+    pair_under, parts,
 };
 use tauri::Manager as _;
 use tokio::sync::watch;
 use voice_support::StandIn;
+
+/// The calls of a phone whose ceremony confirms nothing: what these cases do is not about a
+/// confirmation.
+fn calls_on_phone(
+    platform: Arc<dyn companion_platform::call::CallPlatform>,
+    service: Service,
+    timings: Timings,
+    kept: Kept,
+) -> Calls {
+    Calls::on_phone(platform, Arc::new(NoOwner), service, timings, kept)
+}
 
 /// The access token the phone's account holds first.
 const PHONE_TOKEN: &str = "phone-access-token-1";
@@ -235,6 +251,8 @@ struct Scene {
     workers: Vec<net_support::worker::Worker>,
     /// What the phone's connections to the host carried, and the test's hold on them.
     link: Arc<LinkControl>,
+    /// The person's side of the ceremony: what they do when asked, and what they were asked.
+    ceremony: Arc<ScriptedCeremony>,
 }
 
 impl Scene {
@@ -331,6 +349,23 @@ impl Scene {
     }
 }
 
+/// What the phone is paired to do, and what voice is allowed to do, when a case needs more than the
+/// default: the rights the host's grant to the phone carries, and the actions of the allowance
+/// (null takes the default scope).
+struct Standing {
+    rights: Vec<ActionRight>,
+    voice_actions: serde_json::Value,
+}
+
+impl Default for Standing {
+    fn default() -> Self {
+        Self {
+            rights: vec![ActionRight::SessionView, ActionRight::AgentPrompt],
+            voice_actions: serde_json::Value::Null,
+        }
+    }
+}
+
 /// A host that brokers calls through the stand-in, a phone paired with it that may start one, and
 /// native code that does what it is told.
 async fn scene_with(
@@ -367,6 +402,7 @@ async fn scene_built(
         account_origin,
         deadlines,
         sessions,
+        Standing::default(),
         |service| service,
     )
     .await
@@ -414,6 +450,7 @@ async fn scene_replacing(
     account_origin: Option<&str>,
     deadlines: HttpDeadlines,
     sessions: u64,
+    standing: Standing,
     replacing: impl FnOnce(Service) -> Service,
 ) -> Scene {
     let stand_in = StandIn::start().await;
@@ -460,8 +497,10 @@ async fn scene_replacing(
     ));
     let platform = ScriptedCalls::new();
     let data = tempfile::tempdir().expect("a directory");
+    let ceremony = ScriptedCeremony::new();
     let calls = Calls::on_phone(
         Arc::clone(&platform) as Arc<dyn companion_platform::call::CallPlatform>,
+        Arc::clone(&ceremony) as Arc<dyn kr_client::pairing::owner::Ceremony>,
         replacing(service_with(
             account_origin.unwrap_or_else(|| stand_in.origin()),
             deadlines,
@@ -493,7 +532,7 @@ async fn scene_replacing(
     };
     // Paired with the history of the session from its start: what a call is told of a session is
     // decided against the history the pairing reaches, and none reaches nothing.
-    let mut proposed = net_support::proposal(&[ActionRight::SessionView, ActionRight::AgentPrompt]);
+    let mut proposed = net_support::proposal(&standing.rights);
     proposed.history.lower_bound_ms = Nullable::some(kr_protocol::scalars::TimestampMs::new(0));
     pair_under(&phone, &host, &owner, proposed).await;
     let session = workers.first().map_or_else(
@@ -510,6 +549,7 @@ async fn scene_replacing(
         session,
         workers,
         link,
+        ceremony,
     };
     tokio::time::timeout(WATCHDOG, async {
         loop {
@@ -527,7 +567,7 @@ async fn scene_replacing(
     scene
         .call(
             "voice_allow",
-            json!({ "subject": {}, "params": { "session_ids": [scene.session], "actions": null } }),
+            json!({ "subject": {}, "params": { "session_ids": [scene.session], "actions": standing.voice_actions } }),
         )
         .expect("the person allows voice");
     scene
@@ -2874,6 +2914,7 @@ async fn a_call_the_host_cannot_be_told_about_is_closed_at_the_service_over_its_
         None,
         HttpDeadlines::default(),
         0,
+        Standing::default(),
         move |service| {
             service.with_brokers(Arc::new(move |origin, http, tokens| {
                 counting.fetch_add(1, Ordering::SeqCst);
@@ -3290,6 +3331,12 @@ impl companion_tauri::voice::HostReach for FailsWhenTold {
     fn another_host_in_use(&self, host: &kr_client::pairing::paired::PairedHost) -> bool {
         self.inner.another_host_in_use(host)
     }
+
+    fn authorisation_key(
+        &self,
+    ) -> companion_tauri::error::Result<kr_crypto::keys::AuthorisationKeyPair> {
+        self.inner.authorisation_key()
+    }
 }
 
 /// What a start asks for, as the page asks for it.
@@ -3682,7 +3729,7 @@ async fn the_note_that_the_service_had_no_such_call_survives_a_launch() {
     };
     // The note is in the file once the write that follows the ending has finished.
     kept_file_where(scene.phone.data.path(), |file| !file["note"].is_null()).await;
-    let relaunched = Calls::on_phone(
+    let relaunched = calls_on_phone(
         ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
         service_at(scene.stand_in.origin()),
         quick(),
@@ -3748,7 +3795,7 @@ async fn a_revocation_owed_to_a_host_survives_a_launch() {
     })
     .await;
 
-    let relaunched = Calls::on_phone(
+    let relaunched = calls_on_phone(
         ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
         service_at(scene.stand_in.origin()),
         quick(),
@@ -3853,7 +3900,7 @@ async fn a_named_stop_settles_the_entry_owed_to_the_host_that_revoked_and_no_oth
         .expect("the file is written");
     // A device launched again holds no call, so the stop that names the voice session is the host's
     // to answer alone.
-    let relaunched = Calls::on_phone(
+    let relaunched = calls_on_phone(
         ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
         service_at(scene.stand_in.origin()),
         quick(),
@@ -3956,7 +4003,7 @@ async fn a_host_that_holds_no_such_call_settles_what_was_owed_to_it() {
             note: None,
         })
         .expect("the file is written");
-    let relaunched = Calls::on_phone(
+    let relaunched = calls_on_phone(
         ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
         service_at(scene.stand_in.origin()),
         quick(),
@@ -4051,7 +4098,7 @@ async fn a_refusal_that_is_not_the_typed_reason_stays_owed_until_the_host_revoke
             note: None,
         })
         .expect("the file is written");
-    let relaunched = Calls::on_phone(
+    let relaunched = calls_on_phone(
         ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
         service_at(scene.stand_in.origin()),
         quick(),
@@ -4145,7 +4192,7 @@ async fn a_call_that_stands_open_is_owed_to_the_phone_that_starts_after_the_proc
     );
 
     // The process that starts after this one ended reads the file as it was left.
-    let relaunched = Calls::on_phone(
+    let relaunched = calls_on_phone(
         ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
         service_at(scene.stand_in.origin()),
         quick(),
@@ -4355,7 +4402,7 @@ async fn a_call_started_while_the_record_cannot_be_read_stands_in_it_once_it_can
     // after native code accepts the answer, so no attach changes the note meanwhile.
     scene.platform.hold("accept");
     let _holding = scene.platform.release_when_done("accept");
-    let calls = Arc::new(Calls::on_phone(
+    let calls = Arc::new(calls_on_phone(
         Arc::clone(&scene.platform) as Arc<dyn companion_platform::call::CallPlatform>,
         service_at(scene.stand_in.origin()),
         quick(),
@@ -4618,7 +4665,7 @@ async fn what_an_end_owed_while_the_record_could_not_be_read_is_written_by_the_s
     // answer nor the exchange's own deadlines may run out meanwhile; the host's bound stays short,
     // so that the end owes the revocation.
     let (waiting, deadlines) = waiting_on_the_service();
-    let calls = Calls::on_phone(
+    let calls = calls_on_phone(
         Arc::clone(&scene.platform) as Arc<dyn companion_platform::call::CallPlatform>,
         service_with(scene.stand_in.origin(), deadlines),
         Timings {
@@ -4769,7 +4816,7 @@ async fn a_record_the_system_refused_to_read_is_read_again_when_the_host_is_reac
         .expect("the file is written");
     lock_the_kept_file(&directory);
 
-    let relaunched = Calls::on_phone(
+    let relaunched = calls_on_phone(
         ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
         service_at(scene.stand_in.origin()),
         quick(),
@@ -4833,7 +4880,7 @@ async fn a_record_the_system_refused_to_read_is_not_written_over_and_is_taken_up
         .expect("the file is written");
     lock_the_kept_file(&directory);
 
-    let relaunched = Calls::on_phone(
+    let relaunched = calls_on_phone(
         Arc::clone(&scene.platform) as Arc<dyn companion_platform::call::CallPlatform>,
         service_at(scene.stand_in.origin()),
         quick(),
@@ -4935,7 +4982,7 @@ async fn a_record_the_system_refused_to_read_is_taken_up_in_order_with_what_this
         other => panic!("the phone is signed in: {other:?}"),
     };
     let environment = Some(scene.host().environment_id.to_string());
-    let key = Calls::on_phone(
+    let key = calls_on_phone(
         ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
         service_at(scene.stand_in.origin()),
         quick(),
@@ -4955,7 +5002,7 @@ async fn a_record_the_system_refused_to_read_is_taken_up_in_order_with_what_this
         .expect("the file is written");
     lock_the_kept_file(&directory);
 
-    let relaunched = Calls::on_phone(
+    let relaunched = calls_on_phone(
         Arc::clone(&scene.platform) as Arc<dyn companion_platform::call::CallPlatform>,
         service_at(scene.stand_in.origin()),
         timings,
@@ -5075,7 +5122,7 @@ async fn a_named_stop_after_the_unlock_settles_the_entry_the_file_held() {
         })
         .expect("the file is written");
     lock_the_kept_file(&directory);
-    let relaunched = Calls::on_phone(
+    let relaunched = calls_on_phone(
         ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
         service_at(scene.stand_in.origin()),
         quick(),
@@ -6573,5 +6620,621 @@ async fn with_the_constant_off_the_data_channel_tells_nothing_and_reaches_no_hos
         "{instructions:?}"
     );
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/* Spoken requests that need a confirmation on the unlocked screen                                */
+/* ---------------------------------------------------------------------------------------------- */
+//
+// A close said aloud is the one request of the five classes the host's grammar reads. The host
+// answers its first submission with a challenge; the phone puts it to the person only when
+// everything it says agrees with what the phone itself made of the call, signs it only after the
+// ceremony and a look at the news up to a marker, and sends the same delegation again under the
+// same action with the signature on it. Each negative case asserts the cause the row shows, that
+// the host was sent no signed request, and that the session was not closed; each is read beside the
+// first case, which shows the same call closing a session when nothing is wrong.
+
+/// A scene over one real session whose calls hand spoken requests to the host, whose phone may
+/// close sessions and whose allowance lets voice ask for a close.
+async fn closing_with(timings: Timings) -> Scene {
+    let scene = scene_replacing(
+        timings,
+        Some(phone_grant(PHONE_TOKEN, 3600)),
+        None,
+        HttpDeadlines::default(),
+        1,
+        Standing {
+            rights: vec![
+                ActionRight::SessionView,
+                ActionRight::AgentPrompt,
+                ActionRight::SessionClose,
+            ],
+            voice_actions: json!([
+                "navigate",
+                "status",
+                "brief",
+                "compose_prompt",
+                "close_session"
+            ]),
+        },
+        |service| service,
+    )
+    .await;
+    scene
+        .phone
+        .companion
+        .app
+        .state::<Calls>()
+        .accept_host_delegations(true);
+    scene
+}
+
+async fn closing() -> Scene {
+    closing_with(delegating_timings()).await
+}
+
+impl Scene {
+    /// The number the host gives the session the call is made over.
+    async fn display_number(&self) -> u64 {
+        let mut client = self.host().client().await;
+        let read: kr_protocol::session::SessionReadResult = client
+            .request(
+                kr_protocol::method::Method::SessionRead,
+                &kr_protocol::session::SessionReadParams {
+                    session_id: self.session.parse().expect("a session"),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the session reads")
+            .to_typed()
+            .expect("decodes");
+        read.session.display_number.get()
+    }
+
+    /// Whether the host's worker has closed the session the call is made over.
+    async fn is_closed(&self) -> bool {
+        self.state_of(self.session.parse().expect("a session"))
+            .await
+            == kr_protocol::session::SessionState::Closed
+    }
+
+    /// Waits until the session the call is made over is closed.
+    async fn until_closed(&self) {
+        tokio::time::timeout(WATCHDOG, async {
+            while !self.is_closed().await {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the host closes the session");
+    }
+}
+
+/// What a person says to close the session the call is made over, said from `start_ms`. Returns
+/// where it ends.
+async fn say_close(scene: &Scene, start_ms: u64) -> u64 {
+    let number = scene.display_number().await;
+    speak(scene, start_ms, &format!("close session {number}"))
+}
+
+/// A call over the session, past the first sentence that never acts, and the close said.
+async fn closing_asked(scene: &Scene, id: &str) {
+    calling(scene).await;
+    chatter(scene).await;
+    let end = say_close(scene, 6_000).await;
+    ask(scene, id, end - 200).await;
+}
+
+/// The instructions to end the call a case made, once it has asserted what it was for.
+fn hang_up(scene: &Scene) {
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+}
+
+/// The host answered the first submission with a challenge, the phone asked the person on the
+/// unlocked screen, and the same delegation came back under the same action with the person's
+/// signature: the host's worker closed the session. The person is asked once, about this session on
+/// this host; the model is told a confirmation is being asked for and then what the host did. This is
+/// the control every case below is read beside.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_said_aloud_is_confirmed_on_the_phone_and_closes_the_session() {
+    let mut scene = closing().await;
+    closing_asked(&scene, "d-1").await;
+
+    let row = row_reaching(&scene, "d-1", "performed").await;
+
+    assert_eq!(row["delegation_id"], "d-1");
+    scene.until_closed().await;
+    assert_eq!(
+        at_the_host(&scene),
+        2,
+        "the delegation, and the same delegation with the confirmation"
+    );
+    let actions = scene.link.sent_actions(HostMethod::VoiceDelegate);
+    assert_eq!(actions[0], actions[1], "under one action: {actions:?}");
+    let number = scene.display_number().await;
+    let asked = scene.ceremony.asked();
+    assert_eq!(asked.len(), 1, "the person was asked once: {asked:?}");
+    assert!(
+        asked[0].contains(&format!("session {number}")),
+        "about the session: {asked:?}"
+    );
+    let told = told_of(&scene, "d-1");
+    assert!(
+        told.first()
+            .is_some_and(|words| words.contains("unlocked screen")),
+        "{told:?}"
+    );
+    assert!(
+        told.last()
+            .is_some_and(|words| !words.contains("Nothing was done")),
+        "{told:?}"
+    );
+    hang_up(&scene);
+    scene.stop_host().await;
+}
+
+/// A person who does not confirm, or whose phone has no ceremony to run, signs nothing: the host
+/// was sent the delegation once, was never sent a signature, and the session is open. The same
+/// request said again, once the person does confirm, closes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_person_who_does_not_confirm_signs_nothing_and_the_request_can_be_said_again() {
+    use kr_client::pairing::owner::CeremonyOutcome;
+
+    for (outcome, cause) in [
+        (CeremonyOutcome::NotConfirmed, "not_confirmed"),
+        (CeremonyOutcome::Unavailable, "no_ceremony"),
+    ] {
+        let mut scene = closing().await;
+        scene.ceremony.answer_with(outcome);
+        closing_asked(&scene, "d-1").await;
+
+        let row = row_reaching(&scene, "d-1", "cancelled").await;
+
+        assert_eq!(row["cause"], cause, "{outcome:?}");
+        assert_eq!(scene.ceremony.asked().len(), 1, "{outcome:?}");
+        assert_eq!(at_the_host(&scene), 1, "no signature was sent: {outcome:?}");
+        assert!(!scene.is_closed().await, "{outcome:?}");
+        // The control: said again, once the person does confirm, the host closes the session.
+        scene.ceremony.answer_with(CeremonyOutcome::Confirmed);
+        let again = say_close(&scene, 12_000).await;
+        ask(&scene, "d-2", again - 200).await;
+        row_reaching(&scene, "d-2", "performed").await;
+        scene.until_closed().await;
+        assert_eq!(at_the_host(&scene), 3, "{outcome:?}");
+        hang_up(&scene);
+        scene.stop_host().await;
+    }
+}
+
+/// The host's challenge as a case changes it: what the host issued, and what the phone is handed.
+type Change = fn(&mut VoiceDelegateResult, &VoiceDelegateParams);
+
+fn challenge_of(result: &mut VoiceDelegateResult) -> &mut VoiceConfirmationRequest {
+    match &mut result.outcome {
+        VoiceDelegationOutcome::ConfirmationRequired { request, .. } => request,
+        other => panic!("not a challenge: {other:?}"),
+    }
+}
+
+/// The digest of the plan the words ask for, as the host computes it: so that a case that changes
+/// what the plan is made of changes the digest to agree, and only the check under test refuses.
+fn digest_for(
+    result: &mut VoiceDelegateResult,
+    params: &VoiceDelegateParams,
+    action: VoiceAction,
+    session: Option<kr_protocol::ids::SessionId>,
+) -> kr_protocol::scalars::Digest256 {
+    let voice_session_id = challenge_of(result).voice_session_id;
+    VoiceActionPlan {
+        voice_session_id,
+        action,
+        session_id: Nullable(session),
+        delegation_id: Nullable::some(params.delegation_id.clone()),
+        payload_digest: params.payload_digest().expect("the delegation digests"),
+    }
+    .digest()
+    .expect("the plan digests")
+}
+
+fn an_id(byte: u8) -> kr_protocol::scalars::Uuid {
+    kr_protocol::scalars::Uuid::from_bytes([byte; 16])
+}
+
+/// A challenge the phone cannot show is true to the call, in each way it can fail to be, is put to
+/// nobody: the person is not asked, no signature is sent, and the session is open. Each change
+/// leaves everything else the check reads in agreement, so only the check under test refuses it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_challenge_that_does_not_agree_with_the_call_is_put_to_nobody() {
+    let variants: Vec<(&str, Change)> = vec![
+        ("another action id", |result, _| {
+            challenge_of(result).action_id = kr_protocol::ids::ActionId::new(an_id(0xa1));
+        }),
+        ("another delegation", |result, _| {
+            result.delegation_id = VoiceDelegationId::new("d-other").expect("an identifier");
+        }),
+        ("an action the words did not ask for", |result, _| {
+            result.action = Nullable::some(VoiceAction::Status);
+        }),
+        ("another host", |result, _| {
+            challenge_of(result).host_device_id = kr_protocol::ids::DeviceId::new(an_id(0xa2));
+        }),
+        ("another device", |result, _| {
+            challenge_of(result).device_id = kr_protocol::ids::DeviceId::new(an_id(0xa3));
+        }),
+        ("another voice session", |result, _| {
+            challenge_of(result).voice_session_id =
+                kr_protocol::ids::VoiceSessionId::new(an_id(0xa4));
+        }),
+        (
+            "a class the call's grant does not confirm",
+            |result, params| {
+                let session = result.session_id.0;
+                let digest = digest_for(result, params, VoiceAction::ApplyDiff, session);
+                result.action = Nullable::some(VoiceAction::ApplyDiff);
+                let request = challenge_of(result);
+                request.action = VoiceAction::ApplyDiff;
+                request.action_digest = digest;
+            },
+        ),
+        ("a session the call does not reach", |result, params| {
+            let other = Some(kr_protocol::ids::SessionId::new(an_id(0xa5)));
+            let digest = digest_for(result, params, VoiceAction::CloseSession, other);
+            result.session_id = Nullable(other);
+            challenge_of(result).action_digest = digest;
+        }),
+        ("a digest of something else", |result, _| {
+            challenge_of(result).action_digest =
+                kr_protocol::scalars::Digest256::from_bytes([0xa6; 32]);
+        }),
+    ];
+    for (what, change) in variants {
+        let mut scene = closing().await;
+        calling(&scene).await;
+        chatter(&scene).await;
+        scene.link.change_the_next_challenge(change);
+        let end = say_close(&scene, 6_000).await;
+        ask(&scene, "d-1", end - 200).await;
+
+        let row = row_reaching(&scene, "d-1", "cancelled").await;
+
+        assert_eq!(row["cause"], "challenge_mismatch", "{what}");
+        assert!(
+            scene.ceremony.asked().is_empty(),
+            "nobody was asked: {what}"
+        );
+        assert_eq!(at_the_host(&scene), 1, "no signature was sent: {what}");
+        assert!(!scene.is_closed().await, "{what}");
+        hang_up(&scene);
+        scene.stop_host().await;
+    }
+}
+
+/// A challenge the phone's own clock says has run out is not put to the person, and one that runs
+/// out while the person is being asked is not signed: the host is sent no signature either way.
+/// The clock is moved by the case, not waited for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmation_that_ran_out_on_the_phones_clock_is_not_signed() {
+    const TEN_MINUTES_MS: u64 = 10 * 60 * 1000;
+
+    // Before the person is asked.
+    let mut scene = closing().await;
+    scene
+        .phone
+        .companion
+        .app
+        .state::<Calls>()
+        .run_the_confirmation_clock_ahead(TEN_MINUTES_MS);
+    closing_asked(&scene, "d-1").await;
+    let row = row_reaching(&scene, "d-1", "cancelled").await;
+    assert_eq!(row["cause"], "confirmation_expired");
+    assert!(scene.ceremony.asked().is_empty(), "nobody was asked");
+    assert_eq!(at_the_host(&scene), 1);
+    assert!(!scene.is_closed().await);
+    let told = told_of(&scene, "d-1");
+    assert!(
+        told.last()
+            .is_some_and(|words| words.contains("this phone's clock says")),
+        "{told:?}"
+    );
+    hang_up(&scene);
+    scene.stop_host().await;
+
+    // While the person is being asked.
+    let mut scene = closing().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    scene.ceremony.hold();
+    let end = say_close(&scene, 6_000).await;
+    ask(&scene, "d-1", end - 200).await;
+    scene.ceremony.until_asked(1).await;
+    scene
+        .phone
+        .companion
+        .app
+        .state::<Calls>()
+        .run_the_confirmation_clock_ahead(TEN_MINUTES_MS);
+    scene.ceremony.release();
+    let row = row_reaching(&scene, "d-1", "cancelled").await;
+    assert_eq!(row["cause"], "confirmation_expired");
+    assert_eq!(at_the_host(&scene), 1);
+    assert!(!scene.is_closed().await);
+    hang_up(&scene);
+    scene.stop_host().await;
+}
+
+/// A break in capture while the person is asked ends what the call may do: the confirmation is
+/// dropped at once, and the person's answer, whatever it is, is not signed. The call is tainted
+/// for good, so the same close said again after the microphone is back is refused too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_break_while_the_person_is_asked_stops_the_confirmation_and_the_signature() {
+    for state in [CaptureState::MutedByPerson, CaptureState::Interrupted] {
+        let mut scene = closing().await;
+        calling(&scene).await;
+        chatter(&scene).await;
+        scene.ceremony.hold();
+        let end = say_close(&scene, 6_000).await;
+        ask(&scene, "d-1", end - 200).await;
+        scene.ceremony.until_asked(1).await;
+
+        scene.platform.tell(CallEvent::Capture { state });
+        let row = row_reaching(&scene, "d-1", "cancelled").await;
+        assert_eq!(row["cause"], "capture_break", "{state:?}");
+        scene.platform.tell(CallEvent::Capture {
+            state: CaptureState::Capturing,
+        });
+        scene.ceremony.release();
+        // What the person did is read before anything said after it: the same close, said again.
+        let again = say_close(&scene, 12_000).await;
+        ask(&scene, "d-2", again - 200).await;
+        let later = row_settled(&scene, "d-2").await;
+
+        assert_eq!(later["cause"], "capture_break", "{state:?}");
+        assert_eq!(at_the_host(&scene), 1, "no signature was sent: {state:?}");
+        assert!(!scene.is_closed().await, "{state:?}");
+        hang_up(&scene);
+        scene.stop_host().await;
+    }
+}
+
+/// A break the recorder showed while the person was asked, which the news never told, is found by
+/// the proof taken after the ceremony: nothing is signed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_break_only_the_record_shows_after_the_ceremony_is_found_before_the_signature() {
+    let mut scene = closing().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    scene.ceremony.hold();
+    let end = say_close(&scene, 6_000).await;
+    ask(&scene, "d-1", end - 200).await;
+    scene.ceremony.until_asked(1).await;
+
+    scene.platform.show_a_gap_in_progress();
+    scene.ceremony.release();
+
+    let row = row_reaching(&scene, "d-1", "cancelled").await;
+    assert_eq!(row["cause"], "capture_break");
+    assert_eq!(at_the_host(&scene), 1, "no signature was sent");
+    assert!(!scene.is_closed().await);
+    hang_up(&scene);
+    scene.stop_host().await;
+}
+
+/// More said that belongs to the request while the person is asked taints the call and drops the
+/// confirmation at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn more_said_while_the_person_is_asked_drops_the_confirmation() {
+    let mut scene = closing().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    scene.ceremony.hold();
+    let end = say_close(&scene, 6_000).await;
+    ask(&scene, "d-1", end).await;
+    scene.ceremony.until_asked(1).await;
+
+    scene
+        .platform
+        .tell_provider(&fragment(end, end + 200, " not"));
+
+    let row = row_reaching(&scene, "d-1", "cancelled").await;
+    assert_eq!(row["cause"], "late_fragment");
+    scene.ceremony.release();
+    assert_eq!(at_the_host(&scene), 1, "no signature was sent");
+    assert!(!scene.is_closed().await);
+    hang_up(&scene);
+    scene.stop_host().await;
+}
+
+/// What native code had told before the proof taken after the ceremony is read before anything is
+/// signed: a fragment that belongs to the request, told just ahead of the proof's marker, is read
+/// first, and the confirmation is dropped. The news is told once the owner has acted on the proof's
+/// answer, so that an owner that signed on the answer alone has signed by then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn news_waiting_behind_the_proof_after_the_ceremony_is_read_before_the_signature() {
+    let mut scene = closing().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    scene.ceremony.hold();
+    let end = say_close(&scene, 6_000).await;
+    ask(&scene, "d-1", end).await;
+    scene.ceremony.until_asked(1).await;
+    scene.platform.hold("capture_proof");
+    scene.ceremony.release();
+    // The proofs so far: the first sentence's, the request's, and the one after the ceremony.
+    until_proofs_are_asked(&scene, 3).await;
+    scene.platform.hold_news();
+    scene
+        .platform
+        .tell_provider(&fragment(end, end + 200, " not"));
+    scene.platform.release("capture_proof");
+    let calls = scene.phone.companion.app.state::<Calls>();
+    tokio::time::timeout(WATCHDOG, async {
+        while !calls.has_handled_seal("d-1") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the owner acts on the proof's answer");
+    scene.platform.release_news();
+
+    let row = row_reaching(&scene, "d-1", "cancelled").await;
+
+    assert_eq!(row["cause"], "late_fragment");
+    assert_eq!(at_the_host(&scene), 1, "no signature was sent");
+    assert!(!scene.is_closed().await);
+    hang_up(&scene);
+    scene.stop_host().await;
+}
+
+/// The signature's answer lost after the host acted: the request that carries the signature is
+/// asked about again, as it was composed, on another connection and under the same action, and the
+/// host answers from its record. The person is asked once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_signed_request_whose_answer_is_lost_is_asked_about_again_and_reads_performed() {
+    let timings = Timings {
+        repeat_delays: [Duration::from_millis(20); 3],
+        host_within: Duration::from_secs(5),
+        ..delegating_timings()
+    };
+    let mut scene = closing_with(timings).await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    // The challenge is answered; the answer to what carries the signature is not.
+    scene
+        .link
+        .lose_the_answer_to_after(1, HostMethod::VoiceDelegate);
+    let end = say_close(&scene, 6_000).await;
+    ask(&scene, "d-1", end - 200).await;
+    tokio::time::timeout(WATCHDOG, async {
+        while at_the_host(&scene) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the signed request reaches the host");
+    scene.link.lose_the_answer_to(None);
+
+    let row = row_reaching(&scene, "d-1", "performed").await;
+
+    assert_eq!(row["state"], "performed");
+    scene.until_closed().await;
+    let actions = scene.link.sent_actions(HostMethod::VoiceDelegate);
+    assert!(actions.len() >= 3, "the host was asked again: {actions:?}");
+    assert!(
+        actions.iter().all(|action| *action == actions[0]),
+        "under one action: {actions:?}"
+    );
+    assert_eq!(scene.ceremony.asked().len(), 1, "the person was asked once");
+    hang_up(&scene);
+    scene.stop_host().await;
+}
+
+/// A signed request stopped while it waits for the connection's turn is never written: a break
+/// that comes then taints the call, and the write is stopped at the writer. The host is sent the
+/// challenge's delegation and nothing after it, and the row says nothing was sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_signed_request_stopped_while_it_waits_for_the_writer_is_never_written() {
+    let mut scene = closing().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    scene.ceremony.hold();
+    let end = say_close(&scene, 6_000).await;
+    ask(&scene, "d-1", end - 200).await;
+    scene.ceremony.until_asked(1).await;
+    scene.link.hold_next_request(HostMethod::VoiceDelegate);
+    scene.ceremony.release();
+    scene.link.until_request_held().await;
+
+    scene.platform.tell(CallEvent::Capture {
+        state: CaptureState::MutedByPerson,
+    });
+    scene.link.release_request();
+    scene.link.until_the_held_request_has_passed().await;
+
+    let row = row_settled(&scene, "d-1").await;
+    assert_eq!(row["state"], "not_sent", "{row}");
+    assert_eq!(row["cause"], "capture_break");
+    assert_eq!(at_the_host(&scene), 1, "the signed request never left");
+    assert!(!scene.is_closed().await);
+    hang_up(&scene);
+    scene.stop_host().await;
+}
+
+/// A host that answers a spoken request with a receipt in a result's place has decided nothing: the
+/// row says it is not known, the person is not asked, and no signature is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_receipt_in_a_results_place_is_no_decision_and_no_confirmation_follows() {
+    let mut scene = closing().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    scene.link.answer_the_next_delegation_with_a_receipt();
+    let end = say_close(&scene, 6_000).await;
+    ask(&scene, "d-1", end - 200).await;
+
+    let row = row_reaching(&scene, "d-1", "unknown").await;
+
+    assert_eq!(row["cause"], "receipt");
+    assert!(scene.ceremony.asked().is_empty(), "nobody was asked");
+    assert_eq!(at_the_host(&scene), 1, "no signature was sent");
+    assert!(!scene.is_closed().await);
+    hang_up(&scene);
+    scene.stop_host().await;
+}
+
+/// With the constant off, which every shipped build holds, a spoken close asks nobody and reaches
+/// no host, and what a person may add to the default grant is not offered: nobody is asked to allow
+/// what cannot happen. With it on, the close is what may be added.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_the_constant_off_a_spoken_close_asks_nobody_and_nothing_is_offered_to_allow() {
+    let mut scene = closing().await;
+    let calls = scene.phone.companion.app.state::<Calls>();
+    let on = scene.call("voice_scope", json!({})).expect("the scope");
+    assert_eq!(on["optional"][0]["action"], "close_session", "{on}");
+    assert_eq!(on["optional"][0]["needs_unlocked_screen"], true);
+    calls.accept_host_delegations(false);
+    let off = scene.call("voice_scope", json!({})).expect("the scope");
+    assert_eq!(off["optional"], json!([]), "{off}");
+
+    calling(&scene).await;
+    let end = say_close(&scene, 6_000).await;
+    scene.stand_in.control().announce("d-1", end - 200);
+    scene
+        .platform
+        .tell_provider(&delegation_event("d-1", end - 200));
+    let state = scene
+        .state_where("the delegation answered", |state| {
+            row_of(state, "d-1").is_some()
+        })
+        .await;
+    assert_eq!(row_of(&state, "d-1").expect("the row")["state"], "not_done");
+    assert_eq!(at_the_host(&scene), 0);
+    assert!(scene.ceremony.asked().is_empty());
+    assert!(!scene.is_closed().await);
+    hang_up(&scene);
+    scene.stop_host().await;
+}
+
+/// The path to the host lost while the person is asked drops the confirmation: nothing is signed,
+/// the row says it was dropped for the lost host, and the person's answer, whatever it is, is
+/// not carried to a host the phone cannot reach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmation_waiting_for_the_person_is_dropped_when_the_host_is_lost() {
+    let mut scene = closing().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    scene.ceremony.hold();
+    let end = say_close(&scene, 6_000).await;
+    ask(&scene, "d-1", end - 200).await;
+    scene.ceremony.until_asked(1).await;
+
+    lose_the_host(&scene);
+
+    let row = row_reaching(&scene, "d-1", "cancelled").await;
+    assert_eq!(row["cause"], "host_lost");
+    scene.ceremony.release();
+    assert_eq!(at_the_host(&scene), 1, "no signature was sent");
+    assert!(!scene.is_closed().await);
+    hang_up(&scene);
     scene.stop_host().await;
 }

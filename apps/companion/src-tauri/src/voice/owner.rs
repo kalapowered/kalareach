@@ -40,6 +40,7 @@ use companion_platform::call::{
 use kr_client::ClientError;
 use kr_client::Session;
 use kr_client::Settled;
+use kr_client::pairing::owner::CeremonyOutcome;
 use kr_client::services::AccountTokenSource;
 use kr_client::services::account::{AccountStatus, SignedInAccount};
 use kr_client::services::voice::{VOICE_SCOPE, VoiceCommand, same_origin};
@@ -58,6 +59,8 @@ use kr_protocol::voice::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
+
+mod ceremony;
 
 use super::advice::MuteAdvice;
 use super::cause::Cause;
@@ -98,9 +101,32 @@ const DELEGATION_UNKNOWN: &str = "It is not known whether this was done on the p
 const DELEGATION_ADMITTED: &str = "The person's computer accepted the request. Whether it was \
     carried out is not known. Do not say it was done.";
 
-/// What the model is told of a request that needs the person's confirmation on the phone.
+/// What the model is told of a request that needs the person's confirmation on the phone, once
+/// the phone is asking for it.
 const DELEGATION_CONFIRMATION: &str = "This needs the person's confirmation on the phone's unlocked \
-    screen, which this version cannot ask for yet. Nothing was done. Say so.";
+    screen, which the phone is asking for now. Nothing was done yet. Do not say it was done.";
+
+/// What the model is told when the person did not confirm.
+const DELEGATION_NOT_CONFIRMED: &str = "The person did not confirm it on the phone, so nothing was \
+    done. Say so, and say it can be asked for again.";
+
+/// What the model is told when the phone could not ask the person to confirm.
+const DELEGATION_NO_CEREMONY: &str = "Nothing was done: this phone cannot ask the person to confirm \
+    on its unlocked screen. Say so.";
+
+/// What the model is told when the computer's request for a confirmation was not one the phone
+/// could put to the person.
+const DELEGATION_CHALLENGE_MISMATCH: &str = "Nothing was done: what the computer asked the person to \
+    confirm was not what was said, so the person was not asked. Say so, and ask the person to say it \
+    again.";
+
+/// What the model is told when the phone's own clock says the confirmation ran out.
+const DELEGATION_CONFIRMATION_EXPIRED: &str = "Nothing was done: this phone's clock says the \
+    confirmation ran out. Say so, and ask the person to say it again.";
+
+/// What the model is told when the confirmation was dropped before it was sent.
+const DELEGATION_CONFIRMATION_DROPPED: &str = "Nothing was done: the confirmation was not sent. Say \
+    so, and ask the person to say it again.";
 
 /// What the model is told of a request the host refused.
 const DELEGATION_HOST_REFUSED: &str = "The person's computer refused the request. Nothing was \
@@ -165,6 +191,19 @@ enum Internal {
     },
     /// What came of handing the delegation `id` to the host.
     Delivered { id: String, exchange: Box<Exchange> },
+    /// What the person's ceremony came to, for the confirmation `generation` of the delegation `id`.
+    Ceremony {
+        id: String,
+        generation: u64,
+        outcome: CeremonyOutcome,
+    },
+    /// What native code's capture proof said, when the confirmation `generation` of the delegation
+    /// `id` asked for it with a marker after the ceremony.
+    SealProof {
+        id: String,
+        generation: u64,
+        result: std::result::Result<CaptureProof, CallFailure>,
+    },
     /// What the host answered when asked again about the delegation `id`, if it did.
     Asked {
         id: String,
@@ -431,8 +470,19 @@ pub(super) struct Owner {
     /// that says it was done or not done. Kept apart from the rows the screen shows, which a long
     /// call lets go of.
     unsettled: HashSet<String>,
-    /// The delegations whose answer was a challenge the host awaits a confirmation for.
-    challenged: Vec<String>,
+    /// The delegations whose answer was a challenge the host awaits a confirmation for, and where
+    /// each confirmation is: the person is being asked, or the news is being read before the
+    /// signature is made.
+    confirming: HashMap<String, ceremony::Confirming>,
+    /// The confirmations whose ceremony is done and that wait for the news to be read up to the
+    /// marker of their capture proof.
+    sealing: Vec<ceremony::Sealing>,
+    /// The delegations whose confirmation was signed and sent, which a second challenge for the
+    /// same delegation is not answered by asking the person again.
+    signed: HashSet<String>,
+    /// The number the next confirmation is given, so that what a ceremony or a proof says of one
+    /// that was dropped is not taken for what it says of the one that followed.
+    next_confirmation: u64,
     /// Set when nothing not yet written may be written: the path to the host was lost, or the call
     /// can no longer hand a request over. A fresh one is made when the host is back.
     unsent: Arc<AtomicBool>,
@@ -586,7 +636,10 @@ impl Owner {
             announced: VecDeque::new(),
             attempts: HashMap::new(),
             unsettled: HashSet::new(),
-            challenged: Vec::new(),
+            confirming: HashMap::new(),
+            sealing: Vec::new(),
+            signed: HashSet::new(),
+            next_confirmation: 0,
             unsent: Arc::new(AtomicBool::new(false)),
             taint_told: false,
         }
@@ -1317,7 +1370,7 @@ impl Owner {
                 news = next_news(&mut self.control_events) => self.on_news(news),
                 internal = self.internal.recv() => self.on_internal(internal),
                 _ = tick.tick() => self.on_tick(),
-                () = &mut self.collection_due, if !self.collections.is_empty() => {
+                () = &mut self.collection_due, if !self.collections.is_empty() || !self.sealing.is_empty() => {
                     self.on_collection_due();
                     None
                 }
@@ -1714,6 +1767,24 @@ impl Owner {
                 self.on_delivered(&id, *exchange);
                 None
             }
+            Internal::Ceremony {
+                id,
+                generation,
+                outcome,
+            } => {
+                self.on_ceremony(&id, generation, outcome);
+                None
+            }
+            Internal::SealProof {
+                id,
+                generation,
+                result,
+            } => {
+                self.on_seal_proof(&id, generation, result);
+                #[cfg(any(test, feature = "testing"))]
+                self.shared.handled.seal(&id);
+                None
+            }
             Internal::Asked { id, result } => {
                 self.on_asked(&id, result.map(|boxed| *boxed));
                 None
@@ -1839,6 +1910,7 @@ impl Owner {
         for collection in waiting {
             self.refuse(&collection.id, why);
         }
+        self.cancel_confirmations(why);
         self.arm_collection();
         if self.taint_told {
             return;
@@ -1988,7 +2060,10 @@ impl Owner {
             .map(|collection| match collection.stage {
                 Stage::Waiting => collection.due,
                 Stage::Draining { until, .. } => until,
-            });
+            })
+            .into_iter()
+            .chain(self.sealing.iter().map(|sealing| sealing.until))
+            .min();
         self.collection_due.as_mut().reset(
             next.unwrap_or_else(|| Instant::now() + Duration::from_secs(60 * 60 * 24 * 365)),
         );
@@ -2003,7 +2078,9 @@ impl Owner {
             self.shared.timings.drain_within,
         );
         let call = self.call.clone();
+        self.expire_sealing();
         let Some(head) = self.collections.front_mut() else {
+            self.arm_collection();
             return;
         };
         let now = Instant::now();
@@ -2076,6 +2153,7 @@ impl Owner {
             self.barriers.pop_front();
         }
         self.try_finish();
+        self.try_seal();
     }
 
     /// Freezes the first collection's set once its proof's record and the news up to its marker are
@@ -2155,6 +2233,7 @@ impl Owner {
             host,
             platform: self.platform(),
             call,
+            action_id: None,
             params,
             age_bound: self.shared.timings.proof_age,
             within: self.shared.timings.host_within,
@@ -2179,7 +2258,7 @@ impl Owner {
             ..
         } = exchange;
         match delivered {
-            Delivered::Result(result) => self.host_answered(id, *result),
+            Delivered::Result(result) => self.host_answered(id, *result, composed),
             Delivered::Refused => {
                 self.unsettled.remove(id);
                 self.set_row(id, "host_refused", Some("host_answer"));
@@ -2220,8 +2299,19 @@ impl Owner {
         }
     }
 
-    /// The host answered, once, with a result.
-    fn host_answered(&mut self, id: &str, result: VoiceDelegateResult) {
+    /// The host answered, once, with a result. `composed` is the request the answer is to, as it
+    /// was composed, when there is one.
+    fn host_answered(
+        &mut self,
+        id: &str,
+        result: VoiceDelegateResult,
+        composed: Option<ComposedMutation>,
+    ) {
+        if let VoiceDelegationOutcome::ConfirmationRequired { request, .. } = &result.outcome {
+            let request = request.as_ref().clone();
+            self.on_challenge(id, result, request, composed);
+            return;
+        }
         let (what, cause, told) = answered_as(&result.outcome);
         if may_have_been_carried_out(what) {
             self.unsettled.insert(id.to_owned());
@@ -2229,9 +2319,6 @@ impl Owner {
             self.unsettled.remove(id);
         }
         self.set_row(id, what, cause);
-        if what == "confirmation_required" {
-            self.challenged.push(id.to_owned());
-        }
         self.tell_delegation(id, told);
     }
 
@@ -2274,8 +2361,8 @@ impl Owner {
     fn on_asked(&mut self, id: &str, result: Option<VoiceDelegateResult>) {
         match result {
             Some(result) => {
-                self.attempts.remove(id);
-                self.host_answered(id, result);
+                let composed = self.attempts.remove(id).map(|attempt| attempt.composed);
+                self.host_answered(id, result, composed);
             }
             None => {
                 if let Some(attempt) = self.attempts.get_mut(id) {
@@ -2307,16 +2394,14 @@ impl Owner {
             self.gate.abandon(collection.offset_ms);
             self.not_sent(&collection.id, Why::HostLost);
         }
+        self.cancel_confirmations(Why::HostLost);
         self.arm_collection();
     }
 
     /// A fragment that belongs to a request arrived after it was read: a challenge the host awaits
     /// a confirmation for is not one to answer.
     fn cancel_challenges(&mut self) {
-        for id in std::mem::take(&mut self.challenged) {
-            self.set_row(&id, "cancelled", Some(Why::LateFragment.word()));
-            self.tell_delegation(&id, DELEGATION_LATE.to_owned());
-        }
+        self.cancel_confirmations(Why::LateFragment);
     }
 
     /// Whether a request was written to the host and has no answer: it may have been carried out.

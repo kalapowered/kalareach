@@ -110,6 +110,16 @@ pub(super) enum Cause {
     NotComposed,
     /// The path to the host was lost before the request was written.
     HostLost,
+    // What stops a confirmation, and leaves the call as it was.
+    /// The host's challenge is not one this call can put to the person: it does not match the
+    /// request this device made, the call it belongs to or what the call may ask a confirmation for.
+    ChallengeMismatch,
+    /// The person did not confirm: they declined, cancelled or failed the ceremony, or it ran out.
+    NotConfirmed,
+    /// This device has no ceremony to run.
+    NoCeremony,
+    /// This device's own clock says the challenge has run out.
+    ConfirmationExpired,
 }
 
 impl Cause {
@@ -142,6 +152,10 @@ impl Cause {
             Self::NoProof => "no_proof",
             Self::NotComposed => "not_composed",
             Self::HostLost => "host_lost",
+            Self::ChallengeMismatch => "challenge_mismatch",
+            Self::NotConfirmed => "not_confirmed",
+            Self::NoCeremony => "no_ceremony",
+            Self::ConfirmationExpired => "confirmation_expired",
         }
     }
 
@@ -210,6 +224,12 @@ impl Record {
             breaks: proof.breaks,
             capturing: proof.state == CaptureState::Capturing,
         }
+    }
+
+    /// Whether the record shows what ends a call's authority: an opening that is not the only
+    /// one, a break, or capture that is not on.
+    pub(super) const fn ends_authority(self) -> bool {
+        self.openings != 1 || self.breaks != 0 || !self.capturing
     }
 }
 
@@ -316,7 +336,7 @@ impl Gate {
     pub(super) fn note_record(&mut self, record: Record) -> Told {
         if record.openings != 1 {
             self.taint_with(Cause::Openings)
-        } else if record.breaks != 0 || !record.capturing {
+        } else if record.ends_authority() {
             self.taint_with(Cause::CaptureBreak)
         } else {
             Told::Nothing

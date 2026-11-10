@@ -46,11 +46,13 @@ pub fn platform_ceremony<R: tauri::Runtime>(
     }
 }
 
-/// The ceremony that answers the pairing owner's confirmations. On a phone it is the phone's own;
-/// elsewhere it is [`platform_ceremony`].
+/// The ceremony that answers the pairing owner's confirmations and the confirmation of a spoken
+/// request on the unlocked screen. On a phone it is the phone's own; elsewhere it is
+/// [`platform_ceremony`].
 ///
-/// A phone's ceremony belongs to the confirmations screen and to nothing else: a revocation and a
-/// settings change keep [`NoCeremony`] there, since the phone draws no screen for either.
+/// A phone's ceremony belongs to the confirmations screen and to a voice call's confirmations and to
+/// nothing else: a revocation and a settings change keep [`NoCeremony`] there, since the phone draws
+/// no screen for either.
 #[must_use]
 pub fn pairing_ceremony<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Arc<dyn Ceremony> {
     #[cfg(mobile)]

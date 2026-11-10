@@ -102,6 +102,7 @@ async fn scene() -> Scene {
     let data = tempfile::tempdir().expect("a directory");
     let calls = Calls::on_phone(
         Arc::clone(&platform) as Arc<dyn companion_platform::call::CallPlatform>,
+        Arc::new(NoOwner),
         harness.service().expect("the stand-in's service"),
         Timings {
             tick: Duration::from_millis(100),
