@@ -16,6 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+use quick_xml::Writer;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
 
@@ -515,6 +516,85 @@ fn close(
     }
 }
 
+/// Takes the rules with the given identifiers out of a policy's own XML and leaves everything
+/// else exactly as the platform wrote it: another rule's name, its kind and its conditions, and the
+/// collections this crate does not model. An executable collection left with no rule goes back to
+/// not configured.
+///
+/// # Errors
+///
+/// Returns [`PolicyError::Unreadable`] when the text is not a policy.
+pub fn strip(xml: &str, drop: &[&str]) -> Result<String, PolicyError> {
+    let unreadable = |error: &dyn std::fmt::Display| PolicyError::Unreadable(error.to_string());
+    let policy = Policy::parse(xml)?;
+    let exe_left = policy.collections.get(EXE).map_or(0, |collection| {
+        collection
+            .rules
+            .keys()
+            .filter(|id| !drop.contains(&id.as_str()))
+            .count()
+    });
+    let mut reader = Reader::from_str(xml);
+    let mut writer = Writer::new(Vec::new());
+    let mut skipping = 0_usize;
+    loop {
+        let event = reader.read_event().map_err(|error| unreadable(&error))?;
+        if skipping > 0 {
+            match event {
+                Event::Start(_) => skipping += 1,
+                Event::End(_) => skipping -= 1,
+                Event::Eof => {
+                    return Err(PolicyError::Unreadable(
+                        "the policy ends inside a rule".to_owned(),
+                    ));
+                }
+                _ => {}
+            }
+            continue;
+        }
+        match event {
+            Event::Eof => break,
+            Event::Start(element) if dropped(&element, drop)? => skipping = 1,
+            Event::Empty(element) if dropped(&element, drop)? => {}
+            Event::Start(element) if exe_is_empty(&element, exe_left)? => writer
+                .write_event(Event::Start(not_configured()))
+                .map_err(|error| unreadable(&error))?,
+            Event::Empty(element) if exe_is_empty(&element, exe_left)? => writer
+                .write_event(Event::Empty(not_configured()))
+                .map_err(|error| unreadable(&error))?,
+            other => writer
+                .write_event(other)
+                .map_err(|error| unreadable(&error))?,
+        }
+    }
+    String::from_utf8(writer.into_inner()).map_err(|error| unreadable(&error))
+}
+
+fn dropped(element: &BytesStart<'_>, drop: &[&str]) -> Result<bool, PolicyError> {
+    let name = element.local_name().as_ref().to_owned();
+    if !matches!(
+        name.as_str(),
+        "FilePathRule" | "FilePublisherRule" | "FileHashRule"
+    ) {
+        return Ok(false);
+    }
+    let id = normal_id(&attribute(element, "Id")?.unwrap_or_default());
+    Ok(drop.contains(&id.as_str()))
+}
+
+fn exe_is_empty(element: &BytesStart<'_>, exe_left: usize) -> Result<bool, PolicyError> {
+    Ok(exe_left == 0
+        && element.local_name().as_ref() == "RuleCollection"
+        && attribute(element, "Type")?.as_deref() == Some(EXE))
+}
+
+fn not_configured() -> BytesStart<'static> {
+    let mut element = BytesStart::new("RuleCollection");
+    element.push_attribute(("Type", EXE));
+    element.push_attribute(("EnforcementMode", "NotConfigured"));
+    element
+}
+
 fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -529,7 +609,7 @@ fn rule_name(id: &str) -> &'static str {
         RULE_CONNECT => {
             "KalaReach: the connection account runs only Git, its transport programs and the credential helper"
         }
-        _ => "",
+        _ => "Rule added by an administrator",
     }
 }
 
@@ -542,6 +622,6 @@ fn rule_description(id: &str) -> &'static str {
         RULE_CONNECT => {
             "Denies every program except the listed programs of Git's installation and the credential helper."
         }
-        _ => "",
+        _ => "Added by an administrator.",
     }
 }

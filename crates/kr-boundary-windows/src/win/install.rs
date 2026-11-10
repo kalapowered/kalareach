@@ -901,14 +901,25 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
     if has_rules {
         keep(
             (|| -> Result<(), Error> {
-                let (_, effective) = channel.effective()?;
-                let (after, kept) = effective.without_ours();
+                let (xml, effective) = channel.effective()?;
+                let (_, kept) = effective.without_ours();
                 if kept {
                     say(
                         "an administrator's rule shares the executable collection, so the allow-all rule and the collection's mode stay in force beside it",
                     );
                 }
-                channel.set(&after.render())?;
+                let drop: &[&str] = if kept {
+                    &[policy::RULE_CHECKOUT, policy::RULE_CONNECT]
+                } else {
+                    &[
+                        policy::RULE_ALLOW_ALL,
+                        policy::RULE_CHECKOUT,
+                        policy::RULE_CONNECT,
+                    ]
+                };
+                channel.set(
+                    &policy::strip(&xml, drop).map_err(|error| Error::Failed(error.to_string()))?,
+                )?;
                 say("the policy is put back");
                 Ok(())
             })(),
