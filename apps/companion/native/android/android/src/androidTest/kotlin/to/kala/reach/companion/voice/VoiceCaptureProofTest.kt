@@ -135,11 +135,11 @@ class VoiceCaptureProofTest {
         fun reports(configs: List<AudioRecordingConfiguration>) =
             configs.map { RecordingReport(it.clientAudioSource, it.isClientSilenced) }
         // What is recording before this call's recorder runs belongs to others.
-        watch.read(reports(manager.activeRecordingConfigurations), deviceOn = false)
+        watch.deviceComesOn(reports(manager.activeRecordingConfigurations))
         val seen = LinkedBlockingQueue<VoiceCaptureGate.Recording>()
         val callback = object : AudioManager.AudioRecordingCallback() {
             override fun onRecordingConfigChanged(configs: List<AudioRecordingConfiguration>) {
-                seen.add(watch.read(reports(configs), deviceOn = true))
+                seen.add(watch.read(reports(configs)))
             }
         }
         manager.registerAudioRecordingCallback(callback, Handler(Looper.getMainLooper()))
