@@ -21,9 +21,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kr_ipc::client::LocalClient;
-use kr_ipc::framed::{FrameReader, FrameWriter};
+use kr_ipc::framed::{FrameReader, FrameWhile, FrameWriter};
 use kr_ipc::paths::Endpoint;
 use kr_protocol::envelope::ControlFrame;
+use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::{ActionWindow, ReceiveLimits};
 use kr_protocol::identity::BootIdentity;
 use kr_protocol::ids::{BuildId, ConnectionId, EnvironmentId};
@@ -175,20 +176,74 @@ fn reach_of(context: &LocalContext) -> Option<Reach> {
     })
 }
 
+/// How a frame put on the socket came out.
+enum Written {
+    /// Every byte of it is with the peer.
+    Whole,
+    /// The peer has none of it, and the stream is whole for the next frame.
+    Withdrawn,
+    /// The peer has part of it and the rest will not go: the stream is in pieces.
+    Cut,
+}
+
+/// Puts `frame` on the socket, and stops while it can still be stopped: with a limit, the time
+/// and the caller's wish are looked at before every write to the socket and again once the socket
+/// has room, so a frame the socket would not take until after the limit never goes, and the wait
+/// for room ends when the time does.
+async fn put_on(
+    writer: &mut FrameWriter,
+    frame: &ControlFrame,
+    limit: Option<(Instant, &(dyn Fn() -> bool + Send + Sync))>,
+) -> Result<Written> {
+    let Some((not_after, wanted)) = limit else {
+        writer.write_message(frame).await?;
+        return Ok(Written::Whole);
+    };
+    let framed = FrameWriter::encode(StreamKind::Control, frame)?;
+    let mut may_write = || Instant::now() <= not_after && wanted();
+    let outcome =
+        tokio::time::timeout_at(not_after, writer.write_frame_while(&framed, &mut may_write)).await;
+    Ok(match outcome {
+        Ok(outcome) => match outcome? {
+            FrameWhile::Sent => Written::Whole,
+            FrameWhile::Withdrawn => Written::Withdrawn,
+            FrameWhile::Cut => Written::Cut,
+        },
+        // The time ran out while the socket took nothing more: the frame is taken back when none
+        // of it went, and is cut when part of it did.
+        Err(_) => {
+            if writer.withdraw_unstarted() {
+                Written::Withdrawn
+            } else {
+                Written::Cut
+            }
+        }
+    })
+}
+
 impl IpcTransport {
-    /// Writes `frame` when this connection has its turn, unless `not_after` has passed by then, and
-    /// says whether it was written.
-    async fn write(&self, frame: &ControlFrame, not_after: Option<Instant>) -> Result<bool> {
+    /// Writes `frame` when this connection has its turn, unless `limit` says its time has passed
+    /// or it is no longer wanted by then, and says whether it was written whole.
+    ///
+    /// A frame that is stopped part way is not finished: the connection ends, and the peer reads a
+    /// frame that stops short and acts on nothing of it.
+    async fn write(
+        &self,
+        frame: &ControlFrame,
+        limit: Option<(Instant, &(dyn Fn() -> bool + Send + Sync))>,
+    ) -> Result<bool> {
         // One frame at a time. A second caller waits for the first's turn rather than finding
         // an empty slot and reporting a connection that is perfectly alive as ended.
-        let _turn = match not_after {
+        let _turn = match limit {
             None => self.turn.lock().await,
-            Some(limit) => match tokio::time::timeout_at(limit, self.turn.lock()).await {
-                Ok(turn) => turn,
-                Err(_) => return Ok(false),
-            },
+            Some((not_after, _)) => {
+                match tokio::time::timeout_at(not_after, self.turn.lock()).await {
+                    Ok(turn) => turn,
+                    Err(_) => return Ok(false),
+                }
+            }
         };
-        if not_after.is_some_and(|limit| Instant::now() > limit) {
+        if limit.is_some_and(|(not_after, wanted)| Instant::now() > not_after || !wanted()) {
             return Ok(false);
         }
         // The notification is registered *before* the last look at the flag, so a close
@@ -207,7 +262,7 @@ impl IpcTransport {
             return Err(ClientError::ConnectionEnded);
         };
         let outcome = tokio::select! {
-            outcome = writer.write_message(frame) => outcome,
+            outcome = put_on(&mut writer, frame, limit) => outcome,
             // Closing while this was waiting for the socket. The half is dropped with this
             // future, which is what ends the connection rather than waiting for a peer that
             // may never read again.
@@ -215,14 +270,20 @@ impl IpcTransport {
         };
         // A write that failed has ended this connection, and so has a close that arrived while
         // this one was in progress. Either way the half goes rather than going back.
-        if outcome.is_ok() {
-            let mut held = self.writer.lock().await;
-            if !self.has_closed() {
-                *held = Some(writer);
+        let written = match outcome? {
+            Written::Cut => {
+                drop(writer);
+                self.close();
+                return Ok(false);
             }
+            Written::Whole => true,
+            Written::Withdrawn => false,
+        };
+        let mut held = self.writer.lock().await;
+        if !self.has_closed() {
+            *held = Some(writer);
         }
-        outcome?;
-        Ok(true)
+        Ok(written)
     }
 }
 
@@ -258,8 +319,9 @@ impl ControlTransport for IpcTransport {
         &'a self,
         frame: &'a ControlFrame,
         not_after: Instant,
+        wanted: &'a (dyn Fn() -> bool + Send + Sync),
     ) -> TransportFuture<'a, bool> {
-        Box::pin(async move { self.write(frame, Some(not_after)).await })
+        Box::pin(async move { self.write(frame, Some((not_after, wanted))).await })
     }
 
     fn claim_receiver(&self) -> Result<()> {

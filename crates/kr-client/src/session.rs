@@ -1238,29 +1238,32 @@ impl Session {
     }
 
     /// Sends a composed mutation for the first time as [`Session::send`] does, and writes nothing
-    /// after `not_after`.
+    /// after `not_after`, or once `wanted` says no.
     ///
     /// For a request that is only good while something the caller read before sending still
-    /// holds. The time is looked at where it matters, once this connection holds the right to
-    /// write, so waiting for the book or for another sender's write counts against it. When it had
-    /// passed by then, nothing was written and the action is not on the book: the answer is
+    /// holds. The time and `wanted` are looked at where it matters, once this connection holds the
+    /// right to write, so waiting for the book or for another sender's write counts against it.
+    /// When the time had passed or `wanted` said no before the connection took the frame whole, no
+    /// request was delivered and the action is not on the book: the answer is
     /// [`ClientError::Withheld`], and the same request can be sent again under the same
-    /// identifier. A request whose write began is written to its end, and every outcome after that
-    /// is as for [`Session::send`].
+    /// identifier unless part of it had gone, which ends the connection. Every outcome after the
+    /// frame was taken whole is as for [`Session::send`].
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Withheld`] when nothing was written because `not_after` had
-    /// passed, and otherwise as [`Session::send`].
+    /// Returns [`ClientError::Withheld`] when no request was delivered because `not_after` had
+    /// passed or `wanted` said no, and otherwise as [`Session::send`].
     pub async fn send_before(
         &self,
         composed: &ComposedMutation,
         not_after: tokio::time::Instant,
+        wanted: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<Settled> {
         if composed.composed_on != Some(self.id) {
             return Err(ClientError::Misdirected { repeating: false });
         }
-        self.submit_composed(composed, Some(not_after)).await
+        self.submit_composed(composed, Some((not_after, wanted)))
+            .await
     }
 
     /// Asks the host again with exactly the request that was composed, on another connection.
@@ -1365,7 +1368,7 @@ impl Session {
     async fn submit_composed(
         &self,
         composed: &ComposedMutation,
-        not_after: Option<tokio::time::Instant>,
+        limit: Option<(tokio::time::Instant, &(dyn Fn() -> bool + Send + Sync))>,
     ) -> Result<Settled> {
         let Some(method) = composed.request.method.method() else {
             return Err(ClientError::Cbor(crate::shown::Shown::said(
@@ -1398,9 +1401,11 @@ impl Session {
                 None,
             )?;
         }
-        let written = match not_after {
+        let written = match limit {
             None => self.transport.send(&frame).await.map(|()| true),
-            Some(not_after) => self.transport.send_before(&frame, not_after).await,
+            Some((not_after, wanted)) => {
+                self.transport.send_before(&frame, not_after, wanted).await
+            }
         };
         match written {
             Ok(true) => {}

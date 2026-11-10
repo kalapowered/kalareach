@@ -227,12 +227,16 @@ impl ControlTransport for BoundTransport {
         &'a self,
         frame: &'a ControlFrame,
         not_after: tokio::time::Instant,
+        wanted: &'a (dyn Fn() -> bool + Send + Sync),
     ) -> TransportFuture<'a, bool> {
         Box::pin(async move {
             if self.binding.check().is_some() || self.binding.gate(frame).is_some() {
                 return Err(ClientError::ConnectionEnded);
             }
-            self.binding.inner.send_before(frame, not_after).await
+            self.binding
+                .inner
+                .send_before(frame, not_after, wanted)
+                .await
         })
     }
 

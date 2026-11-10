@@ -110,11 +110,14 @@ pub enum ClientError {
     /// It is not the host's answer: the earlier request can still be in flight or have been
     /// answered, and a caller that classifies answers must not take this for a refusal of it.
     StillAccounting,
-    /// The caller's time for sending the request had run out by the moment the connection could
-    /// write it, so nothing was written and the action is not on this client's book.
+    /// The caller's time for sending the request had run out, or the caller no longer wanted it
+    /// sent, before the connection had taken it whole, so the host reads no request and the action
+    /// is not on this client's book.
     ///
-    /// It is not the host's answer: the host never saw the request. A caller that bounded the send
-    /// ([`crate::session::Session::send_before`]) learns here that nothing left.
+    /// It is not the host's answer: the host never acted on the request. A caller that bounded the
+    /// send ([`crate::session::Session::send_before`]) learns here that no request left. When part
+    /// of the frame had already gone, the connection was ended with it, so that the host reads a
+    /// frame that stops short.
     Withheld,
     /// The connection ended before the request was answered.
     ConnectionEnded,

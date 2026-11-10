@@ -86,25 +86,31 @@ pub trait ControlTransport: Send + Sync + std::fmt::Debug {
     /// Sends one control frame.
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()>;
 
-    /// Sends one control frame unless `not_after` has passed by the moment this transport holds
-    /// the right to write it, and says whether it was written.
+    /// Sends one control frame unless `not_after` has passed, or `wanted` has come to say no, and
+    /// says whether it was written whole.
     ///
-    /// `false` means nothing was written: the frame was not started and the connection is as it
-    /// was. A caller whose request is only good for a bounded time sends this way, so that the
-    /// time spent waiting for the writer counts against it. A frame whose write has begun is
-    /// written to its end whatever the time, and a failure after that is the caller's to read as an
-    /// outcome that is not known.
+    /// A caller whose request is only good for a bounded time, and only while something it read
+    /// before sending still holds, sends this way, so that the time spent waiting for the writer
+    /// or for the connection to take the frame counts against it, and what changed meanwhile stops
+    /// it. A transport looks before the frame is started and again before every write that hands
+    /// bytes to the connection.
     ///
-    /// The provided method looks at the time once, before it asks the transport to send, which is
-    /// all a transport can do whose writer is not shared; a transport that can wait for a writer
-    /// held by another sender looks at the time again once it holds it.
+    /// `false` means the frame was not written whole, and the peer acts on none of it: either none
+    /// of it went and the connection is as it was, or part of it had gone when the answer changed,
+    /// and the connection's control stream was ended so that the peer reads a frame that never
+    /// completes. A failure of a write that was not stopped is the caller's to read as an outcome
+    /// that is not known.
+    ///
+    /// The provided method looks once, before it asks the transport to send, which is all a
+    /// transport can do whose writer it cannot see into.
     fn send_before<'a>(
         &'a self,
         frame: &'a ControlFrame,
         not_after: Instant,
+        wanted: &'a (dyn Fn() -> bool + Send + Sync),
     ) -> TransportFuture<'a, bool> {
         Box::pin(async move {
-            if Instant::now() > not_after {
+            if Instant::now() > not_after || !wanted() {
                 return Ok(false);
             }
             self.send(frame).await?;
@@ -263,19 +269,42 @@ impl ControlTransport for NetworkTransport {
         &'a self,
         frame: &'a ControlFrame,
         not_after: Instant,
+        wanted: &'a (dyn Fn() -> bool + Send + Sync),
     ) -> TransportFuture<'a, bool> {
         Box::pin(async move {
-            // The writer is shared with every other sender on this connection: the time is
-            // looked at once the lock is held, which is the last moment before the write.
+            // The writer is shared with every other sender on this connection: the time and what
+            // the caller wants are looked at once the lock is held, and then before every byte
+            // the stream takes, so that a stream with no room until after the time never carries
+            // the frame.
             let Ok(mut writer) = tokio::time::timeout_at(not_after, self.writer.lock()).await
             else {
                 return Ok(false);
             };
-            if Instant::now() > not_after {
+            let admits = |attempt: &mut dyn FnMut()| {
+                if Instant::now() > not_after || !wanted() {
+                    return false;
+                }
+                attempt();
+                true
+            };
+            // Asked before anything is written, so that a frame refused at once leaves the stream
+            // whole.
+            if !admits(&mut || {}) {
                 return Ok(false);
             }
-            writer.write_message(frame).await?;
-            Ok(true)
+            // The wait for room ends with the time. A frame abandoned after part of it went leaves
+            // the stream in pieces, so the stream is reset and carries nothing more: the peer reads
+            // a frame that never completes.
+            let outcome =
+                tokio::time::timeout_at(not_after, writer.write_message_while(frame, &admits))
+                    .await;
+            match outcome {
+                Ok(sent) => Ok(sent?),
+                Err(_) => {
+                    writer.reset();
+                    Ok(false)
+                }
+            }
         })
     }
 

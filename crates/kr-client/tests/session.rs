@@ -165,6 +165,12 @@ struct HostScript {
     swallow_reads: Mutex<u32>,
     /// The identities of the reads that were swallowed, in order.
     swallowed: Mutex<Vec<kr_protocol::ids::RequestId>>,
+    /// Whether a local host reads nothing from a connection yet, as a peer that has stopped reading.
+    unread: std::sync::atomic::AtomicBool,
+    /// Told when `unread` changes.
+    reading: tokio::sync::Notify,
+    /// Told, once for each, when a connection the local host served has ended.
+    served_to_the_end: tokio::sync::Notify,
 }
 
 /// Serves one connection: handshake, then control frames until the client goes away.
@@ -3121,8 +3127,19 @@ fn spawn_local_host(
                 {
                     return;
                 }
+                // A peer that has stopped reading takes nothing more until it is told to.
+                loop {
+                    let changed = script.reading.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    if !script.unread.load(Ordering::Acquire) {
+                        break;
+                    }
+                    changed.await;
+                }
                 loop {
                     let Ok(frame) = reader.read_message::<ControlFrame>().await else {
+                        script.served_to_the_end.notify_one();
                         return;
                     };
                     let answer = match frame {
@@ -3303,6 +3320,239 @@ async fn a_connection_the_caller_opened_and_checked_carries_a_session() {
     assert_eq!(
         settled.receipt().expect("a receipt").state,
         ReceiptState::Accepted
+    );
+    session.close();
+    serving.abort();
+}
+
+/// A send whose time has run out, or that is no longer wanted, by the moment the connection can
+/// write it writes nothing and leaves nothing on the book: the same request, under the same
+/// action, then goes out once.
+#[tokio::test]
+async fn a_send_whose_time_has_run_out_writes_nothing_and_leaves_nothing_on_the_book() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+    let target = ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16])));
+    let composed = session
+        .compose(
+            Method::SessionCreate,
+            kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x47; 16])),
+            target,
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("composed");
+
+    let late = tokio::time::Instant::now() - Duration::from_millis(1);
+    let in_time = tokio::time::Instant::now() + Duration::from_secs(60);
+    for (not_after, wanted) in [(late, true), (in_time, false)] {
+        let withheld = session.send_before(&composed, not_after, &|| wanted).await;
+        assert!(
+            matches!(withheld, Err(ClientError::Withheld)),
+            "nothing is written once the time has run out or the send is not wanted"
+        );
+        assert!(
+            session.submitted_actions().await.is_empty(),
+            "an action that never left is not one to account for"
+        );
+    }
+    assert!(
+        script.actions.lock().await.is_empty(),
+        "the host read nothing"
+    );
+
+    // The request is as it was, and the action is free: sent in time, it reaches the host once.
+    session
+        .send_before(&composed, in_time, &|| true)
+        .await
+        .expect("the host answers");
+    assert_eq!(
+        script.actions.lock().await.len(),
+        1,
+        "one request reached the host"
+    );
+    session.settle(composed.action_id()).await;
+
+    session.close();
+    serving.abort();
+}
+
+/// The longest a test waits for a send that is bounded by its time, which is far past the bound: a
+/// send that is not bounded fails the test at this and does not hang it.
+const BOUNDED_SEND_WATCHDOG: Duration = Duration::from_secs(60);
+
+/// A request composed with `padding` bytes of params, which fills a local socket whose peer reads
+/// nothing.
+async fn padded_request(
+    session: &Session,
+    action: u8,
+    padding: usize,
+) -> kr_client::session::ComposedMutation {
+    session
+        .compose(
+            Method::SessionCreate,
+            kr_protocol::ids::ActionId::new(Uuid::from_bytes([action; 16])),
+            ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16]))),
+            None,
+            &Empty {},
+            &"x".repeat(padding),
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("composed")
+}
+
+/// The local connection's writer is held by a frame that waits for a peer that reads nothing: a
+/// second request whose time runs out while it waits for its turn is not written and is not on the
+/// book, and when the peer reads again the first request reaches it whole and the second, sent
+/// again in time, after it. The peer never sees the second request until it is sent in time.
+#[tokio::test]
+async fn a_request_that_waits_for_the_connections_writer_past_its_time_is_never_written() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let endpoint = tree
+        .paths()
+        .environment(tree.environment_id())
+        .controller_endpoint()
+        .expect("a controller endpoint");
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("a local endpoint");
+    let script = Arc::new(HostScript::default());
+    script.unread.store(true, Ordering::Release);
+    let serving = spawn_local_host(listener, Arc::clone(&script));
+    let transport = kr_client::ipc::IpcTransport::connect(&endpoint, kr_cli_build_id())
+        .await
+        .expect("a local connection");
+    let session = Arc::new(Session::start(transport.shared()).expect("a session"));
+
+    // The first request is bigger than the socket holds, and is in its first write, which holds the
+    // connection's turn, when it has asked whether it is still wanted.
+    let first = padded_request(&session, 0x61, 900_000).await;
+    let began = Arc::new(tokio::sync::Notify::new());
+    let writing = {
+        let (session, began) = (Arc::clone(&session), Arc::clone(&began));
+        tokio::spawn(async move {
+            let began_writing = move || {
+                began.notify_one();
+                true
+            };
+            session
+                .send_before(
+                    &first,
+                    tokio::time::Instant::now() + Duration::from_secs(600),
+                    &began_writing,
+                )
+                .await
+        })
+    };
+    began.notified().await;
+
+    let second = padded_request(&session, 0x62, 10).await;
+    let withheld = tokio::time::timeout(
+        BOUNDED_SEND_WATCHDOG,
+        session.send_before(
+            &second,
+            tokio::time::Instant::now() + Duration::from_millis(300),
+            &|| true,
+        ),
+    )
+    .await
+    .expect("a request waiting for the writer is bounded by its time");
+    assert!(
+        matches!(withheld, Err(ClientError::Withheld)),
+        "the writer was held past the time"
+    );
+    let submitted = session.submitted_actions().await;
+    assert_eq!(submitted.len(), 1, "only the first request is on the book");
+    assert!(
+        script.actions.lock().await.is_empty(),
+        "the peer has read nothing"
+    );
+
+    // The peer reads again: the first request arrives whole, then the second, sent in time.
+    script.unread.store(false, Ordering::Release);
+    script.reading.notify_waiters();
+    writing
+        .await
+        .expect("the first send ran")
+        .expect("the host answers the first request");
+    session
+        .send_before(
+            &second,
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            &|| true,
+        )
+        .await
+        .expect("the host answers the second request");
+    let reached = script.actions.lock().await.clone();
+    assert_eq!(
+        reached,
+        vec![
+            kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x61; 16])),
+            kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x62; 16])),
+        ],
+        "each request reached the peer once, in order, and the second only when it was sent in time"
+    );
+    session.close();
+    serving.abort();
+}
+
+/// A request that the socket cannot take whole before its time runs out is cut off: the connection
+/// ends with it, nothing of it is on the book, and the peer, which reads what part of it went and
+/// then the end of the connection, acts on none of it.
+#[tokio::test]
+async fn a_request_the_socket_cannot_take_before_its_time_runs_out_is_cut_off_and_acted_on_by_nobody()
+ {
+    let tree = kr_ipc::testing::TempHost::create();
+    let endpoint = tree
+        .paths()
+        .environment(tree.environment_id())
+        .controller_endpoint()
+        .expect("a controller endpoint");
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("a local endpoint");
+    let script = Arc::new(HostScript::default());
+    script.unread.store(true, Ordering::Release);
+    let serving = spawn_local_host(listener, Arc::clone(&script));
+    let transport = kr_client::ipc::IpcTransport::connect(&endpoint, kr_cli_build_id())
+        .await
+        .expect("a local connection");
+    let session = Session::start(transport.shared()).expect("a session");
+
+    let request = padded_request(&session, 0x63, 900_000).await;
+    let withheld = tokio::time::timeout(
+        BOUNDED_SEND_WATCHDOG,
+        session.send_before(
+            &request,
+            tokio::time::Instant::now() + Duration::from_millis(300),
+            &|| true,
+        ),
+    )
+    .await
+    .expect("a request the socket cannot take is bounded by its time");
+    assert!(
+        matches!(withheld, Err(ClientError::Withheld)),
+        "the socket held part of the frame and took no more before the time ran out"
+    );
+    assert!(session.submitted_actions().await.is_empty());
+
+    // The peer reads now: part of the frame, and then the end of the connection.
+    script.unread.store(false, Ordering::Release);
+    script.reading.notify_waiters();
+    script.served_to_the_end.notified().await;
+    assert!(
+        script.actions.lock().await.is_empty(),
+        "the peer read no request: the frame it was given stops short"
+    );
+    assert!(
+        session
+            .read::<_, SessionList>(Method::SessionList, &Empty {})
+            .await
+            .is_err(),
+        "the connection ended with the frame"
     );
     session.close();
     serving.abort();

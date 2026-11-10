@@ -1579,12 +1579,13 @@ impl kr_client::transport::ControlTransport for Tapped {
         &'a self,
         frame: &'a ControlFrame,
         not_after: tokio::time::Instant,
+        wanted: &'a (dyn Fn() -> bool + Send + Sync),
     ) -> kr_client::transport::TransportFuture<'a, bool> {
         Box::pin(async move {
             // A request the test holds waits here, where a transport waits for its writer, and the
-            // time is looked at once it is let go.
+            // time and what the caller wants are looked at once it is let go.
             self.control.before_sending(frame).await;
-            if tokio::time::Instant::now() > not_after {
+            if tokio::time::Instant::now() > not_after || !wanted() {
                 return Ok(false);
             }
             if let Some(refusal) = self.control.refusal_of(frame) {
@@ -1594,7 +1595,7 @@ impl kr_client::transport::ControlTransport for Tapped {
             if let Some(request) = self.control.garbled_request(frame) {
                 self.garbled.lock().expect("the record").push(request);
             }
-            if !self.inner.send_before(frame, not_after).await? {
+            if !self.inner.send_before(frame, not_after, wanted).await? {
                 return Ok(false);
             }
             if lost {
