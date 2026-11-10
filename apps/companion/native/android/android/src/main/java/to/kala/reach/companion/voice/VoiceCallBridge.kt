@@ -13,6 +13,7 @@ import to.kala.reach.companion.mobile.CallNames
 import to.kala.reach.companion.mobile.CallNews
 import to.kala.reach.companion.mobile.CallNewsQueue
 import to.kala.reach.companion.mobile.CallRefused
+import to.kala.reach.companion.mobile.CaptureProofRead
 import to.kala.reach.companion.mobile.HeldCall
 import to.kala.reach.companion.mobile.VoiceCaptureState
 
@@ -124,6 +125,10 @@ class VoiceCallBridge(context: Context) : CallBridge {
 
     override fun held(): HeldCall = heldNow(withMedia = true)
 
+    override fun captureProof(call: String, barrier: Boolean): CaptureProofRead =
+        named(call).call.captureProof(barrier)
+            ?: throw CallRefused(CallRefused.ENDED, "that call has ended")
+
     private fun heldNow(withMedia: Boolean): HeldCall =
         synchronized(lock) { held }?.let {
             HeldCall(
@@ -153,6 +158,8 @@ class VoiceCallBridge(context: Context) : CallBridge {
         override fun onProviderEvent(bytes: ByteArray) = tell(CallEvent.ProviderEvent(bytes))
 
         override fun onPlayout() = tell(CallEvent.Playout)
+
+        override fun onBarrier(token: Long) = tell(CallEvent.Barrier(token))
 
         override fun onConnectionState(state: String) {
             tell(CallEvent.Connection(state))

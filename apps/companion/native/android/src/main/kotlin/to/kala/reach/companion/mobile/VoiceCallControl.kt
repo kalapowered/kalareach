@@ -235,6 +235,14 @@ class VoiceCallControl(
         gate.route(changing, inputAvailable, now)
     }
 
+    /**
+     * What the system reports of this call's recording: heard, silenced because another application
+     * holds the microphone, or not reported at all. Silenced closes the gate and shows the
+     * microphone paused by the system, and a phone that reports nothing of the call's recording
+     * leaves the gate closed.
+     */
+    fun recording(state: VoiceCaptureGate.Recording) = change { now -> gate.recording(state, now) }
+
     /** Something about the media changed, such as a track arriving, and the switches are set again. */
     fun refresh() = change { }
 
@@ -243,9 +251,17 @@ class VoiceCallControl(
      *
      * Asked on the audio thread for every frame, so capture ends at the deadline within one frame
      * whatever the timers are doing. It sets no switch: a switch set from the audio thread would
-     * wait for the very thread that is asking.
+     * wait for the very thread that is asking. It also notes the frame's arrival in the gate's
+     * record, where a wait between two frames over [VoiceCaptureGate.MAX_BUFFER_GAP_MS] while
+     * capture is on is a break.
      */
-    fun carries(): Boolean = gate.captureEnabled(platform.nowMs())
+    fun carries(): Boolean = gate.buffered(platform.nowMs())
+
+    /**
+     * What this call's record of capture shows now. It takes only the gate's lock, as [displayed]
+     * does, and an expired call reads as closed.
+     */
+    fun captureProof(): VoiceCaptureGate.Proof = gate.proof(platform.nowMs())
 
     /** Whether the microphone was carrying speech at `atMs` on the monotonic clock. Never later than now. */
     fun couldHaveHeard(atMs: Long): Boolean = gate.couldHaveHeard(atMs, platform.nowMs())

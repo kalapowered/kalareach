@@ -4,6 +4,8 @@ import android.content.Context
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.media.AudioRecordingConfiguration
+import android.media.MediaRecorder
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
@@ -21,13 +23,16 @@ import org.webrtc.RtpReceiver
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
 import org.webrtc.audio.JavaAudioDeviceModule
+import to.kala.reach.companion.mobile.CaptureProofRead
 import to.kala.reach.companion.mobile.MediaCounters
 import to.kala.reach.companion.mobile.PlayoutDetector
+import to.kala.reach.companion.mobile.RecordingReport
 import to.kala.reach.companion.mobile.VoiceAnswer
 import to.kala.reach.companion.mobile.VoiceCallControl
 import to.kala.reach.companion.mobile.VoiceCallPlatform
 import to.kala.reach.companion.mobile.VoiceCaptureState
 import to.kala.reach.companion.mobile.VoiceMediaSwitches
+import to.kala.reach.companion.mobile.recordingOf
 import to.kala.reach.companion.push.AudioSession
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
@@ -96,6 +101,12 @@ class VoiceCall private constructor(
          * ended it, never on a WebRTC thread.
          */
         fun onEnded() {}
+
+        /**
+         * The marker a capture proof asked for. On the call's own thread, in the same block that read
+         * the proof, so what the call told on that thread before the block was told before it.
+         */
+        fun onBarrier(token: Long)
     }
 
     /** The call's own thread: its timers, and everything the platform reports. */
@@ -129,7 +140,11 @@ class VoiceCall private constructor(
     @Volatile
     private var answerApplied = false
     private var routeCallback: AudioDeviceCallback? = null
+    private var recordingCallback: AudioManager.AudioRecordingCallback? = null
     private var audioDeviceOn: Boolean? = null
+
+    /** How many barriers this call has told its observer of. Touched on the call's own thread only. */
+    private var barriers = 0L
 
     /**
      * The one focus request this call holds. Its listener reports on this call's thread.
@@ -266,6 +281,12 @@ class VoiceCall private constructor(
         /** The label the provider's protocol gives the channel its events arrive on. */
         const val EVENTS_LABEL = "oai-events"
 
+        /** The source the audio device takes this call's audio from: WebRTC's default for a call. */
+        const val RECORDER_SOURCE = MediaRecorder.AudioSource.VOICE_COMMUNICATION
+
+        /** How long the call's thread is given to read its record before the proof is given up on. */
+        private const val PROOF_TIMEOUT_SECONDS = 10L
+
         private val calls = AtomicLong()
 
         /**
@@ -331,6 +352,7 @@ class VoiceCall private constructor(
             }
         }
         watchRoute()
+        watchRecording()
     }
 
     /**
@@ -437,6 +459,57 @@ class VoiceCall private constructor(
     /** Ends the call and gives the microphone back. Local and immediate, as mute is. */
     fun stop() = control.stop()
 
+    /**
+     * What this call's record of capture shows now, or null when the call has ended.
+     *
+     * With [barrier], the observer is also told a marker in the same block of the call's own thread
+     * that reads the record. Provider events and the reports of the audio session reach the observer
+     * through this thread, so an item the call had waiting before the block is told before the
+     * marker. It waits for the thread, so it is never called on it.
+     */
+    fun captureProof(barrier: Boolean): CaptureProofRead? {
+        val answered = CountDownLatch(1)
+        var read: CaptureProofRead? = null
+        val queued = postCaptureProof(barrier) {
+            read = it
+            answered.countDown()
+        }
+        if (!queued) return null
+        if (!answered.await(PROOF_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            throw IllegalStateException("the call's thread did not read its record in time")
+        }
+        return read
+    }
+
+    /**
+     * Queues the block that reads the record and tells the marker, and gives the answer to `done`
+     * from the call's thread. The block is queued when this returns, so anything queued ahead of it
+     * is handled first. False, and nothing queued, when the thread has quit.
+     */
+    internal fun postCaptureProof(barrier: Boolean, done: (CaptureProofRead?) -> Unit): Boolean =
+        handler.post {
+            if (control.isStopped) {
+                done(null)
+                return@post
+            }
+            val proof = control.captureProof()
+            var token: Long? = null
+            if (barrier) {
+                barriers += 1
+                token = barriers
+                observer.onBarrier(barriers)
+            }
+            done(CaptureProofRead(proof, token))
+        }
+
+    /**
+     * Hands a provider event up on the call's own thread, as the data channel does: as bytes, to be
+     * judged by the frozen provider profile one level above this file.
+     */
+    internal fun receive(providerEvent: ByteArray) {
+        handler.post { observer.onProviderEvent(providerEvent) }
+    }
+
     /** Acts on what the system did to audio focus. */
     private fun onFocusChange(change: Int) {
         when (change) {
@@ -474,6 +547,28 @@ class VoiceCall private constructor(
         // Reported on this call's own thread.
         manager.registerAudioDeviceCallback(callback, handler)
         handler.post { control.route(changing = false, inputAvailable = hasInput(manager)) }
+    }
+
+    /**
+     * Tells the control what the system says of this call's recording. The system lists the
+     * recordings that are active; the one from the source this call's recorder takes its audio from
+     * is this call's, and it is silenced when another application holds the microphone. Reported on
+     * this call's own thread.
+     */
+    private fun watchRecording() {
+        val manager = context.getSystemService(AudioManager::class.java) ?: return
+        val callback = object : AudioManager.AudioRecordingCallback() {
+            override fun onRecordingConfigChanged(configs: List<AudioRecordingConfiguration>) {
+                control.recording(
+                    recordingOf(
+                        configs.map { RecordingReport(it.clientAudioSource, it.isClientSilenced) },
+                        RECORDER_SOURCE,
+                    ),
+                )
+            }
+        }
+        synchronized(lock) { recordingCallback = callback }
+        manager.registerAudioRecordingCallback(callback, handler)
     }
 
     /** The platform, as the control sees it. */
@@ -526,13 +621,15 @@ class VoiceCall private constructor(
             // that was already replaced must not take its replacement's place in the holder with it.
             VoiceCallHolder.claimStopped(this@VoiceCall)
             observer.onEnded()
-            val (open, callback) = synchronized(lock) {
-                val held = connection to routeCallback
+            val (open, callbacks) = synchronized(lock) {
+                val held = connection to (routeCallback to recordingCallback)
                 connection = null
                 microphone = null
                 routeCallback = null
+                recordingCallback = null
                 held
             }
+            val (callback, recording) = callbacks
             val channels = synchronized(providerChannels) {
                 acceptingChannels = false
                 providerChannels.toList().also { providerChannels.clear() }
@@ -544,6 +641,9 @@ class VoiceCall private constructor(
             events = null
             callback?.let {
                 context.getSystemService(AudioManager::class.java)?.unregisterAudioDeviceCallback(it)
+            }
+            recording?.let {
+                context.getSystemService(AudioManager::class.java)?.unregisterAudioRecordingCallback(it)
             }
             open?.dispose()
             factory.dispose()
@@ -587,7 +687,7 @@ class VoiceCall private constructor(
                 // Handed up as bytes, on the call's own thread. What is a known event is decided
                 // by the frozen provider profile, one level above this file, and an unknown one is
                 // dropped there.
-                handler.post { observer.onProviderEvent(bytes) }
+                receive(bytes)
             }
         })
     }

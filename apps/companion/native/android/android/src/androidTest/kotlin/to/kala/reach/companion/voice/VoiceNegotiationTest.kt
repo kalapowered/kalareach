@@ -45,6 +45,8 @@ class VoiceNegotiationTest {
         }
 
         override fun onPlayout() {}
+
+        override fun onBarrier(token: Long) {}
     }
 
     /** A peer in this process that answers an offer and reads the channel the offer names. */
