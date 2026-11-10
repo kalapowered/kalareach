@@ -1050,6 +1050,8 @@ pub struct LinkControl {
     /// Told when a request is held before it is sent, and when it is let go.
     request_arrived: tokio::sync::Notify,
     request_released: tokio::sync::Notify,
+    /// Told each time an answer from a host has been read.
+    answers: tokio::sync::Notify,
     /// How many held requests have been let go and have since been carried or withheld, and told
     /// each time.
     requests_passed: std::sync::atomic::AtomicUsize,
@@ -1117,9 +1119,13 @@ struct LinkState {
     /// that needs none.
     ignoring_presentation: bool,
     /// The method of the next request or mutation, on any connection, that is held before it is
-    /// sent, and whether one is held now.
-    holding_request: Option<String>,
+    /// sent, once that many of the method have been carried to the host, and whether one is held
+    /// now.
+    holding_request: Option<(String, usize)>,
     request_held: bool,
+    /// How many answers to requests and mutations of each method were read from a host, on any
+    /// connection, whoever was still waiting for them.
+    answered: std::collections::BTreeMap<String, usize>,
     waiting: Vec<Option<tokio::sync::oneshot::Sender<()>>>,
     /// The host in use each visit was made beside, in the order the visits were asked for.
     visits: Vec<Option<kr_protocol::pairing::NetworkConfig>>,
@@ -1359,7 +1365,56 @@ impl LinkControl {
     /// Holds the next request or mutation of `method`, on any connection, before it is sent, until
     /// the test releases it.
     pub fn hold_next_request(&self, method: kr_protocol::method::Method) {
-        self.state.lock().expect("the record").holding_request = Some(method.as_str().to_owned());
+        self.hold_request_after(0, method);
+    }
+
+    /// Holds the first request or mutation of `method`, on any connection, that is sent after the
+    /// next `skip` of them have been carried to the host, before it is sent, until the test
+    /// releases it.
+    pub fn hold_request_after(&self, skip: usize, method: kr_protocol::method::Method) {
+        let mut state = self.state.lock().expect("the record");
+        let carried = state.sent.get(method.as_str()).copied().unwrap_or(0);
+        state.holding_request = Some((method.as_str().to_owned(), carried + skip));
+    }
+
+    /// Waits until the host has answered `count` requests or mutations of `method` in all, on any
+    /// connection, and the answers have been read, whether or not anything was still waiting for
+    /// them: the host has finished what it was asked to do.
+    pub async fn until_the_host_answers(&self, count: usize, method: kr_protocol::method::Method) {
+        tokio::time::timeout(WATCHDOG, async {
+            loop {
+                let answered = self.answers.notified();
+                tokio::pin!(answered);
+                answered.as_mut().enable();
+                if self
+                    .state
+                    .lock()
+                    .expect("the record")
+                    .answered
+                    .get(method.as_str())
+                    .copied()
+                    .unwrap_or(0)
+                    >= count
+                {
+                    return;
+                }
+                answered.await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the host answered {count} requests of {}", method.as_str()));
+    }
+
+    /// Counts an answer to a request of `method` that was read from a host.
+    fn answer_read(&self, method: &str) {
+        *self
+            .state
+            .lock()
+            .expect("the record")
+            .answered
+            .entry(method.to_owned())
+            .or_default() += 1;
+        self.answers.notify_waiters();
     }
 
     /// Waits until a request is held before it is sent.
@@ -1573,8 +1628,10 @@ impl LinkControl {
         };
         {
             let mut state = self.state.lock().expect("the record");
-            if state.holding_request.as_deref() != Some(method) {
-                return false;
+            let carried = state.sent.get(method).copied().unwrap_or(0);
+            match &state.holding_request {
+                Some((held, after)) if held == method && carried >= *after => {}
+                _ => return false,
             }
             state.holding_request = None;
             state.request_held = true;
@@ -1687,6 +1744,7 @@ impl ControlledLink {
             control: Arc::clone(&self.control),
             garbled: Mutex::new(Vec::new()),
             receipted: Mutex::new(Vec::new()),
+            asked: Mutex::new(std::collections::HashMap::new()),
         }))
     }
 }
@@ -1808,6 +1866,8 @@ struct Tapped {
     /// The requests on this connection whose answers are to be a receipt, with the action each
     /// carried.
     receipted: Mutex<Vec<(kr_protocol::ids::RequestId, kr_protocol::ids::ActionId)>>,
+    /// The method of each request sent on this connection that has not been answered.
+    asked: Mutex<std::collections::HashMap<kr_protocol::ids::RequestId, String>>,
 }
 
 impl std::fmt::Debug for LinkControl {
@@ -1817,12 +1877,38 @@ impl std::fmt::Debug for LinkControl {
 }
 
 impl Tapped {
+    /// Remembers the method of the request `frame` is, to name the answer when it is read.
+    fn note_asked(&self, frame: &ControlFrame) {
+        let (request_id, method) = match frame {
+            ControlFrame::Request(request) => (request.request_id, request.method.as_str()),
+            ControlFrame::Mutation(request) => (request.request_id, request.method.as_str()),
+            _ => return,
+        };
+        self.asked
+            .lock()
+            .expect("the record")
+            .insert(request_id, method.to_owned());
+    }
+
+    /// Counts an answer read from the host, by the method of the request it answers.
+    fn note_answered(&self, response: &kr_protocol::envelope::Response) {
+        let method = self
+            .asked
+            .lock()
+            .expect("the record")
+            .remove(&response.request_id);
+        if let Some(method) = method {
+            self.control.answer_read(&method);
+        }
+    }
+
     /// Carries `frame` to the host.
     async fn carry(&self, frame: &ControlFrame) -> kr_client::Result<()> {
         if let Some(refusal) = self.control.refusal_of(frame) {
             return Err(kr_client::ClientError::Host(refusal));
         }
         let lost = self.control.sent_and_lost(frame);
+        self.note_asked(frame);
         if let Some(request) = self.control.garbled_request(frame) {
             self.garbled.lock().expect("the record").push(request);
         }
@@ -1851,6 +1937,7 @@ impl Tapped {
             return Err(kr_client::ClientError::Host(refusal));
         }
         let lost = self.control.sent_and_lost(frame);
+        self.note_asked(frame);
         if let Some(request) = self.control.garbled_request(frame) {
             self.garbled.lock().expect("the record").push(request);
         }
@@ -1934,6 +2021,9 @@ impl kr_client::transport::ControlTransport for Tapped {
     fn recv(&self) -> kr_client::transport::TransportFuture<'_, Option<ControlFrame>> {
         Box::pin(async move {
             let frame = self.inner.recv().await?;
+            if let Some(ControlFrame::Response(response)) = &frame {
+                self.note_answered(response);
+            }
             Ok(frame.map(|frame| match frame {
                 ControlFrame::Response(mut response)
                     if self

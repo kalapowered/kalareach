@@ -2667,26 +2667,41 @@ fn asking_again() -> Timings {
     }
 }
 
-/// The host's answer to a start never arrives, as a connection that ends between the host's
-/// reading and its answer would leave it. The device asks again under the same action, the host
-/// answers from what it kept, and the call goes on as the one that was started: one creation at
-/// the service, one opening of the call here.
+/// The host's answer to a start is not waited for, as when a connection ends between the host's
+/// reading and its answer. The device asks again under the same action, the host answers from what
+/// it kept, and the call goes on as the one that was started: one creation at the service, one
+/// opening of the call here. The question is held at the writer until the host has answered the
+/// start itself, so it is asked only of a host that has finished.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_start_whose_answer_is_lost_continues_under_the_answer_a_repeat_brings() {
     let timings = Timings {
-        // The first question comes at once; the later ones leave the host time to make the call,
-        // which the case cannot see, so that a question asked before the host has an answer is
-        // asked again.
-        repeat_delays: [
-            Duration::from_millis(20),
-            Duration::from_secs(1),
-            Duration::from_secs(5),
-        ],
+        // The held question is not to give up on the host while the case waits for it.
+        host_within: Duration::from_secs(600),
         ..asking_again()
     };
     let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    scene.link.hold_request_after(1, HostMethod::VoiceStart);
+    let prepared = scene.prepared().await;
 
-    let started = scene.start().await;
+    let starting = scene
+        .phone
+        .companion
+        .start_call("voice_start", scene.start_request(&prepared));
+    scene.link.until_request_held().await;
+    scene
+        .link
+        .until_the_host_answers(1, HostMethod::VoiceStart)
+        .await;
+    assert_eq!(
+        scene.link.sent(HostMethod::VoiceStart),
+        1,
+        "the question waits for the host's answer to the start"
+    );
+    scene.link.release_request();
+    let started = starting
+        .await
+        .expect("the start ran")
+        .expect("a call starts");
 
     assert!(
         started["value"]["outcome"]["started"].is_object(),
@@ -6207,29 +6222,38 @@ async fn a_fragment_that_arrives_before_capture_opened_taints_the_call() {
 
 /// A reply lost after the host acted: the request is asked about again with the whole request as
 /// it was composed, on another connection, under the same action, and the host answers from its
-/// record with the result. The row says unknown meanwhile, and performed after.
+/// record with the result. The question is held at the writer until the host has answered the
+/// request itself, so it is asked only of a host that has finished.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reply_lost_after_the_host_acted_is_asked_about_again_and_reads_performed() {
     let timings = Timings {
-        // The first question comes at once; the later ones leave the host time to finish, which the
-        // case cannot see, so that a question asked before the host has a result is asked again.
-        repeat_delays: [
-            Duration::from_millis(20),
-            Duration::from_secs(1),
-            Duration::from_secs(5),
-        ],
-        host_within: Duration::from_secs(5),
+        repeat_delays: [Duration::from_millis(20); 3],
+        // The held question is not to give up on the host while the case waits for it.
+        host_within: Duration::from_secs(600),
         ..delegating_timings()
     };
     let mut scene = delegating_with(timings, 1).await;
     calling(&scene).await;
     chatter(&scene).await;
     let end = speak(&scene, 6_000, "what is the status");
-    // The answer to the first request of the method is lost, and no other answer is.
+    // The answer to the first request of the method is lost, and no other answer is. The question
+    // that follows is the second request of the method, and is held.
     scene
         .link
         .lose_only_the_answer_after(0, HostMethod::VoiceDelegate);
+    scene.link.hold_request_after(1, HostMethod::VoiceDelegate);
     ask(&scene, "d-1", end - 200).await;
+    scene.link.until_request_held().await;
+    scene
+        .link
+        .until_the_host_answers(1, HostMethod::VoiceDelegate)
+        .await;
+    assert_eq!(
+        scene.link.sent(HostMethod::VoiceDelegate),
+        1,
+        "the question waits for the host's answer to the request"
+    );
+    scene.link.release_request();
 
     let row = row_reaching(&scene, "d-1", "performed").await;
 
@@ -7124,7 +7148,9 @@ async fn news_waiting_behind_the_proof_after_the_ceremony_is_read_before_the_sig
 async fn a_signed_request_whose_answer_is_lost_is_asked_about_again_and_reads_performed() {
     let timings = Timings {
         repeat_delays: [Duration::from_millis(20); 3],
-        host_within: Duration::from_secs(5),
+        // The held question is bounded by this wait: it is not to give up on the host while the
+        // case waits for the session to close.
+        host_within: Duration::from_secs(600),
         ..delegating_timings()
     };
     let mut scene = closing_with(timings).await;
