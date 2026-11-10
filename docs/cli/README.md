@@ -421,19 +421,22 @@ is told by its virtual key, its scan code and whether it is an enhanced key, so 
 Shift are two keys and each one's release is sent. The command does not ask the console for window-size
 records.
 
-The mouse is a virtual-terminal operation on this path too, not a record the session spells. The
-command learns that the application asked for mouse reporting from what the session writes, DEC mode
-1000, 1002 or 1003 for presses and the wheel, a move with a button held, or every move, and mode 1006
-for the SGR encoding. The three tracking modes are settings of their own and the widest one that is set
-counts, since a screen the command draws writes every mode it tracks, the ones that are off among them.
-Only while the application asks, it asks the console for mouse records, which
-takes the mouse from the console's text selection, and it gives the mouse back when the application
-stops asking and when the attachment ends. Each record the console then reports is sent to the
-application as the report it asked for, as input bytes at the cell the pointer is over, counted from
-the console's window: a press or release of each button, the wheel a notch at a time, a move with a
-button held in mode 1002 and a move with none in mode 1003. A position the original encoding has no
-room for (beyond column or row 223, with mode 1006 off) is not reported as another cell. Before the
-application asks, and for what it did not ask for, the console keeps the mouse and nothing is sent.
+The mouse is a virtual-terminal operation on this path too. It is not a record the session spells.
+The command reads what the session writes to learn whether the application asked for mouse
+reporting: DEC mode 1000 for presses and the wheel, 1002 for a move with a button held, 1003 for
+every move, and 1006 for the SGR encoding. The three tracking modes are settings of their own, and
+the widest one that is set counts. A screen the command draws writes every mode it tracks, the ones
+that are off among them, so a mode that is reset says nothing of the others.
+
+While the application asks, the command asks the console for mouse records, which takes the mouse
+away from the console's text selection. It gives the mouse back when the application stops asking
+and when the attachment ends. Each record the console reports in between goes to the application as
+the report it asked for, sent as input bytes at the cell the pointer is over, counted from the
+console's window. That is a press or release of each button, the wheel a notch at a time, a move
+with a button held in mode 1002, and a move with none in mode 1003. A position the original
+encoding has no room for (past column or row 223, with mode 1006 off) is not reported as another
+cell. Until the application asks, and for anything it did not ask for, the console keeps the mouse
+and nothing is sent.
 
 Bracketed paste is the one piece of context the command keeps, and it keeps it by watching the
 bytes as they go past rather than by holding any of them: a start delimiter opens a paste and an
