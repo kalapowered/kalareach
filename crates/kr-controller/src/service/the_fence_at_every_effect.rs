@@ -998,6 +998,60 @@ async fn a_transfer_action_recorded_before_a_late_attempt_is_not_given_back_whil
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
 }
 
+/// KR-REQ-09.09: the local door's answer for a transfer action whose copy the service read from its
+/// record and withheld while this host owes a fence. The caller at this machine is told that what
+/// became of the action is not shown, as a paired device is, and not the refusal of the authority,
+/// which is a definite word and says the action did not happen. The control is the same copy with
+/// nothing owed, which is given the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transfer_copy_a_service_withheld_is_told_at_the_local_door_as_not_shown() {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let params = kr_protocol::transfer::DraftCreateParams {
+        environment_id: temp.environment_id(),
+        device_id: Nullable::null(),
+        session_id: Nullable::null(),
+        application_instance_id: Nullable::null(),
+        text: "recorded by the first attempt".to_owned(),
+    };
+    let mutation = mutation_of(
+        &temp,
+        Method::DraftCreate,
+        ParamsValue::from_typed(&params).expect("encodes"),
+    );
+    // Performed as the local door does once its own look for a record has found none, which is what
+    // a copy admitted before another copy records reaches.
+    let attempt = || {
+        controller.write_method(
+            &actor_id,
+            &mutation,
+            Method::DraftCreate,
+            connection_id,
+            None,
+            Some(accepted(&controller)),
+            controller.admitted_revision(connection_id).ok(),
+        )
+    };
+    let first = attempt().await;
+    assert!(refusal(&first).is_none(), "the first attempt: {first:?}");
+    let control = attempt().await;
+    assert!(
+        refusal(&control).is_none(),
+        "with nothing owed the copy is given the record: {control:?}"
+    );
+
+    controller.hold_fence(true);
+    let withheld = attempt().await;
+    controller.hold_fence(false);
+    let told = refusal(&withheld)
+        .unwrap_or_else(|| panic!("a fence this host owes stops the copy: {withheld:?}"));
+    assert_eq!(
+        told.code,
+        ErrorCode::OutcomeUnknown,
+        "the caller is told the outcome is not shown, and not the authority's refusal: {told:?}"
+    );
+}
+
 /// KR-REQ-09.09, 09.12 and 26.16: the same for an authority change another attempt recorded between
 /// the local door's lookup and this attempt's claim.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
