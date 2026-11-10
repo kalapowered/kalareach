@@ -3696,7 +3696,7 @@ async fn the_application_printed(runtime: &kr_worker::runtime::SessionRuntime, t
 }
 
 /// KR-PERF-002, KR-REQ-08.64: a revision that takes a lease while a paste is open has the paste
-/// closed at the application at once, with nothing else typed or printed.
+/// closed at the application at once, with nothing more typed and no reply written.
 ///
 /// The install releases the lease in one step of the input domain, and what that queued for the
 /// terminal's writer, the notice that the lease moved, goes to the writer with the install and not
