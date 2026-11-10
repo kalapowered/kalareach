@@ -2867,6 +2867,17 @@ async fn a_create_retried_after_its_session_ended_starts_no_worker(ending: Endin
     match ending {
         Ending::Closed => {
             close(&mut client, &host, session_id).await;
+            // The list says Closed while the daemon still lists the worker, and a retry that comes
+            // then is a different case (the daemon's answer carries no endpoint for a worker that
+            // says it has closed). This one is the retry once the daemon has let the session go,
+            // which its last step of the closure, the removal of the worker's descriptor, says.
+            until("the daemon to let the closed session's worker go", || {
+                kr_ipc::descriptor::read(&host.paths(), session_id)
+                    .expect("the descriptor directory reads")
+                    .is_none()
+                    .then_some(())
+            })
+            .await;
         }
         Ending::Crashed => {
             crash(&worker_of(&host, session_id));

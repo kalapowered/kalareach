@@ -10,7 +10,7 @@ use kr_protocol::ids::{ActorId, SessionId};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::scalars::Nullable;
 use kr_protocol::session::{
-    EnvironmentVariable, Presentation, SessionCreateParams, SessionCreateResult,
+    EnvironmentVariable, Presentation, SessionCreateParams, SessionCreateResult, SessionState,
 };
 use kr_protocol::worker::{EnvironmentOrigin, ReservationId, WorkerReady};
 use tokio::sync::oneshot;
@@ -1059,8 +1059,8 @@ impl Controller {
         // retry cannot open a second window either.
         let presentation_error = self.present(create, reservation.session_id).await;
         encode(&SessionCreateResult {
+            endpoint: endpoint_of_a_session(&summary, endpoint),
             session: summary,
-            endpoint: Nullable::some(endpoint),
             deduplicated: false,
             presentation_error: Nullable(presentation_error),
         })
@@ -1363,8 +1363,8 @@ impl Controller {
                 .map_err(session_not_known)?;
             if let Some(session) = described {
                 return encode(&SessionCreateResult {
+                    endpoint: endpoint_of_a_session(&session, worker.endpoint.as_text()),
                     session,
-                    endpoint: Nullable::some(worker.endpoint.as_text()),
                     deduplicated: true,
                     presentation_error: Nullable(
                         self.replayed_presentation(requested.as_ref(), reservation.session_id)
@@ -1428,6 +1428,22 @@ impl Controller {
             deduplicated,
         })
         .map(Some)
+    }
+}
+
+/// Where a create's answer says to attach to the session: the worker's endpoint, unless the worker
+/// reports the session closed. A worker that has finished its closure stays in the directory until
+/// the closure's tail takes it out, and it still describes its session then, so the endpoint is
+/// withheld by the state the worker reports and not by whether it is listed: a closed session has
+/// no endpoint to attach to, as the answer from a closure record says.
+fn endpoint_of_a_session(
+    session: &kr_protocol::session::SessionSummary,
+    endpoint: String,
+) -> Nullable<String> {
+    if session.state == SessionState::Closed {
+        Nullable::null()
+    } else {
+        Nullable::some(endpoint)
     }
 }
 

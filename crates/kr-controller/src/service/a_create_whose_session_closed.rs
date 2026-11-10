@@ -590,3 +590,79 @@ async fn a_create_whose_worker_ends_while_the_create_waits_for_it_is_answered_fr
     assert_closed(&answered, world.session_id);
     world.serving.abort();
 }
+
+/// A create, and the same create asked again, whose worker says its session has closed while the
+/// daemon still lists that worker are answered with the session closed and no endpoint to attach
+/// to. A worker that has finished its closure stays in the daemon's directory until the closure's
+/// tail takes it out, and it answers a read with the session closed in the meantime, so the answer
+/// is not told from the worker's endpoint being there. The control is the same worker while its
+/// session is live, whose endpoint both answers carry.
+///
+/// The worker here is a double that says what a test tells it to, so the case holds the worker in
+/// the directory by what it has been told and not by how long anything takes.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_whose_worker_still_says_its_session_closed_is_given_no_endpoint_and_so_is_its_replay()
+ {
+    use super::a_read_that_meets_a_worker_on_its_way_out::{Scripted, reported_late};
+
+    let script = Scripted::new();
+    let world = reported_late(&script).await;
+    let controller = Arc::clone(&world.controller);
+    let reservation = controller
+        .registry
+        .lock()
+        .await
+        .reservation_for_session(world.session_id)
+        .expect("the registry answers")
+        .expect("the reservation is recorded");
+    let endpoint = world.worker.endpoint.as_text();
+    let create = || async {
+        to_a_result(
+            answer(&controller, &reservation, endpoint.clone())
+                .await
+                .expect("the create is answered"),
+        )
+    };
+    let replay = || async {
+        to_a_result(
+            controller
+                .replay_create(&reservation)
+                .await
+                .expect("the create asked again is answered"),
+        )
+    };
+
+    let live = create().await;
+    assert_ne!(live.session.state, SessionState::Closed);
+    assert_eq!(live.endpoint.0.as_deref(), Some(endpoint.as_str()));
+    let live_again = replay().await;
+    assert!(live_again.deduplicated, "the answer says it is a repeat");
+    assert_eq!(live_again.endpoint.0.as_deref(), Some(endpoint.as_str()));
+
+    // The worker has finished its closure and the directory still lists it.
+    script.set(SessionState::Closed);
+    assert!(
+        controller
+            .directory
+            .lock()
+            .await
+            .get(world.session_id)
+            .is_some(),
+        "the daemon still lists the worker"
+    );
+    let closed = create().await;
+    assert_eq!(closed.session.state, SessionState::Closed);
+    assert!(
+        closed.endpoint.0.is_none(),
+        "a closed session has no endpoint to attach to"
+    );
+    let closed_again = replay().await;
+    assert_eq!(closed_again.session.state, SessionState::Closed);
+    assert!(closed_again.deduplicated, "the answer says it is a repeat");
+    assert!(
+        closed_again.endpoint.0.is_none(),
+        "a closed session has no endpoint to attach to, asked again"
+    );
+    world.serving.abort();
+}

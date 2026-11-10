@@ -557,7 +557,7 @@ impl Scripted {
     }
 
     /// Puts the session in `state`, which every later answer says.
-    fn set(&self, state: SessionState) {
+    pub(super) fn set(&self, state: SessionState) {
         *self
             .state
             .lock()
