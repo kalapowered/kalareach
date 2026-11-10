@@ -2205,10 +2205,10 @@ impl ConsoleMouse {
     }
 
     /// Gives the mouse to the application or back to the console to match what the application has
-    /// asked for and whether this terminal may send it input. A console that will not change its
-    /// mode keeps the mouse as it is, and is asked again whenever the output, a mouse record or the
-    /// lease gives a reason to look.
-    fn update(&mut self, terminal: &ControllingTerminal, may_type: bool) {
+    /// asked for and whether this terminal may send it input, and says whether it is asked for. A
+    /// console that will not change its mode keeps the mouse as it is, and is asked again whenever
+    /// the output, a mouse record or the lease gives a reason to look.
+    fn update(&mut self, terminal: &ControllingTerminal, may_type: bool) -> bool {
         let asked = may_type && self.reporting.tracking() != crate::mouse::Tracking::Off;
         if asked != self.given && report_mouse(terminal, asked) {
             self.given = asked;
@@ -2217,6 +2217,7 @@ impl ConsoleMouse {
             // A console that reports no mouse says nothing of a button let go of meanwhile.
             self.speller.forget_the_buttons();
         }
+        asked
     }
 
     /// The bytes that tell the application of `record`, or none.
@@ -2227,8 +2228,11 @@ impl ConsoleMouse {
         may_type: bool,
     ) -> Vec<u8> {
         // A record that comes while the console should no longer be reporting is the reason to ask
-        // again for the mouse to be given back.
-        self.update(terminal, may_type);
+        // again for the mouse to be given back, and it says nothing to the application: a record
+        // the console had queued before it stopped reporting must not leave a button held.
+        if !self.update(terminal, may_type) {
+            return Vec::new();
+        }
         self.speller
             .spell(record, &self.reporting, window_origin(terminal))
     }
@@ -2308,8 +2312,8 @@ async fn drive(
     // moment a report it is part way through stops waiting for the rest of itself.
     let mut pointers = PointerReports::default();
     let mut pointer_deadline: Option<tokio::time::Instant> = None;
-    // Whether the application has asked to be told of the mouse, which a Windows console reports as
-    // records only while it has.
+    // What the application has asked of the mouse, and whether the console has been given it: a
+    // console window reports the mouse as records only while it has.
     let mut console_mouse = ConsoleMouse::default();
     // Whether the last screen this terminal was given is above the live page. It is what this
     // terminal is *displaying*, which a reset does not change: between a reset and the last page
@@ -2969,7 +2973,7 @@ async fn drive(
                     };
                     continue;
                 }
-                let from_the_mouse = matches!(read, TerminalInput::Mouse(_));
+                let mut mouse_report: Option<Vec<u8>> = None;
                 let bytes = match read {
                     TerminalInput::Bytes(bytes) => bytes,
                     // A console reports the mouse as records, and the mouse is a virtual-terminal
@@ -2980,6 +2984,7 @@ async fn drive(
                         if report.is_empty() {
                             continue;
                         }
+                        mouse_report = Some(report.clone());
                         report
                     }
                     // A console reports keys as records. There is no paste delimiter or pointer
@@ -3158,6 +3163,13 @@ async fn drive(
                 };
                 let request_id = kr_protocol::ids::RequestId::new(next_request);
                 next_request += 1;
+                // What the person typed and the pointer classifier held back goes out with a
+                // report of the mouse as typing; a write that is only the report is not.
+                let write = if mouse_report.as_deref() == Some(bytes.as_slice()) {
+                    Write::pointer(sequence)
+                } else {
+                    Write::bytes(sequence)
+                };
                 if !send_input(
                     client,
                     request_id,
@@ -3175,11 +3187,6 @@ async fn drive(
                         "the connection ended while input was being sent",
                     ));
                 }
-                let write = if from_the_mouse {
-                    Write::pointer(sequence)
-                } else {
-                    Write::bytes(sequence)
-                };
                 outstanding.insert(request_id, Outstanding::Input(write));
                 sequence += 1;
             }
@@ -4454,18 +4461,19 @@ mod tests {
     }
 
     /// The report of a click that is sent behind console keys the session refuses is no more read
-    /// than the keys behind them are: the host cannot place it under the number it was sent with
-    /// and says so, which is no reason to end the attachment once the console spells its keys.
+    /// than the keys behind them are: the host cannot place it under the number it was sent with and
+    /// says so, which is no reason to end the attachment once the console spells its keys. Shift
+    /// going down is not typing and neither is a click, so nothing is said to have been lost.
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn a_click_sent_behind_console_keys_the_session_refuses_does_not_end_the_attachment() {
         use kr_protocol::input::InputContent;
 
         let ran = wire::run_switched(true, true, |mut case| async move {
-            // The application has asked for clicks, and a key and a click are on their way when the
-            // host refuses the key.
+            // The application has asked for clicks, and Shift going down and a click are on their
+            // way when the host refuses the key.
             case.says_output_bytes(0, b"\x1b[?1000h\x1b[?1006h");
-            let key = case.types(key_down(b'A')).await;
+            let key = case.types(key_down(0x10)).await;
             let click = case
                 .types(crate::attach::TerminalInput::Mouse(
                     crate::mouse::MouseRecord {
@@ -4501,9 +4509,53 @@ mod tests {
         );
         assert_eq!(ran.said.len(), 1, "{:?}", ran.said);
         assert!(
-            ran.said[0].as_str().contains("were lost"),
-            "the key typed when the session refused the records is the only loss: {:?}",
+            ran.said[0].as_str().contains("this console spells"),
+            "{:?}",
             ran.said[0]
+        );
+        assert!(
+            !ran.said[0].as_str().contains("were lost"),
+            "Shift going down and a click are not typing: {:?}",
+            ran.said[0]
+        );
+    }
+
+    /// A mouse record that arrives after the application stopped asking for the mouse, because the
+    /// console had queued it before it stopped reporting, tells the application nothing and leaves no
+    /// button held: when the application asks again, the next press is a press.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_queued_before_the_mouse_was_given_back_leaves_no_button_held() {
+        let device = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .expect("a device to hold the place of a terminal");
+        let terminal = crate::terminal::ControllingTerminal::over(device);
+        let press = crate::mouse::MouseRecord {
+            column: 1,
+            row: 1,
+            buttons: 1,
+            control_keys: 0,
+            flags: 0,
+        };
+        let mut mouse = super::ConsoleMouse::default();
+
+        mouse.shown(b"\x1b[?1000h\x1b[?1006h", &terminal, true);
+        assert_eq!(
+            mouse.spelled(press, &terminal, true),
+            b"\x1b[<0;2;2M".to_vec()
+        );
+        mouse.shown(b"\x1b[?1000l", &terminal, true);
+        assert!(
+            mouse.spelled(press, &terminal, true).is_empty(),
+            "a record after the application stopped asking is told to nobody"
+        );
+        mouse.shown(b"\x1b[?1000h", &terminal, true);
+        assert_eq!(
+            mouse.spelled(press, &terminal, true),
+            b"\x1b[<0;2;2M".to_vec(),
+            "the button the console reported down before the mouse was given back is not held"
         );
     }
 

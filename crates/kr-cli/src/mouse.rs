@@ -314,8 +314,9 @@ impl MouseSpeller {
         if record.flags & MOUSE_WHEELED != 0 {
             let high = u16::try_from(record.buttons >> 16).unwrap_or(0);
             let amount = i32::from(i16::from_ne_bytes(high.to_ne_bytes()));
-            // A turn the other way leaves nothing of the turn before it.
-            if (amount > 0) != (self.wheel > 0) {
+            // A turn the other way leaves nothing of the turn before it, and no turn leaves it as
+            // it was.
+            if amount != 0 && (amount > 0) != (self.wheel > 0) {
                 self.wheel = 0;
             }
             self.wheel += amount;
@@ -580,6 +581,13 @@ mod tests {
             Vec::<u8>::new(),
             "the other way, where nothing of the turn before is left"
         );
+        assert_eq!(spelled(up(-60)), b"\x1b[<65;1;1M".to_vec());
+        // A record that turns nothing leaves the part of a notch as it was, whichever way it is.
+        assert_eq!(spelled(up(60)), Vec::<u8>::new());
+        assert_eq!(spelled(up(0)), Vec::<u8>::new());
+        assert_eq!(spelled(up(60)), b"\x1b[<64;1;1M".to_vec());
+        assert_eq!(spelled(up(-60)), Vec::<u8>::new());
+        assert_eq!(spelled(up(0)), Vec::<u8>::new());
         assert_eq!(spelled(up(-60)), b"\x1b[<65;1;1M".to_vec());
     }
 
