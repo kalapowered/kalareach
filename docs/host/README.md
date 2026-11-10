@@ -2149,8 +2149,10 @@ records and nothing about how it draws a stream. The worker gives that profile t
 the application reads the ordinary encoding, and refuses it under either enhanced protocol, because
 a console's records are spelled in the ordinary encoding or in no other. The refusal does not ask
 whether the backend asked for records, which are sent as they are in any keyboard state, so a
-console is refused there too. `kr attach --no-probe` declares nothing, as on every platform, so
-that attachment watches and does not type.
+console is refused there too. A Windows console whose environment sets `TERM` declares that name
+instead, with that terminal's claims (`xterm-256color` claims `modifyOtherKeys` level 2 and a
+direct stream), although its keys still go as records. `kr attach --no-probe` declares nothing, as
+on every platform, so that attachment watches and does not type.
 Under `Fidelity::LegacyVt`, which is every session of a Unix worker and a Windows session whose
 pseudo-console did not ask for records, and while the application in the session has negotiated
 `modifyOtherKeys` or the Kitty keyboard protocol, the worker refuses a write of console keys with

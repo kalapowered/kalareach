@@ -1880,8 +1880,9 @@ async fn a_worker_that_cannot_reach_its_controller_says_why_and_ends_whatever_it
 /// by their recorded parent, which leaves the pseudo-console's host and nothing else, and does not
 /// see a process that a child of the worker left running. The pseudo-console's host is created by
 /// the system for the worker's call, not by a place that writes, so only that read sees it, and it
-/// takes any number of console hosts by their names; the daemon's call to the task scheduler that
-/// starts the worker is the supervisor's, in the list of launches asserted above.
+/// takes any number of console hosts by their names; the daemon's two calls to the task scheduler
+/// for that start, a query of the task and its run, are the supervisor's: the list of launches
+/// asserted above counts the start, not the calls.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_idle_session_runs_nothing_beside_its_shell() {
     let host = Host::create().recording_launches().recording_creations();
