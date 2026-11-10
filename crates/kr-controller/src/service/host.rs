@@ -59,9 +59,10 @@ impl Controller {
         // From here to the recorded outcome is one sequence. Two callers cannot both find no
         // record and both change the same files.
         let _admission = self.agent_tools.lock().await;
-        // Waiting for that lock takes time, and what happens next is either a read of somebody's
-        // completed action or a change to their files. Both need current authority, so it is
-        // checked here rather than before the wait.
+        // Waiting for that lock takes time. Whether the connection's registration stands is asked
+        // after it, so that a caller whose registration is gone is refused before anything of
+        // the agent's files is read. The authority itself is asked where an answer the host
+        // holds goes back and where the dispatch marker is written, below.
         self.authorised(carried.connection_id)?;
         // What the host kept of the action, a refusal as much as a result, goes back only under
         // the authority this attempt arrived under, asked with it in hand: a record that another
