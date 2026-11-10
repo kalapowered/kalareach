@@ -304,14 +304,37 @@ impl Service {
     /// (a services console, a command) holds it open: the manager removes it when the last handle
     /// closes.
     ///
+    /// The service manager refuses every change to such a service, so the answer comes from a
+    /// change that sets nothing.
+    ///
     /// # Errors
     ///
-    /// Returns the platform's error when the configuration cannot be read for any other reason.
+    /// Returns the platform's error when the change is refused for any other reason.
     pub fn marked_for_deletion(&self) -> Result<bool> {
-        match self.configuration() {
-            Ok(_) => Ok(false),
-            Err(failure) if failure.code == ERROR_SERVICE_MARKED_FOR_DELETE => Ok(true),
-            Err(failure) => Err(failure),
+        // SAFETY: the service is open; every setting is left as it is.
+        let changed = unsafe {
+            ChangeServiceConfigW(
+                self.0,
+                SERVICE_NO_CHANGE,
+                SERVICE_NO_CHANGE,
+                SERVICE_NO_CHANGE,
+                null(),
+                null(),
+                null_mut(),
+                null(),
+                null(),
+                null(),
+                null(),
+            )
+        };
+        if changed != 0 {
+            return Ok(false);
+        }
+        let failure = last("asking whether the service is deleted");
+        if failure.code == ERROR_SERVICE_MARKED_FOR_DELETE {
+            Ok(true)
+        } else {
+            Err(failure)
         }
     }
 
