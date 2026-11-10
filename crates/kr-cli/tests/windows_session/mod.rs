@@ -164,9 +164,9 @@ pub async fn attachments_until(
 
 /// What the session's worker reports of it now: its state, its root shell and its attachments. The
 /// worker is reached on a connection of its own, through its descriptor, as a command would. The
-/// error says what the read met: a session with no published descriptor, and a connection that could
-/// not be made or ended before it was answered (whichever step it ended at), are what a worker that
-/// has ended shows; everything else is the worker or its answer being wrong.
+/// error says what the read met: a session with no published descriptor, and a connection that
+/// could not be made or ended before it was answered (whichever step it ended at), are what a
+/// worker that has ended shows; everything else is the worker or its answer being wrong.
 pub async fn snapshot_of(
     environment: &kr_ipc::paths::EnvironmentPaths,
     session_id: kr_protocol::ids::SessionId,

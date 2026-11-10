@@ -348,11 +348,11 @@ async fn the_end_of_the_shells_input_closes_the_session_and_nothing_starts_it_ag
 /// and the shell is not started again.
 ///
 /// The root shell is the Windows command shell at its prompt. The kernel is asked to end it by the
-/// identity the worker reports for it, which is neither the shell's own exit nor a request to close,
-/// so the worker finds the shell gone without having been told why. The session is then closed
-/// for the shell's ending and not for a request, the shell and the worker are gone, a second read
-/// of the worker says no other shell took the root's place, and a session opened and closed after
-/// it finds the first one closed, with its number, and nothing live.
+/// identity the worker reports for it, which is neither the shell's own exit nor a request to
+/// close, so the worker finds the shell gone without having been told why. The session is then
+/// closed for the shell's ending and not for a request, the shell and the worker are gone, a second
+/// read of the worker says no other shell took the root's place, and a session opened and closed
+/// after it finds the first one closed, with its number, and nothing live.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_root_shell_ended_from_outside_closes_the_session_and_nothing_starts_it_again() {
     let host = WorkerHost::start().await;

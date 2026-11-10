@@ -382,8 +382,8 @@ impl OnConsole {
     /// last lines on their way to this side of the console, and how long that takes is not this
     /// test's to know, so the end of the command does not end the wait: the console showing `last`
     /// does. A command writes in order, so what it printed before `last` is in what comes back with
-    /// it, and a check that something was not printed is judged on all of it. The wait fails when the
-    /// console's output has ended without `last`, and at the liveness deadline.
+    /// it, and a check that something was not printed is judged on all of it. The wait fails when
+    /// the console's output has ended without `last`, and at the liveness deadline.
     fn finish(mut self, last: &str) -> (bool, String) {
         let started = Instant::now();
         let status = loop {
@@ -398,7 +398,8 @@ impl OnConsole {
             std::thread::sleep(Duration::from_millis(20));
         };
         loop {
-            // Read before the text is, so that a thread that was done has also added the last bytes.
+            // Read before the text is, so that a thread that was done has also added the last
+            // bytes.
             let complete = self.output.complete();
             let text = self.output.text();
             if text.contains(last) {
