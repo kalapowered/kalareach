@@ -1422,6 +1422,64 @@ async fn a_capability_check_another_copy_answered_is_not_given_back_once_its_hol
     refused_for_a_fence(&refused.to_protocol_error());
 }
 
+/// KR-REQ-09.09, the disclosed checks: the fence is asked under the start's hold, with the record's
+/// answer in hand, as well as once the hold has ended. A fence that lands before the record is read
+/// stops the answer even when it is gone again by the time the hold has ended, because the answer
+/// was in hand while it stood. The late copy is stopped before it reads the record, where the fence
+/// lands, and then at the check it is asked once the hold has ended, where the case lets the fence
+/// go: only the check under the hold can have refused it by then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capability_check_another_copy_answered_is_not_given_back_when_its_fence_is_gone_by_the_end_of_its_hold()
+ {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let mutation = capability_request(&temp, None, None);
+    let admission = carried(&controller, connection_id);
+    controller
+        .start_capability_checks(&actor_id, &mutation, admission)
+        .await
+        .expect("the first copy is answered");
+
+    let (arrived, release) = controller.before_a_capability_check_looks.arm();
+    let (after_the_hold, goes_on) = controller.pause_retained_lookup();
+    let mut late = tokio::spawn({
+        let (controller, actor_id, mutation) =
+            (Arc::clone(&controller), actor_id.clone(), mutation.clone());
+        async move {
+            controller
+                .start_capability_checks(&actor_id, &mutation, admission)
+                .await
+        }
+    });
+    let reached =
+        tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)));
+    tokio::select! {
+        reached = reached => {
+            reached
+                .expect("the wait finishes")
+                .expect("the late copy reaches the place it is stopped at");
+        }
+        answered = &mut late => panic!("the late copy was answered before it read the record: {answered:?}"),
+    }
+    controller.hold_fence(true);
+    release.send(()).expect("the late copy goes on");
+    let answered = tokio::select! {
+        reached = tokio::time::timeout(Duration::from_secs(30), after_the_hold) => {
+            reached
+                .expect("a copy the hold let through reaches the check asked once it has ended")
+                .expect("the pause is armed");
+            controller.hold_fence(false);
+            goes_on.send(()).expect("the check goes on");
+            late.await.expect("the late copy finishes")
+        }
+        answered = &mut late => answered.expect("the late copy finishes"),
+    };
+    controller.hold_fence(false);
+    let refused = answered
+        .expect_err("a fence that stood while the answer was in hand stops it, though it is gone");
+    refused_for_a_fence(&refused.to_protocol_error());
+}
+
 /// KR-REQ-09.09, the disclosed checks' reused identifier: a request that carries the identifier of
 /// another copy's answer but names another file is refused as a reused identifier, and what the
 /// record holds for that identifier is not disclosed to a caller whose authority has gone. The late
