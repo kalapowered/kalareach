@@ -2680,6 +2680,28 @@ fn generation_of(signed_in: &SignedInAccount) -> String {
 const OWNER: &str = "https://owner.example";
 const ELSEWHERE: &str = "https://elsewhere.example";
 
+/// A request at `origin` for the application's own identity, answered on the loopback redirect,
+/// and the grant that answer carries: the answer names `origin`'s issuer.
+fn granted_at(origin: &str) -> AuthorisationGrant {
+    let request =
+        AuthorisationRequest::asking_at_origin(origin, Client::Desktop, Redirect::Loopback, &[])
+            .expect("a request");
+    let state = parameters(&Url::parse(&request.url()).expect("an address"))["state"][0].clone();
+    let mut pending = PendingAuthorisation::new(request);
+    let answer = callback(
+        Redirect::Loopback.uri(),
+        &[
+            ("code", "a-code"),
+            ("state", &state),
+            ("iss", &issuer_of(origin)),
+        ],
+    );
+    match pending.answer(&answer, Carrier::Terminal) {
+        Answer::Granted(grant) => grant,
+        other => panic!("a grant: {other:?}"),
+    }
+}
+
 /// The account service at `origin`, over the scripted exchange.
 fn service_at(http: &Arc<Scripted>, origin: &str) -> ManagedAccountService {
     ManagedAccountService::at_origin(
@@ -2749,6 +2771,8 @@ fn a_request_at_an_origin_names_that_origin_and_exactly_its_parameters() {
         "http://owner.example",
         "https://owner.example/auth",
         "ftp://owner.example",
+        // Spelled as an origin is, and not an address: its punycode label does not decode.
+        "https://a.b.c.xn--pokxncvks",
     ] {
         let error = AuthorisationRequest::asking_at_origin(
             refused,
@@ -2835,7 +2859,7 @@ async fn an_id_token_is_accepted_for_its_own_origins_issuer_and_for_no_other() {
         (ACCOUNT_ORIGIN, ISSUER.to_owned(), true),
         (ACCOUNT_ORIGIN, issuer_of(OWNER), false),
     ] {
-        let grant = granted(client, Redirect::Loopback);
+        let grant = granted_at(origin);
         let mut claims = claims(client, grant.nonce());
         claims["iss"] = serde_json::json!(issuer);
         let http = Scripted::answering(vec![(200, token_answer(&claims))]);
@@ -2877,11 +2901,71 @@ async fn an_id_token_is_accepted_for_its_own_origins_issuer_and_for_no_other() {
             .refresh(&kept)
             .await
             .expect("an answer");
-        assert_eq!(
-            matches!(refreshed, Refreshed::Rotated(_)),
-            accepted,
-            "{origin} {issuer}: {refreshed:?}"
-        );
+        match (refreshed, accepted) {
+            (Refreshed::Rotated(_), true) | (Refreshed::Refused { leftover: Some(_) }, false) => {}
+            (other, _) => panic!("{origin} {issuer}: {other:?}"),
+        }
+    }
+}
+
+/// A code and its verifier go to the service the request was made for, and a refresh token to the
+/// service that issued it, and to no other: nothing is sent, and a grant that is not the service's is
+/// kept as it was.
+#[tokio::test]
+async fn a_code_or_a_refresh_token_is_sent_only_to_the_service_that_issued_it() {
+    let client = Client::Desktop;
+    let managed_code = granted(client, Redirect::Loopback);
+    let owner_code = granted_at(OWNER);
+    for (what, origin, code) in [
+        (
+            "a managed code at the owner's service",
+            OWNER,
+            &managed_code,
+        ),
+        (
+            "the owner's code at the managed service",
+            ACCOUNT_ORIGIN,
+            &owner_code,
+        ),
+    ] {
+        let http = Scripted::answering(vec![]);
+        let error = service_at(&http, origin)
+            .exchange(code)
+            .await
+            .expect_err(what);
+        assert_eq!(error.code(), ErrorCode::InvalidArgument, "{what}");
+        assert!(http.seen().is_empty(), "{what}: nothing was sent");
+    }
+
+    let grant_of = |origin: &str| {
+        StoredGrant::new(
+            &issuer_of(origin),
+            issued_for("account-1", "a-refresh-token", &["openid", "voice"]),
+            client,
+            "the-sign-in-nonce",
+            NOW * 1000,
+        )
+        .expect("a grant")
+    };
+    for (what, origin, kept) in [
+        (
+            "a managed grant at the owner's service",
+            OWNER,
+            grant_of(ACCOUNT_ORIGIN),
+        ),
+        (
+            "the owner's grant at the managed service",
+            ACCOUNT_ORIGIN,
+            grant_of(OWNER),
+        ),
+    ] {
+        let http = Scripted::answering(vec![]);
+        let error = service_at(&http, origin)
+            .refresh(&kept)
+            .await
+            .expect_err(what);
+        assert_eq!(error.code(), ErrorCode::InvalidArgument, "{what}");
+        assert!(http.seen().is_empty(), "{what}: nothing was sent");
     }
 }
 
@@ -2954,7 +3038,10 @@ async fn a_grant_kept_for_one_origin_is_not_read_back_for_another() {
     store
         .set(&name, &serde_json::to_vec(&document).expect("bytes"))
         .expect("written");
-    assert!(owner.status().is_err());
+    assert_eq!(
+        owner.status().expect_err("an edited document").code(),
+        ErrorCode::StorageUnavailable
+    );
     assert_eq!(
         stub.refreshes.load(Ordering::SeqCst),
         0,

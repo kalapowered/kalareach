@@ -1,4 +1,4 @@
-//! Signing in to a managed account through the system browser, and the tokens that come of it.
+//! Signing in to an account service through the system browser, and the tokens that come of it.
 //!
 //! Section 17: native applications are registered public OAuth clients. They use the system
 //! browser, the authorisation-code flow with S256 PKCE, exact registered redirect addresses, state
@@ -14,9 +14,10 @@
 //! * [`PendingAuthorisation`] checks what comes back, in a fixed order, and consumes the request so
 //!   that no second answer can use it.
 //! * [`AccountService`] is the service's token, revocation, identity and usage endpoints, and
-//!   [`ManagedAccountService`] is the managed implementation, over the narrow [`AccountHttp`].
+//!   [`ManagedAccountService`] is the implementation for the managed service and for a service
+//!   the owner runs, over the narrow [`AccountHttp`].
 //! * [`SignedInAccount`] keeps the grant in a [`SecretStore`] under one lock and is the
-//!   [`AccountTokenSource`] every managed resource asks for a token.
+//!   [`AccountTokenSource`] every resource of the service asks for a token.
 //!
 //! The browser, the delivery of the redirect and the store itself are the embedder's: the
 //! companion carries them per platform.
@@ -25,8 +26,8 @@
 //!
 //! The managed origin, its issuer, the endpoints and the two registered clients with their
 //! redirects are constants here rather than something discovered. The registry on the service is
-//! closed and exact, and the issuer is the value every answer is checked against, so reading it
-//! from the service would have the answer vouch for itself.
+//! closed and exact, and the issuer is the value a callback and an ID token are checked against, so
+//! reading it from the service would have the answer vouch for itself.
 //!
 //! A service the owner runs is held to the same rule, at the origin the client was made for: its
 //! issuer is [`issuer_of`] that origin, fixed before anything is asked of the service. Every
@@ -95,8 +96,8 @@ pub const ACCOUNT_ORIGIN: &str = kr_protocol::service::OFFICIAL_GATEWAY_ORIGIN;
 /// The passkey relying party: the origin's host, which is how the service derives it.
 pub const RELYING_PARTY_ID: &str = "reach.kala.to";
 
-/// The managed service's issuer, which every answer of the managed service is checked against: it
-/// is [`issuer_of`] [`ACCOUNT_ORIGIN`].
+/// The managed service's issuer, which its callbacks and ID tokens are checked against: it is
+/// [`issuer_of`] [`ACCOUNT_ORIGIN`].
 pub const ISSUER: &str = "https://reach.kala.to/auth";
 
 /// Where a service mounts its authorisation server, below its origin.
@@ -536,7 +537,8 @@ impl fmt::Debug for AttemptId {
 /// [`IDENTITY_SCOPES`] and that purpose's resources, so the token that comes of it reaches what it
 /// was asked for and nothing else.
 pub struct AuthorisationRequest {
-    origin: String,
+    /// The authorisation endpoint of the service the request is for, parsed when it was made.
+    authorise: Url,
     issuer: String,
     client: Client,
     redirect: Redirect,
@@ -617,19 +619,24 @@ impl AuthorisationRequest {
     /// # Errors
     ///
     /// As [`Self::asking`], and when `origin` is not the origin of an account service: an `https`
-    /// origin, or an `http` one on a loopback host, with a host, an optional port and nothing else.
+    /// origin, or an `http` one on a loopback host, with a host, an optional port and nothing else,
+    /// that also parses as an address.
     pub fn asking_at_origin(
         origin: &str,
         client: Client,
         redirect: Redirect,
         resources: &[&str],
     ) -> Result<Self> {
-        if GatewayOrigin::new(origin).is_err() {
+        let Some(authorise) = GatewayOrigin::new(origin)
+            .ok()
+            .and_then(|_| Url::parse(origin).ok())
+            .and_then(|origin| origin.join(AUTHORIZE_PATH).ok())
+        else {
             return Err(local(
                 "an account service's origin is a scheme, a host and an optional port, and plain \
                  http only for a loopback host",
             ));
-        }
+        };
         if !client.owns(redirect) {
             return Err(local(crate::shown!(
                 "{} is not a redirect registered for {}",
@@ -659,7 +666,7 @@ impl AuthorisationRequest {
             scopes.push((*resource).to_owned());
         }
         Ok(Self {
-            origin: origin.to_owned(),
+            authorise,
             issuer: issuer_of(origin),
             client,
             redirect,
@@ -673,16 +680,9 @@ impl AuthorisationRequest {
 
     /// The address the browser opens: the authorisation endpoint on the request's own origin, with
     /// each parameter once and nothing else.
-    ///
-    /// # Panics
-    ///
-    /// Panics only when the request's origin does not parse, which its constructor ruled out.
     #[must_use]
     pub fn url(&self) -> String {
-        let Ok(mut url) = Url::parse(&self.origin).and_then(|origin| origin.join(AUTHORIZE_PATH))
-        else {
-            unreachable!("the origin was checked when the request was made, and the path parses");
-        };
+        let mut url = self.authorise.clone();
         url.query_pairs_mut()
             .append_pair("response_type", "code")
             .append_pair("client_id", self.client.id())
@@ -779,6 +779,8 @@ impl fmt::Debug for Answer {
 
 /// A code, with everything its exchange needs.
 pub struct AuthorisationGrant {
+    /// The issuer of the service the request was made for, which the code is for and no other.
+    issuer: String,
     client: Client,
     redirect: Redirect,
     attempt: AttemptId,
@@ -915,6 +917,7 @@ impl PendingAuthorisation {
         }
         match inspected.code {
             Some(code) if !code.is_empty() => Answer::Granted(AuthorisationGrant {
+                issuer: request.issuer,
                 client: request.client,
                 redirect: request.redirect,
                 attempt: request.attempt,
@@ -1180,8 +1183,9 @@ impl ManagedAccountService {
     }
 
     /// The account service at another origin: a service the owner runs, or a test server. The
-    /// issuer every answer is checked against is that origin's own, `<origin>/auth`
-    /// ([`issuer_of`]), so an answer that names the managed issuer, or any other, is refused.
+    /// issuer an ID token is checked against is that origin's own, `<origin>/auth` ([`issuer_of`]),
+    /// so an ID token that names the managed issuer, or any other, is refused. A code or a stored
+    /// grant that names another issuer is never sent to it.
     #[must_use]
     pub fn at_origin(
         origin: impl Into<String>,
@@ -1285,8 +1289,9 @@ impl ManagedAccountService {
 
     /// Checks an ID token's payload and returns its subject.
     ///
-    /// Its signature is not checked: it came over TLS straight from the token endpoint this
-    /// service was made for, which OpenID Connect Core section 3.1.3.7 accepts in place of one.
+    /// Its signature is not checked: it came straight from the token endpoint this service was made
+    /// for, over TLS (or over plain http to a loopback host, which only a deployment on this
+    /// machine is reached by), which OpenID Connect Core section 3.1.3.7 accepts in place of one.
     fn checked_subject(&self, token: &str, expected: &Expected<'_>) -> Option<String> {
         let claims = id_token_claims(token)?;
         let text = |name: &str| claims.get(name).and_then(serde_json::Value::as_str);
@@ -1427,6 +1432,10 @@ fn unreadable(what: &'static str, fault: Unreadable) -> ClientError {
 impl AccountService for ManagedAccountService {
     fn exchange<'a>(&'a self, grant: &'a AuthorisationGrant) -> ServiceFuture<'a, Exchanged> {
         Box::pin(async move {
+            // A code and its verifier go to the service the request was made for, and to no other.
+            if grant.issuer != self.issuer {
+                return Err(local("this code was issued by another account service"));
+            }
             let body = form(&[
                 ("grant_type", "authorization_code"),
                 ("code", grant.code()),
@@ -1461,6 +1470,11 @@ impl AccountService for ManagedAccountService {
 
     fn refresh<'a>(&'a self, stored: &'a StoredGrant) -> ServiceFuture<'a, Refreshed> {
         Box::pin(async move {
+            // A refresh token goes to the service that issued it, and to no other. Nothing is
+            // ended: the grant is kept as it was.
+            if stored.issuer != self.issuer {
+                return Err(local("this sign-in belongs to another account service"));
+            }
             let body = form(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", stored.refresh_token.expose()),
@@ -2025,7 +2039,7 @@ pub enum Commit {
 }
 
 /// The account signed in on this device: the grant in secure storage, one lock over every change
-/// to it, and the token source every managed resource asks.
+/// to it, and the token source every resource of the service asks.
 pub struct SignedInAccount {
     service: Arc<dyn AccountService>,
     store: Arc<dyn SecretStore>,
@@ -3040,6 +3054,7 @@ mod tests {
         );
 
         let grant = AuthorisationGrant {
+            issuer: ISSUER.to_owned(),
             client: Client::Desktop,
             redirect: Redirect::Loopback,
             attempt,
