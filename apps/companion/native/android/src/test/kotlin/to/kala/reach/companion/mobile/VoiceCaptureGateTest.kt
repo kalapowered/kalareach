@@ -348,59 +348,59 @@ class VoiceCaptureGateTest {
 
     /**
      * What the system lists of the recordings, and which of them is this call's: those from its source
-     * that were listed while its audio device was off are other applications', and its own is one more.
+     * that the system held when its audio device came on are other applications', and its own is one more.
      */
     @Test
-    fun the_recording_of_the_call_is_one_more_from_its_source_than_there_were_before_the_device_came_on() {
+    fun the_recording_of_the_call_is_one_more_from_its_source_than_there_were_when_the_device_came_on() {
         val call = 7
         val watch = RecordingWatch(call)
-        assertEquals(VoiceCaptureGate.Recording.UNREPORTED, watch.read(emptyList(), deviceOn = false))
+        watch.deviceComesOn(emptyList())
         assertEquals(
             "the device is on and the system lists no recording",
             VoiceCaptureGate.Recording.UNREPORTED,
-            watch.read(emptyList(), deviceOn = true),
+            watch.read(emptyList()),
         )
         assertEquals(
             "another source's recording is not this call's",
             VoiceCaptureGate.Recording.UNREPORTED,
-            watch.read(listOf(RecordingReport(source = 1, silenced = false)), deviceOn = true),
+            watch.read(listOf(RecordingReport(source = 1, silenced = false))),
         )
         assertEquals(
             VoiceCaptureGate.Recording.AUDIBLE,
-            watch.read(listOf(RecordingReport(1, true), RecordingReport(call, false)), deviceOn = true),
+            watch.read(listOf(RecordingReport(1, true), RecordingReport(call, false))),
         )
         assertEquals(
             VoiceCaptureGate.Recording.SILENCED,
-            watch.read(listOf(RecordingReport(call, true)), deviceOn = true),
+            watch.read(listOf(RecordingReport(call, true))),
         )
     }
 
     /**
-     * KR-REQ-15.36: another application's audible recording from the call's source, listed before the
-     * call's own recorder runs, does not stand in for the call's: with the device on and nothing more
-     * listed, the call's recording is not reported, and it is reported only once there is one more.
+     * KR-REQ-15.36: another application's audible recording from the call's source, held when the
+     * call's own recorder was turned on, does not stand in for the call's: with nothing more listed the
+     * call's recording is not reported, and it is reported only once there is one more.
      */
     @Test
     fun another_applications_recording_from_the_same_source_is_not_the_calls_own() {
         val call = 7
         val watch = RecordingWatch(call)
         val theirs = RecordingReport(call, silenced = false)
-        assertEquals(VoiceCaptureGate.Recording.UNREPORTED, watch.read(listOf(theirs), deviceOn = false))
+        watch.deviceComesOn(listOf(theirs))
 
         assertEquals(
-            "a list that holds only theirs, with the device on",
+            "a list that holds only theirs",
             VoiceCaptureGate.Recording.UNREPORTED,
-            watch.read(listOf(theirs), deviceOn = true),
+            watch.read(listOf(theirs)),
         )
         assertEquals(
             "theirs and one more",
             VoiceCaptureGate.Recording.AUDIBLE,
-            watch.read(listOf(theirs, RecordingReport(call, false)), deviceOn = true),
+            watch.read(listOf(theirs, RecordingReport(call, false))),
         )
         assertEquals(
             "theirs ending while ours runs leaves nothing to tell the two apart: refused",
             VoiceCaptureGate.Recording.UNREPORTED,
-            watch.read(listOf(RecordingReport(call, false)), deviceOn = true),
+            watch.read(listOf(RecordingReport(call, false))),
         )
     }
 }

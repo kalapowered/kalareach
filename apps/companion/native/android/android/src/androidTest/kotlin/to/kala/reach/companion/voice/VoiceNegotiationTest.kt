@@ -257,8 +257,9 @@ class VoiceNegotiationTest {
 
     /**
      * KR-REQ-15.36: on the real recorder, a call that the host permitted opens capture once the
-     * system reports its recording: the gate's record shows one opening and no break, and the news
-     * says the microphone is capturing. This is the call's own recorder with the in-process peer, not
+     * system reports its recording: the gate's record shows one opening, and the news says the
+     * microphone is capturing. It says nothing of breaks, which depend on the emulator's audio
+     * thread. This is the call's own recorder with the in-process peer, not
      * a phone: it shows that the rule that waits for the system's report does open on a device that
      * reports the call's recording.
      */

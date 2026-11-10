@@ -64,6 +64,11 @@ class VoiceCallControlTest {
 
         override fun epochMs() = epochAtStart + now
 
+        /** What the system lists as active recordings when the call's audio device is turned on. */
+        var listed: List<RecordingReport> = emptyList()
+
+        override fun activeRecordings() = listed
+
         override fun answerApplied() = answered
 
         override fun acquireFocus(): Boolean {
@@ -226,9 +231,10 @@ class VoiceCallControlTest {
     }
 
     /**
-     * KR-REQ-15.36: another application's recording from the call's source, listed before the call's
-     * audio device runs, is not the call's own: the microphone carries nothing for it, and carries
-     * once the system lists one more.
+     * KR-REQ-15.36: another application's recording from the call's source, held by the system when
+     * the call's audio device is turned on, is not the call's own: the microphone carries nothing for
+     * it, and carries once the system lists one more. The system never reported a change in the list
+     * to the call before the device came on: the call takes the list itself, as the device comes on.
      */
     @Test
     fun another_applications_recording_does_not_open_the_microphone() {
@@ -236,7 +242,7 @@ class VoiceCallControlTest {
         val switches = Switches()
         val control = VoiceCallControl(platform, switches)
         val theirs = RecordingReport(VoiceCallControl.RECORDER_SOURCE, silenced = false)
-        control.recording(listOf(theirs))
+        platform.listed = listOf(theirs)
         assertTrue(control.permit("voice-session-1", platform.closesIn(60)))
         control.servicePromoted()
         control.recorder(true)

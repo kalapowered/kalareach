@@ -27,6 +27,12 @@ interface VoiceCallPlatform {
     /** The wall clock, in milliseconds since the epoch. */
     fun epochMs(): Long
 
+    /**
+     * The recordings the system lists as active now, from every application. Read as the call's
+     * audio device is turned on, when none of them is the call's.
+     */
+    fun activeRecordings(): List<RecordingReport>
+
     /** Whether the provider's answer to the offer has been applied to the connection. */
     fun answerApplied(): Boolean
 
@@ -243,7 +249,7 @@ class VoiceCallControl(
      * phone that reports nothing of the call's recording leaves the gate closed.
      */
     fun recording(reports: List<RecordingReport>) = change { now ->
-        gate.recording(recordings.read(reports, deviceOn), now)
+        gate.recording(if (deviceOn) recordings.read(reports) else VoiceCaptureGate.Recording.UNREPORTED, now)
     }
 
     /** Something about the media changed, such as a track arriving, and the switches are set again. */
@@ -291,6 +297,9 @@ class VoiceCallControl(
         if (endIfExpiredLocked(now)) return
         val live = gate.live(now)
         if (live != deviceOn) {
+            // The recordings the system holds as the device comes on are other applications': the
+            // system reports a change in a list, not the list a call starts with.
+            if (live) recordings.deviceComesOn(platform.activeRecordings())
             // A recorder is heard from afresh each time the device comes on: until the platform
             // reports it started, nothing is being recorded, and a report from before does not count.
             gate.recorder(false, now)
