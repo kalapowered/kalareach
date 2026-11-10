@@ -1895,18 +1895,18 @@ async fn the_console_an_attachment_ran_in_is_given_the_mouse_while_the_applicati
     // the console shows what the application has written.
     probe.waits_for("kr-asker-waiting");
     std::fs::write(gates.path().join("ask"), b"ask").expect("the file the application waits for");
+    probe.waits_for("kr-probe:asked:");
     typist
         .shown("kr-asker-asking", "the application asked for the mouse")
         .await;
-    probe.waits_for("kr-probe:asked:");
     std::fs::write(gates.path().join("stop"), b"stop").expect("the file the application waits for");
+    probe.waits_for("kr-probe:released:");
     typist
         .shown(
             "kr-asker-stopped",
             "the application stopped asking for the mouse",
         )
         .await;
-    probe.waits_for("kr-probe:released:");
     let closed = host.kr(&["close", &session_id.to_string()], &[]).await;
     assert!(
         closed.status.success(),
