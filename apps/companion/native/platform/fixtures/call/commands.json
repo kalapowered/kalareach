@@ -58,5 +58,20 @@
     "command": "callAlive",
     "request": { "call": "c1" },
     "response": { "call": "c1", "capture": "capturing", "microphoneMuted": false, "playing": true }
+  },
+  {
+    "command": "callCaptureProof",
+    "request": { "call": "c1", "barrier": true },
+    "response": { "call": "c1", "state": "capturing", "opened": true, "openings": 1, "breaks": 0, "progressAgeMs": 120, "barrier": 3 }
+  },
+  {
+    "command": "callCaptureProof",
+    "request": { "call": "c1", "barrier": false },
+    "response": { "call": "c1", "state": "muted_by_person", "opened": true, "openings": 2, "breaks": 3, "progressAgeMs": null, "barrier": null }
+  },
+  {
+    "command": "callCaptureProof",
+    "request": { "call": "c2", "barrier": true },
+    "response": { "call": "c2", "state": "unavailable", "opened": false, "openings": 0, "breaks": 0, "progressAgeMs": null, "barrier": 1 }
   }
 ]

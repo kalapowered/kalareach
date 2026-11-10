@@ -108,6 +108,7 @@ fn words(heard: &[Heard]) -> String {
             Heard::Event(CallEvent::Capture { state }) => format!("capture:{state:?}"),
             Heard::Event(CallEvent::Ended) => "ended".to_owned(),
             Heard::Event(CallEvent::Lost) => "lost".to_owned(),
+            Heard::Event(CallEvent::Barrier { token }) => format!("barrier:{token}"),
         })
         .collect::<Vec<_>>()
         .join(",")
@@ -344,6 +345,41 @@ pub async fn bridge_check(
         words(&settled),
     ));
 
+    // The capture proof is native code's own record, and its marker comes in the news behind
+    // everything that was told before it. What the record counts depends on the device, since a
+    // microphone that never runs never opens, so only what must hold either way is checked.
+    let proof = match platform.capture_proof(&call, true).await {
+        Ok(proof) => {
+            let token = proof.barrier;
+            let heard = hear(
+                &mut permitted.events,
+                NEWS_WITHIN,
+                |event| matches!(event, CallEvent::Barrier { token: told } if Some(*told) == token),
+            )
+            .await;
+            let marked = token
+                .is_some_and(|token| heard.contains(&Heard::Event(CallEvent::Barrier { token })));
+            checks.push(Check::found(
+                "the capture proof is of the call and its marker reaches the news",
+                proof.call == call
+                    && marked
+                    && !heard.contains(&Heard::Lost)
+                    && proof.opened == (proof.openings > 0)
+                    && (proof.state != CaptureState::Capturing || proof.opened),
+                format!("{proof:?}, news {}", words(&heard)),
+            ));
+            Some(proof)
+        }
+        Err(failure) => {
+            checks.push(Check::found(
+                "the capture proof is of the call and its marker reaches the news",
+                false,
+                failed(&failure),
+            ));
+            None
+        }
+    };
+
     // A mute is carried out whatever the microphone was doing. What the gate shows of it depends on
     // the device: a microphone that is capturing reads as muted, and one with no recorder running
     // (a call whose connection never carries media) stays unavailable, which says more. So the
@@ -382,6 +418,25 @@ pub async fn bridge_check(
             false,
             failure.message,
         )),
+    }
+
+    // A mute takes capture off. When capture was on at the proof, the record counts that as a
+    // break, and when it never was there is nothing to break.
+    if let Some(before) = proof {
+        match platform.capture_proof(&call, false).await {
+            Ok(after) => checks.push(Check::found(
+                "a mute is a break in the capture record when capture was on",
+                after.state != CaptureState::Capturing
+                    && after.breaks >= before.breaks
+                    && (before.state != CaptureState::Capturing || after.breaks > before.breaks),
+                format!("before {before:?}, after {after:?}"),
+            )),
+            Err(failure) => checks.push(Check::found(
+                "a mute is a break in the capture record when capture was on",
+                false,
+                failed(&failure),
+            )),
+        }
     }
 
     end_and_check(platform, &call, &mut permitted.events, &mut checks).await;
@@ -515,8 +570,19 @@ mod tests {
     use std::sync::Mutex;
 
     use companion_platform::call::{
-        Answered, CallFuture, EventFrame, EventSink, Held, OpenedCall, Permission, event_queue,
+        Answered, CallFuture, CaptureProof, EventFrame, EventSink, Held, OpenedCall, Permission,
+        event_queue,
     };
+
+    /// What a bridge's record of capture holds: whether it is on now, how many times it opened and
+    /// how many times it broke, and how many markers it has put in the news.
+    #[derive(Default)]
+    struct Record {
+        on: bool,
+        openings: u64,
+        breaks: u64,
+        markers: u64,
+    }
 
     /// A bridge that answers as native code does: one call at a time, news in order, an answer
     /// that is not one ends the call. `tell_the_end` is whether it says so when a call ends.
@@ -530,6 +596,7 @@ mod tests {
         recorder_stopped: bool,
         /// Whether the person's mute is held.
         muted: Mutex<bool>,
+        record: Mutex<Record>,
     }
 
     impl Native {
@@ -541,6 +608,7 @@ mod tests {
                 ignores_mutes: false,
                 recorder_stopped: false,
                 muted: Mutex::new(false),
+                record: Mutex::new(Record::default()),
             }
         }
 
@@ -556,6 +624,14 @@ mod tests {
 
         fn is_now(&self, state: CaptureState) {
             *self.capture.lock().unwrap() = state;
+            let mut record = self.record.lock().unwrap();
+            let on = state == CaptureState::Capturing;
+            if on && !record.on {
+                record.openings += 1;
+            } else if !on && record.on {
+                record.breaks += 1;
+            }
+            record.on = on;
         }
 
         fn tell(&self, call: &CallId, event: CallEvent) {
@@ -701,6 +777,36 @@ mod tests {
                 self.held().await
             })
         }
+
+        fn capture_proof<'a>(
+            &'a self,
+            call: &'a CallId,
+            barrier: bool,
+        ) -> CallFuture<'a, CaptureProof> {
+            Box::pin(async move {
+                self.named(call)?;
+                let (openings, breaks, token) = {
+                    let mut record = self.record.lock().unwrap();
+                    let token = barrier.then(|| {
+                        record.markers += 1;
+                        record.markers
+                    });
+                    (record.openings, record.breaks, token)
+                };
+                if let Some(token) = token {
+                    self.tell(call, CallEvent::Barrier { token });
+                }
+                Ok(CaptureProof {
+                    call: call.clone(),
+                    state: *self.capture.lock().unwrap(),
+                    opened: openings > 0,
+                    openings,
+                    breaks,
+                    progress_age_ms: None,
+                    barrier: token,
+                })
+            })
+        }
     }
 
     /// Against a bridge that does what native code does, every check passes: the check reads a
@@ -808,7 +914,10 @@ mod tests {
             .collect();
         assert_eq!(
             failed,
-            vec!["a muted microphone is held and never reported as capturing"]
+            vec![
+                "a muted microphone is held and never reported as capturing",
+                "a mute is a break in the capture record when capture was on"
+            ]
         );
     }
 

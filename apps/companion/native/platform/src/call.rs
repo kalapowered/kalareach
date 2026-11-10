@@ -115,7 +115,10 @@ pub enum Mute {
 }
 
 /// What native code tells Rust of a call.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` never prints what the provider sent: a provider event shows its length only, so a log
+/// of the news holds no spoken text.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CallEvent {
     /// The media connection changed state.
@@ -145,6 +148,39 @@ pub enum CallEvent {
     /// Native code dropped some news here. It is told to the reader as [`Heard::Lost`] and is
     /// never news of its own.
     Lost,
+    /// The marker a capture proof asked for. Native code puts it into the news in the same step
+    /// that reads the proof, behind every item of news the call had before that step, so a reader
+    /// that reaches it has read everything the proof saw. `token` is the one the proof answered.
+    Barrier {
+        /// The marker's number in this call, counted from 1; not the news's own `seq`.
+        token: u64,
+    },
+}
+
+impl std::fmt::Debug for CallEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connection { state } => formatter
+                .debug_struct("Connection")
+                .field("state", state)
+                .finish(),
+            Self::ProviderEvent { bytes } => formatter
+                .debug_struct("ProviderEvent")
+                .field("bytes", &format_args!("{} bytes", bytes.len()))
+                .finish(),
+            Self::Playout => formatter.write_str("Playout"),
+            Self::Capture { state } => formatter
+                .debug_struct("Capture")
+                .field("state", state)
+                .finish(),
+            Self::Ended => formatter.write_str("Ended"),
+            Self::Lost => formatter.write_str("Lost"),
+            Self::Barrier { token } => formatter
+                .debug_struct("Barrier")
+                .field("token", token)
+                .finish(),
+        }
+    }
 }
 
 /// One item of news as it crosses from native code, with the call it is about and its number.
@@ -530,6 +566,36 @@ pub struct Held {
     pub media: Option<Media>,
 }
 
+/// What native code's own record of the call's capture shows now.
+///
+/// It is answered from the record native code keeps under the capture gate's lock for the call's
+/// life, and not from news: a state change can be told after the moment it happened, and a gap in
+/// what the recorder delivered is never news at all. A caller that asks whether capture was
+/// unbroken reads this and nothing else.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureProof {
+    /// The call the record is of.
+    pub call: CallId,
+    /// What the microphone is doing now, as the gate shows it.
+    pub state: CaptureState,
+    /// Whether capture has been on at some time in this call. True from the first opening to the
+    /// end of the call, whatever the microphone is doing now.
+    pub opened: bool,
+    /// How many times capture went from off to on, the first opening included.
+    pub openings: u64,
+    /// How many times capture was broken: it went from on to off after an opening, or what the
+    /// recorder delivered showed a gap while capture was on, or there was no figure to read the
+    /// recorder's progress by while capture was on, or the system silenced the recording.
+    pub breaks: u64,
+    /// How long ago the freshest sign that audio is being recorded was seen, in milliseconds on
+    /// native code's monotonic clock. Absent when none has been seen since capture last opened.
+    pub progress_age_ms: Option<u64>,
+    /// The number of the [`CallEvent::Barrier`] native code put into the news with this answer.
+    /// Absent when none was asked for.
+    pub barrier: Option<u64>,
+}
+
 /// What a call's media has carried, from the connection's statistics. A figure native code could
 /// not read is absent.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -589,6 +655,15 @@ pub trait CallPlatform: Send + Sync {
     /// says the call has ended, or that no call by that name is held, is also the answer to
     /// whether the call is still there.
     fn alive<'a>(&'a self, call: &'a CallId) -> CallFuture<'a, Held>;
+
+    /// Asks native code what its record of the call's capture shows now.
+    ///
+    /// With `barrier`, native code also puts a [`CallEvent::Barrier`] into the call's news in the
+    /// same step that reads the record, behind every item of news the call had before that step,
+    /// and says its number in the answer. A reader that has read the marker has read all the news
+    /// the record saw, a loss included.
+    fn capture_proof<'a>(&'a self, call: &'a CallId, barrier: bool)
+    -> CallFuture<'a, CaptureProof>;
 }
 
 /// The shapes of the commands Rust sends to native code and of what native code answers, which
@@ -667,6 +742,14 @@ mod wire {
         pub(crate) muted: bool,
     }
 
+    /// The arguments of the command that asks for the capture proof.
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub(crate) struct CaptureProofRequest<'a> {
+        pub(crate) call: &'a CallId,
+        pub(crate) barrier: bool,
+    }
+
     /// What a command with nothing to report answers.
     #[derive(Deserialize)]
     pub(crate) struct Nothing {}
@@ -691,8 +774,9 @@ mod native {
 
     use super::{
         AcceptRequest, AcceptResponse, Answered, CallFailure, CallFuture, CallId, CallPlatform,
-        CallRequest, EventSink, FailureKind, Held, Mute, MuteRequest, Nothing, OfferResponse,
-        OpenRequest, OpenResponse, OpenedCall, PermitRequest, PermitResponse, event_queue,
+        CallRequest, CaptureProof, CaptureProofRequest, EventSink, FailureKind, Held, Mute,
+        MuteRequest, Nothing, OfferResponse, OpenRequest, OpenResponse, OpenedCall, PermitRequest,
+        PermitResponse, event_queue,
     };
 
     /// What native code gives back for one command.
@@ -993,6 +1077,21 @@ mod native {
                     .await
             })
         }
+
+        fn capture_proof<'a>(
+            &'a self,
+            call: &'a CallId,
+            barrier: bool,
+        ) -> CallFuture<'a, CaptureProof> {
+            Box::pin(async move {
+                self.command(
+                    "callCaptureProof",
+                    Wait::Quick,
+                    CaptureProofRequest { call, barrier },
+                )
+                .await
+            })
+        }
     }
 
     /// The platform plugin's native half, as the way commands reach native code on a phone.
@@ -1188,6 +1287,47 @@ mod tests {
         let held: Held = serde_json::from_value(alive.response).expect("a state");
         assert_eq!(held.call, Some(CallId("c1".to_owned())));
         assert_eq!(held.capture, CaptureState::Capturing);
+
+        for (nth, barrier) in [true, false, true].into_iter().enumerate() {
+            let proof = of("callCaptureProof", nth);
+            let asked = if nth == 2 {
+                CallId("c2".to_owned())
+            } else {
+                call.clone()
+            };
+            assert_eq!(
+                json(&CaptureProofRequest {
+                    call: &asked,
+                    barrier
+                }),
+                proof.request
+            );
+        }
+        let shown: CaptureProof =
+            serde_json::from_value(of("callCaptureProof", 0).response).expect("a proof");
+        assert_eq!(
+            shown,
+            CaptureProof {
+                call: call.clone(),
+                state: CaptureState::Capturing,
+                opened: true,
+                openings: 1,
+                breaks: 0,
+                progress_age_ms: Some(120),
+                barrier: Some(3),
+            }
+        );
+        // A figure native code has not seen is absent, and is never read as zero.
+        let broken: CaptureProof =
+            serde_json::from_value(of("callCaptureProof", 1).response).expect("a proof");
+        assert_eq!(broken.state, CaptureState::MutedByPerson);
+        assert_eq!((broken.openings, broken.breaks), (2, 3));
+        assert_eq!((broken.progress_age_ms, broken.barrier), (None, None));
+        let never: CaptureProof =
+            serde_json::from_value(of("callCaptureProof", 2).response).expect("a proof");
+        assert!(!never.opened);
+        assert_eq!((never.openings, never.breaks), (0, 0));
+        assert_eq!(never.barrier, Some(1));
     }
 
     /// Native code that is never asked to do anything, or never answers: the commands a test of
@@ -1249,6 +1389,7 @@ mod tests {
             calls.stop(&call).await.err(),
             calls.held().await.err(),
             calls.alive(&call).await.err(),
+            calls.capture_proof(&call, true).await.err(),
         ] {
             let failure = failure.expect("the command ends at its deadline");
             assert_eq!(failure.kind, FailureKind::Unavailable);
@@ -1530,7 +1671,7 @@ mod tests {
         }
         let news: Vec<News> =
             serde_json::from_str(include_str!("../fixtures/call/events.json")).expect("the news");
-        assert_eq!(news.len(), 17);
+        assert_eq!(news.len(), 18);
         for each in news {
             let frame: EventFrame = serde_json::from_value(each.frame.clone())
                 .unwrap_or_else(|error| panic!("{}: {error}", each.name));
@@ -1596,6 +1737,7 @@ mod tests {
             },
             "playout" => CallEvent::Playout,
             "ended" => CallEvent::Ended,
+            "barrier" => CallEvent::Barrier { token: 1 },
             other => panic!("the fixture names news of a kind {other}"),
         }
     }
@@ -1609,6 +1751,7 @@ mod tests {
             Some(Entry::Event(CallEvent::Capture { .. })) => "capture",
             Some(Entry::Event(CallEvent::Playout)) => "playout",
             Some(Entry::Event(CallEvent::Ended)) => "ended",
+            Some(Entry::Event(CallEvent::Barrier { .. })) => "barrier",
             Some(Entry::Event(CallEvent::Lost)) => panic!("a loss is never queued as news"),
         }
     }
@@ -1780,6 +1923,53 @@ mod tests {
         sink.deliver_json("not json");
 
         assert_eq!(reader.await.expect("the reader ends"), Some(Heard::Lost));
+    }
+
+    /// A log of the news never holds what the provider said: a provider event shows how long it
+    /// was and nothing of its text, in the news itself and in the frame that carries it.
+    #[test]
+    fn the_news_never_prints_what_the_provider_sent() {
+        let spoken = br#"{"type":"session.input_transcript.delta","delta":"do not close it"}"#;
+        let event = CallEvent::ProviderEvent {
+            bytes: spoken.to_vec(),
+        };
+        let encoded = base64::engine::general_purpose::STANDARD.encode(spoken);
+        let shown = [
+            format!("{event:?}"),
+            format!("{:?}", Heard::Event(event.clone())),
+            format!("{:?}", frame(&CallId("c1".to_owned()), 7, event.clone())),
+            format!("{:?}", Entry::Event(event)),
+        ];
+        for text in &shown {
+            assert!(text.contains(&format!("{} bytes", spoken.len())), "{text}");
+            assert!(!text.contains("do not"), "{text}");
+            assert!(!text.contains("delta"), "{text}");
+            assert!(!text.contains(&encoded), "{text}");
+            assert!(!text.contains("123, 34"), "no byte list: {text}");
+        }
+    }
+
+    /// A barrier is read after every item of news native code had before it, and news that was
+    /// lost before it, a skipped number or a queue that was full, is read before it.
+    #[tokio::test]
+    async fn a_barrier_is_read_after_everything_that_came_before_it() {
+        let call = CallId("c1".to_owned());
+        let (sink, mut events) = event_queue(call.clone());
+        let provider = || CallEvent::ProviderEvent { bytes: vec![1] };
+        sink.deliver(frame(&call, 1, provider()));
+        sink.deliver(frame(&call, 2, CallEvent::Playout));
+        // Number 3 never arrives.
+        sink.deliver(frame(&call, 4, CallEvent::Barrier { token: 9 }));
+        drop(sink);
+
+        assert_eq!(events.recv().await, Some(Heard::Event(provider())));
+        assert_eq!(events.recv().await, Some(Heard::Event(CallEvent::Playout)));
+        assert_eq!(events.recv().await, Some(Heard::Lost));
+        assert_eq!(
+            events.recv().await,
+            Some(Heard::Event(CallEvent::Barrier { token: 9 }))
+        );
+        assert_eq!(events.recv().await, None);
     }
 
     /// News native code says it lost is lost to the reader, in its place.

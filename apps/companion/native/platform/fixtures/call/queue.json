@@ -58,5 +58,23 @@
     "limit": 3,
     "ops": ["push ended", "push provider", "push capture", "pop", "pop", "pop"],
     "results": ["ended", "none", "none"]
+  },
+  {
+    "name": "a barrier follows the news that was queued before it and a loss before it comes out first",
+    "limit": 2,
+    "ops": ["push provider", "push provider", "push barrier", "pop", "pop", "pop", "pop"],
+    "results": ["lost", "provider", "barrier", "none"]
+  },
+  {
+    "name": "a barrier behind queued news comes out after all of it",
+    "limit": 4,
+    "ops": ["push provider", "push capture", "push barrier", "pop", "pop", "pop", "pop"],
+    "results": ["provider", "capture", "barrier", "none"]
+  },
+  {
+    "name": "with no provider event queued a barrier over the limit takes the place of the oldest news",
+    "limit": 2,
+    "ops": ["push connection", "push capture", "push barrier", "pop", "pop", "pop", "pop"],
+    "results": ["lost", "capture", "barrier", "none"]
   }
 ]

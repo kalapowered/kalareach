@@ -13,5 +13,9 @@
   { "name": "an answer that is missing", "command": "callAccept", "request": { "call": "c1" } },
   { "name": "an offer whose call is a number", "command": "callOffer", "request": { "call": 1 } },
   { "name": "an offer that names no call", "command": "callOffer", "request": {} },
-  { "name": "a stop that names no call", "command": "callStop", "request": {} }
+  { "name": "a stop that names no call", "command": "callStop", "request": {} },
+  { "name": "a proof whose barrier flag is text", "command": "callCaptureProof", "request": { "call": "c1", "barrier": "true" } },
+  { "name": "a proof whose barrier flag is a number", "command": "callCaptureProof", "request": { "call": "c1", "barrier": 1 } },
+  { "name": "a proof with no barrier flag", "command": "callCaptureProof", "request": { "call": "c1" } },
+  { "name": "a proof that names no call", "command": "callCaptureProof", "request": { "barrier": true } }
 ]

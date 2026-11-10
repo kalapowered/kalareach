@@ -11,7 +11,7 @@
 use std::sync::{Arc, Mutex};
 
 use companion_platform::call::{
-    Answered, CallEvent, CallFailure, CallFuture, CallId, CallPlatform, CaptureState,
+    Answered, CallEvent, CallFailure, CallFuture, CallId, CallPlatform, CaptureProof, CaptureState,
     ConnectionState, EventFrame, EventSink, FailureKind, Held, Media, Mute, OpenedCall, Permission,
     event_queue,
 };
@@ -31,6 +31,9 @@ struct Inner {
     answer: Option<String>,
     permitted_for: Option<(String, u64)>,
     capture: CaptureState,
+    /// What native code's record of capture holds: it counts what the gate did, as the real record
+    /// does, and a test adds what only a recorder can show (a gap, an age).
+    record: Record,
     muted: bool,
     playing: bool,
     /// What native code's statistics say the media carried, when a test gives it.
@@ -51,6 +54,37 @@ struct Inner {
     alive_refusal: Option<FailureKind>,
     /// The steps a test holds: a held step has been given and does not return until released.
     held_steps: Vec<&'static str>,
+    /// Whether the provider's answer, once applied, turns discontinuous transmission on.
+    answer_uses_dtx: bool,
+}
+
+/// What native code's record of the call's capture holds, as the capture proof answers it.
+#[derive(Default)]
+struct Record {
+    /// Whether capture is on now, by the news told.
+    on: bool,
+    openings: u64,
+    breaks: u64,
+    /// How long ago native code saw the recorder deliver, when it has.
+    progress_age_ms: Option<u64>,
+    /// How many markers it has put in the news.
+    markers: u64,
+}
+
+impl Inner {
+    /// Capture is `state` now. What the gate does when it goes on or off is counted as it is on a
+    /// phone: an opening when it goes on, a break when it goes off after an opening.
+    fn capture_is(&mut self, state: CaptureState) {
+        self.capture = state;
+        let on = state == CaptureState::Capturing;
+        if on && !self.record.on {
+            self.record.openings += 1;
+        } else if !on && self.record.on {
+            self.record.breaks += 1;
+            self.record.progress_age_ms = None;
+        }
+        self.record.on = on;
+    }
 }
 
 /// Native code, as a test describes it.
@@ -70,6 +104,7 @@ impl ScriptedCalls {
                 answer: None,
                 permitted_for: None,
                 capture: CaptureState::Idle,
+                record: Record::default(),
                 muted: false,
                 playing: true,
                 media: None,
@@ -82,6 +117,7 @@ impl ScriptedCalls {
                 tells_the_end: true,
                 alive_refusal: None,
                 held_steps: Vec::new(),
+                answer_uses_dtx: false,
             }),
             freed: tokio::sync::Notify::new(),
         })
@@ -120,6 +156,11 @@ impl ScriptedCalls {
         self.inner().held.is_some()
     }
 
+    /// The call it holds, when it holds one.
+    pub fn held_call(&self) -> Option<CallId> {
+        self.inner().held.as_ref().map(|(call, ..)| call.clone())
+    }
+
     /// The person has not allowed the microphone: an open is refused.
     pub fn refuse_the_microphone(&self) {
         self.inner().microphone_refused = true;
@@ -150,7 +191,7 @@ impl ScriptedCalls {
         self.inner().held_cannot_be_read = true;
     }
 
-    /// Holds `step` (`open`, `offer`, `accept`, `permit`, `held` or `stop`): the command is given and counted, and
+    /// Holds `step` (`open`, `offer`, `accept`, `permit`, `held`, `capture_proof` or `stop`): the command is given and counted, and
     /// does not return until [`Self::release`] lets it.
     pub fn hold(&self, step: &'static str) {
         self.inner().held_steps.push(step);
@@ -194,13 +235,37 @@ impl ScriptedCalls {
         self.inner().alive_refusal = Some(kind);
     }
 
+    /// The provider's answer, once applied, turns discontinuous transmission on (or off again).
+    pub fn answer_with_dtx(&self, uses_dtx: bool) {
+        self.inner().answer_uses_dtx = uses_dtx;
+    }
+
+    /// The recorder showed a gap while capture was on: the record counts one more break, as the
+    /// phone's does for a gap in what the recorder delivered, a reading with no figure or a
+    /// recording the system silenced.
+    pub fn show_a_gap_in_progress(&self) {
+        self.inner().record.breaks += 1;
+    }
+
+    /// The freshest sign that the recorder delivers is this old when the proof is read; none when
+    /// it is `None`.
+    pub fn show_progress_age(&self, age_ms: Option<u64>) {
+        self.inner().record.progress_age_ms = age_ms;
+    }
+
+    /// What native code's record of capture holds: openings and breaks.
+    pub fn record(&self) -> (u64, u64) {
+        let inner = self.inner();
+        (inner.record.openings, inner.record.breaks)
+    }
+
     /// Tells news the way the system does: the notification's stop, a failed connection. News of
     /// capture changes what native code then says it holds, as it does on a phone, so a sign of
     /// life read after the news agrees with it.
     pub fn tell(&self, event: CallEvent) {
         let mut inner = self.inner();
         if let CallEvent::Capture { state } = &event {
-            inner.capture = *state;
+            inner.capture_is(*state);
         }
         if let Some((call, sink, seq)) = inner.held.as_mut() {
             *seq += 1;
@@ -225,11 +290,11 @@ impl ScriptedCalls {
             let mut inner = self.inner();
             inner.muted = muted;
             inner.commands.push(format!("remote-mute:{muted}"));
-            inner.capture = if muted {
+            inner.capture_is(if muted {
                 CaptureState::MutedByPerson
             } else {
                 CaptureState::Capturing
-            };
+            });
             inner.capture
         };
         self.tell(CallEvent::Capture { state });
@@ -268,7 +333,7 @@ impl ScriptedCalls {
                 });
             }
         }
-        inner.capture = CaptureState::Idle;
+        inner.capture_is(CaptureState::Idle);
     }
 
     fn named(&self, call: &CallId) -> Result<(), CallFailure> {
@@ -341,8 +406,11 @@ impl CallPlatform for ScriptedCalls {
             self.inner().commands.push("accept".to_owned());
             self.gate("accept").await;
             self.named(call)?;
-            self.inner().answer = Some(answer.to_owned());
-            Ok(Answered { uses_dtx: false })
+            let mut inner = self.inner();
+            inner.answer = Some(answer.to_owned());
+            Ok(Answered {
+                uses_dtx: inner.answer_uses_dtx,
+            })
         })
     }
 
@@ -363,7 +431,7 @@ impl CallPlatform for ScriptedCalls {
                     return Ok(false);
                 }
                 inner.permitted_for = Some((voice_session_id.to_owned(), closes_at_epoch_ms));
-                inner.capture = CaptureState::Capturing;
+                inner.capture_is(CaptureState::Capturing);
             }
             self.tell(CallEvent::Capture {
                 state: CaptureState::Capturing,
@@ -380,11 +448,11 @@ impl CallPlatform for ScriptedCalls {
             match what {
                 Mute::Microphone => {
                     inner.muted = muted;
-                    inner.capture = if muted {
+                    inner.capture_is(if muted {
                         CaptureState::MutedByPerson
                     } else {
                         CaptureState::Capturing
-                    };
+                    });
                 }
                 Mute::Playback => inner.playing = !muted,
             }
@@ -402,7 +470,7 @@ impl CallPlatform for ScriptedCalls {
             if self.inner().stop_answers_ended {
                 let mut inner = self.inner();
                 inner.held = None;
-                inner.capture = CaptureState::Idle;
+                inner.capture_is(CaptureState::Idle);
                 return Err(CallFailure::new(FailureKind::Ended, "that call has ended"));
             }
             self.named(call)?;
@@ -412,7 +480,7 @@ impl CallPlatform for ScriptedCalls {
             }
             let mut inner = self.inner();
             inner.held = None;
-            inner.capture = CaptureState::Idle;
+            inner.capture_is(CaptureState::Idle);
             Ok(())
         })
     }
@@ -439,6 +507,44 @@ impl CallPlatform for ScriptedCalls {
             }
             self.named(call)?;
             Ok(self.state_of())
+        })
+    }
+
+    fn capture_proof<'a>(
+        &'a self,
+        call: &'a CallId,
+        barrier: bool,
+    ) -> CallFuture<'a, CaptureProof> {
+        Box::pin(async move {
+            self.named(call)?;
+            self.inner().commands.push(if barrier {
+                "capture_proof:barrier".to_owned()
+            } else {
+                "capture_proof".to_owned()
+            });
+            self.gate("capture_proof").await;
+            self.named(call)?;
+            // The record is read and the marker put in the news in one step, as on a phone.
+            let token = {
+                let mut inner = self.inner();
+                barrier.then(|| {
+                    inner.record.markers += 1;
+                    inner.record.markers
+                })
+            };
+            if let Some(token) = token {
+                self.tell(CallEvent::Barrier { token });
+            }
+            let inner = self.inner();
+            Ok(CaptureProof {
+                call: call.clone(),
+                state: inner.capture,
+                opened: inner.record.openings > 0,
+                openings: inner.record.openings,
+                breaks: inner.record.breaks,
+                progress_age_ms: inner.record.progress_age_ms,
+                barrier: token,
+            })
         })
     }
 }

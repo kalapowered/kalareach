@@ -63,7 +63,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use companion_platform::call::{CallEvent, CaptureState, FailureKind};
+use companion_platform::call::{CallEvent, CallPlatform as _, CaptureState, FailureKind};
 use companion_tauri::account::carrier::{Boxed, Carrier, Ending, Plan, Unavailable};
 use companion_tauri::account::{Account, AccountSlot};
 use companion_tauri::voice::{Calls, Kept, Service, Timings, managed_brokers};
@@ -1646,6 +1646,72 @@ async fn the_systems_changes_to_capture_are_told_and_do_not_end_the_call() {
         );
         assert_eq!(told["ended"], serde_json::Value::Null, "{told}");
     }
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// The marker a capture proof puts in the news is no state of the call: the owner reads it and
+/// neither shows nor ends anything for it, and the news behind it is handled in order. The proof
+/// itself is native code's record, answered with the marker's number.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_barrier_in_the_news_changes_nothing_the_owner_shows() {
+    let timings = Timings {
+        tick: Duration::from_secs(3600),
+        ..quick()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    scene.start().await;
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    let call = scene.platform.held_call().expect("a call is held");
+    let before = scene
+        .platform
+        .capture_proof(&call, false)
+        .await
+        .expect("a proof");
+    assert_eq!(before.barrier, None);
+    assert_eq!((before.openings, before.breaks), (1, 0), "{before:?}");
+
+    let proof = scene
+        .platform
+        .capture_proof(&call, true)
+        .await
+        .expect("a proof");
+    assert_eq!(proof.call, call);
+    assert_eq!(proof.barrier, Some(1));
+    scene.platform.show_a_gap_in_progress();
+    let broken = scene
+        .platform
+        .capture_proof(&call, true)
+        .await
+        .expect("a proof");
+    assert_eq!(broken.barrier, Some(2));
+    assert_eq!(broken.breaks, 1, "{broken:?}");
+
+    // The owner handles the news in order, so once this state is read both markers before it were.
+    scene.platform.tell(CallEvent::Capture {
+        state: CaptureState::Interrupted,
+    });
+    let told = scene
+        .state_where("the news after the markers", |view| {
+            view["capture"] == "interrupted"
+        })
+        .await;
+    assert_eq!(told["running"], true, "{told}");
+    assert_eq!(told["ended"], serde_json::Value::Null, "{told}");
+    let after = scene
+        .platform
+        .capture_proof(&call, false)
+        .await
+        .expect("a proof");
+    assert_eq!(after.state, CaptureState::Interrupted);
+    assert_eq!(
+        after.breaks, 2,
+        "an interruption after a gap is a second break: {after:?}"
+    );
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
     scene.stop_host().await;
 }

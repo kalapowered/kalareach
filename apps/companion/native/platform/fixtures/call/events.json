@@ -148,5 +148,14 @@
       "seq": 17,
       "kind": "ended"
     }
+  },
+  {
+    "name": "a barrier",
+    "frame": {
+      "call": "c1",
+      "seq": 18,
+      "kind": "barrier",
+      "token": 3
+    }
   }
 ]
