@@ -1448,7 +1448,9 @@ async fn a_change_set_action_whose_record_cannot_be_read_by_the_service_is_told_
 /// action is not known only under the authority it arrived under, asked with that answer in hand.
 /// The other copy makes its claim inside the apply's own claim write, which a trigger of the store
 /// arranges, so the door's look cannot have found it. The control: with nothing owed the apply is
-/// told so and moves nothing. A fence that lands once the apply has the answer stops it.
+/// told so and moves nothing. A fence that lands once the apply has the answer stops it: the caller
+/// is told that what became of the action is not shown, which is not the claim's word and not the
+/// fence's, the refusal of the authority being a definite word.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_apply_that_loses_its_claim_to_another_copy_is_told_so_only_under_its_authority() {
     let host = host().await;
@@ -1526,10 +1528,14 @@ async fn an_apply_that_loses_its_claim_to_another_copy_is_told_so_only_under_its
     let outcome = late.await.expect("the apply finishes");
     host.controller.hold_fence(false);
     let refused = failure(outcome.expect("the call reaches the daemon"));
-    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert_eq!(refused.code, ErrorCode::OutcomeUnknown, "{refused:?}");
+    assert_ne!(
+        refused.message, told.message,
+        "the caller is not told what the claim said: {refused:?}"
+    );
     assert!(
-        refused.message.contains("fence"),
-        "the refusal is the fence this host owes: {refused:?}"
+        !refused.message.contains("fence"),
+        "the caller is not told the authority is gone, a definite word: {refused:?}"
     );
     assert_eq!(
         git_output(&path, &["rev-parse", "refs/heads/main"]),
