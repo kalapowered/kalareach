@@ -898,7 +898,9 @@ const DELEGATION_CAUSES: Readonly<Record<string, string>> = {
   challenge_mismatch:
     'What the computer asked you to confirm was not what was said, so you were not asked. Say it again.',
   confirmation_expired: "This phone's clock says the confirmation ran out. Say it again.",
-  confirmation_not_taken: 'The computer asked for a confirmation again instead of taking yours.'
+  confirmation_not_taken: 'The computer asked for a confirmation again instead of taking yours.',
+  session_not_named: 'This phone could not name the session to you in time, so you were not asked. Say it again.',
+  call_ended: 'The call ended before you confirmed it.'
 }
 
 /**

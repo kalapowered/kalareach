@@ -355,7 +355,11 @@ export function tauriPort(): HostPort {
     voiceAllow: (request, subject) =>
       mutate(
         'voice_allow',
-        { session_ids: request.sessionIds, actions: request.actions },
+        {
+          session_ids: request.sessionIds,
+          actions: request.actions,
+          environment_id: request.environmentId
+        },
         subject
       ),
     voiceStop: (voiceSessionId, subject) =>

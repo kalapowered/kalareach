@@ -990,9 +990,7 @@ export function VoiceRoute({
       {choice !== null && call === null && !setUp ? (
         <VoiceGrantEntry
           port={port}
-          sessions={choice.sessions}
           sessionNames={choice.sessionNames}
-          standing={choice.actions}
           onChanged={refreshChoice}
         />
       ) : null}
