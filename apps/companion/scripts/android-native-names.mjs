@@ -150,20 +150,20 @@ function exportedSymbols(bytes) {
 }
 
 /**
- * The class and method a `Java_` symbol is bound to, and the mangled argument list that makes it the
- * long name of one overload (null for the short name), or null when the symbol is no native
- * method's.
+ * The class a `Java_` symbol is for, or null when the symbol is no native method's.
  *
  * The runtime's mangling writes the package and class separators as `_`, a literal underscore as
  * `_1`, `;` as `_2`, `[` as `_3` and any other character as `_0` and four hex digits; an overloaded
- * method continues with `__` and its mangled argument list. A method is bound to the short name when
- * a library exports it, and to the long name otherwise.
+ * method continues with `__` and its mangled argument list.
+ *
+ * This reads a symbol as leniently as it can, in any spelling of an escape, because all it says is
+ * which class the library exports a native method for. Whether the symbol is the one the runtime
+ * looks for is a separate question, answered by comparing it exactly with `nativeSymbols`.
  */
-export function nativeMethodOf(symbol) {
+export function nativeClassOf(symbol) {
   if (!symbol.startsWith('Java_')) return null
   const mangled = symbol.slice(5)
   const parts = ['']
-  let signature = null
   for (let at = 0; at < mangled.length; at += 1) {
     const char = mangled[at]
     if (char !== '_') {
@@ -178,23 +178,23 @@ export function nativeMethodOf(symbol) {
       parts[parts.length - 1] += String.fromCharCode(parseInt(mangled.slice(at + 2, at + 6), 16))
       at += 5
     } else if (next === '_' && !/[0-3]/.test(mangled[at + 2] ?? '')) {
-      signature = mangled.slice(at + 2)
       break
     } else parts.push('')
   }
   if (parts.length < 2 || parts.some((part) => part === '')) return null
-  return { cls: parts.slice(0, -1).join('.'), method: parts[parts.length - 1], signature }
+  return parts.slice(0, -1).join('.')
 }
 
 /**
- * The runtime's mangling of the argument types of a method, as the tail of a long `Java_` name
- * (`ILjava/lang/String;` is `ILjava_lang_String_2`). The runtime looks a symbol up by its exact
- * spelling, so the case of a class name and of a hex digit counts: `call(URL)` and `call(Url)` have
- * two names.
+ * The runtime's mangling of a name or of the argument types of a method (`ILjava/lang/String;` is
+ * `ILjava_lang_String_2`): each UTF-16 unit that is not an ASCII letter or digit is written as
+ * `_0` and four hex digits in lower case, with `/` as `_`, `_` as `_1`, `;` as `_2` and `[` as `_3`.
  */
-export function mangledArguments(descriptors) {
+export function jniMangled(text) {
   let mangled = ''
-  for (const char of descriptors) {
+  // By UTF-16 unit, as the runtime does: a character outside the basic plane is two of them.
+  for (let at = 0; at < text.length; at += 1) {
+    const char = text[at]
     if (char === '/') mangled += '_'
     else if (char === '_') mangled += '_1'
     else if (char === ';') mangled += '_2'
@@ -205,12 +205,25 @@ export function mangledArguments(descriptors) {
   return mangled
 }
 
-/** The native methods a library is bound to by name: each exported `Java_` symbol, decoded. */
+/**
+ * The two symbols the runtime looks a native method up by, in this order: the short name, and the
+ * long name that ends in the method's mangled argument types. It looks each up by its exact
+ * spelling, so the case of a class name and of a hex digit counts: `call(URL)` and `call(Url)` have
+ * two names, and a symbol with `_000E9` in it is not the one that `_000e9` is.
+ *
+ * `arguments_` is the mangled argument list (`jniMangled` of the descriptors).
+ */
+export function nativeSymbols(cls, method, arguments_) {
+  const short = `Java_${jniMangled(cls.replaceAll('.', '/'))}_${jniMangled(method)}`
+  return [short, `${short}__${arguments_}`]
+}
+
+/** The exported `Java_` symbols of a library and the class each one is for. */
 export function libraryNatives(bytes) {
   const natives = []
   for (const symbol of exportedSymbols(bytes)) {
-    const bound = nativeMethodOf(symbol)
-    if (bound) natives.push({ symbol, ...bound })
+    const cls = nativeClassOf(symbol)
+    if (cls !== null) natives.push({ symbol, cls })
   }
   return natives
 }

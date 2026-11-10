@@ -36,7 +36,7 @@ import {
 import { dirname, extname, join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-import { libraryClassNames, libraryNatives, mangledArguments } from './android-native-names.mjs'
+import { jniMangled, libraryClassNames, libraryNatives, nativeSymbols } from './android-native-names.mjs'
 
 /**
  * The classes a packaged application must define, by these exact names.
@@ -331,7 +331,7 @@ export function definedNatives(dex) {
         if ((flags & ACC_NATIVE) !== 0) {
           natives.push({
             name: stringAt(dex, dex.readUInt32LE(methodIdsAt + methodIndex * 8 + 4)),
-            signature: mangledArguments(argumentsOf(methodIndex))
+            signature: jniMangled(argumentsOf(methodIndex))
           })
         }
       }
@@ -393,18 +393,22 @@ function and(items) {
  * Answers the libraries read, each with the number of classes and native methods it names; how many
  * different classes they name together; how many native methods the check asked a symbol for; the
  * classes that declare natives and were not asked; and the problems. One is a class a library names
- * that no dex file of the application defines under that name. The other is a native method of a
- * class the libraries of an ABI are bound to, which none of them exports: the runtime binds a native
- * method to the symbol its class and name make, the short one or, for an overload, the long one that
- * ends in its mangled argument types, so a method the minifier renamed has no symbol, and the call
- * that reaches it throws.
+ * that no dex file of the application defines under that name. Another is a native method of a
+ * class the libraries are bound to, which the libraries of an ABI do not export: the runtime binds a
+ * native method to the symbol its class and name make, the short one or, for an overload, the long
+ * one that ends in its mangled argument types, and looks it up by that exact spelling, so a method
+ * the minifier renamed has no symbol, and the call that reaches it throws. The last is a library
+ * that one ABI carries and another lacks.
  *
- * A class is one the libraries are bound to when they export a native method for it. A class that
- * declares natives and has no export, such as the encoder of a codec the library was built without,
- * is not asked for symbols, and neither is a library that registers its methods and exports none.
- * A class some of whose natives a library exports and the rest of which it registers is asked for
- * all of them, and fails: nothing here overrides that, so such a library would need the check told
- * about it.
+ * A library is built once for each ABI, so a class is bound by a library, and not by an ABI: when
+ * any ABI's copy of a library exports a native method for a class, the copy in every ABI that
+ * carries the library is asked for all of the class's natives, whatever else that ABI exports.
+ *
+ * A class that declares natives and that no library exports a native for, such as the encoder of a
+ * codec the library was built without, is not asked for symbols, in any ABI, and neither is a
+ * library that registers its methods and exports none. A class some of whose natives a library
+ * exports and the rest of which it registers is asked for all of them, and fails: nothing here
+ * overrides that, so such a library would need the check told about it.
  */
 export function nativeNames(path) {
   const kind = extname(path).toLowerCase()
@@ -423,8 +427,12 @@ export function nativeNames(path) {
     const libraries = []
     const named = new Map()
     const everyName = new Set()
-    const exported = new Map()
-    const bound = new Map()
+    // Per ABI: the symbols its libraries export, as spelled, and the libraries it carries.
+    const abis = new Map()
+    // Per library file name: the ABIs that carry it. And per class: the libraries that export a
+    // native method for it, in any ABI.
+    const carriedBy = new Map()
+    const boundBy = new Map()
     for (const member of files.sort((a, b) => (a.name < b.name ? -1 : 1))) {
       let classes
       let natives
@@ -440,35 +448,45 @@ export function nativeNames(path) {
         everyName.add(name)
         if (!declared.has(name)) named.set(name, new Set([...(named.get(name) ?? []), member.name]))
       }
-      const abi = member.name.split('/').at(kind === '.aab' ? 2 : 1)
-      const symbols = exported.get(abi) ?? new Set()
-      const classesBound = bound.get(abi) ?? new Set()
-      for (const { cls, method, signature } of natives) {
-        symbols.add(signature === null ? `${cls}.${method}` : `${cls}.${method}:${signature}`)
-        classesBound.add(cls)
+      const parts = member.name.split('/')
+      const abi = parts.at(kind === '.aab' ? 2 : 1)
+      const file = parts.at(-1)
+      const there = abis.get(abi) ?? { symbols: new Set(), files: new Set() }
+      there.files.add(file)
+      carriedBy.set(file, new Set([...(carriedBy.get(file) ?? []), abi]))
+      for (const { symbol, cls } of natives) {
+        there.symbols.add(symbol)
+        boundBy.set(cls, new Set([...(boundBy.get(cls) ?? []), file]))
       }
-      exported.set(abi, symbols)
-      bound.set(abi, classesBound)
+      abis.set(abi, there)
     }
     const unbound = new Map()
     const asked = new Set()
     const unasked = []
     for (const [name, natives] of declared) {
-      if (natives.length > 0 && ![...bound.values()].some((classes) => classes.has(name))) {
-        unasked.push(name)
-      }
+      const libraryFiles = boundBy.get(name)
+      if (natives.length > 0 && !libraryFiles) unasked.push(name)
+      if (!libraryFiles) continue
       for (const { name: method, signature } of natives) {
         // An overload is told apart by its arguments, so a class with two of a name says which.
         const overloaded = natives.filter((each) => each.name === method).length > 1
         const label = `${name}.${method}${overloaded ? ` (arguments ${signature || 'none'})` : ''}`
-        for (const [abi, symbols] of exported) {
-          if (!bound.get(abi).has(name)) continue
+        const wanted = nativeSymbols(name, method, signature)
+        for (const [abi, there] of abis) {
+          if (![...libraryFiles].some((file) => there.files.has(file))) continue
           asked.add(label)
-          if (symbols.has(`${name}.${method}`) || symbols.has(`${name}.${method}:${signature}`)) continue
+          if (wanted.some((symbol) => there.symbols.has(symbol))) continue
           unbound.set(label, new Set([...(unbound.get(label) ?? []), abi]))
         }
       }
     }
+    const everyAbi = [...abis.keys()].sort()
+    const lost = [...carriedBy]
+      .filter(([, carrying]) => carrying.size < everyAbi.length)
+      .map(([file, carrying]) => [
+        file,
+        `${and(everyAbi.filter((abi) => carrying.has(abi)))}, not in ${and(everyAbi.filter((abi) => !carrying.has(abi)))}`
+      ])
     const byName = ([a], [b]) => (a < b ? -1 : 1)
     const problems = [
       ...[...named]
@@ -476,7 +494,8 @@ export function nativeNames(path) {
         .map(([name, from]) => `class ${name} (named by ${and([...from])})`),
       ...[...unbound]
         .sort(byName)
-        .map(([label, abis]) => `native method ${label} (no library of ${and([...abis])} exports it)`)
+        .map(([label, abiList]) => `native method ${label} (no library of ${and([...abiList])} exports it)`),
+      ...lost.sort(byName).map(([file, where]) => `library ${file} (in ${where})`)
     ]
     return {
       libraries,
@@ -780,13 +799,14 @@ export function verify(paths) {
     whole = false
     const classes = reading.problems.filter((problem) => problem.startsWith('class '))
     const natives = reading.problems.filter((problem) => problem.startsWith('native method '))
+    const lost = reading.problems.filter((problem) => problem.startsWith('library '))
     const lines = (problems) => {
       const first = problems.slice(0, MOST_PROBLEMS)
       const more = problems.length - first.length
       return first.map((problem) => `  ${problem}`).join('\n') + (more > 0 ? `\n  and ${more} more` : '')
     }
     console.error(
-      `${shown}: its native libraries find names that its dex does not hold.` +
+      `${shown}: its native libraries and its dex do not agree.` +
         (classes.length > 0
           ? `\n${classes.length} classes the libraries name, which the dex does not define under that ` +
             `name:\n${lines(classes)}\nNative code finds a class by name, and a minifier that sees no ` +
@@ -795,8 +815,13 @@ export function verify(paths) {
         (natives.length > 0
           ? `\n${natives.length} native methods the dex declares, in classes the libraries export natives ` +
             `for, that no library exports:\n${lines(natives)}\nThe runtime binds a native method to the ` +
-            'symbol its class, name and arguments make. A method that has none was renamed, or its ' +
-            'library registers its natives and does not export them.'
+            'symbol its class, name and arguments make, spelled exactly. A method that has none was ' +
+            'renamed, or its library registers its natives and does not export them.'
+          : '') +
+        (lost.length > 0
+          ? `\n${lost.length} libraries that one ABI carries and another lacks:\n${lines(lost)}\n` +
+            'A library is built for every ABI the package ships, and an ABI without it has none of its ' +
+            'native methods.'
           : '')
     )
   }

@@ -727,6 +727,50 @@ expectNames(
   ],
   `native method ${FACTORY}.call (no library of arm64-v8a exports it)`
 )
+// The runtime looks a native method up by the exact spelling of its symbol: a character outside
+// ASCII is written `_0` and four hex digits, in lower case. A symbol with the same digits in upper
+// case names the same method to a reader that decodes it, and no method to the runtime.
+const SPELLED = 'Java_org_webrtc_PeerConnectionFactory_m_000e9'
+expectNames(
+  'a native method whose name has a character outside ASCII is bound by the symbol the runtime looks for',
+  'natives-escaped-method.apk',
+  [
+    application(mediaDex([], { [FACTORY]: [{ name: 'mé', native: true }] })),
+    library(elf({ exports: [SPELLED] }))
+  ],
+  'nothing'
+)
+expectNames(
+  'a symbol that spells that escape in upper case is not the symbol the runtime looks for',
+  'natives-escaped-method-upper.apk',
+  [
+    application(mediaDex([], { [FACTORY]: [{ name: 'mé', native: true }] })),
+    library(elf({ exports: [SPELLED.replace('000e9', '000E9')] }))
+  ],
+  `native method ${FACTORY}.mé (no library of arm64-v8a exports it)`
+)
+expectNames(
+  'a class whose name has a character outside ASCII is bound by the symbol the runtime looks for',
+  'natives-escaped-class.apk',
+  [
+    application(
+      dex({ defined: ['org.webrtc.Pé'], methods: { 'org.webrtc.Pé': [{ name: 'go', native: true }] } })
+    ),
+    library(elf({ exports: ['Java_org_webrtc_P_000e9_go'] }))
+  ],
+  'nothing'
+)
+expectNames(
+  'a class symbol that spells the escape in upper case is not the symbol the runtime looks for',
+  'natives-escaped-class-upper.apk',
+  [
+    application(
+      dex({ defined: ['org.webrtc.Pé'], methods: { 'org.webrtc.Pé': [{ name: 'go', native: true }] } })
+    ),
+    library(elf({ exports: ['Java_org_webrtc_P_000E9_go'] }))
+  ],
+  'native method org.webrtc.Pé.go (no library of arm64-v8a exports it)'
+)
 expectNames(
   'a weak symbol binds a method, as the runtime binds it',
   'natives-weak.apk',
@@ -789,6 +833,62 @@ expectNames(
     library(mediaLibrary({ exports: ['Java_org_webrtc_PeerConnectionFactory_other'] }), 'base/lib/x86_64/libmedia.so')
   ],
   `native method ${FACTORY}.nativeCreate (no library of x86_64 exports it)`
+)
+
+// -- the libraries of every ABI ------------------------------------------------------------------
+// A library is built once for each ABI, so the natives it exports for a class are the same in every
+// ABI that carries it, and an ABI that lacks a library another one carries has none of its natives.
+
+expectNames(
+  'an ABI whose library exports nothing of a class that another ABI exports is held to its natives',
+  'abis-lost-exports.apk',
+  [application(), library(), library(mediaLibrary({ exports: ['JNI_OnLoad'] }), 'lib/x86_64/libmedia.so')],
+  `native method ${FACTORY}.nativeCreate (no library of x86_64 exports it)`
+)
+expectNames(
+  'the ABI that lost the exports is named whichever of the two comes first',
+  'abis-lost-exports-first.apk',
+  [application(), library(mediaLibrary({ exports: ['JNI_OnLoad'] })), library(mediaLibrary(), 'lib/x86_64/libmedia.so')],
+  `native method ${FACTORY}.nativeCreate (no library of arm64-v8a exports it)`
+)
+expectNames(
+  'a library that one ABI lacks completely is a failure',
+  'abis-lost-library.apk',
+  [
+    application(),
+    library(),
+    library(elf(), 'lib/arm64-v8a/libother.so'),
+    library(mediaLibrary(), 'lib/x86_64/libmedia.so')
+  ],
+  'library libother.so (in arm64-v8a, not in x86_64)'
+)
+expectNames(
+  'a library missing from the ABI that would have carried the exports is a failure, and so is the one only that ABI has',
+  'abis-different-libraries.apk',
+  [application(), library(), library(elf(), 'lib/x86_64/libother.so')],
+  'library libmedia.so (in arm64-v8a, not in x86_64); library libother.so (in x86_64, not in arm64-v8a)'
+)
+expectNames(
+  'a bundle is held to the same libraries in each ABI',
+  'abis-lost-library.aab',
+  [
+    { name: 'base/dex/classes.dex', bytes: mediaDex() },
+    library(mediaLibrary(), 'base/lib/arm64-v8a/libmedia.so'),
+    library(elf(), 'base/lib/x86_64/libother.so')
+  ],
+  'library libmedia.so (in arm64-v8a, not in x86_64); library libother.so (in x86_64, not in arm64-v8a)'
+)
+expectNames(
+  'the same libraries in every ABI, each exporting the same natives, are whole',
+  'abis-whole.apk',
+  [
+    application(),
+    library(),
+    library(mediaLibrary(), 'lib/x86_64/libmedia.so'),
+    library(elf(), 'lib/arm64-v8a/libother.so'),
+    library(elf(), 'lib/x86_64/libother.so')
+  ],
+  'nothing'
 )
 
 // -- which libraries are read --------------------------------------------------------------------
@@ -879,6 +979,17 @@ held('the check passes a package whose dex holds what its libraries find', 'true
 const failing = verified('verify-missing.apk', withLibrary([FACTORY, CANDIDATE, NESTED, RAW]))
 held('the check fails a package whose dex lacks a class its library finds', 'false', String(failing.whole))
 held('and says which class and which library', 'true', String(failing.said.includes(JNI_ZERO) && failing.said.includes(MEDIA)))
+const lostLibrary = verified('verify-lost-library.apk', [
+  ...withLibrary([JNI_ZERO, FACTORY, CANDIDATE, NESTED, RAW]),
+  library(elf(), 'lib/arm64-v8a/libother.so'),
+  library(mediaLibrary(), 'lib/x86_64/libmedia.so')
+])
+held('the check fails a package one of whose ABIs lacks a library', 'false', String(lostLibrary.whole))
+held(
+  'and says which library and which ABI lacks it',
+  'true',
+  String(lostLibrary.said.includes('library libother.so (in arm64-v8a, not in x86_64)'))
+)
 
 // -- the build's own temporary directory -------------------------------------------------------
 // Two builds of the application at once share the options file the command line tool leaves in the
