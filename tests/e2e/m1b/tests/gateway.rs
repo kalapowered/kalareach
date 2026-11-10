@@ -1256,9 +1256,20 @@ fn server_besides(
 ///
 /// The second session serves a conversation first so that the refusal is the claim's: its worker
 /// has answered a launch, so it has read the executable, and a refusal that came from a worker
-/// still reading it, or a launcher out of time, is not taken for one. The host is the real daemon
-/// with two real workers, the shell is the managed zsh, the application is the Codex stand-in, and
-/// the person is `kr` on two terminals. Not claimed: Windows, where no gateway runs.
+/// still reading it, or a launcher out of time, is not taken for one.
+///
+/// What the worker refuses a launch for is not told to anyone outside it: the launcher says the
+/// backend refused it, whatever the reason. So the case shows the claim is the reason by what the
+/// refusal follows. A conversation nothing runs against, whose claim the test itself holds and lets
+/// go of, is refused to the second session each time it is typed while the test holds the claim,
+/// and served each time it is typed while the test does not, over two rounds. A refusal for any
+/// other cause (a read of the executable that outlasted its bound, a launch refused on its own
+/// grounds) does not follow the claim's being held and let go of, and a worker that does not check
+/// the claim serves the line while it is held.
+///
+/// The host is the real daemon with two real workers, the shell is the managed zsh, the
+/// application is the Codex stand-in, and the person is `kr` on two terminals. Not claimed:
+/// Windows, where no gateway runs.
 #[test]
 fn kr_req_12_05_a_second_session_is_not_served_a_conversation_the_first_runs_against() {
     let Some(ctx) = Context::start("gateway-claim") else {
@@ -1268,7 +1279,7 @@ fn kr_req_12_05_a_second_session_is_not_served_a_conversation_the_first_runs_aga
     let (_device, _paired, remote) = ctx.pair(&host);
     let first = Person::enters(&ctx, &host);
     first.exports(&ctx, "stay");
-    first.types("export KR_STAND_IN_SAVED=thread-9,thread-10");
+    first.types("export KR_STAND_IN_SAVED=thread-9,thread-10,thread-11");
     let _ = first.types_until_it_shows(
         "codex resume thread-9",
         "TUI: turn/completed",
@@ -1283,7 +1294,7 @@ fn kr_req_12_05_a_second_session_is_not_served_a_conversation_the_first_runs_aga
     // The second session is served another conversation beside it, and ends that.
     let second = Person::enters_among(&ctx, &host, &[first.session_id]);
     second.exports(&ctx, "stay");
-    second.types("export KR_STAND_IN_SAVED=thread-9,thread-10");
+    second.types("export KR_STAND_IN_SAVED=thread-9,thread-10,thread-11");
     let _ = second.types_until_it_shows(
         "codex resume thread-10",
         "TUI: turn/completed",
@@ -1343,6 +1354,56 @@ fn kr_req_12_05_a_second_session_is_not_served_a_conversation_the_first_runs_aga
     second.window.type_text(b"\x03");
     assert!(ended_within(&again, LIVENESS), "the second server ends");
     wait_until_the_claim_is_free(&host, "thread-10");
+
+    // The refusal follows the claim. Nothing runs against thread-11. While the test holds its claim
+    // (the lock on the file the workers share, taken as a worker takes it) every line the second
+    // session types for it is refused, and once the test has let go of it the same line is served,
+    // twice over. A refusal that is not the claim's does not come and go with it.
+    let mut ended: Vec<ProcessStartIdentity> = Vec::new();
+    for round in 1..=2 {
+        let claim = kr_worker::broker::host_claims::HostClaims::new(host.roots())
+            .take("thread-11")
+            .unwrap_or_else(|why| panic!("round {round}: nothing holds thread-11: {why:?}"));
+        for typed in 1..=2 {
+            let _ = second.types_until_the_launch_is_refused(
+                "codex resume thread-11",
+                &format!(
+                    "round {round}, line {typed}: the second session's line for a conversation \
+                     the test holds"
+                ),
+            );
+        }
+        let running: Vec<_> = kr_e2e_m1b::run::processes_under(ctx.run.root())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, command)| command.contains("app-server"))
+            .collect();
+        assert_eq!(
+            running.len(),
+            1,
+            "round {round}: nothing was started for a conversation the test holds: {running:?}"
+        );
+        drop(claim);
+        let _ = second.types_until_it_shows(
+            "codex resume thread-11",
+            "TUI: turn/completed",
+            &format!("round {round}: the second session's line once the test let go of the claim"),
+        );
+        let served = server_besides(
+            &ctx,
+            &format!(
+                "round {round}: the second session's server for the conversation the test let go of"
+            ),
+            &[&server, &other, &again]
+                .into_iter()
+                .chain(ended.iter())
+                .collect::<Vec<_>>(),
+        );
+        second.window.type_text(b"\x03");
+        assert!(ended_within(&served, LIVENESS), "the second server ends");
+        wait_until_the_claim_is_free(&host, "thread-11");
+        ended.push(served);
+    }
 
     // The first session's program ends and its server with it: the conversation is free once the
     // retirement has ended what the server started.
