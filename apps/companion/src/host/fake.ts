@@ -656,8 +656,8 @@ export interface FakeHostControls {
    */
   holdMutation(): HeldMutations
   /**
-   * Has the host answer the next composer send with only the action's identity, as a host does
-   * that took the request and lost the receipt: nobody knows what became of the action.
+   * Has the host answer the next composer send, or interrupt, with only the action's identity, as
+   * a host does that took the request and lost the receipt: nobody knows what became of the action.
    */
   leaveNextSendUnconfirmed(): void
   /** How many composer sends the host has received, answered or held. */
@@ -2072,7 +2072,12 @@ export function fakeHost(
     composerInterrupt: (params, opening) => {
       requireConnection()
       checkOpening('composerInterrupt', params.target.subject.session_id, opening)
-      return Promise.resolve(records.cancel(params))
+      const answer = records.cancel(params)
+      if (nextSendUnconfirmed) {
+        nextSendUnconfirmed = false
+        return Promise.resolve({ ...answer, receipt: null, value: null })
+      }
+      return Promise.resolve(answer)
     },
     approvalRespond: (params, opening) => {
       requireConnection()
