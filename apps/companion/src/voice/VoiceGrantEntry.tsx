@@ -163,7 +163,7 @@ export function VoiceGrantEntry({
         type="button"
         className="kr-voice__start"
         onClick={allow}
-        disabled={busy || !changed}
+        disabled={busy || !changed || sessions.length === 0}
         data-testid="voice-grant-entry-allow"
       >
         {busy ? 'Changing…' : 'Change what voice may do'}
