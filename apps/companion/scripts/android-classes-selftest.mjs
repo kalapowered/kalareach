@@ -2,29 +2,34 @@
 // Holds the packaged-class check to the answers it must give.
 //
 // The check reads a packaged Android application and says whether it carries the hand-written
-// native classes. Three ways of getting that wrong would be silent: counting a dex the runtime
-// never loads as application code, taking a class the code merely mentions for one the code
-// defines, and losing the central directory to an archive comment that happens to contain the
-// end-of-directory signature. A fourth would be reading the wrong build: checking the package a
-// different variant left behind, or passing over one the build was asked for. None of them can be
-// produced by building the application, so all of them are built here, in memory and in a
-// throwaway outputs directory, and fed to the same reader and the same selection the build uses.
+// native classes, and whether it carries what its native libraries find by name. Three ways of
+// getting that wrong would be silent: counting a dex the runtime never loads as application code,
+// taking a class the code merely mentions for one the code defines, and losing the central
+// directory to an archive comment that happens to contain the end-of-directory signature. A fourth
+// would be reading the wrong build: checking the package a different variant left behind, or
+// passing over one the build was asked for. A fifth is asking too little or too much of the
+// libraries: a name the minifier removed and nothing flagged, or a file name, a metric name or a
+// platform class taken for a class the application must define. None of them can be produced by
+// building the application, so all of them are built here, in memory and in a throwaway outputs
+// directory, and fed to the same reader and the same selection the build uses.
 //
 // The archives are the smallest ones that exercise the reader: a dex here carries its string,
-// type and class tables and nothing else, which is what the reader looks at, and is not a dex any
-// runtime would accept.
+// type, method and class tables and nothing else, a library carries its dynamic symbols and the
+// bytes a case puts in it, and neither is one any runtime would accept.
 import { Buffer } from 'node:buffer'
 import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 
-import { dex, zip } from './archive-fixtures.mjs'
+import { dex, elf, zip } from './archive-fixtures.mjs'
 import {
   definedStrings,
   missingFrom,
+  nativeNames,
   packagesOf,
   requestFrom,
-  sourcesOf
+  sourcesOf,
+  verify
 } from './android-classes.mjs'
 
 const PRESENT = [
@@ -246,6 +251,362 @@ held(
   ),
   JSON.stringify([...carried].sort())
 )
+
+// -- what the native libraries find by name ------------------------------------------------------
+// A minified build removes or renames a class that only native code reaches, and the library then
+// aborts the process when its start-up asks for the class. The check reads the names the
+// libraries carry, from the package itself, and holds the dex to each of them.
+
+const JNI_ZERO = 'org.jni_zero.JniZero'
+const FACTORY = 'org.webrtc.PeerConnectionFactory'
+const CANDIDATE = 'org.webrtc.IceCandidate'
+const NESTED = 'org.webrtc.PeerConnection$Observer'
+const RAW = 'org.webrtc.NamedByFindClass'
+const MEDIA = 'lib/arm64-v8a/libmedia.so'
+
+/** What a media library carries: a dotted name, a descriptor, a slashed name and a native method. */
+function mediaLibrary(more = {}) {
+  return elf({
+    exports: ['Java_org_webrtc_PeerConnectionFactory_nativeCreate', 'JNI_OnLoad'],
+    blobs: [
+      Buffer.from(
+        `\x00\x3e${JNI_ZERO}\x00(ILorg/webrtc/IceCandidate;)V\x00` +
+          `L${NESTED.replaceAll('.', '/')};\x00org/webrtc/NamedByFindClass\x00`,
+        'latin1'
+      )
+    ],
+    ...more
+  })
+}
+
+/** The dex that defines everything `mediaLibrary` names, and the native method it exports. */
+function mediaDex(without = [], methods = null) {
+  const defined = [JNI_ZERO, FACTORY, CANDIDATE, NESTED, RAW].filter((name) => !without.includes(name))
+  return dex({
+    defined,
+    methods: methods ?? { [FACTORY]: [{ name: 'nativeCreate', native: true }] }
+  })
+}
+
+/** Writes one package and states what the check must say its libraries find by name. */
+function expectNames(what, name, members, problems) {
+  const path = join(work, name)
+  writeFileSync(path, zip([filler, ...members]))
+  let answer
+  try {
+    answer = nativeNames(path).problems.join('; ') || 'nothing'
+  } catch (failure) {
+    answer = `refused: ${failure.message}`
+  }
+  held(what, problems, answer)
+}
+
+const library = (bytes = mediaLibrary(), name = MEDIA) => ({ name, bytes })
+const application = (bytes = mediaDex()) => ({ name: 'classes.dex', bytes })
+
+expectNames(
+  'an application that defines every name its library carries, and the natives it is bound to, is whole',
+  'names-whole.apk',
+  [application(), library()],
+  'nothing'
+)
+expectNames(
+  'a class the library finds by name that the dex lacks is named, as the minifier left it',
+  'names-no-jni-zero.apk',
+  [application(mediaDex([JNI_ZERO])), library()],
+  `class ${JNI_ZERO} (named by ${MEDIA})`
+)
+expectNames(
+  'a class the dex only mentions is not a class the dex defines',
+  'names-mentioned-only.apk',
+  [
+    application(
+      dex({
+        defined: [FACTORY, CANDIDATE, NESTED, RAW],
+        referenced: [JNI_ZERO],
+        methods: { [FACTORY]: [{ name: 'nativeCreate', native: true }] }
+      })
+    ),
+    library()
+  ],
+  `class ${JNI_ZERO} (named by ${MEDIA})`
+)
+expectNames(
+  'a class named in a type descriptor is asked for, with the primitive before it left alone',
+  'names-descriptor.apk',
+  [application(mediaDex([CANDIDATE])), library()],
+  `class ${CANDIDATE} (named by ${MEDIA})`
+)
+expectNames(
+  'a nested class named in a descriptor is asked for under its own name',
+  'names-nested.apk',
+  [application(mediaDex([NESTED])), library()],
+  `class ${NESTED} (named by ${MEDIA})`
+)
+expectNames(
+  'a class named the way FindClass takes it is asked for',
+  'names-find-class.apk',
+  [application(mediaDex([RAW])), library()],
+  `class ${RAW} (named by ${MEDIA})`
+)
+expectNames(
+  'every class that is missing is named, in order, and not only the first',
+  'names-all-missing.apk',
+  [application(dex({ defined: [FACTORY], methods: { [FACTORY]: [{ name: 'nativeCreate', native: true }] } })), library()],
+  [JNI_ZERO, CANDIDATE, RAW, NESTED].map((name) => `class ${name} (named by ${MEDIA})`).join('; ')
+)
+expectNames(
+  'names that are no class the application defines are not asked for',
+  'names-noise.apk',
+  [
+    application(dex({ defined: [] })),
+    library(
+      elf({
+        blobs: [
+          Buffer.from(
+            [
+              'java.lang.String',
+              'Ljava/lang/String;',
+              'Landroid/content/Context;',
+              'android/content/Intent',
+              'WebRTC.Video.Encoder.CodecType',
+              'a.J',
+              'libjingle_peerconnection_so.so',
+              'third_party/jni_zero/jni_zero',
+              'org/webrtc/Packed runs into the next string',
+              'com.example.someFile.cc',
+              'Encoded.Qp.Vp8.S1',
+              'keys/notification-preview/recovery/seedauthority/grants/revoked/EmptyInvalidDigit'
+            ]
+              .map((text) => `\x00${text}`)
+              .join('') + '\x00',
+            'latin1'
+          )
+        ]
+      })
+    )
+  ],
+  'nothing'
+)
+expectNames(
+  'a name that runs into the next string has no end to read, so it is not asked for',
+  'names-packed.apk',
+  [
+    application(dex({ defined: [] })),
+    library(
+      elf({
+        blobs: [Buffer.from('org.webrtc.PackedRunningIntoMoreText and org/webrtc/Packed!', 'latin1')]
+      })
+    )
+  ],
+  'nothing'
+)
+
+// -- the native methods the dex declares --------------------------------------------------------
+// The runtime binds a native method to the symbol its class and name make. A method the minifier
+// renamed has no symbol, and the call that reaches it throws.
+
+expectNames(
+  'a native method that a library exports under another name is named, as a renamed one is',
+  'natives-renamed.apk',
+  [application(mediaDex([], { [FACTORY]: [{ name: 'a', native: true }] })), library()],
+  `native method ${FACTORY}.a (no library of arm64-v8a exports it)`
+)
+expectNames(
+  'a class none of whose natives a library exports is not one the libraries are bound to',
+  'natives-unbound.apk',
+  [
+    application(
+      dex({
+        defined: [JNI_ZERO, FACTORY, CANDIDATE, NESTED, RAW, 'org.webrtc.Other'],
+        methods: {
+          [FACTORY]: [{ name: 'nativeCreate', native: true }],
+          'org.webrtc.Other': [{ name: 'nativeOther', native: true }]
+        }
+      })
+    ),
+    library()
+  ],
+  'nothing'
+)
+expectNames(
+  'a native method no library exports, in a class some other of its natives is exported for, is named',
+  'natives-partly-bound.apk',
+  [
+    application(
+      mediaDex([], {
+        [FACTORY]: [
+          { name: 'nativeCreate', native: true },
+          { name: 'nativeOther', native: true }
+        ]
+      })
+    ),
+    library()
+  ],
+  `native method ${FACTORY}.nativeOther (no library of arm64-v8a exports it)`
+)
+expectNames(
+  'a static native method is bound the same as an instance one',
+  'natives-static.apk',
+  [application(mediaDex([], { [FACTORY]: [{ name: 'nativeCreate', native: true, static: true }] })), library()],
+  'nothing'
+)
+expectNames(
+  'a method that is not native needs no symbol',
+  'natives-plain.apk',
+  [application(mediaDex([], { [FACTORY]: [{ name: 'create' }] })), library()],
+  'nothing'
+)
+expectNames(
+  'a native method the library exports and the dex dropped is no problem, as nothing calls it',
+  'natives-dropped.apk',
+  [application(mediaDex([], { [FACTORY]: [{ name: 'other' }] })), library()],
+  'nothing'
+)
+expectNames(
+  'a symbol the library only refers to binds no class, so its natives are not asked for',
+  'natives-imported.apk',
+  [
+    application(),
+    library(mediaLibrary({ exports: [], imports: ['Java_org_webrtc_PeerConnectionFactory_nativeCreate'] }))
+  ],
+  'nothing'
+)
+expectNames(
+  'an escaped underscore and an overloaded method are decoded to the names the class declares',
+  'natives-mangled.apk',
+  [
+    application(
+      dex({
+        defined: ['org.webrtc.Peer_Connection'],
+        methods: { 'org.webrtc.Peer_Connection': [{ name: 'native_call', native: true }] }
+      })
+    ),
+    library(elf({ exports: ['Java_org_webrtc_Peer_1Connection_native_1call__ILjava_lang_String_2'] }))
+  ],
+  'nothing'
+)
+expectNames(
+  'a native method may be bound by any library of the ABI, not only by one that names classes',
+  'natives-other-library.apk',
+  [
+    application(),
+    library(mediaLibrary({ exports: [] })),
+    library(elf({ exports: ['Java_org_webrtc_PeerConnectionFactory_nativeCreate'] }), 'lib/arm64-v8a/libother.so')
+  ],
+  'nothing'
+)
+expectNames(
+  'each ABI is held to its own libraries, and the one that lacks the symbol is the one named',
+  'natives-one-abi.apk',
+  [
+    application(),
+    library(),
+    library(
+      mediaLibrary({ exports: ['Java_org_webrtc_PeerConnectionFactory_other'] }),
+      'lib/x86_64/libmedia.so'
+    )
+  ],
+  `native method ${FACTORY}.nativeCreate (no library of x86_64 exports it)`
+)
+expectNames(
+  'a 32-bit library is read as well as a 64-bit one',
+  'natives-narrow.apk',
+  [
+    application(mediaDex([], { [FACTORY]: [{ name: 'a', native: true }] })),
+    library(mediaLibrary({ wide: false }), 'lib/armeabi-v7a/libmedia.so')
+  ],
+  `native method ${FACTORY}.a (no library of armeabi-v7a exports it)`
+)
+
+// -- which libraries are read --------------------------------------------------------------------
+
+expectNames(
+  'a library of each ABI is read, and a name missing from the dex is reported against both',
+  'libraries-two-abis.apk',
+  [
+    application(mediaDex([JNI_ZERO])),
+    library(mediaLibrary(), 'lib/x86_64/libmedia.so'),
+    library()
+  ],
+  `class ${JNI_ZERO} (named by ${MEDIA} and lib/x86_64/libmedia.so)`
+)
+expectNames(
+  'a bundle is read from its base module',
+  'libraries.aab',
+  [
+    { name: 'base/dex/classes.dex', bytes: mediaDex([JNI_ZERO]) },
+    library(mediaLibrary(), 'base/lib/arm64-v8a/libmedia.so')
+  ],
+  `class ${JNI_ZERO} (named by base/lib/arm64-v8a/libmedia.so)`
+)
+expectNames(
+  'a library in an optional feature of a bundle is not read',
+  'libraries-feature.aab',
+  [
+    { name: 'base/dex/classes.dex', bytes: mediaDex([JNI_ZERO], {}) },
+    library(mediaLibrary(), 'voice/lib/arm64-v8a/libmedia.so'),
+    library(elf(), 'base/lib/arm64-v8a/libother.so')
+  ],
+  'nothing'
+)
+expectNames(
+  'a library under the assets of an APK is not one the runtime loads',
+  'libraries-assets.apk',
+  [
+    application(mediaDex([JNI_ZERO], {})),
+    library(mediaLibrary(), 'assets/lib/arm64-v8a/libmedia.so'),
+    library(elf(), 'lib/arm64-v8a/libother.so')
+  ],
+  'nothing'
+)
+expectNames(
+  'a package with no native library is refused, not passed',
+  'libraries-none.apk',
+  [application()],
+  'refused: the artefact carries no native library'
+)
+expectNames(
+  'a library that is no ELF file is refused by name',
+  'libraries-not-elf.apk',
+  [application(), library(Buffer.from('not a library'))],
+  `refused: ${MEDIA}: not an ELF library`
+)
+
+/** What `verify` says and answers about one package, with its output kept out of this one's. */
+function verified(name, members) {
+  const path = join(work, name)
+  writeFileSync(path, zip(members))
+  const output = []
+  const { log, error } = console
+  console.log = (text) => output.push(text)
+  console.error = (text) => output.push(text)
+  let whole
+  try {
+    whole = verify([path])
+  } finally {
+    console.log = log
+    console.error = error
+  }
+  return { whole, said: output.join('\n') }
+}
+
+const withLibrary = (defined) => [
+  filler,
+  {
+    name: 'classes.dex',
+    bytes: dex({
+      defined: [...PRESENT, ...defined],
+      methods: { [FACTORY]: [{ name: 'nativeCreate', native: true }] }
+    })
+  },
+  library()
+]
+const passing = verified('verify-whole.apk', withLibrary([JNI_ZERO, FACTORY, CANDIDATE, NESTED, RAW]))
+held('the check passes a package whose dex holds what its libraries find', 'true', String(passing.whole))
+const failing = verified('verify-missing.apk', withLibrary([FACTORY, CANDIDATE, NESTED, RAW]))
+held('the check fails a package whose dex lacks a class its library finds', 'false', String(failing.whole))
+held('and says which class and which library', 'true', String(failing.said.includes(JNI_ZERO) && failing.said.includes(MEDIA)))
 
 // -- which packages a build is checked against --------------------------------------------------
 // An outputs directory as a tree carries it after several builds. The ages are deliberately

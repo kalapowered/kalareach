@@ -14,6 +14,14 @@
 // definitions and not references -- and fails by name when one of the classes below is missing.
 // Which artefacts a build is judged against comes from the build's own request, not from what is
 // newest on disk: see "the packages one build was asked for".
+//
+// A minified build can also drop a class that nothing but native code reaches. A native library
+// finds the Java classes it uses by name, and the minifier, which sees only Java, removes or renames
+// a class no Java code refers to: the library still loads, and the application is aborted by the
+// runtime the first time the library asks for the class. So the artefact's native libraries are read
+// for the names they carry (see `android-native-names.mjs`), and each name must be defined, under
+// that name, by the artefact's dex. The libraries come from the artefact itself, so a library that
+// is updated brings its new names with it.
 import { Buffer } from 'node:buffer'
 import { inflateRawSync } from 'node:zlib'
 import {
@@ -27,6 +35,8 @@ import {
 } from 'node:fs'
 import { dirname, extname, join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
+
+import { libraryClassNames, libraryNatives } from './android-native-names.mjs'
 
 /**
  * The classes a packaged application must define, by these exact names.
@@ -261,6 +271,59 @@ export function definedClasses(dex) {
   return classes
 }
 
+/** The access flag of a method the runtime binds to native code. */
+const ACC_NATIVE = 0x100
+
+/**
+ * Every class a dex file defines, with the names of the native methods it declares.
+ *
+ * The methods are read from each class's own data item and not from the file's method table, which
+ * lists the methods the code merely calls as well as the ones a class declares.
+ */
+export function definedNatives(dex) {
+  requireDex(dex)
+  const typeIdsAt = dex.readUInt32LE(0x44)
+  const methodIdsAt = dex.readUInt32LE(0x5c)
+  const classDefsCount = dex.readUInt32LE(0x60)
+  const classDefsAt = dex.readUInt32LE(0x64)
+  const descriptor = (typeIndex) => stringAt(dex, dex.readUInt32LE(typeIdsAt + typeIndex * 4))
+  const classes = new Map()
+  for (let index = 0; index < classDefsCount; index += 1) {
+    const classDef = classDefsAt + index * 32
+    const type = descriptor(dex.readUInt32LE(classDef))
+    if (!type.startsWith('L') || !type.endsWith(';')) continue
+    const natives = new Set()
+    classes.set(type.slice(1, -1).replaceAll('/', '.'), natives)
+    const dataAt = dex.readUInt32LE(classDef + 24)
+    if (dataAt === 0) continue
+    // The counts of the four lists, then the fields, which are skipped, then the two lists of methods.
+    let at = dataAt
+    const sizes = []
+    for (let list = 0; list < 4; list += 1) {
+      const [size, next] = leb128(dex, at)
+      sizes.push(size)
+      at = next
+    }
+    for (let skipped = 0; skipped < sizes[0] + sizes[1]; skipped += 1) {
+      at = leb128(dex, leb128(dex, at)[1])[1]
+    }
+    for (const size of [sizes[2], sizes[3]]) {
+      let methodIndex = 0
+      for (let each = 0; each < size; each += 1) {
+        const [step, afterIndex] = leb128(dex, at)
+        const [flags, afterFlags] = leb128(dex, afterIndex)
+        const [, afterCode] = leb128(dex, afterFlags)
+        at = afterCode
+        methodIndex += step
+        if ((flags & ACC_NATIVE) !== 0) {
+          natives.add(stringAt(dex, dex.readUInt32LE(methodIdsAt + methodIndex * 8 + 4)))
+        }
+      }
+    }
+  }
+  return classes
+}
+
 /**
  * Opens the archive at `path` and hands `visit` its members and a reader of one member's bytes.
  * The archive is closed when `visit` returns.
@@ -292,6 +355,99 @@ function packagedClasses(path) {
     for (const name of definedClasses(dex)) classes.add(name)
   }
   return classes
+}
+
+/** How many problems the command lists before it says how many more there are. */
+const MOST_PROBLEMS = 30
+
+/** Where a packaged artefact keeps the native libraries the runtime loads, by ABI. */
+const LIBRARY_MEMBER = {
+  '.apk': /^lib\/[^/]+\/[^/]+\.so$/,
+  '.aab': /^base\/lib\/[^/]+\/[^/]+\.so$/
+}
+
+/** `a`, then `b` and `c` as `a, b and c`. */
+function and(items) {
+  return items.length < 2 ? items.join('') : `${items.slice(0, -1).join(', ')} and ${items.at(-1)}`
+}
+
+/**
+ * What the native libraries of the artefact at `path` find by name, read against the dex.
+ *
+ * Answers the libraries read, each with the number of classes and native methods it names, the
+ * number of native methods the dex declares, and the problems. One is a class a library names that
+ * no dex file of the application defines under that name. The other is a native method of a class
+ * the libraries of an ABI are bound to, which none of them exports under its name: the runtime binds
+ * a native method by the symbol its class and name make, so a method the minifier renamed has no
+ * symbol, and the call that reaches it throws.
+ *
+ * A class is one the libraries are bound to when they export a native method for it. A class that
+ * declares natives and has no export, such as the encoder of a codec the library was built without,
+ * is not asked for symbols, and neither is a library that registers its methods and exports none.
+ */
+export function nativeNames(path) {
+  const kind = extname(path).toLowerCase()
+  if (!DEX_MEMBER[kind]) throw new Error(`${kind} is not a packaged Android application`)
+  return withArchive(path, (all, read) => {
+    const dexes = all.filter((member) => DEX_MEMBER[kind].test(member.name))
+    if (dexes.length === 0) throw new Error('the artefact carries no application dex file')
+    const declared = new Map()
+    for (const member of dexes) {
+      for (const [name, natives] of definedNatives(read(member))) {
+        declared.set(name, new Set([...(declared.get(name) ?? []), ...natives]))
+      }
+    }
+    const files = all.filter((member) => LIBRARY_MEMBER[kind].test(member.name))
+    if (files.length === 0) throw new Error('the artefact carries no native library')
+    const libraries = []
+    const named = new Map()
+    const exported = new Map()
+    const bound = new Map()
+    for (const member of files.sort((a, b) => (a.name < b.name ? -1 : 1))) {
+      let classes
+      let natives
+      try {
+        const bytes = read(member)
+        classes = libraryClassNames(bytes)
+        natives = libraryNatives(bytes)
+      } catch (failure) {
+        throw new Error(`${member.name}: ${failure.message}`, { cause: failure })
+      }
+      libraries.push({ name: member.name, classes: classes.size, natives: natives.length })
+      for (const name of classes) {
+        if (!declared.has(name)) named.set(name, new Set([...(named.get(name) ?? []), member.name]))
+      }
+      const abi = member.name.split('/').at(kind === '.aab' ? 2 : 1)
+      const symbols = exported.get(abi) ?? new Set()
+      const classesBound = bound.get(abi) ?? new Set()
+      for (const { cls, method } of natives) {
+        symbols.add(`${cls}.${method}`)
+        classesBound.add(cls)
+      }
+      exported.set(abi, symbols)
+      bound.set(abi, classesBound)
+    }
+    const unbound = new Map()
+    for (const [name, natives] of declared) {
+      for (const method of natives) {
+        for (const [abi, symbols] of exported) {
+          if (!bound.get(abi).has(name) || symbols.has(`${name}.${method}`)) continue
+          unbound.set(`${name}.${method}`, new Set([...(unbound.get(`${name}.${method}`) ?? []), abi]))
+        }
+      }
+    }
+    const byName = ([a], [b]) => (a < b ? -1 : 1)
+    const problems = [
+      ...[...named]
+        .sort(byName)
+        .map(([name, from]) => `class ${name} (named by ${and([...from])})`),
+      ...[...unbound]
+        .sort(byName)
+        .map(([name, abis]) => `native method ${name} (no library of ${and([...abis])} exports it)`)
+    ]
+    const natives = [...declared.values()].reduce((sum, each) => sum + each.size, 0)
+    return { libraries, natives, problems }
+  })
 }
 
 // -- the check --------------------------------------------------------------------------------
@@ -550,24 +706,45 @@ export function verify(paths) {
   }
   let whole = true
   for (const path of found) {
+    const shown = relative(process.cwd(), path)
     let missing
+    let reading
     try {
       missing = missingFrom(path)
+      reading = nativeNames(path)
     } catch (failure) {
-      console.error(`${relative(process.cwd(), path)}: ${failure.message}`)
+      console.error(`${shown}: ${failure.message}`)
       whole = false
       continue
     }
     if (missing.length === 0) {
-      console.log(`${relative(process.cwd(), path)}: all ${REQUIRED.length} native classes present`)
+      console.log(`${shown}: all ${REQUIRED.length} native classes present`)
+    } else {
+      whole = false
+      console.error(
+        `${shown} is missing ${missing.length} of ${REQUIRED.length} ` +
+          'hand-written native classes:\n' +
+          missing.map((name) => `  ${name}`).join('\n') +
+          `\nThe build is not compiling ${sourcesOf(missing).join(' and ')} into this application.`
+      )
+    }
+    if (reading.problems.length === 0) {
+      const names = reading.libraries.reduce((sum, each) => sum + each.classes, 0)
+      console.log(
+        `${shown}: its ${reading.libraries.length} native libraries name ${names} classes, all defined ` +
+          `in its dex, and bind all ${reading.natives} native methods it declares`
+      )
       continue
     }
     whole = false
+    const shownProblems = reading.problems.slice(0, MOST_PROBLEMS)
+    const more = reading.problems.length - shownProblems.length
     console.error(
-      `${relative(process.cwd(), path)} is missing ${missing.length} of ${REQUIRED.length} ` +
-        'hand-written native classes:\n' +
-        missing.map((name) => `  ${name}`).join('\n') +
-        `\nThe build is not compiling ${sourcesOf(missing).join(' and ')} into this application.`
+      `${shown}: its native libraries find ${reading.problems.length} names that its dex does not hold:\n` +
+        shownProblems.map((problem) => `  ${problem}`).join('\n') +
+        (more > 0 ? `\n  and ${more} more` : '') +
+        '\nNative code finds these by name, and a minifier that sees no Java reaching them removes or ' +
+        'renames them. Keep them in the rules of the library that carries them.'
     )
   }
   return whole
