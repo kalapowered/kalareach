@@ -1624,7 +1624,8 @@ fn one_principals_open_drafts_are_not_counted_against_another() {
 }
 
 /// KR-REQ-23.41: a draft stops counting when a prompt sends it to a session, which is how a device
-/// ends one, and the places it frees are the ones it held: a draft that was not sent still counts.
+/// frees its place, and the places it frees are the ones it held: a draft that was not sent still
+/// counts.
 #[test]
 fn a_draft_a_prompt_has_sent_stops_counting_against_the_bound() {
     let harness = Harness::create();
@@ -1688,8 +1689,9 @@ fn a_draft_whose_session_has_ended_stops_counting_against_the_bound() {
 
 /// KR-REQ-23.41 and section 9: a repeat of the create that took the last place is answered with the
 /// draft it made, and is not refused for the bound it filled; a create under a new identifier is
-/// refused, and that refusal writes no record, so the identifier it carried is free for a create
-/// that has a place.
+/// refused, and the service writes no record of that refusal, so the service itself would take the
+/// identifier it carried for a create that has a place (the host keeps a refusal as the action's
+/// outcome, and a caller whose place is free asks under a new action).
 #[test]
 fn a_repeat_of_the_create_that_took_the_last_place_is_answered_from_its_record() {
     let harness = Harness::create();
@@ -1740,5 +1742,5 @@ fn a_repeat_of_the_create_that_took_the_last_place_is_answered_from_its_record()
     harness
         .service
         .draft_create(&device, &params, Some(&refused_action), Some(1))
-        .expect("the refusal wrote no record, so the identifier is free");
+        .expect("the service wrote no record of the refusal");
 }

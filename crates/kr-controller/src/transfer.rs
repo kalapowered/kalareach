@@ -61,10 +61,10 @@ pub const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6
 /// A draft is open until a prompt sends it to a session or its target session ends, and the
 /// service counts it against the device's own principal. The page makes one draft for each session
 /// it attaches files in, and another for each eight files, so the bound is several times what a
-/// person works in at once; at most this many drafts of up to
-/// [`kr_protocol::transfer::MAX_TRANSFER_RESULT_BYTES`] of text are held for one device. The
-/// person at this machine has no bound, and nothing a device sends changes it: the limit is a
-/// constant of this host, which an owner cannot change.
+/// person works in at once; a device holds at most this many open drafts, each of up to
+/// [`kr_protocol::transfer::MAX_TRANSFER_RESULT_BYTES`] of text. The person at this machine has
+/// no bound, and nothing a device sends changes it: the limit is a constant of this host, which an
+/// owner cannot change.
 pub const DEVICE_OPEN_DRAFTS: u64 = 64;
 
 /// What a transfer call answers with: the method's result, or the refusal the service decided.
@@ -141,10 +141,6 @@ pub struct TransferModule {
     /// the one it makes as it starts. Compiled only into this crate's tests.
     #[cfg(test)]
     sweeps_ended: tokio::sync::watch::Sender<u64>,
-    /// How many ends of a closed session's insertions have been written, for this crate's tests to
-    /// wait for the one a session's closure queues. Compiled only into this crate's tests.
-    #[cfg(test)]
-    session_endings: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
 /// The admission one transfer mutation arrived under, as the transfer service asks about it.
@@ -163,8 +159,8 @@ pub struct TransferAdmission {
     /// claimed and may begin nothing.
     settling: bool,
     refusal: std::sync::Mutex<Option<ProtocolError>>,
-    /// Whether the service asked this admission where it begins an effect: it did not answer from
-    /// its record, so what it returned is what this attempt performed.
+    /// Whether the service asked this admission where it begins an effect, which it does only once
+    /// it has found no record of the action.
     reached: AtomicBool,
 }
 
@@ -240,7 +236,7 @@ impl TransferAdmission {
     }
 
     /// Whether the service reached the place it begins an effect, which a service that answers an
-    /// action from its own record never does.
+    /// action from its own record does not.
     fn reached(&self) -> bool {
         self.reached.load(Ordering::Acquire)
     }
@@ -419,8 +415,6 @@ impl TransferModule {
             after_a_claim: Arc::new(crate::attention::Pause::default()),
             #[cfg(test)]
             sweeps_ended: tokio::sync::watch::channel(0).0,
-            #[cfg(test)]
-            session_endings: Arc::new(tokio::sync::watch::channel(0).0),
         })
     }
 
@@ -557,16 +551,12 @@ impl TransferModule {
     ) -> impl Future<Output = Result<()>> + Send + use<> {
         let daemon = Weak::clone(daemon);
         let service = Arc::clone(&self.service);
-        #[cfg(test)]
-        let endings = Arc::clone(&self.session_endings);
         let ended = tokio::task::spawn_blocking(move || {
             let Some(owner) = daemon.upgrade() else {
                 return Ok(0);
             };
             let ended =
                 service.end_session_insertions(&std::collections::BTreeSet::from([session_id]));
-            #[cfg(test)]
-            endings.send_modify(|written| *written += 1);
             #[cfg(test)]
             if let Some(pause) = pause {
                 pause.wait();
@@ -727,6 +717,28 @@ impl TransferModule {
         }
     }
 
+    /// Writes the end of every session the registry holds as closed, when `actor_id` already holds
+    /// `limit` open drafts or more, before a create is counted against them.
+    ///
+    /// A session's closure queues the write that ends its drafts on a task of its own, so a create
+    /// that follows closely, or a write that failed and waits for the next sweep or start, would
+    /// count drafts of a session that has ended. Where the bound is about to speak, the registry's
+    /// closures are written first, so a draft stops counting when its session is recorded closed.
+    /// A pass that cannot be written does not stop the create: the service counts what it holds.
+    pub(crate) async fn settle_closures_when_full(
+        &self,
+        owner: &Arc<Controller>,
+        actor_id: &ActorId,
+        limit: u64,
+    ) {
+        let service = Arc::clone(&self.service);
+        let actor = actor_id.clone();
+        let full = blocking(move || Ok(service.open_drafts(&actor)? >= limit)).await;
+        if matches!(full, Ok(true)) {
+            let _ = end_the_insertions_of_closed_sessions(owner).await;
+        }
+    }
+
     /// Records that a prompt sends a draft to a session, which moves the draft's attachments, and
     /// any it gets later, from the seven-day window of an unused attachment onto that session's
     /// retention.
@@ -875,7 +887,6 @@ impl TransferModule {
     /// read it from the record of an earlier submission of the action.
     ///
     /// `admission` and `draft_limit` are as [`Self::write`].
-    #[must_use]
     pub(crate) async fn write_frame(
         &self,
         actor_id: &ActorId,
@@ -1040,7 +1051,19 @@ impl TransferModule {
         #[cfg(feature = "testing")]
         let after_the_outer_check = Arc::clone(&self.after_the_outer_check);
         let answer = blocking(move || {
-            if let Some(retained) = kept(&service, &actor, action_id, name, digest)? {
+            // A look at the record that cannot read it says a record exists, so what it answers is
+            // a copy whichever way it is told.
+            let looked_at = || {
+                let looked = kept(&service, &actor, action_id, name, digest);
+                if looked
+                    .as_ref()
+                    .is_err_and(|error| error.code == ErrorCode::OutcomeUnknown)
+                {
+                    found.store(true, Ordering::Release);
+                }
+                looked
+            };
+            if let Some(retained) = looked_at()? {
                 // Found here, after the lookup the door made before it considered a first
                 // admission: another attempt may have recorded it since.
                 found.store(true, Ordering::Release);
@@ -1068,7 +1091,7 @@ impl TransferModule {
                 // A claim moves from open to settled and never back, so one that is not open
                 // now and was when the lookup above found it open has been settled since, and
                 // what it was settled with is the answer.
-                if let Some(retained) = kept(&service, &actor, action_id, name, digest)? {
+                if let Some(retained) = looked_at()? {
                     found.store(true, Ordering::Release);
                     return answer_of(retained);
                 }
@@ -1208,14 +1231,21 @@ impl TransferModule {
             };
             match recorded {
                 None => outcome,
-                // The record is the answer both callers get. A method that records its own action in
-                // the transaction that performs it leaves a record of this attempt's own, which
-                // is no copy when the service reached the place it begins an effect and this
-                // attempt succeeded; any other record was written by another copy.
+                // The record is the answer both callers get. The three draft writes record their
+                // own action in the transaction that performs it, and hold the journal's lock from
+                // their own look at the record to that commit, so once the service has reached the
+                // place it begins an effect, a record that an attempt finds is its own. The upload
+                // writes let go of the lock while they verify a file, so another copy can record in
+                // between: any record read for them, and for every other method, is a copy.
                 Some(retained) => {
                     let performed_here = outcome.is_ok()
-                        && name != Method::UploadChunk.as_str()
-                        && admission.reached();
+                        && admission.reached()
+                        && matches!(
+                            method,
+                            Method::DraftCreate
+                                | Method::DraftUpdate
+                                | Method::AgentDraftAddAttachment
+                        );
                     if !performed_here {
                         found.store(true, Ordering::Release);
                     }
@@ -1259,21 +1289,6 @@ impl TransferModule {
             #[cfg(test)]
             None,
         )
-    }
-
-    /// How many ends of a closed session's insertions have been written so far.
-    #[cfg(test)]
-    pub(crate) fn session_endings_written(&self) -> u64 {
-        *self.session_endings.borrow()
-    }
-
-    /// Waits until `count` ends of a closed session's insertions have been written: the write a
-    /// session's closure queues on a task of its own, so a test that closes a session through the
-    /// daemon's own closure can wait for exactly that write.
-    #[cfg(test)]
-    pub(crate) async fn until_session_endings_written(&self, count: u64) {
-        let mut written = self.session_endings.subscribe();
-        let _ = written.wait_for(|written| *written >= count).await;
     }
 
     /// Waits until the daemon's own sweep loop has ended a sweep, which is the one it makes as it

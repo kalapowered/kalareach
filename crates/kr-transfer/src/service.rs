@@ -1928,6 +1928,17 @@ impl TransferService {
         }
     }
 
+    /// Returns how many drafts `actor` holds open: the ones no prompt has sent to a session and
+    /// whose target session has not ended, which is what [`Self::draft_create`] counts against a
+    /// bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the count cannot be read.
+    pub fn open_drafts(&self, actor: &ActorId) -> Result<u64> {
+        self.locked()?.open_drafts(actor)
+    }
+
     /// Creates a durable draft.
     ///
     /// `open_limit` is how many open drafts `actor` may hold, `None` for an actor with no bound. A

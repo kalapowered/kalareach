@@ -156,6 +156,16 @@ impl RemoteConnection {
         let mutation = mutation.clone();
         let request_id = mutation.request_id;
         let effect = tokio::spawn(async move {
+            if method == Method::DraftCreate {
+                controller
+                    .transfer
+                    .settle_closures_when_full(
+                        &controller,
+                        &actor_id,
+                        crate::transfer::DEVICE_OPEN_DRAFTS,
+                    )
+                    .await;
+            }
             let admission =
                 crate::transfer::TransferAdmission::new(Arc::clone(&controller), carried);
             controller
