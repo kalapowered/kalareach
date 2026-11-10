@@ -1113,8 +1113,12 @@ impl Controller {
                 crate::push::external::check_secret(&params.secret)
                     .map_err(ControllerError::InvalidArgument)?;
             }
-            // The host's sign-in belongs to the environment, not to a session.
-            Method::AccountSignIn | Method::AccountSignOut => {
+            // The host's sign-ins, the managed account's and the storage account's, belong to the
+            // environment, not to a session.
+            Method::AccountSignIn
+            | Method::AccountSignOut
+            | Method::AccountStorageSignIn
+            | Method::AccountStorageSignOut => {
                 if mutation.target.session_id.as_ref().is_some() {
                     return Err(ControllerError::InvalidArgument(
                         "this host's sign-in belongs to this environment, not to one session"
@@ -1122,7 +1126,7 @@ impl Controller {
                     ));
                 }
                 match method {
-                    Method::AccountSignIn => {
+                    Method::AccountSignIn | Method::AccountStorageSignIn => {
                         let _: kr_protocol::host_account::AccountSignInParams =
                             parse(&mutation.params)?;
                     }

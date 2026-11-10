@@ -555,6 +555,8 @@ async fn a_method_that_takes_no_admission_is_refused_on_a_withdrawn_registration
         Method::BackupBundleWrite,
         Method::AccountSignIn,
         Method::AccountSignOut,
+        Method::AccountStorageSignIn,
+        Method::AccountStorageSignOut,
     ];
 
     // The control first: nothing here is refused for authority while the registration stands.
@@ -1240,6 +1242,8 @@ async fn the_methods_that_take_no_admission_are_refused_while_a_fence_is_owed() 
         Method::BackupBundleWrite,
         Method::AccountSignIn,
         Method::AccountSignOut,
+        Method::AccountStorageSignIn,
+        Method::AccountStorageSignOut,
     ];
     let answer = |method: Method| {
         let controller = Arc::clone(&controller);

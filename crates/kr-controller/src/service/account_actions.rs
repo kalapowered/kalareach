@@ -1,4 +1,5 @@
-//! The host's own sign-ins to account services: the two methods of the managed account's, and the
+//! The host's own sign-ins to account services: the methods that sign the managed account in, out
+//! and read it, the same three for the account at a storage service the owner runs, and the
 //! accounts the daemon builds at start.
 
 use std::sync::Arc;
@@ -217,6 +218,70 @@ impl Controller {
     #[must_use]
     pub fn storage_account(&self) -> &Arc<crate::account::HostAccount> {
         self.storage_account.as_ref().unwrap_or(&self.account)
+    }
+
+    /// The account of the storage service the person runs, or the refusal a host with none is
+    /// given: its `storage.origin` is unset or names the managed account service, so it holds no
+    /// account of its own for storage.
+    fn own_storage_account(&self) -> Result<&Arc<HostAccount>> {
+        self.storage_account.as_ref().ok_or_else(|| {
+            ControllerError::NotConfigured(format!(
+                "{} in this host's configuration document ({}) is unset or names the managed \
+                 account service, so this host holds no account for a storage service you run; \
+                 `kr account sign-in` signs in the managed account",
+                kr_protocol::hostinfo::configuration::STORAGE_ORIGIN.key,
+                kr_protocol::hostinfo::configuration::FILE_NAME,
+            ))
+        })
+    }
+
+    /// Answers `account.storage_sign_in`: starts the sign-in at the storage service the person
+    /// runs and says when the daemon stops waiting for the browser.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::NotConfigured`] naming `storage.origin` for a host that holds no
+    /// storage account, and otherwise why no sign-in can start, as
+    /// [`crate::account::HostAccount::sign_in`] does.
+    pub(super) async fn account_storage_sign_in(
+        &self,
+        mutation: &kr_protocol::envelope::MutationRequest,
+    ) -> Result<ParamsValue> {
+        let _: AccountSignInParams = parse(&mutation.params)?;
+        let started = self.own_storage_account()?.sign_in().await?;
+        ParamsValue::from_typed(&started)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+    }
+
+    /// Answers `account.storage_sign_out`: removes the storage account's grant and asks the storage
+    /// service to end it. The managed account is not touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::NotConfigured`] naming `storage.origin` for a host that holds no
+    /// storage account, and otherwise why the host cannot sign out, as
+    /// [`crate::account::HostAccount::sign_out`] does.
+    pub(super) async fn account_storage_sign_out(
+        &self,
+        mutation: &kr_protocol::envelope::MutationRequest,
+    ) -> Result<ParamsValue> {
+        let _: AccountSignOutParams = parse(&mutation.params)?;
+        let done = self.own_storage_account()?.sign_out().await?;
+        ParamsValue::from_typed(&done)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+    }
+
+    /// Answers `account.storage_status`: where the storage account's sign-in stands.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] for parameters that are not empty, and
+    /// [`ControllerError::NotConfigured`] naming `storage.origin` for a host that holds no storage
+    /// account.
+    pub(super) fn account_storage_status(&self, params: &ParamsValue) -> Result<ParamsValue> {
+        let _: AccountStatusParams = parse(params)?;
+        ParamsValue::from_typed(&self.own_storage_account()?.report())
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
 
     /// Answers `account.sign_in`: starts the sign-in and says when the daemon stops waiting for

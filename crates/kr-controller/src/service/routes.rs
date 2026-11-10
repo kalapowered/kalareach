@@ -31,7 +31,7 @@ use super::{Controller, encode, error_reply, net, parse, respond};
 /// missing runs while the fence is owed. `every_local_write_method_the_daemon_performs_is_placed`
 /// walks the registry and fails for a method that is on neither this list nor the list of those
 /// that take an admission.
-pub(super) const NO_ADMISSION: [Method; 10] = [
+pub(super) const NO_ADMISSION: [Method; 12] = [
     Method::HostPolicyConfirm,
     Method::EnvironmentEnrol,
     Method::EnvironmentForget,
@@ -42,6 +42,8 @@ pub(super) const NO_ADMISSION: [Method; 10] = [
     Method::PrivacyRetainedDelete,
     Method::AccountSignIn,
     Method::AccountSignOut,
+    Method::AccountStorageSignIn,
+    Method::AccountStorageSignOut,
 ];
 
 impl Controller {
@@ -346,6 +348,7 @@ impl Controller {
             Method::OrganisationList => self.organisation_list().await,
             Method::PrivacyStatus => self.privacy_status().await,
             Method::AccountStatus => self.account_status(&request.params),
+            Method::AccountStorageStatus => self.account_storage_status(&request.params),
             Method::BackupRead => self.backup_read(&request.params).await,
             Method::BackupStatus => self.backup_status(&request.params).await,
             Method::DescriptionSetup => self.description_setup(),
@@ -925,6 +928,30 @@ impl Controller {
                         connection_id,
                         admitted,
                         self.account_sign_out(mutation),
+                    )
+                    .await;
+            }
+            // The sign-in and sign-out of the account at a storage service the person runs are
+            // claimed the same way, and act on that account alone.
+            Method::AccountStorageSignIn => {
+                return self
+                    .claimed_action(
+                        actor_id,
+                        mutation,
+                        connection_id,
+                        admitted,
+                        self.account_storage_sign_in(mutation),
+                    )
+                    .await;
+            }
+            Method::AccountStorageSignOut => {
+                return self
+                    .claimed_action(
+                        actor_id,
+                        mutation,
+                        connection_id,
+                        admitted,
+                        self.account_storage_sign_out(mutation),
                     )
                     .await;
             }

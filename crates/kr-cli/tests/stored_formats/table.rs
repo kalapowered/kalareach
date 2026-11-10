@@ -508,6 +508,8 @@ pub fn retained_answers() -> Vec<(kr_protocol::method::Method, &'static str)> {
         (Method::PrivacySet, "PrivacyReport"),
         (Method::AccountSignIn, "AccountSignInStarted"),
         (Method::AccountSignOut, "AccountSignedOut"),
+        (Method::AccountStorageSignIn, "AccountSignInStarted"),
+        (Method::AccountStorageSignOut, "AccountSignedOut"),
         (Method::SessionRename, "SessionRenameResult"),
         (Method::DescriptionConfigure, "DescriptionSetup"),
         (Method::DescriptionDownload, "DescriptionSetup"),
