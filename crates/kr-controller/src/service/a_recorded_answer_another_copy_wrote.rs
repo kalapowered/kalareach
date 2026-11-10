@@ -12,6 +12,7 @@
 //! first copy or planted where the late copy finds it, and asks the service three things: the
 //! control (nothing owed, the copy is given the record), a fence owed, and a registration gone.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,8 +30,52 @@ use crate::authority::AdmittedMutation;
 use crate::given::Given;
 use crate::service::Controller;
 
+/// How long a case waits for a call to reach the place a pause stops it at.
+pub(super) const WAIT_BOUND: Duration = Duration::from_secs(30);
+
+/// What `attempt` is answered with when a fence this host owes lands while it is stopped at the
+/// pause `stopped` arms: the call has arrived there when the receiver says so, and goes on when the
+/// sender is used. The fence is gone again when the answer is given.
+pub(super) async fn answered_after_a_fence_lands_at<T>(
+    controller: &Controller,
+    (arrived, release): (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ),
+    attempt: impl Future<Output = T>,
+) -> T {
+    tokio::pin!(attempt);
+    tokio::select! {
+        reached = tokio::time::timeout(WAIT_BOUND, arrived) => {
+            reached
+                .expect("the attempt reaches the place it is stopped at")
+                .expect("the pause is armed");
+        }
+        _ = &mut attempt => panic!("the attempt was answered without reaching the place it is stopped at"),
+    }
+    controller.hold_fence(true);
+    release.send(()).expect("the attempt goes on");
+    let answered = attempt.await;
+    controller.hold_fence(false);
+    answered
+}
+
+/// [`answered_after_a_fence_lands_at`] the check the service asks with what it found in hand: the
+/// pause every such check starts with.
+///
+/// Where the check is asked on a thread that blocks, or by the door before the service, no pause
+/// stops it, and a case sets its fence before the call ([`refused_for_the_fence`]) and shows that
+/// the check runs, not when.
+pub(super) async fn answered_after_a_fence_lands_at_the_check<T>(
+    controller: &Controller,
+    attempt: impl Future<Output = T>,
+) -> T {
+    answered_after_a_fence_lands_at(controller, controller.pause_retained_lookup(), attempt).await
+}
+
 /// The refusal a late copy is given while this host owes a fence it could not raise, asked again
-/// once the fence is gone and the control has been shown by the case itself.
+/// once the fence is gone and the control has been shown by the case itself. The fence is set
+/// before the call, so the case shows that the check runs, not when.
 pub(super) async fn refused_for_the_fence(
     controller: &Controller,
     late: impl AsyncFn() -> Result<ParamsValue, ProtocolError>,
@@ -41,6 +86,18 @@ pub(super) async fn refused_for_the_fence(
         .expect_err("a fence this host owes stops the recorded answer");
     refused_for_a_fence(&refused);
     controller.hold_fence(false);
+}
+
+/// [`refused_for_the_fence`] with the fence landing at the check the service asks with what it found
+/// in hand ([`answered_after_a_fence_lands_at_the_check`]).
+pub(super) async fn refused_for_a_fence_landing_at_the_check(
+    controller: &Controller,
+    late: impl AsyncFn() -> Result<ParamsValue, ProtocolError>,
+) {
+    let refused = answered_after_a_fence_lands_at_the_check(controller, late())
+        .await
+        .expect_err("a fence this host owes stops what the service found");
+    refused_for_a_fence(&refused);
 }
 
 /// The refusal a late copy is given once the registration it arrived on is gone.
@@ -68,8 +125,9 @@ async fn refused_for_the_registration(
 /// when the create reaches the registry after the door's own look found none, is given what the
 /// reservation leaves only under the authority the create arrived under, asked with it in hand.
 /// The control: with nothing owed the repeat is given the answer as one read from the reservation.
-/// While this host owes a fence, or once the revision the create was admitted under has been
-/// replaced by another device's revocation, it is not.
+/// A fence that lands once the answer is in hand, or the replacement of the revision the create was
+/// admitted under by another device's revocation, stops it, and the refusal is a copy the service
+/// withheld.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_repeated_create_is_given_what_its_first_attempt_made_only_under_its_authority() {
     use kr_protocol::session::{LaunchProfile, Presentation, SessionCreateParams, ShellMode};
@@ -133,18 +191,18 @@ async fn a_repeated_create_is_given_what_its_first_attempt_made_only_under_its_a
         .expect_err("what the reservation leaves is the launch's failure");
     assert_ne!(kept.code(), ErrorCode::PermissionDenied, "{kept}");
 
-    controller.hold_fence(true);
-    let refused = late()
+    // The fence lands once the reservation's answer is in hand, where the create asks its check.
+    let refused = answered_after_a_fence_lands_at_the_check(&controller, late())
         .await
-        .into_answer()
+        .into_withheld()
         .expect_err("a fence this host owes stops the answer");
     refused_for_a_fence(&refused.to_protocol_error());
-    controller.hold_fence(false);
 
+    // The revision is replaced before the call: this leg shows that the check runs, not when.
     another_devices_revocation_lands(&controller).await;
     let refused = late()
         .await
-        .into_answer()
+        .into_withheld()
         .expect_err("a revision that has been replaced stops the answer")
         .to_protocol_error();
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
@@ -161,7 +219,7 @@ async fn a_repeated_create_is_given_what_its_first_attempt_made_only_under_its_a
 
 /// A cancellation of an operation nobody started, under a fresh action identifier. The service
 /// refuses it, and keeps the refusal as the action's answer.
-fn cancellation(temp: &kr_ipc::testing::TempHost) -> MutationRequest {
+pub(super) fn cancellation(temp: &kr_ipc::testing::TempHost) -> MutationRequest {
     mutation_of(
         temp,
         Method::ProjectOperationCancel,
@@ -212,7 +270,7 @@ fn clearing_a_binding(temp: &kr_ipc::testing::TempHost) -> MutationRequest {
 
 /// The project service's answer to `mutation`, asked as the daemon asks it: `begin` is the check a
 /// first admission begins under, and the check a recorded answer is owed is the daemon's own.
-async fn project_answer(
+pub(super) async fn project_answer(
     controller: &Arc<Controller>,
     actor_id: &ActorId,
     mutation: &MutationRequest,
@@ -235,6 +293,28 @@ async fn project_answer(
         .await
 }
 
+/// The project service's answer to `mutation` asked through the daemon's entry for it, which asks
+/// the authority half of the admission before the service reads its record.
+pub(super) async fn project_answer_under(
+    controller: &Arc<Controller>,
+    actor_id: &ActorId,
+    mutation: &MutationRequest,
+    admission: AdmittedMutation,
+) -> Given<Result<ParamsValue, ProtocolError>> {
+    controller
+        .project_mutation(
+            actor_id,
+            mutation,
+            mutation
+                .method
+                .method()
+                .expect("a method this daemon serves"),
+            admission,
+            None,
+        )
+        .await
+}
+
 /// The refusal the project service keeps for an action in the cases that plant one.
 fn the_planted_refusal() -> kr_project::store::RetainedOutcome {
     kr_project::store::RetainedOutcome::Error {
@@ -245,7 +325,7 @@ fn the_planted_refusal() -> kr_project::store::RetainedOutcome {
 
 /// Writes the refusal another copy of `mutation` would have kept, where the project service's own
 /// look finds it.
-fn plant_a_project_refusal(
+pub(super) fn plant_a_project_refusal(
     controller: &Controller,
     actor_id: &ActorId,
     mutation: &MutationRequest,
@@ -265,7 +345,7 @@ fn plant_a_project_refusal(
 }
 
 /// What a deadline that has passed refuses a first admission with.
-fn a_deadline_that_passed() -> ProtocolError {
+pub(super) fn a_deadline_that_passed() -> ProtocolError {
     crate::error::ControllerError::WindowExpired {
         detail: "the deadline passed".to_owned(),
     }
@@ -301,7 +381,7 @@ async fn a_late_copy_of_a_kept_refusal(
             controller.admission_in_service(admission),
         )
         .await
-        .into_answer()
+        .into_withheld()
     };
     let control = project_answer(
         controller,
@@ -325,6 +405,8 @@ async fn a_late_copy_of_a_kept_refusal(
 /// KR-REQ-09.09, the project service's first look: an action another copy recorded after the door's
 /// own lookup is given back only under the authority the late copy arrived under, asked with the
 /// record in hand. The control: with nothing owed the late copy is given the record as a copy.
+/// The fence is set before the call: the project service asks its check on a thread that blocks,
+/// where no pause stops it, so the case shows that the check runs, not when.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_project_action_recorded_before_a_late_attempts_look_is_not_given_back_while_a_fence_is_owed()
  {
@@ -338,6 +420,8 @@ async fn a_project_action_recorded_before_a_late_attempts_look_is_not_given_back
 /// needs no owner's confirmation, and its answer, a refusal here, is kept like any action's. A
 /// repeat of it, found by the decision path's own look after the door's, is given back only under
 /// the authority the repeat arrived under. The control: with nothing owed it is given the record.
+/// The fence is set before the call: the project service asks its check on a thread that blocks,
+/// where no pause stops it, so the case shows that the check runs, not when.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cleared_binding_another_copy_recorded_is_not_given_back_while_a_fence_is_owed() {
     let (temp, controller, _clock) = daemon().await;
@@ -355,6 +439,8 @@ async fn a_cleared_binding_another_copy_recorded_is_not_given_back_while_a_fence
 /// passed) while another copy settles the action is given the record the journal then holds only
 /// under the authority it arrived under. The control: with nothing owed it is given the record.
 /// While this host owes a fence the record is not given back, the fence is the copy's answer.
+/// The fence is set before the call: the project service asks its check on a thread that blocks,
+/// where no pause stops it, so the case shows that the check runs, not when.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_project_action_that_settles_while_its_admission_is_asked_is_not_given_back_while_a_fence_is_owed()
  {
@@ -400,7 +486,7 @@ async fn a_project_action_that_settles_while_its_admission_is_asked_is_not_given
         settling(&mutation),
     )
     .await
-    .into_answer()
+    .into_withheld()
     .expect_err("a fence this host owes stops the record the journal then holds");
     refused_for_a_fence(&refused);
     controller.hold_fence(false);
@@ -415,7 +501,7 @@ async fn a_project_action_that_settles_while_its_admission_is_asked_is_not_given
         settling(&mutation),
     )
     .await
-    .into_answer()
+    .into_withheld()
     .expect_err("a registration that is gone stops it");
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
     assert_ne!(refused.message, "planted");
@@ -425,6 +511,8 @@ async fn a_project_action_that_settles_while_its_admission_is_asked_is_not_given
 /// holds a claim for its action with no outcome is told that what became of the action is not known
 /// only under the authority it arrived under. The control: with nothing owed it is told so. While
 /// this host owes a fence it is refused for the fence, and told nothing of the claim.
+/// The fence is set before the call: the project service asks its check on a thread that blocks,
+/// where no pause stops it, so the case shows that the check runs, not when.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_project_action_whose_claim_is_open_is_not_told_while_a_fence_is_owed() {
     let (temp, controller, _clock) = daemon().await;
@@ -492,6 +580,8 @@ async fn a_project_action_whose_claim_is_open_is_not_told_while_a_fence_is_owed(
 /// the action recorded when it comes to record its own answer (and wrote no claim) is given the
 /// record only under the authority it arrived under. The record is written while the admission is
 /// asked, which passes. The control: with nothing owed the attempt is given it as a copy.
+/// The fence is set before the call: the project service asks its check on a thread that blocks,
+/// where no pause stops it, so the case shows that the check runs, not when.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_project_action_another_copy_recorded_while_it_ran_is_not_given_back_while_a_fence_is_owed()
  {
@@ -538,7 +628,7 @@ async fn a_project_action_another_copy_recorded_while_it_ran_is_not_given_back_w
         racing(&mutation),
     )
     .await
-    .into_answer()
+    .into_withheld()
     .expect_err("a fence this host owes stops the record");
     refused_for_a_fence(&refused);
     controller.hold_fence(false);
@@ -547,6 +637,8 @@ async fn a_project_action_another_copy_recorded_while_it_ran_is_not_given_back_w
 /// KR-REQ-09.09, a record that cannot be written: an attempt whose own record is refused by the
 /// store reads the record another copy wrote, and is given it only under the authority it arrived
 /// under. The control: with nothing owed the attempt is given it as a copy.
+/// The fence is set before the call: the project service asks its check on a thread that blocks,
+/// where no pause stops it, so the case shows that the check runs, not when.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_project_action_whose_record_cannot_be_written_is_given_the_other_copys_only_under_its_authority()
  {
@@ -607,7 +699,7 @@ async fn a_project_action_whose_record_cannot_be_written_is_given_the_other_copy
         racing(&mutation),
     )
     .await
-    .into_answer()
+    .into_withheld()
     .expect_err("a fence this host owes stops the record");
     refused_for_a_fence(&refused);
     controller.hold_fence(false);
@@ -622,7 +714,7 @@ async fn a_project_action_whose_record_cannot_be_written_is_given_the_other_copy
 
 /// A materialisation of a version nobody captured, under a fresh action identifier. The service
 /// refuses it, and keeps the refusal as the action's answer.
-fn materialisation(temp: &kr_ipc::testing::TempHost) -> MutationRequest {
+pub(super) fn materialisation(temp: &kr_ipc::testing::TempHost) -> MutationRequest {
     mutation_of(
         temp,
         Method::ChangesetMaterialize,
@@ -638,7 +730,7 @@ fn materialisation(temp: &kr_ipc::testing::TempHost) -> MutationRequest {
     )
 }
 
-async fn changeset_answer(
+pub(super) async fn changeset_answer(
     controller: &Arc<Controller>,
     actor_id: &ActorId,
     mutation: &MutationRequest,
@@ -676,7 +768,7 @@ async fn a_change_set_action_recorded_before_a_late_attempts_look_is_not_given_b
     let late = async || {
         changeset_answer(&controller, &actor_id, &mutation, admission)
             .await
-            .into_answer()
+            .into_withheld()
     };
     let control = changeset_answer(&controller, &actor_id, &mutation, admission).await;
     assert!(control.is_copied(), "the late copy reads the record");
@@ -741,11 +833,7 @@ async fn a_change_set_action_whose_claim_another_copy_holds_is_not_told_after_a_
     let mut late = tokio::spawn({
         let (controller, actor_id, mutation) =
             (Arc::clone(&controller), actor_id.clone(), mutation.clone());
-        async move {
-            changeset_answer(&controller, &actor_id, &mutation, admission)
-                .await
-                .into_answer()
-        }
+        async move { changeset_answer(&controller, &actor_id, &mutation, admission).await }
     });
     tokio::select! {
         reached = tokio::time::timeout(Duration::from_secs(30), arrived) => {
@@ -763,6 +851,7 @@ async fn a_change_set_action_whose_claim_another_copy_holds_is_not_told_after_a_
     let refused = late
         .await
         .expect("the copy finishes")
+        .into_withheld()
         .expect_err("a fence that landed once the copy had the answer stops it");
     refused_for_a_fence(&refused);
     controller.hold_fence(false);
@@ -775,24 +864,17 @@ async fn a_change_set_action_whose_claim_another_copy_holds_is_not_told_after_a_
 // The catalogue
 // ---------------------------------------------------------------------------------------------
 
-/// An admission that lets a fence land once its first check has passed, and asks the daemon's own
-/// check otherwise.
-struct FenceAfterTheFirstCheck {
-    inner: crate::catalogue::DaemonAdmission,
-    controller: Arc<Controller>,
-    landing: std::sync::atomic::AtomicBool,
+/// An admission that lets a fence land where the check a recorded answer is owed is asked, with the
+/// answer in hand, and asks the daemon's own check otherwise.
+pub(super) struct FenceAtTheRetainedCheck {
+    pub(super) inner: crate::catalogue::DaemonAdmission,
+    pub(super) controller: Arc<Controller>,
+    pub(super) landing: std::sync::atomic::AtomicBool,
 }
 
-impl kr_plugin_catalogue::Authority for FenceAfterTheFirstCheck {
+impl kr_plugin_catalogue::Authority for FenceAtTheRetainedCheck {
     fn check(&self) -> kr_plugin_catalogue::CatalogueResult<()> {
-        let checked = self.inner.check();
-        if self
-            .landing
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            self.controller.hold_fence(true);
-        }
-        checked
+        self.inner.check()
     }
 
     fn commit(
@@ -808,20 +890,26 @@ impl kr_plugin_catalogue::Authority for FenceAfterTheFirstCheck {
     }
 }
 
-impl crate::catalogue::Admission for FenceAfterTheFirstCheck {
+impl crate::catalogue::Admission for FenceAtTheRetainedCheck {
     fn accepted_deadline_ms(&self) -> Option<u64> {
         self.inner.accepted_deadline_ms()
     }
 
     fn check_retained(&self) -> kr_plugin_catalogue::CatalogueResult<()> {
+        if self
+            .landing
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.controller.hold_fence(true);
+        }
         self.inner.check_retained()
     }
 }
 
-/// KR-REQ-09.09, the catalogue's claim: a receipt another copy kept, found by the claim once the
-/// early check has passed, is given back only under the authority the late copy arrived under,
-/// asked with the receipt in hand. The control: with nothing owed the late copy is given the
-/// receipt as a copy. A fence that lands once the early check has passed stops it.
+/// KR-REQ-09.09, the catalogue's receipt: a receipt another copy kept, read before the late copy's
+/// admission is asked, is given back only under the authority the late copy arrived under, asked
+/// with the receipt in hand. The control: with nothing owed the late copy is given the receipt as a
+/// copy. A fence that lands once the receipt is in hand stops it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_catalogue_receipt_kept_before_a_late_attempts_claim_is_not_given_back_after_a_fence_lands()
  {
@@ -839,7 +927,7 @@ async fn a_catalogue_receipt_kept_before_a_late_attempts_claim_is_not_given_back
     );
     let admission = carried(&controller, connection_id);
     let attempt = |landing: bool| {
-        let admission: Arc<dyn crate::catalogue::Admission> = Arc::new(FenceAfterTheFirstCheck {
+        let admission: Arc<dyn crate::catalogue::Admission> = Arc::new(FenceAtTheRetainedCheck {
             inner: crate::catalogue::DaemonAdmission::new(Arc::clone(&controller), admission),
             controller: Arc::clone(&controller),
             landing: std::sync::atomic::AtomicBool::new(landing),
@@ -870,8 +958,8 @@ async fn a_catalogue_receipt_kept_before_a_late_attempts_claim_is_not_given_back
 
     let refused = attempt(true)
         .await
-        .into_answer()
-        .expect_err("a fence that landed after the early check stops the receipt");
+        .into_withheld()
+        .expect_err("a fence that landed once the receipt was in hand stops it");
     refused_for_a_fence(&refused);
     controller.hold_fence(false);
 }
@@ -881,7 +969,7 @@ async fn a_catalogue_receipt_kept_before_a_late_attempts_claim_is_not_given_back
 // ---------------------------------------------------------------------------------------------
 
 /// A quiet-hours window to set, under a fresh action identifier.
-fn setting_quiet_hours(temp: &kr_ipc::testing::TempHost) -> MutationRequest {
+pub(super) fn setting_quiet_hours(temp: &kr_ipc::testing::TempHost) -> MutationRequest {
     use kr_protocol::attention::{AttentionQuietHoursParams, QuietHours};
 
     mutation_of(
@@ -899,7 +987,7 @@ fn setting_quiet_hours(temp: &kr_ipc::testing::TempHost) -> MutationRequest {
 }
 
 /// The attention store's answer to `mutation`, as the daemon asks it.
-async fn attention_answer(
+pub(super) async fn attention_answer(
     controller: &Arc<Controller>,
     actor_id: &ActorId,
     mutation: &MutationRequest,
@@ -920,22 +1008,18 @@ async fn attention_answer(
 
 /// What a late copy is given when it has passed the entry check and is at the store, where the
 /// record is found, and a fence lands there when `fence` says so.
-async fn a_late_attention_copy_at_the_store(
+pub(super) async fn a_late_attention_copy_at_the_store(
     controller: &Arc<Controller>,
     actor_id: &ActorId,
     mutation: &MutationRequest,
     admission: AdmittedMutation,
     fence: bool,
-) -> Result<ParamsValue, ProtocolError> {
+) -> Given<Result<ParamsValue, ProtocolError>> {
     let (arrived, release) = controller.attention().pause_before_store();
     let mut late = tokio::spawn({
         let (controller, actor_id, mutation) =
             (Arc::clone(controller), actor_id.clone(), mutation.clone());
-        async move {
-            attention_answer(&controller, &actor_id, &mutation, admission)
-                .await
-                .into_answer()
-        }
+        async move { attention_answer(&controller, &actor_id, &mutation, admission).await }
     });
     let reached =
         tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)));
@@ -983,6 +1067,7 @@ async fn an_attention_action_recorded_before_a_late_attempts_look_is_not_given_b
     let refused =
         a_late_attention_copy_at_the_store(&controller, &actor_id, &mutation, admission, true)
             .await
+            .into_withheld()
             .expect_err("a fence that landed at the store stops the record it returns");
     refused_for_a_fence(&refused);
 }
@@ -1014,12 +1099,14 @@ async fn an_attention_record_that_cannot_be_read_is_not_told_after_a_fence_lands
     let told =
         a_late_attention_copy_at_the_store(&controller, &actor_id, &mutation, admission, false)
             .await
+            .into_answer()
             .expect_err("an answer that cannot be decoded does not answer the repeat");
     assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
 
     let refused =
         a_late_attention_copy_at_the_store(&controller, &actor_id, &mutation, admission, true)
             .await
+            .into_withheld()
             .expect_err("a fence that landed at the store is the answer");
     refused_for_a_fence(&refused);
 }
@@ -1028,14 +1115,13 @@ async fn an_attention_record_that_cannot_be_read_is_not_told_after_a_fence_lands
 // The automation journal
 // ---------------------------------------------------------------------------------------------
 
-/// KR-REQ-09.09, the automation journal's record: a workflow install that another copy of its
-/// action recorded is read back by the journal, inside its own transaction and without asking the
-/// admission, and is given to the late copy only under the authority it arrived under, asked once
-/// the journal has answered. The late copy passes the daemon's own check and is stopped before the
-/// journal's transaction, where a fence lands. The control: with nothing owed the late copy is
-/// given what the first was told, as a copy of the record.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_automation_action_another_copy_recorded_is_not_given_back_after_a_fence_lands() {
+/// A workflow install whose grant the daemon holds, under a fresh action identifier: the request an
+/// automation case sends. The grant is the one a person sharing a session would have issued, with
+/// every right the workflow's node needs.
+pub(super) fn a_workflow_install(
+    temp: &kr_ipc::testing::TempHost,
+    controller: &Controller,
+) -> MutationRequest {
     use kr_protocol::automation::{
         WorkflowActionKind, WorkflowDeadlines, WorkflowDefinition, WorkflowInstallParams,
         WorkflowNode, WorkflowResourceScope, WorkflowTrigger,
@@ -1046,9 +1132,6 @@ async fn an_automation_action_another_copy_recorded_is_not_given_back_after_a_fe
     use kr_protocol::ids::{GrantId, WorkflowId};
     use kr_protocol::rights::ActionRight;
     use kr_protocol::scalars::{CanonicalSet, Uuid};
-
-    let (temp, controller, _clock) = daemon().await;
-    let (connection_id, actor_id) = admitted(&controller).await;
 
     // The grant the workflow acts under, with every right its node needs, as a person sharing a
     // session would have issued it.
@@ -1123,8 +1206,8 @@ async fn an_automation_action_another_copy_recorded_is_not_given_back_after_a_fe
         enabled: false,
         explicit_recurrence: false,
     };
-    let mutation = mutation_of(
-        &temp,
+    mutation_of(
+        temp,
         Method::WorkflowInstall,
         ParamsValue::from_typed(&WorkflowInstallParams {
             workflow_id: definition.workflow_id,
@@ -1133,7 +1216,21 @@ async fn an_automation_action_another_copy_recorded_is_not_given_back_after_a_fe
             grant_reference: definition.grant_reference,
         })
         .expect("encodes"),
-    );
+    )
+}
+
+/// KR-REQ-09.09, the automation journal's record: a workflow install that another copy of its
+/// action recorded is read back by the journal, inside its own transaction and without asking the
+/// admission, and is given to the late copy only under the authority it arrived under, asked once
+/// the journal has answered. The late copy passes the daemon's own check and is stopped before the
+/// journal's transaction, where a fence lands. The control: with nothing owed the late copy is
+/// given what the first was told, as a copy of the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_automation_action_another_copy_recorded_is_not_given_back_after_a_fence_lands() {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+
+    let mutation = a_workflow_install(&temp, &controller);
     let admission = carried(&controller, connection_id);
     let attempt = || {
         controller.automation_mutation(
@@ -1172,7 +1269,6 @@ async fn an_automation_action_another_copy_recorded_is_not_given_back_after_a_fe
                     None,
                 )
                 .await
-                .into_answer()
         }
     });
     tokio::select! {
@@ -1188,6 +1284,7 @@ async fn an_automation_action_another_copy_recorded_is_not_given_back_after_a_fe
     let refused = late
         .await
         .expect("the late copy finishes")
+        .into_withheld()
         .expect_err("a fence that landed before the journal stops the record it gives back");
     refused_for_a_fence(&refused);
     controller.hold_fence(false);
@@ -1199,7 +1296,7 @@ async fn an_automation_action_another_copy_recorded_is_not_given_back_after_a_fe
 
 /// A request for the disclosed checks that names `authorised_file`, under a fixed action
 /// identifier when one is given.
-fn capability_request(
+pub(super) fn capability_request(
     temp: &kr_ipc::testing::TempHost,
     action_id: Option<ActionId>,
     authorised_file: Option<&str>,
@@ -1326,8 +1423,8 @@ async fn a_reused_capability_check_identifier_is_not_refused_as_a_conflict_after
 /// KR-REQ-09.09, the disclosed checks' record that cannot be read: that a record exists for the
 /// identifier is what the caller would be told, so it is held to the same check. The late copy
 /// holds the lock of the checks and reads a record whose answer cannot be decoded. The control: with
-/// nothing owed the late copy is told the record of answers is unavailable. A fence that lands
-/// before it reads is the answer instead.
+/// nothing owed the late copy is told, as every other service tells a record it cannot read, that
+/// what became of the action is not known. A fence that lands before it reads is the answer instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_capability_check_answer_that_cannot_be_read_is_not_told_after_a_fence_lands() {
     let (temp, controller, _clock) = daemon().await;
@@ -1357,8 +1454,8 @@ async fn a_capability_check_answer_that_cannot_be_read_is_not_told_after_a_fence
             .expect_err("an answer that cannot be decoded does not answer the repeat");
     assert_eq!(
         told.to_protocol_error().code,
-        ErrorCode::StorageUnavailable,
-        "{told:?}"
+        ErrorCode::OutcomeUnknown,
+        "an earlier attempt may have started the checks, so no transient word is told: {told:?}"
     );
 
     let refused =
@@ -1376,6 +1473,8 @@ async fn a_capability_check_answer_that_cannot_be_read_is_not_told_after_a_fence
 /// given, found by the owner's own look after the door's, is given back only under the authority
 /// the late copy arrived under. The control: with nothing owed the repeat is given the challenge
 /// as a copy. While this host owes a fence, or once the registration is gone, it is not.
+/// The fence is set before the call: the pairing door asks its check on a thread that blocks, where
+/// no pause stops it, so the case shows that the check runs, not when.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_confirmation_request_another_copy_was_given_is_not_given_back_while_a_fence_is_owed() {
     use kr_protocol::confirmation::{ConfirmationSubject, OwnerConfirmationRequestParams};
@@ -1427,7 +1526,7 @@ async fn a_confirmation_request_another_copy_was_given_is_not_given_back_while_a
     let late = async || {
         attempt()
             .await
-            .into_answer()
+            .into_withheld()
             .map_err(|error| error.to_protocol_error())
     };
     refused_for_the_fence(&controller, late).await;

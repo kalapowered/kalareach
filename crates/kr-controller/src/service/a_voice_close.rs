@@ -1314,7 +1314,7 @@ async fn a_stop_recorded_by_another_copy_before_its_claim_is_given_back_only_und
     )
     .await;
     let refused = late
-        .into_answer()
+        .into_withheld()
         .expect_err("the record is not given back while a fence is owed");
     assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
     assert!(refused.to_string().contains("fence"), "{refused}");
@@ -1331,7 +1331,7 @@ async fn a_stop_recorded_by_another_copy_before_its_claim_is_given_back_only_und
         })
         .await;
     let refused = late
-        .into_answer()
+        .into_withheld()
         .expect_err("the record is not given back to a connection that is gone");
     assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
     assert_eq!(

@@ -74,21 +74,20 @@ impl Controller {
         carried: crate::authority::AdmittedMutation,
         grant: Option<GrantId>,
     ) -> Given<std::result::Result<ParamsValue, ProtocolError>> {
-        // A mutation carrying no freshness at all is a retry of an action this host may already
-        // hold: section 9 keeps its record readable after the window that admitted it is gone, and
-        // the project service's own retained record is where such a retry is answered from above.
-        // What it may not do is perform the action again.
-        if carried.deadline.is_none() {
-            return Given::Fresh(Err(ControllerError::WindowExpired {
-                detail: "this action carries no freshness, so it may be answered from what this \
-                         host holds and may not be performed"
-                    .to_owned(),
-            }
-            .to_protocol_error()));
-        }
+        // Only the authority half of the admission is asked here. Section 9 keeps a receipt
+        // readable after the window that admitted its action is gone, so a copy whose window passed
+        // while it waited for the registry, or one that carries no freshness at all, is answered
+        // from the project service's record. What neither may do is perform the action: the
+        // service asks the whole admission, deadline included, where the action begins.
         {
             let registry = self.registry.lock().await;
-            if let Err(error) = self.check_admission(&registry, &carried) {
+            if let Err(error) = self.check_admission(
+                &registry,
+                &crate::authority::AdmittedMutation {
+                    deadline: None,
+                    ..carried
+                },
+            ) {
                 return Given::Fresh(Err(error.to_protocol_error()));
             }
         }
@@ -136,20 +135,19 @@ impl Controller {
         carried: crate::authority::AdmittedMutation,
         caller_grant: Option<kr_protocol::ids::GrantId>,
     ) -> Given<std::result::Result<ParamsValue, ProtocolError>> {
-        // A mutation carrying no freshness at all is a retry of an action this host may already
-        // hold, and the journal's record is where such a retry is answered from. What it may not
-        // do is perform the action.
-        if carried.deadline.is_none() {
-            return Given::Fresh(Err(ControllerError::WindowExpired {
-                detail: "this action carries no freshness, so it may be answered from what this \
-                         host holds and may not be performed"
-                    .to_owned(),
-            }
-            .to_protocol_error()));
-        }
+        // Only the authority half of the admission is asked here, as for the project service: a
+        // receipt outlives the window that admitted its action, so the journal answers a copy from
+        // its record whatever its window, and asks the whole admission, deadline included, before
+        // the action's first write.
         {
             let registry = self.registry.lock().await;
-            if let Err(error) = self.check_admission(&registry, &carried) {
+            if let Err(error) = self.check_admission(
+                &registry,
+                &crate::authority::AdmittedMutation {
+                    deadline: None,
+                    ..carried
+                },
+            ) {
                 return Given::Fresh(Err(error.to_protocol_error()));
             }
         }
@@ -163,10 +161,18 @@ impl Controller {
         // The journal reads a repeat's record inside its own transaction, after the lookup the
         // door made and without asking the admission, so what it gives back as a copy goes back
         // only under the authority this attempt arrived under, asked with the answer in hand.
-        if given.is_copied()
+        // The conflict of a reused identifier is no copy, and is held to the same check.
+        let reused =
+            matches!(&given, Given::Fresh(Err(refusal)) if refusal.code == ErrorCode::IdConflict);
+        if (given.is_copied() || reused)
             && let Err(refusal) = self.check_retained_in_hand(&carried).await
         {
-            return Given::Copied(Err(refusal.to_protocol_error()));
+            let refusal = Err(refusal.to_protocol_error());
+            return if given.is_copied() {
+                Given::Withheld(refusal)
+            } else {
+                Given::Fresh(refusal)
+            };
         }
         given
     }

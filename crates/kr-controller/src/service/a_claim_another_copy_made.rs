@@ -5,7 +5,12 @@
 //! action or looks for its record, is told of the conflict only under the authority it arrived
 //! under, asked with the conflict in hand: a fence this host owes stops it, as it stops a recorded
 //! answer. Each case plants the other copy's claim, and asks the service the control (nothing
-//! owed, the conflict is told) and then a fence owed.
+//! owed, the conflict is told) and then a fence owed. Where the service asks its check with the
+//! conflict in hand on the async side (a machine group step, the authority changes), the fence
+//! lands at the pause that check starts with, so the case shows the check is asked after the claim.
+//! Where the check is asked by the door's own function or a store on a thread that blocks (a
+//! privacy change, a transfer), no pause stops it, the fence is set before the call, and the case
+//! shows that the check runs, not when.
 
 use std::sync::Arc;
 
@@ -15,7 +20,9 @@ use kr_protocol::ids::{ActionId, ActorId};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Digest256, Nullable};
 
-use super::a_recorded_answer_another_copy_wrote::refused_for_the_fence;
+use super::a_recorded_answer_another_copy_wrote::{
+    answered_after_a_fence_lands_at_the_check, refused_for_a_fence_landing_at_the_check,
+};
 use super::the_fence_at_every_effect::{
     accepted, admitted, carried, daemon, mutation_of, refusal, refused_for_a_fence,
 };
@@ -38,9 +45,9 @@ fn a_claim_for_another_request(controller: &Controller, actor_id: &ActorId, acti
 /// KR-REQ-09.09, the conflict of a reused identifier, found where a machine group step claims its
 /// action: another attempt claimed the identifier for another request, and what that says goes back
 /// only under the authority this attempt arrived under. The control: with nothing owed the conflict
-/// is told. While this host owes a fence it is refused for the fence.
+/// is told. A fence that lands once the conflict is in hand refuses it for the fence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_machine_group_steps_conflict_is_not_told_while_a_fence_is_owed() {
+async fn a_machine_group_steps_conflict_is_not_told_after_a_fence_lands() {
     use kr_protocol::machine::{MachineExpected, MachineSplitParams};
 
     let (temp, controller, _clock) = daemon().await;
@@ -78,22 +85,20 @@ async fn a_machine_group_steps_conflict_is_not_told_while_a_fence_is_owed() {
         "with nothing owed the conflict is told: {control:?}"
     );
 
-    controller.hold_fence(true);
-    let refused = attempt().await;
+    let refused = answered_after_a_fence_lands_at_the_check(&controller, attempt()).await;
     refused_for_a_fence(
         refusal(&refused)
             .unwrap_or_else(|| panic!("a fence this host owes stops the conflict: {refused:?}")),
     );
-    controller.hold_fence(false);
 }
 
 /// KR-REQ-09.09, the conflict of a reused identifier, found where an authority change, a preview
 /// key's update and a push registration claim their action: another attempt claimed the identifier
 /// for another request, and what that says goes back only under the authority this attempt arrived
-/// under. The control: with nothing owed each conflict is told. While this host owes a fence each
-/// is refused for the fence.
+/// under. The control: with nothing owed each conflict is told. A fence that lands once the conflict
+/// is in hand refuses each for the fence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_authority_changes_conflict_is_not_told_while_a_fence_is_owed() {
+async fn an_authority_changes_conflict_is_not_told_after_a_fence_lands() {
     let (temp, controller, _clock) = daemon().await;
     let (connection_id, actor_id) = admitted(&controller).await;
     let admission = carried(&controller, connection_id);
@@ -139,9 +144,9 @@ async fn an_authority_changes_conflict_is_not_told_while_a_fence_is_owed() {
             ErrorCode::IdConflict
         );
     }
-    refused_for_the_fence(&controller, revoke).await;
-    refused_for_the_fence(&controller, rotate).await;
-    refused_for_the_fence(&controller, register).await;
+    refused_for_a_fence_landing_at_the_check(&controller, revoke).await;
+    refused_for_a_fence_landing_at_the_check(&controller, rotate).await;
+    refused_for_a_fence_landing_at_the_check(&controller, register).await;
 }
 
 /// KR-REQ-09.09, the conflict of a reused identifier, found where an action the host performs under
@@ -149,6 +154,7 @@ async fn an_authority_changes_conflict_is_not_told_while_a_fence_is_owed() {
 /// claims its action: another attempt claimed the identifier for another request, and what that says
 /// goes back only under the authority this attempt arrived under. The control: with nothing owed the
 /// conflict is told. While this host owes a fence it is refused for the fence.
+/// The fence is set before the call: the door's own function asks the check, with no pause before it, so the case shows that the check runs, not when.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_privacy_changes_conflict_is_not_told_while_a_fence_is_owed() {
     let (temp, controller, _clock) = daemon().await;
@@ -191,6 +197,7 @@ async fn a_privacy_changes_conflict_is_not_told_while_a_fence_is_owed() {
 /// record of its action: another attempt recorded the identifier for another request, and what that
 /// says goes back only under the authority this attempt arrived under. The control: with nothing
 /// owed the conflict is told. While this host owes a fence it is refused for the fence.
+/// The fence is set before the call: the transfer service's admission asks the check on a thread that blocks, where no pause stops it, so the case shows that the check runs, not when.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_transfers_conflict_is_not_told_while_a_fence_is_owed() {
     let (temp, controller, _clock) = daemon().await;

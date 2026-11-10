@@ -495,15 +495,32 @@ impl Controller {
         launch: Option<HeldLaunch>,
         admit: &(dyn Fn(&crate::registry::Registry) -> Result<()> + Sync),
     ) -> Given<Result<ParamsValue>> {
-        let mut copied = false;
+        let mut origin = crate::given::Origin::Fresh;
         let answer = self
-            .create_reserving(under_way, who, create, launch, admit, &mut copied)
+            .create_reserving(under_way, who, create, launch, admit, &mut origin)
             .await;
-        Given::of(answer, copied)
+        Given::from_origin(answer, origin)
     }
 
-    /// [`Self::create_under`], setting `copied` when the token already held a reservation and the
-    /// answer is read from it.
+    /// What a create is told when its token's reservation cannot be read, or another request holds
+    /// the token, found after the wait for the registry.
+    ///
+    /// A create that carries an admission is told it only under the authority it arrived under:
+    /// both say something of another attempt's reservation. A workflow node's create carries none.
+    async fn found_by_a_create(
+        &self,
+        carried: Option<crate::authority::AdmittedMutation>,
+        origin: &mut crate::given::Origin,
+        found: ControllerError,
+    ) -> ControllerError {
+        match carried {
+            Some(carried) => self.conflict_under_authority(&carried, origin, found).await,
+            None => found,
+        }
+    }
+
+    /// [`Self::create_under`], noting in `provenance` when the token already held a reservation and
+    /// the answer is read from it.
     ///
     /// # Errors
     ///
@@ -515,7 +532,7 @@ impl Controller {
         mut create: SessionCreateParams,
         launch: Option<HeldLaunch>,
         admit: &(dyn Fn(&crate::registry::Registry) -> Result<()> + Sync),
-        copied: &mut bool,
+        provenance: &mut crate::given::Origin,
     ) -> Result<ParamsValue> {
         let CreateFor {
             actor_id,
@@ -620,10 +637,14 @@ impl Controller {
             // A token whose reservation cannot be read is not a token that has none: an earlier
             // attempt may have made the session, so the caller is not told a transient word that
             // says nothing took effect.
-            let known = registry
-                .reservation_for_token(actor_id, token)
-                .map_err(|error| error.found_unreadable("sessions"))?
-                .is_some();
+            let known = match registry.reservation_for_token(actor_id, token) {
+                Ok(held) => held.is_some(),
+                Err(error) => {
+                    drop(registry);
+                    let found = error.found_unreadable("sessions");
+                    return Err(self.found_by_a_create(carried, provenance, found).await);
+                }
+            };
             // A host that cannot use its configuration document creates no new session: the
             // owner's choice between the two execution contexts is in it, and neither is inside
             // the other. The request cannot say it chose: a client fills in the host's default.
@@ -648,17 +669,20 @@ impl Controller {
                     detail: short.detail,
                 });
             }
-            registry
-                .reserve(actor_id, token, digest, &intent, kr_ipc::now_ms())
-                .map_err(|error| {
+            match registry.reserve(actor_id, token, digest, &intent, kr_ipc::now_ms()) {
+                Ok(admission) => admission,
+                Err(error) => {
+                    drop(registry);
                     // The token was read a moment ago under this lock: one that has a reservation
                     // is a repeat, and a repeat is told the same of a record it cannot read.
-                    if known {
+                    let found = if known {
                         error.found_unreadable("sessions")
                     } else {
                         error
-                    }
-                })?
+                    };
+                    return Err(self.found_by_a_create(carried, provenance, found).await);
+                }
+            }
         };
         let reservation = admission.reservation;
         if admission.deduplicated {
@@ -676,17 +700,23 @@ impl Controller {
                 let registry = self.registry.lock().await;
                 admit(&registry)?;
             }
-            *copied = true;
             // A connection's repeat is told what the first attempt made only under the authority
             // it arrived under, asked once the answer is in hand: the reservation was found after
             // the door's own look, and waiting for the registry and for the session's worker can
             // outlast a fence this host owes or the registration the repeat arrived on.
             return match carried {
                 Some(carried) => {
-                    self.retained_under_authority(&carried, self.replay_create(&reservation))
-                        .await
+                    self.retained_under_authority(
+                        &carried,
+                        provenance,
+                        self.replay_create(&reservation),
+                    )
+                    .await
                 }
-                None => self.replay_create(&reservation).await,
+                None => {
+                    provenance.note(crate::given::Origin::Copied);
+                    self.replay_create(&reservation).await
+                }
             };
         }
 

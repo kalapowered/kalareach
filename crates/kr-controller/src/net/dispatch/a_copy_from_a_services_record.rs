@@ -645,7 +645,7 @@ async fn a_refusal_the_workflow_journal_copies_from_its_record_is_told_as_unknow
 
 /// The step that joins this environment's machine group to another group, approved against the
 /// record the environment holds now.
-fn a_join(world: &fake::Silent) -> ParamsValue {
+pub(super) fn a_join(world: &fake::Silent) -> ParamsValue {
     let current = world
         .controller
         .machine_report()

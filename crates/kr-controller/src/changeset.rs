@@ -353,12 +353,20 @@ impl ChangeSetModule {
             )
             .await;
         let copied = copied.load(Ordering::Acquire);
-        let answer = if copied && let Err(refusal) = standing.check_retained_in_hand(&carried).await
+        // The conflict of a reused identifier is no copy, and is held to the same check.
+        let reused = answer
+            .as_ref()
+            .is_err_and(|refusal| refusal.code == ErrorCode::IdConflict);
+        if (copied || reused)
+            && let Err(refusal) = standing.check_retained_in_hand(&carried).await
         {
-            Err(refusal.to_protocol_error())
-        } else {
-            answer
-        };
+            let refusal = Err(refusal.to_protocol_error());
+            return if copied {
+                Given::Withheld(refusal)
+            } else {
+                Given::Fresh(refusal)
+            };
+        }
         Given::of(answer, copied)
     }
 
@@ -383,7 +391,8 @@ impl ChangeSetModule {
         let action_id = mutation.action_id.get();
         let name = method.as_str();
         blocking(move || {
-            if let Some(retained) = kept(&service, &actor, action_id, name, digest)? {
+            if let Some(retained) = kept_noting(&service, &actor, action_id, name, digest, &copied)?
+            {
                 copied.store(true, Ordering::Release);
                 return recorded(retained);
             }
@@ -865,6 +874,27 @@ fn kept(
     service
         .retained_action(actor, action_id, method, digest)
         .map_err(|error| ControllerError::found_unreadable_on_the_wire(error.into(), RECORDS))
+}
+
+/// [`kept`] for a mutation about to be performed, noting in `copied` when the lookup refuses
+/// because the record cannot be read.
+///
+/// A row that cannot be read says that a record exists, so what the lookup refuses with goes back as
+/// a copy does, under the authority the mutation arrived under. The conflict of a reused identifier
+/// is no copy, and [`ChangeSetModule::write`] holds it to the same check by its code.
+fn kept_noting(
+    service: &ChangeSetService,
+    actor: &ActorId,
+    action_id: kr_protocol::scalars::Uuid,
+    method: &str,
+    digest: kr_protocol::scalars::Digest256,
+    copied: &AtomicBool,
+) -> Answer<Option<RetainedOutcome>> {
+    kept(service, actor, action_id, method, digest).inspect_err(|refusal| {
+        if refusal.code != ErrorCode::IdConflict {
+            copied.store(true, Ordering::Release);
+        }
+    })
 }
 
 /// The answer a record of an action is: the result it kept, or the refusal it kept. A result that
