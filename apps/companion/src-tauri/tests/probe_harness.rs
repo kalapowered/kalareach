@@ -40,6 +40,7 @@ use net_support::worker::{Adopted, Worker};
 use net_support::{Host, proposal};
 use support::call::ScriptedCalls;
 use support::{Companion, LinkControl, NoOwner, StubIntake, WATCHDOG, govern, parts};
+use tauri::Manager as _;
 use voice_support::StandIn;
 
 /// The token the phone's account holds, which the stand-in's control accepts.
@@ -695,14 +696,24 @@ fn delegating_timings() -> Timings {
 struct Scripted<'a> {
     platform: Arc<ScriptedCalls>,
     stand_in: &'a StandIn,
+    /// The phone's calls, whose owner says when it has read a voice service announcement, when the
+    /// call hands delegations to the host. The shipped configuration keeps no such record.
+    calls: tauri::State<'a, Calls>,
+    owner_records_announcements: bool,
     drops: std::sync::atomic::AtomicU64,
     /// Whether native code's record shows a gap from the moment the leg starts.
     gap_from_the_start: bool,
+    /// Whether native code's record shows a gap once the leg says its first word, as a recorder
+    /// that stalls while the leg runs does.
+    gap_at_the_first_word: bool,
 }
 
 impl Driver for Scripted<'_> {
     fn provider<'a>(&'a self, bytes: &'a [u8]) -> DriverFuture<'a, ()> {
         Box::pin(async move {
+            if self.gap_at_the_first_word && self.drops.load(Ordering::SeqCst) == 0 {
+                self.platform.show_a_gap_in_progress();
+            }
             self.platform.tell_provider_bytes(bytes.to_vec());
             Ok(())
         })
@@ -711,7 +722,20 @@ impl Driver for Scripted<'_> {
     fn announce<'a>(&'a self, id: &'a str, offset_ms: u64) -> DriverFuture<'a, ()> {
         Box::pin(async move {
             self.stand_in.control().announce(id, offset_ms);
-            Ok(())
+            // The announcement and the provider's delegation come on paths that nothing orders, and
+            // the model is told what became of a delegation that is refused at once by a request
+            // the control turns away when it has not heard the announcement. The owner says when it
+            // has, and the provider's delegation is written after.
+            if !self.owner_records_announcements {
+                return Ok(());
+            }
+            tokio::time::timeout(WATCHDOG, async {
+                while !self.calls.has_read_announcement(id, offset_ms) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .map_err(|_| "the owner never read the voice service's announcement".to_owned())
         })
     }
 
@@ -764,6 +788,8 @@ struct Before {
     dtx: bool,
     /// Native code's record shows a gap from the start, which makes the gate refuse every set.
     gap: bool,
+    /// Native code's record shows a gap once the leg's first word is said.
+    gap_at_the_first_word: bool,
 }
 
 /// Plays one leg of the connected run on a call over one real session, and gives the scene and the
@@ -781,8 +807,11 @@ async fn play(leg: Leg, before: Before) -> (Scene, Vec<companion_tauri::probe::C
         let driver = Scripted {
             platform: Arc::clone(&scene.platform),
             stand_in: &scene.stand_in,
+            calls: scene.companion.app.state::<Calls>(),
+            owner_records_announcements: !matches!(leg, Leg::Production),
             drops: std::sync::atomic::AtomicU64::new(0),
             gap_from_the_start: before.gap,
+            gap_at_the_first_word: before.gap_at_the_first_word,
         };
         let (checks, ()) = tokio::join!(
             call_check_with(
@@ -917,11 +946,11 @@ async fn the_positive_leg_hands_a_status_to_the_host_and_tells_the_model_what_it
     stop(scene).await;
 }
 
-/// A call whose record of capture shows a gap from the start is one the gate refuses for good, so the
-/// first sentence is refused for the gap and not as the first of the call, and the positive leg
-/// fails on it: a leg that cannot fail would show nothing.
+/// A call whose record of capture shows a gap before the leg begins is not the leg's to judge: the
+/// leg reads the record first, names the break as the recorder's own for the device script to play
+/// the leg again on a new call, and says nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_call_whose_capture_shows_a_gap_fails_the_positive_leg() {
+async fn a_call_whose_capture_broke_before_the_leg_is_not_played() {
     let (scene, checks) = play(
         Leg::Positive,
         Before {
@@ -933,7 +962,46 @@ async fn a_call_whose_capture_shows_a_gap_fails_the_positive_leg() {
 
     assert_eq!(
         measured_failures(&checks),
+        ["the recorder delivered without a break before the leg began"],
+        "{:#?}",
+        failed(&checks)
+    );
+    assert!(
+        failed(&checks)
+            .iter()
+            .any(|check| check.contains("the recorder broke by itself")),
+        "{:#?}",
+        failed(&checks)
+    );
+    assert_eq!(at_the_host(&scene), 0);
+    stop(scene).await;
+}
+
+/// A call whose record of capture shows a gap once the leg is under way is one the gate refuses for
+/// good, so the first sentence is refused for the gap and not as the first of the call. The positive
+/// leg fails on it, which a leg that cannot fail would not, and names the break as one it did not
+/// make, which is what has the device script play the leg again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_whose_capture_breaks_during_the_positive_leg_names_the_break() {
+    let (scene, checks) = play(
+        Leg::Positive,
+        Before {
+            gap_at_the_first_word: true,
+            ..Before::default()
+        },
+    )
+    .await;
+
+    assert_eq!(
+        measured_failures(&checks),
         ["the first utterance is refused"],
+        "{:#?}",
+        failed(&checks)
+    );
+    assert!(
+        failed(&checks)
+            .iter()
+            .any(|check| check.contains("the recorder broke by itself")),
         "{:#?}",
         failed(&checks)
     );

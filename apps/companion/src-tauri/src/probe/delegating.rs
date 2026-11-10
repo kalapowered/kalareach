@@ -52,6 +52,15 @@ const DROP_MS: u64 = 400;
 /// The one real session the host holds for the run, as the script names it.
 const NO_SESSION: &str = "the host named no session for the run";
 
+/// The audio packets a call must have received before a leg begins: the sign that the connection
+/// carries audio and the application's own start is over.
+const AUDIO_FLOOR: u64 = 50;
+
+/// What a check says when the call's own recorder broke in a part of a leg that is not about a
+/// break. A device script that finds it in a leg's result plays the leg again on a new call: the
+/// leg's subject was never reached.
+const BROKE_BY_ITSELF: &str = "the recorder broke by itself";
+
 /// What the probe plays a leg through: the provider's data channel, the voice service's
 /// announcements and the recorder's drop hook.
 pub trait Driver: Send + Sync {
@@ -356,6 +365,7 @@ fn has_problem(state: &Value, kind: &str) -> bool {
 /// What a leg is played with.
 struct Play<'a, R: Runtime> {
     app: &'a AppHandle<R>,
+    platform: &'a dyn CallPlatform,
     driver: &'a dyn Driver,
 }
 
@@ -393,23 +403,44 @@ impl<R: Runtime> Play<'_, R> {
         announced_at: impl FnOnce(u64) -> u64,
     ) -> Result<u64, String> {
         let count = u64::try_from(words.split_whitespace().count()).unwrap_or(0);
-        let end = start_ms + 200 * count;
-        let offset = end - back_ms;
+        let offset = start_ms + 200 * count - back_ms;
         self.driver
             .announce(id, announced_at(offset))
             .await
             .map_err(|error| format!("the voice service announced nothing: {error}"))?;
+        self.said(id, start_ms, words, back_ms).await
+    }
+
+    /// The same as [`Self::utter`] for a delegation the voice service has already announced.
+    ///
+    /// A delegation that the call refuses at once, because the call is tainted, is told to the model
+    /// as soon as its event is read, and the control turns the request away for good when it has not
+    /// yet heard the announcement. The service's frames and the control's answers to the phone's
+    /// requests travel one socket in order, so a delegation announced before a request the phone then
+    /// sends has been answered is heard by the time that answer is read. A leg that refuses a
+    /// delegation at once announces it ahead of the row whose telling it waits for, then says it here.
+    async fn said(
+        &self,
+        id: &str,
+        start_ms: u64,
+        words: &str,
+        back_ms: u64,
+    ) -> Result<u64, String> {
+        let count = u64::try_from(words.split_whitespace().count()).unwrap_or(0);
+        let end = start_ms + 200 * count;
         self.speak(start_ms, words).await?;
         self.driver
-            .provider(delegation_event(id, offset).to_string().as_bytes())
+            .provider(delegation_event(id, end - back_ms).to_string().as_bytes())
             .await
             .map_err(|error| format!("the delegation was not written to the channel: {error}"))?;
         Ok(end)
     }
 
-    /// Waits until the row of `id` is in the state `wanted` and the model was told what became of
-    /// it, and returns the state with the row. Where it never is, what the row last read.
-    async fn row_told(&self, id: &str, wanted: &str) -> Result<(Value, Value), String> {
+    /// Waits until the model was told what became of the delegation `id`, and returns the state with
+    /// the row, whatever the row came to: the caller reads it against what the leg expects, so a leg
+    /// whose delegation came to something else stops at once and says what. Where the model is never
+    /// told, what the row last read.
+    async fn row_told(&self, id: &str) -> Result<(Value, Value), String> {
         let app = self.app;
         let last = std::sync::Mutex::new("no row".to_owned());
         let seen = &last;
@@ -419,13 +450,29 @@ impl<R: Runtime> Play<'_, R> {
             *seen
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = row.to_string();
-            (row["state"] == wanted && row["told"] == true).then_some((state, row))
+            (row["told"] == true).then_some((state, row))
         })
         .await;
         found.ok_or_else(|| {
             last.into_inner()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         })
+    }
+
+    /// Waits until native code holds the person's mute and capture no longer shows as capturing. What
+    /// capture reads then is the display's own word (muted by the person, or unavailable where the
+    /// recorder stopped with the mute); the mute is read as a fact of its own. Returns the word.
+    async fn mute_is_held(&self) -> Option<String> {
+        let (app, platform) = (self.app, self.platform);
+        until(SIGN_WITHIN, || async move {
+            let held = platform.held().await.ok()?;
+            let word = call_state(app).await["capture"]
+                .as_str()
+                .unwrap_or("?")
+                .to_owned();
+            (held.microphone_muted && word != "capturing").then_some(word)
+        })
+        .await
     }
 
     /// Waits until the microphone's capture word is `word`.
@@ -439,6 +486,66 @@ impl<R: Runtime> Play<'_, R> {
     }
 }
 
+/// Before a leg says anything, the call carries audio and native code's own record of capture shows
+/// no break. Both are readings of the call's own signs, never a wait for a time: a leg's subject is a
+/// break the leg makes, and a recorder that broke while the application was starting is not one. A
+/// call that fails either is not the leg's to judge, and says so for the device script to play the
+/// leg again on a new call.
+async fn settled<R: Runtime>(play: &Play<'_, R>, checks: &mut Checks<'_>) -> bool {
+    let platform = play.platform;
+    let carries = until(SIGN_WITHIN, || async move {
+        let media = platform.held().await.ok()?.media;
+        // Where native code reads no media there is nothing to wait for.
+        media
+            .is_none_or(|media| media.packets_received.is_none_or(|n| n >= AUDIO_FLOOR))
+            .then_some(())
+    })
+    .await
+    .is_some();
+    checks.push(Check::found(
+        "the call carries audio before the leg begins",
+        carries,
+        format!("the call received at least {AUDIO_FLOOR} audio packets"),
+    ));
+    if !carries {
+        return false;
+    }
+    let read = async {
+        let held = platform
+            .held()
+            .await
+            .map_err(|failure| failure.message.clone())?;
+        let call = held
+            .call
+            .ok_or_else(|| "native code holds no call".to_owned())?;
+        platform
+            .capture_proof(&call, false)
+            .await
+            .map_err(|failure| failure.message.clone())
+    }
+    .await;
+    let (ok, detail) = match read {
+        Ok(proof) => {
+            let ok = proof.openings == 1 && proof.breaks == 0;
+            let mut detail = format!(
+                "openings {} breaks {} state {:?}",
+                proof.openings, proof.breaks, proof.state
+            );
+            if proof.breaks != 0 {
+                detail.push_str(&format!("; {BROKE_BY_ITSELF}"));
+            }
+            (ok, detail)
+        }
+        Err(why) => (false, why),
+    };
+    checks.push(Check::found(
+        "the recorder delivered without a break before the leg began",
+        ok,
+        detail,
+    ));
+    ok
+}
+
 /// Reads a row against what a leg expects and records the check.
 fn expect_row(
     checks: &mut Checks<'_>,
@@ -448,20 +555,26 @@ fn expect_row(
     cause: Option<&str>,
 ) -> bool {
     let (ok, detail) = match &read {
-        Ok((_, row)) => (
-            row["state"] == state && cause.is_none_or(|cause| row["cause"] == cause),
-            format!(
+        Ok((_, row)) => {
+            let ok = row["state"] == state && cause.is_none_or(|cause| row["cause"] == cause);
+            let mut detail = format!(
                 "state {} cause {} told {}",
                 row["state"].as_str().unwrap_or("?"),
                 row["cause"].as_str().unwrap_or("-"),
                 row["told"]
-            ),
-        ),
+            );
+            // A refusal for a break, where the leg expected anything else, is a break the leg did not
+            // make: the leg's subject was never reached.
+            if !ok && row["cause"] == "capture_break" && cause != Some("capture_break") {
+                detail.push_str(&format!("; {BROKE_BY_ITSELF}"));
+            }
+            (ok, detail)
+        }
         Err(last) => (
             false,
             format!(
-                "the row never reached {state}{} and told; it last read {last}",
-                cause.map_or_else(String::new, |c| format!(" for {c}"))
+                "the model was never told what became of the delegation, which last read {last}{}",
+                cause.map_or_else(String::new, |c| format!(" (expected {state} for {c})"))
             ),
         ),
     };
@@ -478,7 +591,11 @@ pub(super) async fn run<R: Runtime>(
     leg: Leg,
     checks: &mut Checks<'_>,
 ) {
-    let play = Play { app, driver };
+    let play = Play {
+        app,
+        platform,
+        driver,
+    };
     // The microphone is carrying speech before anything is said: what the provider is sent before
     // the gate opens is a call the gate refuses for good, and a leg that began so would be about
     // that, not about its own subject.
@@ -504,6 +621,9 @@ pub(super) async fn run<R: Runtime>(
         "the peer reports the call's oai-events channel",
     ));
     if !open {
+        return;
+    }
+    if !settled(&play, checks).await {
         return;
     }
     let stage = match leg {
@@ -556,7 +676,7 @@ async fn throwaway<R: Runtime>(
 ) -> Result<bool, String> {
     play.utter("d-0", 0, "hello there", 200, |offset| offset)
         .await?;
-    let read = play.row_told("d-0", "refused").await;
+    let read = play.row_told("d-0").await;
     Ok(expect_row(
         checks,
         "the first utterance is refused",
@@ -570,6 +690,21 @@ async fn throwaway<R: Runtime>(
 async fn status<R: Runtime>(play: &Play<'_, R>, id: &str, start_ms: u64) -> Result<u64, String> {
     play.utter(id, start_ms, "what is the status", 200, |offset| offset)
         .await
+}
+
+/// Where the model's delegation for a status said from `start_ms` is, which the voice service
+/// announces when a leg announces it ahead of the status.
+const fn status_offset(start_ms: u64) -> u64 {
+    start_ms + 4 * 200 - 200
+}
+
+/// A status whose delegation was announced earlier.
+async fn status_announced<R: Runtime>(
+    play: &Play<'_, R>,
+    id: &str,
+    start_ms: u64,
+) -> Result<u64, String> {
+    play.said(id, start_ms, "what is the status", 200).await
 }
 
 /// The shipped configuration: the probe does not turn the acceptance on, so a delegation the voice
@@ -589,7 +724,7 @@ async fn production<R: Runtime>(play: &Play<'_, R>, checks: &mut Checks<'_>) -> 
                 .as_bytes(),
         )
         .await?;
-    let read = play.row_told("d-9", "not_done").await;
+    let read = play.row_told("d-9").await;
     let ok = expect_row(
         checks,
         "a delegation the service announces is answered that nothing was done",
@@ -614,7 +749,7 @@ async fn positive<R: Runtime>(play: &Play<'_, R>, checks: &mut Checks<'_>) -> Re
         return Ok(());
     }
     status(play, "d-1", 6_000).await?;
-    let read = play.row_told("d-1", "performed").await;
+    let read = play.row_told("d-1").await;
     expect_row(
         checks,
         "a status said after it is performed",
@@ -631,7 +766,7 @@ async fn first_utterance<R: Runtime>(
     checks: &mut Checks<'_>,
 ) -> Result<(), String> {
     status(play, "d-1", 0).await?;
-    let read = play.row_told("d-1", "refused").await;
+    let read = play.row_told("d-1").await;
     if !expect_row(
         checks,
         "the first utterance is refused",
@@ -642,7 +777,7 @@ async fn first_utterance<R: Runtime>(
         return Ok(());
     }
     status(play, "d-2", 12_000).await?;
-    let read = play.row_told("d-2", "performed").await;
+    let read = play.row_told("d-2").await;
     expect_row(
         checks,
         "the same command said after it is performed",
@@ -659,7 +794,7 @@ async fn control<R: Runtime>(play: &Play<'_, R>, checks: &mut Checks<'_>) -> Res
         return Ok(false);
     }
     status(play, "d-1", 6_000).await?;
-    let read = play.row_told("d-1", "performed").await;
+    let read = play.row_told("d-1").await;
     Ok(expect_row(
         checks,
         "a status said before the break is performed",
@@ -672,6 +807,8 @@ async fn control<R: Runtime>(play: &Play<'_, R>, checks: &mut Checks<'_>) -> Res
 /// A mute and an unmute between two parts of a command refuse it, and every later one: the call is
 /// tainted for good.
 async fn mute<R: Runtime>(play: &Play<'_, R>, checks: &mut Checks<'_>) -> Result<(), String> {
+    // The last command is refused at once, so it is announced ahead of the rows told before it.
+    play.driver.announce("d-3", status_offset(18_000)).await?;
     if !control(play, checks).await? {
         return Ok(());
     }
@@ -681,21 +818,26 @@ async fn mute<R: Runtime>(play: &Play<'_, R>, checks: &mut Checks<'_>) -> Result
     let muted =
         commands::voice_set_muted(play.app.state(), commands::VoiceMute::Microphone, true).await;
     play.driver.after_a_mute(true).await?;
-    let shown = play.capture_is("muted_by_person").await;
+    let shown = play.mute_is_held().await;
+    checks.push(Check::found(
+        "the person mutes between two parts of a command",
+        muted.is_ok() && shown.is_some(),
+        format!("mute ok {} held {shown:?}", muted.is_ok()),
+    ));
     let unmuted =
         commands::voice_set_muted(play.app.state(), commands::VoiceMute::Microphone, false).await;
     play.driver.after_a_mute(false).await?;
     let back = play.capture_is("capturing").await;
     checks.push(Check::found(
-        "the person mutes and unmutes between two parts of a command",
-        muted.is_ok() && shown && unmuted.is_ok() && back,
-        format!("mute {muted:?} shown {shown} unmute {unmuted:?} back {back}"),
+        "the microphone is back to capturing after the unmute",
+        unmuted.is_ok() && back,
+        format!("unmute ok {} capturing {back}", unmuted.is_ok()),
     ));
     let end = play.speak(12_400, "the status").await?;
     play.driver
         .provider(delegation_event("d-2", end - 200).to_string().as_bytes())
         .await?;
-    let read = play.row_told("d-2", "refused").await;
+    let read = play.row_told("d-2").await;
     if !expect_row(
         checks,
         "a mute between two parts of a command refuses it",
@@ -705,8 +847,8 @@ async fn mute<R: Runtime>(play: &Play<'_, R>, checks: &mut Checks<'_>) -> Result
     ) {
         return Ok(());
     }
-    status(play, "d-3", 18_000).await?;
-    let read = play.row_told("d-3", "refused").await;
+    status_announced(play, "d-3", 18_000).await?;
+    let read = play.row_told("d-3").await;
     expect_row(
         checks,
         "the call stays refused after the microphone is back",
@@ -738,7 +880,7 @@ async fn gap<R: Runtime>(play: &Play<'_, R>, checks: &mut Checks<'_>) -> Result<
         return Ok(());
     }
     status(play, "d-2", 12_000).await?;
-    let read = play.row_told("d-2", "refused").await;
+    let read = play.row_told("d-2").await;
     expect_row(
         checks,
         "a gap in the recorder refuses the command",
@@ -752,7 +894,7 @@ async fn gap<R: Runtime>(play: &Play<'_, R>, checks: &mut Checks<'_>) -> Result<
 /// An answer that turns discontinuous transmission on refuses every delegation of the call.
 async fn dtx<R: Runtime>(play: &Play<'_, R>, checks: &mut Checks<'_>) -> Result<(), String> {
     status(play, "d-1", 6_000).await?;
-    let read = play.row_told("d-1", "refused").await;
+    let read = play.row_told("d-1").await;
     expect_row(
         checks,
         "a command in a call whose answer turns DTX on is refused",
@@ -765,12 +907,15 @@ async fn dtx<R: Runtime>(play: &Play<'_, R>, checks: &mut Checks<'_>) -> Result<
 
 /// A message on the data channel that is not an event taints the call.
 async fn malformed<R: Runtime>(play: &Play<'_, R>, checks: &mut Checks<'_>) -> Result<(), String> {
+    // The command after the message is refused at once, so it is announced ahead of the rows told
+    // before it.
+    play.driver.announce("d-2", status_offset(12_000)).await?;
     if !control(play, checks).await? {
         return Ok(());
     }
     play.driver.provider(b"not json at all").await?;
-    status(play, "d-2", 12_000).await?;
-    let read = play.row_told("d-2", "refused").await;
+    status_announced(play, "d-2", 12_000).await?;
+    let read = play.row_told("d-2").await;
     expect_row(
         checks,
         "a message that is not an event refuses the next command",
@@ -790,10 +935,13 @@ async fn late_fragment<R: Runtime>(
     if !throwaway(play, checks).await? {
         return Ok(());
     }
+    // The command after the late fragment is refused at once, so it is announced ahead of the row
+    // told before it.
+    play.driver.announce("d-2", status_offset(12_000)).await?;
     let end = play
         .utter("d-1", 6_000, "what is the status", 0, |offset| offset)
         .await?;
-    let read = play.row_told("d-1", "performed").await;
+    let read = play.row_told("d-1").await;
     if !expect_row(
         checks,
         "a status said before the late fragment is performed",
@@ -822,8 +970,8 @@ async fn late_fragment<R: Runtime>(
         told.as_ref()
             .map_or_else(|| "the call was not told".to_owned(), rows_in),
     ));
-    status(play, "d-2", 12_000).await?;
-    let read = play.row_told("d-2", "refused").await;
+    status_announced(play, "d-2", 12_000).await?;
+    let read = play.row_told("d-2").await;
     expect_row(
         checks,
         "the next command is refused",
@@ -848,7 +996,7 @@ async fn broker_disagrees<R: Runtime>(
         offset + 1_200
     })
     .await?;
-    let read = play.row_told("d-2", "refused").await;
+    let read = play.row_told("d-2").await;
     if !expect_row(
         checks,
         "a delegation the voice service does not announce as the provider did is refused",
@@ -859,7 +1007,7 @@ async fn broker_disagrees<R: Runtime>(
         return Ok(());
     }
     status(play, "d-3", 18_000).await?;
-    let read = play.row_told("d-3", "performed").await;
+    let read = play.row_told("d-3").await;
     expect_row(
         checks,
         "the refusal leaves the call as it was",
