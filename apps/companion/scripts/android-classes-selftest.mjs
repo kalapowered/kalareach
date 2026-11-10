@@ -13,16 +13,20 @@
 // building the application, so all of them are built here, in memory and in a throwaway outputs
 // directory, and fed to the same reader and the same selection the build uses.
 //
+// The build command's own temporary directory is held here as well, since the command that reads the
+// packages back is the one that gives each build its own (see `private-temp.mjs`).
+//
 // The archives are the smallest ones that exercise the reader: a dex here carries its string,
 // type, method and class tables and nothing else, a library carries its dynamic symbols and the
 // bytes a case puts in it, and neither is one any runtime would accept.
 import { Buffer } from 'node:buffer'
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 
 import { dex, elf, zip } from './archive-fixtures.mjs'
 import { libraryClassNames } from './android-native-names.mjs'
+import { privateTemporary } from './private-temp.mjs'
 import {
   definedStrings,
   missingFrom,
@@ -623,6 +627,41 @@ held('the check passes a package whose dex holds what its libraries find', 'true
 const failing = verified('verify-missing.apk', withLibrary([FACTORY, CANDIDATE, NESTED, RAW]))
 held('the check fails a package whose dex lacks a class its library finds', 'false', String(failing.whole))
 held('and says which class and which library', 'true', String(failing.said.includes(JNI_ZERO) && failing.said.includes(MEDIA)))
+
+// -- the build's own temporary directory -------------------------------------------------------
+// Two builds of the application at once share the options file the command line tool leaves in the
+// temporary directory, and cross: each must be given a directory of its own, and leave none behind.
+
+const first = privateTemporary({ KEEP: 'this', TMPDIR: '/elsewhere' })
+const second = privateTemporary()
+writeFileSync(join(first.directory, 'to.kala.reach-server-addr'), '127.0.0.1:1')
+held(
+  'two builds are given two different temporary directories, both made',
+  'true',
+  String(first.directory !== second.directory && existsSync(first.directory) && existsSync(second.directory))
+)
+held(
+  'the directory is the temporary directory of the environment a build is given, whichever name its platform reads',
+  'true',
+  String(
+    first.env.TMPDIR === first.directory &&
+      first.env.TEMP === first.directory &&
+      first.env.TMP === first.directory &&
+      first.env.KEEP === 'this'
+  )
+)
+held(
+  'the directory of one build does not hold the options file of the other',
+  'false',
+  String(existsSync(join(second.directory, 'to.kala.reach-server-addr')))
+)
+first.remove()
+second.remove()
+held(
+  'removing a build\'s directory removes what the build left in it, and only that directory',
+  'false',
+  String(existsSync(first.directory) || existsSync(second.directory))
+)
 
 // -- which packages a build is checked against --------------------------------------------------
 // An outputs directory as a tree carries it after several builds. The ages are deliberately
