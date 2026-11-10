@@ -1952,7 +1952,9 @@ Two presentations, and the choice is the host's:
 | `viewport` | a rendering of the canonical grid, clipped to the terminal's own size | every other case |
 
 `kr attach --no-probe` withholds the declaration, so that attachment is projected: a host that has
-not been told which terminal it is talking to does not hand it a byte stream and hope.
+not been told which terminal it is talking to does not hand it a byte stream and hope. A Windows
+console declares `windows-console`, which is on no list of terminals the host hands the stream, so
+it is always projected, with the reason that its profile is not qualified.
 
 An attachment never receives replayed history. What it is given when it joins, and again whenever
 it resynchronises, is the screen as it is now, rendered from a closed set of operations with no
@@ -2140,9 +2142,12 @@ words, and that is what a detach writes back.
 
 **What the console path does.** The Windows attach client reads the console as key records and sends
 them as `console_keys`, and the worker spells them as the paragraphs above say. The client declares
-a terminal profile only from `TERM`, which a Windows console does not set. It asks for the input
-lease all the same, and the worker gives the lease to no attachment that declared no profile, so a
-session attached from a Windows console is watched and not typed into until `TERM` names a profile.
+the terminal profile that `TERM` names. A Windows console sets none, so it declares
+`windows-console` (`kr_term::win32::CONSOLE_PROFILE`), which says that its keys are console key
+records and nothing about how it draws a stream. The worker gives that profile the input lease while
+the application reads the ordinary encoding, and refuses it under either enhanced protocol, because
+a console's records are spelled in the ordinary encoding or in no other. `kr attach --no-probe`
+declares nothing, as on every platform, so that attachment watches and does not type.
 Under `Fidelity::LegacyVt`, which is every session of a Unix worker and a Windows session whose
 pseudo-console did not ask for records, and while the application in the session has negotiated
 `modifyOtherKeys` or the Kitty keyboard protocol, the worker refuses a write of console keys with
@@ -2659,6 +2664,7 @@ everything else it had: it goes on watching, and its typed actions are unaffecte
 | --- | --- |
 | A semantic attachment | whichever protocol is in force, because it builds each key from the logical key and its modifiers through the shared encoder |
 | A terminal that declared what it is | what that terminal is known to implement, from `kr_worker::input::KEYBOARD_PROTOCOLS` |
+| A Windows console, which declares `windows-console` when its environment names no terminal | the ordinary encoding only: its keys are console key records, which the host spells in the ordinary encoding, or sends as they are where the backend asked for records |
 | The companion's raw terminal view, which declares `kalareach-companion` | `modifyOtherKeys` and the Kitty protocol's disambiguation and event types, which it builds through the shared encoder from what its platform reports of each key; not every key as an escape code, because an input method or a phone's software keyboard gives text with no key to report it by |
 | A terminal outside that table, but declared | the ordinary encoding, which every terminal sends |
 | A terminal that declared nothing, which is what `--no-probe` chooses | nothing, in either direction: a terminal nobody was allowed to ask about is as likely to have been left in an enhanced protocol by whatever ran before it |

@@ -505,6 +505,12 @@ A terminal that may not type at all is told so once, on standard error, and goes
 is what happens under `--no-probe`: the host checks that a controller can supply the encoding the
 application has negotiated, and a terminal nobody was allowed to ask about cannot be shown to.
 
+A Windows console sets no `TERM`, so the command declares it as `windows-console`: its keys are
+console key records, which the session spells in the ordinary encoding. It is given the input lease
+while the application reads that encoding, and the session is drawn to it as a viewport, because the
+host has qualified no console to be handed the session's byte stream. A `TERM` that is set is the
+declaration, as on any platform, and `--no-probe` withholds either.
+
 Losing the keys part way through is a different thing and ends the attachment. An application can
 turn on a keyboard protocol the outer terminal does not implement, and the host then takes the keys
 rather than let it send an encoding that means other keys; the next keystroke is refused with
