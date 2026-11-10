@@ -457,7 +457,7 @@ impl RemoteConnection {
         validated: AuthorityRevision,
     ) -> std::result::Result<(), ProtocolError> {
         self.controller
-            .check_registration(&crate::authority::AdmittedMutation {
+            .check_retained_under(&crate::authority::AdmittedMutation {
                 connection_id: self.connection_id,
                 admitted_revision: validated,
                 deadline: None,

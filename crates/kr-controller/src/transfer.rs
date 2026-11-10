@@ -204,17 +204,15 @@ impl TransferAdmission {
     /// outlives. The refusal is not kept: a retained answer is not retained again.
     fn check_retained(&self) -> std::result::Result<(), ProtocolError> {
         self.controller
-            .check_registration(&crate::authority::AdmittedMutation {
-                deadline: None,
-                ..self.carried
-            })
+            .check_retained_under(&self.carried)
             .map_err(|error| error.to_protocol_error())
     }
 
     /// What a look at the record found, with the conflict a reused identifier meets given back
-    /// only under the check a retained answer is owed: it says that another attempt used the
-    /// identifier for another request, which is a read of that attempt's record. Any other refusal
-    /// of the look says nothing of it and is given back as it is.
+    /// only under the check a retained answer is owed: it names no answer, but it is the host's word
+    /// about another attempt's use of the identifier, which the network door shows only to a caller
+    /// that is still registered. Any other refusal of the look says nothing of another attempt and
+    /// is given back as it is.
     fn retained_under_the_check<T>(
         &self,
         found: std::result::Result<T, ProtocolError>,

@@ -386,7 +386,7 @@ impl Controller {
                      new connection"
                 .to_owned(),
         })?;
-        self.check_registration(&crate::authority::AdmittedMutation {
+        self.check_retained_under(&crate::authority::AdmittedMutation {
             connection_id,
             admitted_revision,
             deadline: None,
@@ -396,9 +396,10 @@ impl Controller {
     /// The check a recorded answer is owed, for a mutation that carries its admission:
     /// [`Self::check_registration`] without the deadline a receipt outlives.
     ///
-    /// Every place that gives back what another attempt of an action recorded asks it, once the
-    /// answer is in hand: this function where the service is asynchronous, and the closure or the
-    /// method its blocking work is handed where it is not.
+    /// Every place that gives back what another attempt of an action recorded asks it, through
+    /// this function, once the answer is in hand: the door's own check ([`Self::check_retained_answer`]
+    /// and the network door's), the transfer service's, the catalogue's and the pairing door's, and
+    /// the project service's closure ([`Self::retained_in_service`]).
     pub(crate) fn check_retained_under(
         &self,
         carried: &crate::authority::AdmittedMutation,
@@ -436,7 +437,9 @@ impl Controller {
     /// [`Self::check_retained_in_hand`] on each answer they read from a record, the project
     /// service through [`Self::retained_in_service`], the pairing door through its
     /// `pairing_standing` check, the catalogue through its admission's `check_retained`, and the
-    /// transfer service through `TransferAdmission::check_retained`. The conflict a reused
+    /// transfer service through `TransferAdmission::check_retained`. The start of the disclosed
+    /// checks reads its record inside the hold on the registration, which keeps a revocation out,
+    /// and asks the fence again once the answer is in hand. The conflict a reused
     /// identifier meets, found by a claim or a look after a wait, goes back through
     /// [`Self::conflict_under_authority`] where the service claims in asynchronous work, and
     /// through the same check in the transfer service and in the door's claim of an action.
@@ -457,10 +460,10 @@ impl Controller {
     /// What a claim or a lookup that found another attempt's record refuses with, given back only
     /// under the authority this attempt arrived under.
     ///
-    /// A reused identifier's conflict says that another attempt has used the identifier for
-    /// another request, which is a read of that attempt's record as much as its answer is, so it
-    /// waits for the same check, asked once it is in hand. Any other refusal says nothing of
-    /// another attempt's record and is given back as it is.
+    /// A reused identifier's conflict names no answer, but it is the host's word about another
+    /// attempt's use of the identifier, and the network door shows it only to a caller that is
+    /// still registered, so it waits for the same check, asked once it is in hand. Any other
+    /// refusal says nothing of another attempt and is given back as it is.
     pub(crate) async fn conflict_under_authority(
         &self,
         carried: &crate::authority::AdmittedMutation,
