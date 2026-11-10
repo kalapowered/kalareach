@@ -146,7 +146,9 @@ pub struct StandIn {
 ///
 /// The accepted end of the connection is bound to the port. While it lives, a connection made to
 /// the port finds no listener and is refused outright, as one to a closed port is; no program that
-/// asks the system for any port is given this one, and the system makes no connection from it.
+/// asks the system for any port is given this one, and the system makes no connection from it (on
+/// macOS a socket that listens on the wildcard address of both families can still be given it,
+/// which no Rust code of this workspace does; the anchor is held on the IPv4 loopback address).
 /// What else it keeps off the port depends on the system. On Linux a program that binds the port
 /// by number is refused as well, unless it sets `SO_REUSEPORT` as the service's own listeners do.
 /// On macOS one that binds it by number with `SO_REUSEADDR` or `SO_REUSEPORT` is not. Where there
