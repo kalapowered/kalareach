@@ -412,6 +412,16 @@ impl WorkerTerminal {
         self.sequence += 1;
     }
 
+    /// The end of what the session has written so far, as it wrote it, control sequences included,
+    /// for the words of a failure.
+    pub fn end_of_what_was_written(&self, how_much: usize) -> &str {
+        let mut start = self.seen.len().saturating_sub(how_much);
+        while !self.seen.is_char_boundary(start) {
+            start += 1;
+        }
+        &self.seen[start..]
+    }
+
     /// What the session has written so far, with its control sequences and line breaks taken out,
     /// so text the console wrapped or redrew reads as one run.
     pub fn text(&self) -> String {

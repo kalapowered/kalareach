@@ -167,7 +167,7 @@ impl ConsoleOutput {
 /// The last part of what a console showed, for the words of a failure: the latest output is at the
 /// end, and a whole screen's drawing before it says nothing.
 fn end_of(text: &str) -> &str {
-    let mut start = text.len().saturating_sub(700);
+    let mut start = text.len().saturating_sub(450);
     while !text.is_char_boundary(start) {
         start += 1;
     }
@@ -1739,11 +1739,11 @@ async fn a_mouse_event_at_an_attached_console_reaches_the_application_that_asked
     while !typist.text().contains("kr-mouse-end") {
         assert!(
             started.elapsed() < LIVENESS_DEADLINE,
-            "the mouse event did not reach the application in {:?}: the session shows {:?}; the \
-             end of what the outer console shows: {:?}",
+            "the mouse event did not reach the application in {:?}: the end of what the outer \
+             console shows: {:?}; the end of what the session wrote: {:?}",
             started.elapsed(),
-            typist.text(),
-            end_of(&console.output.text())
+            end_of(&console.output.text()),
+            typist.end_of_what_was_written(400)
         );
         typist.watch(Duration::from_millis(200)).await;
     }
