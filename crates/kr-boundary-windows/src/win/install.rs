@@ -1018,8 +1018,14 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
                     service.stop()?;
                     service.wait_for(true, Duration::from_secs(60))?;
                 }
-                service.delete()?;
-                say("the broker's service is deleted");
+                if service.marked_for_deletion()? {
+                    say(
+                        "the broker's service is already deleted and goes when the last program that holds it lets go",
+                    );
+                } else {
+                    service.delete()?;
+                    say("the broker's service is deleted");
+                }
             }
             Ok(())
         })(),
@@ -1117,7 +1123,9 @@ pub fn residue(prior: &Prior, paths: &Paths) -> Result<Vec<String>, Error> {
             left.push(format!("{name} is still hidden from the sign-in screen"));
         }
     }
-    if service::manager()?.open(SERVICE)?.is_some() {
+    if let Some(service) = service::manager()?.open(SERVICE)?
+        && !service.marked_for_deletion()?
+    {
         left.push("the broker's service is still there".to_owned());
     }
     if paths.program.exists() {

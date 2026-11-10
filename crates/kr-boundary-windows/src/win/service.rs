@@ -7,7 +7,9 @@ use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, LocalFree};
+use windows_sys::Win32::Foundation::{
+    ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, LocalFree,
+};
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
 use windows_sys::Win32::System::Services::{
@@ -295,6 +297,21 @@ impl Service {
             Err(last("deleting the service"))
         } else {
             Ok(())
+        }
+    }
+
+    /// Whether the service has been deleted and is only still listed because some other program
+    /// (a services console, a command) holds it open: the manager removes it when the last handle
+    /// closes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error when the configuration cannot be read for any other reason.
+    pub fn marked_for_deletion(&self) -> Result<bool> {
+        match self.configuration() {
+            Ok(_) => Ok(false),
+            Err(failure) if failure.code == ERROR_SERVICE_MARKED_FOR_DELETE => Ok(true),
+            Err(failure) => Err(failure),
         }
     }
 
