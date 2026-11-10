@@ -5123,6 +5123,7 @@ version = "0.1.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
+ "kr-boundary-windows",
  "kr-cbor",
  "kr-flush",
  "kr-ipc",
