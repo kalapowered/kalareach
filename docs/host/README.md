@@ -2163,11 +2163,11 @@ spell its keys is given up on: the client hands the lease back with `input.relea
 watching, and says that the keys typed since were not sent. The worker does not check a write of
 bytes against the keyboard state. Under `Fidelity::Records` the worker refuses nothing for the
 keyboard state. The client asks the console for no window-size records. It asks for mouse records
-only while the session's application asks to be told of the mouse and the attachment may send input,
-and sends each as the report the application asked for (the client's own page says how). Nothing reports the
-fidelity at run time: the engine tracks which one the backend asked for and the worker spells
-records accordingly, but no receipt, diagnostic or client message carries the answer, so this page
-is where the limit is stated.
+only while the session's application asks to be told of the mouse and the attachment may send
+input, and sends each as the report the application asked for (the client's own page says how).
+Nothing reports the fidelity at run time: the engine tracks which one the backend asked for and
+the worker spells records accordingly, but no receipt, diagnostic or client message carries the
+answer, so this page is where the limit is stated.
 
 **The standalone start, and signing out.** The standalone start on Windows is one scheduled task
 per environment, `KalaReach-` and the first eight digits of the environment's identifier, in the
