@@ -732,6 +732,47 @@ mod tests {
         }
     }
 
+    /// A record told to nobody still tells the speller what it says: the buttons it holds down and
+    /// the turn of the wheel, so that the next record inside the window is read against them.
+    #[test]
+    fn a_record_told_to_nobody_still_changes_the_buttons_and_the_wheel_the_speller_holds() {
+        let window = Window {
+            left: 10,
+            top: 38,
+            columns: 80,
+            rows: 25,
+        };
+        let mut reporting = MouseReporting::default();
+        reporting.observe(b"\x1b[?1000h\x1b[?1006h");
+        let mut speller = MouseSpeller::default();
+        let mut spelled = |record| speller.spell(record, &reporting, window);
+        let wheel = |column, amount: i16| {
+            record(
+                column,
+                40,
+                u32::from(u16::from_ne_bytes(amount.to_ne_bytes())) << 16,
+                MOUSE_WHEELED,
+            )
+        };
+        // A button goes down inside the window and comes up outside it: the next press is a press.
+        assert_eq!(spelled(record(12, 40, LEFT, 0)), b"\x1b[<0;3;3M".to_vec());
+        assert!(
+            spelled(record(9, 40, 0, 0)).is_empty(),
+            "the release is outside"
+        );
+        assert_eq!(spelled(record(12, 40, LEFT, 0)), b"\x1b[<0;3;3M".to_vec());
+        // A turn of the wheel outside the window is a notch that nobody is told of and is not kept.
+        assert!(spelled(wheel(12, 60)).is_empty(), "half a notch inside");
+        assert!(
+            spelled(wheel(9, 60)).is_empty(),
+            "the notch it makes is outside"
+        );
+        assert!(
+            spelled(wheel(12, 60)).is_empty(),
+            "half a notch again, not a notch"
+        );
+    }
+
     /// An application is told only of what it asked for: nothing before it asks, a move with a
     /// button held only from mode 1002, and a move with none only in mode 1003.
     #[test]
