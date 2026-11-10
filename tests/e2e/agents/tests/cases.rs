@@ -6675,7 +6675,7 @@ fn a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_shows_the
             "prompt": { "question": question, "answer": sum },
             // What the screens showed is said by the marks looked for; the rows, which could show
             // anything of the person's, are in the part's log.
-            "image": { "file": file, "syntax": account.image, "answer": COLOUR, "code": upper, "answered": shown_in_log(stage, "the image's answer", &answered_rows, &upper) },
+            "image": { "file": staged.is_none().then_some(&file), "syntax": account.image, "answer": COLOUR, "code": upper, "answered": shown_in_log(stage, "the image's answer", &answered_rows, &upper) },
             "local": { "shows": upper, "seen": shown_in_log(stage, "the local terminal", &local, &upper) },
             "surface": offered.evidence(),
         });
