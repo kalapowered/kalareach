@@ -296,13 +296,13 @@ impl<'r> Host<'r> {
     ///
     /// A host that keeps its address cannot take another port, because a device dials the one it
     /// has, and the port is free only until another program binds it. A daemon that exited because
-    /// it could not bind that address is started again once the address can be bound, for as many
-    /// as [`PORT_ATTEMPTS`] starts in all.
+    /// it could not bind that address is started again once the address can be bound, for five
+    /// starts in all.
     ///
     /// # Panics
     ///
     /// Panics when it does not answer within [`LIVENESS`], or exits before it does, or when the
-    /// address is held for the whole of [`ADDRESS_FREE`].
+    /// address stays held for twenty seconds.
     pub fn start_daemon(&self) {
         let kept = self
             .configured_address()
