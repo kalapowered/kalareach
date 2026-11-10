@@ -22,6 +22,7 @@ import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 
 import { dex, elf, zip } from './archive-fixtures.mjs'
+import { libraryClassNames } from './android-native-names.mjs'
 import {
   definedStrings,
   missingFrom,
@@ -400,6 +401,21 @@ expectNames(
     )
   ],
   'nothing'
+)
+
+// A library too large to read as one string is read in pieces, and the pieces must not change the
+// answer: a name that crosses the end of a piece is neither lost nor read twice, and the tail of it
+// that starts a piece is not taken for a name.
+const whole = [...libraryClassNames(mediaLibrary())].sort().join(',')
+const different = []
+for (let chunk = 1; chunk <= 80; chunk += 1) {
+  const answer = [...libraryClassNames(mediaLibrary(), { chunk, overlap: 64 })].sort().join(',')
+  if (answer !== whole) different.push(chunk)
+}
+held(
+  'a library read in pieces of any size names the same classes as one read whole',
+  '',
+  different.join(',')
 )
 
 // -- the native methods the dex declares --------------------------------------------------------

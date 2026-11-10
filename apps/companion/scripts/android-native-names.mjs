@@ -38,18 +38,33 @@ const SLASHED = new RegExp(`${NOT_NAME}(${PACKAGE}(?:/${PACKAGE})+/${CLASS})(?=\
 const DESCRIPTOR = new RegExp(`${BEFORE_CLASS}L(${PACKAGE}(?:/${PACKAGE})+/${CLASS});`, 'g')
 
 /**
+ * How much of a library is read as text at once, and how far past that a name may run. A debug
+ * build's library carries its debug information and is far larger than the longest string the
+ * runtime can hold, so it is read in pieces. Each piece takes the matches that start in it and
+ * reads `OVERLAP` bytes past its end to finish the last of them, so a name that crosses the end of
+ * one piece is found once, whole, by the piece it starts in.
+ */
+const CHUNK = 128 * 1024 * 1024
+const OVERLAP = 64 * 1024
+
+/**
  * The classes of the application a library's strings name, in source form (`a.b.C`).
  *
  * The bytes are read as Latin-1, which keeps every byte one character and so keeps the NUL that ends
  * a C string.
  */
-export function libraryClassNames(bytes) {
-  const text = bytes.toString('latin1')
+export function libraryClassNames(bytes, { chunk = CHUNK, overlap = OVERLAP } = {}) {
   const names = new Set()
-  for (const pattern of [DOTTED, SLASHED, DESCRIPTOR]) {
-    for (const match of text.matchAll(pattern)) {
-      const name = match[1].replaceAll('/', '.')
-      if (!PLATFORM.test(name)) names.add(name)
+  for (let start = 0; start < bytes.length; start += chunk) {
+    // One byte before the piece, which the patterns look back at to tell a name's start.
+    const from = Math.max(0, start - 1)
+    const text = bytes.toString('latin1', from, Math.min(bytes.length, start + chunk + overlap))
+    for (const pattern of [DOTTED, SLASHED, DESCRIPTOR]) {
+      for (const match of text.matchAll(pattern)) {
+        if (from + match.index < start || from + match.index >= start + chunk) continue
+        const name = match[1].replaceAll('/', '.')
+        if (!PLATFORM.test(name)) names.add(name)
+      }
     }
   }
   return names
