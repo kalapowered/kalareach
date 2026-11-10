@@ -115,11 +115,9 @@ impl Which {
 /// A daemon of a release before storage accounts does not list the storage methods, and refuses
 /// them as it refuses any method it does not list: `PERMISSION_DENIED`, which is also what a grant
 /// without the right is refused with, and what a fence this host owes is refused with. Reads are
-/// not fenced, so two reads tell the three apart. A daemon that lists the storage methods answers
-/// their status, or refuses it for a reason of its own, and its refusal of the write is returned as
-/// it is. One that refuses the status too either does not list the method or refuses the caller,
-/// and the managed account's status, which asks for the same right and which every daemon with
-/// accounts lists, says which ([`managed_status_is_answered`]).
+/// not fenced, so the status of the storage account tells the three apart
+/// ([`read_storage_status`]): a daemon that lists the storage methods answers it, or refuses it
+/// for a reason of its own, and its refusal of the write is returned as it is.
 async fn mutate<P, T>(daemon: &mut Daemon, which: Which, method: Method, params: &P) -> Result<T>
 where
     P: serde::Serialize + ?Sized,
@@ -138,35 +136,62 @@ where
 /// What a `PERMISSION_DENIED` to a storage write means: an old daemon, or a refusal of the daemon's
 /// own that is returned as it is.
 async fn predates_or(daemon: &mut Daemon, refusal: ProtocolError) -> CliError {
+    match read_storage_status(daemon).await {
+        Ok(StorageRead::Unlisted) => CliError::Other(kr_client::shown::Shown::said(
+            "this host's daemon predates storage accounts, so it cannot hold an account at a \
+             service you run; update it",
+        )),
+        Ok(_) => CliError::Refused(refusal),
+        // The refusal of the caller that the status read found, which says why.
+        Err(error) => error,
+    }
+}
+
+/// What a read of the storage account's status found.
+enum StorageRead {
+    /// The daemon answered.
+    Account(AccountReport),
+    /// The daemon lists the method, and this host holds no storage account.
+    NoAccount,
+    /// The daemon does not list the method.
+    Unlisted,
+}
+
+/// Reads the status of the storage account, and says what the daemon does not say in words when it
+/// refuses.
+///
+/// A daemon that lists the method answers it, or refuses it for a reason of its own. One that
+/// refuses it with `PERMISSION_DENIED` either does not list it or refuses the caller, and the
+/// managed account's status, which asks for the same right and which every daemon with accounts
+/// lists, says which: refused too, the refusal is the caller's and is returned as an error. The
+/// refusals of a caller can end between two reads, as a membership lease that is renewed does, so
+/// when the managed status is answered the storage status is read once more: answered, or refused
+/// for another reason, the daemon lists the method; refused again with `PERMISSION_DENIED` while
+/// the managed status was answered between the two, the daemon does not list it.
+async fn read_storage_status(daemon: &mut Daemon) -> Result<StorageRead> {
+    if let Some(read) = storage_status(daemon).await? {
+        return Ok(read);
+    }
+    let _: AccountReport = daemon
+        .read(Method::AccountStatus, &AccountStatusParams {})
+        .await?;
+    Ok(storage_status(daemon)
+        .await?
+        .unwrap_or(StorageRead::Unlisted))
+}
+
+/// One read of the status of the storage account: what it found, or `None` for
+/// `PERMISSION_DENIED`, which says nothing alone.
+async fn storage_status(daemon: &mut Daemon) -> Result<Option<StorageRead>> {
     match daemon
         .read::<_, AccountReport>(Method::AccountStorageStatus, &AccountStatusParams {})
         .await
     {
-        Err(CliError::Refused(again)) if again.code == ErrorCode::PermissionDenied => {}
-        Ok(_) | Err(CliError::Refused(_)) => return CliError::Refused(refusal),
-        Err(other) => return other,
-    }
-    match managed_status_is_answered(daemon).await {
-        Ok(true) => CliError::Other(kr_client::shown::Shown::said(
-            "this host's daemon predates storage accounts, so it cannot hold an account at a \
-             service you run; update it",
-        )),
-        Ok(false) => CliError::Refused(refusal),
-        Err(other) => other,
-    }
-}
-
-/// Whether the daemon answers the managed account's status: it asks for the right the storage
-/// methods ask for, so a daemon that answers it, and refused a storage method with
-/// `PERMISSION_DENIED`, does not list the method. One that refuses it with `PERMISSION_DENIED` too
-/// is refusing the caller.
-async fn managed_status_is_answered(daemon: &mut Daemon) -> Result<bool> {
-    match daemon
-        .read::<_, AccountReport>(Method::AccountStatus, &AccountStatusParams {})
-        .await
-    {
-        Ok(_) => Ok(true),
-        Err(CliError::Refused(refusal)) if refusal.code == ErrorCode::PermissionDenied => Ok(false),
+        Ok(report) => Ok(Some(StorageRead::Account(report))),
+        Err(CliError::Refused(refusal)) if refusal.code == ErrorCode::HostNotConfigured => {
+            Ok(Some(StorageRead::NoAccount))
+        }
+        Err(CliError::Refused(refusal)) if refusal.code == ErrorCode::PermissionDenied => Ok(None),
         Err(other) => Err(other),
     }
 }
@@ -337,9 +362,8 @@ pub async fn sign_out(selector: &EnvironmentSelector, json: bool, storage: bool)
 ///
 /// A host has a storage account when its daemon answers `account.storage_status`. One that is
 /// refused as `HOST_NOT_CONFIGURED` has none, and one of a release before storage accounts does not
-/// list the method and cannot have one. The managed account is read first, with the same right, and
-/// read again after a `PERMISSION_DENIED`: a daemon that still answers it does not list the method,
-/// and one that now refuses it is refusing the caller, whose refusal is returned.
+/// list the method and cannot have one ([`read_storage_status`] tells it from a caller that is
+/// refused, whose refusal is returned).
 ///
 /// # Errors
 ///
@@ -349,20 +373,9 @@ pub async fn show(selector: &EnvironmentSelector, json: bool) -> Result<()> {
     let managed: AccountReport = daemon
         .read(Method::AccountStatus, &AccountStatusParams {})
         .await?;
-    let storage = match daemon
-        .read::<_, AccountReport>(Method::AccountStorageStatus, &AccountStatusParams {})
-        .await
-    {
-        Ok(report) => Some(report),
-        Err(CliError::Refused(refusal)) if refusal.code == ErrorCode::HostNotConfigured => None,
-        Err(CliError::Refused(refusal)) if refusal.code == ErrorCode::PermissionDenied => {
-            if managed_status_is_answered(&mut daemon).await? {
-                None
-            } else {
-                return Err(CliError::Refused(refusal));
-            }
-        }
-        Err(other) => return Err(other),
+    let storage = match read_storage_status(&mut daemon).await? {
+        StorageRead::Account(report) => Some(report),
+        StorageRead::NoAccount | StorageRead::Unlisted => None,
     };
     if json {
         let mut document = document(&managed);

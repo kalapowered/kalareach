@@ -390,11 +390,14 @@ async fn a_host_with_one_account_shows_it_in_the_document_it_always_had() {
 
 /// A scripted daemon on `temp`'s endpoint that answers the methods it lists and refuses every other
 /// method as a daemon refuses a method it does not list: `PERMISSION_DENIED`. A connection is
-/// answered `account.status` that many times, and refused it after: a membership that lapsed.
+/// answered `account.status` `status_answers` times, and refused it after: a membership that
+/// lapsed. The first `storage_refusals` reads of `account.storage_status` are refused as well,
+/// listed or not: a membership that lapsed and is renewed by another connection.
 fn scripted_daemon(
     temp: &kr_ipc::testing::TempHost,
     listed: &'static [&'static str],
     status_answers: usize,
+    storage_refusals: usize,
 ) -> tokio::task::JoinHandle<()> {
     let endpoint = temp
         .environment()
@@ -441,6 +444,7 @@ fn scripted_daemon(
                 continue;
             }
             let mut status_answered = 0_usize;
+            let mut storage_read = 0_usize;
             while let Ok(frame) = reader.read_message::<ControlFrame>().await {
                 let (request_id, method) = match &frame {
                     ControlFrame::Request(request) => {
@@ -454,7 +458,11 @@ fn scripted_daemon(
                 if method == "account.status" {
                     status_answered += 1;
                 }
-                let lapsed = method == "account.status" && status_answered > status_answers;
+                if method == "account.storage_status" {
+                    storage_read += 1;
+                }
+                let lapsed = (method == "account.status" && status_answered > status_answers)
+                    || (method == "account.storage_status" && storage_read <= storage_refusals);
                 let outcome = if listed.contains(&method.as_str()) && !lapsed {
                     let report = AccountReport {
                         service: Nullable::some("https://reach.kala.to".to_owned()),
@@ -493,7 +501,7 @@ async fn a_daemon_that_does_not_list_the_storage_methods_is_said_to_predate_stor
     host.environment()
         .create()
         .expect("the environment's directories");
-    let serving = scripted_daemon(&host, &["account.status"], usize::MAX);
+    let serving = scripted_daemon(&host, &["account.status"], usize::MAX, 0);
     for line in [
         ["account", "sign-in", "--storage"],
         ["account", "sign-out", "--storage"],
@@ -517,7 +525,7 @@ async fn a_daemon_that_does_not_list_the_storage_methods_is_said_to_predate_stor
         .environment()
         .create()
         .expect("the environment's directories");
-    let serving = scripted_daemon(&denied, &[], usize::MAX);
+    let serving = scripted_daemon(&denied, &[], usize::MAX, 0);
     let (status, refused) = json(&denied, &["account", "sign-in", "--storage"], None);
     assert_ne!(status, Some(0), "{refused}");
     assert_eq!(refused["code"], "PERMISSION_DENIED", "{refused}");
@@ -577,10 +585,42 @@ async fn show_does_not_hide_a_refusal_that_arrives_between_its_two_reads() {
         .create()
         .expect("the environment's directories");
     // The managed account's status is answered once, and refused after: the lease lapsed.
-    let serving = scripted_daemon(&host, &["account.status"], 1);
+    let serving = scripted_daemon(&host, &["account.status"], 1, 0);
     let (status, refused) = json(&host, &["account", "show"], None);
     assert_ne!(status, Some(0), "{refused}");
     assert_eq!(refused["ok"], false, "{refused}");
     assert_eq!(refused["code"], "PERMISSION_DENIED", "{refused}");
+    serving.abort();
+}
+
+/// KR-REQ-20.19: a membership lease that lapses and is renewed by another connection between the
+/// reads that tell an old daemon from a refused caller is not read as an old daemon. The scripted
+/// daemon lists the storage status, refuses its first read as a lapsed membership is refused, and
+/// answers the managed status and then the storage status: the write is shown as the daemon refused
+/// it, and `show` lists the storage account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_membership_renewed_between_the_reads_is_not_an_old_daemon() {
+    let host = kr_ipc::testing::TempHost::create();
+    host.environment()
+        .create()
+        .expect("the environment's directories");
+    let serving = scripted_daemon(
+        &host,
+        &["account.status", "account.storage_status"],
+        usize::MAX,
+        1,
+    );
+    let (status, refused) = json(&host, &["account", "sign-in", "--storage"], None);
+    assert_ne!(status, Some(0), "{refused}");
+    assert_eq!(refused["code"], "PERMISSION_DENIED", "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("this daemon lists no such method")),
+        "the refusal is the daemon's own: {refused}"
+    );
+    let (status, shown) = json(&host, &["account", "show"], None);
+    assert_eq!(status, Some(0), "{shown}");
+    assert_eq!(shown["storage_account"]["state"], "signed_out", "{shown}");
     serving.abort();
 }
