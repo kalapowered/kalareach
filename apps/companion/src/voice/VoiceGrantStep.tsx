@@ -65,6 +65,7 @@ export function VoiceGrantStep({
   port,
   refusal,
   named,
+  moves,
   onAllowed
 }: {
   readonly port: HostPort
@@ -72,8 +73,17 @@ export function VoiceGrantStep({
   readonly refusal: string | null
   /** Sessions the screen was opened for, chosen to begin with. None means every live one. */
   readonly named: readonly string[]
-  /** Called with the sessions the person allowed, once the host has granted them. */
-  readonly onAllowed: (sessionIds: readonly string[]) => void
+  /**
+   * How many hosts the connection has reported, as the screen counts them, read when the person
+   * presses. Allowing is answered with the count it was submitted under, so the screen can tell a
+   * grant made for a host the connection has since left.
+   */
+  readonly moves: () => number
+  /**
+   * Called with the sessions the person allowed, once the host has granted them, and the count of
+   * moves the allowing was submitted under. Not called once the step is gone.
+   */
+  readonly onAllowed: (sessionIds: readonly string[], movesWhenAllowed: number) => void
 }): ReactNode {
   const id = useId()
   const [scope, setScope] = useState<VoiceScope | null>(null)
@@ -86,7 +96,17 @@ export function VoiceGrantStep({
   const [granted, setGranted] = useState<VoiceAllowed | null>(null)
   /** The sessions the host granted, held while the person reads what it could not carry. */
   const [allowedIds, setAllowedIds] = useState<readonly string[] | null>(null)
+  /** The count of moves the held grant was submitted under. */
+  const [allowedUnder, setAllowedUnder] = useState(0)
   const continueButton = useRef<HTMLButtonElement | null>(null)
+  /** Whether the step is still shown: an answer that comes after it is gone is nobody's. */
+  const mounted = useRef(true)
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+    }
+  }, [])
 
   useEffect(() => {
     let current = true
@@ -133,10 +153,12 @@ export function VoiceGrantStep({
   const allow = () => {
     if (busy || chosen.size === 0 || environmentId === null) return
     const sessionIds = [...chosen]
+    const under = moves()
     setBusy(true)
     setFailure(null)
     port.voiceAllow({ sessionIds, actions: null, environmentId }, {}).then(
       (settled) => {
+        if (!mounted.current) return
         setBusy(false)
         // An answer with no result is a host that did not confirm: the grant may or may not stand,
         // so the person is not moved on, and allowing it again settles it.
@@ -154,13 +176,15 @@ export function VoiceGrantStep({
           settled.value.fence.kind !== 'unreadable' &&
           toConfirmOfFence(settled.value.fence).sessions.length === 0
         ) {
-          onAllowed(sessionIds)
+          onAllowed(sessionIds, under)
           return
         }
         setGranted(settled.value)
         setAllowedIds(sessionIds)
+        setAllowedUnder(under)
       },
       (error: unknown) => {
+        if (!mounted.current) return
         setBusy(false)
         setFailure(failureMessage(error))
       }
@@ -275,7 +299,7 @@ export function VoiceGrantStep({
             className="kr-voice__start"
             data-testid="voice-grant-continue"
             onClick={() => {
-              onAllowed(allowedIds)
+              onAllowed(allowedIds, allowedUnder)
             }}
           >
             Continue

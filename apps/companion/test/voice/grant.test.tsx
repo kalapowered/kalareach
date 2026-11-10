@@ -228,7 +228,7 @@ describe('allowing voice for the first time', () => {
   it('sends nothing when the host changed while the step was open', async () => {
     const { port, controls } = fakeHost()
     const onAllowed = vi.fn()
-    render(<VoiceGrantStep port={port} refusal={null} named={[]} onAllowed={onAllowed} />)
+    render(<VoiceGrantStep port={port} refusal={null} named={[]} moves={() => 0} onAllowed={onAllowed} />)
     await screen.findAllByRole('checkbox')
 
     act(() => {
@@ -256,6 +256,133 @@ describe('allowing voice for the first time', () => {
     expect(screen.queryAllByRole('checkbox')).toHaveLength(0)
     expect(screen.getByTestId('voice-allow')).toBeDisabled()
     expect(controls.voiceAllows).toHaveLength(0)
+  })
+
+  // An allowing that was asked for on one host and answered after the connection moved to another is
+  // nobody's: the screen asks the host in use about none of the sessions it was for.
+  it('ignores the answer to an allowing made for a host the connection has since left', async () => {
+    const { port, controls } = fakeHost()
+    controls.requireVoiceGrant('PERMISSION_DENIED: name the sessions this voice session may reach')
+    const asked: (readonly string[])[] = []
+    const watched: HostPort = {
+      ...port,
+      voicePrepare: (params) => {
+        asked.push((params as { readonly session_ids: readonly string[] }).session_ids)
+        return port.voicePrepare(params)
+      }
+    }
+    render(
+      <AppProvider port={watched}>
+        <VoiceRoute surface="ios" />
+      </AppProvider>
+    )
+    await screen.findAllByRole('checkbox')
+    const held = controls.hold('voiceAllow')
+    await userEvent.click(screen.getByTestId('voice-allow'))
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+    const before = asked.length
+    act(() => {
+      controls.switchHost(OTHER_HOST)
+    })
+    await waitFor(() => {
+      expect(asked.length).toBeGreaterThan(before)
+    })
+
+    // The host the allowing was for answers it now.
+    await act(async () => {
+      held.release()
+      await Promise.resolve()
+    })
+
+    expect(asked.at(-1)).toEqual([])
+    expect(await screen.findByRole('button', { name: 'Start voice session' })).toBeInTheDocument()
+  })
+
+  // The step answers for itself only while it is shown, and says which count of moves the allowing
+  // was submitted under, so the screen can tell it from one made for a host it has left.
+  it('does not answer an allowing after it is gone', async () => {
+    const { port, controls } = fakeHost()
+    const onAllowed = vi.fn()
+    const view = render(
+      <VoiceGrantStep port={port} refusal={null} named={[]} moves={() => 0} onAllowed={onAllowed} />
+    )
+    await screen.findAllByRole('checkbox')
+    const held = controls.hold('voiceAllow')
+    await userEvent.click(screen.getByTestId('voice-allow'))
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+
+    view.unmount()
+    await act(async () => {
+      held.release()
+      await Promise.resolve()
+    })
+
+    expect(onAllowed).not.toHaveBeenCalled()
+  })
+
+  it('answers an allowing with the count of moves it was submitted under', async () => {
+    const { port, controls } = fakeHost()
+    const onAllowed = vi.fn()
+    let moves = 0
+    render(
+      <VoiceGrantStep port={port} refusal={null} named={[]} moves={() => moves} onAllowed={onAllowed} />
+    )
+    await screen.findAllByRole('checkbox')
+    const held = controls.hold('voiceAllow')
+    await userEvent.click(screen.getByTestId('voice-allow'))
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+
+    moves = 1
+    await act(async () => {
+      held.release()
+      await Promise.resolve()
+    })
+
+    await waitFor(() => {
+      expect(onAllowed).toHaveBeenCalledTimes(1)
+    })
+    expect(onAllowed).toHaveBeenCalledWith(expect.any(Array), 0)
+  })
+
+  // The session an address named is a session of the host it was opened for.
+  it('drops the session the address named when the connection moves to another host', async () => {
+    window.history.pushState({}, '', `/?session=${SESSION_MAIN}`)
+    try {
+      const { port, controls } = fakeHost()
+      const asked: (readonly string[])[] = []
+      const watched: HostPort = {
+        ...port,
+        voicePrepare: (params) => {
+          asked.push((params as { readonly session_ids: readonly string[] }).session_ids)
+          return port.voicePrepare(params)
+        }
+      }
+      render(
+        <AppProvider port={watched}>
+          <VoiceRoute surface="ios" />
+        </AppProvider>
+      )
+      expect(await screen.findByRole('button', { name: 'Start voice session' })).toBeInTheDocument()
+      expect(asked.at(-1)).toEqual([SESSION_MAIN])
+
+      const before = asked.length
+      act(() => {
+        controls.switchHost(OTHER_HOST)
+      })
+      await waitFor(() => {
+        expect(asked.length).toBeGreaterThan(before)
+      })
+
+      expect(asked.at(-1)).toEqual([])
+    } finally {
+      window.history.pushState({}, '', '/')
+    }
   })
 
   // The sessions the person allowed on one host are not asked about on the next: the voice screen

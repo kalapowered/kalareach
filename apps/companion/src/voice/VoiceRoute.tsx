@@ -210,11 +210,15 @@ export function VoiceRoute({
   /** The sessions the person allowed voice for here, which the preparation is then asked about. */
   const [allowed, setAllowed] = useState<readonly string[] | null>(null)
   /**
-   * The environment of the host this screen reads from, once it has read one, and how many times
-   * the connection has moved to another host. What was read from one host is not shown for the
-   * next: the choice is cleared and read again from the host in use.
+   * The environment of the host the connection last reported, and how many hosts it has reported:
+   * the count advances on every report of another host, the first included. A reply that was asked
+   * for under an earlier count belongs to a host the connection has left, even when the connection
+   * has come back to it since, and is ignored. What was read from one host is not shown for the
+   * next: on a move the choice is cleared and read again from the host in use, which `hostMoves`
+   * triggers.
    */
   const hostEnvironment = useRef<string | null>(null)
+  const moveCount = useRef(0)
   const [hostMoves, setHostMoves] = useState(0)
   const [call, setCall] = useState<RunningCall | null>(null)
   const [busy, setBusy] = useState(false)
@@ -316,11 +320,12 @@ export function VoiceRoute({
   }, [])
 
   // The session this screen was opened for, when an address named one. The preparation is asked
-  // about that selection, and a start then names exactly the sessions the preparation answered.
-  const named = useMemo(() => {
+  // about that selection, and a start then names exactly the sessions the preparation answered. The
+  // address names a session of the host it was opened for, so a move to another host drops it.
+  const [named, setNamed] = useState<readonly string[]>(() => {
     const one = params.get('session')
     return one ? [one] : []
-  }, [params])
+  })
   const sessionIds = allowed ?? named
 
   // What a call would be, read before one exists. Nothing is created by asking, which is the whole
@@ -351,18 +356,19 @@ export function VoiceRoute({
    * Reads what a call would be again, as the person changes what voice may do: the preparation
    * names the grant, and a start that names the one read before the change is refused.
    */
-  const refreshChoice = useCallback(() => {
-    const host = hostEnvironment.current
-    void prepare().then(
+  const refreshChoice = useCallback((): Promise<boolean> => {
+    const moves = moveCount.current
+    return prepare().then(
       (prepared) => {
         // A read made before the connection moved to another host describes the host it left.
-        if (hostEnvironment.current !== host) return
+        if (moveCount.current !== moves) return false
         setNeedsGrant(null)
         setChoice(prepared)
+        return true
       },
       (error: unknown) => {
-        if (hostEnvironment.current !== host) return
-        setNotice(failureMessage(error))
+        if (moveCount.current === moves) setNotice(failureMessage(error))
+        return false
       }
     )
   }, [prepare])
@@ -638,15 +644,19 @@ export function VoiceRoute({
           setRights(state.connected ? state.rights : null)
           if (!state.connected || state.environment_id === null) return
           const left = hostEnvironment.current
+          if (left === state.environment_id) return
           hostEnvironment.current = state.environment_id
-          if (left !== null && left !== state.environment_id) {
-            // What is shown was read from the host the connection left. Nothing of it can be acted
-            // on for this one: it is cleared, and asked again of the host in use.
-            setChoice(null)
-            setNeedsGrant(null)
-            setAllowed(null)
-            setHostMoves((count) => count + 1)
-          }
+          moveCount.current += 1
+          // The first report names the host the screen opened for: nothing was read from another.
+          if (left === null) return
+          // What is shown was read from the host the connection left. Nothing of it can be acted
+          // on for this one: it is cleared, and asked again of the host in use, and so is the
+          // session the address named, which belongs to the host that was left.
+          setChoice(null)
+          setNeedsGrant(null)
+          setAllowed(null)
+          setNamed([])
+          setHostMoves(moveCount.current)
         },
         () => {
           setHostReachable(false)
@@ -973,7 +983,10 @@ export function VoiceRoute({
           port={port}
           refusal={needsGrant}
           named={named}
-          onAllowed={(ids) => {
+          moves={() => moveCount.current}
+          onAllowed={(ids, movesWhenAllowed) => {
+            // A grant made for a host the connection has since left says nothing of this one.
+            if (movesWhenAllowed !== moveCount.current) return
             setNeedsGrant(null)
             setAllowed(ids)
           }}

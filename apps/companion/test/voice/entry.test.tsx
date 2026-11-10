@@ -35,6 +35,7 @@ const OTHER_HOST = '3f1a2c40-11aa-4b2c-9d3e-000000000002'
 
 function start(setup?: (controls: FakeHostControls) => void): {
   controls: FakeHostControls
+  port: HostPort
   settled: () => Promise<void>
 } {
   const { port, controls } = fakeHost()
@@ -67,7 +68,7 @@ function start(setup?: (controls: FakeHostControls) => void): {
       })
     }
   }
-  return { controls, settled }
+  return { controls, port, settled }
 }
 
 /** What a replacement asks for, in the order the actions are sorted. */
@@ -219,7 +220,7 @@ describe('what voice may do', () => {
   it('sends nothing when the host changed between what was shown and the press', async () => {
     const { port, controls } = fakeHost()
     controls.speechReachesTheHost(true)
-    const onChanged = vi.fn()
+    const onChanged = vi.fn(() => Promise.resolve(true))
     render(<VoiceGrantEntry port={port} sessionNames={{}} onChanged={onChanged} />)
     const entry = await screen.findByTestId('voice-grant-entry')
     await userEvent.click(within(entry).getByRole('checkbox', { name: new RegExp(CLOSE_SENTENCE) }))
@@ -296,12 +297,14 @@ describe('what voice may do', () => {
     expect(controls.voiceAllows[0].environmentId).toBe(OTHER_HOST)
   })
 
-  // A read of what a call would be that was made for the host the connection has since left is
-  // not shown: it would put the old host's grant above an entry that reads the new one.
-  it('does not show a refresh made for the host the connection has left', async () => {
-    const { controls, settled } = start((fake) => {
+  // A read of what a call would be that was made for a host the connection has left is not shown,
+  // even when the connection has come back to that host since: it would put the grant the host held
+  // then above an entry that reads the grant it holds now.
+  it('does not show a refresh made for a host the connection has left, even after it came back', async () => {
+    const { controls, port, settled } = start((fake) => {
       fake.speechReachesTheHost(true)
     })
+    const home = (await port.connectionState()).environment_id as string
     const entry = await screen.findByTestId('voice-grant-entry')
     await userEvent.click(within(entry).getByRole('checkbox', { name: new RegExp(CLOSE_SENTENCE) }))
     await settled()
@@ -320,16 +323,23 @@ describe('what voice may do', () => {
     await waitFor(() => {
       expect(held.count).toBeGreaterThanOrEqual(3)
     })
-    // The connection moves to another host, whose grant is read after that.
-    const readsBefore = held.count
-    controls.standingVoiceGrant(['navigate', 'status'])
+    // The connection moves to another host and then back, and the grant is read once more.
+    const reads = held.count
     act(() => {
       controls.switchHost(OTHER_HOST)
     })
     await waitFor(() => {
-      expect(held.count).toBeGreaterThan(readsBefore)
+      expect(held.count).toBeGreaterThan(reads)
     })
-    // The new host's read is answered first, and the reads made for the host that was left after it.
+    const readsMoved = held.count
+    controls.standingVoiceGrant(['navigate', 'status'])
+    act(() => {
+      controls.switchHost(home)
+    })
+    await waitFor(() => {
+      expect(held.count).toBeGreaterThan(readsMoved)
+    })
+    // The read made after the return is answered first, and the reads made before it after.
     await act(async () => {
       held.answer(held.count - 1)
       await Promise.resolve()
