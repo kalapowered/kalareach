@@ -823,6 +823,39 @@ describe('while a call is running', () => {
     })
   })
 
+  // KR-REQ-15.22: the answer to a cancellation is told on the call it was asked on. Once the call
+  // has ended, the screen says how it ended and nothing the host answered afterwards.
+  it('does not tell the answer to a cancellation once its call has ended', async () => {
+    const { person, port } = await startACall()
+    await waitFor(() => {
+      expect(askToCancel()).toBeEnabled()
+    })
+    const answer = port.composerInterrupt.bind(port)
+    let release: () => void = () => undefined
+    const waiting = vi.spyOn(port, 'composerInterrupt').mockImplementation(
+      (...args) =>
+        new Promise((resolve) => {
+          release = () => resolve(answer(...args))
+        })
+    )
+    await person.click(askToCancel())
+    await person.click(screen.getByRole('button', { name: 'Cancel this turn' }))
+    expect(waiting).toHaveBeenCalledTimes(1)
+
+    await person.click(screen.getByRole('button', { name: 'End session' }))
+    await waitFor(() => {
+      expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
+    })
+    // The host answers now, and a task that yields to the event loop runs every promise that is
+    // waiting first, so once it returns the screen has taken the answer.
+    await act(async () => {
+      release()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+
+    expect(screen.queryByText(/asked to cancel that turn/)).not.toBeInTheDocument()
+  })
+
   // KR-REQ-15.22: a call that reaches more than one session has no one turn to name, and a
   // confirmation that does not say whose turn it cancels must not pick one.
   it('names no turn for a call that reaches more than one session', async () => {

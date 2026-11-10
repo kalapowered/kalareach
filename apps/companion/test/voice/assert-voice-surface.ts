@@ -769,17 +769,22 @@ async function assertStopIsNotCancel(page: Page, base: string, target: Target): 
   ])
 }
 
-/** While the host's agent is on no turn the screen offers no cancellation, and says why. */
+/**
+ * When the host's agent leaves its turn the screen takes the offer back and says why. The control
+ * is first shown on offer, so the words can only be drawn after a read that found no turn.
+ */
 async function assertNoTurnToCancel(page: Page, base: string, target: Target): Promise<void> {
   const where = `${target.surface}/${target.engineName}`
   await prove('KR-REQ-15.22', where, [
     opening(page, base, target),
-    hostEndsItsTurn(page),
+    hostAgentIsOnATurn(page, true),
     pressing(page, 'Start voice session'),
     heading(page, 'Voice session'),
-    inOwnSection(page, 'Cancel the current turn', 'Cancel what the agent is doing'),
+    canPress(page, ['Cancel the current turn']),
+    hostEndsItsTurn(page),
+    shows(page, 'has not said which turn the agent is on'),
     cannotPress(page, 'Cancel the current turn'),
-    shows(page, 'has not said which turn the agent is on')
+    inOwnSection(page, 'Cancel the current turn', 'Cancel what the agent is doing')
   ])
 }
 
