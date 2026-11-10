@@ -320,6 +320,40 @@ pub(crate) struct Shared {
     /// Whether spoken delegations are handed to the host: a case's choice, where a case can make one.
     #[cfg(any(test, feature = "testing", debug_assertions))]
     accept: std::sync::atomic::AtomicBool,
+    /// What the owner has read and acted on, which a case waits for instead of a delay.
+    #[cfg(any(test, feature = "testing"))]
+    handled: Handled,
+}
+
+/// What the owner has read and acted on. A case that has to act after the owner did, and not after
+/// a time, waits for it here: a build that is not made for cases records nothing.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Default)]
+struct Handled {
+    /// The voice service's announcements of a delegation: its identifier, and its offset when the
+    /// announcement said one.
+    announcements: Mutex<Vec<(String, Option<u64>)>>,
+    /// The delegations whose capture proof the owner has acted on.
+    proofs: Mutex<Vec<String>>,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl Handled {
+    /// The owner read the voice service's announcement of the delegation `id`.
+    fn announcement(&self, id: String, offset_ms: Option<u64>) {
+        self.announcements
+            .lock()
+            .expect("the record is not poisoned")
+            .push((id, offset_ms));
+    }
+
+    /// The owner acted on the answer to the proof the delegation `id` asked for.
+    fn proof(&self, id: &str) {
+        self.proofs
+            .lock()
+            .expect("the record is not poisoned")
+            .push(id.to_owned());
+    }
 }
 
 impl Shared {
@@ -971,6 +1005,8 @@ impl Calls {
                 standing: Mutex::new(None),
                 #[cfg(any(test, feature = "testing", debug_assertions))]
                 accept: std::sync::atomic::AtomicBool::new(ACCEPT_HOST_DELEGATIONS),
+                #[cfg(any(test, feature = "testing"))]
+                handled: Handled::default(),
             })),
         }
     }
@@ -984,6 +1020,40 @@ impl Calls {
                 .accept
                 .store(accept, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    /// Whether an owner has read the voice service's announcement of the delegation `id` at
+    /// `offset_ms`. For cases, which send the provider's delegation only once it has: they decide by
+    /// that and not by a wait.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn has_read_announcement(&self, id: &str, offset_ms: u64) -> bool {
+        self.shared.as_ref().is_some_and(|shared| {
+            shared
+                .handled
+                .announcements
+                .lock()
+                .expect("the record is not poisoned")
+                .iter()
+                .any(|(known, offset)| known == id && *offset == Some(offset_ms))
+        })
+    }
+
+    /// Whether an owner has acted on the answer to the capture proof the delegation `id` asked for:
+    /// what it holds of the proof is in, and the news behind the proof's marker may be told. For
+    /// cases, which let that news through only once it has.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn has_handled_proof(&self, id: &str) -> bool {
+        self.shared.as_ref().is_some_and(|shared| {
+            shared
+                .handled
+                .proofs
+                .lock()
+                .expect("the record is not poisoned")
+                .iter()
+                .any(|known| known == id)
+        })
     }
 
     /// Says that the host a call left a grant at is reached, over `session`, so that what this
