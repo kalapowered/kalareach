@@ -19,13 +19,16 @@ use crate::services::SyncBackupService;
 /// How a fresh restore is meant to reach the service that holds the ciphertext.
 ///
 /// It is the owner's configuration rather than the restore's choice, which is why it is carried
-/// rather than inferred: a self-hosted deployment has no account to sign in to, and a managed one
-/// has no way in without one.
+/// rather than inferred: the managed service and a service the owner runs each have accounts of
+/// their own, and the restore signs in to an account of the service the owner configured and
+/// reaches nothing at another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RetrievalPolicy {
-    /// A managed account. The restore signs in, and signing in gets it the ciphertext.
+    /// The managed service. The restore signs in to the managed account, and signing in gets it
+    /// the ciphertext.
     Account,
-    /// A service the owner runs. The restore is given its access directly.
+    /// A service the owner runs. It has accounts of its own: the restore signs in to the owner's
+    /// account there, and signing in gets it the ciphertext.
     SelfHosted,
 }
 
@@ -47,9 +50,10 @@ impl RetrievalPolicy {
 /// bundle accepts `backup.restore` or `backup.write`, and the managed service reads an archive's
 /// objects only for a token that carries `backup.write`, so a device that holds `backup.restore`
 /// alone reads the bundle and no object. Under [`RetrievalPolicy::SelfHosted`] it presents the
-/// credential the owner's own deployment issued. Either way the service decides what the reader
-/// reaches, and a reader it does not admit reaches nothing: a restore reads only through this, so
-/// holding one proves nothing by itself.
+/// token of the account the device is signed in to at the owner's own service, whose issuer is
+/// that service's own. Either way the service decides what the reader reaches, and a reader it
+/// does not admit reaches nothing: a restore reads only through this, so holding one proves
+/// nothing by itself.
 ///
 /// It carries no key, and that half *is* structural. Holding one means a restore can *fetch*
 /// ciphertext; opening that ciphertext needs the seed the kit carries, and section 20 says so in
