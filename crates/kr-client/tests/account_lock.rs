@@ -72,7 +72,8 @@ fn account(directory: &Path, origin: &str, clock: fn() -> u64, shared: bool) -> 
         Arc::new(http) as Arc<dyn AccountHttp>,
         Client::Desktop,
     );
-    let account = SignedInAccount::new(
+    let account = SignedInAccount::at_origin(
+        origin,
         Arc::new(service) as Arc<dyn AccountService>,
         open_store(directory),
         Client::Desktop,

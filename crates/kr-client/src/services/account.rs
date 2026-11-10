@@ -23,11 +23,18 @@
 //!
 //! # What is pinned
 //!
-//! The origin, the issuer, the endpoints and the two registered clients with their redirects are
-//! constants here rather than something discovered. The registry on the service is closed and
-//! exact, and the issuer is the value every answer is checked against, so reading it from the
-//! service would have the answer vouch for itself. A self-hosted deployment supplies its own
-//! [`AccountService`].
+//! The managed origin, its issuer, the endpoints and the two registered clients with their
+//! redirects are constants here rather than something discovered. The registry on the service is
+//! closed and exact, and the issuer is the value every answer is checked against, so reading it
+//! from the service would have the answer vouch for itself.
+//!
+//! A service the owner runs is held to the same rule, at the origin the client was made for: its
+//! issuer is [`issuer_of`] that origin, fixed before anything is asked of the service. Every
+//! authorisation request, ID token, stored grant and account mark carries that issuer, so an
+//! answer, a document or a mark that names another service's issuer is refused or is not equal.
+//! The origin forms ([`AuthorisationRequest::asking_at_origin`],
+//! [`ManagedAccountService::at_origin`] and [`SignedInAccount::at_origin`]) take it; the managed
+//! forms are those forms at [`ACCOUNT_ORIGIN`].
 //!
 //! # One lock
 //!
@@ -65,6 +72,7 @@ use std::sync::{Arc, Mutex};
 use base64::Engine as _;
 use kr_crypto::store::{SecretName, SecretStore};
 use kr_protocol::error::ErrorCode;
+use kr_protocol::service::GatewayOrigin;
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 use subtle::ConstantTimeEq as _;
@@ -81,14 +89,27 @@ use crate::shown::Shown;
 /* What is pinned                                                              */
 /* -------------------------------------------------------------------------- */
 
-/// The website's fixed origin, where the passkey ceremony runs.
+/// The managed service's fixed origin, where the passkey ceremony runs.
 pub const ACCOUNT_ORIGIN: &str = kr_protocol::service::OFFICIAL_GATEWAY_ORIGIN;
 
 /// The passkey relying party: the origin's host, which is how the service derives it.
 pub const RELYING_PARTY_ID: &str = "reach.kala.to";
 
-/// The issuer every answer is checked against.
+/// The managed service's issuer, which every answer of the managed service is checked against: it
+/// is [`issuer_of`] [`ACCOUNT_ORIGIN`].
 pub const ISSUER: &str = "https://reach.kala.to/auth";
+
+/// Where a service mounts its authorisation server, below its origin.
+const ISSUER_PATH: &str = "/auth";
+
+/// The issuer of the account service at `origin`: the origin and the path the service mounts its
+/// authorisation server at, which is what it names in a callback and in an ID token.
+///
+/// It is computed from the origin the client was made for and never read from an answer.
+#[must_use]
+pub fn issuer_of(origin: &str) -> String {
+    format!("{origin}{ISSUER_PATH}")
+}
 
 /// Where the browser is sent to sign in.
 pub const AUTHORIZE_PATH: &str = "/auth/oauth2/authorize";
@@ -515,6 +536,8 @@ impl fmt::Debug for AttemptId {
 /// [`IDENTITY_SCOPES`] and that purpose's resources, so the token that comes of it reaches what it
 /// was asked for and nothing else.
 pub struct AuthorisationRequest {
+    origin: String,
+    issuer: String,
     client: Client,
     redirect: Redirect,
     attempt: AttemptId,
@@ -581,6 +604,32 @@ impl AuthorisationRequest {
     /// scope a request can carry or names a scope already asked for, or when this device could not
     /// produce random bytes.
     pub fn asking(client: Client, redirect: Redirect, resources: &[&str]) -> Result<Self> {
+        Self::asking_at_origin(ACCOUNT_ORIGIN, client, redirect, resources)
+    }
+
+    /// A request to the account service at `origin`, for `client`, answered on `redirect`, asking
+    /// for the [`IDENTITY_SCOPES`] and the resources `resources` names, and for nothing else.
+    ///
+    /// The address it opens is `origin`'s own authorisation endpoint, and the answer it accepts
+    /// names `origin`'s own issuer ([`issuer_of`]) and no other. [`Self::asking`] is this at the
+    /// managed origin.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::asking`], and when `origin` is not the origin of an account service: an `https`
+    /// origin, or an `http` one on a loopback host, with a host, an optional port and nothing else.
+    pub fn asking_at_origin(
+        origin: &str,
+        client: Client,
+        redirect: Redirect,
+        resources: &[&str],
+    ) -> Result<Self> {
+        if GatewayOrigin::new(origin).is_err() {
+            return Err(local(
+                "an account service's origin is a scheme, a host and an optional port, and plain \
+                 http only for a loopback host",
+            ));
+        }
         if !client.owns(redirect) {
             return Err(local(crate::shown!(
                 "{} is not a redirect registered for {}",
@@ -610,6 +659,8 @@ impl AuthorisationRequest {
             scopes.push((*resource).to_owned());
         }
         Ok(Self {
+            origin: origin.to_owned(),
+            issuer: issuer_of(origin),
             client,
             redirect,
             attempt: AttemptId::fresh()?,
@@ -620,17 +671,17 @@ impl AuthorisationRequest {
         })
     }
 
-    /// The address the browser opens: the authorisation endpoint on the fixed origin, with each
-    /// parameter once and nothing else.
+    /// The address the browser opens: the authorisation endpoint on the request's own origin, with
+    /// each parameter once and nothing else.
     ///
     /// # Panics
     ///
-    /// Panics only when the pinned origin does not parse, which is a build-time mistake.
+    /// Panics only when the request's origin does not parse, which its constructor ruled out.
     #[must_use]
     pub fn url(&self) -> String {
-        let Ok(mut url) = Url::parse(ACCOUNT_ORIGIN).and_then(|origin| origin.join(AUTHORIZE_PATH))
+        let Ok(mut url) = Url::parse(&self.origin).and_then(|origin| origin.join(AUTHORIZE_PATH))
         else {
-            unreachable!("the pinned origin and path parse");
+            unreachable!("the origin was checked when the request was made, and the path parses");
         };
         url.query_pairs_mut()
             .append_pair("response_type", "code")
@@ -830,7 +881,8 @@ impl PendingAuthorisation {
 
     /// Checks one answer, in this order: the address is the attempt's redirect; `state`, `code`,
     /// `iss` and `error` appear at most once; the state is this attempt's; the request is consumed;
-    /// the issuer is the pinned one; an `error` is a refusal or a failure; a code becomes a grant.
+    /// the issuer is the request's own ([`issuer_of`] its origin); an `error` is a refusal or a
+    /// failure; a code becomes a grant.
     pub fn answer(&mut self, url: &str, carrier: Carrier) -> Answer {
         let inspected = match self.request.as_ref() {
             None => Err(AnswerFault::WrongState),
@@ -851,7 +903,7 @@ impl PendingAuthorisation {
         let Some(request) = self.request.take() else {
             return Answer::Failed(AnswerFault::WrongState);
         };
-        if inspected.issuer.as_deref() != Some(ISSUER) {
+        if inspected.issuer.as_deref() != Some(request.issuer.as_str()) {
             return Answer::Failed(AnswerFault::OtherIssuer);
         }
         if let Some(error) = inspected.error {
@@ -1034,9 +1086,10 @@ pub struct AccountUsage {
     pub lines: Vec<UsageLine>,
 }
 
-/// Where a managed or self-hosted account is signed in.
+/// Where an account is signed in: the managed service, or a service the owner runs.
 ///
-/// Account tokens authorise managed resources only. Nothing here can grant host authority.
+/// Account tokens authorise that service's own resources only. Nothing here can grant host
+/// authority.
 pub trait AccountService: Send + Sync + fmt::Debug {
     /// Exchanges a code for tokens, and checks them.
     fn exchange<'a>(&'a self, grant: &'a AuthorisationGrant) -> ServiceFuture<'a, Exchanged>;
@@ -1091,10 +1144,12 @@ fn system_milliseconds() -> u64 {
         })
 }
 
-/// The managed account service.
+/// The account service of the managed service, or of a service the owner runs
+/// ([`Self::at_origin`]).
 #[derive(Clone)]
 pub struct ManagedAccountService {
     origin: String,
+    issuer: String,
     http: Arc<dyn AccountHttp>,
     client: Client,
     clock: fn() -> u64,
@@ -1124,16 +1179,19 @@ impl ManagedAccountService {
         Self::at_origin(ACCOUNT_ORIGIN, http, client)
     }
 
-    /// The same service answering on another origin, such as a test server. The issuer every
-    /// answer is checked against stays the pinned one.
+    /// The account service at another origin: a service the owner runs, or a test server. The
+    /// issuer every answer is checked against is that origin's own, `<origin>/auth`
+    /// ([`issuer_of`]), so an answer that names the managed issuer, or any other, is refused.
     #[must_use]
     pub fn at_origin(
         origin: impl Into<String>,
         http: Arc<dyn AccountHttp>,
         client: Client,
     ) -> Self {
+        let origin = origin.into();
         Self {
-            origin: origin.into(),
+            issuer: issuer_of(&origin),
+            origin,
             http,
             client,
             clock: system_seconds,
@@ -1227,12 +1285,12 @@ impl ManagedAccountService {
 
     /// Checks an ID token's payload and returns its subject.
     ///
-    /// Its signature is not checked: it came over TLS straight from the pinned token endpoint,
-    /// which OpenID Connect Core section 3.1.3.7 accepts in place of one.
+    /// Its signature is not checked: it came over TLS straight from the token endpoint this
+    /// service was made for, which OpenID Connect Core section 3.1.3.7 accepts in place of one.
     fn checked_subject(&self, token: &str, expected: &Expected<'_>) -> Option<String> {
         let claims = id_token_claims(token)?;
         let text = |name: &str| claims.get(name).and_then(serde_json::Value::as_str);
-        if text("iss") != Some(ISSUER) {
+        if text("iss") != Some(self.issuer.as_str()) {
             return None;
         }
         let client = expected.client.id();
@@ -1546,6 +1604,7 @@ impl AccountService for ManagedAccountService {
 pub struct StoredGrant {
     grant_id: String,
     revision: u64,
+    issuer: String,
     client: Client,
     subject: String,
     email: Option<String>,
@@ -1592,8 +1651,11 @@ struct GrantDocument {
 
 /// Which account, at which service, a token is for.
 ///
-/// A domain-separated digest of the issuer, the account's subject and the origin of the service the
-/// token is presented to. Two marks are equal while it is the same account at the same service.
+/// A domain-separated digest of the issuer the grant names, the account's subject and the origin of
+/// the service the token is presented to. Two marks are equal while it is the same account at the
+/// same service. The issuer is the stored grant's own, not one derived from the origin the token is
+/// presented at, so an account of a service the owner runs never has the mark of an account of the
+/// managed service, whatever it is presented to.
 /// Nothing in a mark says who the account is, and the subject it was made from leaves the sign-in
 /// only in a [`TokenOfAccount`], for the one request that names the account in its signed body: a
 /// caller that must know a token is still its account's holds the mark and compares it.
@@ -1655,10 +1717,11 @@ impl fmt::Debug for AccountMark {
 const ACCOUNT_MARK_DOMAIN: &str = "kalareach-account-mark/1";
 
 impl AccountMark {
-    /// The mark of the account `subject` at the service at `origin`.
-    fn of(subject: &str, origin: &str) -> Self {
+    /// The mark of the account `subject` of the service that issues as `issuer`, presented to the
+    /// service at `origin`.
+    fn of(issuer: &str, subject: &str, origin: &str) -> Self {
         let mut digest = sha2::Sha256::new();
-        for part in [ACCOUNT_MARK_DOMAIN, ISSUER, subject, origin] {
+        for part in [ACCOUNT_MARK_DOMAIN, issuer, subject, origin] {
             digest.update((part.len() as u64).to_be_bytes());
             digest.update(part.as_bytes());
         }
@@ -1667,20 +1730,29 @@ impl AccountMark {
 }
 
 impl StoredGrant {
-    /// The mark of this grant's account at the service at `origin`.
+    /// The mark of this grant's account at the service at `origin`, from the issuer the grant
+    /// names.
     fn mark_at(&self, origin: &str) -> AccountMark {
-        AccountMark::of(&self.subject, origin)
+        AccountMark::of(&self.issuer, &self.subject, origin)
     }
 
-    /// A new grant from an exchange's tokens, with an identifier of its own.
+    /// A new grant from an exchange's tokens, with an identifier of its own, for the service that
+    /// issues as `issuer`.
     ///
     /// # Errors
     ///
     /// Returns an error when this device could not produce random bytes.
-    pub fn new(issued: IssuedGrant, client: Client, nonce: &str, now_ms: u64) -> Result<Self> {
+    pub fn new(
+        issuer: &str,
+        issued: IssuedGrant,
+        client: Client,
+        nonce: &str,
+        now_ms: u64,
+    ) -> Result<Self> {
         Ok(Self {
             grant_id: fresh_secret()?,
             revision: 0,
+            issuer: issuer.to_owned(),
             client,
             subject: issued.subject,
             email: None,
@@ -1699,6 +1771,7 @@ impl StoredGrant {
         Self {
             grant_id: self.grant_id.clone(),
             revision: self.revision.saturating_add(1),
+            issuer: self.issuer.clone(),
             client: self.client,
             subject: self.subject.clone(),
             email: self.email.clone(),
@@ -1766,19 +1839,20 @@ impl StoredGrant {
         self.scopes.iter().any(|held| held == scope)
     }
 
-    /// Reads a stored grant.
+    /// Reads a stored grant, which has to name `issuer`: the issuer of the account that holds it.
     ///
     /// # Errors
     ///
-    /// Returns a storage failure when the document is not one this build wrote.
-    pub(crate) fn read(bytes: &[u8]) -> Result<Self> {
+    /// Returns a storage failure when the document is not one this build wrote, or names another
+    /// issuer.
+    pub(crate) fn read(bytes: &[u8], issuer: &str) -> Result<Self> {
         let document: GrantDocument = serde_json::from_slice(bytes).map_err(|error| {
             storage(crate::shown!(
                 "the stored sign-in could not be read: {}",
                 Shown::json(&error)
             ))
         })?;
-        if document.issuer != ISSUER {
+        if document.issuer != issuer {
             return Err(storage("the stored sign-in names another issuer"));
         }
         let client = Client::from_id(&document.client_id)
@@ -1786,6 +1860,7 @@ impl StoredGrant {
         Ok(Self {
             grant_id: document.grant_id,
             revision: document.revision,
+            issuer: document.issuer,
             client,
             subject: document.subject,
             email: document.email,
@@ -1802,7 +1877,7 @@ impl StoredGrant {
         let document = GrantDocument {
             grant_id: self.grant_id.clone(),
             revision: self.revision,
-            issuer: ISSUER.to_owned(),
+            issuer: self.issuer.clone(),
             client_id: self.client.id().to_owned(),
             subject: self.subject.clone(),
             email: self.email.clone(),
@@ -1954,6 +2029,9 @@ pub enum Commit {
 pub struct SignedInAccount {
     service: Arc<dyn AccountService>,
     store: Arc<dyn SecretStore>,
+    /// The issuer of the service this account signs in at: every grant it keeps names it, and a
+    /// stored grant that names another is refused.
+    issuer: String,
     client: Client,
     lock: tokio::sync::Mutex<()>,
     shared_lock: Option<PathBuf>,
@@ -2016,9 +2094,25 @@ fn ended() -> ClientError {
 }
 
 impl SignedInAccount {
-    /// The account kept in `store`, signed in through `service` as `client`.
+    /// The account kept in `store`, signed in through `service` as `client`, at the managed
+    /// origin: [`Self::at_origin`] with [`ACCOUNT_ORIGIN`].
     #[must_use]
     pub fn new(
+        service: Arc<dyn AccountService>,
+        store: Arc<dyn SecretStore>,
+        client: Client,
+    ) -> Self {
+        Self::at_origin(ACCOUNT_ORIGIN, service, store, client)
+    }
+
+    /// The account kept in `store`, signed in through `service` as `client`, where `service` is
+    /// the account service at `origin`.
+    ///
+    /// The grants it keeps name `origin`'s issuer ([`issuer_of`]), and a stored grant that names
+    /// another is refused when it is read.
+    #[must_use]
+    pub fn at_origin(
+        origin: &str,
         service: Arc<dyn AccountService>,
         store: Arc<dyn SecretStore>,
         client: Client,
@@ -2027,6 +2121,7 @@ impl SignedInAccount {
         Self {
             service,
             store,
+            issuer: issuer_of(origin),
             client,
             lock: tokio::sync::Mutex::new(()),
             shared_lock: None,
@@ -2191,7 +2286,7 @@ impl SignedInAccount {
             ))
         })?;
         bytes
-            .map(|bytes| StoredGrant::read(bytes.expose()))
+            .map(|bytes| StoredGrant::read(bytes.expose(), &self.issuer))
             .transpose()
     }
 
@@ -2369,7 +2464,8 @@ impl SignedInAccount {
     pub async fn commit(&self, issued: IssuedGrant, nonce: &str) -> Result<Commit> {
         let replaced = {
             let _held = self.hold().await?;
-            let grant = StoredGrant::new(issued, self.client, nonce, (self.clock_ms)())?;
+            let grant =
+                StoredGrant::new(&self.issuer, issued, self.client, nonce, (self.clock_ms)())?;
             let replaced = self.read_grant()?;
             // The queue as it is, to be put back whole if the new grant is not written: the old
             // grant is the one still kept then, and its revocation is not owed.
@@ -2964,9 +3060,14 @@ mod tests {
             "IssuedGrant{expires_in_seconds:600,scopes:\"openid,billing.read\",..}",
         );
 
-        let mut stored =
-            StoredGrant::new(issued(NEVER_RENDERED), Client::Mobile, NEVER_RENDERED, 0)
-                .expect("a grant");
+        let mut stored = StoredGrant::new(
+            ISSUER,
+            issued(NEVER_RENDERED),
+            Client::Mobile,
+            NEVER_RENDERED,
+            0,
+        )
+        .expect("a grant");
         stored.grant_id = "a-grant".to_owned();
         stored.email = Some(NEVER_RENDERED.to_owned());
         stored.subject = NEVER_RENDERED.to_owned();
@@ -2987,22 +3088,28 @@ mod tests {
 
     #[test]
     fn a_stored_grant_reads_back_as_it_was_written() {
-        let mut grant = StoredGrant::new(issued("a-refresh"), Client::Desktop, "a-nonce", 1_000)
-            .expect("a grant");
+        let mut grant = StoredGrant::new(
+            ISSUER,
+            issued("a-refresh"),
+            Client::Desktop,
+            "a-nonce",
+            1_000,
+        )
+        .expect("a grant");
         grant.email = Some("sam@example.com".to_owned());
-        let read = StoredGrant::read(&grant.write().expect("bytes")).expect("read back");
+        let read = StoredGrant::read(&grant.write().expect("bytes"), ISSUER).expect("read back");
         assert_eq!(read, grant);
         assert_eq!(read.access_expires_at_ms, 601_000);
     }
 
     #[test]
     fn a_stored_grant_for_another_issuer_is_not_read() {
-        let grant =
-            StoredGrant::new(issued("a-refresh"), Client::Desktop, "a-nonce", 0).expect("a grant");
+        let grant = StoredGrant::new(ISSUER, issued("a-refresh"), Client::Desktop, "a-nonce", 0)
+            .expect("a grant");
         let mut document: serde_json::Value =
             serde_json::from_slice(&grant.write().expect("bytes")).expect("json");
         document["issuer"] = serde_json::json!("https://evil.example/auth");
-        let error = StoredGrant::read(&serde_json::to_vec(&document).expect("bytes"))
+        let error = StoredGrant::read(&serde_json::to_vec(&document).expect("bytes"), ISSUER)
             .expect_err("another issuer");
         assert_eq!(error.code(), ErrorCode::StorageUnavailable);
     }
@@ -3254,7 +3361,8 @@ mod tests {
         );
         assert_unmarked("stored scopes", &[summary]);
         let mut grant =
-            StoredGrant::new(issued("a-refresh"), Client::Desktop, "a-nonce", 0).expect("a grant");
+            StoredGrant::new(ISSUER, issued("a-refresh"), Client::Desktop, "a-nonce", 0)
+                .expect("a grant");
         grant.scopes = stored;
         assert_unmarked("a stored grant", &debug_renderings(&grant));
 
@@ -3479,8 +3587,8 @@ mod tests {
     async fn kr_req_23_57_a_gateway_that_lost_an_exchange_or_a_refresh_leaves_its_outcome_unknown()
     {
         let grant = granted();
-        let stored =
-            StoredGrant::new(issued("a-refresh"), Client::Desktop, "a-nonce", 0).expect("a grant");
+        let stored = StoredGrant::new(ISSUER, issued("a-refresh"), Client::Desktop, "a-nonce", 0)
+            .expect("a grant");
         let page: &'static [u8] = b"<html><body>Bad Gateway</body></html>";
         for status in [502, 504] {
             let service = behind(status, page);

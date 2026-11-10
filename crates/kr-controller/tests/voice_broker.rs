@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use connect_proxy::ConnectProxy;
 use kr_client::services::account::{
-    AccountToken, Client, ISSUER, IssuedGrant, Redirect, RefreshToken, code_challenge,
+    AccountToken, Client, IssuedGrant, Redirect, RefreshToken, code_challenge, issuer_of,
 };
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
@@ -49,6 +49,8 @@ struct Seen {
 
 /// What the stand-in account service has issued, and what it will do next.
 struct Account {
+    /// What the service names as its issuer in every ID token: its own origin and `/auth`.
+    issuer: String,
     /// The nonce and the challenge of the sign-in the browser was sent to.
     nonce: String,
     challenge: String,
@@ -96,7 +98,7 @@ impl Account {
             };
             let now = kr_ipc::now_ms().get() / 1000;
             let claims = serde_json::json!({
-                "iss": ISSUER,
+                "iss": self.issuer,
                 "sub": self.subject,
                 "aud": Client::Desktop.id(),
                 "nonce": self.nonce_override.as_ref().unwrap_or(&self.nonce),
@@ -177,6 +179,7 @@ impl Broker {
             holds: Mutex::default(),
             call: Mutex::new(Call::Open),
             account: Mutex::new(Account {
+                issuer: issuer_of(&origin),
                 nonce: String::new(),
                 challenge: String::new(),
                 expires_in: 600,
@@ -327,9 +330,12 @@ impl Broker {
             .clone()
     }
 
-    /// Tells the stand-in which sign-in the browser was sent to.
+    /// Tells the stand-in which sign-in the browser was sent to, which is a sign-in at this
+    /// service: the daemon opens the authorisation address of the account service it is
+    /// configured for.
     fn expect_sign_in(&self, authorise_url: &str) {
         let url = url::Url::parse(authorise_url).expect("an address");
+        assert_eq!(url.origin().ascii_serialization(), self.origin);
         let query: std::collections::BTreeMap<String, String> = url
             .query_pairs()
             .map(|(name, value)| (name.into_owned(), value.into_owned()))
@@ -698,7 +704,7 @@ async fn browser_answers(redirect_address: &str, authorise_url: &str, code: &str
     let query = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("code", code)
         .append_pair("state", &state)
-        .append_pair("iss", ISSUER)
+        .append_pair("iss", &issuer_of(&url.origin().ascii_serialization()))
         .finish();
     let mut stream = TcpStream::connect(redirect_address)
         .await
@@ -1122,6 +1128,13 @@ async fn an_operator_signs_the_host_in_and_a_call_presents_the_account_it_signed
         Some("someone@example.test")
     );
     assert!(scopes.iter().any(|scope| scope == "voice"), "{scopes:?}");
+    // The grant the host keeps names the issuer of the service it signed in at, which the host's
+    // scope for it is named by as well.
+    let kept = account_item_in(&host.tree().environment().secrets_dir(), "session");
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(kept).expect("the grant is kept"))
+            .expect("a grant document");
+    assert_eq!(document["issuer"], issuer_of(&broker.origin));
     let said = serde_json::to_string(&report).expect("a report");
     for held in [broker.access(1), broker.refresh(1)] {
         assert!(!said.contains(&held), "the report says no token: {said}");

@@ -830,13 +830,13 @@ mod cases {
         // The negative control: the document as written reads, and holds the marker in every
         // text field, the grant's identifier among them.
         let whole = serde_json::to_vec(&document(MARKER)).expect("a document");
-        let grant = StoredGrant::read(&whole).expect("the document reads");
+        let grant = StoredGrant::read(&whole, ISSUER).expect("the document reads");
         assert_eq!(grant.grant_id(), MARKER);
         assert_unmarked("a stored grant", &debug_renderings(&grant));
         let (mut read, mut refused) = (0, 0);
         for planted in json_plantings(&document("a-stored-value"), MARKER) {
             let bytes = serde_json::to_vec(&planted.input).expect("a document");
-            match StoredGrant::read(&bytes) {
+            match StoredGrant::read(&bytes, ISSUER) {
                 Ok(grant) => {
                     read += 1;
                     assert_unmarked(&planted.at, &debug_renderings(&grant));
@@ -850,7 +850,7 @@ mod cases {
         assert!(read > 0 && refused > 0, "{read} read, {refused} refused");
         // The neutral control: a document that is not one says the class of the fault and where
         // it is, and nothing it held.
-        let said = StoredGrant::read(format!("{{\"grantId\": {NEUTRAL}").as_bytes())
+        let said = StoredGrant::read(format!("{{\"grantId\": {NEUTRAL}").as_bytes(), ISSUER)
             .expect_err("not a document")
             .to_string();
         assert!(

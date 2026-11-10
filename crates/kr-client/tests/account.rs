@@ -19,7 +19,7 @@ use kr_client::services::account::{
     AuthorisationRequest, Carrier, Client, Commit, Exchanged, ISSUER, IdentityRead, IssuedGrant,
     LEASE_SCOPE, ManagedAccountService, PendingAuthorisation, RELYING_PARTY_ID, REQUESTED_SCOPES,
     Redirect, RefreshToken, Refreshed, SignedInAccount, StoredGrant, TOKEN_PATH, USAGE_PATH,
-    USAGE_SCOPE, UsageLine, UsageResource, code_challenge,
+    USAGE_SCOPE, UsageLine, UsageResource, code_challenge, issuer_of,
 };
 use kr_client::services::{ServiceFuture, ServiceHttpAnswer};
 use kr_crypto::store::{MemoryStore, SecretName, SecretStore};
@@ -830,6 +830,7 @@ async fn a_refused_code_is_refused_and_a_failing_service_is_an_error() {
 
 fn stored(client: Client) -> StoredGrant {
     StoredGrant::new(
+        ISSUER,
         IssuedGrant {
             access_token: AccountToken::new("an-access-token").expect("a token"),
             expires_in_seconds: 600,
@@ -2670,4 +2671,389 @@ fn generation_of(signed_in: &SignedInAccount) -> String {
         AccountStatus::SignedIn { generation, .. } => generation,
         other => panic!("not signed in: {other:?}"),
     }
+}
+
+/* ---- An account service at another origin ----------------------------------------------------- */
+
+/// The origin of a service the owner runs, and of another service: the issuer of each is its own
+/// origin and `/auth`, and no answer, document or mark of one is taken for the other's.
+const OWNER: &str = "https://owner.example";
+const ELSEWHERE: &str = "https://elsewhere.example";
+
+/// The account service at `origin`, over the scripted exchange.
+fn service_at(http: &Arc<Scripted>, origin: &str) -> ManagedAccountService {
+    ManagedAccountService::at_origin(
+        origin,
+        Arc::clone(http) as Arc<dyn AccountHttp>,
+        Client::Desktop,
+    )
+    .with_clock(now)
+}
+
+/// KR-REQ-20.19: a request at a service the owner runs goes to that service's own authorisation
+/// endpoint with exactly the parameters the managed one sends, each once; an origin that is not an
+/// account service's is refused before an address is built.
+#[test]
+fn a_request_at_an_origin_names_that_origin_and_exactly_its_parameters() {
+    let managed =
+        AuthorisationRequest::new(Client::Desktop, Redirect::Loopback).expect("a request");
+    let managed_names: Vec<String> = parameters(&Url::parse(&managed.url()).expect("an address"))
+        .into_keys()
+        .collect();
+    let owner = AuthorisationRequest::asking_at_origin(
+        OWNER,
+        Client::Desktop,
+        Redirect::Loopback,
+        &["backup.write"],
+    )
+    .expect("a request");
+    let url = Url::parse(&owner.url()).expect("an address");
+    assert_eq!(url.origin().ascii_serialization(), OWNER);
+    assert_eq!(url.host_str(), Some("owner.example"));
+    assert_eq!(url.path(), AUTHORIZE_PATH);
+    let parameters = parameters(&url);
+    assert_eq!(
+        parameters.keys().cloned().collect::<Vec<_>>(),
+        managed_names,
+        "the parameters the managed service is sent, and no others"
+    );
+    assert!(parameters.values().all(|values| values.len() == 1));
+    let one = |name: &str| parameters[name][0].as_str();
+    assert_eq!(one("client_id"), Client::Desktop.id());
+    assert_eq!(one("redirect_uri"), Redirect::Loopback.uri());
+    assert_eq!(
+        one("scope"),
+        "openid profile email offline_access backup.write"
+    );
+    assert_eq!(one("prompt"), "login");
+    for secret in ["state", "nonce", "code_challenge"] {
+        assert!(base64url_43(one(secret)), "{secret}");
+    }
+
+    // A loopback origin over plain http is the one a local deployment stands at.
+    let local = AuthorisationRequest::asking_at_origin(
+        "http://127.0.0.1:8805",
+        Client::Desktop,
+        Redirect::Loopback,
+        &[],
+    )
+    .expect("a request");
+    assert!(
+        local
+            .url()
+            .starts_with("http://127.0.0.1:8805/auth/oauth2/authorize?")
+    );
+    for refused in [
+        "",
+        "owner.example",
+        "http://owner.example",
+        "https://owner.example/auth",
+        "ftp://owner.example",
+    ] {
+        let error = AuthorisationRequest::asking_at_origin(
+            refused,
+            Client::Desktop,
+            Redirect::Loopback,
+            &[],
+        )
+        .expect_err("not an account service's origin");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument, "{refused:?}");
+    }
+}
+
+/// Section 17: issuer checks, at every origin. An answer to a request at an origin names that
+/// origin's issuer: another service's issuer, the managed one among them, grants nothing, and the
+/// origin's own beside it is accepted.
+#[test]
+fn an_answer_naming_another_origins_issuer_fails_and_grants_nothing_at_every_origin() {
+    for (origin, other) in [
+        (OWNER, ISSUER.to_owned()),
+        (OWNER, issuer_of(ELSEWHERE)),
+        (ACCOUNT_ORIGIN, issuer_of(OWNER)),
+    ] {
+        for carrier in [Carrier::Terminal, Carrier::Continuing] {
+            let request = AuthorisationRequest::asking_at_origin(
+                origin,
+                Client::Desktop,
+                Redirect::Loopback,
+                &[],
+            )
+            .expect("a request");
+            let state =
+                parameters(&Url::parse(&request.url()).expect("an address"))["state"][0].clone();
+            let mut pending = PendingAuthorisation::new(request);
+            let named = |issuer: &str| {
+                callback(
+                    Redirect::Loopback.uri(),
+                    &[("code", "a-code"), ("state", &state), ("iss", issuer)],
+                )
+            };
+            assert!(
+                matches!(
+                    pending.answer(&named(&other), carrier),
+                    Answer::Failed(AnswerFault::OtherIssuer)
+                ),
+                "{origin} {carrier:?} {other}"
+            );
+            assert!(!pending.is_waiting());
+        }
+        let request = AuthorisationRequest::asking_at_origin(
+            origin,
+            Client::Desktop,
+            Redirect::Loopback,
+            &[],
+        )
+        .expect("a request");
+        let state =
+            parameters(&Url::parse(&request.url()).expect("an address"))["state"][0].clone();
+        let mut pending = PendingAuthorisation::new(request);
+        let own = callback(
+            Redirect::Loopback.uri(),
+            &[
+                ("code", "a-code"),
+                ("state", &state),
+                ("iss", &issuer_of(origin)),
+            ],
+        );
+        assert!(
+            matches!(pending.answer(&own, Carrier::Terminal), Answer::Granted(_)),
+            "{origin}: its own issuer is accepted"
+        );
+    }
+}
+
+/// KR-REQ-20.19: an exchange and a refresh at a service the owner runs are issued for that
+/// service's issuer and refused for any other, the managed one included; the managed service is
+/// held to the managed issuer the same way. A refused answer hands back its refresh token.
+#[tokio::test]
+async fn an_id_token_is_accepted_for_its_own_origins_issuer_and_for_no_other() {
+    let client = Client::Desktop;
+    for (origin, issuer, accepted) in [
+        (OWNER, issuer_of(OWNER), true),
+        (OWNER, ISSUER.to_owned(), false),
+        (OWNER, issuer_of(ELSEWHERE), false),
+        (ACCOUNT_ORIGIN, ISSUER.to_owned(), true),
+        (ACCOUNT_ORIGIN, issuer_of(OWNER), false),
+    ] {
+        let grant = granted(client, Redirect::Loopback);
+        let mut claims = claims(client, grant.nonce());
+        claims["iss"] = serde_json::json!(issuer);
+        let http = Scripted::answering(vec![(200, token_answer(&claims))]);
+        let outcome = service_at(&http, origin)
+            .exchange(&grant)
+            .await
+            .expect("an answer");
+        match (outcome, accepted) {
+            (Exchanged::Issued(issued), true) => assert_eq!(issued.subject, "account-1"),
+            (Exchanged::Refused { leftover }, false) => assert_eq!(
+                leftover.map(|token| token.expose().to_owned()),
+                Some("a-refresh-token".to_owned()),
+                "{origin} {issuer}"
+            ),
+            (other, _) => panic!("{origin} {issuer}: {other:?}"),
+        }
+        assert_eq!(
+            http.seen()[0].1,
+            format!("{origin}{TOKEN_PATH}"),
+            "the exchange goes to the service the client was made for"
+        );
+
+        // The refresh of a grant kept for this origin is checked against the same issuer.
+        let mut refresh_claims = claims.clone();
+        refresh_claims
+            .as_object_mut()
+            .expect("an object")
+            .remove("nonce");
+        let http = Scripted::answering(vec![(200, refresh_answer(Some(refresh_claims)))]);
+        let kept = StoredGrant::new(
+            &issuer_of(origin),
+            issued_for("account-1", "a-refresh-token", &["openid", "voice"]),
+            client,
+            "the-sign-in-nonce",
+            NOW * 1000,
+        )
+        .expect("a grant");
+        let refreshed = service_at(&http, origin)
+            .refresh(&kept)
+            .await
+            .expect("an answer");
+        assert_eq!(
+            matches!(refreshed, Refreshed::Rotated(_)),
+            accepted,
+            "{origin} {issuer}: {refreshed:?}"
+        );
+    }
+}
+
+/// The account of the service at `origin`, over a store of its own or a shared one.
+fn account_at(origin: &str, stub: &Arc<Stub>, store: &Arc<MemoryStore>) -> Arc<SignedInAccount> {
+    Arc::new(
+        SignedInAccount::at_origin(
+            origin,
+            Arc::clone(stub) as Arc<dyn AccountService>,
+            Arc::clone(store) as Arc<dyn SecretStore>,
+            Client::Desktop,
+        )
+        .with_clock(clock_ms),
+    )
+}
+
+/// KR-REQ-20.19: a grant kept for one service is not read back as another's, whatever a store
+/// holds: the document names the issuer it was kept for, and an account of another issuer refuses
+/// it, and asks its service for nothing. A document whose issuer was edited is refused the same way.
+#[tokio::test]
+async fn a_grant_kept_for_one_origin_is_not_read_back_for_another() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(MemoryStore::new());
+    let owner = account_at(OWNER, &stub, &store);
+    owner
+        .commit(
+            issued_for("account-1", "owner-grant", &["openid", "backup.write"]),
+            "a-nonce",
+        )
+        .await
+        .expect("the owner's sign-in");
+    assert!(matches!(
+        owner.status().expect("its own grant reads"),
+        AccountStatus::SignedIn { .. }
+    ));
+    for (what, other) in [
+        ("the managed account", account(&stub, &store)),
+        (
+            "another service's account",
+            account_at(ELSEWHERE, &stub, &store),
+        ),
+    ] {
+        let refused = other.status().expect_err(what);
+        assert_eq!(refused.code(), ErrorCode::StorageUnavailable, "{what}");
+        let refused = other.token("backup.write").await.expect_err(what);
+        assert_eq!(refused.code(), ErrorCode::StorageUnavailable, "{what}");
+    }
+
+    // The other way: the managed account's grant is not the owner's.
+    let managed_store = Arc::new(MemoryStore::new());
+    account(&stub, &managed_store)
+        .commit(
+            issued_for("account-1", "managed-grant", &["openid", "backup.write"]),
+            "a-nonce",
+        )
+        .await
+        .expect("the managed sign-in");
+    let refused = account_at(OWNER, &stub, &managed_store)
+        .status()
+        .expect_err("the managed grant is not the owner's");
+    assert_eq!(refused.code(), ErrorCode::StorageUnavailable);
+
+    // A document whose issuer was edited to another's is refused where it was kept.
+    let name = SecretName::new("account/session").expect("a name");
+    let bytes = store.get(&name).expect("a read").expect("a grant");
+    let mut document: serde_json::Value = serde_json::from_slice(bytes.expose()).expect("json");
+    document["issuer"] = serde_json::json!(issuer_of(ELSEWHERE));
+    store
+        .set(&name, &serde_json::to_vec(&document).expect("bytes"))
+        .expect("written");
+    assert!(owner.status().is_err());
+    assert_eq!(
+        stub.refreshes.load(Ordering::SeqCst),
+        0,
+        "no refresh was asked of a service for a grant that was not its own"
+    );
+}
+
+/// The marks the digest of {domain, issuer, subject, origin} gives, worked out apart from this
+/// crate (SHA-256 over each part's length as eight bytes big-endian and then the part).
+const MANAGED_MARK: &str = "496fdd6d0a0a59eaeca53e35060c67882995ae95b181eac6a546832f34eb5da6";
+const OWNER_MARK_AT_OWNER: &str =
+    "47b4487171402ddb609663c6f64b2f9294d5a22284115cef7b4184fa98e982ad";
+const OWNER_MARK_AT_ELSEWHERE: &str =
+    "0323044dcd748ac8975b100da2d3827c55179a749a245543570ba8616de75668";
+
+/// KR-REQ-20.19: the mark of an account at a service the owner runs is never the mark of the same
+/// subject at the managed service, and is taken from the issuer the grant itself names, not from
+/// the origin the token is presented at.
+#[tokio::test]
+async fn the_mark_of_an_account_at_another_origin_is_taken_from_its_own_issuer() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let managed = account(&stub, &Arc::new(MemoryStore::new()));
+    let owner = account_at(OWNER, &stub, &Arc::new(MemoryStore::new()));
+    for kept in [&managed, &owner] {
+        kept.commit(
+            issued_for("account-1", "a-grant", &["openid", "backup.write"]),
+            "a-nonce",
+        )
+        .await
+        .expect("a sign-in");
+    }
+    let mark = |kept: &SignedInAccount, origin: &str| {
+        kept.mark(origin)
+            .expect("a read")
+            .expect("signed in")
+            .to_hex()
+    };
+    assert_ne!(
+        mark(&managed, OWNER),
+        mark(&owner, OWNER),
+        "the same subject, presented to the same service, under two issuers"
+    );
+    assert_eq!(mark(&owner, OWNER), OWNER_MARK_AT_OWNER);
+    assert_eq!(
+        mark(&owner, ELSEWHERE),
+        OWNER_MARK_AT_ELSEWHERE,
+        "the owner's issuer, whatever origin it is presented at"
+    );
+    let (_, marked) = owner
+        .token_marked("backup.write", ELSEWHERE, false)
+        .await
+        .expect("a token");
+    assert_eq!(marked.to_hex(), OWNER_MARK_AT_ELSEWHERE);
+}
+
+/// What the managed account keeps and what it is marked by do not move: the stored document is
+/// these bytes for a fixed grant, with its identifier (drawn fresh for each grant) read out of it,
+/// and the mark of a fixed subject at the managed origin is this digest. The backup binding record
+/// compares the mark, so a mark that moved would read every managed host's backup as another
+/// account's.
+#[tokio::test]
+async fn the_managed_stored_grant_document_and_account_mark_keep_their_bytes() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(MemoryStore::new());
+    let managed = account(&stub, &store);
+    managed
+        .commit(
+            issued_for("account-1", "a-refresh", &["openid", "backup.write"]),
+            "a-nonce",
+        )
+        .await
+        .expect("a sign-in");
+
+    let bytes = store
+        .get(&SecretName::new("account/session").expect("a name"))
+        .expect("a read")
+        .expect("a grant");
+    let text = String::from_utf8(bytes.expose().to_vec()).expect("text");
+    let document: serde_json::Value = serde_json::from_str(&text).expect("json");
+    let grant_id = document["grantId"].as_str().expect("an identifier");
+    assert_eq!(
+        text.replacen(grant_id, "a-grant-id", 1),
+        concat!(
+            r#"{"grantId":"a-grant-id","revision":0,"issuer":"https://reach.kala.to/auth","#,
+            r#""clientId":"kalareach-desktop","subject":"account-1","email":null,"name":null,"#,
+            r#""nonce":"a-nonce","refreshToken":"a-refresh","accessToken":"a-refresh-access","#,
+            r#""accessExpiresAtMs":1790251800000,"scopes":["openid","backup.write"]}"#
+        )
+    );
+    assert_eq!(
+        managed
+            .mark(ACCOUNT_ORIGIN)
+            .expect("a read")
+            .expect("signed in")
+            .to_hex(),
+        MANAGED_MARK
+    );
 }

@@ -554,7 +554,9 @@ impl SignedInAccount {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .as_deref()
-                .is_some_and(|subject| AccountMark::of(subject, origin).to_hex() == mark);
+                .is_some_and(|subject| {
+                    AccountMark::of(&self.issuer, subject, origin).to_hex() == mark
+                });
         let noted = (ours || theirs) && self.ended.swap(false, Ordering::SeqCst);
         if ours || noted {
             self.publish();

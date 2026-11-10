@@ -248,9 +248,13 @@ impl HostAccount {
                     "{environment_id}/host-account/{}",
                     named_by(&service.origin)
                 );
-                let signed_in =
-                    SignedInAccount::new(Arc::clone(&service.account), store, Client::Desktop)
-                        .in_scope(scope);
+                let signed_in = SignedInAccount::at_origin(
+                    &service.origin,
+                    Arc::clone(&service.account),
+                    store,
+                    Client::Desktop,
+                )
+                .in_scope(scope);
                 (
                     Some(Held {
                         origin: service.origin,
@@ -571,9 +575,13 @@ impl HostAccount {
                 });
             }
         };
-        let request =
-            AuthorisationRequest::asking(Client::Desktop, Redirect::Loopback, &held.scopes)
-                .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        let request = AuthorisationRequest::asking_at_origin(
+            &held.origin,
+            Client::Desktop,
+            Redirect::Loopback,
+            &held.scopes,
+        )
+        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         let url = request.url();
         let pending = PendingAuthorisation::new(request);
         let expires_at_ms = kr_ipc::now_ms()
