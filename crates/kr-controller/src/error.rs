@@ -196,6 +196,21 @@ impl ControllerError {
         }
     }
 
+    /// What a caller is told when this host will not show it what became of an action that was, or
+    /// may have been, carried out.
+    ///
+    /// The refusal to show it is about what the caller may be shown, not about the action: a
+    /// definite refusal is taken for the host's word that nothing was done, so the caller is told
+    /// that what became of the action is not known.
+    #[must_use]
+    pub fn outcome_not_shown() -> Self {
+        Self::Uncertain {
+            detail: "this action may have been carried out, and this host does not report what \
+                     became of it in this answer"
+                .to_owned(),
+        }
+    }
+
     /// What a repeat of an action is told while the attempt that claimed it is still running.
     ///
     /// That attempt carries the action out, or has, so a transient word, which says nothing took

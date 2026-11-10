@@ -856,3 +856,64 @@ async fn kr_req_23_24_a_share_that_cannot_be_read_back_is_not_called_unperformed
     );
     assert_eq!(found.grant.grant_id, grant_id);
 }
+
+/// KR-REQ-09.09: the refusal a fresh share is given while an earlier share of its subject runs
+/// names the action that holds it, which is another attempt's word, so it goes back only under the
+/// authority the share arrived under, asked with the refusal in hand. The control: with nothing
+/// owed the refusal is told. A fence that lands once the claim has refused the share is the answer
+/// instead, told as the share's own refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_share_refused_beside_one_that_runs_is_not_told_after_a_fence_lands() {
+    let (world, _holding) = world(Holding::default(), holds_question_reads()).await;
+    let owner = owner();
+    let first = viewing(&world, world.session_id, recipient(), 0x01);
+    let replacing = |action: u8| {
+        let mut replacement = viewing(&world, world.session_id, recipient(), action);
+        replacement.requested_ttl_ms = DurationMs::new(31_000);
+        replacement.target.session_epoch = Nullable::null();
+        replacement
+    };
+    let (control, raced) = (replacing(0x02), replacing(0x03));
+
+    let mut running = starting(&world, &owner, AuthorityCaller::Owner, &first).await;
+    let mut controlled = starting(&world, &owner, AuthorityCaller::Owner, &control).await;
+    let mut racing = starting(&world, &owner, AuthorityCaller::Owner, &raced).await;
+
+    let registry = world.controller.registry.lock().await;
+    assert!(
+        until_claimed(&mut running, &world, &owner, &first)
+            .await
+            .is_none(),
+        "the first share waits for the registry"
+    );
+    let told = until_claimed(&mut controlled, &world, &owner, &control)
+        .await
+        .expect("a refusal is answered at the claim");
+    assert_eq!(refused(&told).code(), ErrorCode::DraftConflict);
+
+    let (arrived, release) = world.controller.pause_retained_lookup();
+    tokio::select! {
+        reached = tokio::time::timeout(std::time::Duration::from_secs(30), arrived) => {
+            reached
+                .expect("the refused share reaches the check it is asked with the refusal in hand")
+                .expect("the pause is armed");
+        }
+        answered = &mut racing => panic!("the refused share was answered before the check: {answered:?}"),
+    }
+    world.controller.hold_fence(true);
+    release.send(()).expect("the refused share goes on");
+    let answered = racing.await;
+    world.controller.hold_fence(false);
+    let told = refused(&answered).to_protocol_error();
+    assert_eq!(told.code, ErrorCode::PermissionDenied, "{told:?}");
+    assert!(
+        told.message.contains("fence"),
+        "a fence this host owes is the answer, and not the share that holds the subject: {told:?}"
+    );
+
+    drop(registry);
+    running
+        .await
+        .into_answer()
+        .expect("the first share is written");
+}

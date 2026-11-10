@@ -409,6 +409,9 @@ impl Controller {
         let taken = fingerprint_of(&evidence, worker.as_ref());
         let digest = mutation_digest(mutation, actor_id)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        // Set when the answer is the record's, which the cleanup below waits behind: it goes back
+        // only under the authority this call arrived under, asked once the cleanup has ended.
+        let copied = std::sync::atomic::AtomicBool::new(false);
         let begun = self.under_registration_until_it_begins(&carried, |begin| {
             let mut checks = self.checks.lock().unwrap_or_else(PoisonError::into_inner);
             #[cfg(test)]
@@ -424,6 +427,7 @@ impl Controller {
             match self.capability_answers.recall(actor_id, mutation.action_id) {
                 Ok(Some(held)) if held.digest == digest => {
                     self.check_fence()?;
+                    copied.store(true, std::sync::atomic::Ordering::Release);
                     return Ok(held.answer);
                 }
                 Ok(Some(_)) => {
@@ -473,6 +477,12 @@ impl Controller {
             Ok(view)
         })??;
         self.forget_old_capability_answers();
+        // The hold ended before the cleanup, which waits for locks and for storage, and nothing in
+        // it keeps a fence this host owes, or a registration withdrawn, from landing. The record's
+        // answer is checked again with it in hand.
+        if copied.load(std::sync::atomic::Ordering::Acquire) {
+            self.check_retained_in_hand(&carried).await?;
+        }
         ParamsValue::from_typed(&begun)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }

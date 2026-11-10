@@ -102,6 +102,17 @@ impl<T> Given<T> {
         }
     }
 
+    /// The answer, without where it came from, for a caller that is told every answer whole except
+    /// a copy the service withheld: `unknown` is then what the caller is told, in place of the
+    /// service's refusal of the authority, which says what the caller may not be told, that the
+    /// action did not happen.
+    pub(crate) fn into_answer_or(self, unknown: impl FnOnce() -> T) -> T {
+        match self {
+            Self::Withheld(_) => unknown(),
+            Self::Fresh(answer) | Self::Copied(answer) => answer,
+        }
+    }
+
     /// The answer, without where it came from. For a caller that is told every answer whole.
     pub fn into_answer(self) -> T {
         match self {

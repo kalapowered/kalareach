@@ -184,9 +184,11 @@ async fn an_authority_change_that_meets_a_refusal_it_cannot_read_is_not_told_aft
 /// KR-REQ-09.09, a refusal kept under a code this build cannot read, met where an action the host
 /// performs under one claim in the shared store (a privacy change) claims its action: it goes back
 /// only under the authority this attempt arrived under. The control: with nothing owed the copy is
-/// told that what became of the action is not known. While this host owes a fence it is refused for
-/// the fence. The fence is set before the call: the door's own function asks the check, with no
-/// pause before it, so the case shows that the check runs, not when.
+/// told that what became of the action is not known. While this host owes a fence the caller is told
+/// that what became of it is not shown, which is not the record's word and not the fence's: the
+/// refusal of the authority is a definite word, and an earlier attempt may have carried the action
+/// out. The fence is set before the call: the door's own function asks the check, with no pause
+/// before it, so the case shows that the check runs, not when.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_privacy_change_that_meets_a_refusal_it_cannot_read_is_not_told_while_a_fence_is_owed() {
     let (temp, controller, _clock) = daemon().await;
@@ -210,19 +212,23 @@ async fn a_privacy_change_that_meets_a_refusal_it_cannot_read_is_not_told_while_
         )
     };
     let control = attempt().await;
-    assert_eq!(
-        super::the_fence_at_every_effect::refusal(&control).map(|error| error.code),
-        Some(ErrorCode::OutcomeUnknown),
-        "with nothing owed the copy is told it is not known: {control:?}"
-    );
+    let control = super::the_fence_at_every_effect::refusal(&control)
+        .unwrap_or_else(|| panic!("a record that cannot be read does not answer the copy"))
+        .clone();
+    assert_eq!(control.code, ErrorCode::OutcomeUnknown, "{control:?}");
 
     controller.hold_fence(true);
     let refused = attempt().await;
-    refused_for_a_fence(
-        super::the_fence_at_every_effect::refusal(&refused)
-            .unwrap_or_else(|| panic!("a fence this host owes stops it: {refused:?}")),
-    );
     controller.hold_fence(false);
+    let told = super::the_fence_at_every_effect::refusal(&refused)
+        .unwrap_or_else(|| panic!("a fence this host owes stops it: {refused:?}"));
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    assert_eq!(
+        told.message,
+        crate::error::ControllerError::outcome_not_shown().to_string(),
+        "the caller is told the outcome is not shown, and not what the record said"
+    );
+    assert_ne!(told.message, control.message);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -881,4 +887,170 @@ async fn a_confirmation_request_that_meets_another_requests_identifier_is_not_to
         .expect_err("a fence this host owes stops the conflict");
     refused_for_a_fence(&refused.to_protocol_error());
     controller.hold_fence(false);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The local door
+// ---------------------------------------------------------------------------------------------
+
+/// `mutation` as the local door performs it once its own look for a record has found none, which is
+/// what a copy that is admitted before another copy records reaches.
+async fn at_the_local_door(
+    controller: &Arc<Controller>,
+    connection_id: kr_protocol::ids::ConnectionId,
+    actor_id: &ActorId,
+    mutation: &MutationRequest,
+    method: Method,
+) -> kr_protocol::envelope::ControlFrame {
+    controller
+        .write_method(
+            actor_id,
+            mutation,
+            method,
+            connection_id,
+            None,
+            Some(super::the_fence_at_every_effect::accepted(controller)),
+            controller.admitted_revision(connection_id).ok(),
+        )
+        .await
+}
+
+/// What the local door tells a copy that a service read from its record and withheld, whatever the
+/// service: not the refusal of the authority, which is a definite word and says the action did not
+/// happen, but that what became of the action is not shown, as a paired device is told. The control
+/// is told what the record said, and the case compares the two.
+fn told_as_not_shown_after(
+    control: &kr_protocol::envelope::ControlFrame,
+    raced: &kr_protocol::envelope::ControlFrame,
+) {
+    let control = super::the_fence_at_every_effect::refusal(control)
+        .unwrap_or_else(|| panic!("a record that cannot be read does not answer the copy"));
+    assert_eq!(control.code, ErrorCode::OutcomeUnknown, "{control:?}");
+    let told = super::the_fence_at_every_effect::refusal(raced)
+        .unwrap_or_else(|| panic!("a fence this host owes stops the copy: {raced:?}"));
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    assert_eq!(
+        told.message,
+        crate::error::ControllerError::outcome_not_shown().to_string(),
+        "the caller is told the outcome is not shown, and not the authority's refusal"
+    );
+    assert_ne!(told.message, control.message);
+}
+
+/// KR-REQ-09.09, the local door's answer for a machine group step whose copy the service read from
+/// its record and withheld: a refusal kept under a code this build cannot read says that another
+/// attempt's record exists, and a fence that lands once it is met stops it. The caller at this
+/// machine is told that what became of the action is not shown, as a paired device is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_machine_group_step_a_service_withheld_is_told_at_the_local_door_as_not_shown() {
+    use kr_protocol::machine::{MachineExpected, MachineSplitParams};
+
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let group = controller
+        .machine_report()
+        .expect("this daemon serves a machine group record");
+    let mutation = mutation_of(
+        &temp,
+        Method::MachineSplit,
+        ParamsValue::from_typed(&MachineSplitParams {
+            expected: MachineExpected {
+                machine_id: group.machine_id,
+                revision: group.revision,
+            },
+        })
+        .expect("encodes"),
+    );
+    plant_a_refusal_this_build_cannot_read(&temp, &actor_id, &mutation);
+    let attempt = || {
+        at_the_local_door(
+            &controller,
+            connection_id,
+            &actor_id,
+            &mutation,
+            Method::MachineSplit,
+        )
+    };
+    let control = attempt().await;
+    let raced = answered_after_a_fence_lands_at_the_check(&controller, attempt()).await;
+    told_as_not_shown_after(&control, &raced);
+}
+
+/// KR-REQ-09.09, the local door's answer for an attention change whose copy the store read from its
+/// row and withheld: a row that cannot be decoded says that the action's row exists, and a fence
+/// that lands once the store has met it stops it. The caller at this machine is told that what
+/// became of the action is not shown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attention_change_a_store_withheld_is_told_at_the_local_door_as_not_shown() {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let mutation = setting_quiet_hours(&temp);
+    let admission = carried(&controller, connection_id);
+    attention_answer(&controller, &actor_id, &mutation, admission)
+        .await
+        .into_answer()
+        .expect("the window is set");
+    let store =
+        rusqlite::Connection::open(temp.environment().state_dir().join("attention.sqlite3"))
+            .expect("opens the attention store");
+    store
+        .busy_timeout(Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    store
+        .execute("UPDATE attention_actions SET recorded_at_ms = -1", [])
+        .expect("the row cannot be decoded");
+    let attempt = || {
+        at_the_local_door(
+            &controller,
+            connection_id,
+            &actor_id,
+            &mutation,
+            Method::AttentionQuietHours,
+        )
+    };
+    let control = attempt().await;
+    let raced = answered_after_a_fence_lands_at_the_check(&controller, attempt()).await;
+    told_as_not_shown_after(&control, &raced);
+}
+
+/// KR-REQ-09.09, the local door's own search of the other stores for the identifier of a first
+/// admission: the conflict it finds says that another request spent the identifier, which is
+/// another attempt's word, so it goes back only under the authority the arrival still has, asked
+/// once the search has found it. The control: with nothing owed the conflict is told. A fence that
+/// lands once the arrival is past its look for a record is the answer instead. The fence lands at
+/// the pause before the search, so the case shows that the check runs on the conflict, not when.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_identifier_another_method_spent_is_not_told_as_a_conflict_after_a_fence_lands() {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let spent = setting_quiet_hours(&temp);
+    let first = at_the_local_door(
+        &controller,
+        connection_id,
+        &actor_id,
+        &spent,
+        Method::AttentionQuietHours,
+    )
+    .await;
+    assert!(
+        super::the_fence_at_every_effect::refusal(&first).is_none(),
+        "the first method records its action: {first:?}"
+    );
+    let another = super::a_recorded_answer_another_copy_wrote::capability_request(
+        &temp,
+        Some(spent.action_id),
+        None,
+    );
+    let attempt = || controller.perform(&actor_id, connection_id, None, another.clone());
+
+    let control = attempt().await;
+    let control = super::the_fence_at_every_effect::refusal(&control)
+        .unwrap_or_else(|| panic!("an identifier another method spent is a conflict"));
+    assert_eq!(control.code, ErrorCode::IdConflict, "{control:?}");
+
+    let raced = answered_after_a_fence_lands_at_the_check(&controller, attempt()).await;
+    refused_for_a_fence(
+        super::the_fence_at_every_effect::refusal(&raced)
+            .unwrap_or_else(|| panic!("a fence this host owes stops the conflict: {raced:?}")),
+    );
 }
