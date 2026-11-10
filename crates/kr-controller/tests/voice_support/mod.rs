@@ -339,8 +339,8 @@ impl StandIn {
     /// made to it was never carried out. [`Self::go_down`] is the other way down: the service takes
     /// the connection and ends it, so a request may have been carried out.
     ///
-    /// Returns once the port refuses a connection, so that the port is closed when a request comes
-    /// to it, and is not still taken by a socket that is closing.
+    /// Returns once the port has refused a connection, which a socket that is still closing does
+    /// not do.
     pub async fn refuse_connections(&self) {
         let task = self.task.lock().expect("the stand-in's task").take();
         if let Some(task) = task {
