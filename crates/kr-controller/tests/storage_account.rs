@@ -1002,8 +1002,7 @@ async fn a_storage_account_whose_scope_is_the_managed_accounts_is_refused_before
         )),
         None,
     )
-    .err()
-    .expect("a storage service whose scope is the managed account's is refused");
+    .expect_err("a storage service whose scope is the managed account's is refused");
     assert!(
         matches!(&refused, kr_controller::ControllerError::NotConfigured(text)
             if text.contains("storage.origin")),
