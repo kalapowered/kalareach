@@ -548,7 +548,7 @@ expectNames(
     ),
     library(elf({ exports: ['Java_org_webrtc_PeerConnectionFactory_call__I'] }))
   ],
-  `native method ${FACTORY}.call (arguments j) (no library of arm64-v8a exports it)`
+  `native method ${FACTORY}.call (arguments J) (no library of arm64-v8a exports it)`
 )
 expectNames(
   'overloads each bound by a long name are bound',
@@ -703,6 +703,64 @@ for (const wide of [true, false]) {
   )
 }
 expectNames(
+  'overloads whose argument classes differ only in case are told apart, as the runtime looks a symbol up exactly',
+  'natives-overloads-case.apk',
+  [
+    application(
+      mediaDex([], {
+        [FACTORY]: [
+          { name: 'call', native: true, params: ['Lorg/example/URL;'] },
+          { name: 'call', native: true, params: ['Lorg/example/Url;'] }
+        ]
+      })
+    ),
+    library(elf({ exports: ['Java_org_webrtc_PeerConnectionFactory_call__Lorg_example_URL_2'] }))
+  ],
+  `native method ${FACTORY}.call (arguments Lorg_example_Url_2) (no library of arm64-v8a exports it)`
+)
+expectNames(
+  'a symbol whose argument types are spelled in the wrong case does not bind the method',
+  'natives-wrong-case.apk',
+  [
+    application(mediaDex([], { [FACTORY]: [{ name: 'call', native: true, params: ['I'] }] })),
+    library(elf({ exports: ['Java_org_webrtc_PeerConnectionFactory_call__i'] }))
+  ],
+  `native method ${FACTORY}.call (no library of arm64-v8a exports it)`
+)
+expectNames(
+  'a weak symbol binds a method, as the runtime binds it',
+  'natives-weak.apk',
+  [application(), library(mediaLibrary({ exports: ['Java_org_webrtc_PeerConnectionFactory_other'], weak: ['Java_org_webrtc_PeerConnectionFactory_nativeCreate'] }))],
+  'nothing'
+)
+expectNames(
+  'a library whose symbol table is no dynamic one is refused, not read as one that exports nothing',
+  'libraries-no-dynsym.apk',
+  [application(), library(mediaLibrary({ dynamic: false }))],
+  `refused: ${MEDIA}: an ELF library with no dynamic symbol table`
+)
+expectNames(
+  'a library whose symbols name the table of section names is refused',
+  'libraries-wrong-strings.apk',
+  [application(), library(mediaLibrary({ stringsLink: 3 }))],
+  `refused: ${MEDIA}: an ELF library whose dynamic symbols name no dynamic string table`
+)
+expectNames(
+  'a library whose section headers are too small to be headers is refused',
+  'libraries-small-headers.apk',
+  [
+    application(),
+    library(
+      (() => {
+        const small = Buffer.from(mediaLibrary())
+        small.writeUInt16LE(8, 0x3a)
+        return small
+      })()
+    )
+  ],
+  `refused: ${MEDIA}: an ELF library whose section headers are not within the file`
+)
+expectNames(
   'a library with no section headers is refused, not read as one that exports nothing',
   'libraries-no-headers.apk',
   [application(), library(mediaLibrary({ headers: false }))],
@@ -855,6 +913,52 @@ held(
   'removing a build\'s directory removes what the build left in it, and only that directory',
   'false',
   String(existsSync(first.directory) || existsSync(second.directory))
+)
+
+// What the success line counts: the different classes the libraries name (once, however many ABIs
+// carry the library), the native methods a symbol was asked for, and the classes not asked.
+const counted = verified('verify-counts.apk', [
+  filler,
+  {
+    name: 'classes.dex',
+    bytes: dex({
+      defined: [...PRESENT, JNI_ZERO, FACTORY, CANDIDATE, NESTED, RAW, 'org.webrtc.Other'],
+      methods: {
+        [FACTORY]: [
+          { name: 'nativeCreate', native: true },
+          { name: 'nativeSecond', native: true }
+        ],
+        'org.webrtc.Other': [{ name: 'nativeOther', native: true }]
+      }
+    })
+  },
+  library(
+    mediaLibrary({
+      exports: [
+        'Java_org_webrtc_PeerConnectionFactory_nativeCreate',
+        'Java_org_webrtc_PeerConnectionFactory_nativeSecond'
+      ]
+    })
+  ),
+  library(
+    mediaLibrary({
+      exports: [
+        'Java_org_webrtc_PeerConnectionFactory_nativeCreate',
+        'Java_org_webrtc_PeerConnectionFactory_nativeSecond'
+      ]
+    }),
+    'lib/x86_64/libmedia.so'
+  )
+])
+held(
+  'the success line counts each class once across ABIs, the natives asked, and names the classes not asked',
+  'true',
+  String(
+    counted.whole &&
+      counted.said.includes('its 2 native libraries name 4 classes, all defined in its dex') &&
+      counted.said.includes('bind the 2 native methods it declares') &&
+      counted.said.includes('org.webrtc.Other')
+  )
 )
 
 // -- which packages a build is checked against --------------------------------------------------
