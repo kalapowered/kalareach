@@ -332,6 +332,10 @@ pub(crate) struct Shared {
     /// What the owner has read and acted on, which a case waits for instead of a delay.
     #[cfg(any(test, feature = "testing"))]
     handled: Handled,
+    /// A case's hold on what the host answered a delegation, kept from the owner until the case
+    /// lets it go.
+    #[cfg(any(test, feature = "testing"))]
+    delivery: DeliveryHold,
     /// How far ahead of the time the system says this device's clock reads a confirmation's expiry,
     /// in milliseconds: a case's way of making the clock disagree with the host's.
     #[cfg(any(test, feature = "testing"))]
@@ -353,6 +357,62 @@ struct Handled {
     seals: Mutex<Vec<String>>,
     /// The delegations whose ceremony's answer the owner has read, acted on or dropped.
     ceremonies: Mutex<Vec<String>>,
+}
+
+/// Where a case's hold on the answer to a delegation stands.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Delivery {
+    /// Nothing is held and nothing is to be.
+    #[default]
+    Free,
+    /// The next answer to a delegation handed to the host is to be held.
+    Armed,
+    /// An answer is held.
+    Held,
+}
+
+/// A case's hold on the answer to the next delegation handed to the host, between the moment the
+/// host has answered it and the moment the owner is told: what a case that needs the owner to read
+/// something else first waits on, in place of a delay.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Default)]
+struct DeliveryHold {
+    state: Mutex<Delivery>,
+    changed: tokio::sync::Notify,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl DeliveryHold {
+    /// Holds the answer in hand when a hold is armed, until the case lets it go.
+    async fn pass(&self) {
+        {
+            let mut state = self.state.lock().expect("the record is not poisoned");
+            if *state != Delivery::Armed {
+                return;
+            }
+            *state = Delivery::Held;
+        }
+        self.changed.notify_waiters();
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if *self.state.lock().expect("the record is not poisoned") != Delivery::Held {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    fn set(&self, to: Delivery) {
+        *self.state.lock().expect("the record is not poisoned") = to;
+        self.changed.notify_waiters();
+    }
+
+    fn is(&self, is: Delivery) -> bool {
+        *self.state.lock().expect("the record is not poisoned") == is
+    }
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -1062,6 +1122,8 @@ impl Calls {
                 #[cfg(any(test, feature = "testing"))]
                 handled: Handled::default(),
                 #[cfg(any(test, feature = "testing"))]
+                delivery: DeliveryHold::default(),
+                #[cfg(any(test, feature = "testing"))]
                 clock_ahead_ms: std::sync::atomic::AtomicU64::new(0),
             })),
         }
@@ -1130,6 +1192,41 @@ impl Calls {
                 .iter()
                 .any(|known| known == id)
         })
+    }
+
+    /// Holds the host's answer to the next delegation an owner hands over, after the host has given
+    /// it and before the owner is told, until [`Self::release_the_delivery`]. For cases that need
+    /// the owner to read something else first.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn hold_the_next_delivery(&self) {
+        if let Some(shared) = self.shared.as_ref() {
+            shared.delivery.set(Delivery::Armed);
+        }
+    }
+
+    /// Waits until an answer is held by [`Self::hold_the_next_delivery`].
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn until_a_delivery_is_held(&self) {
+        let Some(shared) = self.shared.as_ref() else {
+            return;
+        };
+        loop {
+            let changed = shared.delivery.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if shared.delivery.is(Delivery::Held) {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    /// Lets the held answer go to the owner.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn release_the_delivery(&self) {
+        if let Some(shared) = self.shared.as_ref() {
+            shared.delivery.set(Delivery::Free);
+        }
     }
 
     /// Whether an owner has read the answer of the ceremony the confirmation of the delegation `id`

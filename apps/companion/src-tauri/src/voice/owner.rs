@@ -488,9 +488,10 @@ pub(super) struct Owner {
     /// is back, and a request keeps the one it was made under, which stays set once it is.
     unsent: Arc<AtomicBool>,
     /// Set when what was said can no longer be acted on: the gate says the call is tainted, or a
-    /// capture proof shows a break. The tasks that read a proof set it before they tell the owner,
-    /// so that no request waiting for the connection's turn leaves in between. It outlives every
-    /// connection: a host that comes back does not clear it.
+    /// capture proof shows a break. The task that reads the proof taken after a ceremony and the one
+    /// that reads the proof taken just before a write set it before they tell the owner, so that no
+    /// request waiting for the connection's turn leaves in between. It outlives every connection: a
+    /// host that comes back does not clear it.
     tainted: Arc<AtomicBool>,
     /// The connection's flag each delegation was handed over under, which a challenge answered
     /// later is read against: one answered after the path to the host was lost is not put to the
@@ -2258,8 +2259,12 @@ impl Owner {
         self.sent_under
             .insert(id.to_owned(), Arc::clone(&self.unsent));
         let (internal, id) = (self.internal_tx.clone(), id.to_owned());
+        #[cfg(any(test, feature = "testing"))]
+        let shared = Arc::clone(&self.shared);
         tokio::spawn(async move {
             let exchange = hand_over(handover).await;
+            #[cfg(any(test, feature = "testing"))]
+            shared.delivery.pass().await;
             let _ = internal.send(Internal::Delivered {
                 id,
                 exchange: Box::new(exchange),
@@ -2447,9 +2452,12 @@ impl Owner {
     pub(super) async fn end(&mut self, cause: Cause) -> Closed {
         let timings = self.shared.timings;
         let id = self.id;
-        // Nothing not yet written to the host is written from here on.
+        // Nothing not yet written to the host is written from here on, and nobody is asked to
+        // confirm what can no longer be sent.
         self.unsent.store(true, Ordering::SeqCst);
         self.tainted.store(true, Ordering::SeqCst);
+        self.sealing.clear();
+        self.confirming.clear();
         // What the opening context came to is in the record before the call is said to have ended,
         // so that a person who reads the end reads it too.
         self.settle_the_opening().await;
