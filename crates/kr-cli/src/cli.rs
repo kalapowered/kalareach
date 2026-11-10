@@ -1320,14 +1320,22 @@ pub enum AccountCommand {
     /// it signs in; nothing the daemon holds is ever printed. This command opens the address and
     /// always prints it. On a host with no display, forward the port from the machine that has the
     /// browser (`ssh -L 8765:127.0.0.1:8765 <host>`) and open the printed address there.
-    SignIn(AccountEnvironmentArguments),
+    ///
+    /// With --storage, it signs in the account at the storage service whose origin this host's
+    /// storage.origin names, a service you run, for backup storage and nothing else. It says which
+    /// service it signs in at before it opens the browser.
+    SignIn(AccountSignArguments),
     /// Sign this host out of the managed account service.
     ///
     /// The control daemon removes the account it holds and asks the service to end the sign-in. It
     /// is refused while a voice call is open on this host, because a call closes under the account
     /// it started under.
-    SignOut(AccountEnvironmentArguments),
-    /// Show whether this host is signed in to the managed account service, and to which.
+    ///
+    /// With --storage, it signs out the account at the storage service you run, and leaves the
+    /// managed account as it is.
+    SignOut(AccountSignArguments),
+    /// Show whether this host is signed in to the managed account service, and to which. A host
+    /// with an account at a storage service you run shows that account too.
     Show(AccountEnvironmentArguments),
 }
 
@@ -1337,6 +1345,18 @@ pub struct AccountEnvironmentArguments {
     /// The environment.
     #[command(flatten)]
     pub selector: EnvironmentSelector,
+}
+
+/// The environment `kr account sign-in` or `kr account sign-out` acts in, and which account.
+#[derive(Args)]
+pub struct AccountSignArguments {
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+    /// Act on the account at the storage service this host's storage.origin names, which you run,
+    /// and not on the managed account.
+    #[arg(long)]
+    pub storage: bool,
 }
 
 /// `kr host`.

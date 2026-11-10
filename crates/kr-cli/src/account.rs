@@ -1,5 +1,5 @@
-//! `kr account`: signing this host in to the managed account service and out of it, and saying where
-//! that stands.
+//! `kr account`: signing this host in to an account service and out of it, and saying where that
+//! stands.
 //!
 //! Managed voice spends an account's balance and managed storage keeps an account's backups, so the
 //! host presents an account token of its own, and the control daemon alone holds the sign-in that
@@ -9,11 +9,19 @@
 //! keeps the account. `sign-out` has the daemon remove the account and ask the service to end it.
 //! `show` reads where that stands.
 //!
+//! A host whose `storage.origin` names a service its owner runs holds a second account, at that
+//! service, for backup storage and nothing else. `--storage` on `sign-in` and `sign-out` acts on
+//! that account and never on the managed one, and `show` lists it beside the managed account when
+//! the host has it. `sign-in --storage` says which service it signs in at before it opens the
+//! browser, and that it is not the managed account service, because a mistyped `storage.origin`
+//! opens a sign-in at whatever service it names.
+//!
 //! **Nothing the daemon holds is printed.** The address to open carries this attempt's state and
 //! nonce, and is shown to the person who asked, as the command that asked for it; what is said of
 //! an account is the service it belongs to, its address and the scopes it carries.
 
 use kr_client::shown;
+use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::host_account::{
     AccountAttempt, AccountReport, AccountSignInParams, AccountSignInStarted, AccountSignOutParams,
     AccountSignedOut, AccountState, AccountStatusParams, SignInUnavailable,
@@ -22,7 +30,7 @@ use kr_protocol::method::Method;
 
 use crate::cli::EnvironmentSelector;
 use crate::daemon::Daemon;
-use crate::error::Result;
+use crate::error::{CliError, Result};
 use crate::output::{self, Asked, Document, Line, Request};
 use crate::stdout_line;
 
@@ -30,20 +38,131 @@ use crate::stdout_line;
 /// registered redirect names.
 const FORWARDED_PORT: &str = "8765";
 
-/// `kr account sign-in`: starts the sign-in, prints the address to open and opens it.
+/// Which of the host's two accounts a command acts on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Which {
+    /// The managed account, for voice, relay leases and managed storage.
+    Managed,
+    /// The account at the storage service the owner runs.
+    Storage,
+}
+
+impl Which {
+    const fn of(storage: bool) -> Self {
+        if storage {
+            Self::Storage
+        } else {
+            Self::Managed
+        }
+    }
+
+    const fn sign_in(self) -> Method {
+        match self {
+            Self::Managed => Method::AccountSignIn,
+            Self::Storage => Method::AccountStorageSignIn,
+        }
+    }
+
+    const fn sign_out(self) -> Method {
+        match self {
+            Self::Managed => Method::AccountSignOut,
+            Self::Storage => Method::AccountStorageSignOut,
+        }
+    }
+
+    const fn status(self) -> Method {
+        match self {
+            Self::Managed => Method::AccountStatus,
+            Self::Storage => Method::AccountStorageStatus,
+        }
+    }
+
+    /// The command that signs this account in.
+    const fn sign_in_command(self) -> &'static str {
+        match self {
+            Self::Managed => "`kr account sign-in`",
+            Self::Storage => "`kr account sign-in --storage`",
+        }
+    }
+
+    /// The command that signs this account out.
+    const fn sign_out_command(self) -> &'static str {
+        match self {
+            Self::Managed => "`kr account sign-out`",
+            Self::Storage => "`kr account sign-out --storage`",
+        }
+    }
+
+    /// What the account is called to a person.
+    const fn noun(self) -> &'static str {
+        match self {
+            Self::Managed => "account",
+            Self::Storage => "storage account",
+        }
+    }
+
+    /// What a sign-in of the account is called to a person.
+    const fn sign_in_noun(self) -> &'static str {
+        match self {
+            Self::Managed => "sign-in",
+            Self::Storage => "storage sign-in",
+        }
+    }
+}
+
+/// Calls the account mutation `method` of `which`.
+///
+/// A daemon of a release before storage accounts does not list the storage methods, and refuses
+/// them as it refuses any method it does not list: `PERMISSION_DENIED`, which is also what a grant
+/// without the right is refused with. The two are told apart by asking for the managed account's
+/// status, which asks for the same right and which every daemon with accounts lists: where it is
+/// answered, the daemon does not know the method; where it is refused too, the refusal is the
+/// grant's and is returned as it is.
+async fn mutate<P, T>(daemon: &mut Daemon, which: Which, method: Method, params: &P) -> Result<T>
+where
+    P: serde::Serialize + ?Sized,
+    T: kr_protocol::wire::WireMessage,
+{
+    match daemon.mutate(method, params).await {
+        Err(CliError::Refused(refusal))
+            if which == Which::Storage && refusal.code == ErrorCode::PermissionDenied =>
+        {
+            Err(predates_or(daemon, refusal).await)
+        }
+        other => other,
+    }
+}
+
+/// What a `PERMISSION_DENIED` to a storage method means: an old daemon, or the grant's own refusal.
+async fn predates_or(daemon: &mut Daemon, refusal: ProtocolError) -> CliError {
+    match daemon
+        .read::<_, AccountReport>(Method::AccountStatus, &AccountStatusParams {})
+        .await
+    {
+        Ok(_) => CliError::Other(kr_client::shown::Shown::said(
+            "this host's daemon predates storage accounts, so it cannot hold an account at a \
+             service you run; update it",
+        )),
+        Err(CliError::Refused(again)) if again.code == ErrorCode::PermissionDenied => {
+            CliError::Refused(refusal)
+        }
+        Err(other) => other,
+    }
+}
+
+/// `kr account sign-in`: starts the sign-in, prints the address to open and opens it. With
+/// `storage`, it is the sign-in of the account at the storage service the host's owner runs.
 ///
 /// # Errors
 ///
-/// Returns the daemon's refusal: this host names no managed service, a sign-in is finishing, or
-/// another program holds the loopback address.
-pub async fn sign_in(selector: &EnvironmentSelector, json: bool) -> Result<()> {
+/// Returns the daemon's refusal: this host names no managed service, or no storage service of its
+/// own for `--storage`, a sign-in is finishing, or another program holds the loopback address.
+pub async fn sign_in(selector: &EnvironmentSelector, json: bool, storage: bool) -> Result<()> {
+    let which = Which::of(storage);
     let mut daemon = Daemon::open(&kr_ipc::paths::HostPaths::discover()?, selector).await?;
-    let started: AccountSignInStarted = daemon
-        .mutate(Method::AccountSignIn, &AccountSignInParams {})
-        .await?;
-    let report: AccountReport = daemon
-        .read(Method::AccountStatus, &AccountStatusParams {})
-        .await?;
+    let started: AccountSignInStarted =
+        mutate(&mut daemon, which, which.sign_in(), &AccountSignInParams {}).await?;
+    let report: AccountReport = daemon.read(which.status(), &AccountStatusParams {}).await?;
     let AccountState::WaitingForBrowser {
         authorise_url,
         redirect_address,
@@ -51,27 +170,38 @@ pub async fn sign_in(selector: &EnvironmentSelector, json: bool) -> Result<()> {
     } = &report.state
     else {
         // The attempt has already ended, such as a browser that answered before this asked.
-        say(&report, json);
+        say(&report, which, json);
         return Ok(());
     };
+    // The service is named before the browser opens: a `storage.origin` that was mistyped opens a
+    // sign-in at whatever service it names, and the person can still stop it here.
+    if let (Which::Storage, Some(service), false) = (which, report.service.as_ref(), json) {
+        output::line(&stdout_line!(
+            "This host's storage account signs in at {}, the service its storage.origin names. It \
+             is not the managed account service.",
+            Asked::location(Request::Account, service)
+        ));
+    }
     // Opened here, on the machine the person is at, and printed whether or not it opened: a host
     // with no display has nobody to open it for.
-    let opened = open::that_detached(authorise_url).is_ok();
+    let opened = open_browser(authorise_url);
     if json {
-        output::document(
-            &Document::new()
-                .with("ok", true)
-                .with("opened", opened)
-                .with(
-                    "authorise_url",
-                    Asked::text(Request::Account, authorise_url),
-                )
-                .with(
-                    "redirect_address",
-                    Asked::text(Request::Account, redirect_address),
-                )
-                .with("expires_at_ms", started.expires_at_ms.get()),
-        );
+        let mut document = Document::new()
+            .with("ok", true)
+            .with("opened", opened)
+            .with(
+                "authorise_url",
+                Asked::text(Request::Account, authorise_url),
+            )
+            .with(
+                "redirect_address",
+                Asked::text(Request::Account, redirect_address),
+            )
+            .with("expires_at_ms", started.expires_at_ms.get());
+        if let (Which::Storage, Some(service)) = (which, report.service.as_ref()) {
+            document.set("service", Asked::location(Request::Account, service));
+        }
+        output::document(&document);
     } else {
         output::line(&stdout_line!(
             "Open this address in a browser to sign this host in: {}",
@@ -94,17 +224,49 @@ pub async fn sign_in(selector: &EnvironmentSelector, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `kr account sign-out`: removes this host's account and asks the service to end it.
+/// Opens `address` in the person's browser, and says whether it could.
+///
+/// A debug build that is given `KR_BROWSER_LOG` appends the address to that file instead, so that
+/// a test of the command opens no browser on the machine it runs on. A release build has no such
+/// variable.
+#[cfg(debug_assertions)]
+fn open_browser(address: &str) -> bool {
+    use std::io::Write as _;
+
+    let Some(log) = std::env::var_os("KR_BROWSER_LOG") else {
+        return open::that_detached(address).is_ok();
+    };
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .and_then(|mut file| writeln!(file, "{address}"))
+        .is_ok()
+}
+
+/// Opens `address` in the person's browser, and says whether it could.
+#[cfg(not(debug_assertions))]
+fn open_browser(address: &str) -> bool {
+    open::that_detached(address).is_ok()
+}
+
+/// `kr account sign-out`: removes this host's account and asks the service to end it. With
+/// `storage`, it is the account at the storage service the host's owner runs.
 ///
 /// # Errors
 ///
-/// Returns the daemon's refusal: this host cannot reach the account service, a sign-in is
-/// finishing, or a voice call is open.
-pub async fn sign_out(selector: &EnvironmentSelector, json: bool) -> Result<()> {
+/// Returns the daemon's refusal: this host cannot reach the account service, holds no storage
+/// service of its own for `--storage`, a sign-in is finishing, or a voice call is open.
+pub async fn sign_out(selector: &EnvironmentSelector, json: bool, storage: bool) -> Result<()> {
+    let which = Which::of(storage);
     let mut daemon = Daemon::open(&kr_ipc::paths::HostPaths::discover()?, selector).await?;
-    let done: AccountSignedOut = daemon
-        .mutate(Method::AccountSignOut, &AccountSignOutParams {})
-        .await?;
+    let done: AccountSignedOut = mutate(
+        &mut daemon,
+        which,
+        which.sign_out(),
+        &AccountSignOutParams {},
+    )
+    .await?;
     if json {
         output::document(
             &Document::new()
@@ -113,40 +275,90 @@ pub async fn sign_out(selector: &EnvironmentSelector, json: bool) -> Result<()> 
                 .with("service_told", done.service_told),
         );
     } else if !done.was_signed_in {
-        output::line(&stdout_line!("No account was signed in."));
+        output::line(&match which {
+            Which::Managed => stdout_line!("No account was signed in."),
+            Which::Storage => stdout_line!("No storage account was signed in."),
+        });
     } else if done.service_told {
-        output::line(&stdout_line!(
-            "Signed out. The account service has ended the sign-in."
-        ));
+        output::line(&match which {
+            Which::Managed => {
+                stdout_line!("Signed out. The account service has ended the sign-in.")
+            }
+            Which::Storage => {
+                stdout_line!("Signed out. The storage service has ended the sign-in.")
+            }
+        });
     } else {
-        output::line(&stdout_line!(
-            "Signed out. The account service could not be told, so the daemon tells it at a later \
-             start that can reach it."
-        ));
+        output::line(&match which {
+            Which::Managed => stdout_line!(
+                "Signed out. The account service could not be told, so the daemon tells it at a \
+                 later start that can reach it."
+            ),
+            Which::Storage => stdout_line!(
+                "Signed out. The storage service could not be told, so the daemon tells it at a \
+                 later start that can reach it."
+            ),
+        });
     }
     Ok(())
 }
 
-/// `kr account show`: where this host's sign-in stands.
+/// `kr account show`: where this host's sign-in stands, and where its storage account stands when
+/// it has one.
+///
+/// A host has a storage account when its daemon answers `account.storage_status`. One that is
+/// refused as `HOST_NOT_CONFIGURED` has none, and one of a release before storage accounts does not
+/// list the method and cannot have one: the managed account was read first, with the same right, so
+/// neither refusal is about the caller.
 ///
 /// # Errors
 ///
 /// Returns the daemon's refusal, or a transport failure.
 pub async fn show(selector: &EnvironmentSelector, json: bool) -> Result<()> {
     let mut daemon = Daemon::open(&kr_ipc::paths::HostPaths::discover()?, selector).await?;
-    let report: AccountReport = daemon
+    let managed: AccountReport = daemon
         .read(Method::AccountStatus, &AccountStatusParams {})
         .await?;
-    say(&report, json);
+    let storage = match daemon
+        .read::<_, AccountReport>(Method::AccountStorageStatus, &AccountStatusParams {})
+        .await
+    {
+        Ok(report) => Some(report),
+        Err(CliError::Refused(refusal))
+            if matches!(
+                refusal.code,
+                ErrorCode::HostNotConfigured | ErrorCode::PermissionDenied
+            ) =>
+        {
+            None
+        }
+        Err(other) => return Err(other),
+    };
+    if json {
+        let mut document = document(&managed);
+        if let Some(storage) = &storage {
+            document.set("storage_account", members(storage));
+        }
+        output::document(&document);
+    } else {
+        for line in lines(&managed, Which::Managed) {
+            output::line(&line);
+        }
+        if let Some(storage) = &storage {
+            for line in lines(storage, Which::Storage) {
+                output::line(&line);
+            }
+        }
+    }
     Ok(())
 }
 
 /// Writes a report for a person or a script.
-fn say(report: &AccountReport, json: bool) {
+fn say(report: &AccountReport, which: Which, json: bool) {
     if json {
         output::document(&document(report));
     } else {
-        for line in lines(report) {
+        for line in lines(report, which) {
             output::line(&line);
         }
     }
@@ -155,9 +367,14 @@ fn say(report: &AccountReport, json: bool) {
 /// The report as a document. The address a sign-in is opened at is left out: it is the one answer
 /// of `sign-in` and is not repeated by a read.
 fn document(report: &AccountReport) -> Document {
-    let mut document = Document::new()
-        .with("ok", true)
-        .with("state", report.state.name());
+    let mut document = Document::new().with("ok", true);
+    document.merge(members(report));
+    document
+}
+
+/// What a report says of one account, as the members of a document.
+fn members(report: &AccountReport) -> Document {
+    let mut document = Document::new().with("state", report.state.name());
     if let Some(service) = report.service.as_ref() {
         document.set("service", Asked::location(Request::Account, service));
     }
@@ -182,39 +399,61 @@ fn document(report: &AccountReport) -> Document {
     document
 }
 
-/// Where the host's sign-in stands, as lines for a person.
-fn lines(report: &AccountReport) -> Vec<Line> {
+/// Where an account stands, as lines for a person.
+fn lines(report: &AccountReport, which: Which) -> Vec<Line> {
     let mut lines = Vec::new();
-    match (report.service.as_ref(), report.unavailable.as_ref()) {
-        (Some(service), None) => lines.push(stdout_line!(
-            "This host signs in at {}.",
-            Asked::location(Request::Account, service)
-        )),
-        (_, Some(SignInUnavailable::BrokerIsAnotherService)) => lines.push(stdout_line!(
-            "This host's voice.broker_origin names another service than the managed account \
-             service, so it signs in nowhere and presents no account."
-        )),
-        (_, Some(SignInUnavailable::NotUsable)) => lines.push(stdout_line!(
-            "This host cannot reach the managed account service the way its configuration says: \
-             when its configuration document cannot be used, `kr doctor` says how to put it \
-             right; otherwise the daemon's log says why."
-        )),
-        (_, Some(SignInUnavailable::NoManagedService)) | (None, None) => lines.push(stdout_line!(
-            "This host names no managed service: set voice.broker_origin or relay.origin in its \
-             configuration document to the managed account service's origin to use managed voice \
-             or relay leases. A storage.origin that names a service you run has an account of its \
-             own: `kr account sign-in --storage` signs this host in there."
-        )),
+    match which {
+        Which::Managed => match (report.service.as_ref(), report.unavailable.as_ref()) {
+            (Some(service), None) => lines.push(stdout_line!(
+                "This host signs in at {}.",
+                Asked::location(Request::Account, service)
+            )),
+            (_, Some(SignInUnavailable::BrokerIsAnotherService)) => lines.push(stdout_line!(
+                "This host's voice.broker_origin names another service than the managed account \
+                 service, so it signs in nowhere and presents no account."
+            )),
+            (_, Some(SignInUnavailable::NotUsable)) => lines.push(stdout_line!(
+                "This host cannot reach the managed account service the way its configuration \
+                 says: when its configuration document cannot be used, `kr doctor` says how to \
+                 put it right; otherwise the daemon's log says why."
+            )),
+            (_, Some(SignInUnavailable::NoManagedService)) | (None, None) => {
+                lines.push(stdout_line!(
+                    "This host names no managed service: set voice.broker_origin or relay.origin \
+                     in its configuration document to the managed account service's origin to use \
+                     managed voice or relay leases. A storage.origin that names a service you run \
+                     has an account of its own: `kr account sign-in --storage` signs this host in \
+                     there."
+                ));
+            }
+        },
+        Which::Storage => match (report.service.as_ref(), report.unavailable.as_ref()) {
+            (Some(service), None) => lines.push(stdout_line!(
+                "This host's storage account signs in at {}, the service its storage.origin \
+                 names. It is not the managed account service.",
+                Asked::location(Request::Account, service)
+            )),
+            _ => lines.push(stdout_line!(
+                "This host cannot reach the storage service the way its configuration says: when \
+                 its configuration document cannot be used, `kr doctor` says how to put it right; \
+                 otherwise the daemon's log says why."
+            )),
+        },
     }
     match &report.state {
         AccountState::SignedOut => lines.push(stdout_line!(
-            "No account is signed in. `kr account sign-in` signs one in."
+            "No {} is signed in. {} signs one in.",
+            which.noun(),
+            which.sign_in_command()
         )),
         AccountState::WaitingForBrowser { expires_at_ms, .. } => lines.push(stdout_line!(
-            "A sign-in is waiting for the browser until {} in UTC milliseconds.",
+            "A {} is waiting for the browser until {} in UTC milliseconds.",
+            which.sign_in_noun(),
             expires_at_ms.get()
         )),
-        AccountState::Finishing => lines.push(stdout_line!("A sign-in is finishing.")),
+        AccountState::Finishing => {
+            lines.push(stdout_line!("A {} is finishing.", which.sign_in_noun()));
+        }
         AccountState::SignedIn {
             origin,
             email,
@@ -237,13 +476,17 @@ fn lines(report: &AccountReport) -> Vec<Line> {
             ));
             if report.unavailable.as_ref().is_some() {
                 lines.push(stdout_line!(
-                    "This host presents no account while its configuration is as it is. \
-                     `kr account sign-out` ends the sign-in."
+                    "This host presents no {} while its configuration is as it is. {} ends the \
+                     sign-in.",
+                    which.noun(),
+                    which.sign_out_command()
                 ));
             }
         }
         AccountState::Ended => lines.push(stdout_line!(
-            "The service ended the sign-in. `kr account sign-in` signs in again."
+            "The service ended the {}. {} signs in again.",
+            which.sign_in_noun(),
+            which.sign_in_command()
         )),
     }
     if let Some(attempt) = report.last_attempt.as_ref() {

@@ -1478,11 +1478,11 @@ async fn run(cli: Cli) -> Result<Completion> {
         },
         Command::Account(arguments) => match arguments.command {
             AccountCommand::SignIn(arguments) => {
-                kr_cli::account::sign_in(&arguments.selector, cli.json).await?;
+                kr_cli::account::sign_in(&arguments.selector, cli.json, arguments.storage).await?;
                 Ok(Completion::Done)
             }
             AccountCommand::SignOut(arguments) => {
-                kr_cli::account::sign_out(&arguments.selector, cli.json).await?;
+                kr_cli::account::sign_out(&arguments.selector, cli.json, arguments.storage).await?;
                 Ok(Completion::Done)
             }
             AccountCommand::Show(arguments) => {
