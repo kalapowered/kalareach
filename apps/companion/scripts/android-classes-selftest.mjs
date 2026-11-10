@@ -422,6 +422,30 @@ held(
   different.join(',')
 )
 
+expectNames(
+  'a nested class named with dots, and a class of a library the application brings, are asked for',
+  'names-nested-dotted.apk',
+  [
+    application(dex({ defined: [] })),
+    library(
+      elf({
+        blobs: [Buffer.from('\x00org.webrtc.Outer$Inner\x00androidx.camera.core.ImageProcessingUtil\x00', 'latin1')]
+      })
+    )
+  ],
+  'class androidx.camera.core.ImageProcessingUtil (named by lib/arm64-v8a/libmedia.so); ' +
+    'class org.webrtc.Outer$Inner (named by lib/arm64-v8a/libmedia.so)'
+)
+expectNames(
+  'a string of many nested parts that is no name is read without trouble',
+  'names-many-parts.apk',
+  [
+    application(dex({ defined: [] })),
+    library(elf({ blobs: [Buffer.from(`\x00org.webrtc.Foo${'$a'.repeat(200)}!\x00`, 'latin1')] }))
+  ],
+  'nothing'
+)
+
 // -- the native methods the dex declares --------------------------------------------------------
 // The runtime binds a native method to the symbol its class and name make. A method the minifier
 // renamed has no symbol, and the call that reaches it throws.
@@ -499,12 +523,116 @@ expectNames(
     application(
       dex({
         defined: ['org.webrtc.Peer_Connection'],
-        methods: { 'org.webrtc.Peer_Connection': [{ name: 'native_call', native: true }] }
+        methods: {
+          'org.webrtc.Peer_Connection': [
+            { name: 'native_call', native: true, params: ['I', 'Ljava/lang/String;'] }
+          ]
+        }
       })
     ),
     library(elf({ exports: ['Java_org_webrtc_Peer_1Connection_native_1call__ILjava_lang_String_2'] }))
   ],
   'nothing'
+)
+expectNames(
+  'an overload with no symbol of its own is named, as the long name of the other does not bind it',
+  'natives-overload-missing.apk',
+  [
+    application(
+      mediaDex([], {
+        [FACTORY]: [
+          { name: 'call', native: true, params: ['I'] },
+          { name: 'call', native: true, params: ['J'] }
+        ]
+      })
+    ),
+    library(elf({ exports: ['Java_org_webrtc_PeerConnectionFactory_call__I'] }))
+  ],
+  `native method ${FACTORY}.call (arguments j) (no library of arm64-v8a exports it)`
+)
+expectNames(
+  'overloads each bound by a long name are bound',
+  'natives-overloads-bound.apk',
+  [
+    application(
+      mediaDex([], {
+        [FACTORY]: [
+          { name: 'call', native: true, params: ['I'] },
+          { name: 'call', native: true, params: ['J'] }
+        ]
+      })
+    ),
+    library(
+      elf({
+        exports: [
+          'Java_org_webrtc_PeerConnectionFactory_call__I',
+          'Java_org_webrtc_PeerConnectionFactory_call__J'
+        ]
+      })
+    )
+  ],
+  'nothing'
+)
+expectNames(
+  'overloads of a name that a library exports by its short name are bound to it',
+  'natives-overloads-short.apk',
+  [
+    application(
+      mediaDex([], {
+        [FACTORY]: [
+          { name: 'call', native: true, params: ['I'] },
+          { name: 'call', native: true, params: ['J'] }
+        ]
+      })
+    ),
+    library(elf({ exports: ['Java_org_webrtc_PeerConnectionFactory_call'] }))
+  ],
+  'nothing'
+)
+expectNames(
+  'a native method with an argument of a class is bound by the class as the runtime writes it',
+  'natives-class-argument.apk',
+  [
+    application(
+      mediaDex([], {
+        [FACTORY]: [{ name: 'call', native: true, params: ['I', 'Lorg/webrtc/IceCandidate;', 'J'] }]
+      })
+    ),
+    library(elf({ exports: ['Java_org_webrtc_PeerConnectionFactory_call__ILorg_webrtc_IceCandidate_2J'] }))
+  ],
+  'nothing'
+)
+expectNames(
+  'a class that has fields before its methods is read through them',
+  'natives-fields.apk',
+  [
+    application(
+      dex({
+        defined: [JNI_ZERO, FACTORY, CANDIDATE, NESTED, RAW],
+        fields: { [FACTORY]: [2, 3] },
+        methods: { [FACTORY]: [{ name: 'a', native: true }] }
+      })
+    ),
+    library(mediaLibrary())
+  ],
+  `native method ${FACTORY}.a (no library of arm64-v8a exports it)`
+)
+expectNames(
+  'a class with a static native and an instance native is read for both',
+  'natives-both-lists.apk',
+  [
+    application(
+      mediaDex([], {
+        [FACTORY]: [
+          { name: 'nativeCreate', native: true },
+          { name: 'make', native: true, static: true },
+          { name: 'a', native: true, static: true }
+        ]
+      })
+    ),
+    library(mediaLibrary({ exports: ['Java_org_webrtc_PeerConnectionFactory_nativeCreate', 'Java_org_webrtc_PeerConnectionFactory_make'] }))
+  ],
+  `native method ${FACTORY}.a (no library of arm64-v8a exports it)`
 )
 expectNames(
   'a native method may be bound by any library of the ABI, not only by one that names classes',
@@ -537,6 +665,72 @@ expectNames(
     library(mediaLibrary({ wide: false }), 'lib/armeabi-v7a/libmedia.so')
   ],
   `native method ${FACTORY}.a (no library of armeabi-v7a exports it)`
+)
+
+// A library whose symbols cannot be found is refused, and a symbol no other library can find does
+// not bind a method: neither may excuse a class from its symbols.
+for (const wide of [true, false]) {
+  const width = wide ? '64-bit' : '32-bit'
+  expectNames(
+    `a ${width} library's local symbol does not bind a method of a class its other symbols bind`,
+    `natives-local-${width}.apk`,
+    [
+      application(mediaDex([], { [FACTORY]: [{ name: 'nativeCreate', native: true }] })),
+      library(
+        mediaLibrary({
+          wide,
+          exports: ['Java_org_webrtc_PeerConnectionFactory_other'],
+          locals: ['Java_org_webrtc_PeerConnectionFactory_nativeCreate']
+        })
+      )
+    ],
+    `native method ${FACTORY}.nativeCreate (no library of arm64-v8a exports it)`
+  )
+  expectNames(
+    `a ${width} library's hidden symbol does not bind a method of a class its other symbols bind`,
+    `natives-hidden-${width}.apk`,
+    [
+      application(mediaDex([], { [FACTORY]: [{ name: 'nativeCreate', native: true }] })),
+      library(
+        mediaLibrary({
+          wide,
+          exports: ['Java_org_webrtc_PeerConnectionFactory_other'],
+          hidden: ['Java_org_webrtc_PeerConnectionFactory_nativeCreate']
+        })
+      )
+    ],
+    `native method ${FACTORY}.nativeCreate (no library of arm64-v8a exports it)`
+  )
+}
+expectNames(
+  'a library with no section headers is refused, not read as one that exports nothing',
+  'libraries-no-headers.apk',
+  [application(), library(mediaLibrary({ headers: false }))],
+  `refused: ${MEDIA}: an ELF library with no section headers`
+)
+expectNames(
+  'a library whose section headers run past its end is refused',
+  'libraries-truncated.apk',
+  [
+    application(),
+    library(
+      (() => {
+        const whole = mediaLibrary()
+        return whole.subarray(0, whole.length - 8)
+      })()
+    )
+  ],
+  `refused: ${MEDIA}: an ELF library whose section headers are not within the file`
+)
+expectNames(
+  'a bundle holds each ABI to its own libraries',
+  'libraries-two-abis.aab',
+  [
+    { name: 'base/dex/classes.dex', bytes: mediaDex() },
+    library(mediaLibrary(), 'base/lib/arm64-v8a/libmedia.so'),
+    library(mediaLibrary({ exports: ['Java_org_webrtc_PeerConnectionFactory_other'] }), 'base/lib/x86_64/libmedia.so')
+  ],
+  `native method ${FACTORY}.nativeCreate (no library of x86_64 exports it)`
 )
 
 // -- which libraries are read --------------------------------------------------------------------

@@ -36,7 +36,7 @@ import {
 import { dirname, extname, join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-import { libraryClassNames, libraryNatives } from './android-native-names.mjs'
+import { libraryClassNames, libraryNatives, mangledArguments } from './android-native-names.mjs'
 
 /**
  * The classes a packaged application must define, by these exact names.
@@ -275,7 +275,8 @@ export function definedClasses(dex) {
 const ACC_NATIVE = 0x100
 
 /**
- * Every class a dex file defines, with the names of the native methods it declares.
+ * Every class a dex file defines, with the native methods it declares: each one's name, and the
+ * runtime's mangling of its argument types, which is what tells one overload from another.
  *
  * The methods are read from each class's own data item and not from the file's method table, which
  * lists the methods the code merely calls as well as the ones a class declares.
@@ -283,16 +284,28 @@ const ACC_NATIVE = 0x100
 export function definedNatives(dex) {
   requireDex(dex)
   const typeIdsAt = dex.readUInt32LE(0x44)
+  const protoIdsAt = dex.readUInt32LE(0x4c)
   const methodIdsAt = dex.readUInt32LE(0x5c)
   const classDefsCount = dex.readUInt32LE(0x60)
   const classDefsAt = dex.readUInt32LE(0x64)
   const descriptor = (typeIndex) => stringAt(dex, dex.readUInt32LE(typeIdsAt + typeIndex * 4))
+  /** The argument types of the method at `methodIndex`, from its prototype's type list. */
+  const argumentsOf = (methodIndex) => {
+    const proto = dex.readUInt16LE(methodIdsAt + methodIndex * 8 + 2)
+    const listAt = dex.readUInt32LE(protoIdsAt + proto * 12 + 8)
+    if (listAt === 0) return ''
+    let types = ''
+    for (let each = 0; each < dex.readUInt32LE(listAt); each += 1) {
+      types += descriptor(dex.readUInt16LE(listAt + 4 + each * 2))
+    }
+    return types
+  }
   const classes = new Map()
   for (let index = 0; index < classDefsCount; index += 1) {
     const classDef = classDefsAt + index * 32
     const type = descriptor(dex.readUInt32LE(classDef))
     if (!type.startsWith('L') || !type.endsWith(';')) continue
-    const natives = new Set()
+    const natives = []
     classes.set(type.slice(1, -1).replaceAll('/', '.'), natives)
     const dataAt = dex.readUInt32LE(classDef + 24)
     if (dataAt === 0) continue
@@ -316,7 +329,10 @@ export function definedNatives(dex) {
         at = afterCode
         methodIndex += step
         if ((flags & ACC_NATIVE) !== 0) {
-          natives.add(stringAt(dex, dex.readUInt32LE(methodIdsAt + methodIndex * 8 + 4)))
+          natives.push({
+            name: stringAt(dex, dex.readUInt32LE(methodIdsAt + methodIndex * 8 + 4)),
+            signature: mangledArguments(argumentsOf(methodIndex))
+          })
         }
       }
     }
@@ -374,12 +390,14 @@ function and(items) {
 /**
  * What the native libraries of the artefact at `path` find by name, read against the dex.
  *
- * Answers the libraries read, each with the number of classes and native methods it names, the
- * number of native methods the dex declares, and the problems. One is a class a library names that
- * no dex file of the application defines under that name. The other is a native method of a class
- * the libraries of an ABI are bound to, which none of them exports under its name: the runtime binds
- * a native method by the symbol its class and name make, so a method the minifier renamed has no
- * symbol, and the call that reaches it throws.
+ * Answers the libraries read, each with the number of classes and native methods it names; how many
+ * different classes they name together; how many native methods the check asked a symbol for; the
+ * classes that declare natives and were not asked; and the problems. One is a class a library names
+ * that no dex file of the application defines under that name. The other is a native method of a
+ * class the libraries of an ABI are bound to, which none of them exports: the runtime binds a native
+ * method to the symbol its class and name make, the short one or, for an overload, the long one that
+ * ends in its mangled argument types, so a method the minifier renamed has no symbol, and the call
+ * that reaches it throws.
  *
  * A class is one the libraries are bound to when they export a native method for it. A class that
  * declares natives and has no export, such as the encoder of a codec the library was built without,
@@ -394,13 +412,14 @@ export function nativeNames(path) {
     const declared = new Map()
     for (const member of dexes) {
       for (const [name, natives] of definedNatives(read(member))) {
-        declared.set(name, new Set([...(declared.get(name) ?? []), ...natives]))
+        declared.set(name, [...(declared.get(name) ?? []), ...natives])
       }
     }
     const files = all.filter((member) => LIBRARY_MEMBER[kind].test(member.name))
     if (files.length === 0) throw new Error('the artefact carries no native library')
     const libraries = []
     const named = new Map()
+    const everyName = new Set()
     const exported = new Map()
     const bound = new Map()
     for (const member of files.sort((a, b) => (a.name < b.name ? -1 : 1))) {
@@ -415,24 +434,35 @@ export function nativeNames(path) {
       }
       libraries.push({ name: member.name, classes: classes.size, natives: natives.length })
       for (const name of classes) {
+        everyName.add(name)
         if (!declared.has(name)) named.set(name, new Set([...(named.get(name) ?? []), member.name]))
       }
       const abi = member.name.split('/').at(kind === '.aab' ? 2 : 1)
       const symbols = exported.get(abi) ?? new Set()
       const classesBound = bound.get(abi) ?? new Set()
-      for (const { cls, method } of natives) {
-        symbols.add(`${cls}.${method}`)
+      for (const { cls, method, signature } of natives) {
+        symbols.add(signature === null ? `${cls}.${method}` : `${cls}.${method}:${signature}`)
         classesBound.add(cls)
       }
       exported.set(abi, symbols)
       bound.set(abi, classesBound)
     }
     const unbound = new Map()
+    const asked = new Set()
+    const unasked = []
     for (const [name, natives] of declared) {
-      for (const method of natives) {
+      if (natives.length > 0 && ![...bound.values()].some((classes) => classes.has(name))) {
+        unasked.push(name)
+      }
+      for (const { name: method, signature } of natives) {
+        // An overload is told apart by its arguments, so a class with two of a name says which.
+        const overloaded = natives.filter((each) => each.name === method).length > 1
+        const label = `${name}.${method}${overloaded ? ` (arguments ${signature || 'none'})` : ''}`
         for (const [abi, symbols] of exported) {
-          if (!bound.get(abi).has(name) || symbols.has(`${name}.${method}`)) continue
-          unbound.set(`${name}.${method}`, new Set([...(unbound.get(`${name}.${method}`) ?? []), abi]))
+          if (!bound.get(abi).has(name)) continue
+          asked.add(label)
+          if (symbols.has(`${name}.${method}`) || symbols.has(`${name}.${method}:${signature}`)) continue
+          unbound.set(label, new Set([...(unbound.get(label) ?? []), abi]))
         }
       }
     }
@@ -443,10 +473,15 @@ export function nativeNames(path) {
         .map(([name, from]) => `class ${name} (named by ${and([...from])})`),
       ...[...unbound]
         .sort(byName)
-        .map(([name, abis]) => `native method ${name} (no library of ${and([...abis])} exports it)`)
+        .map(([label, abis]) => `native method ${label} (no library of ${and([...abis])} exports it)`)
     ]
-    const natives = [...declared.values()].reduce((sum, each) => sum + each.size, 0)
-    return { libraries, natives, problems }
+    return {
+      libraries,
+      classes: everyName.size,
+      checked: asked.size,
+      unasked: unasked.sort(),
+      problems
+    }
   })
 }
 
@@ -729,10 +764,13 @@ export function verify(paths) {
       )
     }
     if (reading.problems.length === 0) {
-      const names = reading.libraries.reduce((sum, each) => sum + each.classes, 0)
       console.log(
-        `${shown}: its ${reading.libraries.length} native libraries name ${names} classes, all defined ` +
-          `in its dex, and bind all ${reading.natives} native methods it declares`
+        `${shown}: its ${reading.libraries.length} native libraries name ${reading.classes} classes, ` +
+          `all defined in its dex, and bind the ${reading.checked} native methods it declares in the ` +
+          'classes they export natives for' +
+          (reading.unasked.length > 0
+            ? `; not asked, since no library exports a native of them: ${reading.unasked.join(', ')}`
+            : '')
       )
       continue
     }
