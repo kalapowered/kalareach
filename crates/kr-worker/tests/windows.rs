@@ -1053,8 +1053,35 @@ impl Tree {
 }
 
 impl Drop for Tree {
+    /// Removes the tree, again while the removal is refused and for no longer than the patience.
+    ///
+    /// A case that holds a path of the tree on purpose lets go of it before the tree goes, so a
+    /// removal that is still refused when the patience is over is a holder that was not let go of:
+    /// the case fails for it, and says which tree is left.
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let begun = Instant::now();
+        loop {
+            match std::fs::remove_dir_all(&self.0) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) if begun.elapsed() < PATIENCE => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => {
+                    eprintln!(
+                        "{} is left in the temporary folder, its removal is refused: {error}",
+                        self.0.display()
+                    );
+                    // A case that is already failing is not made to panic twice.
+                    assert!(
+                        std::thread::panicking(),
+                        "{} is left: {error}",
+                        self.0.display()
+                    );
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -1352,11 +1379,20 @@ fn on_a_tree(
     runtime.block_on(case(&temp));
     drop(runtime);
     drop(temp);
-    assert!(
-        !root.exists(),
-        "{} is left in the temporary folder",
-        root.display()
-    );
+    // The tree's own removal gives up after its patience and says so; what is left is removed again
+    // here, for as long as a case is given to wait for anything, and the case fails when it stays.
+    let begun = Instant::now();
+    while root.exists() {
+        let removed = std::fs::remove_dir_all(&root);
+        assert!(
+            begun.elapsed() < PATIENCE || removed.is_ok(),
+            "{} is left in the temporary folder: {removed:?}",
+            root.display()
+        );
+        if removed.is_err() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
 /// A worker this test hosts: a session whose root shell is PowerShell, served on the environment's

@@ -2173,7 +2173,6 @@ fn channel_server() -> kr_protocol::identity::ProcessStartIdentity {
 /// A daemon with a real worker service in its directory, in this process, whose broker holds one
 /// launched Claude Code instance with its connector's channel open.
 struct Served {
-    _temp: kr_ipc::testing::TempHost,
     controller: Arc<crate::service::Controller>,
     environment_id: kr_protocol::ids::EnvironmentId,
     session_id: SessionId,
@@ -2191,6 +2190,10 @@ struct Served {
     _verdicts: tokio::io::ReadHalf<tokio::io::DuplexStream>,
     /// Ends the channel as the command backend's retirement does.
     retire: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Declared last, so the tree is removed after the daemon and the worker, which hold files in
+    /// it, are let go of: on Windows a folder with a file held open without sharing is not
+    /// removed.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl Served {

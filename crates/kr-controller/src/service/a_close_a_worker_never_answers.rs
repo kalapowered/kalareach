@@ -306,7 +306,6 @@ pub(super) async fn admission(
 }
 
 pub(super) struct Silent {
-    pub(super) _temp: kr_ipc::testing::TempHost,
     pub(super) controller: Arc<Controller>,
     pub(super) environment_id: kr_protocol::ids::EnvironmentId,
     pub(super) session_id: SessionId,
@@ -314,6 +313,10 @@ pub(super) struct Silent {
     pub(super) actor: kr_protocol::actor::ActorEnvelope,
     pub(super) accepted: AcceptedDeadline,
     pub(super) serving: tokio::task::JoinHandle<()>,
+    /// Declared last, so the tree is removed after the daemon, which holds its lock file in the
+    /// tree, is let go of: on Windows a folder with a file held open without sharing is not
+    /// removed.
+    pub(super) _temp: kr_ipc::testing::TempHost,
 }
 
 /// A daemon with one silent worker in its directory, and everything a close needs.

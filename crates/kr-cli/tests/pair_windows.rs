@@ -15,6 +15,7 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -374,8 +375,16 @@ impl OnConsole {
         writer.flush().expect("flushed");
     }
 
-    /// Waits for the command to end, and returns whether it succeeded and what it printed.
-    fn finish(mut self) -> (bool, String) {
+    /// Waits for the command to end and its console to show `last`, and returns whether it
+    /// succeeded and what it printed.
+    ///
+    /// `last` is what the command prints at its end. A command that has ended can still have its
+    /// last lines on their way to this side of the console, and how long that takes is not this
+    /// test's to know, so the end of the command does not end the wait: the console showing `last`
+    /// does. A command writes in order, so what it printed before `last` is in what comes back with
+    /// it, and a check that something was not printed is judged on all of it. The wait fails when the
+    /// console's output has ended without `last`, and at the liveness deadline.
+    fn finish(mut self, last: &str) -> (bool, String) {
         let started = Instant::now();
         let status = loop {
             if let Some(status) = self.child.try_wait().expect("the command's state") {
@@ -388,14 +397,32 @@ impl OnConsole {
             );
             std::thread::sleep(Duration::from_millis(20));
         };
-        std::thread::sleep(Duration::from_millis(200));
-        (status.success(), self.output.text())
+        loop {
+            // Read before the text is, so that a thread that was done has also added the last bytes.
+            let complete = self.output.complete();
+            let text = self.output.text();
+            if text.contains(last) {
+                return (status.success(), text);
+            }
+            assert!(
+                !complete,
+                "kr ended ({status}) and its console showed all it will, without {last:?}: {text}"
+            );
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "kr ended ({status}) and its console did not show {last:?} in {:?}: {text}",
+                started.elapsed()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
 /// Everything a console has printed so far, read on a thread of its own.
 struct ConsoleOutput {
     seen: Arc<Mutex<Vec<u8>>>,
+    /// Set by the thread once it has read the last of what the console will show.
+    complete: Arc<AtomicBool>,
 }
 
 impl ConsoleOutput {
@@ -405,6 +432,8 @@ impl ConsoleOutput {
     ) -> Self {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let collected = Arc::clone(&seen);
+        let complete = Arc::new(AtomicBool::new(false));
+        let finished = Arc::clone(&complete);
         std::thread::spawn(move || {
             // The pseudo-console asks this terminal where its cursor is. portable-pty creates it with
             // PSEUDOCONSOLE_INHERIT_CURSOR, and with that flag the console host writes a cursor-position
@@ -438,8 +467,16 @@ impl ConsoleOutput {
                     answered += 1;
                 }
             }
+            // After the last byte was added to what is seen, so a reader that finds this set reads
+            // all of it.
+            finished.store(true, Ordering::SeqCst);
         });
-        Self { seen }
+        Self { seen, complete }
+    }
+
+    /// Whether the console has shown everything it will: its thread has read to the end.
+    fn complete(&self) -> bool {
+        self.complete.load(Ordering::SeqCst)
     }
 
     fn text(&self) -> String {
@@ -478,7 +515,7 @@ async fn a_first_owner_invitation_is_confirmed_at_a_console() {
         .output
         .expect("Type pair to issue the invitation", "kr asks the person");
     console.type_in(b"pair\r");
-    let (succeeded, printed) = console.finish();
+    let (succeeded, printed) = console.finish("kr pair confirm ");
     assert!(succeeded, "kr pair invite: {printed}\n{}", host.log());
     assert!(
         printed.contains("kr pair confirm "),
@@ -496,7 +533,7 @@ async fn the_first_owner_is_not_confirmed_inside_a_session() {
             &["pair", "invite", "--owner", "--direct"],
             &[(variable, "00000000-0000-4000-8000-000000000001")],
         );
-        let (succeeded, printed) = console.finish();
+        let (succeeded, printed) = console.finish(&format!("{variable} is set"));
         assert!(!succeeded, "{printed}");
         assert!(printed.contains(&format!("{variable} is set")), "{printed}");
         assert!(
@@ -513,7 +550,7 @@ async fn the_first_owner_is_not_confirmed_where_membership_is_unknown() {
     let host = Host::start().await;
     host.unreadable_descriptor();
     let console = host.on_console(&["pair", "invite", "--owner", "--direct"], &[]);
-    let (succeeded, printed) = console.finish();
+    let (succeeded, printed) = console.finish("cannot be established");
     assert!(!succeeded, "{printed}");
     assert!(printed.contains("cannot be established"), "{printed}");
     assert!(

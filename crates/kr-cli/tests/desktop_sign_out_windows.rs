@@ -328,6 +328,8 @@ impl Reopened {
     async fn start(root: PathBuf) -> Self {
         use kr_controller::service::{Controller, ControllerSetup};
 
+        // From the first line, so that a start that fails says which tree it leaves.
+        let gone = TreeGone(root.clone());
         let paths =
             kr_ipc::paths::HostPaths::new(root.join("r"), root.join("s")).expect("absolute roots");
         let environment_id = paths
@@ -377,7 +379,7 @@ impl Reopened {
             tokio::spawn(Arc::clone(&controller).serve_clients(clients)),
         ];
         Self {
-            _gone: TreeGone(root.clone()),
+            _gone: gone,
             root,
             environment,
             serving,
@@ -479,15 +481,15 @@ impl Drop for RegisteredTask {
     }
 }
 
-/// A daemon hosted on a tree an earlier process left takes the tree with it when it is let go of,
-/// and the tree is not left in the temporary folder.
+/// The daemon the second half of the sign-out pair is given takes the tree an earlier process left
+/// with it when it is let go of, and the tree is not left in the temporary folder.
 ///
 /// The daemon holds `controller.lock` until the daemon value itself is gone, and that is an open
 /// file that shares nothing: the removal of the folder it is in is refused for as long as it is
 /// held. The tree is what the case that follows a sign-out is given, made here the way the first
 /// half makes it, and nothing of it is let go of by the process that made it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_daemon_hosted_on_a_tree_an_earlier_process_left_takes_the_tree_with_it() {
+async fn the_reopened_daemon_of_the_sign_out_pair_takes_the_tree_an_earlier_process_left_with_it() {
     let earlier = kr_ipc::testing::TempHost::create();
     let tree = earlier.root().to_path_buf();
     std::mem::forget(earlier);

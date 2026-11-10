@@ -389,24 +389,29 @@ impl Shell {
     /// not UTF-8 on most machines (437 on the Windows test machine), so a directory with an accented
     /// letter in its name makes a line that is not valid text there. Such a byte reads back as the
     /// replacement character.
+    ///
+    /// The report is the condition: the end of the launcher does not end the wait, since a report a
+    /// program wrote just before it ended can be refused to a read for a moment (a file that was
+    /// only just renamed into place is still held by whatever looks at it). The wait goes on until
+    /// the report reads or the liveness bound passes, and then says how the launcher stood and why
+    /// the last read failed.
     fn report_from(&self, name: &str, launcher: &mut Child) -> BTreeMap<String, String> {
         let path = self.reports.join(name);
         let started = Instant::now();
         loop {
-            if let Ok(bytes) = std::fs::read(&path) {
-                return parsed(&String::from_utf8_lossy(&bytes));
-            }
-            if let Ok(Some(status)) = launcher.try_wait() {
-                // A program that has written its report and gone is read once more.
-                std::thread::sleep(Duration::from_millis(200));
-                if let Ok(bytes) = std::fs::read(&path) {
-                    return parsed(&String::from_utf8_lossy(&bytes));
-                }
-                panic!("the launcher ended with {status} and the program reported nothing");
-            }
+            let refused = match std::fs::read(&path) {
+                Ok(bytes) => return parsed(&String::from_utf8_lossy(&bytes)),
+                Err(error) => error,
+            };
             assert!(
                 started.elapsed() < LIVENESS,
-                "the program reported by now: the launcher is still running"
+                "the program reported by now: the launcher {} and reading {} failed: {refused}",
+                match launcher.try_wait() {
+                    Ok(Some(status)) => format!("ended with {status}"),
+                    Ok(None) => "is still running".to_owned(),
+                    Err(error) => format!("cannot be asked how it stands ({error:?})"),
+                },
+                path.display()
             );
             std::thread::sleep(Duration::from_millis(20));
         }

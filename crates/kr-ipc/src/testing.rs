@@ -221,25 +221,22 @@ impl PrivateTempDir {
 }
 
 /// How long the removal of a [`PrivateTempDir`] is tried again while it is refused.
-const REMOVAL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
+///
+/// It is longer than the thirty seconds the slowest holder a test host has keeps a file after the
+/// daemon is let go of: the sweep that lets go of the challenges nobody answered holds the host
+/// owner's files until its next tick.
+const REMOVAL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(45);
 
-/// Removes `root` and what is in it. Where `again` is set, a removal that is refused is tried again,
-/// for no longer than `patience`, and `refused` is called with each refusal that another try
-/// follows; the refusal that is left at the end is returned. A directory that is not there is
-/// removed.
-fn remove_tree(
-    root: &Path,
-    again: bool,
-    patience: std::time::Duration,
-    mut refused: impl FnMut(&std::io::Error),
-) -> std::io::Result<()> {
+/// Removes `root` and what is in it. A removal that is refused is tried again for no longer than
+/// `patience`, which is no time at all when it is zero; the refusal that is left at the end is
+/// returned. A directory that is not there is removed.
+fn remove_tree(root: &Path, patience: std::time::Duration) -> std::io::Result<()> {
     let begun = std::time::Instant::now();
     loop {
         match std::fs::remove_dir_all(root) {
             Ok(()) => return Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) if again && begun.elapsed() < patience => {
-                refused(&error);
+            Err(_) if begun.elapsed() < patience => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(error) => return Err(error),
@@ -254,7 +251,7 @@ impl Drop for PrivateTempDir {
     /// removal of the folder it is in, and the holder is usually something that is ending and lets
     /// go in a moment: a task that was aborted and has not been cancelled yet, a thread that is
     /// joining. So the removal is tried again for as long as it is refused, and for no longer than
-    /// `REMOVAL_PATIENCE` (20 seconds), and what is not removed at the end is said on the error
+    /// `REMOVAL_PATIENCE` (45 seconds), and what is not removed at the end is said on the error
     /// output, outside what a test's capture keeps. It does not fail the case: this directory is made
     /// by the suites of every platform, and a case that has a holder to wait for, as a host that
     /// waits for its daemon's lock does, fails on a tree that is left, and one that has a guard of
@@ -265,12 +262,20 @@ impl Drop for PrivateTempDir {
         use std::io::Write as _;
 
         let begun = std::time::Instant::now();
-        if let Err(error) = remove_tree(&self.root, cfg!(windows), REMOVAL_PATIENCE, |_| {}) {
+        let patience = if cfg!(windows) {
+            REMOVAL_PATIENCE
+        } else {
+            std::time::Duration::ZERO
+        };
+        if let Err(error) = remove_tree(&self.root, patience) {
+            // The thread of a case is named for the case, so this names the case that left the tree.
+            let thread = std::thread::current();
             let _ = writeln!(
                 std::io::stderr(),
-                "{} is not removed {:?} after its removal was first tried: {error}",
+                "{} is not removed {:?} after its removal was first tried, by {}: {error}",
                 self.root.display(),
-                begun.elapsed()
+                begun.elapsed(),
+                thread.name().unwrap_or("a thread with no name")
             );
         }
     }
@@ -634,37 +639,42 @@ mod tests {
         );
     }
 
-    /// A directory whose removal is refused is removed again, and goes once the file that refused it
-    /// is let go of: a file held open without sharing, as a task that is ending holds one. The file
-    /// is let go of after the first refusal, so that nothing here waits for a time.
+    /// A private directory that is dropped while a file in it is held open without sharing, as a task
+    /// that is ending holds one, is removed once the file is let go of. The holder lets go when the
+    /// first removal has taken the file that sorts before the held one, so nothing here waits for a
+    /// time: the removal tried again is the one that finds the folder free.
     #[cfg(windows)]
     #[test]
-    fn a_directory_whose_removal_is_refused_is_removed_when_the_file_is_let_go_of() {
+    fn a_private_directory_dropped_while_a_file_in_it_is_held_is_removed_when_the_file_is_let_go_of()
+     {
         use std::os::windows::fs::OpenOptionsExt as _;
 
-        let place = PrivateTempDir::create();
-        let root = place.path().join("tree");
-        std::fs::create_dir(&root).expect("a tree");
-        let mut held = Some(
-            std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .share_mode(0)
-                .open(root.join("store.db"))
-                .expect("a file held open without sharing"),
-        );
-        let mut refusals = 0_u32;
-
-        let outcome = super::remove_tree(&root, true, Duration::from_secs(60), |_| {
-            refusals += 1;
-            drop(held.take());
+        let directory = PrivateTempDir::create();
+        let root = directory.path().to_path_buf();
+        std::fs::write(root.join("a-plain"), b"goes at the first removal").expect("a plain file");
+        let held = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .share_mode(0)
+            .open(root.join("store.db"))
+            .expect("a file held open without sharing");
+        let plain = root.join("a-plain");
+        let holder = std::thread::spawn(move || {
+            // The first removal took the plain file and was refused at the held one.
+            let begun = std::time::Instant::now();
+            while plain.exists() {
+                assert!(
+                    begun.elapsed() < Duration::from_secs(60),
+                    "the first removal did not take the plain file in a minute"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            drop(held);
         });
 
-        assert!(outcome.is_ok(), "the tree is removed: {outcome:?}");
-        assert!(
-            refusals >= 1,
-            "the first removal was refused, which is what the case is about"
-        );
+        drop(directory);
+
+        holder.join().expect("the holder let go of the file");
         assert!(!root.exists(), "{} is left", root.display());
     }
 

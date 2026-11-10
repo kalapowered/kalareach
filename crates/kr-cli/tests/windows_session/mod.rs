@@ -815,15 +815,18 @@ pub fn wait_for_the_lock(environment: &kr_ipc::paths::EnvironmentPaths) -> Resul
 ///
 /// The tree's own removal gives up after a time of refusals (`REMOVAL_PATIENCE` in kr-ipc's testing
 /// module) and only says on the error output what it could not remove, so a tree whose removal
-/// stays refused is left in the temporary folder and the case goes on. This removes what is left, again, for as long as the refusal lasts, and
-/// fails the case when the folder is still there at the liveness deadline.
+/// stays refused is left in the temporary folder and the case goes on. This removes what is left,
+/// again, for as long as the refusal lasts, and fails the case when the folder is still there at
+/// the liveness deadline.
+///
 /// Something that is not the worker may hold a file after the daemon's lock is free: on the Windows
 /// test machine a host's drop takes about 33.5 s with this where a closure case itself takes 11 s,
 /// the same time after the daemon starts whatever the case did, which fits the daemon's challenge
 /// sweep (30 s) holding part of the daemon until its next tick; that is inferred from the times
-/// and the code, not measured. A case that is failing is left as it is, and so is a tree that was
-/// kept on purpose because something it started could not be shown to have ended: that one is said
-/// by the tree, with a failure of its own.
+/// and the code, not measured. The tree's own removal is given longer than that sweep, so it is
+/// mostly the tree's own removal that finds the folder free. A case that is failing is left as it
+/// is, and so is a tree that was kept on purpose because something it started could not be shown
+/// to have ended: that one is said by the tree, with a failure of its own.
 pub struct TreeGone(pub PathBuf);
 
 impl Drop for TreeGone {
