@@ -445,10 +445,11 @@ impl Controller {
     /// transfer service through `TransferAdmission::check_retained`. The start of the disclosed
     /// checks reads its record inside the hold on the registration, which keeps a revocation out,
     /// and asks the fence again once the record is read, whatever it holds (an answer, another
-    /// request's identifier, a row that cannot be read). The conflict a reused
-    /// identifier meets, found by a claim or a look after a wait, goes back through
-    /// [`Self::conflict_under_authority`] where the service claims in asynchronous work, and
-    /// through the same check in the transfer service and in the door's claim of an action.
+    /// request's identifier, a row that cannot be read). The conflict a reused identifier meets,
+    /// found by a claim or a look after a wait, goes back through
+    /// [`Self::conflict_under_authority`] in the voice, machine group and authority change
+    /// services, and through the same check in the transfer service and in the door's claim of an
+    /// action.
     ///
     /// # Errors
     ///
