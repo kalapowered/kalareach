@@ -9684,16 +9684,18 @@ async fn storage_that_moves_between_the_managed_service_and_one_the_owner_runs_l
         .managed_inference
         .clone()
         .expect("the managed voice client");
+    let before_voice = managed.web().arrived().len();
     let _ = voice.metadata().await;
     let presented: Vec<_> = managed
         .web()
         .arrived()
         .into_iter()
+        .skip(before_voice)
         .filter_map(|request| request.token)
         .collect();
     assert!(
         presented.iter().any(|token| token == TOKEN),
-        "the managed token went to managed voice: {presented:?}"
+        "the managed token went to managed voice after the move: {presented:?}"
     );
     assert!(
         presented.iter().all(|token| token != OWNER_TOKEN),

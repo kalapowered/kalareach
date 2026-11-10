@@ -21,8 +21,8 @@ use kr_crypto::keys::DeviceKeys;
 use kr_protocol::backup_read::{BackupReadParams, BackupReadResult};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::host_account::{AccountAttempt, AccountState};
-use kr_protocol::hostinfo::HostDoctorResult;
 use kr_protocol::hostinfo::configuration::ConfigurationDocument;
+use kr_protocol::hostinfo::{DoctorStatus, HostDoctorResult};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, Uuid};
 use kr_service_stand_in::{Served, TOKEN, serve};
@@ -262,6 +262,61 @@ async fn each_account_reaches_the_account_service_at_its_own_origin_and_no_other
         );
         own.seen.lock().expect("what arrived").clear();
     }
+    host.stop().await;
+}
+
+/// A host whose storage service is one its owner runs has a line of its own in `kr doctor`, whatever
+/// the managed account is: signed out it names the sign-in that mends it, signed in it says the
+/// account serves storage and nothing else, and a host whose storage is managed has no such line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_doctor_names_the_storage_account_on_a_line_of_its_own() {
+    let managed = serve().await;
+    let storage = serve().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start_with_document_at(
+        &owner,
+        &document(None, None, Some(storage.origin())),
+        AccountAt::Origin(managed.origin().to_owned()),
+    )
+    .await;
+    let line = |result: HostDoctorResult| {
+        result
+            .checks
+            .into_iter()
+            .find(|check| check.id() == "storage-account")
+            .expect("the storage account's line")
+    };
+    let signed_out = line(doctor(&host).await);
+    assert_eq!(signed_out.status, DoctorStatus::Warning);
+    assert!(
+        signed_out
+            .remedy()
+            .is_some_and(|remedy| remedy.contains("kr account sign-in --storage")),
+        "{:?}",
+        signed_out.remedy()
+    );
+    host.controller()
+        .storage_account()
+        .keep_for_test(grant(TOKEN, &["openid", "backup.write"]))
+        .await;
+    let signed_in = line(doctor(&host).await);
+    assert_eq!(signed_in.status, DoctorStatus::Ok, "{}", signed_in.detail());
+    host.stop().await;
+
+    // The control: a host whose storage is the managed service has no such line.
+    let host = Host::start_with_document_at(
+        &owner,
+        &document(None, None, Some(managed.origin())),
+        AccountAt::Origin(managed.origin().to_owned()),
+    )
+    .await;
+    assert!(
+        doctor(&host)
+            .await
+            .checks
+            .iter()
+            .all(|check| check.id() != "storage-account")
+    );
     host.stop().await;
 }
 
