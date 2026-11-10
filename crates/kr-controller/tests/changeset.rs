@@ -1442,3 +1442,103 @@ async fn a_change_set_action_whose_record_cannot_be_read_by_the_service_is_told_
     host.clients.abort();
     let _ = host.clients.await;
 }
+
+/// KR-REQ-09.09, an apply's deferred claim: an apply whose preflight passes and that meets the
+/// claim another copy of its action made an instant before its own is told that what became of the
+/// action is not known only under the authority it arrived under, asked with that answer in hand.
+/// The other copy makes its claim inside the apply's own claim write, which a trigger of the store
+/// arranges, so the door's look cannot have found it. The control: with nothing owed the apply is
+/// told so and moves nothing. A fence that lands once the apply has the answer stops it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_apply_that_loses_its_claim_to_another_copy_is_told_so_only_under_its_authority() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let (path, [older, newer], workspace, captured) =
+        adopted_repository_with_two_commits(&host, &mut control, "claim-lost").await;
+    let params = moving_main(&captured, workspace, &newer, &older);
+    let environment_id = host.environment_id;
+    let store = beside_the_store(&host);
+    // From here every claim a copy writes meets another copy's claim for the same request, made an
+    // instant before: the door's look has already found nothing.
+    store
+        .execute_batch(
+            "CREATE TRIGGER another_copy_claims_first BEFORE INSERT ON actions
+             WHEN NEW.result IS NULL AND NEW.error_code IS NULL
+             BEGIN
+                 INSERT OR IGNORE INTO actions (actor_id, action_id, method, payload_digest,
+                                                result, error_code, error_detail, recorded_at_ms)
+                 VALUES (NEW.actor_id, NEW.action_id, NEW.method, NEW.payload_digest,
+                         NULL, NULL, NULL, 1);
+             END;",
+        )
+        .expect("another copy is made to claim first");
+
+    let told = failure(
+        control
+            .mutate(
+                Method::DiffApply,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment_id),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    assert_eq!(
+        git_output(&path, &["rev-parse", "refs/heads/main"]),
+        newer,
+        "an apply that lost its claim moved nothing"
+    );
+
+    // The pause fires once, at the door's own look first. The apply is let through it, and the
+    // next stop is the service's check with the answer in hand, where the fence lands.
+    let (looked, goes_on) = host.controller.pause_retained_lookup();
+    let mut late = tokio::spawn(async move {
+        control
+            .mutate(
+                Method::DiffApply,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment_id),
+                &params,
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(30), looked)
+        .await
+        .expect("the apply reaches the door's look")
+        .expect("the pause is armed");
+    let (answered, release) = host.controller.pause_retained_lookup();
+    goes_on.send(()).expect("the apply goes on");
+    tokio::select! {
+        reached = tokio::time::timeout(std::time::Duration::from_secs(30), answered) => {
+            reached
+                .expect("the apply reaches the place it is stopped at")
+                .expect("the pause is armed");
+        }
+        outcome = &mut late => panic!(
+            "the apply was answered without the check being asked with the answer in hand: \
+             {outcome:?}"
+        ),
+    }
+    host.controller.hold_fence(true);
+    release.send(()).expect("the apply goes on");
+    let outcome = late.await.expect("the apply finishes");
+    host.controller.hold_fence(false);
+    let refused = failure(outcome.expect("the call reaches the daemon"));
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        refused.message.contains("fence"),
+        "the refusal is the fence this host owes: {refused:?}"
+    );
+    assert_eq!(
+        git_output(&path, &["rev-parse", "refs/heads/main"]),
+        newer,
+        "the refused apply moved nothing"
+    );
+    store
+        .execute_batch("DROP TRIGGER another_copy_claims_first;")
+        .expect("the store is whole again");
+    host.clients.abort();
+    let _ = host.clients.await;
+}
