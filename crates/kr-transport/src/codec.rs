@@ -8,6 +8,13 @@
 //!
 //! Each stream also begins with its bounded 1 KiB header, which travels in the same shape so the
 //! reader never has a second parsing rule to get right.
+//!
+//! A reader can be given [`Deadlines`]. It then takes a frame in
+//! pieces, as the connection delivers them: the wait for a frame to begin is bounded by the idle
+//! deadline, and each piece after the first byte by the stall deadline, so a slow link is never cut
+//! for the size of a frame and a peer that stops sending part way through one is.
+
+use std::sync::Arc;
 
 use iroh::endpoint::{RecvStream, SendStream};
 use kr_protocol::frame::{
@@ -17,6 +24,7 @@ use kr_protocol::limits::MAX_STREAM_HEADER_LEN;
 use kr_protocol::wire::WireMessage;
 use serde::Serialize;
 
+use crate::deadlines::{Deadline, DeadlineKind, Deadlines};
 use crate::error::{Result, TransportError};
 
 /// How a frame is admitted to the stream, one attempt at a time.
@@ -215,14 +223,35 @@ impl FrameWriter {
             &kr_cbor::Limits::DEFAULT.with_max_message_len(self.max_payload),
         )
         .map_err(FrameError::Cbor)?;
+        self.write_payload_while(&payload, admits).await
+    }
+
+    /// Writes one already-canonical payload while `admits` holds, and says whether it went.
+    ///
+    /// # Errors
+    ///
+    /// Returns a framing error when the payload is empty or exceeds this stream kind's bound, and
+    /// a stream error when the write fails or the peer has stopped reading.
+    pub async fn write_payload_while(
+        &mut self,
+        payload: &[u8],
+        admits: Admission<'_>,
+    ) -> Result<bool> {
         if payload.is_empty() {
             return Err(FrameError::EmptyPayload.into());
+        }
+        if payload.len() > self.max_payload {
+            return Err(FrameError::PayloadTooLarge {
+                len: payload.len(),
+                limit: self.max_payload,
+            }
+            .into());
         }
         let length = u32::try_from(payload.len()).map_err(|_| FrameError::PayloadTooLarge {
             len: payload.len(),
             limit: self.max_payload,
         })?;
-        self.write_framed_while(&length.to_be_bytes(), &payload, admits)
+        self.write_framed_while(&length.to_be_bytes(), payload, admits)
             .await
     }
 
@@ -322,6 +351,13 @@ impl FrameWriter {
     }
 }
 
+/// The error a stream that ended part way through a frame is read as.
+fn ended_inside_a_frame(read: usize) -> TransportError {
+    TransportError::Stream(format!(
+        "the stream ended {read} bytes into a frame, with the rest still to come"
+    ))
+}
+
 /// The QUIC application error code a revoked stream is reset with.
 ///
 /// Closing or failing the control stream revokes every data stream it authorised; the peer sees
@@ -338,6 +374,16 @@ pub struct FrameReader {
     /// Set while a read is in progress. A read that never completed consumed part of a frame, so
     /// the byte after it is not a length prefix and the stream can carry nothing more.
     interrupted: bool,
+    /// The deadlines a frame is read under, when it is read under any.
+    deadlines: Option<Arc<dyn Deadlines>>,
+}
+
+/// How far a read into a buffer got.
+enum Filled {
+    /// The buffer is full.
+    Complete,
+    /// The peer ended the stream after this many bytes.
+    Ended(usize),
 }
 
 impl FrameReader {
@@ -350,7 +396,21 @@ impl FrameReader {
             codec,
             max_payload: codec.max_payload_len(),
             interrupted: false,
+            deadlines: None,
         }
+    }
+
+    /// Holds every frame this reader reads to `deadlines`.
+    ///
+    /// The wait for a frame to begin is bounded by [`DeadlineKind::Idle`] and each piece of a frame
+    /// that arrives after it has begun by [`DeadlineKind::Stall`]. A read that is cut ends with
+    /// [`TransportError::Deadline`], stops the stream and leaves the reader refusing every further
+    /// read, since part of a frame has been consumed. A reader that was given none waits for its
+    /// peer for as long as the peer takes.
+    #[must_use]
+    pub fn with_deadlines(mut self, deadlines: Arc<dyn Deadlines>) -> Self {
+        self.deadlines = Some(deadlines);
+        self
     }
 
     /// Lowers the bound to what this side declared it could receive.
@@ -387,6 +447,7 @@ impl FrameReader {
             codec,
             max_payload: codec.max_payload_len(),
             interrupted: self.interrupted,
+            deadlines: self.deadlines,
         }
     }
 
@@ -471,10 +532,10 @@ impl FrameReader {
 
     async fn read_one(&mut self, limit: usize) -> Result<Option<Vec<u8>>> {
         let mut prefix = [0u8; FRAME_LENGTH_PREFIX_LEN];
-        match self.stream.read_exact(&mut prefix).await {
-            Ok(()) => {}
-            Err(iroh::endpoint::ReadExactError::FinishedEarly(0)) => return Ok(None),
-            Err(error) => return Err(TransportError::Stream(error.to_string())),
+        match self.fill(&mut prefix, DeadlineKind::Idle).await? {
+            Filled::Complete => {}
+            Filled::Ended(0) => return Ok(None),
+            Filled::Ended(read) => return Err(ended_inside_a_frame(read)),
         }
         let declared = self.codec.decode_length(prefix)?;
         let limit = limit.min(self.max_payload);
@@ -486,8 +547,43 @@ impl FrameReader {
             .into());
         }
         let mut payload = vec![0u8; declared];
-        self.read_exact(&mut payload).await?;
-        Ok(Some(payload))
+        match self.fill(&mut payload, DeadlineKind::Stall).await? {
+            Filled::Complete => Ok(Some(payload)),
+            Filled::Ended(read) => Err(ended_inside_a_frame(read)),
+        }
+    }
+
+    /// Reads into `buffer` until it is full or the peer ends the stream.
+    ///
+    /// The first piece is waited for under `first` and every later one under the stall deadline,
+    /// each started afresh, so what is bounded is the time without progress and never the time a
+    /// frame takes. The read it waits on is the connection's own and loses nothing when it is
+    /// dropped, but the stream is stopped when a deadline cuts it all the same: a peer that stalled
+    /// is not owed another frame.
+    async fn fill(&mut self, buffer: &mut [u8], first: DeadlineKind) -> Result<Filled> {
+        let mut filled = 0;
+        while filled < buffer.len() {
+            let kind = if filled == 0 {
+                first
+            } else {
+                DeadlineKind::Stall
+            };
+            let mut deadline = Deadline::start(self.deadlines.as_ref(), kind);
+            let read = tokio::select! {
+                read = self.stream.read(&mut buffer[filled..]) => Some(read),
+                () = &mut deadline => None,
+            };
+            match read {
+                Some(Ok(Some(count))) => filled += count,
+                Some(Ok(None)) => return Ok(Filled::Ended(filled)),
+                Some(Err(error)) => return Err(TransportError::Stream(error.to_string())),
+                None => {
+                    self.stop();
+                    return Err(TransportError::Deadline(kind));
+                }
+            }
+        }
+        Ok(Filled::Complete)
     }
 
     /// Reads one bounded frame and deserialises it.

@@ -1,4 +1,4 @@
-//! Data streams: opening, header validation, and revocation when the control stream ends.
+//! Data streams: opening, accepting, header validation, and revocation when the control stream ends.
 //!
 //! Section 23 gives each stream kind its own stream, its own frame bound and a bounded 1 KiB header
 //! validated against the established control connection before any data frame is accepted. It also
@@ -10,23 +10,49 @@
 //! the controller stops renewing the connection's dispatch leases. A revoked stream is reset rather
 //! than finished, so the peer sees that the stream was taken away instead of a clean end it might
 //! read as completion.
+//!
+//! # Accepting a stream
+//!
+//! A stream the peer opens is taken in two steps, so that one that never sends its header cannot
+//! hold back another. [`StreamRegistry::accept_pending`] takes the stream from the connection and
+//! nothing more, and hands back a [`PendingStream`]. [`PendingStream::open`] reads its header under
+//! the header deadline, checks it, and returns the [`DataStream`]. At most
+//! [`MAX_PENDING_HEADERS`] streams of a connection are pending at once, and a caller that opens
+//! each one on a task of its own, as the listener does, reads their headers side by side.
+//!
+//! # Reading and writing
+//!
+//! A [`DataStream`] reads and writes through the same handle that revokes it, so a revocation
+//! reaches an operation that is already waiting. [`DataStream::split`] gives the reading half to
+//! one task and the writing half to another, which share the handle and keep the stream counted
+//! against the connection until both are gone. A stream whose registry holds deadlines
+//! ([`StreamRegistry::with_deadlines`]) is cut when its peer stops sending or stops reading.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, SendStream};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::{StreamHeader, StreamKind};
 use kr_protocol::hello::ReceiveLimits;
 use kr_protocol::ids::ConnectionId;
 use kr_protocol::limits::MAX_STREAM_HEADER_LEN;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::codec::{FrameReader, FrameWriter};
+use crate::codec::{Admission, FrameReader, FrameWriter, STREAM_REVOKED};
+use crate::deadlines::{Deadline, DeadlineKind, Deadlines};
 use crate::error::{Result, TransportError};
 use crate::scheduler::{
     BulkStreamSlot, QueueReservation, StreamBudget, StreamClass, class_of, priority_of,
 };
+
+/// How many streams of one connection may be waiting for their headers at once.
+///
+/// A header is read on a task of its own, so a stream that sends half of one holds a place for
+/// as long as the header deadline and holds nothing back beyond that. The places bound the tasks
+/// and the connection's QUIC stream limit is set with them in mind.
+pub const MAX_PENDING_HEADERS: usize = 4;
 
 /// Returns the complete frame size a payload of this length is written as.
 const fn framed_len(payload: usize) -> usize {
@@ -83,59 +109,82 @@ pub fn validate_header(
     }
 }
 
+/// What keeps a stream counted against its connection while any half of it is held.
+///
+/// The bulk slot is returned and the registry entry removed when the last half is dropped.
+#[derive(Debug)]
+struct Life {
+    _bulk_slot: Option<BulkStreamSlot>,
+    /// Removes this stream from its registry when it ends.
+    _registration: Registration,
+}
+
 /// One open data stream.
 ///
 /// Reads and writes go through this type rather than through the reader and writer directly,
 /// because revocation has to reach an operation that is already waiting. Each one races the
 /// revocation signal, so a stream that is revoked while a task is blocked on it returns
 /// [`TransportError::ControlLost`] at once rather than waiting for a peer that will never send.
+///
+/// A task that has to read the next frame while another writes the answer to the last takes the
+/// stream apart with [`DataStream::split`].
 #[derive(Debug)]
 pub struct DataStream {
-    header: StreamHeader,
-    writer: Option<FrameWriter>,
-    reader: Option<FrameReader>,
-    handle: StreamHandle,
-    budget: Arc<StreamBudget>,
-    /// The bulk slot this stream occupies, released when the stream is dropped.
-    _bulk_slot: Option<BulkStreamSlot>,
-    /// Removes this stream from its registry when it ends.
-    _registration: Registration,
+    reader: DataReader,
+    writer: DataWriter,
 }
 
 impl DataStream {
     /// Returns the header this stream was opened with.
     #[must_use]
     pub const fn header(&self) -> &StreamHeader {
-        &self.header
+        self.reader.header()
     }
 
     /// Returns the stream kind.
     #[must_use]
     pub const fn kind(&self) -> StreamKind {
-        self.header.kind
+        self.reader.header().kind
     }
 
     /// Returns the handle that revokes this stream.
     #[must_use]
     pub fn handle(&self) -> StreamHandle {
-        self.handle.clone()
+        self.reader.handle()
     }
 
     /// Returns true once this stream has been revoked.
     #[must_use]
     pub fn is_revoked(&self) -> bool {
-        self.handle.is_revoked()
+        self.reader.is_revoked()
     }
 
     /// Returns the send priority the connection is using for this stream.
     ///
-    /// `None` once the stream is closed, or on the receiving half of a unidirectional stream,
-    /// which has nothing to send. What comes back is the priority the connection installed, so a
-    /// caller can see that the scheduler's decision reached the connection rather than only that
-    /// the scheduler made it.
+    /// `None` once the stream is closed. What comes back is the priority the connection installed,
+    /// so a caller can see that the scheduler's decision reached the connection rather than only
+    /// that the scheduler made it.
     #[must_use]
     pub fn priority(&self) -> Option<i32> {
-        self.writer.as_ref().and_then(FrameWriter::priority)
+        self.writer.priority()
+    }
+
+    /// Takes the stream apart into the half that reads and the half that writes.
+    ///
+    /// The halves share the stream's handle, so revoking either reaches the other, and the stream
+    /// stays counted against its connection until both are dropped. Each half resets its own
+    /// direction when it is dropped after a revocation.
+    #[must_use]
+    pub fn split(self) -> (DataReader, DataWriter) {
+        (self.reader, self.writer)
+    }
+
+    /// Ends the stream by resetting it, so the peer sees that it was taken away.
+    ///
+    /// Dropping a stream that was not revoked finishes it instead, which the peer reads as a clean
+    /// end of data. A host that refuses a stream resets it.
+    pub fn reset(self) {
+        self.reader.handle.revoke();
     }
 
     /// Writes one message, reserving queue space for it before it is handed to the connection.
@@ -149,30 +198,204 @@ impl DataStream {
     ///
     /// Returns [`TransportError::ControlLost`] when the stream has been revoked,
     /// [`TransportError::LimitExceeded`] when the write would exceed the connection's queued
-    /// bytes, and a framing or stream failure otherwise.
+    /// bytes, [`TransportError::Deadline`] when the peer did not read it in time, and a framing or
+    /// stream failure otherwise.
     pub async fn write_message<T: serde::Serialize + ?Sized>(&mut self, message: &T) -> Result<()> {
+        self.writer.write_message(message).await
+    }
+
+    /// Writes one message for as long as `admits` holds, and says whether it went.
+    ///
+    /// It reserves queue space and holds the write to the same bounds as
+    /// [`DataStream::write_message`], and the write is made as
+    /// [`FrameWriter::write_message_while`] makes it: `admits` is asked at every attempt to hand
+    /// bytes to the stream, and a frame it refuses leaves the stream reset. A revocation ends the
+    /// write at once with an error, and so does a refused reservation, never with `Ok(false)`.
+    ///
+    /// # Errors
+    ///
+    /// As [`DataStream::write_message`].
+    pub async fn write_message_while<T: serde::Serialize + ?Sized>(
+        &mut self,
+        message: &T,
+        admits: Admission<'_>,
+    ) -> Result<bool> {
+        self.writer.write_message_while(message, admits).await
+    }
+
+    /// Writes one already-canonical payload, reserving queue space for it first.
+    ///
+    /// # Errors
+    ///
+    /// As [`DataStream::write_message`].
+    pub async fn write_payload(&mut self, payload: &[u8]) -> Result<()> {
+        self.writer.write_payload(payload).await
+    }
+
+    /// Reads one frame's payload, or `None` when the peer ended the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::ControlLost`] when the stream is revoked while the read is
+    /// waiting, [`TransportError::Deadline`] when the peer stopped sending, and a framing or
+    /// stream failure otherwise.
+    pub async fn read_payload(&mut self) -> Result<Option<Vec<u8>>> {
+        self.reader.read_payload().await
+    }
+
+    /// Reads one frame and deserialises it, or `None` when the peer ended the stream.
+    ///
+    /// # Errors
+    ///
+    /// As [`DataStream::read_payload`].
+    pub async fn read_message<T: kr_protocol::wire::WireMessage>(&mut self) -> Result<Option<T>> {
+        self.reader.read_message().await
+    }
+}
+
+/// The half of a data stream that reads.
+#[derive(Debug)]
+pub struct DataReader {
+    header: StreamHeader,
+    reader: FrameReader,
+    handle: StreamHandle,
+    _life: Arc<Life>,
+}
+
+impl DataReader {
+    /// Returns the header the stream was opened with.
+    #[must_use]
+    pub const fn header(&self) -> &StreamHeader {
+        &self.header
+    }
+
+    /// Returns the handle that revokes the stream, which both halves share.
+    #[must_use]
+    pub fn handle(&self) -> StreamHandle {
+        self.handle.clone()
+    }
+
+    /// Returns true once the stream has been revoked.
+    #[must_use]
+    pub fn is_revoked(&self) -> bool {
+        self.handle.is_revoked()
+    }
+
+    /// Reads one frame's payload, or `None` when the peer ended the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::ControlLost`] when the stream is revoked, before the read or
+    /// while it waits, [`TransportError::Deadline`] when the peer left the wait for a frame, or
+    /// the frame itself, longer than its deadline allows, and a framing or stream failure
+    /// otherwise. A read that was cut revokes the stream, so the writing half stops too.
+    pub async fn read_payload(&mut self) -> Result<Option<Vec<u8>>> {
         if self.handle.is_revoked() {
             return Err(TransportError::ControlLost);
         }
-        let class = class_of(self.header.kind);
-        let bound = self
-            .writer
-            .as_ref()
-            .map_or(self.header.kind.max_payload_len(), FrameWriter::max_payload)
-            .min(
-                self.budget
-                    .limits()
-                    .ceiling_for(class)
-                    .saturating_sub(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN),
-            );
-        let payload = kr_cbor::to_canonical_vec_within(
-            message,
-            &kr_cbor::Limits::DEFAULT.with_max_message_len(bound),
-        )
-        .map_err(kr_protocol::frame::FrameError::Cbor)?
-        .into_boxed_slice();
-        let reservation = self.budget.reserve(class, framed_len(payload.len()))?;
+        let handle = self.handle.clone();
+        let outcome = tokio::select! {
+            outcome = self.reader.read_payload() => outcome,
+            () = handle.revoked() => Err(TransportError::ControlLost),
+        };
+        self.handle.revoke_if_cut(outcome)
+    }
+
+    /// Reads one frame and deserialises it, or `None` when the peer ended the stream.
+    ///
+    /// # Errors
+    ///
+    /// As [`DataReader::read_payload`].
+    pub async fn read_message<T: kr_protocol::wire::WireMessage>(&mut self) -> Result<Option<T>> {
+        if self.handle.is_revoked() {
+            return Err(TransportError::ControlLost);
+        }
+        let handle = self.handle.clone();
+        let outcome = tokio::select! {
+            outcome = self.reader.read_message() => outcome,
+            () = handle.revoked() => Err(TransportError::ControlLost),
+        };
+        self.handle.revoke_if_cut(outcome)
+    }
+}
+
+impl Drop for DataReader {
+    fn drop(&mut self) {
+        // A revoked stream is reset, not finished: the peer has to see that the stream was taken
+        // away rather than a clean end of data it might read as completion.
+        if self.handle.is_revoked() {
+            self.reader.stop();
+        }
+    }
+}
+
+/// The half of a data stream that writes.
+#[derive(Debug)]
+pub struct DataWriter {
+    kind: StreamKind,
+    writer: FrameWriter,
+    handle: StreamHandle,
+    budget: Arc<StreamBudget>,
+    deadlines: Option<Arc<dyn Deadlines>>,
+    _life: Arc<Life>,
+}
+
+impl DataWriter {
+    /// Returns the stream kind.
+    #[must_use]
+    pub const fn kind(&self) -> StreamKind {
+        self.kind
+    }
+
+    /// Returns the handle that revokes the stream, which both halves share.
+    #[must_use]
+    pub fn handle(&self) -> StreamHandle {
+        self.handle.clone()
+    }
+
+    /// Returns true once the stream has been revoked.
+    #[must_use]
+    pub fn is_revoked(&self) -> bool {
+        self.handle.is_revoked()
+    }
+
+    /// Returns the send priority the connection is using for this stream, or `None` once the
+    /// stream is closed.
+    #[must_use]
+    pub fn priority(&self) -> Option<i32> {
+        self.writer.priority()
+    }
+
+    /// Writes one message, reserving queue space for it first.
+    ///
+    /// # Errors
+    ///
+    /// As [`DataStream::write_message`].
+    pub async fn write_message<T: serde::Serialize + ?Sized>(&mut self, message: &T) -> Result<()> {
+        let (payload, reservation) = self.encode(message)?;
         self.write_reserved(&payload, reservation).await
+    }
+
+    /// Writes one message for as long as `admits` holds, and says whether it went.
+    ///
+    /// # Errors
+    ///
+    /// As [`DataStream::write_message`].
+    pub async fn write_message_while<T: serde::Serialize + ?Sized>(
+        &mut self,
+        message: &T,
+        admits: Admission<'_>,
+    ) -> Result<bool> {
+        let (payload, reservation) = self.encode(message)?;
+        let handle = self.handle.clone();
+        let mut deadline = Deadline::start(self.deadlines.as_ref(), DeadlineKind::Write);
+        let outcome = tokio::select! {
+            outcome = self.writer.write_payload_while(&payload, admits) => outcome,
+            () = handle.revoked() => Err(TransportError::ControlLost),
+            () = &mut deadline => Err(TransportError::Deadline(DeadlineKind::Write)),
+        };
+        drop(reservation);
+        self.handle.revoke_if_cut(outcome)
     }
 
     /// Writes one already-canonical payload, reserving queue space for it first.
@@ -186,83 +409,60 @@ impl DataStream {
         }
         let reservation = self
             .budget
-            .reserve(class_of(self.header.kind), framed_len(payload.len()))?;
+            .reserve(class_of(self.kind), framed_len(payload.len()))?;
         self.write_reserved(payload, reservation).await
+    }
+
+    /// Encodes a message under the bound it is written under, and reserves queue space for it.
+    fn encode<T: serde::Serialize + ?Sized>(
+        &self,
+        message: &T,
+    ) -> Result<(Box<[u8]>, QueueReservation)> {
+        if self.handle.is_revoked() {
+            return Err(TransportError::ControlLost);
+        }
+        let class = class_of(self.kind);
+        let bound = self.writer.max_payload().min(
+            self.budget
+                .limits()
+                .ceiling_for(class)
+                .saturating_sub(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN),
+        );
+        let payload = kr_cbor::to_canonical_vec_within(
+            message,
+            &kr_cbor::Limits::DEFAULT.with_max_message_len(bound),
+        )
+        .map_err(kr_protocol::frame::FrameError::Cbor)?
+        .into_boxed_slice();
+        let reservation = self.budget.reserve(class, framed_len(payload.len()))?;
+        Ok((payload, reservation))
     }
 
     /// Writes a payload the connection's budget has already admitted.
     ///
-    /// The reservation is held for as long as the bytes are the connection's to send, and released
-    /// when the write finishes, fails or is revoked.
+    /// The reservation is held for as long as the bytes are the connection's to send, and
+    /// released when the write finishes, fails, is revoked or is cut by its deadline.
     async fn write_reserved(
         &mut self,
         payload: &[u8],
         _reservation: QueueReservation,
     ) -> Result<()> {
-        let writer = self
-            .writer
-            .as_mut()
-            .ok_or_else(|| TransportError::Stream("this stream does not send".to_owned()))?;
         let handle = self.handle.clone();
-        tokio::select! {
-            outcome = writer.write_payload(payload) => outcome,
+        let mut deadline = Deadline::start(self.deadlines.as_ref(), DeadlineKind::Write);
+        let outcome = tokio::select! {
+            outcome = self.writer.write_payload(payload) => outcome,
             () = handle.revoked() => Err(TransportError::ControlLost),
-        }
-    }
-
-    /// Reads one frame's payload, or `None` when the peer ended the stream.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TransportError::ControlLost`] when the stream is revoked while the read is
-    /// waiting, and a framing or stream failure otherwise.
-    pub async fn read_payload(&mut self) -> Result<Option<Vec<u8>>> {
-        if self.handle.is_revoked() {
-            return Err(TransportError::ControlLost);
-        }
-        let handle = self.handle.clone();
-        let reader = self
-            .reader
-            .as_mut()
-            .ok_or_else(|| TransportError::Stream("this stream does not receive".to_owned()))?;
-        tokio::select! {
-            outcome = reader.read_payload() => outcome,
-            () = handle.revoked() => Err(TransportError::ControlLost),
-        }
-    }
-
-    /// Reads one frame and deserialises it, or `None` when the peer ended the stream.
-    ///
-    /// # Errors
-    ///
-    /// As [`DataStream::read_payload`].
-    pub async fn read_message<T: kr_protocol::wire::WireMessage>(&mut self) -> Result<Option<T>> {
-        if self.handle.is_revoked() {
-            return Err(TransportError::ControlLost);
-        }
-        let handle = self.handle.clone();
-        let reader = self
-            .reader
-            .as_mut()
-            .ok_or_else(|| TransportError::Stream("this stream does not receive".to_owned()))?;
-        tokio::select! {
-            outcome = reader.read_message() => outcome,
-            () = handle.revoked() => Err(TransportError::ControlLost),
-        }
+            () = &mut deadline => Err(TransportError::Deadline(DeadlineKind::Write)),
+        };
+        self.handle.revoke_if_cut(outcome)
     }
 }
 
-impl Drop for DataStream {
+impl Drop for DataWriter {
     fn drop(&mut self) {
-        // A revoked stream is reset, not finished: the peer has to see that the stream was taken
-        // away rather than a clean end of data it might read as completion.
+        // As the reading half: a revoked stream is reset, not finished.
         if self.handle.is_revoked() {
-            if let Some(writer) = self.writer.as_mut() {
-                writer.reset();
-            }
-            if let Some(reader) = self.reader.as_mut() {
-                reader.stop();
-            }
+            self.writer.reset();
         }
     }
 }
@@ -314,6 +514,18 @@ impl StreamHandle {
             }
         }
     }
+
+    /// Passes an outcome through, revoking the stream first when it is a cut deadline.
+    ///
+    /// A stream whose peer stopped reading or sending is dead, and a write or a read that was
+    /// dropped part way has left a frame in pieces. Revoking is what stops the other half and makes
+    /// dropping the stream a reset.
+    fn revoke_if_cut<T>(&self, outcome: Result<T>) -> Result<T> {
+        if matches!(outcome, Err(TransportError::Deadline(_))) {
+            self.revoke();
+        }
+        outcome
+    }
 }
 
 /// Removes one stream from its registry when the stream ends.
@@ -360,6 +572,10 @@ struct RegistryState {
     budget: Arc<StreamBudget>,
     hook: Option<Arc<dyn RevocationHook>>,
     limits: ReceiveLimits,
+    /// What a stream's reads and writes are held to, when they are held to anything.
+    deadlines: Option<Arc<dyn Deadlines>>,
+    /// The places for streams that are waiting for their headers.
+    pending: Arc<Semaphore>,
     streams: Mutex<RegistryStreams>,
     /// Woken when the control stream ends, so a stream that is waiting to open or be accepted stops
     /// waiting for a peer that will never answer.
@@ -398,6 +614,114 @@ impl RegistryState {
     fn remove(&self, key: StreamKey) {
         self.lock().open.remove(&key);
     }
+
+    fn is_revoked(&self) -> bool {
+        self.lock().revoked
+    }
+
+    fn register(self: &Arc<Self>, kind: StreamKind) -> Result<(StreamHandle, Registration)> {
+        let mut state = self.lock();
+        if state.revoked {
+            return Err(TransportError::ControlLost);
+        }
+        let handle = StreamHandle::default();
+        let key = state.next_key;
+        state.next_key = state.next_key.wrapping_add(1);
+        state.open.insert(key, (kind, handle.clone()));
+        Ok((
+            handle,
+            Registration {
+                registry: Arc::downgrade(self),
+                key,
+            },
+        ))
+    }
+
+    /// Runs one step of opening or accepting a stream, giving up if the control stream ends first.
+    ///
+    /// The step's own error is preserved. A refused header is an `INVALID_ARGUMENT`, and turning it
+    /// into a connection failure here would change what a peer is told about its own mistake.
+    async fn until_revoked<T>(&self, step: impl Future<Output = Result<T>>) -> Result<T> {
+        let ended = self.ended.notified();
+        tokio::pin!(ended);
+        if self.is_revoked() {
+            return Err(TransportError::ControlLost);
+        }
+        tokio::select! {
+            outcome = step => outcome,
+            () = &mut ended => Err(TransportError::ControlLost),
+        }
+    }
+
+    /// Runs one QUIC step, giving up if the control stream ends first.
+    async fn quic_until_revoked<T, E: std::fmt::Display>(
+        &self,
+        step: impl Future<Output = std::result::Result<T, E>>,
+    ) -> Result<T> {
+        self.until_revoked(async move {
+            step.await
+                .map_err(|error| TransportError::Stream(error.to_string()))
+        })
+        .await
+    }
+
+    /// Runs one step under a deadline of `kind`, when the registry holds deadlines.
+    async fn within<T>(
+        &self,
+        kind: DeadlineKind,
+        step: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let mut deadline = Deadline::start(self.deadlines.as_ref(), kind);
+        tokio::select! {
+            outcome = step => outcome,
+            () = &mut deadline => Err(TransportError::Deadline(kind)),
+        }
+    }
+
+    /// Registers a stream, and joins it to the bulk slot it holds, if it holds one.
+    fn life(
+        self: &Arc<Self>,
+        kind: StreamKind,
+        bulk_slot: Option<BulkStreamSlot>,
+    ) -> Result<(Arc<Life>, StreamHandle)> {
+        let (handle, registration) = self.register(kind)?;
+        let life = Arc::new(Life {
+            _bulk_slot: bulk_slot,
+            _registration: registration,
+        });
+        Ok((life, handle))
+    }
+
+    /// Builds the stream whose header has been admitted, from its two halves.
+    fn stream(
+        &self,
+        header: StreamHeader,
+        writer: FrameWriter,
+        reader: FrameReader,
+        life: Arc<Life>,
+        handle: StreamHandle,
+    ) -> DataStream {
+        let reader = match &self.deadlines {
+            Some(deadlines) => reader.with_deadlines(Arc::clone(deadlines)),
+            None => reader,
+        };
+        DataStream {
+            writer: DataWriter {
+                kind: header.kind,
+                writer,
+                handle: handle.clone(),
+                budget: Arc::clone(&self.budget),
+                deadlines: self.deadlines.clone(),
+                _life: Arc::clone(&life),
+            },
+            reader: DataReader {
+                header,
+                reader,
+                handle,
+                _life: life,
+            },
+        }
+    }
 }
 
 impl StreamRegistry {
@@ -422,12 +746,39 @@ impl StreamRegistry {
         hook: Option<Arc<dyn RevocationHook>>,
         limits: ReceiveLimits,
     ) -> Self {
+        Self::build(connection_id, budget, hook, limits, None)
+    }
+
+    /// Creates a registry as [`StreamRegistry::with_limits`] does, whose streams are also held to
+    /// `deadlines`: a header that does not arrive, a frame that stops arriving, a wait for the next
+    /// frame that does not end and a write the peer does not read are each cut when their deadline
+    /// passes. A registry made without them waits for its peer as long as the peer takes.
+    #[must_use]
+    pub fn with_deadlines(
+        connection_id: ConnectionId,
+        budget: Arc<StreamBudget>,
+        hook: Option<Arc<dyn RevocationHook>>,
+        limits: ReceiveLimits,
+        deadlines: Arc<dyn Deadlines>,
+    ) -> Self {
+        Self::build(connection_id, budget, hook, limits, Some(deadlines))
+    }
+
+    fn build(
+        connection_id: ConnectionId,
+        budget: Arc<StreamBudget>,
+        hook: Option<Arc<dyn RevocationHook>>,
+        limits: ReceiveLimits,
+        deadlines: Option<Arc<dyn Deadlines>>,
+    ) -> Self {
         Self {
             state: Arc::new(RegistryState {
                 connection_id,
                 budget,
                 hook,
                 limits,
+                deadlines,
+                pending: Arc::new(Semaphore::new(MAX_PENDING_HEADERS)),
                 streams: Mutex::new(RegistryStreams::default()),
                 ended: tokio::sync::Notify::new(),
             }),
@@ -468,70 +819,86 @@ impl StreamRegistry {
             _ => None,
         };
         let limit = effective_limit(header.kind, self.state.limits);
-        let (send, recv) = self.quic_until_revoked(connection.open_bi()).await?;
+        let (send, recv) = self.state.quic_until_revoked(connection.open_bi()).await?;
         let mut writer = FrameWriter::new(send, header.kind).with_max_payload(limit);
         writer.set_priority(priority_of(header.kind));
         // The header is bytes handed to the connection like any other, so it is charged like any
         // other.
         let header_charge = self.state.budget.reserve(class, MAX_STREAM_HEADER_LEN)?;
-        self.until_revoked(writer.write_header(&header)).await?;
+        self.state
+            .until_revoked(writer.write_header(&header))
+            .await?;
         drop(header_charge);
         let reader = FrameReader::new(recv, header.kind).with_max_payload(limit);
-        let (handle, registration) = self.register(header.kind)?;
-        Ok(DataStream {
-            header,
-            writer: Some(writer),
-            reader: Some(reader),
-            handle,
-            budget: Arc::clone(&self.state.budget),
-            _bulk_slot: bulk_slot,
-            _registration: registration,
-        })
+        let (life, handle) = self.state.life(header.kind, bulk_slot)?;
+        Ok(self.state.stream(header, writer, reader, life, handle))
     }
 
-    /// Accepts a data stream the peer opened, reading and validating its header first.
+    /// Accepts a data stream the peer opened and reads its header, for a caller that takes one
+    /// stream at a time and wants every kind.
+    ///
+    /// A host that takes streams from its peer on a connection uses [`StreamRegistry::accept_pending`]
+    /// and opens each one on a task of its own, so that one stream with half a header does not hold
+    /// the next.
     ///
     /// # Errors
     ///
     /// Returns [`TransportError::ControlLost`] once the control stream has ended, and a handshake
     /// failure when the header does not belong to this connection or the stream carried early data.
     pub async fn accept(&self, connection: &Connection) -> Result<DataStream> {
+        self.accept_pending(connection)
+            .await?
+            .open(StreamKind::ALL)
+            .await
+    }
+
+    /// Takes the next stream the peer opened from the connection, without reading it.
+    ///
+    /// It waits for one of [`MAX_PENDING_HEADERS`] places first, so a connection never has more
+    /// streams waiting for their headers than that, and the stream it returns holds its place until
+    /// [`PendingStream::open`] has read the header and ended. A stream that carried QUIC early data
+    /// is refused here, whatever its header says: a data stream exists only on an authorised
+    /// connection, and authorisation cannot complete in 0-RTT.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::ControlLost`] once the control stream has ended, a stream error
+    /// when the connection can accept no more, and a handshake failure for a stream that carried
+    /// early data, which is reset.
+    pub async fn accept_pending(&self, connection: &Connection) -> Result<PendingStream> {
         if self.is_revoked() {
             return Err(TransportError::ControlLost);
         }
-        let (send, recv) = self.quic_until_revoked(connection.accept_bi()).await?;
+        let place = Arc::clone(&self.state.pending);
+        let permit = self
+            .state
+            .until_revoked(async move {
+                place
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| TransportError::ControlLost)
+            })
+            .await?;
+        let (mut send, recv) = self
+            .state
+            .quic_until_revoked(connection.accept_bi())
+            .await?;
         // The header is read on a control-bounded reader: the kind, and therefore the frame bound,
         // is not known until the header has been read, so it cannot decide how much to read.
         let mut reader = FrameReader::new(recv, StreamKind::Control);
         if reader.is_zero_rtt() {
-            // A data stream exists only on an authorised connection, and authorisation cannot
-            // complete in 0-RTT. A stream that carried early data therefore predates the
-            // authorisation it claims, and is refused before its header is read.
+            reader.stop();
+            let _ = send.reset(iroh::endpoint::VarInt::from(STREAM_REVOKED));
             return Err(TransportError::Handshake(ProtocolError::new(
                 ErrorCode::PermissionDenied,
                 "early data is not accepted on a data stream",
             )));
         }
-        let header = self.until_revoked(reader.read_header()).await?;
-        validate_header(&header, self.state.connection_id)
-            .map_err(|refusal| TransportError::Handshake(ProtocolError::from(refusal)))?;
-        let bulk_slot = match class_of(header.kind) {
-            StreamClass::Bulk => Some(self.state.budget.open_bulk()?),
-            _ => None,
-        };
-        let limit = effective_limit(header.kind, self.state.limits);
-        let writer = FrameWriter::new(send, header.kind).with_max_payload(limit);
-        writer.set_priority(priority_of(header.kind));
-        let reader = reader.for_kind(header.kind).with_max_payload(limit);
-        let (handle, registration) = self.register(header.kind)?;
-        Ok(DataStream {
-            header,
-            writer: Some(writer),
+        Ok(PendingStream {
+            state: Arc::clone(&self.state),
+            send: Some(send),
             reader: Some(reader),
-            handle,
-            budget: Arc::clone(&self.state.budget),
-            _bulk_slot: bulk_slot,
-            _registration: registration,
+            _place: permit,
         })
     }
 
@@ -566,7 +933,7 @@ impl StreamRegistry {
     /// Returns true once the control stream has ended.
     #[must_use]
     pub fn is_revoked(&self) -> bool {
-        self.state.lock().revoked
+        self.state.is_revoked()
     }
 
     /// Returns how many data streams are open.
@@ -581,50 +948,94 @@ impl StreamRegistry {
         self.len() == 0
     }
 
-    /// Runs one step of opening or accepting a stream, giving up if the control stream ends first.
-    ///
-    /// The step's own error is preserved. A refused header is an `INVALID_ARGUMENT`, and turning it
-    /// into a connection failure here would change what a peer is told about its own mistake.
-    async fn until_revoked<T>(&self, step: impl Future<Output = Result<T>>) -> Result<T> {
-        let ended = self.state.ended.notified();
-        tokio::pin!(ended);
-        if self.is_revoked() {
-            return Err(TransportError::ControlLost);
-        }
-        tokio::select! {
-            outcome = step => outcome,
-            () = &mut ended => Err(TransportError::ControlLost),
-        }
-    }
-
-    /// Runs one QUIC step, giving up if the control stream ends first.
-    async fn quic_until_revoked<T, E: std::fmt::Display>(
-        &self,
-        step: impl Future<Output = std::result::Result<T, E>>,
-    ) -> Result<T> {
-        self.until_revoked(async move {
-            step.await
-                .map_err(|error| TransportError::Stream(error.to_string()))
-        })
-        .await
-    }
-
+    /// Registers a stream the way an admitted one is, for this module's tests.
+    #[cfg(test)]
     fn register(&self, kind: StreamKind) -> Result<(StreamHandle, Registration)> {
-        let mut state = self.state.lock();
-        if state.revoked {
-            return Err(TransportError::ControlLost);
+        self.state.register(kind)
+    }
+}
+
+/// A stream the peer opened whose header has not been read.
+///
+/// It holds one of its connection's places for streams waiting for their headers until
+/// [`PendingStream::open`] has returned, and nothing else: no slot against the bulk limits, no
+/// entry in the registry. Dropping it resets the stream.
+#[derive(Debug)]
+pub struct PendingStream {
+    state: Arc<RegistryState>,
+    send: Option<SendStream>,
+    reader: Option<FrameReader>,
+    _place: OwnedSemaphorePermit,
+}
+
+impl PendingStream {
+    /// Reads the stream's header and admits it, or resets the stream.
+    ///
+    /// The header is read under the header deadline when the registry holds deadlines. It is then
+    /// checked against the connection ([`validate_header`]) and its kind against `accepted`, and
+    /// only a stream that passes both is given a bulk slot and a place in the registry. A stream
+    /// that fails any step is reset, with nothing counted against the connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::Deadline`] when no header arrived in time,
+    /// [`TransportError::ControlLost`] once the control stream has ended, a handshake failure when
+    /// the header does not belong to this connection or names a kind not in `accepted`,
+    /// [`TransportError::LimitExceeded`] when the bulk limits refuse the stream, and a framing or
+    /// stream failure when the header could not be read.
+    pub async fn open(mut self, accepted: &[StreamKind]) -> Result<DataStream> {
+        let state = Arc::clone(&self.state);
+        let reader = self
+            .reader
+            .as_mut()
+            .expect("a pending stream holds its reader until it is opened");
+        let header = state
+            .until_revoked(state.within(DeadlineKind::Header, reader.read_header()))
+            .await?;
+        validate_header(&header, state.connection_id)
+            .map_err(|refusal| TransportError::Handshake(ProtocolError::from(refusal)))?;
+        if !accepted.contains(&header.kind) {
+            return Err(TransportError::Handshake(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "this host does not accept a stream of this kind",
+            )));
         }
-        let handle = StreamHandle::default();
-        let key = state.next_key;
-        state.next_key = state.next_key.wrapping_add(1);
-        state.open.insert(key, (kind, handle.clone()));
-        Ok((
-            handle,
-            Registration {
-                registry: Arc::downgrade(&self.state),
-                key,
-            },
-        ))
+        // Everything that can still refuse the stream is done before its halves leave `self`, so a
+        // refusal resets them rather than finishing the one that sends.
+        let bulk_slot = match class_of(header.kind) {
+            StreamClass::Bulk => Some(state.budget.open_bulk()?),
+            _ => None,
+        };
+        let (life, handle) = state.life(header.kind, bulk_slot)?;
+        let limit = effective_limit(header.kind, state.limits);
+        let writer = FrameWriter::new(
+            self.send
+                .take()
+                .expect("a pending stream holds its sender until it is opened"),
+            header.kind,
+        )
+        .with_max_payload(limit);
+        writer.set_priority(priority_of(header.kind));
+        let reader = self
+            .reader
+            .take()
+            .expect("a pending stream holds its reader until it is opened")
+            .for_kind(header.kind)
+            .with_max_payload(limit);
+        Ok(state.stream(header, writer, reader, life, handle))
+    }
+}
+
+impl Drop for PendingStream {
+    fn drop(&mut self) {
+        // A stream refused before it became one is reset, never finished: the peer must not read
+        // a refusal as a clean end.
+        if let Some(send) = self.send.as_mut() {
+            let _ = send.reset(iroh::endpoint::VarInt::from(STREAM_REVOKED));
+        }
+        if let Some(reader) = self.reader.as_mut() {
+            reader.stop();
+        }
     }
 }
 

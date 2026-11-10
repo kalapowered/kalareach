@@ -89,13 +89,12 @@ impl HostHandler for TestHandler {
         Box::pin(async move {
             self.served.fetch_add(1, Ordering::AcqRel);
             *self.last.lock().await = Some(session.connection_id);
-            // Accept whatever data streams the client opens, and read the control stream until it
+            // Take whatever data streams the listener admits, and read the control stream until it
             // ends. A real host would dispatch; here the point is only to hold the connection.
-            let streams = Arc::clone(&session.streams);
-            let connection = session.connection.clone();
+            let mut admitted = session.data_streams;
             let handler = Arc::clone(&self);
             let accepting = tokio::spawn(async move {
-                while let Ok(stream) = streams.accept(&connection).await {
+                while let Some(stream) = admitted.recv().await {
                     handler.streams.lock().await.push(stream.handle());
                     handler.accepted.fetch_add(1, Ordering::AcqRel);
                     // The stream is kept alive by the registry's handle; dropping it here would
@@ -114,14 +113,17 @@ impl HostHandler for TestHandler {
 }
 
 async fn start(host: &Side, handler: Arc<TestHandler>) -> NetworkListener {
-    let config = ListenerConfig::new(
-        EndpointConfig {
-            bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
-            ..EndpointConfig::default()
-        },
-        epochs(),
-        ControllerGeneration::new(1),
-    );
+    let config = ListenerConfig {
+        accepted_kinds: vec![StreamKind::TerminalOutput],
+        ..ListenerConfig::new(
+            EndpointConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
+                ..EndpointConfig::default()
+            },
+            epochs(),
+            ControllerGeneration::new(1),
+        )
+    };
     register(
         config,
         Arc::clone(&host.identity),
