@@ -8,15 +8,21 @@
 //! programs, as the real accounts, and reads what the system did.
 //!
 //! * The **checkout account** is the one every invocation that checks out or applies runs as. Its
-//!   list holds Git, the helpers under Git's own helper directory and the console host Git's console
-//!   program starts, and no shell.
+//!   list holds Git's own `git.exe` and nothing else: no helper, no shell, no console host.
 //! * The **connection account** is the one the clone that checks nothing out runs as. Its list is the
-//!   checkout account's, with the shell Git builds its connection as a command string for, and the
-//!   program that shell starts to serve a repository. The policy is installed once, so the two lists
-//!   are two accounts' rules and not two policies.
+//!   checkout account's with the helpers Git starts to connect (`git-remote-https.exe` and
+//!   `git-remote-http.exe` under its helper directory, `git-upload-pack.exe`), the shell Git builds a
+//!   connection as a command string for, the secure shell program and the credential helper. The
+//!   other helpers of Git's helper directory (`git-daemon.exe`, `git-imap-send.exe`, `scalar.exe`
+//!   and the system's credential helper) are on neither list.
 //! * An **ordinary account** stands for the person. It runs every program the boundary accounts are
 //!   refused, from a place the person owns as well as from the system's, so a refusal that is the
 //!   result of anything but the policy shows here too.
+//!
+//! Every account is started the way the broker starts it: from a logon token made without its
+//! password, with the boundary accounts' own identifier marked deny-only and an invocation group of
+//! their own, in a process with no console. A case that makes such a token must be the system, so
+//! the case runs as SYSTEM.
 //!
 //! What the case requires of each boundary account: a signed system program (`cmd.exe`, and the
 //! system's `hostname.exe`), a signed program copied to a place a repository could put it, a copy of
@@ -24,10 +30,11 @@
 //! and each refusal is a blocked-launch event of the application-control log that names the rule
 //! (and the rule is the account's own deny rule); a program planted as a hook (`post-commit.exe`)
 //! and a program a repository's configuration names as a helper (a clean filter) never run, and Git
-//! reports that it could not start them; the shell is refused to the checkout account, so a hook
-//! script that needs it and a clone that needs it never run there, and they run for the connection
-//! account; neither account can make a directory in the directories its list names; and Git, its
-//! helpers and a clone that checks nothing out run where they are on the list. What the case
+//! reports that it could not start them; every helper of Git's helper directory that is not on the
+//! account's own list is refused, and the ones that are run; the shell is refused to the checkout
+//! account, so a hook script that needs it and a clone that needs it never run there, and they run
+//! for the connection account; neither account can make a directory in the directories its list
+//! names; and Git and a clone that checks nothing out run where they are on the list. What the case
 //! requires of the ordinary account: every one of those programs runs.
 //!
 //! The same launches in a guest where the policy is not in place all succeed, which is the case's
@@ -36,9 +43,9 @@
 //! The permissions the case gives its accounts on its own window station and desktop last as long as
 //! that session does.
 //!
-//! It makes a local account for the person, resets the two boundary accounts' passwords to values
-//! only this process holds, writes under `%ProgramData%` and gives the accounts it launches access to
-//! its own window station and desktop. It is run elevated, in a disposable guest, by name:
+//! It makes a local account for the person, writes under `%ProgramData%` and gives the accounts it
+//! launches access to its own window station and desktop. It is run as SYSTEM in a disposable guest
+//! where the boundary is installed, by name:
 //!
 //! ```text
 //! windows_enforcement --ignored --exact the_boundary_accounts_run_only_git_and_the_person_runs_everything --nocapture
@@ -67,13 +74,15 @@ use std::process::Command;
 use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 
+use kr_boundary_windows::win::ffi::Handle;
+use kr_boundary_windows::win::token::{baseline_token, boundary_token, new_invocation_group};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GENERIC_ALL, HANDLE, HANDLE_FLAG_INHERIT, LocalFree, SetHandleInformation,
     WAIT_OBJECT_0,
 };
 use windows_sys::Win32::NetworkManagement::NetManagement::{
-    NERR_Success, NetUserAdd, NetUserDel, NetUserSetInfo, UF_DONT_EXPIRE_PASSWD, UF_SCRIPT,
-    USER_INFO_1, USER_INFO_1003, USER_PRIV_USER,
+    NERR_Success, NetUserAdd, NetUserDel, UF_DONT_EXPIRE_PASSWD, UF_SCRIPT, USER_INFO_1,
+    USER_PRIV_USER,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
@@ -86,7 +95,7 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::System::StationsAndDesktops::{GetProcessWindowStation, GetThreadDesktop};
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessWithLogonW, GetCurrentProcess,
+    CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, DETACHED_PROCESS, GetCurrentProcess,
     GetCurrentThreadId, GetExitCodeProcess, OpenProcessToken, PROCESS_INFORMATION,
     STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
@@ -112,8 +121,9 @@ const LOG_TIME: Duration = Duration::from_secs(45);
 struct Account {
     role: &'static str,
     name: String,
-    password: String,
     sid: String,
+    /// The token every launch as this account runs under.
+    token: Handle,
 }
 
 /// What became of one launch.
@@ -245,16 +255,30 @@ impl Case {
             "the Application Identity service is not running, so no application-control policy is \
              enforced:\n{service}"
         );
-        let smart_app_control = output_of(Command::new("reg.exe").args([
-            "query",
-            r"HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy",
-            "/v",
-            "VerifiedAndReputablePolicyState",
-        ]));
+        let smart_app_control = Command::new("reg.exe")
+            .args([
+                "query",
+                r"HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy",
+                "/v",
+                "VerifiedAndReputablePolicyState",
+            ])
+            .output()
+            .expect("reg.exe starts");
         assert!(
-            smart_app_control.split_whitespace().last() != Some("0x1"),
-            "Smart App Control is enforcing, so it can refuse the unsigned program for a reason \
-             that is not this policy:\n{smart_app_control}"
+            smart_app_control.status.success(),
+            "Smart App Control's state could not be read, so the case cannot tell it from this \
+             policy:\n{}{}",
+            String::from_utf8_lossy(&smart_app_control.stdout),
+            String::from_utf8_lossy(&smart_app_control.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&smart_app_control.stdout)
+                .split_whitespace()
+                .last()
+                == Some("0x0"),
+            "Smart App Control is on or evaluating, so it can refuse the unsigned program for a \
+             reason that is not this policy:\n{}",
+            String::from_utf8_lossy(&smart_app_control.stdout)
         );
 
         let git_root = PathBuf::from(
@@ -656,9 +680,11 @@ impl Case {
         });
     }
 
-    /// Git runs for both boundary accounts, and so does a helper under its helper directory.
+    /// Git runs for both boundary accounts. A helper under its helper directory runs only for the
+    /// account whose list holds it and for the person, and a helper on neither list is refused to
+    /// both boundary accounts.
     fn git_and_its_helpers(&mut self) {
-        println!("--- Git and the helpers on its list");
+        println!("--- Git, the helpers on a list and the helpers on neither");
         let directory = self.root.clone();
         let git = self.git.clone();
         let helper = self.exec_path.join("git-remote-https.exe");
@@ -694,22 +720,70 @@ impl Case {
                     inside.outcome, inside.output
                 )
             });
-            self.expect(
-                remote.outcome.ran() && remote.output.contains("usage"),
-                || {
+            if who == Who::Checkout {
+                self.expect(remote.outcome.refused(), || {
                     format!(
-                        "{role}: the helper under the helper directory {} {:?}",
-                        remote.outcome, remote.output
+                        "{role}: the connection helper {}, and was not refused by policy",
+                        remote.outcome
                     )
-                },
-            );
+                });
+                self.expect_blocked(
+                    who,
+                    r"\GIT-CORE\GIT-REMOTE-HTTPS.EXE",
+                    "the connection helper is named as blocked",
+                );
+            } else {
+                self.expect(
+                    remote.outcome.ran() && remote.output.contains("usage"),
+                    || {
+                        format!(
+                            "{role}: the connection helper {} {:?}",
+                            remote.outcome, remote.output
+                        )
+                    },
+                );
+            }
             if who != Who::Person {
                 self.expect_allowed(who, r"\MINGW64\BIN\GIT.EXE", "Git is named as allowed");
+            }
+            if who == Who::Connect {
                 self.expect_allowed(
                     who,
                     r"\GIT-CORE\GIT-REMOTE-HTTPS.EXE",
-                    "the helper is named as allowed",
+                    "the connection helper is named as allowed",
                 );
+            }
+            // The helpers of Git's helper directory that no list holds.
+            for name in [
+                "git-daemon.exe",
+                "git-imap-send.exe",
+                "scalar.exe",
+                "git-credential-wincred.exe",
+            ] {
+                let path = self.exec_path.join(name);
+                assert!(
+                    path.is_file(),
+                    "{} is not in Git's helper directory",
+                    path.display()
+                );
+                let launch = self.launch(who, name, &path, "", &directory);
+                if who == Who::Person {
+                    self.expect(launch.outcome.ran(), || {
+                        format!("{role}: {name} {}", launch.outcome)
+                    });
+                } else {
+                    self.expect(launch.outcome.refused(), || {
+                        format!(
+                            "{role}: {name} {}, and was not refused by policy",
+                            launch.outcome
+                        )
+                    });
+                    self.expect_blocked(
+                        who,
+                        &format!(r"\GIT-CORE\{}", name.to_uppercase()),
+                        &format!("{name} is named as blocked"),
+                    );
+                }
             }
         }
     }
@@ -934,13 +1008,22 @@ impl Case {
         for who in [Who::Checkout, Who::Connect] {
             for place in &listed {
                 // A name of this launch alone, required to be free before the launch: a directory
-                // found there afterwards was made by the launch, and only that one is removed.
+                // found there afterwards was made by the launch, and only that one is removed. A
+                // link or a file of that name counts as taken, and so does a name that cannot be
+                // told apart from taken because the lookup failed. This holds in the disposable
+                // guest the case runs in, and claims nothing about another machine.
                 let probe = place.join(format!("kr-write-check-{}", uuid::Uuid::new_v4().simple()));
-                assert!(
-                    !probe.exists(),
-                    "{} exists before the launch that would make it",
-                    probe.display()
-                );
+                match std::fs::symlink_metadata(&probe) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Ok(_) => panic!(
+                        "{} exists before the launch that would make it",
+                        probe.display()
+                    ),
+                    Err(error) => panic!(
+                        "whether {} exists could not be told before the launch that would make it: {error}",
+                        probe.display()
+                    ),
+                }
                 let launch = self.launch(
                     who,
                     "git init inside a directory on the lists",
@@ -1177,36 +1260,19 @@ fn sid_text(account: &str) -> Option<String> {
     }
 }
 
-/// Returns a boundary account the installer made, with a password of this process's own.
+/// Returns a boundary account the installation made, with the token the broker would start Git
+/// under: made without the account's password.
 fn boundary_account(role: &'static str, name: &str) -> Account {
     let sid = sid_text(name).unwrap_or_else(|| {
-        panic!("the {role} boundary account {name} does not exist: the policy is not installed")
+        panic!("the {role} boundary account {name} does not exist: the boundary is not installed")
     });
-    let password = password();
-    let account = wide(name);
-    let mut secret = wide(&password);
-    let info = USER_INFO_1003 {
-        usri1003_password: secret.as_mut_ptr(),
-    };
-    // SAFETY: the structure and the strings it points at are this function's own for the call.
-    let status = unsafe {
-        NetUserSetInfo(
-            null(),
-            account.as_ptr(),
-            1003,
-            (&raw const info).cast(),
-            null_mut(),
-        )
-    };
-    assert_eq!(
-        status, NERR_Success,
-        "the {role} boundary account's password could not be set"
-    );
+    let token = boundary_token(name, &new_invocation_group())
+        .unwrap_or_else(|error| panic!("the {role} boundary account's token: {error}"));
     Account {
         role,
         name: name.to_owned(),
-        password,
         sid,
+        token,
     }
 }
 
@@ -1237,11 +1303,12 @@ fn person_account(cleanup: &mut Cleanup) -> Account {
     );
     cleanup.person = Some(name.clone());
     let sid = sid_text(&name).expect("the ordinary account has an identifier");
+    let token = baseline_token(&name).expect("the ordinary account's token");
     Account {
         role: "person",
         name,
-        password,
         sid,
+        token,
     }
 }
 
@@ -1346,9 +1413,6 @@ fn create_process_as(
     environment: &[(String, String)],
     output_path: &Path,
 ) -> Launch {
-    let user = wide(&account.name);
-    let domain = wide(".");
-    let secret = wide(&account.password);
     let application = wide_path(program);
     let mut line = wide(command);
     let directory = wide_path(directory);
@@ -1383,14 +1447,14 @@ fn create_process_as(
     // SAFETY: every pointer is to a buffer this function owns for the call, and the command line is
     // the mutable buffer the call requires.
     let created = unsafe {
-        CreateProcessWithLogonW(
-            user.as_ptr(),
-            domain.as_ptr(),
-            secret.as_ptr(),
-            0,
+        CreateProcessAsUserW(
+            account.token.raw(),
             application.as_ptr(),
             line.as_mut_ptr(),
-            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+            null(),
+            null(),
+            1,
+            DETACHED_PROCESS | CREATE_UNICODE_ENVIRONMENT,
             block.as_ptr().cast(),
             directory.as_ptr(),
             &raw const startup,

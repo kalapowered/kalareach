@@ -66,9 +66,10 @@ serde_json.workspace = true
 tempfile.workspace = true
 
 [target.'cfg(windows)'.dev-dependencies]
-# The enforcement case in `tests/windows_enforcement.rs` makes and removes a local account, and gives
-# the accounts it launches access to its own window station and desktop. Nothing the service ships
-# needs either.
+# The enforcement case in `tests/windows_enforcement.rs` makes and removes a local account, gives the
+# accounts it launches access to its own window station and desktop, and starts programs under the
+# logon tokens the boundary's broker makes. Nothing the service ships needs any of it.
+kr-boundary-windows.workspace = true
 windows-sys = { workspace = true, features = [
     "Win32_NetworkManagement_NetManagement",
     "Win32_System_StationsAndDesktops",
