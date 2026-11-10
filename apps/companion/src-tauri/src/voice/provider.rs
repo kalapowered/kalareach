@@ -29,8 +29,9 @@ pub(super) enum Provider {
     Delegation { id: String, offset_ms: u64 },
     /// The provider says it muted what it hears of the caller.
     InputMuted,
-    /// Anything else the provider may send: it never reaches the gate.
-    Other,
+    /// Anything else the provider may send: it never reaches the gate, and is known by its type
+    /// alone.
+    Other { kind: String },
     /// A message of a required kind that cannot be read as it must be, or one that is no event.
     Malformed(Malformed),
 }
@@ -94,7 +95,9 @@ pub(super) fn read(bytes: &[u8]) -> Provider {
         {
             Provider::Malformed(Malformed::UnknownRequired)
         }
-        _ => Provider::Other,
+        other => Provider::Other {
+            kind: other.to_owned(),
+        },
     }
 }
 
@@ -254,7 +257,12 @@ mod tests {
                     }
                 ),
                 "muted" => assert_eq!(read, Provider::InputMuted),
-                "other" => assert_eq!(read, Provider::Other),
+                "other" => assert_eq!(
+                    read,
+                    Provider::Other {
+                        kind: entry["event"]["type"].as_str().expect("a type").to_owned()
+                    }
+                ),
                 unknown => panic!("an entry the test does not know: {unknown}"),
             }
         }

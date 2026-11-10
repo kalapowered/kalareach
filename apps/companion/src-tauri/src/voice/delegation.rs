@@ -248,8 +248,8 @@ pub(super) struct Gate {
     first_after_opening: Option<u64>,
     previous_start: u64,
     furthest_end: u64,
-    /// The latest end of a fragment no longer kept.
-    dropped_to: u64,
+    /// The latest end of a fragment no longer kept, when one was dropped.
+    dropped_to: Option<u64>,
     seen: VecDeque<(String, u64)>,
     last_offset: Option<u64>,
     /// The largest offset of a set that was frozen.
@@ -266,7 +266,7 @@ impl Gate {
             first_after_opening: None,
             previous_start: 0,
             furthest_end: 0,
-            dropped_to: 0,
+            dropped_to: None,
             seen: VecDeque::new(),
             last_offset: None,
             frozen_to: None,
@@ -305,7 +305,7 @@ impl Gate {
     /// Takes what the provider's data channel said.
     pub(super) fn provider(&mut self, message: Provider) -> Told {
         match message {
-            Provider::Other => Told::Nothing,
+            Provider::Other { .. } => Told::Nothing,
             Provider::Malformed(malformed) => self.taint_with(malformed.into()),
             Provider::InputMuted => {
                 if self.opened {
@@ -342,14 +342,21 @@ impl Gate {
         }
         self.previous_start = self.previous_start.max(fragment.start_ms);
         self.furthest_end = self.furthest_end.max(fragment.end_ms);
-        self.kept.push_back(Kept {
-            ordinal,
-            fragment,
-            used: false,
-        });
-        self.prune();
-        if self.kept.len() > KEPT_MAX {
-            self.taint_with(Cause::TooManyFragments);
+        // A tainted call hands nothing over, so what it hears is not kept: the text of a call that
+        // can no longer act is not held, and what is held is bounded by what can still be used.
+        if self.taint.is_some() {
+            self.kept.clear();
+        } else {
+            self.kept.push_back(Kept {
+                ordinal,
+                fragment,
+                used: false,
+            });
+            self.prune();
+            if self.kept.len() > KEPT_MAX {
+                self.taint_with(Cause::TooManyFragments);
+                self.kept.clear();
+            }
         }
         match (before, self.taint) {
             (None, Some(_)) if late => Told::Late,
@@ -358,20 +365,17 @@ impl Gate {
         }
     }
 
-    /// Forgets the fragments that no later delegation can use, and what they ended at.
+    /// Forgets the fragments older than the gate keeps, and remembers what the latest of them
+    /// ended at. What was forgotten is never read as nothing said: a delegation whose reach goes
+    /// back to it is refused as too old, whatever offsets came before it.
     fn prune(&mut self) {
         let newest = self.previous_start;
-        let floor = self.last_offset;
         while let Some(front) = self.kept.front() {
             let end = front.fragment.end_ms;
-            let old = end.saturating_add(KEEP_MS) < newest;
-            let behind_offsets = floor.is_none_or(|offset| {
-                end.saturating_add(VOICE_LOOK_BACK_MS + EXCLUSION_GAP_MS) < offset
-            });
-            if !(old && behind_offsets) {
+            if end.saturating_add(KEEP_MS) >= newest {
                 break;
             }
-            self.dropped_to = self.dropped_to.max(end);
+            self.dropped_to = Some(self.dropped_to.map_or(end, |dropped| dropped.max(end)));
             self.kept.pop_front();
         }
     }
@@ -423,17 +427,6 @@ impl Gate {
         if let Some(cause) = self.taint {
             return Frozen::Refused(cause);
         }
-        if announced != Some(offset_ms) {
-            return Frozen::Refused(Cause::BrokerDisagrees);
-        }
-        if self
-            .dropped_to
-            .saturating_add(VOICE_LOOK_BACK_MS + EXCLUSION_GAP_MS)
-            > offset_ms
-            && self.dropped_to > 0
-        {
-            return Frozen::Refused(Cause::TooOld);
-        }
         let chosen: Vec<usize> = self
             .kept
             .iter()
@@ -448,6 +441,16 @@ impl Gate {
         // said after it.
         for index in &chosen {
             self.kept[*index].used = true;
+        }
+        if announced != Some(offset_ms) {
+            return Frozen::Refused(Cause::BrokerDisagrees);
+        }
+        // A fragment forgotten may be one that excludes this set: it did if it ended within the gap
+        // before where the set can start, which is as far back as the look-back reaches.
+        if self.dropped_to.is_some_and(|dropped| {
+            dropped.saturating_add(VOICE_LOOK_BACK_MS + EXCLUSION_GAP_MS) >= offset_ms
+        }) {
+            return Frozen::Refused(Cause::TooOld);
         }
         let (Some(first), Some(last)) = (chosen.first(), chosen.last()) else {
             return Frozen::Refused(Cause::Empty);
@@ -668,6 +671,88 @@ mod tests {
                 "{openings} openings"
             );
         }
+    }
+
+    /// What the gate has forgotten is never read as nothing said: a delegation whose reach goes back
+    /// to a fragment it forgot is refused as too old, whatever offsets were announced before it.
+    #[test]
+    fn what_the_gate_has_forgotten_is_never_read_as_nothing_said() {
+        let mut gate = open();
+        // An early delegation, then four hundred seconds of speech, a fragment a second: the first
+        // of it is forgotten, and the early offset does not hold it.
+        delegating(&mut gate, "early", 0);
+        for second in 0..400_u64 {
+            gate.provider(said(second * 1_000, second * 1_000 + 200));
+        }
+        assert!(gate.kept.len() <= 301, "{} kept", gate.kept.len());
+        delegating(&mut gate, "old", 50_000);
+        assert_eq!(
+            gate.freeze(50_000, CLEAN, Some(50_000)),
+            Frozen::Refused(Cause::TooOld)
+        );
+    }
+
+    /// A fragment forgotten that ended exactly as far before a command as the exclusion gap reaches
+    /// excludes it, so the command is refused as too old and not read as a set of its own; and one
+    /// forgotten that ended at the start of the call counts as one forgotten.
+    #[test]
+    fn a_forgotten_fragment_at_the_edge_of_the_gap_still_refuses_the_command() {
+        let mut gate = open();
+        gate.provider(said(0, 100));
+        gate.provider(said(2_100, 400_000));
+        gate.provider(said(400_000, 400_001));
+        delegating(&mut gate, "command", 32_100);
+        assert_eq!(
+            gate.freeze(32_100, CLEAN, Some(32_100)),
+            Frozen::Refused(Cause::TooOld)
+        );
+
+        let mut gate = open();
+        gate.provider(said(0, 0));
+        gate.provider(said(400_000, 400_200));
+        delegating(&mut gate, "command", 30_000);
+        assert_eq!(
+            gate.freeze(30_000, CLEAN, Some(30_000)),
+            Frozen::Refused(Cause::TooOld)
+        );
+    }
+
+    /// More fragments than the gate keeps taint the call, and a call that is tainted keeps none.
+    #[test]
+    fn a_flood_of_fragments_taints_the_call_and_is_not_kept() {
+        let mut gate = open();
+        let mut told = Told::Nothing;
+        for index in 0..=KEPT_MAX as u64 {
+            told = gate.provider(said(index * 10, index * 10 + 10));
+        }
+        assert_eq!(told, Told::Tainted(Cause::TooManyFragments));
+        for index in 0..2 * KEPT_MAX as u64 {
+            let start = (KEPT_MAX as u64 + 1 + index) * 10;
+            gate.provider(said(start, start + 10));
+        }
+        assert!(gate.kept.is_empty(), "a tainted call keeps nothing");
+    }
+
+    /// A set the voice service did not confirm, or that reaches back to what was forgotten, is
+    /// refused and spent all the same: the words it held answer no later delegation.
+    #[test]
+    fn a_set_refused_for_the_service_or_for_age_is_spent() {
+        let mut gate = open();
+        gate.provider(said(0, 200));
+        delegating(&mut gate, "first", 0);
+        let _ = gate.freeze(0, CLEAN, Some(0));
+        gate.provider(said(6_000, 6_200));
+        delegating(&mut gate, "a", 6_000);
+        assert_eq!(
+            gate.freeze(6_000, CLEAN, Some(7_000)),
+            Frozen::Refused(Cause::BrokerDisagrees)
+        );
+        delegating(&mut gate, "b", 6_100);
+        assert_eq!(
+            gate.freeze(6_100, CLEAN, Some(6_100)),
+            Frozen::Refused(Cause::Empty),
+            "what the refused set held is not read again"
+        );
     }
 
     /// The provider's mute taints a call only after capture opened.
