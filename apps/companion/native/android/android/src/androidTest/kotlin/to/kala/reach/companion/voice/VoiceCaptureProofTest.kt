@@ -1,5 +1,12 @@
 package to.kala.reach.companion.voice
 
+import android.Manifest
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioRecord
+import android.media.AudioRecordingConfiguration
+import android.os.Handler
+import android.os.Looper
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.After
@@ -10,7 +17,10 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import to.kala.reach.companion.mobile.CaptureProofRead
+import to.kala.reach.companion.mobile.RecordingReport
+import to.kala.reach.companion.mobile.VoiceCaptureGate
 import to.kala.reach.companion.mobile.VoiceCaptureState
+import to.kala.reach.companion.mobile.recordingOf
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -28,9 +38,9 @@ class VoiceCaptureProofTest {
         val firstEventHeld = CountDownLatch(1)
         val release = CountDownLatch(1)
 
-        override fun onCaptureState(state: VoiceCaptureState) {
-            told.add("capture $state")
-        }
+        // What the microphone shows is no part of the order this case holds: a call reports its own
+        // state when it starts.
+        override fun onCaptureState(state: VoiceCaptureState) {}
 
         override fun onProviderEvent(bytes: ByteArray) {
             told.add("event ${bytes.size}")
@@ -101,6 +111,52 @@ class VoiceCaptureProofTest {
 
         started.stop()
         assertNull("a call that has ended reads no record", started.captureProof(barrier = true))
+    }
+
+    /**
+     * The system lists a recording this application makes from the source the call's recorder uses,
+     * and the call reads it as heard and not silenced: what a phone that reports the call's
+     * recording shows, and the report the gate opens on. A real recording is started and stopped by
+     * the test; nothing is sent anywhere.
+     */
+    @Test
+    fun a_recording_from_the_calls_source_is_listed_by_the_system_and_reads_as_audible() {
+        InstrumentationRegistry.getInstrumentation().uiAutomation
+            .grantRuntimePermission(context.packageName, Manifest.permission.RECORD_AUDIO)
+        val manager = context.getSystemService(AudioManager::class.java)
+        val seen = LinkedBlockingQueue<VoiceCaptureGate.Recording>()
+        val callback = object : AudioManager.AudioRecordingCallback() {
+            override fun onRecordingConfigChanged(configs: List<AudioRecordingConfiguration>) {
+                seen.add(
+                    recordingOf(
+                        configs.map { RecordingReport(it.clientAudioSource, it.isClientSilenced) },
+                        VoiceCall.RECORDER_SOURCE,
+                    ),
+                )
+            }
+        }
+        manager.registerAudioRecordingCallback(callback, Handler(Looper.getMainLooper()))
+        val size = AudioRecord.getMinBufferSize(16_000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        val record = AudioRecord(
+            VoiceCall.RECORDER_SOURCE,
+            16_000,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            maxOf(size, 4_096),
+        )
+        try {
+            assertEquals("the recorder is made", AudioRecord.STATE_INITIALIZED, record.state)
+            record.startRecording()
+            val reports = mutableListOf<VoiceCaptureGate.Recording>()
+            while (VoiceCaptureGate.Recording.AUDIBLE !in reports) {
+                reports += seen.poll(SECONDS, TimeUnit.SECONDS) ?: break
+            }
+            assertTrue("the system reported the recording heard: $reports", VoiceCaptureGate.Recording.AUDIBLE in reports)
+        } finally {
+            record.stop()
+            record.release()
+            manager.unregisterAudioRecordingCallback(callback)
+        }
     }
 
     private companion object {
