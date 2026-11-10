@@ -372,7 +372,8 @@ pub struct DelegationRow {
     /// What became of it. `not_done` for every delegation while this version acts on no spoken
     /// request. A call that hands spoken requests to the host, which only a case or the debug
     /// build's probe makes, also says `collecting` (the fragments said before it are still being
-    /// read), `asking` (the host has the request and has not answered), `refused` (this device
+    /// read), `asking` (the request is being made ready or was written, and the host has not
+    /// answered), `refused` (this device
     /// would not hand it over, for `cause`), `not_sent` (nothing was written to the host, for
     /// `cause`), `performed`, `admitted` (the host took it and what became of it is not
     /// established), `confirmation_required`, `cancelled` (a challenge the host awaited an answer
