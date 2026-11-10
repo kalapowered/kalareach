@@ -1916,6 +1916,10 @@ async fn the_console_an_attachment_ran_in_is_given_the_mouse_while_the_applicati
     // The command draws the session's screen in the console, so it is attached to the session once
     // the console shows what the application has written.
     probe.waits_for("kr-asker-waiting");
+    // The console is the command's to draw in and has been shown the session's screen, with the
+    // application waiting: it has not been given the mouse.
+    std::fs::write(gates.path().join("look"), b"look").expect("the file the probe waits for");
+    probe_reports(&report, "kr-probe:waiting:", &mut typist, &mut probe).await;
     std::fs::write(gates.path().join("ask"), b"ask").expect("the file the application waits for");
     typist
         .shown("kr-asker-asking", "the application asked for the mouse")
@@ -1939,9 +1943,15 @@ async fn the_console_an_attachment_ran_in_is_given_the_mouse_while_the_applicati
     let shown = probe_reports(&report, "kr-probe:end", &mut typist, &mut probe).await;
     println!("{shown}");
     let before = probed_modes(&shown, "kr-probe:before:");
+    let waiting = probed_modes(&shown, "kr-probe:waiting:");
     let asked = probed_modes(&shown, "kr-probe:asked:");
     let released = probed_modes(&shown, "kr-probe:released:");
     let after = probed_modes(&shown, "kr-probe:after:");
+    assert_eq!(
+        waiting.0 & ENABLE_MOUSE_INPUT,
+        0,
+        "the console was given the mouse before the application asked for it: {waiting:x?}"
+    );
     assert_ne!(
         asked.0 & ENABLE_MOUSE_INPUT,
         0,
@@ -2059,6 +2069,21 @@ fn mouse_mode_probe_in_the_console() {
     say(format!(
         "kr-probe:inside:{:x}:{:x}",
         inside.input, inside.output
+    ));
+    // The case says when the command has drawn the session's screen with the application waiting.
+    let look = report.with_file_name("look");
+    let deadline = Instant::now() + LIVENESS_DEADLINE;
+    while !look.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the case did not ask for a look at the console's mode"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let waiting = console.modes().expect("the console's modes");
+    say(format!(
+        "kr-probe:waiting:{:x}:{:x}",
+        waiting.input, waiting.output
     ));
     let asked = waits_for(
         &mut attach,
