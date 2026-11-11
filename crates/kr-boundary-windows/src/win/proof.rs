@@ -129,7 +129,7 @@ pub struct Captured {
 /// system alone for the broker's own token. It belongs to no invocation, so its permit to resume
 /// is the proof's own: this is the one place that makes one.
 ///
-/// Nothing in the call waits past the deadline: the program is waited for until [`END_RESERVE`]
+/// Nothing in the call waits past the deadline: the program is waited for until two seconds
 /// before it, the job's end and the pipes' end take the rest, and a program that is not shown to
 /// have ended by the deadline is an uncertain end and not a late success.
 ///
