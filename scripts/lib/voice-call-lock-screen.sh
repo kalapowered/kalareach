@@ -3,7 +3,8 @@
 # The lock-screen leg of `scripts/e2e-voice-call-device.sh android lock-screen`.
 #
 # Sourced by that script. While the application holds a call, this first presses the microphone
-# control on the call's own screen and reads what the screen says, then locks the emulator's screen and
+# control on the call's own screen and reads what the screen says, swipes the call's notification
+# away in the unlocked shade and reads that it is posted again, then locks the emulator's screen and
 # reads the lock screen the way a person and the system do: the system's own record of the call's
 # notification (`dumpsys notification`), the keyguard's state, the notification's controls on the
 # lock screen itself (`uiautomator`, which reads the system's screens), and a still of it. It then
@@ -179,7 +180,7 @@ lock_stop_through_the_shade() {
 # Waits up to `$1` seconds for the call's own screen, read afresh into `$3`, to say all of `$2`:
 # words separated by a bar, each of which must be on the screen.
 screen_says() { # <seconds> <words, separated by |> <dump>
-    local seconds=$1 words=$2 dump=$3 waited=0 word ok
+    local seconds=$1 words=$2 dump=$3 word ok until=$((SECONDS + $1))
     while :; do
         lock_dump "$dump"
         ok=1
@@ -187,9 +188,8 @@ screen_says() { # <seconds> <words, separated by |> <dump>
             python3 -I "$here/scripts/lib/ui-node.py" has "$dump" "$word" || ok=0
         done < <(printf '%s\n' "$words" | tr '|' '\n')
         [ "$ok" = 1 ] && return 0
-        [ "$waited" -lt "$seconds" ] || return 1
+        [ "$SECONDS" -lt "$until" ] || return 1
         sleep 1
-        waited=$((waited + 1))
     done
 }
 
@@ -240,35 +240,51 @@ screen_posted() {
     lock_record | sed -n 's/.*[[:space:]]when=\([0-9][0-9]*\)\/.*/\1/p' | head -1
 }
 
+# Waits until the notification has read as posted at one time for three looks in a row, and prints
+# that time: a capture change that lands during the swipe below must not pass for its republication.
+screen_posted_still() {
+    local last="" same=0 now tries=0
+    while [ "$tries" -lt 30 ]; do
+        now="$(screen_posted)"
+        if [ -n "$now" ] && [ "$now" = "$last" ]; then same=$((same + 1)); else same=0; fi
+        if [ "$same" -ge 3 ]; then printf '%s\n' "$now"; return 0; fi
+        last="$now"
+        sleep 1
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
 # The notification of a running call on an unlocked phone: the person swipes it away in the shade,
 # and it is back while the call runs (Android 14 and later let the person dismiss it, and a locked
-# phone would then show no controls for the call). The swipe is made where the notification's own
-# title is drawn; the system's record must hold a notification posted after the swipe.
+# phone would then show no controls for the call). The swipe is made across the screen where the
+# notification's own title is drawn, after the notification has stopped changing; the system's
+# record must then hold a notification, carrying the foreground-service flag, posted after the swipe.
 screen_dismiss_leg() {
-    local dump="$artefacts/lock-screen/shade.xml" before after point px py ok=0 found=""
-    before="$(screen_posted)"
+    local dump="$artefacts/lock-screen/shade.xml" before after point px py width ok=0 found="" waited=0
     lock_device shell cmd statusbar expand-notifications
     sleep 2
     lock_dump "$dump"
     lock_still 0-shade-before
     point="$(python3 -I "$here/scripts/lib/ui-node.py" at "$dump" "Voice call running")"
-    if [ -z "$before" ] || [ -z "$point" ]; then
-        found="the notification was not in the shade (posted: ${before:-none})"
+    before="$(screen_posted_still)"
+    width="$(lock_device shell wm size 2>/dev/null | tr -d '\r' | sed -n 's/.*[^0-9]\([0-9][0-9]*\)x[0-9][0-9]*.*/\1/p' | tail -1)"
+    if [ -z "$before" ] || [ -z "$point" ] || [ -z "$width" ]; then
+        found="the notification was not in the shade, or did not settle (posted: ${before:-none})"
     else
         read -r px py <<<"$point"
-        lock_device shell input swipe "$px" "$py" 1060 "$py" 250
-        sleep 1
-        if lock_wait 15 lock_record_has "FOREGROUND_SERVICE"; then
+        lock_device shell input swipe "$px" "$py" "$((width - 20))" "$py" 250
+        found="the notification was swiped away in the shade and was not posted again (posted $before)"
+        while [ "$waited" -lt 20 ]; do
             after="$(screen_posted)"
-            if [ -n "$after" ] && [ "$after" -gt "$before" ] 2>/dev/null; then
+            if [ -n "$after" ] && [ "$after" -gt "$before" ] 2>/dev/null && lock_record_has "FOREGROUND_SERVICE"; then
                 ok=1
                 found="the notification was swiped away in the shade and was posted again (posted $before, then $after)"
-            else
-                found="the notification was not posted again after the swipe (posted $before, then ${after:-none})"
+                break
             fi
-        else
-            found="the notification did not come back after the swipe"
-        fi
+            sleep 1
+            waited=$((waited + 1))
+        done
     fi
     lock_device shell cmd statusbar collapse
     lock_still 0-shade-after

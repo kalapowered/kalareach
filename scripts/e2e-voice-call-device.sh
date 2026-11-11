@@ -64,7 +64,8 @@
 # The fourth mode, `lock-screen` (Android only), runs a call against the peer and, while it is up, first
 # reads the call's own screen and presses its microphone control (the screen says the microphone is
 # on and offers to mute it; muted, it says so and offers to unmute it; unmuted, it says it is on
-# again), and then locks the emulator's screen and reads the lock screen: the notification manager's record of the call's
+# again), swipes the call's notification away in the shade and reads that it is posted again, and
+# then locks the emulator's screen and reads the lock screen: the notification manager's record of the call's
 # notification, the keyguard's state and a still of the screen (under the run's evidence folder). It
 # presses the notification's controls there: Mute acts with no unlock, Unmute asks for the unlock and
 # leaves the call muted until it is given, and Stop ends the call with no unlock. The emulator's
