@@ -35,12 +35,12 @@ use kr_protocol::scalars::{Bytes, Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::transfer::{
     AgentDraftAddAttachmentParams, AgentDraftAddAttachmentResult, AttachmentHandle,
     AttachmentPreview, AttachmentReadGrant, ChunkBitmap, ChunkLayout, DOWNLOAD_SNAPSHOT_LIFETIME,
-    DraftAttachment, DraftCreateParams, DraftCreateResult, DraftRecord, DraftState,
-    DraftUpdateParams, DraftUpdateResult, InsertionMethod, InsertionState, MAX_MEDIA_TYPE_LEN,
-    MAX_ORIGINAL_FILE_NAME_LEN, UNFINISHED_UPLOAD_LIFETIME, UNUSED_ATTACHMENT_LIFETIME,
-    UploadBeginParams, UploadBeginResult, UploadCancelParams, UploadCancelResult,
-    UploadChunkParams, UploadChunkResult, UploadFinishParams, UploadFinishResult, UploadState,
-    UploadStatusParams, UploadStatusResult,
+    DraftAttachment, DraftCreateParams, DraftCreateResult, DraftDiscardParams, DraftDiscardResult,
+    DraftRecord, DraftState, DraftUpdateParams, DraftUpdateResult, InsertionMethod, InsertionState,
+    MAX_MEDIA_TYPE_LEN, MAX_ORIGINAL_FILE_NAME_LEN, UNFINISHED_UPLOAD_LIFETIME,
+    UNUSED_ATTACHMENT_LIFETIME, UploadBeginParams, UploadBeginResult, UploadCancelParams,
+    UploadCancelResult, UploadChunkParams, UploadChunkResult, UploadFinishParams,
+    UploadFinishResult, UploadState, UploadStatusParams, UploadStatusResult,
 };
 
 use crate::authority::{AuthorisedDirectory, AuthorisedFile, ObjectPolicy, RelativeName};
@@ -1928,9 +1928,9 @@ impl TransferService {
         }
     }
 
-    /// Returns how many drafts `actor` holds open: the ones no prompt has sent to a session and
-    /// whose target session has not ended, which is what [`Self::draft_create`] counts against a
-    /// bound.
+    /// Returns how many drafts `actor` holds open: the ones no prompt has sent to a session, whose
+    /// target session has not ended and whose files the agent has not all taken, which is what
+    /// [`Self::draft_create`] counts against a bound.
     ///
     /// # Errors
     ///
@@ -1952,7 +1952,8 @@ impl TransferService {
     /// Creates a durable draft.
     ///
     /// `open_limit` is how many open drafts `actor` may hold, `None` for an actor with no bound. A
-    /// draft is open until a prompt sends it to a session or its target session ends. The count
+    /// draft is open until a prompt sends it to a session, its target session ends, the agent has
+    /// taken every file bound to it, or [`Self::draft_discard`] ends it. The count
     /// and the write are one transaction, taken after the host has been asked about the action's
     /// admission, so an actor whose admission no longer stands is told that and never how many
     /// drafts it holds. A repeat of a create this service already performed is answered from its
@@ -2096,6 +2097,59 @@ impl TransferService {
                     },
                 )
             }
+        }
+    }
+
+    /// Ends a draft the caller made, and releases what it holds.
+    ///
+    /// One transaction deletes the draft with its attachment and prompt records and revokes the
+    /// read grants of its attachments. Nothing an upload owns is touched: its bytes, their charge,
+    /// the session it was bound to and its expiry are the upload's. A draft a prompt named, and one
+    /// with an attachment the agent was offered or took, are the record of what the agent was given:
+    /// they are refused whole and stay until their session ends.
+    ///
+    /// An action this service already performed is answered from its record before the draft is
+    /// looked for, because the draft that action ended is gone and a repeat is owed the answer, not
+    /// an unknown draft. The host is asked about the action's admission before the used-draft check
+    /// is made, so a caller whose admission no longer stands is told nothing of the draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::UnknownDraft`] for a draft that is gone and for one another
+    /// principal holds, in the same words, [`TransferError::DraftConflict`] for a draft that is in
+    /// use, [`TransferError::WrongEnvironment`] for another environment's, and
+    /// [`TransferError::StoreUnavailable`] when the write fails.
+    pub fn draft_discard(
+        &self,
+        actor: &ActorId,
+        params: &DraftDiscardParams,
+        action: Option<&Action>,
+    ) -> Result<DraftDiscardResult> {
+        let now = self.clock.now_ms();
+        let result = DraftDiscardResult {
+            draft_id: params.draft_id,
+        };
+        let retained = match action {
+            Some(action) => Some(action.retained(
+                kr_cbor::to_canonical_vec(&result).map_err(TransferError::store)?,
+                now,
+            )),
+            None => None,
+        };
+        let mut store = self.locked()?;
+        if let Recorded::Answered(answered) = recorded_with(&store, action)? {
+            return Ok(answered);
+        }
+        let row = draft_of(&store, params.draft_id, actor)?;
+        self.check_environment(row.environment_id)?;
+        ask_admission(action)?;
+        let outcome = commit_admitted(action, || {
+            store.discard_draft(params.draft_id, retained.as_ref())
+        })?;
+        drop(store);
+        match outcome {
+            ActionOutcome::AlreadyPerformed => self.retained_result(action),
+            ActionOutcome::Committed => Ok(result),
         }
     }
 

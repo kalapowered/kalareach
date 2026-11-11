@@ -12,7 +12,7 @@ use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, U64, Uuid};
 use kr_protocol::transfer::{
     AgentDraftAddAttachmentParams, AttachmentContribution, AttachmentHandle, DraftCreateParams,
-    DraftState, DraftUpdateParams, InsertionMethod, InsertionState,
+    DraftDiscardParams, DraftState, DraftUpdateParams, InsertionMethod, InsertionState,
 };
 use kr_transfer::service::{Action, Admission};
 use support::{Harness, pattern};
@@ -1600,6 +1600,10 @@ fn a_create_past_the_bound_is_refused_under_the_quota_code_naming_the_bound() {
         refused.to_string().contains("3 of the 3"),
         "the words name the bound: {refused}"
     );
+    assert!(
+        refused.to_string().contains("draft.discard"),
+        "the words name how a place is freed: {refused}"
+    );
 
     for _ in 0..6 {
         a_sessionless_draft(&harness, &harness.actor, None).expect("no bound");
@@ -1743,4 +1747,415 @@ fn a_repeat_of_the_create_that_took_the_last_place_is_answered_from_its_record()
         .service
         .draft_create(&device, &params, Some(&refused_action), Some(1))
         .expect("the service wrote no record of the refusal");
+}
+
+/// What became of the one binding a draft holds for the cases that end a draft.
+#[derive(Clone, Copy, Debug)]
+enum Offered {
+    /// Bound and nothing more.
+    Recorded,
+    /// Claimed by a worker that has not reported.
+    Inserting,
+    /// Reported accepted, with evidence.
+    Accepted,
+    /// Reported unknown.
+    Unknown,
+    /// Reported failed.
+    Failed,
+}
+
+/// Binds a new upload to `created` as `method` says and takes it as far as `offered` says, for the
+/// actor of the harness. Returns the draft as it reads afterwards and the upload's handle.
+fn bound_and_offered(
+    harness: &Harness,
+    created: &kr_protocol::transfer::DraftRecord,
+    method: InsertionMethod,
+    offered: Offered,
+    salt: u8,
+) -> (kr_protocol::transfer::DraftRecord, AttachmentHandle) {
+    let handle = harness.publish(&pattern(64 + usize::from(salt)), "image/png", "photo.png");
+    harness
+        .service
+        .draft_add_attachment(
+            &harness.actor,
+            &AgentDraftAddAttachmentParams {
+                draft_id: created.draft_id,
+                expected_revision: created.revision,
+                transfer_id: handle.transfer_id,
+                contribution: contribution(&handle, method),
+            },
+            None,
+        )
+        .expect("binds the attachment");
+    if !matches!(offered, Offered::Recorded) {
+        let session = created.session_id.0.expect("a session");
+        let action = ActionId::new(Uuid::from_bytes([salt; 16]));
+        harness
+            .claim(session, created.draft_id, handle.transfer_id, action)
+            .expect("claims the binding for an offer");
+        let begin = harness.begin_of(session, created.draft_id, handle.transfer_id, action);
+        let outcome = match offered {
+            Offered::Recorded | Offered::Inserting => None,
+            Offered::Accepted => Some(ReportedOutcome::AcceptedByAgent {
+                provenance: ActionProvenance::UpstreamTypedRpc,
+                evidence: "upstream part msg_01H".to_owned(),
+            }),
+            Offered::Unknown => Some(ReportedOutcome::Unknown {
+                detail: "the offer may have reached the agent".to_owned(),
+            }),
+            Offered::Failed => Some(ReportedOutcome::Failed {
+                detail: "the composer was not empty".to_owned(),
+            }),
+        };
+        if let Some(outcome) = outcome {
+            harness
+                .report(session, &begin, outcome)
+                .expect("records what became of the offer");
+        }
+    }
+    let read = harness
+        .service
+        .draft(&harness.actor, created.draft_id)
+        .expect("reads the draft");
+    (read, handle)
+}
+
+/// The refusal for a draft that is not there, with the draft's identifier taken out, so two of them
+/// compare byte for byte.
+fn unknown_draft_words(
+    error: &kr_transfer::TransferError,
+    draft_id: DraftId,
+) -> (ErrorCode, String) {
+    (
+        error.code(),
+        error.to_string().replace(&draft_id.to_string(), "<draft>"),
+    )
+}
+
+/// KR-REQ-23.41: ending a draft deletes it with its attachment records, revokes the read grants of
+/// its attachments, and changes no upload: the files stay published, and the bytes they charge stay
+/// charged. A binding the agent was never offered (`recorded`) and one whose offer failed go with
+/// the draft. The draft's place is free at once.
+#[test]
+fn ending_a_draft_deletes_it_with_what_it_holds_and_changes_no_upload() {
+    let harness = Harness::create();
+    let created = draft(&harness);
+    let (read, manual) = bound_and_offered(
+        &harness,
+        &created,
+        InsertionMethod::ManualTerminalWorkflow,
+        Offered::Recorded,
+        1,
+    );
+    let grant = read.attachments[0]
+        .read_grant
+        .as_ref()
+        .expect("a readable path")
+        .grant_id;
+    let (read, typed) = bound_and_offered(
+        &harness,
+        &read,
+        InsertionMethod::TypedSubmission,
+        Offered::Failed,
+        2,
+    );
+    assert_eq!(read.attachments.len(), 2);
+    harness.service.read_grant(grant).expect("the grant holds");
+    let staged = harness.service.staged_byte_len().expect("reads the total");
+    assert!(staged > 0, "the uploads charge their bytes");
+    assert_eq!(
+        harness.service.open_drafts(&harness.actor).expect("counts"),
+        1
+    );
+
+    let ended = harness
+        .service
+        .draft_discard(
+            &harness.actor,
+            &DraftDiscardParams {
+                draft_id: created.draft_id,
+            },
+            None,
+        )
+        .expect("ends the draft");
+    assert_eq!(ended.draft_id, created.draft_id);
+
+    let gone = harness
+        .service
+        .draft(&harness.actor, created.draft_id)
+        .expect_err("the draft is gone");
+    assert_eq!(gone.code(), ErrorCode::InvalidArgument);
+    assert_eq!(
+        harness
+            .service
+            .read_grant(grant)
+            .expect_err("the grant is revoked")
+            .code(),
+        ErrorCode::PermissionDenied
+    );
+    for handle in [&manual, &typed] {
+        harness
+            .service
+            .attachment_handle(&harness.actor, handle.transfer_id)
+            .expect("the upload is still published");
+    }
+    assert_eq!(
+        harness.service.staged_byte_len().expect("reads the total"),
+        staged,
+        "no byte was released"
+    );
+    assert_eq!(
+        harness.service.open_drafts(&harness.actor).expect("counts"),
+        0
+    );
+}
+
+/// KR-REQ-23.41: a draft a prompt sent, and one with a binding the agent was offered (`inserting`),
+/// took (`accepted_by_agent`) or may have been given (`unknown`), is the record of what the agent was
+/// offered. Ending it is refused `DRAFT_CONFLICT` and nothing is deleted: the draft reads as it did,
+/// with its bindings, and the read grant of its other binding still holds.
+#[test]
+fn a_draft_in_use_is_refused_and_nothing_is_deleted() {
+    let session = SessionId::new(Uuid::from_bytes([9; 16]));
+    for (name, offered) in [
+        ("sent", None),
+        ("inserting", Some(Offered::Inserting)),
+        ("accepted", Some(Offered::Accepted)),
+        ("unknown", Some(Offered::Unknown)),
+    ] {
+        let harness = Harness::create();
+        let created = draft(&harness);
+        let (mut read, _) = bound_and_offered(
+            &harness,
+            &created,
+            InsertionMethod::ManualTerminalWorkflow,
+            Offered::Recorded,
+            1,
+        );
+        let grant = read.attachments[0]
+            .read_grant
+            .as_ref()
+            .expect("a readable path")
+            .grant_id;
+        match offered {
+            Some(offered) => {
+                read = bound_and_offered(
+                    &harness,
+                    &read,
+                    InsertionMethod::TypedSubmission,
+                    offered,
+                    2,
+                )
+                .0;
+            }
+            None => {
+                harness
+                    .service
+                    .record_prompt(
+                        &harness.actor,
+                        created.draft_id,
+                        session,
+                        support::an_application(),
+                        &Admission::none(),
+                    )
+                    .expect("the prompt sends the draft");
+                read = harness
+                    .service
+                    .draft(&harness.actor, created.draft_id)
+                    .expect("reads the draft");
+            }
+        }
+
+        let refused = harness
+            .service
+            .draft_discard(
+                &harness.actor,
+                &DraftDiscardParams {
+                    draft_id: created.draft_id,
+                },
+                None,
+            )
+            .expect_err(name);
+        assert_eq!(
+            refused.code(),
+            ErrorCode::DraftConflict,
+            "{name}: {refused}"
+        );
+        let kept = harness
+            .service
+            .draft(&harness.actor, created.draft_id)
+            .unwrap_or_else(|error| panic!("{name}: the draft was deleted: {error}"));
+        assert_eq!(kept, read, "{name}: the draft is as it was");
+        harness
+            .service
+            .read_grant(grant)
+            .unwrap_or_else(|error| panic!("{name}: a grant was revoked: {error}"));
+    }
+}
+
+/// KR-REQ-23.41: only the draft's own principal ends it. Another principal's draft and a draft that
+/// was never made are refused in the same words, so the refusal shows nothing of what exists, and the
+/// draft stands. The control is the owner's own call, which ends it; after that the draft is gone and
+/// a call for it is refused as the others were.
+#[test]
+fn another_principals_draft_and_a_gone_draft_are_refused_alike_and_the_draft_stands() {
+    let harness = Harness::create();
+    let other = kr_protocol::ids::ActorId::new("device:another").expect("a principal");
+    let created = draft(&harness);
+    let never = DraftId::new(Uuid::from_bytes([77; 16]));
+    let discard = |actor: &kr_protocol::ids::ActorId, draft_id: DraftId| {
+        harness
+            .service
+            .draft_discard(actor, &DraftDiscardParams { draft_id }, None)
+    };
+
+    let theirs = discard(&other, created.draft_id).expect_err("not the other's draft");
+    let nothing = discard(&other, never).expect_err("no such draft");
+    assert_eq!(theirs.code(), ErrorCode::InvalidArgument);
+    assert_eq!(
+        unknown_draft_words(&theirs, created.draft_id),
+        unknown_draft_words(&nothing, never),
+        "the refusal is the same for a draft that exists and one that does not"
+    );
+    assert_eq!(
+        harness
+            .service
+            .draft(&harness.actor, created.draft_id)
+            .expect("the draft stands")
+            .revision,
+        created.revision
+    );
+
+    discard(&harness.actor, created.draft_id).expect("the owner ends its own draft");
+    let gone = discard(&harness.actor, created.draft_id).expect_err("the draft is gone");
+    assert_eq!(
+        unknown_draft_words(&gone, created.draft_id),
+        unknown_draft_words(&nothing, never)
+    );
+}
+
+/// KR-REQ-23.41: a draft stops counting against a bound when every file bound to it was taken by
+/// the agent (there is at least one binding), and in no other case: a binding the agent was offered
+/// or may have been given (`inserting`, `unknown`) goes on counting, as does one taken beside one
+/// that was not, and a draft with no binding or with a `recorded` or `failed` one. The place is the
+/// device's to take again, and the refusal names the way to free one.
+#[test]
+fn a_draft_whose_every_file_the_agent_took_stops_counting_and_every_other_goes_on_counting() {
+    let harness = Harness::create();
+    let open = || harness.service.open_drafts(&harness.actor).expect("counts");
+    let session_draft = || draft(&harness);
+
+    let all_taken = session_draft();
+    bound_and_offered(
+        &harness,
+        &all_taken,
+        InsertionMethod::TypedSubmission,
+        Offered::Accepted,
+        1,
+    );
+    assert_eq!(open(), 0, "every file taken: the draft stops counting");
+
+    let offering = session_draft();
+    bound_and_offered(
+        &harness,
+        &offering,
+        InsertionMethod::TypedSubmission,
+        Offered::Inserting,
+        2,
+    );
+    assert_eq!(open(), 1, "an offer is being made");
+
+    let unknown = session_draft();
+    bound_and_offered(
+        &harness,
+        &unknown,
+        InsertionMethod::TypedSubmission,
+        Offered::Unknown,
+        3,
+    );
+    assert_eq!(open(), 2, "a report may still come");
+
+    let mixed = session_draft();
+    let (read, _) = bound_and_offered(
+        &harness,
+        &mixed,
+        InsertionMethod::TypedSubmission,
+        Offered::Accepted,
+        4,
+    );
+    bound_and_offered(
+        &harness,
+        &read,
+        InsertionMethod::ManualTerminalWorkflow,
+        Offered::Recorded,
+        5,
+    );
+    assert_eq!(open(), 3, "one file was taken and another was not");
+
+    let failed_beside = session_draft();
+    let (read, _) = bound_and_offered(
+        &harness,
+        &failed_beside,
+        InsertionMethod::TypedSubmission,
+        Offered::Accepted,
+        6,
+    );
+    bound_and_offered(
+        &harness,
+        &read,
+        InsertionMethod::TypedSubmission,
+        Offered::Failed,
+        7,
+    );
+    assert_eq!(open(), 4, "a failed offer beside a taken one");
+
+    session_draft();
+    assert_eq!(open(), 5, "a draft with no binding");
+
+    let device = harness.actor.clone();
+    a_sessionless_draft(&harness, &device, Some(6)).expect("the sixth place is free");
+    let refused = a_sessionless_draft(&harness, &device, Some(6)).expect_err("no place is free");
+    assert_eq!(refused.code(), ErrorCode::QuotaExceeded);
+    assert!(
+        refused.to_string().contains("draft.discard"),
+        "the words name how a place is freed: {refused}"
+    );
+}
+
+/// KR-REQ-09.07 and KR-REQ-23.41: the same action asked again is answered from its record, though the
+/// draft it ended is gone, and does nothing twice; a new action for the gone draft is refused as
+/// unknown; the identifier reused for another payload is `ID_CONFLICT`.
+#[test]
+fn a_draft_ended_by_an_action_is_answered_from_its_record_when_the_action_is_asked_again() {
+    let harness = Harness::create();
+    let created = draft(&harness);
+    let params = DraftDiscardParams {
+        draft_id: created.draft_id,
+    };
+    let id = kr_ipc::new_uuid();
+    let action = draft_action(&harness, id, "draft.discard", b"discard");
+
+    let first = harness
+        .service
+        .draft_discard(&harness.actor, &params, Some(&action))
+        .expect("ends the draft");
+    let again = harness
+        .service
+        .draft_discard(&harness.actor, &params, Some(&action))
+        .expect("the repeat is answered from the record");
+    assert_eq!(again, first);
+
+    let fresh = draft_action(&harness, kr_ipc::new_uuid(), "draft.discard", b"discard");
+    let unknown = harness
+        .service
+        .draft_discard(&harness.actor, &params, Some(&fresh))
+        .expect_err("a new action finds no draft");
+    assert_eq!(unknown.code(), ErrorCode::InvalidArgument);
+
+    let reused = draft_action(&harness, id, "draft.discard", b"another payload");
+    let conflict = harness
+        .service
+        .draft_discard(&harness.actor, &params, Some(&reused))
+        .expect_err("the identifier carried another payload");
+    assert_eq!(conflict.code(), ErrorCode::IdConflict);
 }
