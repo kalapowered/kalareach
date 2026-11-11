@@ -1613,6 +1613,10 @@ pub(crate) mod tests {
             Ok(())
         }
 
+        fn stream_opener(&self) -> Option<Arc<dyn kr_client::transport::StreamOpener>> {
+            None
+        }
+
         fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>> {
             Box::pin(std::future::pending())
         }

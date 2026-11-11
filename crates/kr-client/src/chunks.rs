@@ -13,6 +13,19 @@
 //! connection is the control endpoint's: the peer-credential authentication, the admission and the
 //! answers.
 //!
+//! A paired host takes a transfer's chunks on a data stream of the control connection's own, of
+//! kind `attachment_chunks`, which is a bulk stream beside the control stream. [`ChunkRoute::network`]
+//! first asks the host whether it takes that stream, and says so by name when it does not, before
+//! anything is reserved or opened. A lane there is one stream, with the same turn-taking: a frame,
+//! then its answer on the same stream. The stream runs under the connection's registration, grant
+//! and windows, so a chunk carries the window the control connection's reader last received, and
+//! its request identifier comes from the same counter as the session's.
+//!
+//! The client owns the bound on every wait for a paired host in a lane: the open of the stream
+//! (thirty seconds), which waits for the host's credit and writes the header, the write of a chunk
+//! (two minutes), and the wait for its answer (one minute). A host that gives no credit, or holds a
+//! chunk and never answers, ends the lane; the driver reads what the host holds and goes on.
+//!
 //! What travels is the control union. A chunk is an ordinary `upload.chunk` mutation, with its own
 //! action identifier, window and requested lifetime, and a read of one is an ordinary
 //! `download.chunk` request, so both go through the host's admission like every other call. A lane
@@ -30,16 +43,21 @@ use kr_protocol::envelope::{
     ActionTarget, ControlEvent, ControlFrame, MutationRequest, Outcome, ParamsValue, Request,
 };
 use kr_protocol::error::ErrorCode;
-use kr_protocol::frame::StreamKind;
+use kr_protocol::frame::{StreamHeader, StreamKind, StreamResource};
 use kr_protocol::hello::{ActionWindow, PROTOCOL_VERSION, ReceiveLimits};
-use kr_protocol::ids::{ActionId, BuildId, EnvironmentId, RequestId, TransferId};
+use kr_protocol::ids::{ActionId, ActionWindowId, BuildId, EnvironmentId, RequestId, TransferId};
 use kr_protocol::local::{LocalClientKind, LocalHello, LocalRole};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Bytes, CanonicalSet, Digest256, DurationMs, Nullable};
 use kr_protocol::transfer::{
-    ChunkDescriptor, DownloadChunkParams, DownloadChunkResult, UploadChunkParams, UploadChunkResult,
+    ChunkDescriptor, DownloadChunkParams, DownloadChunkResult, TransferStreamsParams,
+    TransferStreamsResult, UploadChunkParams, UploadChunkResult,
 };
+use kr_transport::TransportError;
+use kr_transport::deadlines::{DeadlineKind, Deadlines, TimerDeadlines};
+use kr_transport::streams::DataStream;
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -47,7 +65,9 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
 use crate::error::{ClientError, Result};
+use crate::session::{Issued, LaneSupport, Session};
 use crate::shown::Shown;
+use crate::transport::{ControlTransport, StreamOpener};
 
 /// Where a transfer's chunks travel.
 #[derive(Clone)]
@@ -64,7 +84,37 @@ enum Form {
         environment_id: EnvironmentId,
         build_id: BuildId,
     },
+    /// Data streams of a paired host's connection.
+    Network(Arc<Network>),
 }
+
+/// What the lanes of a network route share.
+#[derive(Clone)]
+struct Network {
+    transport: Arc<dyn ControlTransport>,
+    opener: Arc<dyn StreamOpener>,
+    windows: Arc<WindowSource>,
+    requests: Arc<AtomicU64>,
+    environment_id: EnvironmentId,
+    bounds: Arc<dyn Deadlines>,
+    /// Seams this crate's own tests act through.
+    #[cfg(feature = "testing")]
+    seam: Seam,
+}
+
+/// What a network route's tests can do to its lanes.
+#[cfg(feature = "testing")]
+#[derive(Clone, Default)]
+struct Seam {
+    /// Ends the first lane's stream with a reset once it has carried this many chunks.
+    reset_first_lane_after: Option<u64>,
+    /// Set once a lane has taken the reset above.
+    reset_taken: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The refusal a host of an earlier build, and one that takes no attachment stream, are both told.
+const NO_ATTACHMENT_STREAM: &str =
+    "this host does not accept an attachment stream from a device; update it";
 
 impl ChunkRoute {
     /// The attachment-chunk endpoint of an environment on this machine.
@@ -86,13 +136,91 @@ impl ChunkRoute {
         })
     }
 
+    /// The data streams of the paired host `session` is connected to.
+    ///
+    /// Nothing is reserved or opened before the host has said it takes the stream: a session whose
+    /// transport has no data streams is refused before anything is asked, and then one read
+    /// (`transfer.streams`) asks the host which streams it takes from a device. The read is not
+    /// signalled, so a host of an earlier build that refuses it does not start the review of a
+    /// connection that holds the right it reads under. `environment_id` is the environment the
+    /// session's host belongs to, which every stream's header names.
+    ///
+    /// # Errors
+    ///
+    /// Returns `INVALID_ARGUMENT` for a session whose transport has no data streams, such as one on
+    /// this machine, whose chunks go on [`ChunkRoute::local`]; `UNSUPPORTED_CAPABILITY`, whose words
+    /// tell the person to update the host, when the host of an earlier build refuses the read as
+    /// one it does not list or answers that it does not take `attachment_chunks`; and any other
+    /// refusal or failure of the read as it is.
+    pub async fn network(session: &Session, environment_id: EnvironmentId) -> Result<Self> {
+        let LaneSupport {
+            windows,
+            requests,
+            transport,
+        } = session.lane_support();
+        let Some(opener) = transport.stream_opener() else {
+            return Err(refusal(
+                ErrorCode::InvalidArgument,
+                "this connection has no data streams; its chunks go on the local route",
+            ));
+        };
+        match session
+            .read_unsignalled::<_, TransferStreamsResult>(
+                Method::TransferStreams,
+                &TransferStreamsParams {},
+            )
+            .await
+        {
+            Ok(taken)
+                if taken
+                    .accepted_streams
+                    .contains(&StreamKind::AttachmentChunks) => {}
+            Ok(_) => {
+                return Err(refusal(
+                    ErrorCode::UnsupportedCapability,
+                    NO_ATTACHMENT_STREAM,
+                ));
+            }
+            // The refusal of a method the host does not list, which is how a host of an earlier
+            // build answers. Only that one is the host's age: another refusal says its own reason.
+            Err(ClientError::Host(refused))
+                if refused.code == ErrorCode::PermissionDenied
+                    && refused.message == kr_transport::actor::METHOD_NOT_AVAILABLE =>
+            {
+                return Err(refusal(
+                    ErrorCode::UnsupportedCapability,
+                    NO_ATTACHMENT_STREAM,
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(Self {
+            form: Form::Network(Arc::new(Network {
+                transport,
+                opener,
+                windows: Arc::new(WindowSource::new(windows)),
+                requests,
+                environment_id,
+                bounds: Arc::new(lane_bounds()),
+                #[cfg(feature = "testing")]
+                seam: Seam::default(),
+            })),
+        })
+    }
+
     /// Opens a lane for one transfer.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Ipc`] when nothing answers at the endpoint or the host refuses the
-    /// caller, the host's refusal of the hello, and a refusal when the host that answered belongs
-    /// to another environment or shares no protocol major with this client.
+    /// On a local route, returns [`ClientError::Ipc`] when nothing answers at the endpoint or the
+    /// host refuses the caller, the host's refusal of the hello, and a refusal when the host that
+    /// answered belongs to another environment or shares no protocol major with this client.
+    ///
+    /// On a network route, returns [`ClientError::ConnectionEnded`] when the connection, or the
+    /// sign-in it was opened under, has ended, a transport failure (a deadline of the header kind)
+    /// when the host gave no credit for the stream or did not take its header within thirty
+    /// seconds, and the bulk-limit refusal when the connection already holds as many transfer
+    /// streams as it allows.
     pub async fn open(&self, transfer_id: TransferId) -> Result<ChunkLane> {
         match &self.form {
             Form::Local {
@@ -105,7 +233,80 @@ impl ChunkRoute {
                     LocalCarrier::connect(endpoint, *environment_id, build_id.clone()).await?,
                 ),
             }),
+            Form::Network(network) => {
+                let header = StreamHeader {
+                    kind: StreamKind::AttachmentChunks,
+                    connection_id: network.transport.connection_id(),
+                    stream_id: Nullable::null(),
+                    resource: StreamResource {
+                        environment_id: network.environment_id,
+                        session_id: Nullable::null(),
+                        attachment_id: Nullable::null(),
+                        transfer_id: Nullable::some(transfer_id),
+                    },
+                };
+                // The open waits for the host's credit while it holds one of the connection's four
+                // bulk slots, and the header is written to a host that has to take it: both under
+                // the one bound, and a bound that passes gives the slot back.
+                let stream = bounded(network.bounds.as_ref(), DeadlineKind::Header, async {
+                    network.opener.open(header).await
+                })
+                .await?;
+                Ok(ChunkLane {
+                    transfer_id,
+                    carrier: Carrier::Network(Box::new(NetworkCarrier::new(network, stream))),
+                })
+            }
         }
+    }
+
+    /// Replaces the bounds a network route's lanes wait under, for this crate's own tests, which
+    /// fire them by what the lane is waiting for and never wait for a time.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the route is not a network route.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn bounded_by(mut self, bounds: Arc<dyn Deadlines>) -> Self {
+        let Form::Network(network) = &mut self.form else {
+            panic!("only a network route has bounds");
+        };
+        Arc::make_mut(network).bounds = bounds;
+        self
+    }
+
+    /// Makes the first lane this network route opens end its stream with a reset once it has
+    /// carried `chunks` chunks, as a client does that abandons a stream, for this crate's own
+    /// tests.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the route is not a network route.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn resetting_first_lane_after(mut self, chunks: u64) -> Self {
+        let Form::Network(network) = &mut self.form else {
+            panic!("only a network route has streams to reset");
+        };
+        Arc::make_mut(network).seam.reset_first_lane_after = Some(chunks);
+        self
+    }
+}
+
+/// Runs `wait` until it ends or until a deadline of `kind` from `bounds` has passed, in which case
+/// the wait is dropped and the failure names the deadline.
+async fn bounded<T>(
+    bounds: &dyn Deadlines,
+    kind: DeadlineKind,
+    wait: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let passed = bounds.start(kind);
+    tokio::pin!(wait);
+    tokio::select! {
+        biased;
+        outcome = &mut wait => outcome,
+        () = passed => Err(ClientError::Transport(TransportError::Deadline(kind))),
     }
 }
 
@@ -124,6 +325,44 @@ crate::debug_fields!(ChunkLane { transfer_id });
 /// What a lane's frames travel over.
 enum Carrier {
     Local(LocalCarrier),
+    Network(Box<NetworkCarrier>),
+}
+
+impl Carrier {
+    /// Says whether this lane can still carry a call, before one is built.
+    fn usable(&mut self) -> Result<()> {
+        match self {
+            Self::Local(carrier) => carrier.usable(),
+            Self::Network(carrier) => carrier.usable(),
+        }
+    }
+
+    /// The window a call carries.
+    async fn window(&mut self) -> Result<ActionWindow> {
+        match self {
+            Self::Local(carrier) => carrier.window().await,
+            Self::Network(carrier) => carrier.window().await,
+        }
+    }
+
+    fn next_request_id(&mut self) -> RequestId {
+        match self {
+            Self::Local(carrier) => carrier.next_request_id(),
+            Self::Network(carrier) => carrier.next_request_id(),
+        }
+    }
+
+    /// Sends one frame and returns the result its answer carries.
+    async fn exchange(
+        &mut self,
+        frame: &ControlFrame,
+        request_id: RequestId,
+    ) -> Result<ParamsValue> {
+        match self {
+            Self::Local(carrier) => carrier.exchange(frame, request_id).await,
+            Self::Network(carrier) => carrier.exchange(frame, request_id).await,
+        }
+    }
 }
 
 impl ChunkLane {
@@ -139,10 +378,13 @@ impl ChunkLane {
     /// the test waiting for it. Windows the lane receives from then on are stamped with it.
     #[cfg(feature = "testing")]
     pub fn hold_clock_at(&self, by: Duration) {
-        let Carrier::Local(carrier) = &self.carrier;
+        let clock = match &self.carrier {
+            Carrier::Local(carrier) => &carrier.clock,
+            Carrier::Network(carrier) => &carrier.clock,
+        };
         let by_ms = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
-        carrier.clock.ahead_ms.store(by_ms, Ordering::Release);
-        carrier.clock.held.store(true, Ordering::Release);
+        clock.ahead_ms.store(by_ms, Ordering::Release);
+        clock.held.store(true, Ordering::Release);
     }
 
     /// Sends one chunk of an upload and returns what the host accepted.
@@ -170,7 +412,7 @@ impl ChunkLane {
                 "this lane carries another transfer's chunks",
             ));
         }
-        let Carrier::Local(carrier) = &mut self.carrier;
+        let carrier = &mut self.carrier;
         carrier.usable()?;
         let entry = Method::UploadChunk.entry();
         let window = carrier.window().await?;
@@ -212,7 +454,7 @@ impl ChunkLane {
     /// Returns [`ClientError::ConnectionEnded`] when the connection failed, the host's own refusal
     /// under its code, and `ATTACHMENT_INTEGRITY` when the answer is not the chunk described.
     pub async fn read_chunk(&mut self, expected: &ChunkDescriptor) -> Result<Bytes> {
-        let Carrier::Local(carrier) = &mut self.carrier;
+        let carrier = &mut self.carrier;
         carrier.usable()?;
         let request_id = carrier.next_request_id();
         let request = Request {
@@ -336,24 +578,11 @@ impl LaneClock {
     }
 }
 
-/// A window the host issued on a lane's connection, and when the lane received it.
-#[derive(Clone)]
-struct Issued {
-    window: ActionWindow,
-    received_at: tokio::time::Instant,
-}
-
-impl Issued {
-    fn at(window: ActionWindow, clock: &LaneClock) -> Self {
-        Self {
-            window,
-            received_at: clock.now(),
-        }
-    }
-
-    /// How long the host said the window stands, from when it was issued.
-    fn validity(&self) -> Duration {
-        Duration::from_millis(self.window.valid_for_ms.get())
+/// A window the host issued on a lane's connection, stamped with the lane's reading of time.
+fn issued_at(window: ActionWindow, clock: &LaneClock) -> Issued {
+    Issued {
+        window,
+        received_at: clock.now(),
     }
 }
 
@@ -515,27 +744,13 @@ impl LocalCarrier {
     /// [`ClientError::ConnectionEnded`] when the window this lane holds would have expired before
     /// a renewal came.
     async fn window(&mut self) -> Result<ActionWindow> {
-        loop {
-            let issued = self.window.borrow_and_update().clone();
-            if issued.window.valid_for_ms.get() == 0 {
-                return Err(ClientError::NoActionWindow);
-            }
-            let validity = issued.validity();
-            let now = self.clock.now();
-            if now.saturating_duration_since(issued.received_at) < validity / 2 {
-                return Ok(issued.window);
-            }
-            // The renewal is due. The reader delivers it as soon as it arrives.
-            let expiry = issued.received_at + validity;
-            match tokio::time::timeout_at(self.clock.timer_deadline(expiry), self.window.changed())
-                .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => return Err(self.stopped()),
-                Err(_) => {
-                    self.ended = true;
-                    return Err(ClientError::ConnectionEnded);
-                }
+        match newest_window(&mut self.window, &self.clock, None).await {
+            Ok(window) => Ok(window),
+            Err(Unavailable::Nothing) => Err(ClientError::NoActionWindow),
+            Err(Unavailable::SourceEnded) => Err(self.stopped()),
+            Err(Unavailable::RanOut) => {
+                self.ended = true;
+                Err(ClientError::ConnectionEnded)
             }
         }
     }
@@ -620,6 +835,295 @@ impl LocalCarrier {
     }
 }
 
+/// Why a lane has no window to carry.
+enum Unavailable {
+    /// The host issued a window that admits nothing.
+    Nothing,
+    /// The reader that delivers the windows has stopped.
+    SourceEnded,
+    /// The window the lane holds would have expired before a replacement came.
+    RanOut,
+}
+
+/// The window a call carries: the newest the host issued, once the lane has received it less than
+/// half its validity ago.
+///
+/// The host issues a window for a stated validity and renews it when half of that has passed, so an
+/// older one is due for renewal, and the call waits for the renewal until the window it holds would
+/// have expired by the lane's clock. A window the host turned down is waited out in the same way
+/// whatever its age: only one it issued since can be carried.
+async fn newest_window(
+    issued: &mut watch::Receiver<Issued>,
+    clock: &LaneClock,
+    source: Option<&WindowSource>,
+) -> std::result::Result<ActionWindow, Unavailable> {
+    loop {
+        let held = issued.borrow_and_update().clone();
+        if held.window.valid_for_ms.get() == 0 {
+            return Err(Unavailable::Nothing);
+        }
+        let validity = held.validity();
+        let turned_down =
+            source.is_some_and(|source| source.turned_down(&held.window.action_window_id));
+        if !turned_down && clock.now().saturating_duration_since(held.received_at) < validity / 2 {
+            return Ok(held.window);
+        }
+        // The renewal is due, or the host turned this window down. The reader delivers the next
+        // one as soon as it arrives.
+        let expiry = held.received_at + validity;
+        match tokio::time::timeout_at(clock.timer_deadline(expiry), issued.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(Unavailable::SourceEnded),
+            Err(_) => return Err(Unavailable::RanOut),
+        }
+    }
+}
+
+/// Where the lanes of one network route take their windows from: the windows the control
+/// connection's reader delivers, and the window the host last turned down.
+///
+/// The marker is here and not in a lane because the driver drops a lane that failed before it sends
+/// the chunk again. A lane opened after would find the same window still the newest, send it
+/// once more and be refused again, so the replacement reads the route's marker and waits for a
+/// window with another identifier.
+struct WindowSource {
+    issued: watch::Receiver<Issued>,
+    turned_down: std::sync::Mutex<Option<ActionWindowId>>,
+}
+
+impl WindowSource {
+    const fn new(issued: watch::Receiver<Issued>) -> Self {
+        Self {
+            issued,
+            turned_down: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn turned_down(&self, window: &ActionWindowId) -> bool {
+        self.turned_down
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            == Some(window)
+    }
+
+    fn turn_down(&self, window: &ActionWindowId) {
+        *self
+            .turned_down
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(window.clone());
+    }
+}
+
+/// How long the open of a stream may take: the wait for the host's stream credit, which the host
+/// grants once it has decided to take the device's streams (its own lookup is bounded at ten
+/// seconds), and the write of the header.
+const OPEN_BOUND: Duration = Duration::from_secs(30);
+
+/// How long the write of one chunk may take, counted from its start. A chunk is a frame of about a
+/// mebibyte, so a link slower than about nine kibibytes a second cannot carry one in it.
+const WRITE_BOUND: Duration = Duration::from_secs(120);
+
+/// How long the host has to answer a chunk once it has been written whole.
+const ANSWER_BOUND: Duration = Duration::from_secs(60);
+
+/// The bounds a network lane waits under: the stream's header phase is the open, a frame's write is
+/// the chunk's, and the wait for the next frame is the wait for the answer.
+fn lane_bounds() -> TimerDeadlines {
+    TimerDeadlines {
+        header: OPEN_BOUND,
+        write: WRITE_BOUND,
+        idle: ANSWER_BOUND,
+        ..TimerDeadlines::default()
+    }
+}
+
+/// A data stream of a paired host's connection, as one transfer's lane.
+///
+/// One stream carries the transfer's chunks in turn: a frame, then its answer on the same stream.
+/// The window a chunk carries is the control connection's newest, taken as a local lane takes its
+/// own, and its request identifier comes from the session's counter.
+///
+/// Every wait on the host is under a bound of the lane's own: the open and the write of the header,
+/// the write of a chunk, and the wait for its answer. A bound that passes ends the lane and resets
+/// its stream, so the host stops waiting for a frame and the bulk slot is free for the next.
+struct NetworkCarrier {
+    stream: DataStream,
+    issued: watch::Receiver<Issued>,
+    source: Arc<WindowSource>,
+    clock: LaneClock,
+    requests: Arc<AtomicU64>,
+    transport: Arc<dyn ControlTransport>,
+    bounds: Arc<dyn Deadlines>,
+    /// Set from before a call is written until its answer has been read whole, and once the lane
+    /// has failed. A frame abandoned part way, or a call dropped before its answer came, leaves
+    /// nothing a later call could trust.
+    ended: bool,
+    #[cfg(feature = "testing")]
+    reset_after: Option<u64>,
+    #[cfg(feature = "testing")]
+    carried: u64,
+}
+
+impl Drop for NetworkCarrier {
+    fn drop(&mut self) {
+        // A call dropped before its answer was read whole leaves a stream the host may be part way
+        // through reading, which is reset so that it stops. One dropped between calls is finished
+        // and the host reads a clean end.
+        if self.ended {
+            self.stream.handle().revoke();
+        }
+    }
+}
+
+impl NetworkCarrier {
+    fn new(network: &Network, stream: DataStream) -> Self {
+        #[cfg(feature = "testing")]
+        let reset_after = network.seam.reset_first_lane_after.filter(|_| {
+            !network
+                .seam
+                .reset_taken
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+        });
+        Self {
+            stream,
+            issued: network.windows.issued.clone(),
+            source: Arc::clone(&network.windows),
+            clock: LaneClock::new(tokio::time::Instant::now()),
+            requests: Arc::clone(&network.requests),
+            transport: Arc::clone(&network.transport),
+            bounds: Arc::clone(&network.bounds),
+            ended: false,
+            #[cfg(feature = "testing")]
+            reset_after,
+            #[cfg(feature = "testing")]
+            carried: 0,
+        }
+    }
+
+    /// Says whether this lane can still carry a call, before one is built.
+    ///
+    /// The transport is asked each time: the sign-in the connection was opened under can end after
+    /// the lane opened, and the next chunk then stops with the reason the transport recorded.
+    fn usable(&mut self) -> Result<()> {
+        if self.ended || self.stream.is_revoked() {
+            return Err(self.end(ClientError::ConnectionEnded));
+        }
+        if let Some(reason) = self.transport.ended_by_this_device() {
+            return Err(self.end(ClientError::Host(reason)));
+        }
+        Ok(())
+    }
+
+    /// Ends this lane: nothing more goes on it, and its stream is reset, so that the host stops
+    /// waiting for a frame and the stream's bulk slot is free.
+    fn end(&mut self, error: ClientError) -> ClientError {
+        self.ended = true;
+        self.stream.handle().revoke();
+        error
+    }
+
+    /// The window a call carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::NoActionWindow`] when the host issued a window that admits nothing,
+    /// or the one this lane holds would have expired, or was turned down, before another came, and
+    /// [`ClientError::ConnectionEnded`] when the session's reader stopped while this waited.
+    async fn window(&mut self) -> Result<ActionWindow> {
+        match newest_window(&mut self.issued, &self.clock, Some(&self.source)).await {
+            Ok(window) => Ok(window),
+            Err(Unavailable::Nothing | Unavailable::RanOut) => Err(ClientError::NoActionWindow),
+            Err(Unavailable::SourceEnded) => Err(self.end(ClientError::ConnectionEnded)),
+        }
+    }
+
+    fn next_request_id(&self) -> RequestId {
+        RequestId::new(self.requests.fetch_add(1, Ordering::AcqRel))
+    }
+
+    /// Writes one frame, reads the one answer that comes back on the same stream, and checks it
+    /// answers this call.
+    async fn exchange(
+        &mut self,
+        frame: &ControlFrame,
+        request_id: RequestId,
+    ) -> Result<ParamsValue> {
+        if self.ended {
+            return Err(ClientError::ConnectionEnded);
+        }
+        self.ended = true;
+        let bounds = Arc::clone(&self.bounds);
+        if let Err(error) = bounded(bounds.as_ref(), DeadlineKind::Write, async {
+            self.stream
+                .write_message(frame)
+                .await
+                .map_err(ClientError::from)
+        })
+        .await
+        {
+            return Err(self.end(error));
+        }
+        let answer = match bounded(bounds.as_ref(), DeadlineKind::Idle, async {
+            self.stream
+                .read_message::<ControlFrame>()
+                .await
+                .map_err(ClientError::from)
+        })
+        .await
+        {
+            Ok(Some(answer)) => answer,
+            Ok(None) => return Err(self.end(ClientError::ConnectionEnded)),
+            Err(error) => return Err(self.end(error)),
+        };
+        match answer {
+            ControlFrame::Response(response) if response.request_id == request_id => {
+                self.ended = false;
+                #[cfg(feature = "testing")]
+                self.carried_one();
+                match response.outcome {
+                    Outcome::Ok(value) => Ok(value),
+                    Outcome::Error(error) => {
+                        // A refusal as not permitted is how a host refuses a window that has
+                        // expired. This window is not carried again, by this lane or the lane
+                        // that replaces it.
+                        if error.code == ErrorCode::PermissionDenied
+                            && let ControlFrame::Mutation(mutation) = frame
+                        {
+                            self.source.turn_down(&mutation.action_window_id);
+                        }
+                        Err(ClientError::from(error))
+                    }
+                }
+            }
+            // An answer that is a receipt rather than a result settles the call without the
+            // result a chunk needs.
+            ControlFrame::Receipt(receipt) if receipt.request_id == request_id => {
+                self.ended = false;
+                Err(refusal(
+                    ErrorCode::OutcomeUnknown,
+                    "the host settled the call with a receipt and no result",
+                ))
+            }
+            // The stream carries one call at a time, so an answer to another is the host's mistake.
+            _ => Err(self.end(refusal(
+                ErrorCode::InvalidArgument,
+                "the host answered a call this lane did not make",
+            ))),
+        }
+    }
+
+    /// Counts an answered chunk, and ends the stream with a reset once the count a test asked for
+    /// has been carried.
+    #[cfg(feature = "testing")]
+    fn carried_one(&mut self) {
+        self.carried += 1;
+        if self.reset_after == Some(self.carried) {
+            self.stream.handle().revoke();
+        }
+    }
+}
+
 /// Reads a lane's connection until it ends: each renewed window goes to the lane at once, and
 /// each answer to a call the lane made goes to the call waiting for it.
 async fn read_lane(
@@ -639,7 +1143,7 @@ async fn read_lane(
         };
         let answered = match &frame {
             ControlFrame::Event(ControlEvent::ActionWindowRenewed(window)) => {
-                renewals.send_replace(Issued::at(window.clone(), &clock));
+                renewals.send_replace(issued_at(window.clone(), &clock));
                 continue;
             }
             ControlFrame::Event(ControlEvent::Keepalive) | ControlFrame::Notification(_) => {

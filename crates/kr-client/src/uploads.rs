@@ -27,16 +27,19 @@
 
 use std::time::Duration;
 
+use tokio::sync::watch;
+
 use kr_protocol::envelope::ActionTarget;
-use kr_protocol::ids::{ActionId, DeviceId, EnvironmentId, SessionId};
+use kr_protocol::ids::{ActionId, DeviceId, EnvironmentId, SessionId, TransferId};
 use kr_protocol::limits::UPLOAD_CHUNK_LEN;
 use kr_protocol::method::Method;
 use kr_protocol::receipt::ReceiptState;
 use kr_protocol::scalars::{Bytes, Digest256, DurationMs, Nullable, U64};
 use kr_protocol::transfer::{
     AttachmentHandle, ChunkBitmap, ChunkDescriptor, ChunkLayout, UploadBeginParams,
-    UploadBeginResult, UploadChunkParams, UploadChunkResult, UploadFinishParams,
-    UploadFinishResult, UploadStatusParams, UploadStatusResult,
+    UploadBeginResult, UploadCancelParams, UploadCancelResult, UploadChunkParams,
+    UploadChunkResult, UploadFinishParams, UploadFinishResult, UploadStatusParams,
+    UploadStatusResult,
 };
 
 use crate::chunks::{ChunkLane, ChunkRoute};
@@ -201,6 +204,37 @@ pub enum Answer {
     Status(Box<UploadStatusResult>),
 }
 
+/// What [`send`] is doing for a caller that watches it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage {
+    /// Reserving the transfer, or reading what the host holds of one already reserved.
+    #[default]
+    Starting,
+    /// Sending chunks.
+    Sending,
+    /// A lane failed, or the host refused a chunk's window: the driver is reading what the host
+    /// holds and will send from the first chunk it lacks, until a chunk is acknowledged.
+    Resuming,
+    /// Every chunk is acknowledged and the handle is being published.
+    Publishing,
+    /// The handle is published.
+    Published,
+}
+
+/// Where a driven upload stands, which [`send`] updates as it goes.
+///
+/// A caller creates the channel, hands [`send`] its sender and reads the receiver; the plan itself
+/// is borrowed by [`send`] for as long as it runs. A value is published only when it changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Progress {
+    /// What the driver is doing.
+    pub stage: Stage,
+    /// How many of the layout's chunks the host has acknowledged.
+    pub acknowledged_chunks: u64,
+    /// How many chunks the layout has. Zero for empty content, which has none.
+    pub chunks: u64,
+}
+
 /// The state one upload is in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
@@ -216,7 +250,7 @@ pub struct Upload {
     content: Box<dyn Content>,
     layout: ChunkLayout,
     sent: Option<ChunkBitmap>,
-    transfer_id: Option<kr_protocol::ids::TransferId>,
+    transfer_id: Option<TransferId>,
     handle: Option<AttachmentHandle>,
     phase: Phase,
     /// Where the reservation stands while this plan holds no transfer.
@@ -312,6 +346,15 @@ impl Upload {
     #[must_use]
     pub const fn handle(&self) -> Option<&AttachmentHandle> {
         self.handle.as_ref()
+    }
+
+    /// What a watcher is told of this plan, while the driver is at `stage`.
+    fn progress_at(&self, stage: Stage) -> Progress {
+        Progress {
+            stage,
+            acknowledged_chunks: self.acknowledged_chunks(),
+            chunks: self.layout.chunk_count.get(),
+        }
     }
 
     /// How many of the layout's chunks the host has acknowledged.
@@ -607,7 +650,10 @@ struct Unconditional {}
 /// `session`, every chunk on the lane `route` opens for the transfer.
 ///
 /// `target` and `requested_ttl` are those of every call the upload makes, chunks included. The plan
-/// stays the caller's, so a call that fails leaves it holding what the host has confirmed:
+/// stays the caller's, so a call that fails leaves it holding what the host has confirmed. The
+/// plan is borrowed for as long as this runs, so what a caller shows while it runs it reads from
+/// `progress`: the stage, and how many chunks the host has acknowledged of how many. Dropping this
+/// future cancels the send and leaves the transfer with the host, which [`cancel`] releases.
 ///
 /// * A plan that already holds a transfer starts from `upload.status`. Calling this again after a
 ///   lost `upload.finish` reply, a dropped session or a restart ([`Upload::resuming`]) therefore
@@ -638,7 +684,11 @@ pub async fn send(
     target: &ActionTarget,
     plan: &mut Upload,
     requested_ttl: DurationMs,
+    progress: &watch::Sender<Progress>,
 ) -> Result<AttachmentHandle> {
+    // A plan that holds a transfer is resuming it: the host's bitmap decides what is sent.
+    let mut resuming = plan.transfer_id().is_some();
+    publish(progress, plan.progress_at(Stage::Starting));
     if let (Some(transfer_id), None) = (plan.transfer_id().copied(), plan.handle()) {
         plan.accept(Answer::Status(Box::new(
             status(session, transfer_id).await?,
@@ -714,6 +764,14 @@ pub async fn send(
             }
             Step::Chunk(params) => {
                 let confirmed = plan.acknowledged_chunks();
+                publish(
+                    progress,
+                    plan.progress_at(if resuming {
+                        Stage::Resuming
+                    } else {
+                        Stage::Sending
+                    }),
+                );
                 match send_chunk(&mut lane, route, target, &params, requested_ttl).await {
                     Ok(accepted) => plan.accept(Answer::Chunked(Box::new(accepted)))?,
                     Err(error) => {
@@ -730,8 +788,18 @@ pub async fn send(
                             new_window = false;
                             Duration::ZERO
                         } else {
-                            let decision = attempts
-                                .decide(Failure::new(error.code()), RequestClass::TransferChunk);
+                            // A host that could not tell what became of a chunk has told nothing:
+                            // the chunk is neither sent nor unsent until its record says, so it is
+                            // read as any other lost answer is, from the status below, and counts
+                            // against the same budget.
+                            let code = match error.code() {
+                                kr_protocol::error::ErrorCode::OutcomeUnknown => {
+                                    kr_protocol::error::ErrorCode::ResourceUnavailable
+                                }
+                                other => other,
+                            };
+                            let decision =
+                                attempts.decide(Failure::new(code), RequestClass::TransferChunk);
                             let Recovery::Retry { delay } = decision.recovery else {
                                 return Err(error);
                             };
@@ -742,6 +810,8 @@ pub async fn send(
                         // chunk the host refused may still be one it holds. A lane whose
                         // connection failed carries nothing more, so the next chunk opens another.
                         lane = None;
+                        resuming = true;
+                        publish(progress, plan.progress_at(Stage::Resuming));
                         tokio::time::sleep(delay).await;
                         plan.accept(Answer::Status(Box::new(
                             status(session, params.transfer_id).await?,
@@ -751,11 +821,14 @@ pub async fn send(
                 if plan.acknowledged_chunks() > confirmed {
                     attempts = Attempts::new();
                     new_window = true;
+                    resuming = false;
+                    publish(progress, plan.progress_at(Stage::Sending));
                 }
             }
             Step::Finish(params) => {
                 // Every chunk is acknowledged, so the lane has nothing left to carry.
                 lane = None;
+                publish(progress, plan.progress_at(Stage::Publishing));
                 let settled = session
                     .mutate(
                         Method::UploadFinish,
@@ -768,9 +841,50 @@ pub async fn send(
                     .await?;
                 plan.accept(Answer::Finished(Box::new(settled.to_typed()?)))?;
             }
-            Step::Done(handle) => return Ok(*handle),
+            Step::Done(handle) => {
+                publish(progress, plan.progress_at(Stage::Published));
+                return Ok(*handle);
+            }
         }
     }
+}
+
+/// Tells a watcher where the upload stands, when that is not what it was last told.
+fn publish(progress: &watch::Sender<Progress>, now: Progress) {
+    progress.send_if_modified(|told| {
+        let changed = *told != now;
+        *told = now;
+        changed
+    });
+}
+
+/// Cancels the upload `transfer_id`, which the host then ends and whose reservation it gives back.
+///
+/// A caller that abandons a [`send`] calls this for the transfer the plan holds
+/// ([`Upload::transfer_id`]); a transfer the plan does not hold yet, because the answer to its
+/// reservation never came, cannot be named and is released when the host's own sweep ends it.
+///
+/// # Errors
+///
+/// Returns the host's refusal, and a failure when the connection ended before the answer came,
+/// which leaves the outcome unknown: the transfer may be cancelled, and `upload.status` says.
+pub async fn cancel(
+    session: &Session,
+    target: &ActionTarget,
+    transfer_id: TransferId,
+    requested_ttl: DurationMs,
+) -> Result<UploadCancelResult> {
+    let settled = session
+        .mutate(
+            Method::UploadCancel,
+            target.clone(),
+            None,
+            &Unconditional {},
+            &UploadCancelParams { transfer_id },
+            requested_ttl,
+        )
+        .await?;
+    settled.to_typed()
 }
 
 /// Sends one chunk on the transfer's lane, opening the lane first when there is none.

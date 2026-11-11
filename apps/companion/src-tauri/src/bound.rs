@@ -31,9 +31,10 @@ use std::sync::{Arc, OnceLock};
 use kr_client::error::{ClientError, Result};
 use kr_client::organisation::LeaseStop;
 use kr_client::services::account::AccountStatus;
-use kr_client::transport::{ControlTransport, Reach, TransportFuture};
+use kr_client::transport::{ControlTransport, Reach, StreamOpener, TransportFuture};
 use kr_protocol::envelope::ControlFrame;
 use kr_protocol::error::ProtocolError;
+use kr_protocol::frame::StreamHeader;
 use kr_protocol::hello::{ActionWindow, ReceiveLimits};
 use kr_protocol::ids::ConnectionId;
 use kr_protocol::method::Method;
@@ -124,6 +125,12 @@ impl Binding {
             self.presented.store(true, Ordering::Release);
             return None;
         }
+        self.gate_use()
+    }
+
+    /// The gate for what only a lease the host took allows, with no frame to read it from: a data
+    /// stream, which the host judges on the connection's lease like any request.
+    fn gate_use(&self) -> Option<ProtocolError> {
         if self.presented.load(Ordering::Acquire) {
             return None;
         }
@@ -255,6 +262,14 @@ impl ControlTransport for BoundTransport {
         })
     }
 
+    fn stream_opener(&self) -> Option<Arc<dyn StreamOpener>> {
+        let inner = self.binding.inner.stream_opener()?;
+        Some(Arc::new(BoundOpener {
+            binding: Arc::clone(&self.binding),
+            inner,
+        }))
+    }
+
     fn revoke_streams(&self) {
         self.binding.inner.revoke_streams();
     }
@@ -262,6 +277,34 @@ impl ControlTransport for BoundTransport {
     fn close(&self) {
         self.over.notify_one();
         self.binding.inner.close();
+    }
+}
+
+/// The data streams of a bound connection: one opens only while the sign-in the connection was
+/// opened under is in force, and, for a connection that presents no lease of its own, while the
+/// keeper of that sign-in holds a lease the host took.
+struct BoundOpener {
+    binding: Arc<Binding>,
+    inner: Arc<dyn StreamOpener>,
+}
+
+impl std::fmt::Debug for BoundOpener {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundOpener")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StreamOpener for BoundOpener {
+    fn open(&self, header: StreamHeader) -> TransportFuture<'_, kr_transport::streams::DataStream> {
+        Box::pin(async move {
+            if self.binding.check().is_some() || self.binding.gate_use().is_some() {
+                return Err(ClientError::ConnectionEnded);
+            }
+            self.inner.open(header).await
+        })
     }
 }
 
@@ -300,6 +343,10 @@ mod tests {
 
         fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>> {
             unreachable!("the connection is only asked whether it ended")
+        }
+
+        fn stream_opener(&self) -> Option<Arc<dyn StreamOpener>> {
+            None
         }
 
         fn revoke_streams(&self) {}

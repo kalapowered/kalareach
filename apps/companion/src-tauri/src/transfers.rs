@@ -389,12 +389,16 @@ async fn send(
     };
     let route = ChunkRoute::local(environment, crate::connection::build_id()?)?;
     let mut plan = Upload::new(subject, content);
+    // A local host's upload shows no progress of its own: the page learns the result.
+    let (progress, _unwatched) =
+        tokio::sync::watch::channel(kr_client::uploads::Progress::default());
     Ok(kr_client::uploads::send(
         session,
         &route,
         &target,
         &mut plan,
         crate::commands::MUTATION_TTL,
+        &progress,
     )
     .await?)
 }
