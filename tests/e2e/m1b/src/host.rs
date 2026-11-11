@@ -27,7 +27,8 @@ use serde_json::Value;
 
 use crate::LIVENESS;
 use crate::run::{
-    Run, ended_within, output_within, processes_under, read_tail_below, running, signal,
+    HARNESS_PROGRAM, Run, binary_place, ended_within, output_within, processes_under,
+    read_tail_below, running, signal, socket_below,
 };
 
 /// The daemon's log, in the run's directory.
@@ -219,6 +220,9 @@ pub struct Host<'r> {
     environment: EnvironmentPaths,
     shell_packages: Option<PathBuf>,
     daemon: Mutex<Option<Daemon>>,
+    /// The control socket the daemon bound, by its device and inode, once the daemon has answered:
+    /// what `kr` is run against is checked to be that socket, or why it could not be recorded.
+    control: Mutex<Option<Result<(i128, i128), String>>>,
 }
 
 #[derive(Debug)]
@@ -274,6 +278,7 @@ impl<'r> Host<'r> {
             environment,
             shell_packages: options.shell_packages.clone(),
             daemon: Mutex::new(None),
+            control: Mutex::new(None),
         };
         // The port was free when it was chosen, and it is bound when the daemon starts: other legs
         // choose theirs meanwhile, on this machine and on a shared one, and two can choose alike.
@@ -348,6 +353,7 @@ impl<'r> Host<'r> {
     ///
     /// Panics when it does not answer within [`LIVENESS`].
     fn start_daemon_once(&self) -> Result<(), String> {
+        *self.control.lock().unwrap_or_else(PoisonError::into_inner) = None;
         // What the log holds before this start is an earlier start's, and is not this one's to say.
         let earlier = std::fs::metadata(self.daemon_log()).map_or(0, |log| log.len());
         let log = std::fs::OpenOptions::new()
@@ -411,7 +417,10 @@ impl<'r> Host<'r> {
             ControlFlow::Continue(heard)
         });
         match answered {
-            Ok(None) => Ok(()),
+            Ok(None) => {
+                self.note_control_socket();
+                Ok(())
+            }
             Ok(Some(said)) => Err(said),
             Err(heard) => panic!(
                 "the control daemon did not answer within {LIVENESS:?} ({heard}): {}",
@@ -452,6 +461,57 @@ impl<'r> Host<'r> {
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .map(|daemon| daemon.identity.clone())
+    }
+
+    /// The place of the daemon's control socket below the run's directory.
+    fn control_socket_place(&self) -> Result<PathBuf, String> {
+        let endpoint = self
+            .environment
+            .controller_endpoint()
+            .map_err(|error| format!("the control socket has no place: {error}"))?;
+        endpoint
+            .as_path()
+            .strip_prefix(self.run.root())
+            .map(Path::to_path_buf)
+            .map_err(|_| "the control socket is not below the run's directory".to_owned())
+    }
+
+    /// Records the control socket the daemon bound, by its device and inode, found by a walk from
+    /// the run's pinned directory that follows no link, or why it could not be.
+    fn note_control_socket(&self) {
+        let found = self.control_socket_place().and_then(|place| {
+            socket_below(self.run.root(), self.run.pin(), &place)
+                .map_err(|why| format!("the control socket cannot be recorded: {why}"))?
+                .ok_or_else(|| "the control socket is not there".to_owned())
+        });
+        *self.control.lock().unwrap_or_else(PoisonError::into_inner) = Some(found);
+    }
+
+    /// Checks that the control socket `kr` will use is the one the daemon bound: the same device and
+    /// inode, found again by a walk from the pin that follows no link. Before the daemon has
+    /// answered there is none to check.
+    fn control_socket_is_the_daemons(&self) -> Result<(), String> {
+        let Some(recorded) = self
+            .control
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        else {
+            return Ok(());
+        };
+        let recorded = recorded?;
+        match socket_below(
+            self.run.root(),
+            self.run.pin(),
+            &self.control_socket_place()?,
+        ) {
+            Ok(Some(now)) if now == recorded => Ok(()),
+            Ok(Some(_)) => Err("the control socket is not the one the daemon bound".to_owned()),
+            Ok(None) => Err("the control socket the daemon bound is gone".to_owned()),
+            Err(why) => Err(format!(
+                "the control socket cannot be looked at as the daemon's: {why}"
+            )),
+        }
     }
 
     fn daemon_log(&self) -> PathBuf {
@@ -612,10 +672,16 @@ impl<'r> Host<'r> {
 
     /// Runs `kr` with nothing on its input and waits at most `within` for it.
     ///
+    /// The program is run only while it is the file that was placed in the run, and against the
+    /// control socket the daemon bound: the agent under test runs in the same account and may leave
+    /// anything in the run's tree, and `kr` runs with the person's own rights.
+    ///
     /// # Errors
     ///
-    /// Returns why it did not finish.
+    /// Returns why it was not run or did not finish.
     pub fn kr_within(&self, arguments: &[&str], within: Duration) -> Result<Output, String> {
+        self.run.placed_as_it_was(&binary_place(HARNESS_PROGRAM))?;
+        self.control_socket_is_the_daemons()?;
         output_within(self.command(arguments), within)
     }
 
@@ -984,6 +1050,7 @@ mod shutdown_tests {
             environment,
             shell_packages: None,
             daemon: Mutex::new(None),
+            control: Mutex::new(None),
         }
     }
 
@@ -1002,6 +1069,141 @@ mod shutdown_tests {
             Some(Daemon { child, identity });
         host.stop_daemon()
             .expect_err("a daemon that ended by the interrupt did not end well")
+    }
+
+    /// A host over a scratch run with a `kr` that is a script writing a mark in the run's home.
+    fn host_with_a_kr(root: &Path) -> (Run, PathBuf) {
+        std::fs::create_dir_all(root.join("b")).expect("b");
+        std::fs::create_dir_all(root.join("h")).expect("h");
+        let mark = root.join("h/ran");
+        let kr = root.join("b/kr");
+        std::fs::write(&kr, "#!/bin/sh\necho placed >> \"$HOME/ran\"\n").expect("a kr");
+        std::fs::set_permissions(&kr, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("executable");
+        (Run::over(root), mark)
+    }
+
+    fn runs(mark: &Path) -> usize {
+        std::fs::read_to_string(mark).map_or(0, |text| text.lines().count())
+    }
+
+    /// The `kr` the harness starts after the agent has run is the file that was placed: a file
+    /// rewritten in place, replaced, linked, or given a second name is not run, and the control
+    /// is the placed file, which is.
+    #[test]
+    fn a_kr_that_is_not_the_file_that_was_placed_is_not_run() {
+        let root = scratch("kr");
+        let theirs = scratch("kr-theirs");
+        let (run, mark) = host_with_a_kr(&root);
+        run.note_placed(Path::new("b/kr"))
+            .expect("the placed kr is recorded");
+        let host = host_over(&run);
+        let kr = root.join("b/kr");
+        host.kr_within(&["list"], Duration::from_secs(10))
+            .expect("the placed kr runs");
+        assert_eq!(runs(&mark), 1);
+
+        // Rewritten in place: the same inode and name, and other bytes.
+        let placed = std::fs::read(&kr).expect("the placed bytes");
+        std::fs::write(&kr, "#!/bin/sh\necho hijacked >> \"$HOME/ran\"\n").expect("rewritten");
+        let why = host
+            .kr_within(&["list"], Duration::from_secs(10))
+            .expect_err("a kr rewritten in place is not run");
+        assert!(why.contains("not the file that was placed"), "{why}");
+        assert_eq!(runs(&mark), 1, "the rewritten file did not run");
+
+        // Rewritten and put back: the bytes are the placed ones again and it runs.
+        std::fs::write(&kr, &placed).expect("put back");
+        host.kr_within(&["list"], Duration::from_secs(10))
+            .expect("the placed bytes run");
+        assert_eq!(runs(&mark), 2);
+
+        // A link to a program of the person's.
+        let outside = theirs.join("program");
+        std::fs::write(&outside, "#!/bin/sh\necho theirs >> \"$HOME/ran\"\n").expect("a program");
+        std::fs::set_permissions(
+            &outside,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("executable");
+        std::fs::remove_file(&kr).expect("removed");
+        std::os::unix::fs::symlink(&outside, &kr).expect("a link at kr");
+        let why = host
+            .kr_within(&["list"], Duration::from_secs(10))
+            .expect_err("a link is not run");
+        assert!(why.contains("symbolic link"), "{why}");
+        std::fs::remove_file(&kr).expect("removed");
+
+        // A second name for the placed file.
+        std::fs::write(&kr, &placed).expect("the placed bytes");
+        std::fs::set_permissions(&kr, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("executable");
+        std::fs::hard_link(&kr, theirs.join("second")).expect("a second name");
+        let why = host
+            .kr_within(&["list"], Duration::from_secs(10))
+            .expect_err("a file with a second name is not run");
+        assert!(why.contains("more than one name"), "{why}");
+        assert_eq!(runs(&mark), 2, "nothing but the placed kr ever ran");
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+        std::fs::remove_dir_all(&theirs).expect("clean up");
+    }
+
+    /// The control socket `kr` is run against is the one the daemon bound: a link at its place, a
+    /// socket that is another one, and a file that is no socket are each refused, and the control
+    /// is the socket that was bound.
+    #[test]
+    fn a_control_socket_that_is_not_the_one_the_daemon_bound_is_not_run_against() {
+        use std::os::unix::net::UnixListener;
+        let root = std::path::PathBuf::from(format!(
+            "/private/tmp/kt-{}",
+            &kr_ipc::new_uuid().to_string()[..8]
+        ));
+        std::fs::create_dir_all(&root).expect("a short run directory");
+        let (run, mark) = host_with_a_kr(&root);
+        run.note_placed(Path::new("b/kr"))
+            .expect("the placed kr is recorded");
+        let host = host_over(&run);
+        let place = root.join(host.control_socket_place().expect("a place"));
+        let bound = UnixListener::bind(&place).expect("the daemon's socket");
+        host.note_control_socket();
+        host.kr_within(&["list"], Duration::from_secs(10))
+            .expect("the bound socket is used");
+        assert_eq!(runs(&mark), 1);
+
+        let elsewhere = root.join("elsewhere.sock");
+        let another = UnixListener::bind(&elsewhere).expect("another socket");
+        // A link to another socket.
+        std::fs::remove_file(&place).expect("removed");
+        std::os::unix::fs::symlink(&elsewhere, &place).expect("a link at the socket");
+        let why = host
+            .kr_within(&["list"], Duration::from_secs(10))
+            .expect_err("a link is not the daemon's socket");
+        assert!(why.contains("symbolic link"), "{why}");
+        // Another socket bound at the place.
+        std::fs::remove_file(&place).expect("removed");
+        let impostor = UnixListener::bind(&place).expect("another socket at the place");
+        let why = host
+            .kr_within(&["list"], Duration::from_secs(10))
+            .expect_err("another socket is not the daemon's");
+        assert!(why.contains("not the one the daemon bound"), "{why}");
+        // A file that is no socket.
+        std::fs::remove_file(&place).expect("removed");
+        std::fs::write(&place, b"not a socket").expect("a file at the place");
+        let why = host
+            .kr_within(&["list"], Duration::from_secs(10))
+            .expect_err("a file is not a socket");
+        assert!(why.contains("not the kind of entry"), "{why}");
+        assert_eq!(
+            runs(&mark),
+            1,
+            "kr was run once, against the socket that was bound"
+        );
+        drop((bound, another, impostor));
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     /// A link left at the host's registry, to a database of the person's, is not opened: the file it
