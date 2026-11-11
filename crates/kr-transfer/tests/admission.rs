@@ -20,9 +20,9 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{DeviceId, DraftRevision, SessionId, TransferId};
 use kr_protocol::scalars::{Nullable, U64, Uuid};
 use kr_protocol::transfer::{
-    AgentDraftAddAttachmentParams, AttachmentContribution, DraftCreateParams, DraftUpdateParams,
-    InsertionMethod, UploadBeginParams, UploadCancelParams, UploadChunkParams, UploadState,
-    UploadStatusParams,
+    AgentDraftAddAttachmentParams, AttachmentContribution, DraftCreateParams, DraftDiscardParams,
+    DraftUpdateParams, InsertionMethod, UploadBeginParams, UploadCancelParams, UploadChunkParams,
+    UploadState, UploadStatusParams,
 };
 use kr_transfer::TransferError;
 use kr_transfer::service::{Action, Admission, AdmissionHook};
@@ -784,6 +784,84 @@ fn the_record_of_a_prompt_the_host_refuses_inside_the_lock_leaves_the_draft_unse
         .expect("under an admission that stands the prompt is recorded");
     assert!(submitted(&harness, &draft));
     assert_eq!(host.committed.load(Ordering::SeqCst), 1);
+}
+
+/// KR-REQ-09.09 and KR-REQ-23.41: ending a draft deletes nothing when the host's answer is no inside
+/// the lock, wherever it turns to no, and the host is asked before the draft's use is looked at: a
+/// draft a prompt sent is told the host's refusal and not that it is in use, so a caller whose
+/// authority has gone learns nothing of the draft. The controls are the same discards under an
+/// admission that stands: the unused draft is ended and the sent one is kept as a conflict.
+#[test]
+fn ending_a_draft_the_host_refuses_inside_the_lock_deletes_nothing_and_says_nothing_of_its_use() {
+    let session_id = SessionId::new(Uuid::from_bytes([9; 16]));
+    for refuses in REFUSALS {
+        let harness = Harness::create();
+        let unused = a_draft_holding_an_attachment(&harness);
+        let sent = a_draft_holding_an_attachment(&harness);
+        harness
+            .service
+            .record_prompt(
+                &harness.actor,
+                sent.draft_id,
+                session_id,
+                crate::support::an_application(),
+                &Admission::none(),
+            )
+            .expect("a prompt sends the draft");
+        for draft in [&unused, &sent] {
+            let host = Host::new(refuses);
+            let ended = harness.service.draft_discard(
+                &harness.actor,
+                &DraftDiscardParams {
+                    draft_id: draft.draft_id,
+                },
+                Some(&action(&harness, "draft.discard", b"discard", &host)),
+            );
+            assert_not_admitted(ended, refuses, &host);
+            harness
+                .service
+                .draft(&harness.actor, draft.draft_id)
+                .expect("the draft stands");
+        }
+    }
+
+    let harness = Harness::create();
+    let unused = a_draft_holding_an_attachment(&harness);
+    let sent = a_draft_holding_an_attachment(&harness);
+    harness
+        .service
+        .record_prompt(
+            &harness.actor,
+            sent.draft_id,
+            session_id,
+            crate::support::an_application(),
+            &Admission::none(),
+        )
+        .expect("a prompt sends the draft");
+    let host = Host::new(Refuses::Never);
+    harness
+        .service
+        .draft_discard(
+            &harness.actor,
+            &DraftDiscardParams {
+                draft_id: unused.draft_id,
+            },
+            Some(&action(&harness, "draft.discard", b"unused", &host)),
+        )
+        .expect("under an admission that stands the unused draft is ended");
+    assert_eq!(host.committed.load(Ordering::SeqCst), 1);
+    let host = Host::new(Refuses::Never);
+    let kept = harness
+        .service
+        .draft_discard(
+            &harness.actor,
+            &DraftDiscardParams {
+                draft_id: sent.draft_id,
+            },
+            Some(&action(&harness, "draft.discard", b"sent", &host)),
+        )
+        .expect_err("a draft a prompt sent is in use");
+    assert_eq!(kept.code(), ErrorCode::DraftConflict);
 }
 
 /// An answer a call already holds is not a new effect and is not asked about: a repeat of a
