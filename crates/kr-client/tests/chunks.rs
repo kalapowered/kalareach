@@ -61,6 +61,11 @@ fn window(id: &str) -> ActionWindowId {
     ActionWindowId::new(id).expect("a window identifier")
 }
 
+/// A progress channel nobody watches.
+fn unwatched() -> tokio::sync::watch::Sender<uploads::Progress> {
+    tokio::sync::watch::channel(uploads::Progress::default()).0
+}
+
 fn digest(bytes: &[u8]) -> Digest256 {
     Digest256::from_bytes(kr_cbor::sha256(bytes))
 }
@@ -815,9 +820,16 @@ async fn a_full_chunk_travels_on_the_lane_under_the_window_the_host_renewed() {
     let bytes = pattern(UPLOAD_CHUNK_LEN + 10);
     let mut plan = Upload::new(host.subject(), Box::new(Held::new(bytes.clone())));
 
-    let handle = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL)
-        .await
-        .expect("the upload reaches a handle");
+    let handle = uploads::send(
+        &session,
+        &host.route(),
+        &host.target(),
+        &mut plan,
+        TTL,
+        &unwatched(),
+    )
+    .await
+    .expect("the upload reaches a handle");
     assert_eq!(handle.content_digest, digest(&bytes));
     assert_eq!(handle.byte_len.get(), bytes.len() as u64);
 
@@ -1029,9 +1041,16 @@ async fn the_driver_resumes_from_the_status_bitmap_after_its_lane_drops() {
     let bytes = pattern(3 * UPLOAD_CHUNK_LEN + 10);
     let mut plan = Upload::new(host.subject(), Box::new(Held::new(bytes.clone())));
 
-    let handle = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL)
-        .await
-        .expect("the upload resumes and reaches a handle");
+    let handle = uploads::send(
+        &session,
+        &host.route(),
+        &host.target(),
+        &mut plan,
+        TTL,
+        &unwatched(),
+    )
+    .await
+    .expect("the upload resumes and reaches a handle");
     assert_eq!(handle.content_digest, digest(&bytes));
     assert_eq!(Some(&handle.transfer_id), plan.transfer_id());
 
@@ -1050,18 +1069,32 @@ async fn a_plan_that_holds_a_transfer_starts_from_status() {
     let session = host.session().await;
     let bytes = pattern(UPLOAD_CHUNK_LEN + 10);
     let mut first = Upload::new(host.subject(), Box::new(Held::new(bytes.clone())));
-    let published = uploads::send(&session, &host.route(), &host.target(), &mut first, TTL)
-        .await
-        .expect("the upload reaches a handle");
+    let published = uploads::send(
+        &session,
+        &host.route(),
+        &host.target(),
+        &mut first,
+        TTL,
+        &unwatched(),
+    )
+    .await
+    .expect("the upload reaches a handle");
 
     let mut resumed = Upload::resuming(
         host.subject(),
         Box::new(Held::new(bytes)),
         published.transfer_id,
     );
-    let handle = uploads::send(&session, &host.route(), &host.target(), &mut resumed, TTL)
-        .await
-        .expect("the resumed plan reaches the published handle");
+    let handle = uploads::send(
+        &session,
+        &host.route(),
+        &host.target(),
+        &mut resumed,
+        TTL,
+        &unwatched(),
+    )
+    .await
+    .expect("the resumed plan reaches the published handle");
     assert_eq!(handle, published);
 
     let seen = host.seen();
@@ -1079,9 +1112,16 @@ async fn an_uncertain_reservation_is_never_reserved_again() {
     let session = host.session().await;
     let mut plan = Upload::new(host.subject(), Box::new(Held::new(pattern(4096))));
 
-    let uncertain = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL)
-        .await
-        .expect_err("the reservation's reply was lost");
+    let uncertain = uploads::send(
+        &session,
+        &host.route(),
+        &host.target(),
+        &mut plan,
+        TTL,
+        &unwatched(),
+    )
+    .await
+    .expect_err("the reservation's reply was lost");
     let ClientError::SubmissionUncertain { action_id } = uncertain else {
         panic!("the reservation is uncertain, not {uncertain}");
     };
@@ -1090,9 +1130,16 @@ async fn an_uncertain_reservation_is_never_reserved_again() {
     assert!(refused.to_string().contains(&action_id.to_string()));
 
     let reconnected = host.session().await;
-    let refused = uploads::send(&reconnected, &host.route(), &host.target(), &mut plan, TTL)
-        .await
-        .expect_err("a new session does not reserve again either");
+    let refused = uploads::send(
+        &reconnected,
+        &host.route(),
+        &host.target(),
+        &mut plan,
+        TTL,
+        &unwatched(),
+    )
+    .await
+    .expect_err("a new session does not reserve again either");
     assert_eq!(refused.code(), ErrorCode::OutcomeUnknown);
     assert_eq!(host.seen().reservations, 1);
 }
@@ -1107,19 +1154,40 @@ async fn never_reserved_twice(reply: Reply) -> ClientError {
     let session = host.session().await;
     let mut plan = Upload::new(host.subject(), Box::new(Held::new(pattern(4096))));
 
-    let first = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL)
-        .await
-        .expect_err("the reservation has no definite answer");
+    let first = uploads::send(
+        &session,
+        &host.route(),
+        &host.target(),
+        &mut plan,
+        TTL,
+        &unwatched(),
+    )
+    .await
+    .expect_err("the reservation has no definite answer");
     let refused = plan.next().expect_err("the plan will not reserve again");
     assert_eq!(refused.code(), ErrorCode::OutcomeUnknown);
-    let refused = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL)
-        .await
-        .expect_err("the same session does not reserve again");
+    let refused = uploads::send(
+        &session,
+        &host.route(),
+        &host.target(),
+        &mut plan,
+        TTL,
+        &unwatched(),
+    )
+    .await
+    .expect_err("the same session does not reserve again");
     assert_eq!(refused.code(), ErrorCode::OutcomeUnknown);
     let reconnected = host.session().await;
-    let refused = uploads::send(&reconnected, &host.route(), &host.target(), &mut plan, TTL)
-        .await
-        .expect_err("a new session does not reserve again either");
+    let refused = uploads::send(
+        &reconnected,
+        &host.route(),
+        &host.target(),
+        &mut plan,
+        TTL,
+        &unwatched(),
+    )
+    .await
+    .expect_err("a new session does not reserve again either");
     assert_eq!(refused.code(), ErrorCode::OutcomeUnknown);
     assert_eq!(host.seen().reservations, 1);
     first
@@ -1151,9 +1219,16 @@ async fn a_reservation_whose_receipt_says_it_never_took_effect_may_be_asked_for_
         let session = host.session().await;
         let mut plan = Upload::new(host.subject(), Box::new(Held::new(pattern(4096))));
 
-        let refused = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL)
-            .await
-            .expect_err("the host's receipt refuses the reservation");
+        let refused = uploads::send(
+            &session,
+            &host.route(),
+            &host.target(),
+            &mut plan,
+            TTL,
+            &unwatched(),
+        )
+        .await
+        .expect_err("the host's receipt refuses the reservation");
         // The receipt's own error when it carries one, and a refusal otherwise.
         let expected = if state == ReceiptState::Refused {
             ErrorCode::QuotaExceeded
@@ -1165,7 +1240,15 @@ async fn a_reservation_whose_receipt_says_it_never_took_effect_may_be_asked_for_
             matches!(plan.next(), Ok(uploads::Step::Begin(_))),
             "{state:?}: the plan may ask again"
         );
-        let _ = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL).await;
+        let _ = uploads::send(
+            &session,
+            &host.route(),
+            &host.target(),
+            &mut plan,
+            TTL,
+            &unwatched(),
+        )
+        .await;
         assert_eq!(host.seen().reservations, 2, "{state:?}: it asked again");
     }
 }
@@ -1184,7 +1267,8 @@ async fn a_reservation_abandoned_in_flight_is_never_reserved_again() {
     let route = host.route();
     let target = host.target();
     {
-        let first = uploads::send(&session, &route, &target, &mut plan, TTL);
+        let progress = unwatched();
+        let first = uploads::send(&session, &route, &target, &mut plan, TTL, &progress);
         tokio::pin!(first);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
@@ -1202,9 +1286,16 @@ async fn a_reservation_abandoned_in_flight_is_never_reserved_again() {
     }
     let refused = plan.next().expect_err("the plan will not reserve again");
     assert_eq!(refused.code(), ErrorCode::OutcomeUnknown);
-    let refused = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL)
-        .await
-        .expect_err("the plan does not reserve again");
+    let refused = uploads::send(
+        &session,
+        &host.route(),
+        &host.target(),
+        &mut plan,
+        TTL,
+        &unwatched(),
+    )
+    .await
+    .expect_err("the plan does not reserve again");
     assert_eq!(refused.code(), ErrorCode::OutcomeUnknown);
     assert_eq!(host.seen().reservations, 1);
 }
@@ -1225,9 +1316,16 @@ async fn a_reservation_that_never_left_the_client_may_be_asked_for_again() {
     let session = host.session().await;
     let mut plan = Upload::new(host.subject(), Box::new(Held::new(pattern(4096))));
 
-    let refused = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL)
-        .await
-        .expect_err("a session with no window sends no reservation");
+    let refused = uploads::send(
+        &session,
+        &host.route(),
+        &host.target(),
+        &mut plan,
+        TTL,
+        &unwatched(),
+    )
+    .await
+    .expect_err("a session with no window sends no reservation");
     assert!(matches!(refused, ClientError::NoActionWindow), "{refused}");
     assert!(matches!(plan.next(), Ok(uploads::Step::Begin(_))));
     assert_eq!(host.seen().reservations, 0);
@@ -1246,9 +1344,16 @@ async fn a_refused_reservation_may_be_asked_for_again() {
         },
         Box::new(Held::new(pattern(4096))),
     );
-    let refused = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL)
-        .await
-        .expect_err("the host refuses a reservation for another environment");
+    let refused = uploads::send(
+        &session,
+        &host.route(),
+        &host.target(),
+        &mut plan,
+        TTL,
+        &unwatched(),
+    )
+    .await
+    .expect_err("the host refuses a reservation for another environment");
     assert_ne!(refused.code(), ErrorCode::OutcomeUnknown);
     assert!(matches!(plan.next(), Ok(uploads::Step::Begin(_))));
 }
@@ -1509,9 +1614,16 @@ async fn a_chunk_refused_for_its_window_goes_once_more_on_a_new_lane() {
     let bytes = pattern(UPLOAD_CHUNK_LEN + 10);
     let mut plan = Upload::new(host.subject(), Box::new(Held::new(bytes.clone())));
 
-    let handle = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL)
-        .await
-        .expect("the upload goes on over a new lane");
+    let handle = uploads::send(
+        &session,
+        &host.route(),
+        &host.target(),
+        &mut plan,
+        TTL,
+        &unwatched(),
+    )
+    .await
+    .expect("the upload goes on over a new lane");
     assert_eq!(handle.content_digest, digest(&bytes));
     assert_eq!(
         host.seen().legs,
@@ -1531,9 +1643,16 @@ async fn a_chunk_refused_on_the_new_lane_too_ends_the_upload() {
     let session = host.session().await;
     let mut plan = Upload::new(host.subject(), Box::new(Held::new(pattern(4096))));
 
-    let refused = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL)
-        .await
-        .expect_err("the host refuses every chunk");
+    let refused = uploads::send(
+        &session,
+        &host.route(),
+        &host.target(),
+        &mut plan,
+        TTL,
+        &unwatched(),
+    )
+    .await
+    .expect_err("the host refuses every chunk");
     assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
     assert_eq!(
         host.seen().legs,

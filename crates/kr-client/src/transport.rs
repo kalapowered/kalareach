@@ -53,6 +53,25 @@ pub struct Reach {
 
 crate::debug_as_name!(Reach);
 
+/// Opens the data streams of one connection, each with its bounded header written first.
+///
+/// Only a transport that multiplexes streams has one ([`ControlTransport::stream_opener`]): a local
+/// socket carries the same control frames and has no streams to open.
+pub trait StreamOpener: Send + Sync + std::fmt::Debug {
+    /// Opens a data stream under `header`.
+    ///
+    /// The open waits for the host's stream credit and holds one of the connection's bulk slots
+    /// while it waits, and the write of the header waits for the host to take it. Neither has a
+    /// bound of its own, so a caller that must not wait for ever bounds the whole open itself; a
+    /// dropped open gives its slot back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::ConnectionEnded`] when the connection, or the sign-in it was opened
+    /// under, has ended, and otherwise the bulk-limit refusal or a stream failure.
+    fn open(&self, header: StreamHeader) -> TransportFuture<'_, DataStream>;
+}
+
 /// What a client needs from whichever transport it connected over.
 ///
 /// The trait is narrow on purpose: everything above it works in control frames and data streams,
@@ -134,6 +153,12 @@ pub trait ControlTransport: Send + Sync + std::fmt::Debug {
     /// Only the holder of the claim calls this.
     fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>>;
 
+    /// Returns the opener of this connection's data streams, or none for a transport that has no
+    /// data streams, which a route for an attachment stream refuses before it asks the host
+    /// anything. A transport that wraps another forwards the question, adding what it checks when
+    /// a stream opens.
+    fn stream_opener(&self) -> Option<Arc<dyn StreamOpener>>;
+
     /// Revokes every data stream, which is what the end of the control stream means.
     fn revoke_streams(&self);
 
@@ -152,6 +177,7 @@ pub struct NetworkTransport {
     /// Set once a session has claimed the receive side.
     claimed: std::sync::atomic::AtomicBool,
     streams: Arc<StreamRegistry>,
+    opener: Arc<NetworkStreams>,
     reach: Reach,
 }
 
@@ -189,6 +215,10 @@ impl NetworkTransport {
             None,
             authorised.selection.limits,
         ));
+        let opener = Arc::new(NetworkStreams {
+            connection: connection.clone(),
+            streams: Arc::clone(&streams),
+        });
         Ok(Self {
             connection,
             connection_id: authorised.connection_id,
@@ -198,32 +228,12 @@ impl NetworkTransport {
             reader: Mutex::new(Some(authorised.control_reader)),
             claimed: std::sync::atomic::AtomicBool::new(false),
             streams,
+            opener,
             reach: Reach {
                 host: format!("host:{}", host_record.device_id),
                 actor: format!("device:{}", identity.device_id),
             },
         })
-    }
-
-    /// Opens a data stream, sending its bounded header first.
-    ///
-    /// Data streams are the network transport's own: a local socket carries the same control frames
-    /// but has no streams to multiplex, so this is not part of [`ControlTransport`].
-    ///
-    /// # Errors
-    ///
-    /// Returns the bulk-limit refusal or a stream failure.
-    pub async fn open_stream(&self, header: StreamHeader) -> Result<DataStream> {
-        Ok(self.streams.open(&self.connection, header).await?)
-    }
-
-    /// Accepts a data stream the host opened.
-    ///
-    /// # Errors
-    ///
-    /// Returns a stream failure, or a refusal when the header does not belong to this connection.
-    pub async fn accept_stream(&self) -> Result<DataStream> {
-        Ok(self.streams.accept(&self.connection).await?)
     }
 
     /// Returns a sender that can be held without the transport.
@@ -232,6 +242,20 @@ impl NetworkTransport {
         ControlSender {
             writer: Arc::clone(&self.writer),
         }
+    }
+}
+
+/// The data streams of a connection to a paired host.
+struct NetworkStreams {
+    connection: Connection,
+    streams: Arc<StreamRegistry>,
+}
+
+crate::debug_as_name!(NetworkStreams);
+
+impl StreamOpener for NetworkStreams {
+    fn open(&self, header: StreamHeader) -> TransportFuture<'_, DataStream> {
+        Box::pin(async move { Ok(self.streams.open(&self.connection, header).await?) })
     }
 }
 
@@ -326,6 +350,10 @@ impl ControlTransport for NetworkTransport {
             }
             Ok(frame)
         })
+    }
+
+    fn stream_opener(&self) -> Option<Arc<dyn StreamOpener>> {
+        Some(Arc::clone(&self.opener) as Arc<dyn StreamOpener>)
     }
 
     fn revoke_streams(&self) {

@@ -2512,8 +2512,11 @@ impl RawDevice {
         &self,
         header: kr_protocol::frame::StreamHeader,
     ) -> kr_transport::streams::DataStream {
+        use kr_client::transport::ControlTransport as _;
         self.transport
-            .open_stream(header)
+            .stream_opener()
+            .expect("a network transport has data streams")
+            .open(header)
             .await
             .expect("the stream opens")
     }

@@ -139,6 +139,10 @@ impl ControlTransport for Lossy {
         self.inner.claim_receiver()
     }
 
+    fn stream_opener(&self) -> Option<Arc<dyn kr_client::transport::StreamOpener>> {
+        self.inner.stream_opener()
+    }
+
     fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>> {
         Box::pin(async move {
             let frame = self.inner.recv().await?;

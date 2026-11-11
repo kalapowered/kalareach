@@ -519,10 +519,43 @@ pub const MAX_UNRESOLVED_ACTIONS: usize = 1024;
 /// establish. The host recorded nothing of them, so the oldest are let go past this.
 const MAX_REFUSED_FOR_NOW: usize = 64;
 
+/// An action window the host issued to a connection, and when this client received it.
+///
+/// A window's age is counted from when it arrived and not from the host's clock, which this client
+/// cannot see: the host issues a window for a stated validity and renews it when half of that has
+/// passed.
+#[derive(Clone)]
+pub(crate) struct Issued {
+    pub(crate) window: ActionWindow,
+    pub(crate) received_at: tokio::time::Instant,
+}
+
+impl Issued {
+    /// How long the host said the window stands, from when it was issued.
+    pub(crate) fn validity(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.window.valid_for_ms.get())
+    }
+}
+
+/// What a lane that sends an upload's chunks on a data stream takes from the session: the windows
+/// its reader receives, the counter request identifiers come from, and the transport.
+///
+/// A data stream runs under its connection's registration, grant, scope and windows, so the window
+/// a chunk carries is the one the control stream's reader last delivered, and a request identifier
+/// has to be unique among all the connection's, which the session's counter makes it.
+#[derive(Clone)]
+pub(crate) struct LaneSupport {
+    pub(crate) windows: tokio::sync::watch::Receiver<Issued>,
+    pub(crate) requests: Arc<AtomicU64>,
+    pub(crate) transport: Arc<dyn ControlTransport>,
+}
+
 /// The shared state of one connection.
 struct SessionState {
     waiters: std::sync::Mutex<Waiters>,
-    action_window: Mutex<ActionWindow>,
+    /// The window the host last issued, which the reader replaces as each renewal arrives. A holder
+    /// that waits for the next renewal waits on this.
+    action_window: tokio::sync::watch::Sender<Issued>,
     /// Every action window the host issued to this connection, the current one included. A window
     /// admits a request on the connection it was issued to and on no other, so a request carrying
     /// one of these is one this connection could admit.
@@ -584,7 +617,9 @@ pub struct Session {
     id: u64,
     transport: Arc<dyn ControlTransport>,
     state: Arc<SessionState>,
-    next_request_id: AtomicU64,
+    /// The next request identifier, shared with the lanes that send on data streams of this
+    /// connection.
+    next_request_id: Arc<AtomicU64>,
     reader: tokio::task::JoinHandle<()>,
 }
 
@@ -624,7 +659,11 @@ impl Session {
         let state = Arc::new(SessionState {
             waiters: std::sync::Mutex::new(Waiters::default()),
             issued_windows: std::sync::Mutex::new(vec![initial.action_window_id.clone()]),
-            action_window: Mutex::new(initial),
+            action_window: tokio::sync::watch::channel(Issued {
+                window: initial,
+                received_at: tokio::time::Instant::now(),
+            })
+            .0,
             cursors: Mutex::new(cursors),
             outcomes: Mutex::new(Outcomes::default()),
             events,
@@ -639,9 +678,18 @@ impl Session {
             id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
             transport,
             state,
-            next_request_id: AtomicU64::new(1),
+            next_request_id: Arc::new(AtomicU64::new(1)),
             reader,
         })
+    }
+
+    /// What a lane for this connection's data streams takes from the session.
+    pub(crate) fn lane_support(&self) -> LaneSupport {
+        LaneSupport {
+            windows: self.state.action_window.subscribe(),
+            requests: Arc::clone(&self.next_request_id),
+            transport: Arc::clone(&self.transport),
+        }
     }
 
     /// The host this connection reaches and the actor it acts as, when the transport can say.
@@ -658,7 +706,7 @@ impl Session {
 
     /// Returns the action window the host last issued.
     pub async fn action_window(&self) -> ActionWindow {
-        self.state.action_window.lock().await.clone()
+        self.state.action_window.borrow().window.clone()
     }
 
     /// Subscribes to the events the host sends on this connection.
@@ -1048,13 +1096,13 @@ impl Session {
         // the accepted deadline from whichever bound is earliest, and a window it did not need
         // costs nothing.
         let action_window_id = {
-            let window = self.state.action_window.lock().await;
+            let issued = self.state.action_window.borrow();
             if entry.freshness == FreshnessRequirement::ActionWindow
-                && window.valid_for_ms.get() == 0
+                && issued.window.valid_for_ms.get() == 0
             {
                 return Err(ClientError::NoActionWindow);
             }
-            window.action_window_id.clone()
+            issued.window.action_window_id.clone()
         };
 
         let action_id = identity.action_id()?;
@@ -1187,13 +1235,13 @@ impl Session {
             });
         }
         let window = {
-            let window = self.state.action_window.lock().await;
+            let issued = self.state.action_window.borrow();
             if entry.freshness == FreshnessRequirement::ActionWindow
-                && window.valid_for_ms.get() == 0
+                && issued.window.valid_for_ms.get() == 0
             {
                 return Err(ClientError::NoActionWindow);
             }
-            window.clone()
+            issued.window.clone()
         };
         let request = MutationRequest {
             // Replaced by whichever session sends it.
@@ -1783,7 +1831,10 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
                     issued.push(window.action_window_id.clone());
                 }
             }
-            *state.action_window.lock().await = window;
+            state.action_window.send_replace(Issued {
+                window,
+                received_at: tokio::time::Instant::now(),
+            });
         }
         ControlFrame::Event(ControlEvent::Keepalive) => {}
         // A client never receives a request or a mutation: the host does not call the client. The

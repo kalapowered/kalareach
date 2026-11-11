@@ -33,7 +33,7 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 use crate::error::{ClientError, Result};
-use crate::transport::{ControlTransport, Reach, TransportFuture};
+use crate::transport::{ControlTransport, Reach, StreamOpener, TransportFuture};
 
 /// What the host stamped on a local connection, in place of a device proof.
 ///
@@ -329,6 +329,10 @@ impl ControlTransport for IpcTransport {
             return Err(ClientError::ConnectionEnded);
         }
         Ok(())
+    }
+
+    fn stream_opener(&self) -> Option<Arc<dyn StreamOpener>> {
+        None
     }
 
     fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>> {
