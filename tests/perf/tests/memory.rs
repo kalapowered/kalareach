@@ -243,19 +243,55 @@ fn a_written_page_of_a_private_file_mapping_and_a_shared_page_with_no_inode_coun
     );
 }
 
-/// A page that is not in memory is not counted, as in a resident size.
+/// KR-PERF-003: a page in swap is not resident, so it is not among the pages in memory; it is counted
+/// apart for each process whose page map shows it, and the figure the bound is held to includes it,
+/// so that a reading taken on a host that swaps does not read lower than the same group's resident
+/// size on a host that does not.
 #[test]
-fn a_page_that_is_swapped_out_is_not_counted() {
-    let mut stand = Stand::new(40);
-    stand.map(16, 8, 0, "00:00", 0, "");
-    stand.resident(16, 3, Page::Own);
-    stand.resident(19, 3, Page::Swapped);
-    let (_dir, proc) = tree(&[stand]);
+fn a_page_in_swap_is_counted_apart_for_each_process_that_shows_it_and_the_held_figure_includes_it()
+{
+    let mut first = Stand::new(40);
+    first.map(16, 8, 0, "00:00", 0, "");
+    first.resident(16, 3, Page::Own);
+    first.resident(19, 3, Page::Swapped);
+    let mut second = Stand::new(41);
+    second.map(16, 8, 0, "00:00", 0, "");
+    second.resident(16, 1, Page::Own);
+    second.resident(17, 2, Page::Swapped);
+    let (_dir, proc) = tree(&[first, second]);
 
-    let reading = proc.read(&group(&[40])).expect("a reading");
+    let reading = proc.read(&group(&[40, 41])).expect("a reading");
 
-    assert_eq!(reading.resident_kib, 3 * 4);
-    assert_eq!(reading.combined_kib, 3 * 4);
+    assert_eq!(
+        reading.resident_kib,
+        4 * 4,
+        "only the pages in memory are resident"
+    );
+    assert_eq!(reading.combined_kib, 4 * 4);
+    assert_eq!(
+        reading.swapped_kib,
+        5 * 4,
+        "each process counts the pages its map shows"
+    );
+    assert_eq!(
+        reading.held_kib(),
+        9 * 4,
+        "the held figure is memory and swap"
+    );
+    let class = reading.class("group").expect("the class");
+    assert_eq!(
+        class.swapped_kib,
+        5 * 4,
+        "the class shows its own pages in swap"
+    );
+
+    let mut lines = reading.to_lines();
+    lines.push("memory.end".to_owned());
+    assert_eq!(
+        Reading::from_lines(lines.iter().map(String::as_str)),
+        Ok(reading),
+        "and the pages in swap are what the caller reads back"
+    );
 }
 
 /// The mapping the kernel never lets a program read lies beyond the page map of any process, and

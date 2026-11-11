@@ -1004,16 +1004,22 @@ async fn held_memory(
             .map_err(|error| format!("the memory reading's thread: {error}"))?
             .map_err(|reason| format!("the memory the group holds could not be read: {reason}"))?;
     let class = |name: &str| {
-        reading
-            .class(name)
-            .map_or((0, 0), |class| (class.combined_kib, class.resident_kib))
+        reading.class(name).map_or((0, 0, 0), |class| {
+            (class.combined_kib, class.resident_kib, class.swapped_kib)
+        })
     };
     let mut lines = vec![
         format!(
-            "  resident set      {} KiB with each resident page counted once for the group, \
-             against {RESIDENT_BOUND_KIB} KiB: the asserted figure ({} KiB of it is counted for \
-             each process that holds it, and {} KiB is file pages counted once)",
-            reading.combined_kib, reading.own_kib, reading.files_kib
+            "  resident set      {} KiB with each resident page counted once for the group and \
+             each page in swap counted for each process that shows it, against \
+             {RESIDENT_BOUND_KIB} KiB: the asserted figure ({} KiB in memory, of which {} KiB is \
+             counted for each process that holds it and {} KiB is file pages counted once, and \
+             {} KiB in swap)",
+            reading.held_kib(),
+            reading.combined_kib,
+            reading.own_kib,
+            reading.files_kib,
+            reading.swapped_kib
         ),
         format!(
             "  by class          held, then the resident pages the scan counted for each process: the \
@@ -1029,10 +1035,19 @@ async fn held_memory(
             class("root_shells").1
         ),
         format!(
-            "  scan              {} KiB counted for each process against the process table's \
-             {sum} KiB, {} KiB of it beyond the kernel's own resident sizes (zero pages and huge \
-             pages, which a resident size leaves out)",
-            reading.resident_kib, reading.beyond_kib
+            "  scan              present {} KiB counted for each process (daemon {}, session \
+             workers {}, root shells {}) against the process table's {sum} KiB, {} KiB of it \
+             beyond the kernel's own resident sizes (zero pages and huge pages, which a resident \
+             size leaves out); in swap {} KiB (daemon {}, session workers {}, root shells {})",
+            reading.resident_kib,
+            class("daemon").1,
+            class("session_workers").1,
+            class("root_shells").1,
+            reading.beyond_kib,
+            reading.swapped_kib,
+            class("daemon").2,
+            class("session_workers").2,
+            class("root_shells").2
         ),
     ];
     let program_line = program
@@ -1063,7 +1078,7 @@ async fn held_memory(
             .collect::<Vec<_>>()
             .join(", ")
     ));
-    Ok((Some(reading.combined_kib), lines))
+    Ok((Some(reading.held_kib()), lines))
 }
 
 /// Where the memory the group holds cannot be read, the memory bound is held to the sum.

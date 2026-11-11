@@ -119,9 +119,13 @@ against 512,000 KiB:
   written, a shared page with no inode) is counted for each process that maps it. Pages shared
   through a fork, or merged by the kernel, are counted for each process, so the figure can only be
   above the physical set there.
-- A swapped page is not resident and not counted. A page the page map shows as present counts,
-  including the zero page that a read of untouched memory maps, which the kernel's own resident size
-  leaves out; the excess over the kernel's sizes is recorded on the `scan` line. A scan that finds
+- A page in swap is not resident, but it is counted for each process whose page map shows it, and
+  the figure asserted includes it, so that a reading taken on a host that swaps does not read lower
+  than the group's resident size on a host that does not. The `scan` line gives the pages present
+  and the pages in swap for each class.
+- A page the page map shows as present counts, including the zero page that a read of untouched
+  memory maps, which the kernel's own resident size leaves out; the excess over the kernel's sizes
+  is recorded on the `scan` line. A scan that finds
   fewer pages than a process's kernel resident size, by more than the larger of 64 KiB and one per
   cent, has lost pages: the reading is refused and the measurement fails with the process named.
   A scan inside that tolerance is accepted, so the reading can fall short of what a process holds

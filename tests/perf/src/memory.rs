@@ -20,7 +20,10 @@
 //! the kernel's size, and the excess is kept in [`Reading::beyond_kib`]. A scan that finds fewer
 //! pages than the kernel's resident size by more than the larger of 64 KiB and one per cent has lost
 //! some and is refused, so an accepted reading can fall short of the pages a process holds by up to
-//! that much. Swapped pages are not resident and not counted, as in a resident size.
+//! that much. A page in swap (bit 62 of its entry) is not resident, but it is counted apart for the
+//! process whose page map shows it, and the figure the bound is held to includes it
+//! ([`Reading::held_kib`]): a reading taken while the host swaps must not read lower than the same
+//! group's resident size on a host that does not.
 //!
 //! A reading that cannot be taken whole is a refusal that names the process and what failed, never a
 //! smaller figure. A process is scanned at most [`ATTEMPTS`] times in all, and again only when its
@@ -41,6 +44,10 @@ const PRESENT: u64 = 1 << 63;
 
 /// The page map's bit for a page of a file or of shared memory.
 const FILE_OR_SHARED: u64 = 1 << 61;
+
+/// The page map's bit for a page that is in swap; it means something only where [`PRESENT`] is
+/// clear.
+const SWAPPED: u64 = 1 << 62;
 
 /// How many page map entries one read takes.
 const CHUNK_PAGES: u64 = 1 << 16;
@@ -86,8 +93,10 @@ pub struct ClassReading {
     pub own_kib: u64,
     /// The file pages, each once for the class.
     pub files_kib: u64,
-    /// `own_kib` and `files_kib` together.
+    /// `own_kib` and `files_kib` together: the pages in memory.
     pub combined_kib: u64,
+    /// The pages in swap, counted for each process whose page map shows them.
+    pub swapped_kib: u64,
 }
 
 /// What a file holds in the group, in kibibytes.
@@ -112,8 +121,11 @@ pub struct Reading {
     pub own_kib: u64,
     /// The file pages, each once for the group.
     pub files_kib: u64,
-    /// `own_kib` and `files_kib` together: the memory the group holds.
+    /// `own_kib` and `files_kib` together: the memory the group holds in memory.
     pub combined_kib: u64,
+    /// The pages in swap, counted for each process whose page map shows them. They are not
+    /// resident, and a host that does not swap would have them resident.
+    pub swapped_kib: u64,
     /// How far the scan's pages are above the kernel's own resident sizes, in all: the zero pages
     /// and huge pages it leaves out of a resident size.
     pub beyond_kib: u64,
@@ -131,6 +143,12 @@ impl Reading {
         self.files.iter().find(|file| file.path == path)
     }
 
+    /// The figure the memory bound is held to: the pages in memory and the pages in swap.
+    #[must_use]
+    pub fn held_kib(&self) -> u64 {
+        self.combined_kib + self.swapped_kib
+    }
+
     /// The reading of one class.
     #[must_use]
     pub fn class(&self, name: &str) -> Option<&ClassReading> {
@@ -141,23 +159,25 @@ impl Reading {
     #[must_use]
     pub fn to_lines(&self) -> Vec<String> {
         let mut lines = vec![format!(
-            "memory.group {} {} {} {} {} {}",
+            "memory.group {} {} {} {} {} {} {}",
             self.processes,
             self.resident_kib,
             self.own_kib,
             self.files_kib,
             self.combined_kib,
-            self.beyond_kib
+            self.beyond_kib,
+            self.swapped_kib
         )];
         for class in &self.classes {
             lines.push(format!(
-                "memory.class {} {} {} {} {} {}",
+                "memory.class {} {} {} {} {} {} {}",
                 class.name,
                 class.processes,
                 class.resident_kib,
                 class.own_kib,
                 class.files_kib,
-                class.combined_kib
+                class.combined_kib,
+                class.swapped_kib
             ));
         }
         for file in &self.files {
@@ -197,7 +217,15 @@ impl Reading {
                 ended = true;
             } else if let Some(rest) = line.strip_prefix("memory.group ") {
                 let fields: Vec<&str> = rest.split(' ').collect();
-                let [processes, resident, own, files_kib, combined, beyond] = numbers(&fields)?[..]
+                let [
+                    processes,
+                    resident,
+                    own,
+                    files_kib,
+                    combined,
+                    beyond,
+                    swapped,
+                ] = numbers(&fields)?[..]
                 else {
                     return Err("the reader's group line has the wrong number of fields".to_owned());
                 };
@@ -207,6 +235,7 @@ impl Reading {
                     own_kib: own,
                     files_kib,
                     combined_kib: combined,
+                    swapped_kib: swapped,
                     beyond_kib: beyond,
                     classes: Vec::new(),
                     files: Vec::new(),
@@ -216,7 +245,9 @@ impl Reading {
                 let [name, numeric @ ..] = &fields[..] else {
                     return Err("the reader's class line is empty".to_owned());
                 };
-                let [processes, resident, own, files_kib, combined] = numbers(numeric)?[..] else {
+                let [processes, resident, own, files_kib, combined, swapped] =
+                    numbers(numeric)?[..]
+                else {
                     return Err("the reader's class line has the wrong number of fields".to_owned());
                 };
                 classes.push(ClassReading {
@@ -226,6 +257,7 @@ impl Reading {
                     own_kib: own,
                     files_kib,
                     combined_kib: combined,
+                    swapped_kib: swapped,
                 });
             } else if let Some(rest) = line.strip_prefix("memory.file ") {
                 let mut fields = rest.splitn(3, ' ');
@@ -361,6 +393,8 @@ type FilePage = (String, u64, u64);
 struct Scan {
     /// The pages found resident.
     resident: u64,
+    /// The pages found in swap.
+    swapped: u64,
     /// The pages that count for this process alone.
     own: u64,
     /// The file pages it maps.
@@ -446,6 +480,7 @@ impl Proc {
         })?;
         let mut scan = Scan {
             resident: 0,
+            swapped: 0,
             own: 0,
             files: HashSet::new(),
             by_file: HashMap::new(),
@@ -482,6 +517,9 @@ impl Proc {
                 for (index, entry) in bytes.chunks_exact(8).enumerate() {
                     let entry = u64::from_ne_bytes(entry.try_into().unwrap_or([0; 8]));
                     if entry & PRESENT == 0 {
+                        if entry & SWAPPED != 0 {
+                            scan.swapped += 1;
+                        }
                         continue;
                     }
                     scan.resident += 1;
@@ -528,12 +566,14 @@ impl Proc {
         let mut each_by_file: HashMap<(String, u64), (String, u64)> = HashMap::new();
         let mut kinds = Vec::new();
         let mut resident = 0;
+        let mut swapped = 0;
         let mut own = 0;
         let mut beyond_kib = 0;
         let mut processes = 0;
         for class in classes {
             let mut within: HashSet<FilePage> = HashSet::new();
             let mut class_resident = 0;
+            let mut class_swapped = 0;
             let mut class_own = 0;
             for &pid in &class.pids {
                 let scan = with_retries(|| self.scan(pid)).map_err(|reason| {
@@ -541,6 +581,7 @@ impl Proc {
                 })?;
                 processes += 1;
                 class_resident += scan.resident;
+                class_swapped += scan.swapped;
                 class_own += scan.own;
                 beyond_kib += scan.beyond_kib;
                 for (file, (path, pages)) in scan.by_file {
@@ -550,6 +591,7 @@ impl Proc {
                 whole.extend(scan.files);
             }
             resident += class_resident;
+            swapped += class_swapped;
             own += class_own;
             kinds.push(ClassReading {
                 name: class.name.clone(),
@@ -558,6 +600,7 @@ impl Proc {
                 own_kib: kib(class_own),
                 files_kib: kib(within.len() as u64),
                 combined_kib: kib(class_own + within.len() as u64),
+                swapped_kib: kib(class_swapped),
             });
         }
         let mut once_by_file: BTreeMap<(String, u64), u64> = BTreeMap::new();
@@ -592,6 +635,7 @@ impl Proc {
             own_kib: kib(own),
             files_kib: kib(whole.len() as u64),
             combined_kib: kib(own + whole.len() as u64),
+            swapped_kib: kib(swapped),
             beyond_kib,
             classes: kinds,
             files,
