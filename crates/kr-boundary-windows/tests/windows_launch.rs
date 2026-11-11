@@ -1542,6 +1542,47 @@ fn a_program_started_with_the_brokers_own_token_runs_and_is_read_to_its_end_for_
     assert!(held.stderr.is_empty(), "nothing on standard error");
 }
 
+/// The application-control log's last words, which the proof quotes when its search fails, are read
+/// by one query of the installer's own token, for the system and for an elevated administrator. The
+/// query ends well inside the reserve that the proof keeps for it, so that a query that began at the
+/// start of the reserve never enters the reserve's last two seconds, where the program of a run has
+/// no time left; and a query that begins when the deadline has passed reads nothing.
+#[test]
+#[ignore = "needs an elevated session in a disposable Windows guest (see the file's header)"]
+fn the_logs_last_words_are_read_well_inside_their_reserve_for_the_system_and_for_an_elevated_administrator()
+ {
+    let system = PathBuf::from(system_windows_directory().unwrap());
+    let scratch = std::env::temp_dir();
+    let env = build_env(
+        Kind::Proof,
+        &RootPaths {
+            system: system.display().to_string(),
+            boundary: r"C:\Program Files\KalaReach\Boundary".to_owned(),
+            private_root: scratch.display().to_string(),
+        },
+        None,
+        &QualifiedGit {
+            dir: GUEST_GIT.to_owned(),
+        },
+    )
+    .unwrap();
+    let reserve = Duration::from_secs(20);
+    let begun = Instant::now();
+    let words = kr_boundary_windows::win::applocker::latest(&scratch, &env, begun + reserve)
+        .expect("the log's last words are read");
+    let took = begun.elapsed();
+    println!("the log's last words were read in {took:?}: {words}");
+    assert!(!words.is_empty(), "the words or `nothing`");
+    assert!(
+        took + Duration::from_secs(2) < reserve,
+        "the query did not enter the last two seconds of its reserve: {took:?}"
+    );
+    assert!(
+        kr_boundary_windows::win::applocker::latest(&scratch, &env, Instant::now()).is_err(),
+        "a deadline that has passed reads nothing"
+    );
+}
+
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_launch_that_cannot_use_the_job_attribute_starts_nothing() {
