@@ -6,12 +6,18 @@
 //! file to it in order, so that a journal that was damaged or written by something else cannot be
 //! mistaken for a complete one: a row out of order marks the invocation unreadable, which keeps its
 //! tree blocked and is reported.
+//!
+//! The order is this. A process that started, or an end that was reported uncertain, leaves the end
+//! unproved until a row says the job ended; no release, no verification, no removal of the root and
+//! no end comes while the end is unproved. A release that begins after a verification makes the
+//! verification void. Nothing follows the end but the clearing of a leftover of the private root
+//! and the removal of the root itself.
 
 use std::collections::BTreeMap;
 
 use crate::filekey::FileKey;
 
-use super::framing::{self, FramingError};
+use super::framing;
 use super::rows::{LeftoverClass, RootName, Row};
 
 /// Where an invocation stands.
@@ -75,6 +81,7 @@ pub struct Tracker {
     released: u64,
     process: Option<(u32, u64)>,
     job_ended: bool,
+    unproved: bool,
     uncertain: bool,
     release_verified: bool,
     ended: bool,
@@ -104,6 +111,7 @@ impl Tracker {
             released: 0,
             process: None,
             job_ended: false,
+            unproved: false,
             uncertain: false,
             release_verified: false,
             ended: false,
@@ -145,6 +153,9 @@ impl Tracker {
                 }
                 _ => wrong("the first row is not the one that begins the invocation"),
             };
+        }
+        if self.ended && !matches!(row, Row::LeftoverCleared { .. } | Row::RootRemoved) {
+            return wrong("a row follows the end of the invocation");
         }
         match row {
             Row::Begin { .. } => wrong("the invocation began twice"),
@@ -194,23 +205,29 @@ impl Tracker {
                     return wrong("a second primary process is recorded");
                 }
                 self.process = Some((*pid, *creation_time));
+                self.unproved = true;
+                self.job_ended = false;
                 Ok(())
             }
             Row::JobEnded => {
+                self.unproved = false;
+                self.uncertain = false;
                 self.job_ended = true;
                 Ok(())
             }
             Row::EndUncertain { .. } => {
-                if self.ended {
-                    return wrong("the end is not proved after the invocation ended");
-                }
+                self.unproved = true;
                 self.uncertain = true;
+                self.job_ended = false;
                 Ok(())
             }
             Row::ReleaseIntent { key, .. } => {
-                if self.uncertain {
+                if self.unproved {
                     return wrong("a release is begun while the end is not proved");
                 }
+                // A release that begins after the verification means the verification no longer
+                // holds.
+                self.release_verified = false;
                 self.pending_releases.insert(*key, ());
                 Ok(())
             }
@@ -222,6 +239,9 @@ impl Tracker {
                 Ok(())
             }
             Row::ReleaseVerified { leftovers, .. } => {
+                if self.unproved {
+                    return wrong("the release is verified while the end is not proved");
+                }
                 if !self.pending_releases.is_empty() {
                     return wrong(
                         "the release is verified with objects whose release is not written",
@@ -230,11 +250,13 @@ impl Tracker {
                 if self.slot_leftovers() != 0 || *leftovers != 0 {
                     return wrong("the release is verified while a leftover is open");
                 }
-                self.uncertain = false;
                 self.release_verified = true;
                 Ok(())
             }
             Row::RootRemoved => {
+                if self.unproved {
+                    return wrong("the root is removed while the end is not proved");
+                }
                 if !matches!(self.root, RootState::Made(..)) {
                     return wrong("a root is removed that was not made");
                 }
@@ -283,8 +305,8 @@ impl Tracker {
                 Ok(())
             }
             Row::End { root_leftovers } => {
-                if self.ended {
-                    return wrong("the invocation ended twice");
+                if self.unproved {
+                    return wrong("the invocation ends while its end is not proved");
                 }
                 if !self.release_verified {
                     return wrong("the invocation ends before its release was verified");
@@ -389,6 +411,19 @@ pub struct Invocation {
     pub damage: Option<String>,
 }
 
+impl Invocation {
+    /// Whether recovery has something to do with it: the invocation did not finish, or it finished
+    /// with a leftover of its private root that the sweep still carries (its tree's slot is free).
+    #[must_use]
+    pub fn needs_recovery(&self) -> bool {
+        self.standing != Standing::Finished || !self.tracker.leftovers().is_empty()
+    }
+}
+
+/// The most bytes of a journal file that are read. A file longer than this is read up to the limit
+/// and its invocation is unreadable.
+pub const MAX_FILE: usize = 128 * 1024 * 1024;
+
 /// What a file turned out to be.
 #[derive(Debug)]
 pub enum Reading {
@@ -398,17 +433,23 @@ pub enum Reading {
     Invocation(Box<Invocation>),
 }
 
-/// Reads one journal file's bytes.
+/// Reads one journal file's bytes, up to [`MAX_FILE`].
 ///
 /// A file whose first row is missing or torn describes an invocation that made nothing. A torn
-/// tail is dropped. A damaged record that is followed by a valid one, a row that is not a row and
-/// a row out of order make the invocation unreadable.
+/// tail is dropped. A damaged record that is not a torn tail, a row that is not a row, a row out of
+/// order, a first row that begins another invocation than the file's name says and a file longer
+/// than the limit make the invocation unreadable, and the rows before the damage are kept.
 #[must_use]
 pub fn read_file(id: &str, bytes: &[u8], current_boot: &str) -> Reading {
-    let reading = match framing::read_all(bytes) {
-        Ok(reading) => reading,
-        Err(error) => return unreadable(id, error, bytes.len()),
-    };
+    read_file_limited(id, bytes, current_boot, MAX_FILE)
+}
+
+/// [`read_file`] with the limit named.
+#[must_use]
+pub fn read_file_limited(id: &str, bytes: &[u8], current_boot: &str, limit: usize) -> Reading {
+    let too_long = bytes.len() > limit;
+    let bytes = &bytes[..bytes.len().min(limit)];
+    let reading = framing::read_all(bytes);
     let mut tracker = Tracker::new();
     let mut rows = Vec::new();
     let mut damage = None;
@@ -424,7 +465,20 @@ pub fn read_file(id: &str, bytes: &[u8], current_boot: &str) -> Reading {
             damage = Some(format!("record {index}: {error}"));
             break;
         }
+        let began_another = matches!(&row, Row::Begin { invocation, .. } if invocation != id);
         rows.push(row);
+        if began_another {
+            damage = Some(format!(
+                "record {index} begins another invocation than the file's name, {id}"
+            ));
+            break;
+        }
+    }
+    if damage.is_none() {
+        damage = reading.damage.as_ref().map(ToString::to_string);
+    }
+    if damage.is_none() && too_long {
+        damage = Some(format!("the journal is longer than {limit} bytes"));
     }
     if rows.is_empty() && damage.is_none() {
         return Reading::MadeNothing;
@@ -444,18 +498,5 @@ pub fn read_file(id: &str, bytes: &[u8], current_boot: &str) -> Reading {
         torn_bytes: reading.torn_len(bytes.len()),
         valid_len: reading.valid_len,
         damage,
-    }))
-}
-
-fn unreadable(id: &str, error: FramingError, length: usize) -> Reading {
-    Reading::Invocation(Box::new(Invocation {
-        id: id.to_owned(),
-        rows: Vec::new(),
-        tracker: Tracker::new(),
-        standing: Standing::Unreadable,
-        same_boot: false,
-        torn_bytes: 0,
-        valid_len: length,
-        damage: Some(error.to_string()),
     }))
 }

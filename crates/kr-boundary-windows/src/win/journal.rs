@@ -8,7 +8,7 @@
 //! refused here and never reaches the file.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Seek as _, SeekFrom, Write as _};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
@@ -16,7 +16,7 @@ use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_WRITE_THROUGH, FILE_SHAR
 
 use crate::filekey::FileKey;
 use crate::journal::framing::{self, FramingError};
-use crate::journal::replay::{self, Invocation, OrderError, Reading, Standing, Tracker};
+use crate::journal::replay::{self, Invocation, MAX_FILE, OrderError, Reading, Standing, Tracker};
 use crate::journal::rows::{RootName, Row};
 
 use super::launch::{InvocationId, ResumePermit, SuspendedChild};
@@ -68,6 +68,16 @@ pub fn file_name(invocation: InvocationId) -> String {
     format!("{}.{EXTENSION}", hex::encode(invocation.0))
 }
 
+/// Reads a journal file, at most one byte more than the limit: the reader sees from the excess that
+/// the file is too long and leaves the rest unread.
+fn read_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(MAX_FILE as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 fn open(path: &Path, create: bool) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options
@@ -112,7 +122,7 @@ impl Journal {
         current_boot: &str,
     ) -> Result<(Journal, Invocation), JournalError> {
         let path = dir.join(file_name(invocation));
-        let bytes = std::fs::read(&path)?;
+        let bytes = read_bounded(&path)?;
         let id = hex::encode(invocation.0);
         let found = match replay::read_file(&id, &bytes, current_boot) {
             Reading::MadeNothing => {
@@ -226,10 +236,12 @@ impl RootRows for Journal {
     }
 }
 
-/// Reads every journal in the directory and returns the invocations that did not finish: those that
-/// did not end, those that ended with a leftover that holds the tree's slot, those whose end is not
-/// proved and those whose file cannot be read. A file whose first row is missing made nothing and is
-/// left out. `current_boot` is the boot marker now, which each invocation's own is compared with.
+/// Reads every journal in the directory (each up to a bound) and returns the invocations that recovery
+/// has something to do with: those that did not end, those that ended with a leftover that holds the
+/// tree's slot, those whose end is not proved, those whose file cannot be read, and those that
+/// ended with a leftover of the private root that the sweep still carries (their tree's slot is
+/// free). A file whose first row is missing made nothing and is left out. `current_boot` is the
+/// boot marker now, which each invocation's own is compared with.
 ///
 /// # Errors
 ///
@@ -244,9 +256,9 @@ pub fn replay(dir: &Path, current_boot: &str) -> Result<Vec<Invocation>, Journal
         let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        let bytes = std::fs::read(&path)?;
+        let bytes = read_bounded(&path)?;
         if let Reading::Invocation(invocation) = replay::read_file(id, &bytes, current_boot)
-            && invocation.standing != Standing::Finished
+            && invocation.needs_recovery()
         {
             found.push(*invocation);
         }

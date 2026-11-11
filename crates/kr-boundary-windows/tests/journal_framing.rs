@@ -35,7 +35,8 @@ fn a_record_is_its_length_its_bytes_and_a_checksum_of_both() {
 #[test]
 fn records_come_back_in_order_with_nothing_dropped() {
     let bytes = journal(&[b"begin", b"", b"a longer row with \0 and \n inside", b"end"]);
-    let reading = read_all(&bytes).unwrap();
+    let reading = read_all(&bytes);
+    assert_eq!(reading.damage, None);
     assert_eq!(
         reading.records,
         [
@@ -47,7 +48,7 @@ fn records_come_back_in_order_with_nothing_dropped() {
     );
     assert_eq!(reading.valid_len, bytes.len());
     assert_eq!(reading.torn_len(bytes.len()), 0);
-    assert!(read_all(b"").unwrap().records.is_empty());
+    assert!(read_all(b"").records.is_empty());
 }
 
 #[test]
@@ -57,14 +58,15 @@ fn a_last_record_cut_at_any_offset_is_dropped_and_the_earlier_ones_stay() {
     for cut in 0..last.len() {
         let mut bytes = first.clone();
         bytes.extend_from_slice(&last[..cut]);
-        let reading = read_all(&bytes).unwrap_or_else(|error| panic!("cut {cut}: {error}"));
+        let reading = read_all(&bytes);
+        assert_eq!(reading.damage, None, "cut {cut}");
         assert_eq!(reading.records, [b"begin".as_slice(), b"middle".as_slice()]);
         assert_eq!(reading.valid_len, first.len(), "cut {cut}");
         assert_eq!(reading.torn_len(bytes.len()), cut);
     }
     let mut whole = first.clone();
     whole.extend_from_slice(&last);
-    assert_eq!(read_all(&whole).unwrap().records.len(), 3);
+    assert_eq!(read_all(&whole).records.len(), 3);
 }
 
 #[test]
@@ -75,7 +77,8 @@ fn a_last_record_with_a_wrong_checksum_is_a_torn_tail() {
     last[end - 1] ^= 0x01;
     let mut bytes = first.clone();
     bytes.extend_from_slice(&last);
-    let reading = read_all(&bytes).unwrap();
+    let reading = read_all(&bytes);
+    assert_eq!(reading.damage, None);
     assert_eq!(reading.records, [b"begin".as_slice()]);
     assert_eq!(reading.valid_len, first.len());
 }
@@ -86,7 +89,8 @@ fn a_tail_of_zero_bytes_is_a_torn_tail() {
     for zeros in [1_usize, 3, 4, 7, 8, 9, 64, 4096] {
         let mut bytes = first.clone();
         bytes.extend(std::iter::repeat_n(0_u8, zeros));
-        let reading = read_all(&bytes).unwrap_or_else(|error| panic!("{zeros} zeros: {error}"));
+        let reading = read_all(&bytes);
+        assert_eq!(reading.damage, None, "{zeros} zeros");
         assert_eq!(reading.records.len(), 2, "{zeros} zeros");
         assert_eq!(reading.valid_len, first.len(), "{zeros} zeros");
     }
@@ -102,24 +106,67 @@ fn a_damaged_record_before_the_tail_names_its_index() {
         offsets.push(at);
         at += payload.len() + 8;
     }
-    // One flipped bit in the length's low byte, the bytes or the checksum of any record but the
-    // last. (A length flipped to point past the journal's end reads as a cut record: the module's
-    // documentation names that limit.)
+    // One flipped bit in any byte of any record but the last, the length's four bytes included
+    // (a length that points past the journal's end has a valid record after it). The records before
+    // the damage come back with it.
     for index in 0..payloads.len() - 1 {
         let record_len = payloads[index].len() + 8;
-        for byte in (0..record_len).filter(|byte| !(1..4).contains(byte)) {
+        for byte in 0..record_len {
             let mut bytes = whole.clone();
             bytes[offsets[index] + byte] ^= 0x01;
+            let reading = read_all(&bytes);
             assert_eq!(
-                read_all(&bytes),
-                Err(FramingError::Damaged {
+                reading.damage,
+                Some(FramingError::Damaged {
                     index,
                     offset: offsets[index]
                 }),
                 "record {index}, byte {byte}"
             );
+            assert_eq!(
+                reading.records,
+                payloads[..index],
+                "record {index}, byte {byte}"
+            );
+            assert_eq!(
+                reading.valid_len, offsets[index],
+                "record {index}, byte {byte}"
+            );
+            assert_eq!(reading.torn_len(bytes.len()), 0);
         }
     }
+}
+
+#[test]
+fn a_length_that_runs_past_the_end_with_valid_records_after_it_is_damage_not_a_tail() {
+    let first = journal(&[b"begin"]);
+    let damaged = encode(b"the second row").unwrap();
+    let later = journal(&[b"third", b"fourth"]);
+    // The second record's length grows to run past the end of the journal.
+    let mut bytes = first.clone();
+    bytes.extend_from_slice(&damaged);
+    bytes.extend_from_slice(&later);
+    let grown = u32::try_from(bytes.len()).unwrap();
+    bytes[first.len()..first.len() + 4].copy_from_slice(&grown.to_le_bytes());
+    let reading = read_all(&bytes);
+    assert_eq!(
+        reading.damage,
+        Some(FramingError::Damaged {
+            index: 1,
+            offset: first.len()
+        })
+    );
+    assert_eq!(reading.records, [b"begin".as_slice()]);
+    assert_eq!(reading.valid_len, first.len());
+
+    // The same record as the last thing in the file is a cut write, and nothing is damaged.
+    let mut cut = first.clone();
+    cut.extend_from_slice(&damaged);
+    cut[first.len()..first.len() + 4].copy_from_slice(&grown.to_le_bytes());
+    let reading = read_all(&cut);
+    assert_eq!(reading.damage, None);
+    assert_eq!(reading.records, [b"begin".as_slice()]);
+    assert_eq!(reading.torn_len(cut.len()), damaged.len());
 }
 
 #[test]
@@ -128,20 +175,23 @@ fn a_length_over_the_limit_is_damage_not_a_tail() {
     let length = u32::try_from(MAX_RECORD + 1).unwrap();
     bytes.extend_from_slice(&length.to_le_bytes());
     bytes.extend_from_slice(b"only a few bytes follow");
+    let reading = read_all(&bytes);
     assert_eq!(
-        read_all(&bytes),
-        Err(FramingError::Damaged {
+        reading.damage,
+        Some(FramingError::Damaged {
             index: 1,
             offset: 13
         })
     );
+    assert_eq!(reading.records, [b"begin".as_slice()]);
 }
 
 #[test]
 fn a_record_may_be_as_long_as_the_limit_and_no_longer() {
     let payload = vec![0xA5_u8; MAX_RECORD];
     let framed = encode(&payload).unwrap();
-    let reading = read_all(&framed).unwrap();
+    let reading = read_all(&framed);
+    assert_eq!(reading.damage, None);
     assert_eq!(reading.records.len(), 1);
     assert_eq!(reading.records[0], payload.as_slice());
     assert_eq!(

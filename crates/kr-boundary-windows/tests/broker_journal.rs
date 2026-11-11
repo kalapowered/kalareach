@@ -58,6 +58,19 @@ fn snapshot(id: u32, kind: SnapshotKind) -> Row {
     }
 }
 
+fn started() -> Row {
+    Row::ProcessStarted {
+        pid: 12,
+        creation_time: 34,
+    }
+}
+
+fn uncertain() -> Row {
+    Row::EndUncertain {
+        reason: "the session is still there".to_owned(),
+    }
+}
+
 fn release_intent(n: u64) -> Row {
     Row::ReleaseIntent {
         key: key(n),
@@ -312,6 +325,49 @@ fn every_row_that_comes_out_of_order_is_refused() {
             release_intent(1),
         ),
         (
+            "a release begun while a process that started has no proved end",
+            vec![begin(), started()],
+            release_intent(1),
+        ),
+        (
+            "a release verified while the end is not proved (an uncertain end, then the verification)",
+            vec![begin(), uncertain()],
+            verified.clone(),
+        ),
+        (
+            "a release verified while a process that started has no proved end",
+            vec![begin(), started()],
+            verified.clone(),
+        ),
+        (
+            "a root removed while the end is not proved",
+            vec![
+                begin(),
+                Row::RootIntent { name: root_name(1) },
+                Row::RootMade {
+                    name: root_name(1),
+                    key: key(9),
+                },
+                uncertain(),
+            ],
+            Row::RootRemoved,
+        ),
+        (
+            "an end while the end is not proved",
+            vec![begin(), verified.clone(), uncertain()],
+            Row::End { root_leftovers: 0 },
+        ),
+        (
+            "an end after a release began that voided the verification",
+            vec![begin(), verified.clone(), release_intent(1)],
+            Row::End { root_leftovers: 0 },
+        ),
+        (
+            "an end after a release that was begun and written, with no new verification",
+            vec![begin(), verified.clone(), release_intent(1), released(1)],
+            Row::End { root_leftovers: 0 },
+        ),
+        (
             "an object released without its intent",
             vec![begin()],
             released(1),
@@ -353,6 +409,188 @@ fn every_row_that_comes_out_of_order_is_refused() {
     }
 }
 
+/// Applies every row in turn, each of which must be accepted.
+fn tracker_after(rows: &[Row]) -> Tracker {
+    let mut tracker = Tracker::new();
+    for row in rows {
+        tracker
+            .apply(row)
+            .unwrap_or_else(|error| panic!("{row:?} is in order: {error}"));
+    }
+    tracker
+}
+
+#[test]
+fn a_proved_end_is_required_after_a_process_started_or_an_uncertain_end_and_then_the_release_goes_on()
+ {
+    let verified = Row::ReleaseVerified {
+        objects: 1,
+        leftovers: 0,
+    };
+    // After a process started, the job's end is the proof.
+    let tracker = tracker_after(&[
+        begin(),
+        Row::Grant {
+            key: key(1),
+            path: "p".to_owned(),
+            kind: kr_boundary_windows::journal::rows::ObjectKind::File,
+            owner: "o".to_owned(),
+            dacl_bytes: vec![],
+            control_flags: 0,
+            protected: false,
+            link_count: 1,
+            added_ace: "a".to_owned(),
+        },
+        Row::GrantComplete { count: 1 },
+        started(),
+        Row::JobEnded,
+        release_intent(1),
+        released(1),
+        verified.clone(),
+        Row::End { root_leftovers: 0 },
+    ]);
+    assert_eq!(tracker.standing(), Standing::Finished);
+    // After an uncertain end that a later try proved, the release is journalled.
+    let tracker = tracker_after(&[begin(), started(), uncertain()]);
+    assert_eq!(tracker.standing(), Standing::Uncertain);
+    let tracker = tracker_after(&[
+        begin(),
+        started(),
+        uncertain(),
+        uncertain(),
+        Row::JobEnded,
+        release_intent(1),
+        released(1),
+        verified,
+        Row::End { root_leftovers: 0 },
+    ]);
+    assert_eq!(tracker.standing(), Standing::Finished);
+    // A job that never had a process needs no proof of its end.
+    let tracker = tracker_after(&[
+        begin(),
+        Row::ReleaseVerified {
+            objects: 0,
+            leftovers: 0,
+        },
+        Row::End { root_leftovers: 0 },
+    ]);
+    assert_eq!(tracker.standing(), Standing::Finished);
+}
+
+#[test]
+fn a_release_that_begins_after_the_verification_voids_it() {
+    let verified = Row::ReleaseVerified {
+        objects: 0,
+        leftovers: 0,
+    };
+    let mut tracker = tracker_after(&[begin(), verified.clone(), release_intent(1)]);
+    assert!(tracker.apply(&Row::End { root_leftovers: 0 }).is_err());
+    tracker.apply(&released(1)).unwrap();
+    assert!(tracker.apply(&Row::End { root_leftovers: 0 }).is_err());
+    tracker.apply(&verified).unwrap();
+    tracker.apply(&Row::End { root_leftovers: 0 }).unwrap();
+}
+
+#[test]
+fn nothing_follows_the_end_but_the_clearing_of_root_leftovers_and_the_removal_of_the_root() {
+    let root_leftover = Row::Leftover {
+        object: "tmp/held".to_owned(),
+        reason: "in use".to_owned(),
+        class: LeftoverClass::Root,
+        snapshot: None,
+    };
+    let finished = [
+        begin(),
+        Row::RootIntent { name: root_name(1) },
+        Row::RootMade {
+            name: root_name(1),
+            key: key(9),
+        },
+        root_leftover,
+        Row::ReleaseVerified {
+            objects: 0,
+            leftovers: 0,
+        },
+        Row::End { root_leftovers: 1 },
+    ];
+    for (what, row) in [
+        ("a snapshot", snapshot(1, SnapshotKind::Initial)),
+        ("a root intent", Row::RootIntent { name: root_name(2) }),
+        ("a process", started()),
+        ("a job end", Row::JobEnded),
+        ("an uncertain end", uncertain()),
+        ("a release intent", release_intent(1)),
+        (
+            "a verification",
+            Row::ReleaseVerified {
+                objects: 0,
+                leftovers: 0,
+            },
+        ),
+        ("a grant count", Row::GrantComplete { count: 0 }),
+        ("a second end", Row::End { root_leftovers: 1 }),
+        (
+            "a new leftover",
+            Row::Leftover {
+                object: "x".to_owned(),
+                reason: "r".to_owned(),
+                class: LeftoverClass::Root,
+                snapshot: None,
+            },
+        ),
+    ] {
+        assert!(
+            refused_after(&finished, &row),
+            "{what} after the end is refused"
+        );
+    }
+    // The sweep's work is allowed: clear the leftover, then remove the root.
+    let mut tracker = tracker_after(&finished);
+    assert_eq!(tracker.standing(), Standing::Finished);
+    assert!(!tracker.holds_the_slot());
+    tracker
+        .apply(&Row::LeftoverCleared {
+            key: "tmp/held".to_owned(),
+        })
+        .unwrap();
+    tracker.apply(&Row::RootRemoved).unwrap();
+    assert!(tracker.leftovers().is_empty());
+    assert_eq!(tracker.root(), &RootState::Removed);
+}
+
+#[test]
+fn a_finished_invocation_with_a_root_leftover_is_kept_for_recovery_with_its_slot_free() {
+    let mut rows = vec![
+        begin(),
+        Row::Leftover {
+            object: "tmp/held".to_owned(),
+            reason: "in use".to_owned(),
+            class: LeftoverClass::Root,
+            snapshot: None,
+        },
+        Row::ReleaseVerified {
+            objects: 0,
+            leftovers: 0,
+        },
+        Row::End { root_leftovers: 1 },
+    ];
+    let found = invocation(&file_of(&rows), BOOT);
+    assert_eq!(found.standing, Standing::Finished);
+    assert!(
+        found.needs_recovery(),
+        "the sweep still carries the leftover"
+    );
+    assert!(!found.tracker.holds_the_slot());
+    assert_eq!(found.tracker.leftovers().len(), 1);
+    rows.push(Row::LeftoverCleared {
+        key: "tmp/held".to_owned(),
+    });
+    let found = invocation(&file_of(&rows), BOOT);
+    assert!(!found.needs_recovery(), "nothing is left to do");
+    // An invocation that is not finished is always kept.
+    assert!(invocation(&file_of(&[begin()]), BOOT).needs_recovery());
+}
+
 #[test]
 fn a_leftover_that_names_a_snapshot_never_written_is_refused() {
     let mut tracker = Tracker::new();
@@ -392,13 +630,65 @@ fn a_torn_tail_is_dropped_and_the_rows_before_it_stand() {
 }
 
 #[test]
-fn a_damaged_record_that_is_not_the_last_makes_the_invocation_unreadable() {
+fn a_damaged_record_that_is_not_the_last_makes_the_invocation_unreadable_and_keeps_the_rows_before_it()
+ {
     let mut bytes = file_of(&[begin(), snapshot(1, SnapshotKind::Initial), Row::JobEnded]);
     let first = framing::encode(&begin().to_bytes()).unwrap().len();
     bytes[first + 6] ^= 0xff;
     let found = invocation(&bytes, BOOT);
     assert_eq!(found.standing, Standing::Unreadable);
     assert!(found.damage.is_some());
+    assert_eq!(
+        found.rows,
+        [begin()],
+        "the Begin row and its chain are kept"
+    );
+    assert!(found.tracker.holds_the_slot());
+    assert_eq!(found.valid_len, first);
+    assert_eq!(found.torn_bytes, 0);
+}
+
+#[test]
+fn a_length_that_runs_past_the_end_with_valid_records_after_it_is_damage_in_a_journal() {
+    let mut bytes = file_of(&[begin(), snapshot(1, SnapshotKind::Initial), Row::JobEnded]);
+    let first = framing::encode(&begin().to_bytes()).unwrap().len();
+    let grown = u32::try_from(bytes.len()).unwrap();
+    bytes[first..first + 4].copy_from_slice(&grown.to_le_bytes());
+    let found = invocation(&bytes, BOOT);
+    assert_eq!(found.standing, Standing::Unreadable);
+    assert_eq!(found.rows, [begin()]);
+    assert_eq!(found.tracker.leftovers().len(), 0);
+}
+
+#[test]
+fn a_first_row_that_begins_another_invocation_than_the_files_name_is_damage() {
+    let bytes = file_of(&[begin(), snapshot(1, SnapshotKind::Initial)]);
+    let other = "ffffffffffffffffffffffffffffffff";
+    let Reading::Invocation(found) = replay::read_file(other, &bytes, BOOT) else {
+        panic!("the file holds an invocation");
+    };
+    assert_eq!(found.standing, Standing::Unreadable);
+    assert_eq!(found.rows, [begin()], "the chain is kept");
+    assert!(found.damage.unwrap().contains(other));
+}
+
+#[test]
+fn a_file_longer_than_the_bound_is_read_up_to_it_and_is_unreadable() {
+    let bytes = file_of(&[begin(), snapshot(1, SnapshotKind::Initial), Row::JobEnded]);
+    let first = framing::encode(&begin().to_bytes()).unwrap().len();
+    let Reading::Invocation(found) = replay::read_file_limited(ID, &bytes, BOOT, first + 1) else {
+        panic!("the file holds an invocation");
+    };
+    assert_eq!(found.standing, Standing::Unreadable);
+    assert_eq!(found.rows, [begin()]);
+    assert!(found.damage.unwrap().contains("longer than"));
+    // At exactly the bound it is read whole.
+    let Reading::Invocation(whole) = replay::read_file_limited(ID, &bytes, BOOT, bytes.len())
+    else {
+        panic!("the file holds an invocation");
+    };
+    assert_eq!(whole.damage, None);
+    assert_eq!(whole.rows.len(), 3);
 }
 
 #[test]
@@ -524,7 +814,7 @@ mod native {
         // Read through a second handle while the journal stays open: the row is already there.
         let path = dir.0.join(file_name(id()));
         let on_disk = std::fs::read(&path).unwrap();
-        assert_eq!(framing::read_all(&on_disk).unwrap().records.len(), 1);
+        assert_eq!(framing::read_all(&on_disk).records.len(), 1);
         let refused = journal.append(&Row::End { root_leftovers: 0 });
         assert!(
             matches!(refused, Err(JournalError::Order(_))),
@@ -569,7 +859,7 @@ mod native {
             .append(&Row::RootIntent { name: root_name(1) })
             .unwrap();
         let after = std::fs::read(&path).unwrap();
-        let reading = framing::read_all(&after).unwrap();
+        let reading = framing::read_all(&after);
         assert_eq!(reading.records.len(), 3);
         assert_eq!(reading.torn_len(after.len()), 0);
     }
@@ -609,6 +899,61 @@ mod native {
         assert!(same[0].same_boot);
         let other = replay_dir(&dir.0, "another boot").unwrap();
         assert!(!other[0].same_boot);
+    }
+
+    #[test]
+    fn replay_keeps_a_finished_invocation_that_still_has_a_root_leftover() {
+        let dir = Dir::new();
+        let mut journal = Journal::create(&dir.0, id()).unwrap();
+        for row in [
+            begin(),
+            Row::Leftover {
+                object: "tmp/held".to_owned(),
+                reason: "in use".to_owned(),
+                class: kr_boundary_windows::journal::rows::LeftoverClass::Root,
+                snapshot: None,
+            },
+            Row::ReleaseVerified {
+                objects: 0,
+                leftovers: 0,
+            },
+            Row::End { root_leftovers: 1 },
+        ] {
+            journal.append(&row).unwrap();
+        }
+        let kept = replay_dir(&dir.0, BOOT).unwrap();
+        assert_eq!(kept.len(), 1, "the sweep still carries the leftover");
+        assert_eq!(kept[0].standing, Standing::Finished);
+        assert!(!kept[0].tracker.holds_the_slot(), "the tree's slot is free");
+        journal
+            .append(&Row::LeftoverCleared {
+                key: "tmp/held".to_owned(),
+            })
+            .unwrap();
+        assert!(replay_dir(&dir.0, BOOT).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_file_longer_than_the_bound_is_read_up_to_it_and_is_unreadable() {
+        let dir = Dir::new();
+        {
+            let mut journal = Journal::create(&dir.0, id()).unwrap();
+            journal.append(&begin()).unwrap();
+        }
+        let path = dir.0.join(file_name(id()));
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(kr_boundary_windows::journal::replay::MAX_FILE as u64 + 4096)
+            .unwrap();
+        drop(file);
+        let found = replay_dir(&dir.0, BOOT).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].standing, Standing::Unreadable);
+        assert_eq!(
+            found[0].rows,
+            [begin()],
+            "the rows before the bound are kept"
+        );
+        assert!(Journal::resume(&dir.0, id(), BOOT).is_err());
     }
 
     #[test]
@@ -665,7 +1010,7 @@ mod guest {
     impl Checked<'_> {
         fn last_row(&self) -> Row {
             let bytes = std::fs::read(self.journal.path()).unwrap();
-            let reading = framing::read_all(&bytes).unwrap();
+            let reading = framing::read_all(&bytes);
             Row::from_bytes(reading.records.last().unwrap()).unwrap()
         }
     }
