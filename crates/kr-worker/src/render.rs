@@ -277,9 +277,8 @@ pub fn render(
             *held = enabled;
         }
     }
-    // The three mouse tracking modes are carried as three settings and Terminal.app and xterm keep one, so
-    // what is written is the widest of them that is on, found here and written where the first of
-    // them is reached.
+    // The session holds the mouse tracking as one state (at most one of the three modes is on), and
+    // what is written is that one, found here and written where the first of the three is reached.
     let tracking_entries: Vec<_> = operations
         .iter()
         .filter_map(|operation| match operation {
@@ -296,9 +295,8 @@ pub fn render(
         writer.mouse_tracking = Some(
             tracking_entries
                 .iter()
-                .filter(|entry| entry.enabled)
-                .map(|entry| entry.mode)
-                .max(),
+                .find(|entry| entry.enabled)
+                .map(|entry| entry.mode),
         );
     }
     for operation in operations {
@@ -478,8 +476,10 @@ impl Writer {
                     }
                     // The three mouse tracking modes are one setting on a terminal, so they are
                     // written together, where the first of them is reached: all three reset, then
-                    // the widest one that is on set. Written one by one in the order they are
-                    // carried, the reset of one that is off would turn off the one that is on.
+                    // the one that is on set. A terminal's own tracking is not known at this point,
+                    // so the resets are written even for a state with none on, and written one by
+                    // one in the order they are carried, the reset of a mode that is off would turn
+                    // off the one that is on.
                     if MOUSE_TRACKING_MODES.contains(&entry.mode) {
                         if let Some(tracking) = self.mouse_tracking.take() {
                             for mode in MOUSE_TRACKING_MODES {

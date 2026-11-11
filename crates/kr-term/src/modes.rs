@@ -81,8 +81,9 @@ pub const ALTERNATE_BUFFER_MODES: &[u16] = &[47, 1047, 1049];
 /// The DEC modes that choose which mouse events are reported, narrowest first: presses, releases
 /// and the wheel (1000), those and a move with a button held (1002), and every move (1003).
 ///
-/// The engine keeps them as three settings. Terminal.app and xterm keep one: setting any of them replaces the
-/// tracking in force, and resetting any of them turns tracking off whichever of them had set it.
+/// They are one state, as Terminal.app and xterm keep it: setting any of them replaces the tracking
+/// in force, and resetting any of them turns tracking off whichever of them had set it. So at most
+/// one of the three is set at any time, in the session's state as in the terminal.
 pub const MOUSE_TRACKING_MODES: &[u16] = &[1000, 1002, 1003];
 
 /// Every mode the engine tracks, and the keyboard state that goes with it.
@@ -163,6 +164,17 @@ impl ModeState {
                 if ALTERNATE_BUFFER_MODES.contains(&mode) {
                     for alias in ALTERNATE_BUFFER_MODES {
                         self.dec.insert(*alias, enabled);
+                    }
+                    return true;
+                }
+                // The mouse tracking is one state, as xterm and Terminal.app keep it: a set of one
+                // of the three replaces the one in force, and a reset of any of them turns tracking
+                // off, whichever of them had set it.
+                if MOUSE_TRACKING_MODES.contains(&mode) {
+                    for tracking in MOUSE_TRACKING_MODES {
+                        if let Some(slot) = self.dec.get_mut(tracking) {
+                            *slot = enabled && *tracking == mode;
+                        }
                     }
                     return true;
                 }
