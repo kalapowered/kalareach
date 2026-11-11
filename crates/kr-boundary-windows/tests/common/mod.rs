@@ -107,6 +107,14 @@ impl RootRows for Rows {
     }
 }
 
+/// Whether the root's name is gone once its own handle is closed: the platform removes a directory's
+/// name when the last handle to it closes, and the broker's handle is the last one.
+pub fn is_gone(root: kr_boundary_windows::win::root::PrivateRoot) -> bool {
+    let path = root.path().to_owned();
+    drop(root);
+    !path.exists()
+}
+
 pub fn group() -> Sid {
     token::new_invocation_group()
 }
