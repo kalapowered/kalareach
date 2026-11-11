@@ -1,67 +1,112 @@
 //! An invocation's private root: its creation and its removal.
 //!
 //! The root is one directory under the broker's `run` directory, with a random name, made by a
-//! single call that carries its descriptor, so that it never inherits an entry from the folder
-//! above. Under it are `tmp` and `home`, made the same way. Git runs as a boundary account and
-//! may fill the root with anything its group can write: links to outside names, junctions, long
-//! and case-sensitive names, read-only files, files with open handles, objects whose own
-//! permission list refuses the system. The removal is written for exactly that and writes no
-//! permission list and no attribute on anything.
+//! single create call, relative to the held `run` handle, that carries its descriptor, so that it
+//! never inherits an entry from the folder above. Under it are `tmp` and `home`, made the same
+//! way. The handle the create call returns is the one the broker keeps. Git runs as a boundary
+//! account and may fill the root with anything its group can write: links to outside names,
+//! junctions, long and case-sensitive names, names that end in a dot or a space, read-only files,
+//! files with open handles, objects whose own permission list refuses the system. The removal is
+//! written for exactly that and writes no permission list and no attribute on anything.
 //!
-//! The removal works from the bottom up, from handles, on the walk's primitives. A reparse point,
-//! and a file with more than one name, is removed by its name, opened relative to its parent's
-//! handle and never through its target, so a link's target and a hard link's other names stay as
-//! they were. Every other object is opened by its name relative to the held directory, with the
-//! right to delete it and the backup and restore privileges that the guard on this thread holds,
-//! checked against the identity its listing gave (the platform refuses a deletion through a
-//! handle opened by identifier, and does not hold such a handle's object against a rename), and is deleted with the platform's POSIX semantics, which ignore
-//! the read-only attribute. An
-//! object that still cannot be opened, or stays in use for five seconds, is a leftover: its
-//! reason and path are returned, and nothing on it is changed.
+//! The removal works from the bottom up, from handles, on the walk's primitives. Every object,
+//! a link and a file with several names included, is opened once by its listed name relative to
+//! the held directory, with the right to delete it and the backup and restore privileges that the
+//! guard on this thread holds, and without delete sharing. Its whole key is compared with the
+//! listing's on that handle, and the same handle is then deleted with the platform's POSIX
+//! semantics, which ignore the read-only attribute. A name is never opened a second time, so what
+//! is deleted is the object that was checked, and nothing that a sibling swapped in or renamed
+//! out can be reached. A link's target is never opened, and a hard link's other names stay. An
+//! object that cannot be opened or read, that is not the listed one, or that stays in use past
+//! the waits of [`ROOT_LIMITS`] is a leftover: its reason and path are returned, and nothing on it
+//! is changed.
 
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_DISPOSITION_DELETE, FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE,
     FILE_DISPOSITION_INFORMATION_EX, FILE_DISPOSITION_POSIX_SEMANTICS,
     FileDispositionInformationEx, NtSetInformationFile,
 };
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
+};
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-use super::ffi::{Handle, Sid, error, last, wide_path};
+use super::ffi::{Handle, Sid, error};
 use super::privilege::PrivGuard;
 use super::sd::{self, Principals, SdKind};
-use super::walk::{Bounds, Child, DirHandle, Kind, LIST, Lost, ROOT_BOUNDS};
+use super::walk::{Bounds, Child, DELETE, DirHandle, Kind, LIST, Lost, ROOT_BOUNDS};
 use crate::filekey::FileKey;
 use crate::journal::rows::RootName;
 
-const DELETE: u32 = 0x0001_0000;
 const READ_CONTROL: u32 = 0x0002_0000;
-/// How long the removal waits for an object that is in use before it calls it a leftover.
-const IN_USE_WAIT: Duration = Duration::from_secs(5);
 const RETRY_EVERY: Duration = Duration::from_millis(100);
 
-/// The rows the root writes about itself, each durable before the step it protects.
+/// The figures a removal works within, stated once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// The most objects a root may hold and the deepest it may be nested. More is one
+    /// `too large` leftover for the root.
+    pub bounds: Bounds,
+    /// How long the removal waits for one object that another process has open.
+    pub wait_each: Duration,
+    /// How long the removal waits for objects in use in all, for one root. Past it, an object in
+    /// use is a leftover at once.
+    pub wait_total: Duration,
+}
+
+/// The limits of a private root's removal.
+pub const ROOT_LIMITS: Limits = Limits {
+    bounds: ROOT_BOUNDS,
+    wait_each: Duration::from_secs(5),
+    wait_total: Duration::from_secs(60),
+};
+
+/// Draws a name for a private root from the system's random source.
+fn random_name() -> Result<RootName, RootError> {
+    let mut bytes = [0_u8; 16];
+    // SAFETY: the buffer is 16 bytes, which is the length passed; no algorithm handle is used.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            bytes.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status < 0 {
+        return Err(error(status as u32, "drawing a random name for the private root").into());
+    }
+    Ok(RootName::from_bytes(bytes))
+}
+
+/// A name as the units a name relative to a held directory is given in.
+fn units(name: &RootName) -> Vec<u16> {
+    name.as_str().encode_utf16().collect()
+}
+
+/// The rows the root writes about itself, each durable before the step it protects. A root is
+/// named by its [`RootName`] alone: the journal records no path.
 pub trait RootRows {
-    /// The root is about to be made under this name in the `run` directory.
+    /// The root is about to be made under this name.
     ///
     /// # Errors
     ///
     /// Returns an error when the row is not durable; nothing is made then.
     fn intent(&mut self, name: &RootName) -> Result<(), RootError>;
-    /// The root was made, and this is its identity.
+    /// The root was made under this name, and this is its identity.
     ///
     /// # Errors
     ///
@@ -108,14 +153,21 @@ impl std::fmt::Display for Leftover {
 #[derive(Debug)]
 pub struct PrivateRoot {
     dir: DirHandle,
+    name: RootName,
     path: PathBuf,
 }
 
 impl PrivateRoot {
-    /// The root's path as the invocation's environment names it.
+    /// The root's path as the invocation's environment names it. Nothing is opened through it.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The root's name beneath `run`, which is what the journal records.
+    #[must_use]
+    pub fn name(&self) -> &RootName {
+        &self.name
     }
 
     /// The root's `tmp` directory.
@@ -143,53 +195,54 @@ impl PrivateRoot {
     }
 }
 
-fn random_name() -> Result<RootName, RootError> {
-    let mut bytes = [0_u8; 16];
-    // SAFETY: the buffer is 16 bytes, which is the length passed; no algorithm handle is used.
-    let status = unsafe {
-        BCryptGenRandom(
-            std::ptr::null_mut(),
-            bytes.as_mut_ptr(),
-            bytes.len() as u32,
-            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        )
-    };
-    if status < 0 {
-        return Err(error(status as u32, "drawing a random name for the private root").into());
-    }
-    Ok(RootName::from_bytes(bytes))
-}
-
-/// Makes a directory with one call that carries the descriptor. The call fails on an existing
-/// name.
-fn make_directory(path: &Path, descriptor: &sd::OwnedSd) -> Result<(), RootError> {
-    let wide = wide_path(path);
-    let attributes = descriptor.attributes();
-    // SAFETY: the path is NUL-terminated and the attributes point at a descriptor that lives
-    // through the call.
-    if unsafe { CreateDirectoryW(wide.as_ptr(), &raw const attributes) } == 0 {
-        return Err(last(format!("making the directory {}", path.display())).into());
-    }
-    Ok(())
-}
-
-/// Makes the private root for an invocation under `run`, the held directory at `run_path`.
+/// Makes the private root for an invocation under `run`, the held directory whose path is
+/// `run_path`.
 ///
 /// The row `intent` is durable before the directory is made and `made` after it is made and
-/// checked. The check opens the new directory relative to `run`, requires a directory that is not
-/// a reparse point and directly beneath `run`, and reads its descriptor back and compares it with
-/// the one sent.
+/// checked. The directory and its `tmp` and `home` are each made by one create call relative to
+/// the handle above them, so nothing is opened through a path: `run_path` only tells the
+/// invocation's environment where the root is. The handle the call returns is the one kept. The
+/// check requires a directory that is not a reparse point and directly beneath `run`, and reads
+/// the descriptor back and compares it with the one sent; `tmp` and `home` are compared with the
+/// same whole descriptor.
 ///
 /// A failure after the intent may leave the directory behind; the recovery of an intent without
 /// its `made` row looks for it by its name and removes it.
 ///
 /// # Errors
 ///
-/// Returns an error when a row cannot be written, the platform refuses a call, or what was made
-/// is not what was asked for.
+/// Returns an error when a row cannot be written, the name exists, the platform refuses a call,
+/// or what was made is not what was asked for.
 pub fn create_root(
     run: &DirHandle,
     run_path: &Path,
+    group: &Sid,
+    rows: &mut dyn RootRows,
+) -> Result<PrivateRoot, RootError> {
+    make_root(run, run_path, random_name()?, group, rows)
+}
+
+/// As [`create_root`], under a name the case chooses, so that a name that already exists can be
+/// tried.
+///
+/// # Errors
+///
+/// See [`create_root`].
+#[cfg(feature = "testing")]
+pub fn create_root_named(
+    run: &DirHandle,
+    run_path: &Path,
+    name: RootName,
+    group: &Sid,
+    rows: &mut dyn RootRows,
+) -> Result<PrivateRoot, RootError> {
+    make_root(run, run_path, name, group, rows)
+}
+
+fn make_root(
+    run: &DirHandle,
+    run_path: &Path,
+    name: RootName,
     group: &Sid,
     rows: &mut dyn RootRows,
 ) -> Result<PrivateRoot, RootError> {
@@ -198,35 +251,34 @@ pub fn create_root(
         ..Principals::default()
     };
     let descriptor = sd::descriptor(SdKind::PrivateRoot, &principals)?;
-    let name = random_name()?;
-    let path = run_path.join(name.as_str());
     rows.intent(&name)?;
-    make_directory(&path, &descriptor)?;
-    let wide_name: Vec<u16> = name.as_str().encode_utf16().collect();
     let held = run
-        .open_directory_named(&wide_name, LIST | DELETE | READ_CONTROL)?
+        .create_directory_named(&units(&name), &descriptor, LIST | DELETE | READ_CONTROL)?
         .map_err(|lost| RootError::Refused(format!("the new private root: {lost}")))?;
     let wanted = descriptor.summary()?;
-    let found = sd::summary_of_handle(held.handle())?;
-    if found != wanted {
+    if sd::summary_of_handle(held.handle())? != wanted {
         return Err(RootError::Refused(
             "the private root's descriptor is not the one that was sent".to_owned(),
         ));
     }
     rows.made(&name, &held.key())?;
     for part in ["tmp", "home"] {
-        make_directory(&path.join(part), &descriptor)?;
         let units: Vec<u16> = part.encode_utf16().collect();
         let inner = held
-            .open_directory_named(&units, LIST | READ_CONTROL)?
+            .create_directory_named(&units, &descriptor, LIST | READ_CONTROL)?
             .map_err(|lost| RootError::Refused(format!("the root's {part} directory: {lost}")))?;
-        if sd::summary_of_handle(inner.handle())?.owner != wanted.owner {
+        if sd::summary_of_handle(inner.handle())? != wanted {
             return Err(RootError::Refused(format!(
-                "the root's {part} directory has another owner than the root"
+                "the root's {part} directory has another descriptor than the root"
             )));
         }
     }
-    Ok(PrivateRoot { dir: held, path })
+    let path = run_path.join(name.as_str());
+    Ok(PrivateRoot {
+        dir: held,
+        name,
+        path,
+    })
 }
 
 /// Removes the private root and everything under it. The privileged thread's guard is the proof
@@ -238,17 +290,16 @@ pub fn create_root(
 ///
 /// # Errors
 ///
-/// Returns an error when a row cannot be written or the platform refuses a call the removal
-/// cannot work around.
+/// Returns an error when a row cannot be written.
 pub fn remove_root(
     root: &PrivateRoot,
     guard: &PrivGuard,
     rows: &mut dyn RootRows,
 ) -> Result<Vec<Leftover>, RootError> {
-    remove_root_within(root, guard, ROOT_BOUNDS, rows)
+    remove_root_within(root, guard, ROOT_LIMITS, rows)
 }
 
-/// As [`remove_root`], with the bounds a case chooses.
+/// As [`remove_root`], within the limits a case chooses.
 ///
 /// # Errors
 ///
@@ -256,15 +307,17 @@ pub fn remove_root(
 pub fn remove_root_within(
     root: &PrivateRoot,
     _guard: &PrivGuard,
-    bounds: Bounds,
+    limits: Limits,
     rows: &mut dyn RootRows,
 ) -> Result<Vec<Leftover>, RootError> {
     let mut state = Removal {
-        bounds,
-        seen: 0,
+        limits,
+        listed: 0,
+        waited: Duration::ZERO,
+        too_large: false,
         leftovers: Vec::new(),
     };
-    state.empty(&root.dir, "", 1)?;
+    state.empty(&root.dir, "", 1);
     if state.leftovers.is_empty() {
         match delete(root.dir.handle()) {
             Ok(()) => rows.removed()?,
@@ -277,10 +330,70 @@ pub fn remove_root_within(
     Ok(state.leftovers)
 }
 
+/// What the cases may watch and use during a removal: the points between a listing and the open
+/// of what it named, and between that open and the deletion, where a sibling's change would land.
+#[cfg(feature = "testing")]
+pub mod testing {
+    use std::sync::{Arc, Mutex};
+
+    /// A point of the removal.
+    #[derive(Debug)]
+    pub enum Event<'a> {
+        /// A directory was listed and none of its children is opened yet.
+        Listed {
+            /// The directory, below the root; empty for the root.
+            directory: &'a str,
+            /// The names the listing returned, in order.
+            names: Vec<String>,
+            /// Whether the directory has more children than the listing returned.
+            more: bool,
+        },
+        /// A child was opened and checked and is about to be removed or entered.
+        Opened {
+            /// The child, below the root.
+            path: &'a str,
+        },
+    }
+
+    type Hook = Arc<dyn Fn(&Event<'_>) + Send + Sync>;
+
+    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+
+    /// Sets the function called at each point, until [`clear`].
+    pub fn set(hook: impl Fn(&Event<'_>) + Send + Sync + 'static) {
+        *HOOK.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    /// Removes the function.
+    pub fn clear() {
+        *HOOK.lock().unwrap() = None;
+    }
+
+    pub(super) fn fire(event: &Event<'_>) {
+        let hook = HOOK.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(event);
+        }
+    }
+}
+
 struct Removal {
-    bounds: Bounds,
-    seen: usize,
+    limits: Limits,
+    /// The children listed so far, in every directory: the objects the root has used.
+    listed: usize,
+    /// The time spent so far waiting for objects in use.
+    waited: Duration,
+    /// Whether the one `too large` leftover was made.
+    too_large: bool,
     leftovers: Vec<Leftover>,
+}
+
+fn joined(at: &str, child: &Child) -> String {
+    if at.is_empty() {
+        child.display()
+    } else {
+        format!("{at}\\{}", child.display())
+    }
 }
 
 impl Removal {
@@ -291,155 +404,166 @@ impl Removal {
         });
     }
 
-    /// Removes every child of `dir`, which is held open with the right to delete it.
-    fn empty(&mut self, dir: &DirHandle, at: &str, depth: usize) -> Result<(), RootError> {
-        for child in dir.children()? {
-            self.seen += 1;
-            let path = if at.is_empty() {
-                child.display()
-            } else {
-                format!("{at}\\{}", child.display())
-            };
-            if self.seen > self.bounds.objects {
-                self.leave(&path, "too large");
-                continue;
-            }
-            self.remove_child(dir, &child, &path, depth)?;
+    /// The root's tree has more than the limits allow. That is one leftover for the root, made
+    /// the first time and naming where it was first seen.
+    fn leave_too_large(&mut self, path: &str) {
+        if !self.too_large {
+            self.too_large = true;
+            self.leave(path, "too large");
         }
-        Ok(())
     }
 
-    fn remove_child(
-        &mut self,
-        dir: &DirHandle,
-        child: &Child,
-        path: &str,
-        depth: usize,
-    ) -> Result<(), RootError> {
-        if child.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return self.remove_by_name(dir, child, path);
-        }
-        let is_directory = child.attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
-        if is_directory && depth >= self.bounds.depth {
-            self.leave(path, "too large");
-            return Ok(());
-        }
-        let access = DELETE | if is_directory { LIST } else { 0 };
-        let opened = match open_waiting(dir, child, access)? {
-            Ok(opened) => opened,
-            Err(Lost::Gone) => return Ok(()),
-            Err(lost) => {
-                self.leave(path, lost.to_string());
-                return Ok(());
+    /// Removes every child of `dir`, which is held open. The listing stops at the objects the
+    /// root has left. A failure to list or to read an object is a leftover for it and the removal
+    /// goes on.
+    fn empty(&mut self, dir: &DirHandle, at: &str, depth: usize) {
+        let room = self.limits.bounds.objects.saturating_sub(self.listed);
+        let listing = match dir.children(room) {
+            Ok(listing) => listing,
+            Err(failure) => {
+                self.leave(
+                    at,
+                    format!("could not be listed (Windows error {})", failure.code),
+                );
+                return;
             }
         };
+        self.listed += listing.children.len();
+        #[cfg(feature = "testing")]
+        testing::fire(&testing::Event::Listed {
+            directory: at,
+            names: listing.children.iter().map(Child::display).collect(),
+            more: listing.more,
+        });
+        if listing.more {
+            self.leave_too_large(at);
+        }
+        for child in &listing.children {
+            let path = joined(at, child);
+            self.remove_child(dir, child, &path, depth);
+        }
+    }
+
+    fn remove_child(&mut self, dir: &DirHandle, child: &Child, path: &str, depth: usize) {
+        let listed_directory = child.attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+            && child.attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0;
+        if listed_directory && depth >= self.limits.bounds.depth {
+            self.leave_too_large(path);
+            return;
+        }
+        // A link is opened as itself, with the right to delete it alone; a directory also with
+        // the right to list it.
+        let access = DELETE | if listed_directory { LIST } else { 0 };
+        let opened = match self.open_waiting(dir, child, access) {
+            Ok(opened) => opened,
+            Err(Lost::Gone) => return,
+            Err(Lost::Refused(code)) if code == ERROR_SHARING_VIOLATION => {
+                self.leave(path, "in use");
+                return;
+            }
+            Err(Lost::Refused(code)) if code == ERROR_ACCESS_DENIED => {
+                self.leave(path, "access denied");
+                return;
+            }
+            Err(lost) => {
+                self.leave(path, lost.to_string());
+                return;
+            }
+        };
+        #[cfg(feature = "testing")]
+        testing::fire(&testing::Event::Opened { path });
         match opened.kind {
-            Kind::ReparsePoint => {
-                drop(opened);
-                self.remove_by_name(dir, child, path)
-            }
-            Kind::File if opened.links > 1 => {
-                drop(opened);
-                self.remove_by_name(dir, child, path)
-            }
-            Kind::File => {
+            Kind::File | Kind::ReparsePoint => {
                 if let Err(failure) = delete(&opened.handle) {
                     self.leave(
                         path,
                         format!("not removed (Windows error {})", failure.code),
                     );
                 }
-                Ok(())
+            }
+            Kind::Directory if !listed_directory => {
+                // The listing said a link and the object now reads as an ordinary directory:
+                // it was opened for deletion alone and is not entered.
+                self.leave(
+                    path,
+                    "it is a directory that was not one when it was listed",
+                );
             }
             Kind::Directory => {
-                let held = DirHandle::from_opened(opened)?;
-                let before = self.leftovers.len();
-                self.empty(&held, path, depth + 1)?;
-                if !held.children()?.is_empty() {
-                    // A directory that stays only because of a leftover inside it is not listed
-                    // beside it; one that holds something new is.
-                    if self.leftovers.len() == before {
-                        self.leave(path, "not empty after its contents were removed");
+                let held = match DirHandle::from_opened(opened) {
+                    Ok(held) => held,
+                    Err(failure) => {
+                        self.leave(
+                            path,
+                            format!(
+                                "could not be read after it was opened (Windows error {})",
+                                failure.code
+                            ),
+                        );
+                        return;
                     }
-                } else if let Err(failure) = delete(held.handle()) {
-                    self.leave(
+                };
+                let before = self.leftovers.len();
+                self.empty(&held, path, depth + 1);
+                match held.children(1) {
+                    Err(failure) => self.leave(
                         path,
-                        format!("not removed (Windows error {})", failure.code),
-                    );
+                        format!("could not be listed (Windows error {})", failure.code),
+                    ),
+                    Ok(rest) if !rest.is_empty() => {
+                        // A directory that stays only because of a leftover inside it, or
+                        // because the root is too large, is not listed beside it; one that holds
+                        // something new is.
+                        if self.leftovers.len() == before && !self.too_large {
+                            self.leave(path, "not empty after its contents were removed");
+                        }
+                    }
+                    Ok(_) => {
+                        if let Err(failure) = delete(held.handle()) {
+                            self.leave(
+                                path,
+                                format!("not removed (Windows error {})", failure.code),
+                            );
+                        }
+                    }
                 }
-                Ok(())
             }
         }
     }
 
-    /// Removes one name: opened relative to its parent, as the link itself, never by identifier.
-    fn remove_by_name(
+    /// Opens a child for removal, waiting for a short while while another process has it open:
+    /// at most `wait_each` for this object, and `wait_total` for all of the root's.
+    fn open_waiting(
         &mut self,
         dir: &DirHandle,
         child: &Child,
-        path: &str,
-    ) -> Result<(), RootError> {
-        let started = Instant::now();
+        access: u32,
+    ) -> Result<super::walk::Opened, Lost> {
+        let mut here = Duration::ZERO;
         loop {
-            match dir.open_name(&child.name, DELETE, true) {
-                Ok(handle) => {
-                    if let Err(failure) = delete(&handle) {
-                        self.leave(
-                            path,
-                            format!("not removed (Windows error {})", failure.code),
-                        );
-                    }
-                    return Ok(());
-                }
-                Err(failure) if failure.code == ERROR_SHARING_VIOLATION => {
-                    if started.elapsed() >= IN_USE_WAIT {
-                        self.leave(path, "in use");
-                        return Ok(());
+            match dir.open_child(child, access) {
+                Ok(Err(Lost::Refused(code))) if code == ERROR_SHARING_VIOLATION => {
+                    if here >= self.limits.wait_each || self.waited >= self.limits.wait_total {
+                        return Err(Lost::Refused(code));
                     }
                     std::thread::sleep(RETRY_EVERY);
+                    here += RETRY_EVERY;
+                    self.waited += RETRY_EVERY;
                 }
-                Err(failure) if failure.code == ERROR_ACCESS_DENIED => {
-                    self.leave(path, "access denied");
-                    return Ok(());
-                }
-                Err(failure) if is_gone(failure.code) => return Ok(()),
-                Err(failure) => {
-                    self.leave(path, format!("not opened (Windows error {})", failure.code));
-                    return Ok(());
-                }
+                Ok(other) => return other,
+                Err(failure) => return Err(Lost::Refused(failure.code)),
             }
         }
     }
 }
 
 fn is_gone(code: u32) -> bool {
-    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
     code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND
-}
-
-/// Opens a child for removal, waiting for a short while while another process has it open.
-fn open_waiting(
-    dir: &DirHandle,
-    child: &Child,
-    access: u32,
-) -> Result<std::result::Result<super::walk::Opened, Lost>, RootError> {
-    let started = Instant::now();
-    loop {
-        match dir.open_child(child, access)? {
-            Err(Lost::Refused(code)) if code == ERROR_SHARING_VIOLATION => {
-                if started.elapsed() >= IN_USE_WAIT {
-                    return Ok(Err(Lost::Refused(code)));
-                }
-                std::thread::sleep(RETRY_EVERY);
-            }
-            other => return Ok(other),
-        }
-    }
 }
 
 /// Deletes the object behind the handle with POSIX semantics: the name goes at once, whatever
 /// else has the object open, and the read-only attribute does not stop it. The handle must be
-/// open with the right to delete.
+/// open with the right to delete. On a link or a reparse point it removes that name only.
 fn delete(handle: &Handle) -> Result<(), super::ffi::Error> {
     let information = FILE_DISPOSITION_INFORMATION_EX {
         Flags: FILE_DISPOSITION_DELETE

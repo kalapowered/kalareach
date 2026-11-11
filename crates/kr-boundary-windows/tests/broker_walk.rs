@@ -17,19 +17,25 @@ use std::os::windows::fs::MetadataExt as _;
 use std::path::Path;
 
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_BASIC_INFO, FILE_WRITE_ATTRIBUTES, FileBasicInfo, GetFileInformationByHandleEx,
+    FILE_APPEND_DATA, FILE_BASIC_INFO, FILE_EXECUTE, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FileBasicInfo, GetFileInformationByHandleEx,
     SetFileInformationByHandle,
 };
 
 use kr_boundary_windows::win::ffi::Handle;
 use kr_boundary_windows::win::privilege;
 use kr_boundary_windows::win::walk::{
-    AnchorRefusal, Bounds, DirHandle, Entry, Kind, Lost, Verdict, VolumeRefusal, WalkError, walk,
+    AnchorRefusal, Bounds, DELETE, DirHandle, Entry, Kind, LIST, Lost, RecordedDir, Verdict,
+    VolumeRefusal, WalkError, walk,
 };
 
 use common::{Scratch, look_at, run};
 
 const NOT_CONTENT_INDEXED: u32 = 0x2000;
+const READ_CONTROL: u32 = 0x0002_0000;
+const WRITE_DAC: u32 = 0x0004_0000;
+const WRITE_OWNER: u32 = 0x0008_0000;
+const SYNCHRONIZE: u32 = 0x0010_0000;
 const BIG: Bounds = Bounds {
     objects: 10_000,
     depth: 64,
@@ -74,7 +80,8 @@ fn mark_visitor<'a>(
 ) -> impl FnMut(&Entry<'_>) -> kr_boundary_windows::win::ffi::Result<Verdict> + 'a {
     move |entry| {
         let name = entry.child.display();
-        match entry.open(FILE_WRITE_ATTRIBUTES)? {
+        // The right to write attributes alone would hold nothing, so a data right comes with it.
+        match entry.open(FILE_WRITE_ATTRIBUTES | FILE_READ_DATA)? {
             Ok(opened) => {
                 let kind = opened.kind;
                 if kind != Kind::ReparsePoint && opened.links == 1 {
@@ -491,4 +498,220 @@ fn the_system_volume_is_accepted_and_every_other_kind_of_volume_is_refused_with_
             "a ReFS volume could not be made on this guest, so that refusal was not shown: {reason}"
         ),
     }
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn an_open_that_asks_for_no_delete_or_data_right_is_refused_and_one_that_does_holds_the_object() {
+    let scratch = Scratch::new();
+    let tree = scratch.path("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("file.txt"), b"f").unwrap();
+    let start = anchor(&tree);
+    let listing = start.children(10).unwrap();
+    let child = &listing.children[0];
+    for attribute_or_security in [
+        FILE_READ_ATTRIBUTES,
+        FILE_WRITE_ATTRIBUTES,
+        READ_CONTROL,
+        WRITE_DAC,
+        WRITE_OWNER,
+        FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+    ] {
+        assert!(
+            start.open_child(child, attribute_or_security).is_err(),
+            "{attribute_or_security:#x} holds nothing and is refused"
+        );
+    }
+    assert!(
+        start
+            .open_directory_named(&units("file.txt"), READ_CONTROL)
+            .is_err(),
+        "a named directory is held the same way"
+    );
+    // The platform fact the refusal rests on: an open for attributes alone is not held against a
+    // rename, and one that takes part in share checks is.
+    {
+        let weak = start
+            .open_name(
+                &units("file.txt"),
+                READ_CONTROL | FILE_READ_ATTRIBUTES,
+                false,
+            )
+            .unwrap();
+        std::fs::rename(tree.join("file.txt"), tree.join("renamed.txt"))
+            .expect("an attribute-only handle holds nothing");
+        std::fs::rename(tree.join("renamed.txt"), tree.join("file.txt")).unwrap();
+        drop(weak);
+    }
+    for holding in [
+        DELETE,
+        FILE_READ_DATA,
+        FILE_WRITE_DATA,
+        FILE_APPEND_DATA,
+        FILE_EXECUTE,
+    ] {
+        let opened = start
+            .open_child(child, holding)
+            .expect("a holding right is accepted")
+            .expect("the child opens");
+        let renamed = std::fs::rename(tree.join("file.txt"), tree.join("renamed.txt"));
+        assert_eq!(
+            renamed.err().and_then(|error| error.raw_os_error()),
+            Some(32),
+            "{holding:#x}: the object is held against a rename while the handle is open"
+        );
+        drop(opened);
+        std::fs::rename(tree.join("file.txt"), tree.join("renamed.txt"))
+            .expect("after the handle closes a rename works");
+        std::fs::rename(tree.join("renamed.txt"), tree.join("file.txt")).unwrap();
+    }
+}
+
+fn units(text: &str) -> Vec<u16> {
+    text.encode_utf16().collect()
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_directory_opened_by_a_recorded_key_compares_the_whole_key_on_the_handle_it_returns() {
+    let scratch = Scratch::new();
+    let tree = scratch.path("tree");
+    let outside = scratch.path("outside");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(tree.join("file.txt"), b"f").unwrap();
+    run(
+        "cmd.exe",
+        &[
+            "/c",
+            "mklink",
+            "/J",
+            &tree.join("junction").display().to_string(),
+            &outside.display().to_string(),
+        ],
+    );
+    let start = anchor(&tree);
+    let listing = start.children(10).unwrap();
+    let key_of = |name: &str| {
+        listing
+            .children
+            .iter()
+            .find(|child| child.display() == name)
+            .unwrap()
+            .key
+    };
+    let right = key_of("sub");
+    let recorded = RecordedDir::open(start.handle(), &right)
+        .expect("the platform answers")
+        .expect("the recorded directory is accepted");
+    assert_eq!(recorded.key(), right, "the handle carries the recorded key");
+    let mut forged = right;
+    forged.volume_serial ^= 1;
+    match RecordedDir::open(start.handle(), &forged).expect("the platform answers") {
+        Err(AnchorRefusal::OtherObject) => {}
+        other => panic!("an identifier under another volume's serial is another object: {other:?}"),
+    }
+    match RecordedDir::open(start.handle(), &key_of("file.txt")).expect("the platform answers") {
+        Err(AnchorRefusal::NotADirectory) => {}
+        other => panic!("a file is not a directory: {other:?}"),
+    }
+    match RecordedDir::open(start.handle(), &key_of("junction")).expect("the platform answers") {
+        Err(AnchorRefusal::ReparsePoint) => {}
+        other => panic!("a junction is not entered: {other:?}"),
+    }
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_listing_stops_at_the_limit_it_is_given() {
+    let scratch = Scratch::new();
+    let tree = scratch.path("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    for index in 0..1000 {
+        std::fs::write(tree.join(format!("f{index}.txt")), b"x").unwrap();
+    }
+    let start = anchor(&tree);
+    let five = start.children(5).unwrap();
+    assert_eq!(five.children.len(), 5, "no more than the limit is returned");
+    assert!(five.more, "and the listing says there are more");
+    let exact = start.children(1000).unwrap();
+    assert_eq!((exact.children.len(), exact.more), (1000, false));
+    let all = start.children(usize::MAX).unwrap();
+    assert_eq!((all.children.len(), all.more), (1000, false));
+    let none = start.children(0).unwrap();
+    assert_eq!((none.children.len(), none.more), (0, true));
+    let empty = scratch.path("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    assert!(anchor(&empty).children(0).unwrap().is_empty());
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn an_anchor_that_is_a_file_or_a_reparse_point_is_refused_and_so_is_a_named_directory_that_is_not_one()
+ {
+    let scratch = Scratch::new();
+    let tree = scratch.path("tree");
+    let outside = scratch.path("outside");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(tree.join("file.txt"), b"f").unwrap();
+    for (flag, name) in [("/J", "junction"), ("/D", "symlink")] {
+        run(
+            "cmd.exe",
+            &[
+                "/c",
+                "mklink",
+                flag,
+                &tree.join(name).display().to_string(),
+                &outside.display().to_string(),
+            ],
+        );
+    }
+    assert!(matches!(
+        DirHandle::open_anchor(&tree.join("file.txt")).expect("the platform answers"),
+        Err(AnchorRefusal::NotADirectory)
+    ));
+    for name in ["junction", "symlink"] {
+        assert!(
+            matches!(
+                DirHandle::open_anchor(&tree.join(name)).expect("the platform answers"),
+                Err(AnchorRefusal::ReparsePoint)
+            ),
+            "{name} is not an anchor"
+        );
+    }
+    let start = anchor(&tree);
+    for name in ["file.txt", "junction", "symlink"] {
+        assert!(
+            matches!(
+                start.open_directory_named(&units(name), LIST).unwrap(),
+                Err(Lost::IdentityChanged)
+            ),
+            "{name} is not held as a directory"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_named_directory_must_carry_the_name_the_platform_stores_for_it() {
+    let scratch = Scratch::new();
+    let tree = scratch.path("tree");
+    std::fs::create_dir_all(tree.join("Sub")).unwrap();
+    let start = anchor(&tree);
+    assert!(
+        start
+            .open_directory_named(&units("Sub"), LIST)
+            .unwrap()
+            .is_ok(),
+        "the stored name opens"
+    );
+    assert!(
+        matches!(
+            start.open_directory_named(&units("sub"), LIST).unwrap(),
+            Err(Lost::MovedOut)
+        ),
+        "a name that differs only by case reaches the directory, whose final path does not carry it, and is a lost proof"
+    );
 }

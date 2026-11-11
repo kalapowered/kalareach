@@ -102,14 +102,12 @@ const WRITE_DAC: u32 = 0x0004_0000;
 /// sharing, and stays held from the check that it is empty to the change. The change is made with
 /// `NtSetSecurityObject` on that handle and propagates to nothing, so a child that appears is not
 /// reached. It is for the broker's `run` directory, which holds invocations' private roots and
-/// must not be changed under one. A directory that is not empty is left as it is and reported, so
-/// the caller can leave it or refuse.
+/// must not be changed under one.
 ///
 /// # Errors
 ///
 /// Returns the platform's error when the descriptor has no list, the directory cannot be opened
-/// or listed, or the list is refused. A path that is not an acceptable directory is the answer
-/// [`Reset::Refused`], not an error.
+/// or listed, or the list is refused.
 pub fn set_protected_when_empty(path: &Path, descriptor: &OwnedSd) -> Result<Reset> {
     let mut present = 0;
     let mut defaulted = 0;
@@ -130,7 +128,7 @@ pub fn set_protected_when_empty(path: &Path, descriptor: &OwnedSd) -> Result<Res
         Ok(held) => held,
         Err(refusal) => return Ok(Reset::Refused(refusal)),
     };
-    if !held.children()?.is_empty() {
+    if !held.children(1)?.is_empty() {
         return Ok(Reset::NotEmpty);
     }
     // SAFETY: the handle is open with the right to change the list and the descriptor lives
