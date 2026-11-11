@@ -234,7 +234,7 @@ fn a_quoted_pattern_unquotes_exactly_the_escapes_git_knows() {
         assert_eq!(rule(&line), RULE_FILTER, "{line:?}");
     }
     for escape in [
-        r"\q", r"\x", r"\0", r"\00", r"\18", r"\400", r"\777", r"\8", r"\3x7",
+        r"\q", r"\x", r"\0", r"\00", r"\18", r"\400", r"\777", r"\8", r"\3x7", r"\180", r"\108",
     ] {
         let line = format!("\"p{escape}q\"filter=lfs\n");
         allowed(&line);

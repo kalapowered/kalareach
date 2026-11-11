@@ -90,9 +90,10 @@ pub fn scan_attributes(bytes: &[u8]) -> Result<(), Refusal> {
 }
 
 /// The bytes Git separates a pattern and its attributes by, and the only ones: a space, a tab, a
-/// carriage return and a line feed. A form feed, a control byte and DEL are ordinary bytes.
+/// carriage return and a line feed. A form feed, a control byte and DEL are ordinary bytes. A line
+/// feed ends the line before any byte of it is tested, so it is not listed here.
 const fn is_blank(byte: u8) -> bool {
-    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+    matches!(byte, b' ' | b'\t' | b'\r')
 }
 
 fn skip_blanks(line: &[u8]) -> &[u8] {

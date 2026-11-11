@@ -587,14 +587,9 @@ fn the_identifier_a_reader_printed_is_what_the_steps_follow() {
         (&by_reference, Some(&OID[..39])),
         (&by_identifier, Some(OID2)),
     ] {
-        assert_eq!(
-            parts
-                .peel_argument(read)
-                .expect_err(&format!("{read:?}"))
-                .rule,
-            RULE_READER_ARGUMENT,
-            "{read:?}"
-        );
+        let refusal = parts.peel_argument(read).expect_err(&format!("{read:?}"));
+        assert_eq!(refusal.rule, RULE_READER_ARGUMENT, "{read:?}");
+        assert!(refusal.detail().contains("R1b"), "{}", refusal.detail());
     }
 }
 
