@@ -10,10 +10,15 @@
 //! - the invocation's group is the token's owner and default owner, and the default permission
 //!   list of every object the token creates names that group and the system.
 //!
-//! Two invocations of one account therefore cannot reach each other's objects, whether the
-//! objects were made with the defaults or with an explicit owner and a list that names the
-//! account. A deny rule written for the account still refuses what it names, because a deny-only
-//! identifier still matches a deny.
+//! Three kinds of object must be told apart. An object made with no descriptor given takes the
+//! token's default list, which names the group and the system. An object made with a NULL list is
+//! open to every account, and one made with an empty list is open to none. Two invocations of one
+//! account therefore cannot reach each other's objects when the objects are closed to everyone but
+//! the account, the group and the system, whether they took the defaults or got an explicit owner
+//! and a list that names the account. An object whose list names Everyone or Authenticated Users,
+//! or that has a NULL list, stays open to a sibling invocation for as long as it lives. A deny rule
+//! written for the account still refuses what it names, because a deny-only identifier still
+//! matches a deny.
 
 #![allow(unsafe_code)]
 
