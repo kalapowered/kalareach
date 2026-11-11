@@ -599,6 +599,8 @@ impl RunScan {
                     .map(|holder| &holder.path)
                     .collect::<Vec<_>>()
             );
+            evidence["held_by_not_listed"] = json!(scan.held_by.not_listed());
+            evidence["unread_not_listed"] = json!(scan.unread.not_listed());
             evidence["complete"] = json!(scan.complete());
         }
         let unread = self.key.as_ref().map_or(0, |(_, scan)| scan.unread.len())
