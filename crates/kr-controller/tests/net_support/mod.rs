@@ -2460,6 +2460,64 @@ impl RawDevice {
         }
     }
 
+    /// The frame that submits one mutation under `action_id`, to send on a stream of the suite's
+    /// own choosing, and the request it is.
+    pub fn mutation_frame_for<P: serde::Serialize + ?Sized>(
+        &self,
+        method: Method,
+        action_id: kr_protocol::ids::ActionId,
+        target: kr_protocol::envelope::ActionTarget,
+        params: &P,
+    ) -> (
+        kr_protocol::ids::RequestId,
+        kr_protocol::envelope::ControlFrame,
+    ) {
+        self.mutation_frame(
+            None,
+            self.action_window_id(),
+            method,
+            action_id,
+            target,
+            params,
+        )
+    }
+
+    /// The frame that sends one read, to send on a stream of the suite's own choosing, and the
+    /// request it is.
+    pub fn read_frame_for<P: serde::Serialize + ?Sized>(
+        &self,
+        method: Method,
+        params: &P,
+    ) -> (
+        kr_protocol::ids::RequestId,
+        kr_protocol::envelope::ControlFrame,
+    ) {
+        self.read_frame(method, params)
+    }
+
+    /// The identity of the connection this device holds, which a stream's header names.
+    pub fn connection_id(&self) -> kr_protocol::ids::ConnectionId {
+        use kr_client::transport::ControlTransport as _;
+        self.transport.connection_id()
+    }
+
+    /// Opens a data stream on this connection with `header`, which is sent first. The host takes a
+    /// stream's header apart before it says anything of the stream, so a refusal of the header is
+    /// first seen as the stream's end.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the stream cannot be opened at all.
+    pub async fn open_stream(
+        &self,
+        header: kr_protocol::frame::StreamHeader,
+    ) -> kr_transport::streams::DataStream {
+        self.transport
+            .open_stream(header)
+            .await
+            .expect("the stream opens")
+    }
+
     /// Sends one read under a method name the registry may not list, and returns what the host
     /// answered: the way a device meets a host older than the method it asks for.
     ///

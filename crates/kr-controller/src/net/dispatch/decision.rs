@@ -168,8 +168,7 @@ impl RemoteConnection {
                 }
                 other => (shown, other),
             };
-            match self
-                .output
+            match output
                 .write_held(
                     &shown,
                     &asked.decision.bounds(),

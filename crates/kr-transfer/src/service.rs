@@ -1928,6 +1928,34 @@ impl TransferService {
         }
     }
 
+    /// Returns where `actor`'s upload belongs when it is receiving chunks and has not expired, for a
+    /// host that decides whether to take a stream of its chunks.
+    ///
+    /// An upload that is unknown, another principal's, no longer receiving or expired is refused by
+    /// the one answer every unknown identifier is, so a caller learns nothing about which
+    /// identifiers exist or what became of them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::UnknownTransfer`] for each of those.
+    pub fn receiving_upload(
+        &self,
+        actor: &ActorId,
+        transfer_id: TransferId,
+    ) -> Result<StoredSubject> {
+        let now = self.clock.now_ms();
+        let store = self.locked()?;
+        let row = upload_of(&store, transfer_id, actor)?;
+        if !row.state.accepts_chunks() || row.expires_at_ms.get() <= now.get() {
+            return Err(unknown(transfer_id));
+        }
+        Ok(StoredSubject {
+            environment_id: row.environment_id,
+            session_id: row.session_id,
+            application_instance_id: None,
+        })
+    }
+
     /// Returns how many drafts `actor` holds open: the ones no prompt has sent to a session and
     /// whose target session has not ended, which is what [`Self::draft_create`] counts against a
     /// bound.

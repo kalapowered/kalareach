@@ -487,6 +487,19 @@ impl Controller {
         self.before_a_connection_is_registered.arm()
     }
 
+    /// Arms the pause the withdrawal of the next network connection whose control stream is lost
+    /// stops at, once the loss is declared and before the registration goes. Returns the end that
+    /// says the withdrawal has arrived, and the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_connection_deregistration(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.before_a_connection_is_deregistered.arm()
+    }
+
     /// Answers an action this daemon has already admitted for this caller, if it has.
     ///
     /// The de-duplication key is the actor and the action together, and the payload digest decides
