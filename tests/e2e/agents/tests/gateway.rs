@@ -674,6 +674,71 @@ impl Real {
 /// Where the stand-in agent is placed in the run, below its directory.
 const STAND_IN_PLACE: &str = "t/codex";
 
+/// How many reads of the host's list of application instances a failure's text keeps.
+const POLLS_KEPT: usize = 20;
+
+/// The last reads of the host's list of application instances, as the device read them, each with
+/// the time it was read after the case began and what it listed.
+struct Polls {
+    began: Instant,
+    last: std::sync::Mutex<std::collections::VecDeque<String>>,
+}
+
+impl Polls {
+    fn new() -> Self {
+        Self {
+            began: Instant::now(),
+            last: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    /// Keeps one read, and drops the oldest beyond the last [`POLLS_KEPT`].
+    fn record(&self, listed: &str) {
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last.len() == POLLS_KEPT {
+            last.pop_front();
+        }
+        last.push_back(format!(
+            "+{} ms {}",
+            self.began.elapsed().as_millis(),
+            listed.chars().take(400).collect::<String>()
+        ));
+    }
+
+    /// The kept reads, oldest first, one to a line.
+    fn text(&self) -> String {
+        let last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last.is_empty() {
+            "(no read)".to_owned()
+        } else {
+            last.iter().cloned().collect::<Vec<_>>().join("\n")
+        }
+    }
+}
+
+/// What a failure at the instance wait or at the device's prompt adds to its text: the host's list
+/// of application instances as the device read it, and the terminal's screen as the harness holds
+/// it. Nothing of the run's tree is read for it and nothing is started.
+fn diagnosis_text(polls: &Polls, screen: &[String]) -> String {
+    let rows: Vec<&str> = screen.iter().map(|row| row.trim_end()).collect();
+    let used = rows
+        .iter()
+        .rposition(|row| !row.is_empty())
+        .map_or(0, |last| last + 1);
+    format!(
+        "the host's list of application instances as the device read it, the last {POLLS_KEPT} \
+         reads, oldest first:\n{}\nthe terminal's screen:\n{}",
+        polls.text(),
+        rows[..used].join("\n")
+    )
+}
+
 /// Everything a case needs besides its host.
 struct Context {
     runtime: tokio::runtime::Runtime,
@@ -687,6 +752,8 @@ struct Context {
     /// The run's working directory as it was when the agent was placed, before the session's shell
     /// was started in it.
     work: Option<PlacedDirectory>,
+    /// The device's reads of the host's list of application instances.
+    polls: Polls,
 }
 
 impl Context {
@@ -706,6 +773,7 @@ impl Context {
             executable: PathBuf::new(),
             bin: PathBuf::new(),
             work: None,
+            polls: Polls::new(),
         }
     }
 
@@ -879,9 +947,18 @@ impl Context {
         (device, paired, remote)
     }
 
-    /// Reads what a session holds of its agents.
-    fn instances(&self, remote: &Remote, session_id: SessionId) -> AgentInstancesResult {
-        self.runtime
+    /// Reads what a session holds of its agents, and keeps what it listed with the polls.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the host could not be read.
+    fn read_instances(
+        &self,
+        remote: &Remote,
+        session_id: SessionId,
+    ) -> Result<AgentInstancesResult, String> {
+        let read: Result<AgentInstancesResult, String> = self
+            .runtime
             .block_on(remote.read(
                 Method::AgentInstances,
                 &AgentInstancesParams {
@@ -889,7 +966,43 @@ impl Context {
                     agent_resources_from: Nullable::null(),
                 },
             ))
-            .unwrap_or_else(|why| panic!("agent.instances: {why}"))
+            .map_err(|why| format!("agent.instances: {why}"));
+        match &read {
+            Ok(result) => self.polls.record(&format!("{:?}", result.agent_instances)),
+            Err(why) => self.polls.record(why),
+        }
+        read
+    }
+
+    /// Reads what a session holds of its agents.
+    fn instances(&self, remote: &Remote, session_id: SessionId) -> AgentInstancesResult {
+        self.read_instances(remote, session_id)
+            .unwrap_or_else(|why| panic!("{why}"))
+    }
+
+    /// Reads the instances until `holds` is true of them, within the liveness bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the last read held when the bound passed.
+    fn instances_within(
+        &self,
+        remote: &Remote,
+        session_id: SessionId,
+        why: &str,
+        holds: impl Fn(&AgentInstancesResult) -> bool,
+    ) -> Result<AgentInstancesResult, String> {
+        let started = Instant::now();
+        loop {
+            let read = self.instances(remote, session_id);
+            if holds(&read) {
+                return Ok(read);
+            }
+            if started.elapsed() >= LIVENESS {
+                return Err(format!("{why}: the session holds {read:?}"));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     /// Reads the instances until `holds` is true of them, within the liveness bound.
@@ -900,18 +1013,8 @@ impl Context {
         why: &str,
         holds: impl Fn(&AgentInstancesResult) -> bool,
     ) -> AgentInstancesResult {
-        let started = Instant::now();
-        loop {
-            let read = self.instances(remote, session_id);
-            if holds(&read) {
-                return read;
-            }
-            assert!(
-                started.elapsed() < LIVENESS,
-                "{why}: the session holds {read:?}"
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        self.instances_within(remote, session_id, why, holds)
+            .unwrap_or_else(|why| panic!("{why}\n{}", self.polls.text()))
     }
 
     /// Reads what the host says of an instance's binding.
@@ -1807,12 +1910,13 @@ impl<'a> Session<'a> {
         }
         let instance = self
             .ctx
-            .instances_until(&self.remote, self.session_id(), "the instance", |read| {
+            .instances_within(&self.remote, self.session_id(), "the instance", |read| {
                 read.agent_instances
                     .instances
                     .iter()
                     .any(|instance| Some(instance.application_instance_id) != not)
             })
+            .unwrap_or_else(|why| panic!("{why}\n{}", self.diagnosis()))
             .agent_instances
             .instances
             .iter()
@@ -1838,6 +1942,14 @@ impl<'a> Session<'a> {
             );
         }
         instance
+    }
+
+    /// What a failure at the instance wait or at the device's prompt adds to its text: one more read
+    /// of the host's list of instances through the device, the last reads of it, and the terminal's
+    /// screen ([`diagnosis_text`]).
+    fn diagnosis(&self) -> String {
+        let _ = self.ctx.read_instances(&self.remote, self.session_id());
+        diagnosis_text(&self.ctx.polls, &self.person.window.screen())
     }
 
     /// Fails the case unless the host announces `instance` as served through a gateway, with no
@@ -2376,7 +2488,12 @@ fn gateway_the_terminal_shows_a_turn_the_host_started() {
                             &idle,
                             "run it again",
                         )
-                        .expect("the device's prompt is carried");
+                        .unwrap_or_else(|why| {
+                            panic!(
+                                "the device's prompt is carried: {why:?}\n{}",
+                                session.diagnosis()
+                            )
+                        });
                     assert!(started.turn_id.0.is_some(), "the host started a turn");
                     let _ = session.person.window.wait_for(
                         from,
@@ -2408,7 +2525,12 @@ fn gateway_the_terminal_shows_a_turn_the_host_started() {
                             &idle,
                             &format!("({marked}) {question}"),
                         )
-                        .expect("the device's prompt is carried");
+                        .unwrap_or_else(|why| {
+                            panic!(
+                                "the device's prompt is carried: {why:?}\n{}",
+                                session.diagnosis()
+                            )
+                        });
                     assert!(started.turn_id.0.is_some(), "the host started a turn");
                     let _ = session.person.sees_the_sum(
                         &sum,
@@ -3464,4 +3586,38 @@ fn the_sum_is_matched_as_a_whole_word_with_or_without_a_thousands_separator() {
     assert!(shows_sum("2,015", "2015"));
     assert_eq!(with_thousands("1557"), "1,557");
     assert_eq!(with_thousands("1000"), "1,000");
+}
+
+/// A failure at the instance wait or at the device's prompt carries the host's list of application
+/// instances as the device read it, the last twenty reads in order, and the terminal's screen
+/// without its empty rows.
+#[test]
+fn a_row_the_failure_text_keeps_the_last_twenty_polls_and_the_screen() {
+    let polls = Polls::new();
+    for number in 0..25 {
+        polls.record(&format!("poll {number} listed no instance"));
+    }
+    let text = diagnosis_text(
+        &polls,
+        &[
+            "TUI: thread/started".to_owned(),
+            "   ".to_owned(),
+            String::new(),
+        ],
+    );
+    assert_eq!(text.matches(" listed no instance").count(), POLLS_KEPT);
+    assert!(
+        !text.contains("poll 4 listed"),
+        "the oldest reads are dropped"
+    );
+    assert!(text.contains("poll 5 listed") && text.contains("poll 24 listed"));
+    assert!(
+        text.find("poll 5 listed") < text.find("poll 24 listed"),
+        "the reads are in order"
+    );
+    assert!(
+        text.ends_with("the terminal's screen:\nTUI: thread/started"),
+        "{text}"
+    );
+    assert_eq!(Polls::new().text(), "(no read)");
 }
