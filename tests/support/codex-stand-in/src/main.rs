@@ -7,6 +7,8 @@
 //!   after the words that were typed.
 //! * `codex --exec-in-new-session PROGRAM [arguments]` is how the server starts a command in a
 //!   session of its own, as the pinned release's server does.
+//! * `codex --rewrite-config` appends a line to the configuration file `CODEX_HOME` names, as an
+//!   agent that rewrites its configuration at a start does.
 //!
 //! Every frame either side writes or reads is checked against the schemas that release publishes
 //! (see `contract`), so a gateway that makes a frame the pinned release would not write is caught.
@@ -36,6 +38,9 @@ async fn main() {
         .as_slice()
     {
         ["--version"] => println!("codex-cli {}", contract::RELEASE),
+        // What an agent that rewrites its own configuration at a start does: a line is added to the
+        // `config.toml` that `CODEX_HOME` names.
+        ["--rewrite-config"] => rewrite_config(),
         ["app-server", "--listen", "stdio://"] => server::run(variants).await,
         ["--remote", remote, words @ ..] | [words @ .., "--remote", remote]
             if remote.starts_with("unix://") =>
@@ -58,6 +63,23 @@ async fn main() {
             std::process::exit(2);
         }
     }
+}
+
+/// Appends a line to the `config.toml` in the directory `CODEX_HOME` names, and says so.
+///
+/// # Panics
+///
+/// Panics when the directory is not named or the file cannot be appended to.
+#[cfg(unix)]
+fn rewrite_config() {
+    use std::io::Write as _;
+    let directory = std::env::var_os("CODEX_HOME").expect("CODEX_HOME names the configuration");
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(std::path::Path::new(&directory).join("config.toml"))
+        .expect("the configuration file");
+    writeln!(file, "# rewritten by a start of the agent").expect("appends to it");
+    println!("codex-cli rewrote its configuration");
 }
 
 #[cfg(not(unix))]

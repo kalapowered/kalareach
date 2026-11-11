@@ -274,6 +274,9 @@ struct Real {
     person: MetaGuard,
     /// The agent's program as the run placed it, recorded once before the agent first starts.
     placed: std::sync::OnceLock<PlacedProgram>,
+    /// The agent's configuration files as the harness wrote them, by their place below the run's
+    /// directory, each recorded with its stamp and digest when it was written.
+    configured: std::sync::Mutex<Vec<PathBuf>>,
 }
 
 impl Route {
@@ -326,6 +329,7 @@ impl Route {
             home,
             person,
             placed: std::sync::OnceLock::new(),
+            configured: std::sync::Mutex::new(Vec::new()),
         }))
     }
 }
@@ -396,6 +400,18 @@ impl Real {
                 "a configuration file stays in its directory: {relative}"
             );
             std::fs::write(&path, content).expect("writes the configuration file");
+            // What the probes vouch for: the file as it is now, read back through the run's handles.
+            let place = Path::new(CONFIG_DIRECTORY).join(relative);
+            host.run()
+                .note_placed(&place)
+                .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+            let mut configured = self
+                .configured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !configured.contains(&place) {
+                configured.push(place);
+            }
         }
         variables.retain(|(existing, _)| existing != &config.variable);
         variables.push((config.variable.clone(), directory.display().to_string()));
@@ -505,6 +521,7 @@ impl Real {
             .transpose()?;
         // The program is started by the absolute path recorded when it was placed, once the route to
         // it is checked to be as it was: the agent's earlier start may have left another link.
+        self.configuration_as_placed(run)?;
         let mut command = self.placed().command(run.root(), run.pin())?;
         command
             .args(probe.arguments.iter().map(|argument| match &stub {
@@ -572,6 +589,24 @@ impl Real {
         self.placed()
             .checked(run.root(), run.pin())
             .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+        self.configuration_as_placed(run)
+            .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+    }
+
+    /// Whether each configuration file the harness wrote is still the file that was written, read
+    /// through the run's handles with its stamp and digest: the isolation probes vouch for the
+    /// agent's configuration, and an earlier start of the agent may have rewritten it.
+    fn configuration_as_placed(&self, run: &Run) -> Result<(), String> {
+        let configured = self
+            .configured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for place in configured {
+            run.placed_as_it_was(&place)
+                .map_err(|why| format!("the agent's configuration: {why}"))?;
+        }
+        Ok(())
     }
 
     /// The text of the slash command `which`.
