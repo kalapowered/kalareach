@@ -509,11 +509,12 @@ impl Network {
 
 /// How many connections one paired device may use on this host at once.
 ///
-/// The companion uses up to 26 by its own count: its main link, a link for each of at most eight
-/// open sessions, a terminal view for each of those, up to four ambient links, and the connections
-/// of the owner's confirmations, the revocation readings and the push registration. This crate
-/// cannot see that count: a case in the companion's suite holds the two together. The host allows
-/// more, so that a kind the count misses does not at once cost a connection in use.
+/// The companion uses up to 30 to the host in use by its own count: its main link, a link for each
+/// of at most eight open sessions, a terminal view for each of those, up to four ambient links, and
+/// the connections of the owner's confirmations, the revocation readings, the push registration,
+/// the inbox, a voice call and the sharing desk. This crate cannot see that count: a case in the
+/// companion's suite holds the two together. The host allows more, so that a kind the count
+/// misses does not at once cost a connection in use.
 pub const DEVICE_CONNECTIONS_IN_USE: usize = 32;
 
 /// How many live connections one paired device may hold on this host at once.

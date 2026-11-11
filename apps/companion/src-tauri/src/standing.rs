@@ -54,7 +54,8 @@ pub const OPENED_LIMIT: usize = 8;
 /// The most ambient links held at once.
 pub const AMBIENT_LIMIT: usize = 4;
 
-/// The most connections this computer holds to one host at once, as the one device it is there.
+/// The most connections this computer holds to the host in use at once, as the one device it is
+/// there.
 ///
 /// * the main connection: one;
 /// * the opened links: one for each opened session, at most [`OPENED_LIMIT`];
@@ -64,8 +65,18 @@ pub const AMBIENT_LIMIT: usize = 4;
 /// * the owner's confirmations: two, a review beside the cycle of visits;
 /// * a revocation reading: two, a view beside a revoke or in a second window, which native code
 ///   holds to no number;
-/// * the push registration: one.
-pub const HOST_CONNECTIONS: usize = 1 + OPENED_LIMIT + OPENED_LIMIT + AMBIENT_LIMIT + 2 + 2 + 1;
+/// * the push registration: one;
+/// * the inbox's kept connection: one, which it closes at its next visit after the host became the
+///   host in use;
+/// * a voice call's own connection, when it avoids the main session: one;
+/// * the sharing desk's repeat connection and its reading connection: two for the action it
+///   carries on, and native code holds the actions carried on at once to no number.
+///
+/// Not counted: the settings list's visits (two at once), which reach only hosts that are not in
+/// use; the pairing candidate's first connection, which exists only while a host is being paired;
+/// and the endpoint holds of the push registration, which open no connection to the host.
+pub const HOST_CONNECTIONS: usize =
+    1 + OPENED_LIMIT + OPENED_LIMIT + AMBIENT_LIMIT + 2 + 2 + 1 + 1 + 1 + 2;
 
 /// How long an ambient link may sit idle before it is let go.
 const AMBIENT_IDLE: Duration = Duration::from_secs(60);

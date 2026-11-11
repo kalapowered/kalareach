@@ -3361,10 +3361,10 @@ device is told, and the stream is read no further. When the connection's authori
 connection is closed and nothing more is written on it.
 
 A device holds at most 64 live connections: the host lets it use 32 at once, which covers the
-companion's own count of 26 (its main link, a link and a terminal view for each of at most eight
-open sessions, up to four ambient links, and the connections of the owner's confirmations, the
-revocation readings and the push registration), and each may linger once beside its replacement
-after a reconnection. At the first connection above the bound the host serves the new connection
+companion's own count of 30 to the host in use (its main link, a link and a terminal view for each
+of at most eight open sessions, up to four ambient links, and the connections of the owner's
+confirmations, the revocation readings, the push registration, the inbox, a voice call and the
+sharing desk), and each may linger once beside its replacement after a reconnection. At the first connection above the bound the host serves the new connection
 and withdraws the oldest as a revocation withdraws a device's connections: it is closed, a request in
 flight on it gets no answer, and the device presents the same action on a newer connection and
 settles it as it would after any lost connection. Another device's connections are not touched. An
