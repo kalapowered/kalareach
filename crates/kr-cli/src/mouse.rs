@@ -13,7 +13,9 @@
 //! asks for the SGR encoding, which carries any position and says which button came up; without it
 //! the original report is used, which has room for 223 columns and rows and no way to say which
 //! button was released. A position the original report has no room for is not reported, as
-//! [`kr_keys::mouse`] has it, rather than reported as another cell.
+//! [`kr_keys::mouse`] has it, rather than reported as another cell. The encoding is one choice: mode
+//! 1005 asks for UTF-8 coordinates, which are spelled as the original report, and setting either
+//! mode replaces the one in force, while resetting either returns the original report.
 
 use kr_keys::{Modifiers, MouseAction, MouseButton, MouseEncoding, MouseEvent, WheelDirection};
 use kr_term::win32::control_keys::{
@@ -80,7 +82,9 @@ pub enum Tracking {
 /// The tracking is one setting, as a terminal and the session's screen keep it: setting one of the
 /// three tracking modes replaces the one in force, and resetting any of them turns tracking off. A
 /// frame drawn from the screen resets the three and then sets the one that is on. A full reset of
-/// the terminal (`ESC c`) turns tracking off.
+/// the terminal (`ESC c`) turns tracking off. The encoding is one setting in the same way: a set of
+/// 1005 or 1006 replaces the one in force and a reset of either returns the default, and a frame
+/// resets the four modes xterm names before it sets the one that is on.
 #[derive(Debug, Default)]
 pub struct MouseReporting {
     clicks: bool,
@@ -272,7 +276,14 @@ impl MouseReporting {
                         self.motion = set && mode == 1003;
                     }
                 }
-                1006 => self.sgr = set,
+                // One encoding state, as a terminal keeps it: a set of 1005 or 1006 replaces the
+                // encoding in force, and a reset of either returns the default, also when it names
+                // the one that is not in force. Only the SGR report is spelled, so the console is
+                // spelled it while 1006 is the one in force, and the original report otherwise,
+                // which is also what UTF-8 coordinates (1005) are spelled as. A frame of a worker
+                // of an earlier build that holds both flags on draws `?1005h ?1006h`, which reads
+                // as 1006, the later number.
+                1005 | 1006 => self.sgr = set && mode == 1006,
                 _ => {}
             }
         }
@@ -628,6 +639,43 @@ mod tests {
             reporting.observe(on);
             reporting.observe(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l");
             assert_eq!(reporting.tracking(), Tracking::Off, "{on:?}");
+        }
+    }
+
+    /// The encoding is one state: a set of 1005 or 1006 replaces the one in force, and a reset of
+    /// either returns the default, also when it names the one that is not in force. The console is
+    /// spelled the SGR report only while 1006 is the one in force; UTF-8 coordinates are spelled
+    /// as the original report, as they always were. A frame drawn from the session's screen resets
+    /// the four modes xterm names and sets the one that is on, and a frame of a worker of an earlier
+    /// build that holds both flags on reads as 1006.
+    #[test]
+    fn the_encoding_is_one_state_and_a_reset_of_either_mode_returns_the_default() {
+        for (output, encoding) in [
+            (&b"\x1b[?1006h\x1b[?1005h"[..], kr_keys::MouseEncoding::X10),
+            (b"\x1b[?1005h\x1b[?1006h", kr_keys::MouseEncoding::Sgr),
+            (b"\x1b[?1005h\x1b[?1006l", kr_keys::MouseEncoding::X10),
+            (b"\x1b[?1006h\x1b[?1005l", kr_keys::MouseEncoding::X10),
+            (b"\x1b[?1006h\x1b[?1006l", kr_keys::MouseEncoding::X10),
+            (
+                b"\x1b[?1006h\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l",
+                kr_keys::MouseEncoding::X10,
+            ),
+            (
+                b"\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?1006h",
+                kr_keys::MouseEncoding::Sgr,
+            ),
+            (
+                b"\x1b[?1000h\x1b[?1002l\x1b[?1003l\x1b[?1005h\x1b[?1006h",
+                kr_keys::MouseEncoding::Sgr,
+            ),
+            (
+                b"\x1b[?1000h\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006h",
+                kr_keys::MouseEncoding::Sgr,
+            ),
+        ] {
+            let mut reporting = MouseReporting::default();
+            reporting.observe(output);
+            assert_eq!(reporting.encoding(), encoding, "{output:?}");
         }
     }
 
