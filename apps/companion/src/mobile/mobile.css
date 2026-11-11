@@ -643,6 +643,13 @@
 .m-session[data-pane='semantic'] > .m-pane {
   padding-inline: var(--reach-inline);
   margin-inline: calc(-1 * var(--reach-inline));
+  /* The layers of the links' areas and words stay inside the pane, under the bars and sheets. */
+  isolation: isolate;
+}
+
+/* The pane's own focus ring stays 4px outside the messages, not outside the room kept for the reach. */
+.m-session[data-pane='semantic'] > .m-pane:focus-visible {
+  outline-offset: calc(4px - var(--reach-inline));
 }
 
 /* The terminal fills its pane, under the words of a view that has ended. */
@@ -699,13 +706,6 @@
   border-block-end: 0;
 }
 
-/* The last line of the conversation can be a link, whose press area reaches below its words. */
-@supports (height: 1lh) {
-  .m-node:last-child {
-    padding-block-end: max(var(--gap-2), calc(var(--target) / 2 - 0.5lh));
-  }
-}
-
 .m-node-role {
   font-size: 0.6875rem;
   font-weight: 700;
@@ -719,19 +719,26 @@
  * box grows by a reach on each side and its margin takes the same amount back, so the line, the
  * paragraph and the words around the link stay where they were, while the box that a finger, TalkBack
  * and VoiceOver find is `--target` in both directions. The block reach is what the line lacks; the
- * inline reach is a quarter of `--target` on each side, and a link of a character or two is widened
- * to `--target`.
+ * inline reach is a quarter of `--target` on each side, and half of it for a label of a few
+ * characters, whose words are narrower than the box needs. A label of four characters or more that
+ * is still narrower than half of `--target` (as `iiii` is) is widened to `--target`, which moves the
+ * words after it by the difference.
  *
- * The area reaches half a line into the lines above and below, as a target this tall must. Where
- * two links are closer than the reach, the words of each stay that link's own: they are a layer
- * above every button's area, so a press on a link's words is that link's whichever neighbour's area
- * lies under it.
+ * The area reaches half a line into the lines above and below, as a target this tall must, and over
+ * plain words after the link. Each button is above plain text, so a press anywhere in its box is its
+ * own; the words of each link are a layer above every button, so a press on a link's words is that
+ * link's whichever neighbour's area lies under it.
  */
 .m-node .md-link {
   --reach-block: 16px;
+  position: relative;
   padding: var(--reach-block) var(--reach-inline);
   margin: calc(-1 * var(--reach-block)) calc(-1 * var(--reach-inline));
   min-inline-size: var(--target);
+}
+
+.m-node .md-link-short {
+  --reach-inline: calc(var(--target) / 2);
 }
 
 @supports (height: 1lh) {
@@ -742,6 +749,7 @@
 
 .m-node .md-link-label {
   position: relative;
+  z-index: 1;
 }
 
 /* The ring follows the words, not the larger box a finger has. */
