@@ -486,9 +486,11 @@ impl RunScan {
 
     /// Why the run's directory is to be left where it is, as a class: the search met a volume
     /// mounted below it, or its root was not the directory the run made.
-    fn left_in_place(&self) -> Option<&'static str> {
+    fn left_in_place(&self, writers_ended: bool) -> Option<&'static str> {
         let scans = || self.key.iter().map(|(_, scan)| scan).chain(&self.others);
-        if scans().any(|scan| scan.root_changed) {
+        if !writers_ended {
+            Some("a process the run started may still be running")
+        } else if scans().any(|scan| scan.root_changed) {
             Some("the root was not the directory the run made")
         } else if scans().any(|scan| scan.crossed_a_mount) {
             Some("an entry below it lies on another file system")
@@ -505,10 +507,14 @@ impl RunScan {
     /// another key's value found in a file. The login's own value found in a file is recorded, as
     /// the qualification cases record it, and stops nothing. Call it once the run is dropped, so the
     /// run's own end does not say it keeps a directory that is about to go.
+    ///
+    /// The order is the caller's: everything the run started is ended and checked ended before the
+    /// search and before this removal. `writers_ended` says whether that check passed, and a run
+    /// whose check did not pass is left where it is, whatever else holds.
     #[must_use]
     pub fn finish(self, root: &Path, case: &str, writers_ended: bool) -> (Vec<Stop>, Value) {
         let mut stops: Vec<Stop> = Vec::new();
-        let left = match self.left_in_place() {
+        let left = match self.left_in_place(writers_ended) {
             Some(why) => Some(why.to_owned()),
             None => match remove_run_directory(root, &self.pin) {
                 Removal::Removed => None,
@@ -2671,10 +2677,22 @@ mod tests {
             key: Some(("LOGIN".to_owned(), own.to_owned())),
             others: Vec::new(),
         };
-        let (stops, _) = RunScan::of(&again, &RunRules::new(&pinned(&again), Vec::new()), &held)
-            .finish(&again, "held-test", false);
-        assert_eq!(stops.len(), 1, "{stops:?}");
-        assert_eq!(stops[0].0, "key_scan_incomplete");
+        let (stops, evidence) = RunScan::of(
+            &again,
+            &RunRules::new(&pinned(&again), Vec::new()),
+            &held,
+        )
+        .finish(&again, "held-test", false);
+        // A run whose processes were not shown ended is searched and left where it is.
+        let classes: Vec<&str> = stops.iter().map(|(class, _)| *class).collect();
+        assert_eq!(
+            classes,
+            ["run_left_in_place", "key_scan_incomplete"],
+            "{stops:?}"
+        );
+        assert!(again.is_dir(), "the run was left");
+        assert_eq!(evidence["run_gone"], json!(false));
+        std::fs::remove_dir_all(&again).expect("clean up");
     }
 
     /// A directory that is not the one the run made, put at the run's path, is not read, scanned or
@@ -2723,9 +2741,14 @@ mod tests {
             run.join(sessions).join("theirs.jsonl").exists(),
             "nothing was removed"
         );
-        // The directory the run made is found by its identity wherever it now is.
-        assert_eq!(remove_run_directory(&away, &pin), Removal::Removed);
-        assert!(!away.exists());
+        // The directory the run made, renamed away, is the right directory at another place: it is
+        // not emptied either, since what is beneath the run's own place is the run's.
+        assert_eq!(
+            remove_run_directory(&away, &pin),
+            Removal::Left(kr_e2e_m1b::run::Left::MovedOut)
+        );
+        assert!(away.join(sessions).join("own.jsonl").exists());
+        std::fs::remove_dir_all(&away).expect("clean up");
         std::fs::remove_dir_all(&run).expect("clean up");
     }
 

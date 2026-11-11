@@ -824,11 +824,19 @@ fn scan_root(
                 Err(error) => scan.unread.push(format!(": {error}")),
             }
         }
+        // The root of a run's scan is the directory the run made, which no file is: a file there
+        // is another entry put in its place, and it is not read.
+        FileType::RegularFile if rules.is_some() => {
+            scan.root_changed = true;
+            scan.unread.push(format!(
+                ": {}",
+                not_scanned("the run's directory is not the one the run made")
+            ));
+        }
         // A root of a place of the person's own that is a link to a file is looked at through the
         // link, and the no-follow open then refuses it and tells it with the wrong text, "it became
         // a link while the scan ran": it was one from the start. It is still refused and still
         // incomplete; only the wording is off, and only the parts that scan such a place meet it.
-        // A run's own root is never a file.
         FileType::RegularFile => {
             scan_file(rustix::fs::CWD, root, &looked, &name, rules, holds, scan)
         }
@@ -2285,32 +2293,29 @@ mod tests {
         let scan = run_files_holding(&linked_file, &rules_for(&linked_file, &[]), key);
         assert!(!scan.complete());
         assert!(scan.held_by.is_empty(), "{:?}", scan.held_by);
-        // The root is a file with one name: read, and named by its own name.
+        // The root is a file of any kind: in a run's scan it is no directory the run made, so it is
+        // refused as a changed root and not read, whatever its name count; in the scan of a place of
+        // the person's own it is read through its checked handle, a second name included, and named
+        // by its own name.
         let own = scratch.0.join("own-file");
         std::fs::write(&own, key).expect("a file");
-        let scan = run_files_holding(&own, &rules_for(&own, &[]), key);
-        assert!(scan.complete(), "{:?}", scan.unread);
+        let second = scratch.0.join("second-name");
+        std::fs::hard_link(elsewhere.join("inner/theirs"), &second).expect("a hard link");
+        for file in [&own, &second] {
+            let scan = run_files_holding(file, &rules_for(file, &[]), key);
+            assert!(scan.root_changed && !scan.complete(), "{:?}", scan.unread);
+            assert!(scan.held_by.is_empty(), "{:?}", scan.held_by);
+        }
+        let lenient = files_holding(&own, key);
+        assert!(lenient.complete(), "{:?}", lenient.unread);
         assert_eq!(
-            scan.held_by
+            lenient
+                .held_by
                 .iter()
                 .map(|holder| holder.path.as_str())
                 .collect::<Vec<_>>(),
             vec!["own-file"]
         );
-        // The root is a file with a second name, one of the person's: not read in a run's scan,
-        // read in the scan of a place of theirs.
-        let second = scratch.0.join("second-name");
-        std::fs::hard_link(elsewhere.join("inner/theirs"), &second).expect("a hard link");
-        let scan = run_files_holding(&second, &rules_for(&second, &[]), key);
-        assert!(!scan.complete());
-        assert!(
-            scan.unread
-                .iter()
-                .any(|entry| entry.contains("not scanned: a file with more than one name")),
-            "{:?}",
-            scan.unread
-        );
-        assert!(scan.held_by.is_empty(), "{:?}", scan.held_by);
         let lenient = files_holding(&second, key);
         assert!(lenient.complete(), "{:?}", lenient.unread);
         assert_eq!(lenient.held_by.len(), 1);
