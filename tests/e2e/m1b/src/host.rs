@@ -19,13 +19,16 @@ use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use kr_ipc::identity::{ProcessQuery, query_process};
 use kr_ipc::paths::{EnvironmentPaths, HostPaths};
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::EnvironmentId;
 use serde_json::Value;
 
 use crate::LIVENESS;
-use crate::run::{Run, ended_within, output_within, read_tail_below, running, signal};
+use crate::run::{
+    Run, ended_within, output_within, processes_under, read_tail_below, running, signal,
+};
 
 /// The daemon's log, in the run's directory.
 const DAEMON_LOG: &str = "controller.log";
@@ -512,17 +515,18 @@ impl<'r> Host<'r> {
         }
     }
 
-    /// Records every worker this host's registry names, with everything that runs beneath it, by
-    /// start identity.
+    /// Records every worker this host started, with everything that runs beneath it, by start
+    /// identity.
     ///
-    /// The registry is where the host itself keeps each worker's identity, and it is readable
-    /// whether or not the daemon still answers. So a leg that stops part way still reaches the
-    /// sessions it made, their shells and what runs in them, through the record rather than by a
-    /// name. A search that does not finish is kept with the run, whose closing check then fails
-    /// rather than report a search that did not finish, and it is tried again within
-    /// `DISCOVERY` so that the run can still end what a later search finds. A later search that
-    /// finishes does not clear the earlier failure: what the earlier one missed may since have
-    /// left the tree it searched.
+    /// A worker is found in the process table by its command line, which names this run's
+    /// directory and the session it serves, and is recorded like any other process this run
+    /// learns of ([`Run::record_named`]). That needs nothing of the host, so a leg that stops part
+    /// way still reaches the sessions it made, their shells and what runs in them, whether or not
+    /// the daemon still answers, and no file of the host's is opened. A search that does not finish
+    /// is kept with the run, whose closing check then fails rather than report a search that did
+    /// not finish, and it is tried again within `DISCOVERY` so that the run can still end what a
+    /// later search finds. A later search that finishes does not clear the earlier failure: what
+    /// the earlier one missed may since have left the tree it searched.
     pub fn record_workers(&self) {
         let started = Instant::now();
         loop {
@@ -540,20 +544,23 @@ impl<'r> Host<'r> {
     }
 
     fn discover_workers(&self) -> Result<(), String> {
-        let registry = kr_controller::registry::Registry::open(
-            self.environment.registry_database(),
-            self.environment.environment_id(),
-        )
-        .map_err(|error| format!("the host's registry could not be opened: {error}"))?;
-        let workers = registry
-            .workers()
-            .map_err(|error| format!("the host's registry could not be read: {error}"))?;
-        drop(registry);
-        for worker in workers {
-            let what = format!("the worker of session {}", worker.session_id);
-            self.run.record(worker.process_identity.clone(), &what);
-            self.run
-                .record_descendants(&worker.process_identity, &format!("under {what}"))?;
+        for (pid, command) in processes_under(self.run.root())? {
+            let Some(session) = worker_session(&command) else {
+                continue;
+            };
+            let what = format!("the worker of session {session}");
+            match self.run.record_named(pid, &what, &["--session"]) {
+                Some(identity) => self
+                    .run
+                    .record_descendants(&identity, &format!("under {what}"))?,
+                // Ended since the table was read, or not the process the table named any more.
+                None if matches!(query_process(pid), ProcessQuery::Gone) => {}
+                None => {
+                    return Err(format!(
+                        "process {pid}, which runs {what}, could not be recorded"
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -812,6 +819,16 @@ impl Drop for Host<'_> {
     }
 }
 
+/// The session a command line is the worker of: the program is `kr-worker` and `--session` names it.
+fn worker_session(command: &str) -> Option<&str> {
+    let mut words = command.split_whitespace();
+    let program = words.next()?;
+    if Path::new(program).file_name()? != "kr-worker" {
+        return None;
+    }
+    words.skip_while(|word| *word != "--session").nth(1)
+}
+
 /// How many times a host with a stable address is given a port before the daemon's refusal of it is
 /// reported. It ends a hang: each refusal is taken to be a port another leg chose at the same moment.
 const PORT_ATTEMPTS: usize = 5;
@@ -980,6 +997,65 @@ mod shutdown_tests {
             Some(Daemon { child, identity });
         host.stop_daemon()
             .expect_err("a daemon that ended by the interrupt did not end well")
+    }
+
+    /// A link left at the host's registry, to a database of the person's, is not opened: the file it
+    /// names is byte for byte what it was and nothing is made beside it. The workers are found in
+    /// the process table all the same: the control is a process that runs as a worker of this run,
+    /// which is recorded with what runs beneath it.
+    #[test]
+    fn a_link_at_the_registry_is_not_opened_and_the_workers_are_found_by_their_command_lines() {
+        use std::os::unix::process::CommandExt as _;
+        let root = scratch("registry");
+        let theirs = scratch("registry-theirs");
+        let database = theirs.join("personal.sqlite");
+        std::fs::write(&database, b"").expect("a database of the person's, not yet written to");
+        let run = Run::over(&root);
+        let host = host_over(&run);
+        let place = host.environment().registry_database();
+        std::os::unix::fs::symlink(&database, &place).expect("a link at the registry");
+        let session = kr_ipc::new_uuid().to_string();
+        // A process that runs as this run's worker for a session, with a child beneath it.
+        let mut worker = Command::new("/bin/sh")
+            .arg0(run.root().join("b/kr-worker"))
+            .args(["-c", "/bin/sleep 30; true", "--session", &session])
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("a process standing for a worker");
+        let started = Instant::now();
+        let recorded = loop {
+            host.record_workers();
+            let owned = run.owned();
+            if owned.len() >= 2 || started.elapsed() > Duration::from_secs(10) {
+                break owned;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        run.end_everything();
+        let _ = worker.wait();
+        assert_eq!(
+            std::fs::read(&database).expect("theirs"),
+            b"",
+            "the database the link names is unchanged"
+        );
+        let mut beside = std::fs::read_dir(&theirs)
+            .expect("theirs")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect::<Vec<_>>();
+        beside.sort();
+        assert_eq!(beside, ["personal.sqlite"], "nothing was made beside it");
+        let names: Vec<&str> = recorded.iter().map(|owned| owned.what.as_str()).collect();
+        assert!(
+            names.contains(&format!("the worker of session {session}").as_str())
+                && names
+                    .iter()
+                    .any(|what| what.starts_with("under the worker of")),
+            "the worker and what runs beneath it are recorded: {names:?}"
+        );
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+        std::fs::remove_dir_all(&theirs).expect("clean up");
     }
 
     /// A link, or a second name, left at the daemon's log is a class in the error and none of the
