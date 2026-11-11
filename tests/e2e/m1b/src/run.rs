@@ -681,6 +681,29 @@ pub fn system_program_of_another_user(pid: u32, error: &str) -> Option<PathBuf> 
     }
 }
 
+/// The path of the file the process `pid` runs, as the system says it (`proc_pidpath` on macOS, the
+/// process's own link on Linux), and not as the process that started it named it: `None` where the
+/// system will not say, as of a process of another account, or where the platform has no such
+/// answer.
+#[must_use]
+pub fn executable_path(pid: u32) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(PathBuf::from(
+            libproc::proc_pid::pidpath(i32::try_from(pid).ok()?).ok()?,
+        ))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// Whether the process `pid`, a system program noted under [`Run::note_system_program`], may
 /// still run: only the kernel's answer that it has no such process (`ESRCH`, to a question about
 /// that one number) says it has ended. Any other answer, a process under that number whatever it
