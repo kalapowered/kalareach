@@ -256,8 +256,8 @@ impl HostHandler for ChunkHost {
                     drop(session.data_streams);
                     self.receiver_dropped.store(true, Ordering::Release);
                     self.dropped.notify_waiters();
-                    // The frames the device sends are answered with themselves, so a device can make
-                    // one round trip on the control stream.
+                    // The frames the device sends are answered with themselves, so a device can
+                    // make one round trip on the control stream.
                     while let Some(received) = session.control.recv().await {
                         let (frame, _) = received.into_parts();
                         let _ = session.control.send(&frame).await;
