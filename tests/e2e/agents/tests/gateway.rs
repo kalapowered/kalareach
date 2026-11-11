@@ -99,7 +99,7 @@ use kr_e2e_agents::account::{KEY_SCAN_VARIABLE, Ledger};
 use kr_e2e_agents::build::{self, Account, Build, InstallSwitch, Probe};
 use kr_e2e_agents::held::{
     Absent, Audit, CONFIG_DIRECTORY, HeldKeys, ISOLATION_UNPROVEN, MetaGuard, RunScan, Stop,
-    absent_paths, audit_turns, conversations_relative, grouped_output, kept_panic_text,
+    absent_paths, audit_turns, conversations_relative, grouped_output, is_absent, kept_panic_text,
     other_agent_processes, other_agents_refusal, panic_text, person_home, read_record,
     turns_recorded, unchanged_before_the_charge,
 };
@@ -429,12 +429,18 @@ impl Real {
     /// template filled in.
     fn checks_absent(&self, run: &Run) {
         for path in absent_paths(&self.account, run, &run.home(), &self.home, Absent::All) {
-            assert!(
-                !path.exists(),
-                "{ISOLATION_UNPROVEN} {} exists, which would load the person's own settings, hooks \
-                 or servers into the agent, or which it would remove",
-                path.display()
-            );
+            match is_absent(&path) {
+                Ok(true) => {}
+                Ok(false) => panic!(
+                    "{ISOLATION_UNPROVEN} {} exists, which would load the person's own settings, \
+                     hooks or servers into the agent, or which it would remove",
+                    path.display()
+                ),
+                Err(error) => panic!(
+                    "{ISOLATION_UNPROVEN} {} cannot be shown absent: {error}",
+                    path.display()
+                ),
+            }
         }
     }
 
