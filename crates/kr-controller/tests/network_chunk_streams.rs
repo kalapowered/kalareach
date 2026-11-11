@@ -1253,19 +1253,24 @@ async fn has_ended(raw: &RawDevice) -> bool {
         == Some(false)
 }
 
-/// KR-REQ-23.21: a connection is dated by the packets its device sends on it. A device that has
-/// made a request on a connection has sent frames the host's transport received, and the host dates
-/// the connection to the time it read them, which is later than the time it admitted it. The wait
-/// is for that reading, which the host makes at most a second after the packets arrive.
+/// KR-REQ-23.21: a connection is dated by the packets its device sends on it, requests or not. A
+/// device that has made a request on a connection has sent frames the host's transport received,
+/// and the host dates the connection to the time it read them, which is later than the time it
+/// admitted it. A device that then sends nothing still sends the transport's keepalive, and the
+/// acknowledgements of the host's own, which date it again. Each wait is for the host's reading,
+/// which it makes a second after the packets arrive at the latest.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_connection_is_dated_by_the_packets_its_device_sends_on_it() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let device = paired(&host, &owner, &[ActionRight::SessionView]).await;
-    let admitted = host.heard_from_of(&device.record);
-    assert_eq!(admitted.len(), 1, "the host counts the one connection");
+    until(|| host.heard_from_of(&device.record).len() == 1).await;
+    let admitted = host.heard_from_of(&device.record)[0];
     assert!(is_served(&device.raw).await, "the connection is served");
-    until(|| host.heard_from_of(&device.record).first() > admitted.first()).await;
+    until(|| host.heard_from_of(&device.record)[0] > admitted).await;
+    // No request follows. Only the keepalives of the two ends can date the connection again.
+    let after_the_request = host.heard_from_of(&device.record)[0];
+    until(|| host.heard_from_of(&device.record)[0] > after_the_request).await;
     host.stop().await;
 }
 
@@ -1313,7 +1318,9 @@ async fn with_every_connection_live_the_first_above_the_bound_withdraws_exactly_
 
 /// KR-REQ-23.21: the connections whose packets no longer arrive, which are the copies a lossy path
 /// leaves of the links it replaced, are withdrawn before a connection the device still sends on,
-/// although that connection is the oldest. One of the copies has a mutation in flight, held before
+/// although that connection is the oldest. Every connection the device still uses sends a request
+/// after the copies went quiet and the next connection is admitted at once, before the host's
+/// periodic reading has dated those packets: they count. One of the copies has a mutation in flight, held before
 /// the service's ask: it ends with no answer, and the same action sent on a new connection settles
 /// and is made at most once, whether or not the held request committed before it was lost. The
 /// copies go in the order they were opened, one for each connection above the bound; the device's
@@ -1356,13 +1363,14 @@ async fn the_copies_a_device_left_are_withdrawn_before_the_oldest_connection_it_
         .await;
     arrived(held).await;
 
+    // The device goes on using every connection but the copies, the oldest among them.
+    for raw in std::iter::once(&device.raw).chain(&more[COPIES..]) {
+        assert!(is_served(raw).await, "a connection in use answers");
+    }
+
     // One connection above the bound for each copy: each is served and withdraws the oldest copy.
     let mut above = Vec::new();
     for _ in 0..COPIES {
-        assert!(
-            is_served(&device.raw).await,
-            "the oldest connection answers before each new one"
-        );
         let raw = device.again(&host).await;
         assert!(
             is_served(&raw).await,
