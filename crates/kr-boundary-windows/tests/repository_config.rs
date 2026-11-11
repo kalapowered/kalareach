@@ -1,10 +1,12 @@
 //! The configuration classifier against listings of `git config --list --null`: the listings that
 //! Git writes, and the ones a hostile repository could make it write.
 //!
-//! Three golden listings are written by hand from Git's documented defaults for Windows and for
-//! the values the table admits (`written-by-hand-*`); one is a recording of `git init` made with
-//! Apple's Git 2.50.1 on macOS (`macos-git-2.50.1-init.listing`). None is a recording from the Git
-//! that Windows hosts use.
+//! Two golden listings are recordings of `git config --list --null --local` made with Git for
+//! Windows 2.55.0.windows.5, the Git that Windows hosts use: a fresh `git init`
+//! (`windows-git-2.55.0-init.listing`) and a fresh local `git clone`
+//! (`windows-git-2.55.0-clone.listing`). One is a recording of `git init` made with Apple's Git
+//! 2.50.1 on macOS (`macos-git-2.50.1-init.listing`). One is written by hand to hold every key and
+//! value the table admits (`written-by-hand-everything-admitted.listing`).
 
 use kr_boundary_windows::frame::invocation::RefusedKind;
 use kr_boundary_windows::repository::config::{
@@ -73,7 +75,9 @@ fn golden_listings_are_admitted_with_the_facts_they_hold() {
     let recorded = classify_config(&fixture("macos-git-2.50.1-init.listing"), &limits).unwrap();
     assert_eq!(recorded, ConfigFacts::default());
 
-    let init = classify_config(&fixture("written-by-hand-windows-init.listing"), &limits).unwrap();
+    let recorded_init = fixture("windows-git-2.55.0-init.listing");
+    assert_eq!(recorded_init.len(), 135);
+    let init = classify_config(&recorded_init, &limits).unwrap();
     assert_eq!(
         init,
         ConfigFacts {
@@ -82,8 +86,11 @@ fn golden_listings_are_admitted_with_the_facts_they_hold() {
         }
     );
 
-    let clone =
-        classify_config(&fixture("written-by-hand-windows-clone.listing"), &limits).unwrap();
+    // The clone's address is a path of the local disk, with a drive letter and backslashes, and
+    // its default branch is `master`.
+    let recorded_clone = fixture("windows-git-2.55.0-clone.listing");
+    assert_eq!(recorded_clone.len(), 323);
+    let clone = classify_config(&recorded_clone, &limits).unwrap();
     assert_eq!(
         clone,
         ConfigFacts {
