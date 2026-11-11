@@ -83,9 +83,11 @@ impl Ledger {
         Ok(ledger)
     }
 
-    /// The turns the budget holds in `ledger`, as an array.
+    /// The turns the budget holds in `ledger`, as an array of charge records: a ledger whose
+    /// array holds anything else is refused, since an entry that is not a charge cannot be counted
+    /// as one.
     fn entries(&self, ledger: &Value) -> Result<Vec<Value>, String> {
-        ledger
+        let entries = ledger
             .get("budgets")
             .and_then(|budgets| budgets.get(&self.budget))
             .and_then(Value::as_array)
@@ -98,7 +100,16 @@ impl Ledger {
                     self.budget,
                     how_to_make_a_ledger(&self.budget)
                 )
-            })
+            })?;
+        if let Some(place) = entries.iter().position(|entry| !is_charge(entry)) {
+            return Err(format!(
+                "entry {place} of the {} budget's array in the ledger {} is not a charge, so what \
+                 is left of the budget is not known: {CHARGE_FORM}",
+                self.budget,
+                self.path.display()
+            ));
+        }
+        Ok(entries)
     }
 
     /// How many turns this run has charged so far.
@@ -172,23 +183,78 @@ impl Ledger {
     }
 }
 
-/// Writes the ledger so that it is on disk when this returns: the new file is written and
-/// synchronised, renamed over the old one, and the directory that holds the name is synchronised
-/// too. A charge is made before a prompt is sent, so a crash after the prompt must not leave the
-/// older ledger to be read next.
+/// What an entry of a budget's array is, in the words of a refusal.
+const CHARGE_FORM: &str = "a valid entry is an object that holds at_ms (a whole number of \
+     milliseconds), part (text) and what (text), as a charge writes it";
+
+/// Whether `entry` is a charge record, as [`Ledger::charge`] writes one.
+fn is_charge(entry: &Value) -> bool {
+    entry.as_object().is_some_and(|record| {
+        record.get("at_ms").is_some_and(Value::is_u64)
+            && record.get("part").is_some_and(Value::is_string)
+            && record.get("what").is_some_and(Value::is_string)
+    })
+}
+
+/// A file this process made exclusively beside the ledger, removed when this is dropped unless it
+/// was renamed into the ledger's place: its name is the run's own, so what is removed is only what
+/// this run made.
+struct Temporary {
+    path: PathBuf,
+    kept: bool,
+}
+
+impl Drop for Temporary {
+    fn drop(&mut self) {
+        if !self.kept {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Writes the ledger so that it is on disk when this returns: the new file is created exclusively
+/// under a name of this run's own (never one that was there, never through a link, never opened
+/// with truncation), written and synchronised, renamed over the old one, and the directory that
+/// holds the name is synchronised too. A charge is made before a prompt is sent, so a crash after
+/// the prompt must not leave the older ledger to be read next. A file left behind by a failure is
+/// removed, as far as it can be.
 fn write_ledger(path: &Path, ledger: &Value) -> Result<(), String> {
     use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
     let failed = |error: std::io::Error| format!("the ledger {}: {error}", path.display());
-    let next = path.with_extension("next");
-    let mut file = std::fs::File::create(&next).map_err(failed)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("the ledger {} names no file", path.display()))?;
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let unique = kr_ipc::new_uuid().to_string();
+    let next = directory.join(format!(
+        "{}.{}-{}.tmp",
+        name.to_string_lossy(),
+        std::process::id(),
+        &unique[..8]
+    ));
+    // `create_new` is `O_CREAT | O_EXCL`: a name that is taken, a link included, is refused and
+    // left alone.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&next)
+        .map_err(failed)?;
+    let mut temporary = Temporary {
+        path: next.clone(),
+        kept: false,
+    };
     file.write_all(&serde_json::to_vec_pretty(ledger).expect("the ledger is JSON"))
         .and_then(|()| file.sync_all())
         .map_err(failed)?;
+    drop(file);
     std::fs::rename(&next, path).map_err(failed)?;
-    let directory = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty());
-    std::fs::File::open(directory.unwrap_or_else(|| Path::new(".")))
+    temporary.kept = true;
+    std::fs::File::open(directory)
         .and_then(|directory| directory.sync_all())
         .map_err(failed)
 }
@@ -201,19 +267,50 @@ fn how_to_make_a_ledger(budget: &str) -> String {
     )
 }
 
-/// Reads the ledger. A file that is not there is not an empty ledger: it is an error, which says
-/// how the first one is made.
+/// Reads the ledger, opened with no link followed and checked to be a regular file: a ledger that
+/// is a symbolic link is refused, since a charge replaces the name and the link's target would keep
+/// the old count. A file that is not there is not an empty ledger: it is an error, which says how
+/// the first one is made.
 fn read_ledger(path: &Path, budget: &str) -> Result<Value, String> {
-    match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|error| format!("the ledger {}: {error}", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
-            "the ledger {} is not there, and a charge makes no ledger of its own; {}",
-            path.display(),
-            how_to_make_a_ledger(budget)
-        )),
-        Err(error) => Err(format!("the ledger {}: {error}", path.display())),
+    use rustix::fs::{FileType, Mode, OFlags};
+    use std::io::Read as _;
+    let handle = match rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(handle) => handle,
+        Err(rustix::io::Errno::NOENT) => {
+            return Err(format!(
+                "the ledger {} is not there, and a charge makes no ledger of its own; {}",
+                path.display(),
+                how_to_make_a_ledger(budget)
+            ));
+        }
+        // What `O_NOFOLLOW` says of a name that is a symbolic link.
+        Err(rustix::io::Errno::LOOP) => {
+            return Err(format!(
+                "the ledger {} is a symbolic link, which is refused: a charge would replace the \
+                 link and leave its target with the old count; name the ledger file itself",
+                path.display()
+            ));
+        }
+        Err(error) => return Err(format!("the ledger {}: {error}", path.display())),
+    };
+    let stat = rustix::fs::fstat(&handle)
+        .map_err(|error| format!("the ledger {}: {error}", path.display()))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(format!(
+            "the ledger {} is not a regular file",
+            path.display()
+        ));
     }
+    let mut bytes = Vec::new();
+    std::fs::File::from(handle)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("the ledger {}: {error}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("the ledger {}: {error}", path.display()))
 }
 
 /// The ledger's lock: a file created exclusively beside it, removed when this is dropped.
@@ -221,7 +318,13 @@ struct LedgerLock(PathBuf);
 
 impl LedgerLock {
     fn take(ledger: &Path) -> Result<Self, String> {
-        let path = ledger.with_extension("lock");
+        // The ledger's own file name and `.lock`: never the ledger's own name, whatever it ends in.
+        let path = ledger.with_file_name(format!(
+            "{}.lock",
+            ledger
+                .file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
+        ));
         let started = std::time::Instant::now();
         loop {
             match std::fs::OpenOptions::new()
@@ -1525,6 +1628,14 @@ mod tests {
             r#"{"budgets": {"another": []}}"#,
             "[]",
             "{ not json",
+            // An array whose entries are not charges: nothing counts them as turns.
+            r#"{"budgets": {"agent": [null]}}"#,
+            r#"{"budgets": {"agent": [{"spent": 21}]}}"#,
+            r#"{"budgets": {"agent": [{"at_ms": 1, "part": "1"}]}}"#,
+            r#"{"budgets": {"agent": [{"at_ms": -1, "part": "1", "what": "w"}]}}"#,
+            r#"{"budgets": {"agent": [{"at_ms": 1.5, "part": "1", "what": "w"}]}}"#,
+            r#"{"budgets": {"agent": [{"at_ms": 1, "part": 1, "what": "w"}]}}"#,
+            r#"{"budgets": {"agent": [{"at_ms": 1, "part": "1", "what": "w"}, 7]}}"#,
         ] {
             std::fs::write(&path, wrong).expect("a wrong ledger");
             assert!(
@@ -1550,10 +1661,109 @@ mod tests {
             );
             assert_eq!(ledger.charged_here(), 0);
         }
-        // The explicit empty ledger is accepted and charges.
+        // The explicit empty ledger is accepted and charges; an entry a charge wrote is a charge.
         let ledger = made(&path, &["agent"], "agent", 3);
         assert_eq!(ledger.spent(), Ok(0));
         assert_eq!(ledger.charge("1", "first"), Ok(1));
+        assert_eq!(ledger.charge_found("1", "found", 1), Ok(2));
+        assert_eq!(
+            Ledger::at(path.clone(), "agent", 3).map(|l| l.limit()),
+            Ok(3)
+        );
+        // The refusal says what a valid entry is.
+        std::fs::write(&path, r#"{"budgets": {"agent": [null]}}"#).expect("a wrong ledger");
+        let why = Ledger::at(path, "agent", 3).expect_err("a null entry");
+        assert!(
+            why.contains("at_ms")
+                && why.contains("part")
+                && why.contains("what")
+                && why.contains("entry 0"),
+            "{why}"
+        );
+    }
+
+    /// A ledger that is a symbolic link is refused; a charge never replaces the link and leaves its
+    /// target with the old count; and the temporary file is a name of the run's own, created
+    /// exclusively, never the fixed name beside the ledger, and gone after a failure.
+    #[test]
+    fn a_linked_ledger_is_refused_and_the_temporary_file_is_the_runs_own() {
+        let scratch = Scratch::new("files");
+        let real = scratch.0.join("real.json");
+        let link = scratch.0.join("linked.json");
+        let ledger = made(&real, &["agent"], "agent", 3);
+        std::os::unix::fs::symlink(&real, &link).expect("a link");
+        let why = Ledger::at(link.clone(), "agent", 3).expect_err("a linked ledger");
+        assert!(why.contains("symbolic link"), "{why}");
+        // A ledger that became a link after it was accepted takes no charge, and the link stays.
+        let linked = Ledger {
+            path: link.clone(),
+            ..ledger.clone()
+        };
+        assert!(linked.charge("1", "first").is_err());
+        assert!(linked.charge_found("1", "found", 1).is_err());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("the link")
+                .file_type()
+                .is_symlink(),
+            "a refused charge leaves the link as it was"
+        );
+        assert_eq!(ledger.spent(), Ok(0), "the target keeps its count");
+        // A file that is not a regular file is refused too.
+        assert!(Ledger::at(scratch.0.clone(), "agent", 3).is_err());
+
+        // The predictable names beside the ledger are not used: files there are left alone.
+        let fixed = real.with_extension("next");
+        let appended = scratch.0.join("real.json.next");
+        std::fs::write(&fixed, "keep one").expect("a file");
+        std::fs::write(&appended, "keep two").expect("a file");
+        assert_eq!(ledger.charge("1", "first"), Ok(1));
+        assert_eq!(std::fs::read_to_string(&fixed).expect("kept"), "keep one");
+        assert_eq!(
+            std::fs::read_to_string(&appended).expect("kept"),
+            "keep two"
+        );
+        let left: Vec<String> = std::fs::read_dir(&scratch.0)
+            .expect("a listing")
+            .map(|entry| {
+                entry
+                    .expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.ends_with(".tmp") || name.ends_with(".lock"))
+            .collect();
+        assert!(
+            left.is_empty(),
+            "no temporary file or lock is left: {left:?}"
+        );
+        // A ledger whose own name ends in `.next` or `.lock` is not its own temporary file or lock.
+        for name in ["turns.next", "turns.lock", "turns.tmp"] {
+            let odd = made(&scratch.0.join(name), &["agent"], "agent", 3);
+            assert_eq!(odd.charge("1", "first"), Ok(1), "{name}");
+            assert_eq!(odd.spent(), Ok(1), "{name}");
+        }
+        // A failure after the file was made leaves none behind: the rename onto a directory fails.
+        let directory = scratch.0.join("a-directory");
+        std::fs::create_dir(&directory).expect("a directory");
+        assert!(write_ledger(&directory, &json!({ "budgets": {} })).is_err());
+        let left: Vec<String> = std::fs::read_dir(&scratch.0)
+            .expect("a listing")
+            .map(|entry| {
+                entry
+                    .expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            // `turns.tmp` is a ledger of this test's own.
+            .filter(|name| name.ends_with(".tmp") && name != "turns.tmp")
+            .collect();
+        assert!(
+            left.is_empty(),
+            "a failed write leaves no temporary file: {left:?}"
+        );
     }
 
     #[test]
