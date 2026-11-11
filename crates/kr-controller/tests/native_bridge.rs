@@ -2329,7 +2329,7 @@ fn on_windows_a_recipe_is_refused_and_recorded_at_every_reconciliation() {
             reports[0].files.is_empty(),
             "nothing is in place: {reports:?}"
         );
-        // It says the same at every reconciliation, and gathers no notes.
+        // It says the same at every reconciliation, and gathers no more notes.
         if let Some(first) = &first {
             assert_eq!(&reports, first, "the report is the same each time");
         } else {
