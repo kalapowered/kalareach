@@ -124,6 +124,10 @@ pub struct Variants {
     /// The terminal runs the program `STAND_IN_LEAVE` names once, before it connects, and goes
     /// on when it has ended.
     pub leave_a_host: bool,
+    /// The server answers a turn whose input asks `What is A plus B?` with the sum of the two
+    /// numbers, in a message of its own before the turn ends, and the terminal writes it as a row
+    /// of its own. The sum is worked out from the input.
+    pub answer_the_sum: bool,
 }
 
 impl Variants {
@@ -171,6 +175,7 @@ impl Variants {
                 "die-on-second-turn" => variants.die_on_second_turn = true,
                 "hold-before-thread" => variants.hold_before_thread = true,
                 "leave-a-host" => variants.leave_a_host = true,
+                "answer-the-sum" => variants.answer_the_sum = true,
                 other => panic!("{VARIABLE} names a variant this program does not have: {other}"),
             }
         }
@@ -218,6 +223,27 @@ impl Variants {
                 .unwrap_or_else(|error| panic!("{PAD_VARIABLE} is a number of bytes: {error}")),
         )
     }
+}
+
+/// The sum of the two numbers a turn's input asks for, where a text of it asks `What is A plus B?`
+/// (two whole numbers), worked out here and given by nothing else.
+#[must_use]
+pub fn sum_asked(turn_request: &serde_json::Value) -> Option<String> {
+    let items = turn_request["params"]["input"].as_array()?;
+    items
+        .iter()
+        .filter_map(|item| item["text"].as_str())
+        .find_map(|text| {
+            let rest = text.split_once("What is ")?.1;
+            let (first, rest) = rest.split_once(" plus ")?;
+            let (second, _) = rest.split_once('?')?;
+            let sum = first
+                .trim()
+                .parse::<u64>()
+                .ok()?
+                .checked_add(second.trim().parse::<u64>().ok()?)?;
+            Some(sum.to_string())
+        })
 }
 
 /// Makes `text` as long as it takes for the whole frame `frame(text)` to be `size` bytes.
