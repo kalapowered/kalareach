@@ -1034,7 +1034,7 @@ impl Run {
 
 /// Runs the host for one phone, phase by phase, until the script says it is done.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "started by scripts/e2e-pairing-device.sh beside a simulator or an emulator"]
+#[ignore = "started by scripts/e2e-pairing-device.sh beside a simulator or an emulator, which gives its threads a larger stack with RUST_MIN_STACK"]
 async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
     let directory = PathBuf::from(std::env::var("KR_HARNESS_DIR").expect("KR_HARNESS_DIR"));
     let peer = std::env::var("KR_HARNESS_PEER").unwrap_or_else(|_| "127.0.0.1".to_owned());
