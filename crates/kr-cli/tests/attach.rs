@@ -1204,21 +1204,13 @@ async fn a_terminal_that_reported_its_modes_is_put_back_into_them_after_a_kill()
     let _ = shell.wait();
 }
 
-/// KR-REQ-01.11: an application that turned mouse reporting on before the attachment has it on in
-/// the outer terminal once the attachment has drawn the session.
-///
-/// The session's screen keeps the three tracking modes as three settings, and a frame writes every
-/// mode it tracks, the ones that are off among them. Terminal.app and xterm keep one tracking state: setting
-/// any of `1000`, `1002` and `1003` replaces the one in force, and resetting any of them turns it
-/// off. A frame that wrote the `1003 l` of a mode that was never on after the `1002 h` that was
-/// asked for left Terminal.app reporting no mouse at all, so what is read here is the state a
-/// terminal ends in, which depends on the order the modes are written in and not only on which of
-/// them are written.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_application_that_turned_the_mouse_on_before_the_attachment_is_sent_it_after() {
-    let hosted =
-        hosted("printf '\\033[?1000h\\033[?1002h\\033[?1006h'; printf 'ready\\r\\n'; exec cat")
-            .await;
+/// What `kr attach` draws on a terminal for a session whose application has written `history`
+/// (printf's spelling) and then `ready`, which it printed before anything attached.
+async fn drawn_after(history: &str) -> Vec<u8> {
+    let hosted = hosted(&format!(
+        "printf '{history}'; printf 'ready\\r\\n'; exec cat"
+    ))
+    .await;
     let pty = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -1247,22 +1239,43 @@ async fn an_application_that_turned_the_mouse_on_before_the_attachment_is_sent_i
         "the session's screen reached the terminal",
     );
     answered(&output, queries);
-
     let drawn = output.bytes();
-    assert_eq!(
-        mouse_tracking(&drawn),
-        Some(1002),
-        "the terminal reports the mouse as the application asked, once the screen is drawn: {}",
-        output.text().escape_debug()
-    );
-    assert_eq!(
-        final_modes(&drawn).get("?1006").copied(),
-        Some(true),
-        "and in the encoding it asked for: {}",
-        output.text().escape_debug()
-    );
     let _ = shell.kill();
     let _ = shell.wait();
+    drawn
+}
+
+/// KR-REQ-01.11: an application that turned mouse reporting on before the attachment has it on in
+/// the outer terminal once the attachment has drawn the session, as its own terminal would have it.
+///
+/// Terminal.app and xterm keep one tracking state: setting any of `1000`, `1002` and `1003` replaces
+/// the one in force, and resetting any of them turns it off. A frame that wrote the `1003 l` of a
+/// mode that was never on after the `1002 h` that was asked for left Terminal.app reporting no mouse
+/// at all, so what is read here is the state a terminal ends in, which depends on the order the
+/// modes are written in and not only on which of them are written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_application_that_turned_the_mouse_on_before_the_attachment_is_sent_it_after() {
+    // The application's own history, and the one state its terminal would hold after it: the
+    // tracking it widened to, the one it went back to, none after it turned any of them off.
+    for (history, expected) in [
+        ("\\033[?1000h\\033[?1002h", Some(1002)),
+        ("\\033[?1003h\\033[?1000h", Some(1000)),
+        ("\\033[?1002h\\033[?1000l", None),
+        ("\\033[?1000h\\033[?1002h\\033[?1003h\\033[?1003l", None),
+    ] {
+        let drawn = drawn_after(&format!("{history}\\033[?1006h")).await;
+        assert_eq!(
+            mouse_tracking(&drawn),
+            expected,
+            "the terminal reports the mouse as the application's own terminal would after {history}, once the screen is drawn: {}",
+            String::from_utf8_lossy(&drawn).escape_debug()
+        );
+        assert_eq!(
+            final_modes(&drawn).get("?1006").copied(),
+            Some(true),
+            "and in the encoding it asked for after {history}"
+        );
+    }
 }
 
 /// KR-REQ-08.84: an attach that fails after the handshake still leaves the terminal its own modes.

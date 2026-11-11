@@ -25,7 +25,7 @@ use crate::event::{DirectDisposition, Event, EventKind};
 use crate::grid::{CanonicalGrid, GridConfig, GridRow};
 use crate::lane::{LaneDegradation, LaneLimits, ResponseLane};
 use crate::lexer::{LexLimits, Lexer};
-use crate::modes::{ModeKind, ModeState};
+use crate::modes::{MOUSE_TRACKING_MODES, ModeKind, ModeState};
 use crate::palette::{DynamicColour, Palette, PaletteSource};
 use crate::policy::{Backend, Policy};
 use crate::profile::Profile;
@@ -1358,7 +1358,15 @@ impl Engine {
                         continue;
                     }
                     self.modes.set(ModeKind::Dec, mode, enabled);
-                    self.mark_mode(ModeKind::Dec, mode);
+                    // A change of the mouse tracking can clear the other two, so a delta carries
+                    // all three and a client is not left holding a flag the session no longer has.
+                    if MOUSE_TRACKING_MODES.contains(&mode) {
+                        for tracking in MOUSE_TRACKING_MODES {
+                            self.mark_mode(ModeKind::Dec, *tracking);
+                        }
+                    } else {
+                        self.mark_mode(ModeKind::Dec, mode);
+                    }
                     if matches!(mode, 47 | 1047 | 1049) {
                         self.advance_projection();
                     }
