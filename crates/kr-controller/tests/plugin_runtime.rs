@@ -1905,6 +1905,10 @@ async fn a_registration_the_runtime_holds_is_named_in_the_workers_account_with_i
     let first_binding = world.reported().await[0].0;
     let host = world.published_host().expect("the runtime is published");
 
+    // The first program goes to the background of the session, and the runtime hangs. The second
+    // program is run at the prompt it leaves.
+    typing.send("\u{1a}").await;
+    typing.send("bg\n").await;
     stop(&host);
     let _second_agent = world.start_agent(&mut typing, "").await;
 
