@@ -7,6 +7,7 @@
 //  adapter the plugin reaches answers each command from what it holds.
 //
 
+import UIKit
 import XCTest
 
 final class PendingFileTests: XCTestCase {
@@ -408,5 +409,184 @@ final class PushAdapterTests: XCTestCase {
         route.opened(on: NotificationRoute.attention)
         XCTAssertEqual(answer(held, "pushRoute")?["route"] as? String, "attention")
         XCTAssertTrue(answer(held, "pushRoute")?["route"] is NSNull, "the route is given once")
+    }
+}
+
+/// The delegate class of the case below, which the methods are added to for the life of the process.
+private final class RestartedDelegate: NSObject {}
+
+final class RegistrationRecoveryTests: XCTestCase {
+    private static let registration = "2e749a03-c158-4d62-a019-6f3bd784215c"
+    private let now: UInt64 = 1_763_000_000_000
+    private var directory: URL!
+    private var defaults: UserDefaults!
+
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defaults = UserDefaults(suiteName: UUID().uuidString)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private var file: URL { directory.appendingPathComponent("pending.json") }
+
+    private struct NoPermissions: NotificationPermissions {
+        func current(then: @escaping (PushPermission) -> Void) { then(.unknown) }
+        func ask(then: @escaping (PushPermission) -> Void) { then(.unknown) }
+    }
+
+    private struct NoKeys: LimitedKeyWriting {
+        func replace(with keys: PreviewKeySet) -> Bool { true }
+    }
+
+    /// The Rust half's decision for this case, made from the record it is given and from nothing
+    /// else: with no record, a record that is no longer pending, or a challenge for another
+    /// registration, it refuses.
+    private struct RecordDecidingCrypto: ChallengeCrypto {
+        func classify(_ input: String) -> String {
+            let read = (try? JSONSerialization.jsonObject(with: Data(input.utf8))) as? [String: Any] ?? [:]
+            guard let record = read["pending"] as? [String: Any] else {
+                return #"{"verdict":"refused","reason":"no_pending"}"#
+            }
+            if record["state"] as? String != PendingFile.pending {
+                return #"{"verdict":"refused","reason":"state"}"#
+            }
+            let named = (read["data"] as? [String: String])?["kr_registration_id"]
+            if record["registration_id"] as? String != named {
+                return #"{"verdict":"refused","reason":"registration"}"#
+            }
+            return #"{"verdict":"answer","url":"https://reach.kala.to/api/push/installation/register","seed_item":"x"}"#
+        }
+
+        func sign(_ input: String) -> String {
+            #"{"ok":true,"url":"https://reach.kala.to/api/push/installation/register","body":"{}"}"#
+        }
+    }
+
+    /// A gateway that takes the post and answers it when the test says so, as the network does.
+    private final class Gateway: GatewayPost {
+        var posted: [(String, String)] = []
+        private var waiting: ((PostResult) -> Void)?
+
+        func post(url: String, body: Data, then: @escaping (PostResult) -> Void) {
+            posted.append((url, String(data: body, encoding: .utf8) ?? ""))
+            waiting = then
+        }
+
+        /// The gateway answers the post that is waiting.
+        func answers(_ result: PostResult) {
+            let then = waiting
+            waiting = nil
+            then?(result)
+        }
+    }
+
+    /// The application in one process: its adapter over the record in the application's directory.
+    private func application() -> PushAdapter {
+        PushAdapter(
+            permissions: NoPermissions(),
+            tokens: PushTokenStore(defaults: defaults),
+            record: PendingFile(url: file),
+            keys: NoKeys(),
+            route: NotificationRoute(),
+            clock: { self.now },
+            permissionRead: { _ in })
+    }
+
+    private func ask(_ adapter: PushAdapter, _ command: String, _ arguments: String = "{}") -> [String: Any]? {
+        var result: String?
+        adapter.run(command, arguments) { text, _, _ in result = text }
+        return result.flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
+    }
+
+    /// The state the record file holds, read from the file itself and not through the record.
+    private func stateOnDisk() -> String {
+        let object = (try? Data(contentsOf: file))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        return (object?["state"] as? String) ?? "no record"
+    }
+
+    /// The system's call of the delegate's wake method, made as it makes it: the application, the
+    /// payload and a block that takes the result.
+    private func wake(_ delegate: NSObject, with payload: [String: String], told: @escaping (UInt) -> Void) {
+        let selector = Selector(("application:didReceiveRemoteNotification:fetchCompletionHandler:"))
+        typealias Call = @convention(c) (AnyObject, Selector, AnyObject, NSDictionary, @escaping @convention(block) (UInt) -> Void) -> Void
+        let call = unsafeBitCast(delegate.method(for: selector), to: Call.self)
+        call(delegate, selector, NSObject(), payload as NSDictionary, told)
+    }
+
+    /// KR-REQ-13.24: lifecycle recovery with no page running. The application is ended after it
+    /// wrote the record of the registration it waits for. The system starts it again for the
+    /// challenge's push alone, and native code answers from the stored record: the delegate's wake
+    /// method reaches an answerer built afresh over the file, the answer is posted, the record moves
+    /// to answered, and only then is the system told the data was new. The application's next start
+    /// reads that the answer was taken, and the same push delivered again is not answered twice. No
+    /// page exists in any of these processes. Not shown here: the application's own hand-off from the
+    /// delegate to the answerer, which links the Rust library and is not built into this bundle.
+    func testAPushThatWakesAnEndedApplicationIsAnsweredFromTheRecordItLeftAndTheNextStartReadsTheResult() throws {
+        // The application's earlier run writes the record before it proposes a token, and is ended.
+        let record: [String: Any] = [
+            "registration_id": Self.registration, "token_digest": "d", "gateway_origin": "https://reach.kala.to",
+            "platform": "ios", "deadline_ms": now + 60_000, "state": "pending",
+        ]
+        let arguments = String(data: try JSONSerialization.data(withJSONObject: ["record": record]), encoding: .utf8)!
+        do {
+            let earlier = application()
+            XCTAssertNotNil(ask(earlier, "pushPendingSet", arguments))
+        }
+        XCTAssertEqual(stateOnDisk(), "pending", "the record is in the file and not in a process")
+
+        // The system starts the application again for the push, through the delegate's wake method.
+        let gateway = Gateway()
+        let outcomes = Box<[ChallengeOutcome]>([])
+        let stateWhenTold = Box<[String]>([])
+        let results = Box<[UInt]>([])
+        let added = DelegateMethods.install(
+            on: RestartedDelegate.self, received: { _ in }, refused: { _ in },
+            remote: { userInfo, finished in
+                var data: [String: String] = [:]
+                for (key, value) in userInfo {
+                    if let key = key as? String, let value = value as? String { data[key] = value }
+                }
+                // An answerer built afresh over the file: nothing of the earlier process is in it.
+                ChallengeAnswerer(
+                    record: PendingFile(url: self.file), crypto: RecordDecidingCrypto(), gateway: gateway,
+                    clock: { self.now }
+                ).answer(data) { outcome in
+                    outcomes.value.append(outcome)
+                    finished()
+                }
+            })
+        XCTAssertEqual(added, .added)
+        let delegate = RestartedDelegate()
+        let message = ["kr_challenge": "x", "kr_registration_id": Self.registration]
+        wake(delegate, with: message) {
+            results.value.append($0)
+            stateWhenTold.value.append(self.stateOnDisk())
+        }
+
+        XCTAssertEqual(gateway.posted.map(\.0), ["https://reach.kala.to/api/push/installation/register"])
+        XCTAssertEqual(gateway.posted.map(\.1), ["{}"])
+        XCTAssertEqual(results.value, [], "the system is not told while the answer is on its way")
+        XCTAssertEqual(stateOnDisk(), "pending")
+        gateway.answers(.status(200))
+        XCTAssertEqual(outcomes.value, [.answered])
+        XCTAssertEqual(stateOnDisk(), "answered")
+        XCTAssertEqual(results.value, [UIBackgroundFetchResult.newData.rawValue])
+        XCTAssertEqual(stateWhenTold.value, ["answered"], "the system is told only once the record says so")
+
+        // The application's next start reads what became of the registration.
+        let next = application()
+        let read = ask(next, "pushPendingGet")?["record"] as? [String: Any]
+        XCTAssertEqual(read?["state"] as? String, "answered")
+
+        // The same push delivered again finds the registration settled and answers nothing.
+        wake(delegate, with: message) { results.value.append($0) }
+        XCTAssertEqual(outcomes.value, [.answered, .ignored("state")])
+        XCTAssertEqual(gateway.posted.count, 1, "nothing is posted a second time")
+        XCTAssertEqual(results.value.count, 2, "and the system is told this push is done too")
     }
 }
