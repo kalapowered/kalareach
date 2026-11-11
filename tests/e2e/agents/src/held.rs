@@ -668,6 +668,10 @@ pub(crate) enum Class {
     Refused(rustix::io::Errno),
     /// The tree is deeper than the walk goes.
     TooDeep,
+    /// A file of the agent's record is larger than the audit reads: none of it was read.
+    TooLarge,
+    /// The agent's record lists more entries than the audit walks.
+    TooMany,
 }
 
 /// A tree that could not be looked at: the class of the failure and how many entries had been looked
@@ -723,12 +727,51 @@ impl std::fmt::Display for Unlooked {
                 formatter,
                 "the tree is deeper than {DEEPEST} levels (after {seen} entries)"
             ),
+            Class::TooLarge => write!(
+                formatter,
+                "a file is larger than the audit reads, and none of it was read (after {seen} \
+                 entries)"
+            ),
+            Class::TooMany => write!(
+                formatter,
+                "the tree lists more entries than the audit walks (after {seen} entries)"
+            ),
         }
     }
 }
 
 /// The deepest the walk goes: what lies below is not looked at, and that is a failure.
 pub(crate) const DEEPEST: usize = 64;
+
+/// The most bytes of one file of the agent's record that the audit reads: a file above it, by the
+/// size its handle reports or by what is read through it, is left unread.
+pub(crate) const RECORD_FILE_AT_MOST: u64 = 64 << 20;
+
+/// The most entries of the agent's record that the audit lists and looks at, in all.
+pub(crate) const RECORD_ENTRIES_AT_MOST: usize = 100_000;
+
+/// What the audit's walk of the agent's record reads at most. A walk past either is a failure of
+/// its own ([`Class::TooLarge`], [`Class::TooMany`]): nothing of the file is read, and the audit says
+/// it is incomplete.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Limits {
+    /// The most bytes of one file.
+    pub(crate) file: u64,
+    /// The most entries listed and looked at, in all.
+    pub(crate) entries: usize,
+}
+
+impl Limits {
+    /// What the agent's record is read within.
+    pub(crate) const RECORD: Self = Self {
+        file: RECORD_FILE_AT_MOST,
+        entries: RECORD_ENTRIES_AT_MOST,
+    };
+}
+
+/// The start of what is said of a record that is beyond the audit's bounds, which the audit takes
+/// for an incomplete count, not for a record that could not be read.
+pub const RECORD_BEYOND_THE_BOUNDS: &str = "the agent's record is beyond what the audit reads";
 
 /// The two moments of the walk at which a test changes the tree under it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1244,6 +1287,7 @@ fn turn_identifier(value: &Value) -> Option<String> {
 struct Bounds<'a> {
     root: rustix::fs::Stat,
     pin: &'a kr_e2e_m1b::run::RootPin,
+    limits: Limits,
 }
 
 /// Opens the directory `relative` below `within`, one component at a time, each looked at and opened
@@ -1298,7 +1342,14 @@ fn record_directory<'a>(
             return Err(unlooked(Class::Moved));
         }
     }
-    Ok(Some((directory, Bounds { root, pin })))
+    Ok(Some((
+        directory,
+        Bounds {
+            root,
+            pin,
+            limits: Limits::RECORD,
+        },
+    )))
 }
 
 /// Reads every file of the directory `directory` and below through handles, handing each file's
@@ -1331,11 +1382,19 @@ fn read_files(
             seen: *seen,
         };
         let listing = rustix::fs::Dir::read_from(directory).map_err(refused)?;
+        let room = bounds.limits.entries.saturating_sub(*seen);
         let mut names = Vec::new();
         for entry in listing {
             let entry = entry.map_err(refused)?;
             let name = entry.file_name();
             if name.to_bytes() != b"." && name.to_bytes() != b".." {
+                // A directory that lists more than the walk has room for is not listed further.
+                if names.len() >= room {
+                    return Err(Unlooked {
+                        class: Class::TooMany,
+                        seen: *seen,
+                    });
+                }
                 names.push(name.to_owned());
             }
         }
@@ -1356,6 +1415,9 @@ fn read_files(
                 )
             })?;
         *seen += 1;
+        if *seen > bounds.limits.entries {
+            return Err(unlooked(Class::TooMany, seen));
+        }
         // A volume attached below the record is no link and its files have one name: only the
         // device tells it from the run's own (a check for mounts only: the system's own volumes
         // share one device number).
@@ -1407,8 +1469,14 @@ fn read_files(
                 if !bounds.pin.contains(&handle) {
                     return Err(unlooked(Class::Moved, seen));
                 }
+                // The size comes from the handle that will be read, and no more than the bound is
+                // read through it: a file above it, sparse or not, is not read into memory.
+                if u64::try_from(opened.st_size).map_or(true, |size| size > bounds.limits.file) {
+                    return Err(unlooked(Class::TooLarge, seen));
+                }
                 let mut bytes = Vec::new();
                 std::fs::File::from(handle)
+                    .take(bounds.limits.file.saturating_add(1))
                     .read_to_end(&mut bytes)
                     .map_err(|error| {
                         unlooked(
@@ -1418,6 +1486,10 @@ fn read_files(
                             seen,
                         )
                     })?;
+                // A file that grew past the bound since its size was read is not handed on.
+                if u64::try_from(bytes.len()).map_or(true, |read| read > bounds.limits.file) {
+                    return Err(unlooked(Class::TooLarge, seen));
+                }
                 visit(&path, &bytes);
             }
             FileType::Symlink => return Err(unlooked(Class::Link, seen)),
@@ -1457,10 +1529,32 @@ fn read_record_by(
     visit: &mut dyn FnMut(&[u8], &[u8]),
     between: &mut dyn FnMut(Moment, &[u8]),
 ) -> Result<u64, String> {
-    let said = |why: Unlooked| format!("the agent's record cannot be read whole: {why}");
-    let Some((directory, bounds)) = record_directory(within, pin, relative).map_err(said)? else {
+    read_record_within(within, pin, relative, Limits::RECORD, visit, between)
+}
+
+/// [`read_record_by`] within `limits`: a file above `limits.file` bytes, or more than
+/// `limits.entries` entries, is a failure that says the record is beyond the audit's bounds
+/// ([`RECORD_BEYOND_THE_BOUNDS`]) and the entries looked at by then, and no content.
+fn read_record_within(
+    within: &Path,
+    pin: &kr_e2e_m1b::run::RootPin,
+    relative: &Path,
+    limits: Limits,
+    visit: &mut dyn FnMut(&[u8], &[u8]),
+    between: &mut dyn FnMut(Moment, &[u8]),
+) -> Result<u64, String> {
+    let said = |why: Unlooked| {
+        if matches!(why.class, Class::TooLarge | Class::TooMany) {
+            format!("{RECORD_BEYOND_THE_BOUNDS}: {why}")
+        } else {
+            format!("the agent's record cannot be read whole: {why}")
+        }
+    };
+    let Some((directory, mut bounds)) = record_directory(within, pin, relative).map_err(said)?
+    else {
         return Ok(0);
     };
+    bounds.limits = limits;
     let mut seen = 0_usize;
     let mut files = 0_u64;
     read_files(
@@ -1613,6 +1707,10 @@ pub enum Audit {
         /// How many files of the record were read.
         files: u64,
     },
+    /// The record is beyond what the audit reads (a file above its size bound, or more entries
+    /// than its walk lists): the turns were not counted, and what is said holds the entries looked
+    /// at by then and no content.
+    Incomplete(String),
     /// The record could not be counted.
     Uncountable(String),
 }
@@ -1624,6 +1722,7 @@ pub enum Audit {
 #[must_use]
 pub fn audit_turns(passed: bool, charged: u64, recorded: &Result<Recorded, String>) -> Audit {
     match recorded {
+        Err(why) if why.starts_with(RECORD_BEYOND_THE_BOUNDS) => Audit::Incomplete(why.clone()),
         Err(why) => Audit::Uncountable(why.clone()),
         Ok(found) if found.turns > charged => Audit::Surplus(found.turns - charged),
         Ok(found) if passed && charged > 0 && found.turns == 0 => {
@@ -2591,6 +2690,98 @@ mod tests {
         assert_eq!(
             audit_turns(true, 1, &Err("unread".to_owned())),
             Audit::Uncountable("unread".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_record_beyond_the_audits_bounds_is_incomplete_and_none_of_it_is_read() {
+        let run = scratch("record-bounds");
+        let sessions = Path::new("agent-config/sessions");
+        let line = r#"{"type":"task_started","turn_id":"019a0000-0000-7000-8000-0000000000aa"}"#;
+        std::fs::create_dir_all(run.join("agent-config/sessions/2026")).expect("a record");
+        std::fs::write(
+            run.join("agent-config/sessions/2026/own.jsonl"),
+            format!("{line}\n"),
+        )
+        .expect("a conversation");
+        // A sparse file far over the bound: a file the agent left, of a size that no memory holds.
+        let sparse = std::fs::File::create(run.join("agent-config/sessions/2026/large.jsonl"))
+            .expect("a file");
+        sparse.set_len(256 << 20).expect("a sparse file");
+        let within = Limits {
+            file: 1 << 10,
+            entries: 100,
+        };
+        let mut read = Vec::new();
+        let why = read_record_within(
+            &run,
+            &pinned(&run),
+            sessions,
+            within,
+            &mut |place, content| read.push((place.to_vec(), content.len())),
+            &mut |_, _| {},
+        )
+        .expect_err("a file above the bound");
+        assert!(why.starts_with(RECORD_BEYOND_THE_BOUNDS), "{why}");
+        assert!(why.contains("entries"), "{why}");
+        assert!(
+            !why.contains("large.jsonl") && !why.contains("agent-config"),
+            "no name: {why}"
+        );
+        assert!(
+            read.iter()
+                .all(|(place, _)| !place.ends_with(b"large.jsonl")),
+            "no byte of the large file was handed on"
+        );
+        // The audit says it is incomplete: a stop of its own, and not a record that was refused.
+        assert_eq!(
+            audit_turns(true, 1, &Err(why.clone())),
+            Audit::Incomplete(why)
+        );
+        // The same through the audit's own count, at the bound it has: the file is above it.
+        let counted = turns_recorded(&account(), &run, &pinned(&run), sessions)
+            .expect_err("a file above the audit's bound");
+        assert!(counted.starts_with(RECORD_BEYOND_THE_BOUNDS), "{counted}");
+        // More entries than the walk lists: the walk stops at the count and reads no more.
+        std::fs::remove_file(run.join("agent-config/sessions/2026/large.jsonl")).expect("removed");
+        for index in 0..8 {
+            std::fs::write(
+                run.join(format!("agent-config/sessions/2026/more-{index}.jsonl")),
+                format!("{line}\n"),
+            )
+            .expect("a conversation");
+        }
+        let few = Limits {
+            file: 1 << 10,
+            entries: 4,
+        };
+        let mut handed = 0;
+        let why = read_record_within(
+            &run,
+            &pinned(&run),
+            sessions,
+            few,
+            &mut |_, _| handed += 1,
+            &mut |_, _| {},
+        )
+        .expect_err("more entries than the bound");
+        assert!(why.starts_with(RECORD_BEYOND_THE_BOUNDS), "{why}");
+        assert!(handed <= few.entries, "{handed} files read");
+        // Within the bounds the same record is read whole.
+        let wide = Limits {
+            file: 1 << 10,
+            entries: 100,
+        };
+        assert_eq!(
+            read_record_within(
+                &run,
+                &pinned(&run),
+                sessions,
+                wide,
+                &mut |_, _| {},
+                &mut |_, _| {}
+            ),
+            Ok(9)
         );
     }
 
