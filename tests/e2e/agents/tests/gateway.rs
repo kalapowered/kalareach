@@ -865,7 +865,8 @@ impl Context {
             .unwrap_or_else(|why| {
                 panic!(
                     "{ISOLATION_UNPROVEN} {why}. A directory that the agent moved out of the run \
-                     is outside it, and was neither scanned for keys nor removed"
+                     is outside it and is not scanned for keys; the end removes it only where it \
+                     is empty, and stops the case where it holds anything"
                 )
             });
         let mut files = vec![binary_place("kr-hook")];
@@ -2347,8 +2348,16 @@ fn ends(
     }
     // What a probe that moved the working directory left beside the run's root, outside the run.
     if let (Route::Real(_), Some(root)) = (&route, &root) {
-        evidence["moved_work_directory"] =
-            serde_json::json!(removes_the_moved_work_directory(root));
+        let (moved, holds_something) = removes_the_moved_work_directory(root);
+        evidence["moved_work_directory"] = serde_json::json!(moved);
+        if holds_something {
+            stops.push((
+                "moved_work_directory_left",
+                format!(
+                    "{moved}: what it holds is outside the run, so the key scan did not cover it"
+                ),
+            ));
+        }
     }
     // The person's files once more, after the run's directory went: a removal that reached them
     // would show here.
@@ -2406,24 +2415,33 @@ fn ends(
 /// so the key scan did not read it and the run's removal did not take it. It is removed here only
 /// where it is an empty directory, by the name this derives from the run's root and no name read
 /// from the run, and what was done or left is said.
-fn removes_the_moved_work_directory(root: &Path) -> &'static str {
+///
+/// Returns what was found and done, and whether the directory holds something (or could not be
+/// removed), which stops the case: what it holds was not scanned.
+fn removes_the_moved_work_directory(root: &Path) -> (&'static str, bool) {
     let Some(name) = root.file_name() else {
-        return "no place to look for";
+        return ("no place to look for", false);
     };
     let mut moved_name = name.to_os_string();
     moved_name.push("-moved");
     let moved = root.with_file_name(moved_name);
     match std::fs::symlink_metadata(&moved) {
-        Err(_) => "none beside the run",
+        Err(_) => ("none beside the run", false),
         Ok(found) if found.is_dir() => {
             if std::fs::remove_dir(&moved).is_ok() {
-                "an empty directory beside the run, removed"
+                ("an empty directory beside the run, removed", false)
             } else {
-                "a directory beside the run that holds something or could not be removed, outside \
-                 the run and neither scanned for keys nor removed"
+                (
+                    "a directory beside the run that holds something or could not be removed, \
+                     outside the run, not scanned for keys and not removed",
+                    true,
+                )
             }
         }
-        Ok(_) => "an entry beside the run that is not a directory, left in place",
+        Ok(_) => (
+            "an entry beside the run that is not a directory, left in place",
+            false,
+        ),
     }
 }
 
@@ -3448,7 +3466,7 @@ fn gateway_a_work_directory_the_agent_moved_out_of_the_run_is_not_started_in_by_
         "the next start was refused as another directory at the work directory's place: {said}"
     );
     assert!(
-        said.contains("outside it, and was neither scanned for keys nor removed"),
+        said.contains("is outside it and is not scanned for keys"),
         "the refusal says what became of the moved directory: {said}"
     );
 }
@@ -3816,19 +3834,26 @@ fn the_directory_a_move_probe_leaves_beside_the_run_is_removed_only_where_it_is_
     let root = base.join("krm-run");
     let moved = base.join("krm-run-moved");
     std::fs::create_dir_all(&root).expect("a run's root");
-    assert!(removes_the_moved_work_directory(&root).starts_with("none"));
+    assert_eq!(
+        removes_the_moved_work_directory(&root),
+        ("none beside the run", false)
+    );
     // Empty: removed, and the run's own root is not touched.
     std::fs::create_dir(&moved).expect("a moved directory");
-    assert!(removes_the_moved_work_directory(&root).contains("removed"));
+    assert!(
+        !removes_the_moved_work_directory(&root).1,
+        "an empty directory is no stop"
+    );
     assert!(!moved.exists() && root.is_dir());
     // It holds something: left where it is, with what is in it, and said so.
     std::fs::create_dir(&moved).expect("a moved directory");
     std::fs::write(moved.join("theirs"), "kept").expect("a file");
-    let said = removes_the_moved_work_directory(&root);
+    let (said, stops) = removes_the_moved_work_directory(&root);
     assert!(
-        said.contains("holds something") && said.contains("neither scanned"),
+        said.contains("holds something") && said.contains("not scanned"),
         "{said}"
     );
+    assert!(stops, "a directory that holds something stops the case");
     assert_eq!(
         std::fs::read_to_string(moved.join("theirs")).expect("a file"),
         "kept"
@@ -3838,8 +3863,8 @@ fn the_directory_a_move_probe_leaves_beside_the_run_is_removed_only_where_it_is_
     let elsewhere = base.join("elsewhere");
     std::fs::create_dir(&elsewhere).expect("a directory");
     std::os::unix::fs::symlink(&elsewhere, &moved).expect("a link");
-    let said = removes_the_moved_work_directory(&root);
-    assert!(said.contains("not a directory"), "{said}");
+    let (said, stops) = removes_the_moved_work_directory(&root);
+    assert!(said.contains("not a directory") && !stops, "{said}");
     assert!(elsewhere.is_dir() && moved.is_symlink());
     let _ = std::fs::remove_dir_all(&base);
 }
