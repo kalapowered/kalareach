@@ -987,8 +987,6 @@ fn home_environment(home: &Path, order: &Path) -> Vec<(String, String)> {
         ),
         ("KR_TEST_ORDER".to_owned(), told(order)),
         ("TERM".to_owned(), "xterm-256color".to_owned()),
-        ("LANG".to_owned(), "C".to_owned()),
-        ("LC_ALL".to_owned(), "C".to_owned()),
     ]
 }
 
@@ -1153,6 +1151,11 @@ impl Session {
         for (name, value) in &setup.environment {
             command.env(name, value);
         }
+        // The locale is the byte locale unless the case runs inside `in_each_locale`, and it is
+        // set with `LANG` and `LC_ALL` together so that no inherited variable can win.
+        let locale = locale_in_force();
+        command.env("LANG", &locale);
+        command.env("LC_ALL", &locale);
         command.env("KR_SESSION", session_id.to_string());
         command.env("KR_SHELL_BRIDGE", &endpoint.path);
         command.env(

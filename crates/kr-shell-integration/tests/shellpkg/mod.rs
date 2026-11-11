@@ -1302,9 +1302,15 @@ impl Session {
             }
         }
         // What the case itself names goes last, so a variable a case sets replaces the one set
-        // above. `LC_ALL` outranks `LANG` and `LC_CTYPE`, so a case that needs another locale
-        // goes through `in_each_locale` and does not set those two.
+        // above. The locale is the one variable it may not name: the log names the locale of each
+        // run, and a case that set its own would run under another, so a case that needs a locale
+        // goes through `in_each_locale`.
         for (name, value) in environment {
+            assert!(
+                name != "LANG" && !name.starts_with("LC_"),
+                "a case that sets {name}={value} would run in a locale its log does not name; \
+                 run it through `in_each_locale` instead"
+            );
             command.env(name, value);
         }
 

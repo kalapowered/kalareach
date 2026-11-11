@@ -48,8 +48,20 @@ pub fn locale_in_force() -> String {
 struct InForce;
 
 impl InForce {
+    /// # Panics
+    ///
+    /// Panics when a run is already in force on this thread: the inner run would end with the byte
+    /// locale back in force for what is left of the outer one, under a log line that names
+    /// another.
     fn set(name: &str) -> Self {
-        IN_FORCE.with(|current| *current.borrow_mut() = Some(name.to_owned()));
+        IN_FORCE.with(|current| {
+            let mut current = current.borrow_mut();
+            assert!(
+                current.is_none(),
+                "`in_each_locale` is running inside a run of its own"
+            );
+            *current = Some(name.to_owned());
+        });
         Self
     }
 }
