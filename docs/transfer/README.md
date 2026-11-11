@@ -176,9 +176,10 @@ the only difference, and it is why the endpoint exists at all.
 A paired device begins, finishes and cancels an upload and reads its status on its control stream,
 and only the chunks travel on a data stream. An exact repeat of `upload.finish` or `upload.cancel` on
 a replacement connection is settled from the action's claim: an open claim is finished, and a
-settled one gives back its answer. An exact repeat of a chunk is not settled there. The host tells
-the device the outcome is unknown, and the device reads `upload.status` and sends the chunks that are
-not staged as new actions.
+settled one gives back its answer. An exact repeat of a chunk is not settled there: one that was
+committed is answered from its record, and one with no record is refused. The host tells the device
+the outcome is unknown, and the device reads `upload.status` and sends the chunks that are not
+staged as new actions.
 
 On the network transport a host takes a paired device's chunks on a data stream of that kind for
 the device's own uploads only, keeps one live stream for each transfer, and answers each chunk on

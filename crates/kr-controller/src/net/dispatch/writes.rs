@@ -152,8 +152,8 @@ impl Arrival<'_> {
 }
 
 impl RemoteConnection {
-    /// Performs one draft write, or one chunk that arrived on `on_stream`, under this device's own
-    /// principal, in the transfer service.
+    /// Performs one transfer write (a draft write, an upload's begin, finish or cancel, or a chunk
+    /// that arrived on a data stream), under this device's own principal, in the transfer service.
     ///
     /// The service scopes every draft by the principal that made it, so nothing the request names
     /// reaches the owner's drafts or another device's. The stored subject is read first, because

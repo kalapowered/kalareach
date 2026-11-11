@@ -599,9 +599,19 @@ impl RemoteConnection {
                     admitted_revision: validated,
                     deadline: None,
                 };
-                match self.controller.check_retained_in_hand(&carried).await {
-                    Ok(()) => answer,
-                    Err(_) => failure(request.request_id, outcome_not_shown()),
+                let held = self.controller.check_retained_in_hand(&carried).await;
+                // An upload that no session holds takes the session of the first draft it is bound
+                // to and keeps it. This read was decided over the session the upload belonged to
+                // before it was read, so an upload that belongs to another by the end of the read
+                // is not shown under that decision: the device reads it again and is decided over
+                // the session it is bound to now.
+                let rebound = self
+                    .upload_session(request)
+                    .await
+                    .map_or(true, |now| now != named);
+                match held {
+                    Ok(()) if !rebound => answer,
+                    _ => failure(request.request_id, outcome_not_shown()),
                 }
             }
             // Answered before the routes are read, so a request cannot arrive here.
