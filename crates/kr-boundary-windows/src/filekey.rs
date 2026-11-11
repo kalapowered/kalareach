@@ -70,9 +70,16 @@ impl std::str::FromStr for FileKey {
         let volume_serial = u64::from_str_radix(volume, 16).map_err(|_| bad())?;
         let bytes = hex::decode(id).map_err(|_| bad())?;
         let file_id: [u8; 16] = bytes.try_into().map_err(|_| bad())?;
-        Ok(FileKey {
+        let key = FileKey {
             volume_serial,
             file_id,
-        })
+        };
+        // Only the printed form is a key: 16 lowercase hex digits, a colon and 32 lowercase hex
+        // digits. A longer or otherwise different spelling of the same key (leading zeros past the
+        // width, capitals, a sign) is refused, so that a row's size follows from its key.
+        if key.to_string() != text {
+            return Err(bad());
+        }
+        Ok(key)
     }
 }
