@@ -21,8 +21,8 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION,
-    GetAce, GetAclInformation, GetSecurityDescriptorDacl, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION,
+    GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorDacl, IsValidSid,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
 };
 
 use super::ffi::{Result, Sid, error, from_wide, last, wide_path};
@@ -32,6 +32,10 @@ use super::walk::{AnchorRefusal, DirHandle, LIST};
 const SDDL_REVISION_1: u32 = 1;
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const INHERIT_ONLY_ACE: u8 = 0x08;
+const OBJECT_INHERIT_ACE: u8 = 0x01;
+const CONTAINER_INHERIT_ACE: u8 = 0x02;
+/// The rights to write attributes and extended attributes.
+const ATTRIBUTE_WRITES: u32 = 0x0000_0100 | 0x0000_0010;
 
 /// Replaces a path's permissions with a descriptor's list and stops it inheriting, by the system's
 /// own call, which also walks the path's children. It is for the installation's own directories
@@ -326,7 +330,13 @@ pub fn changeable_by_others(path: &Path, replacement_only: bool) -> Result<Optio
 /// (delete child, delete, change permissions, take ownership, generic write and all, maximum
 /// allowed), since adding a sibling beside it changes nothing it holds. Without it every right that
 /// changes a file or what a directory holds counts as well (write data or add a file, append data or
-/// add a subdirectory).
+/// add a subdirectory). Either way the rights to write attributes and extended attributes count: a
+/// handle with the first can turn an empty directory into a mount point.
+///
+/// An entry that only a child inherits (it has no effect on the object itself) counts like any
+/// other when it carries an inheritance flag, since the child it gives a right on is made by the
+/// caller's creating call or by whoever creates in the directory next. An entry whose size does not
+/// hold its identifier is refused as malformed, whatever its type.
 ///
 /// The answer is `None` only when the owner is in the system's own class (the system, the
 /// administrators, the installer service and the creator-owner placeholder), the object has a
@@ -419,11 +429,12 @@ unsafe fn finding_in(
     {
         return Err(last("reading the size of a permission list"));
     }
-    let mask_of_interest = if replacement_only {
-        REPLACES
-    } else {
-        CHANGES_CONTENT
-    };
+    let mask_of_interest = ATTRIBUTE_WRITES
+        | if replacement_only {
+            REPLACES
+        } else {
+            CHANGES_CONTENT
+        };
     for index in 0..information.AceCount {
         let mut entry: *mut c_void = null_mut();
         // SAFETY: the index is below the entry count the list reported.
@@ -433,16 +444,28 @@ unsafe fn finding_in(
         let allowed = entry.cast::<ACCESS_ALLOWED_ACE>();
         // SAFETY: every entry begins with a header; the platform returned a pointer to a whole one.
         let header = unsafe { (*allowed).Header };
-        if header.AceType == ACCESS_DENIED_ACE_TYPE {
-            continue;
-        }
-        if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+        if header.AceType != ACCESS_ALLOWED_ACE_TYPE && header.AceType != ACCESS_DENIED_ACE_TYPE {
             return Ok(Some(format!(
                 "its permission list has an entry of type {}, which this check does not read",
                 header.AceType
             )));
         }
-        if header.AceFlags & INHERIT_ONLY_ACE != 0 {
+        // SAFETY: the entry is a header, a mask and an identifier; the size the header gives bounds
+        // every read of the identifier.
+        if !unsafe { entry_holds_its_identifier(allowed) } {
+            return Ok(Some(
+                "its permission list has an entry whose size does not hold its identifier"
+                    .to_owned(),
+            ));
+        }
+        if header.AceType == ACCESS_DENIED_ACE_TYPE {
+            continue;
+        }
+        // An entry for inheritance alone gives no right on this object, but what it inherits is
+        // given on the objects made in it.
+        if header.AceFlags & INHERIT_ONLY_ACE != 0
+            && header.AceFlags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) == 0
+        {
             continue;
         }
         // SAFETY: a plain allow entry is a header, a mask and an identifier.
@@ -461,4 +484,195 @@ unsafe fn finding_in(
         }
     }
     Ok(None)
+}
+
+/// Whether an allow or deny entry is large enough for the identifier it names, and the identifier
+/// is a valid one.
+///
+/// # Safety
+///
+/// `entry` points at an entry of type allow or deny that lives through the call, whose header
+/// (four bytes) is readable.
+unsafe fn entry_holds_its_identifier(entry: *const ACCESS_ALLOWED_ACE) -> bool {
+    let start = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+    // An identifier is at least its revision, its count and its authority: eight bytes.
+    const SID_HEAD: usize = 8;
+    // SAFETY: the header is readable by the caller's contract.
+    let size = usize::from(unsafe { (*entry).Header.AceSize });
+    if size < start + SID_HEAD {
+        return false;
+    }
+    // SAFETY: the size covers the identifier's first eight bytes, which say how long it is.
+    let sid = unsafe { std::ptr::addr_of!((*entry).SidStart) }
+        .cast_mut()
+        .cast::<c_void>();
+    // SAFETY: the identifier's head lies inside the entry.
+    if unsafe { IsValidSid(sid) } == 0 {
+        return false;
+    }
+    // SAFETY: the identifier is valid, so its length is the one it says.
+    let length = unsafe { GetLengthSid(sid) } as usize;
+    start + length <= size
+}
+
+#[cfg(all(test, feature = "testing"))]
+mod tests {
+    use super::*;
+    use crate::win::sd;
+    use windows_sys::Win32::Security::GetSecurityDescriptorOwner;
+
+    /// A list the platform built from text, copied so that a case can damage an entry, with the
+    /// owner of the descriptor it came from.
+    struct Fixture {
+        _descriptor: sd::OwnedSd,
+        owner: *mut c_void,
+        list: Vec<u8>,
+    }
+
+    impl Fixture {
+        fn from(text: &str) -> Fixture {
+            let descriptor = sd::descriptor_from_text(text).unwrap();
+            let mut owner: *mut c_void = null_mut();
+            let mut defaulted = 0;
+            let mut present = 0;
+            let mut dacl: *mut ACL = null_mut();
+            // SAFETY: the descriptor is valid and the outputs are local.
+            unsafe {
+                assert_ne!(
+                    GetSecurityDescriptorOwner(
+                        descriptor.as_ptr(),
+                        &raw mut owner,
+                        &raw mut defaulted
+                    ),
+                    0
+                );
+                assert_ne!(
+                    GetSecurityDescriptorDacl(
+                        descriptor.as_ptr(),
+                        &raw mut present,
+                        &raw mut dacl,
+                        &raw mut defaulted,
+                    ),
+                    0
+                );
+            }
+            let mut information = ACL_SIZE_INFORMATION {
+                AceCount: 0,
+                AclBytesInUse: 0,
+                AclBytesFree: 0,
+            };
+            // SAFETY: the list is valid and the buffer is the size the class asks for.
+            unsafe {
+                assert_ne!(
+                    GetAclInformation(
+                        dacl,
+                        (&raw mut information).cast(),
+                        size_of::<ACL_SIZE_INFORMATION>() as u32,
+                        AclSizeInformation,
+                    ),
+                    0
+                );
+            }
+            // SAFETY: the list holds `AclBytesInUse` bytes.
+            let list = unsafe {
+                std::slice::from_raw_parts(dacl.cast::<u8>(), information.AclBytesInUse as usize)
+            }
+            .to_vec();
+            Fixture {
+                _descriptor: descriptor,
+                owner,
+                list,
+            }
+        }
+
+        /// Where entry `index` begins in the copy.
+        fn offset(&self, index: usize) -> usize {
+            let mut at = size_of::<ACL>();
+            for _ in 0..index {
+                at += usize::from(u16::from_le_bytes([self.list[at + 2], self.list[at + 3]]));
+            }
+            at
+        }
+
+        fn set_size(&mut self, index: usize, size: u16) {
+            let at = self.offset(index);
+            self.list[at + 2..at + 4].copy_from_slice(&size.to_le_bytes());
+        }
+
+        fn finding(&mut self, replacement_only: bool) -> Option<String> {
+            // SAFETY: the owner lives in the descriptor the fixture keeps, and the list is a copy
+            // of a valid one, damaged only in an entry's size or identifier.
+            unsafe {
+                finding_in(self.owner, self.list.as_mut_ptr().cast(), replacement_only).unwrap()
+            }
+        }
+    }
+
+    const BASE: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+
+    #[test]
+    fn a_list_of_the_system_class_alone_has_no_finding() {
+        assert_eq!(Fixture::from(BASE).finding(false), None);
+        assert_eq!(Fixture::from(BASE).finding(true), None);
+    }
+
+    #[test]
+    fn an_entry_that_only_a_child_inherits_counts_and_one_that_inherits_nowhere_does_not() {
+        let mut fixture = Fixture::from(&format!("{BASE}(A;OICIIO;FA;;;BU)"));
+        let finding = fixture.finding(false).expect("a child would inherit it");
+        assert!(finding.contains("S-1-5-32-545"), "{finding}");
+        // An entry that inherits to no child and applies to nothing is not a right.
+        let at = fixture.offset(2);
+        fixture.list[at + 1] = INHERIT_ONLY_ACE;
+        assert_eq!(fixture.finding(false), None);
+    }
+
+    #[test]
+    fn the_rights_to_write_attributes_and_extended_attributes_count() {
+        for mask in ["0x100", "0x10"] {
+            for replacement_only in [false, true] {
+                let mut fixture = Fixture::from(&format!("{BASE}(A;;{mask};;;BU)"));
+                assert!(
+                    fixture.finding(replacement_only).is_some(),
+                    "{mask} is a right that turns an empty folder into a link"
+                );
+            }
+        }
+        // Reading and listing do not.
+        assert_eq!(
+            Fixture::from(&format!("{BASE}(A;;0x1200a9;;;BU)")).finding(false),
+            None
+        );
+    }
+
+    #[test]
+    fn an_entry_that_is_too_small_for_its_identifier_is_refused_whatever_its_type() {
+        // An allow entry, a deny entry and an inherit-only entry, each cut to a size that holds the
+        // mask and not the identifier; and one cut to hold the identifier's head and not all of it.
+        for text in [
+            format!("{BASE}(A;;0x1200a9;;;BU)"),
+            format!("{BASE}(D;;FA;;;BU)"),
+            format!("{BASE}(A;OICIIO;0x1200a9;;;BU)"),
+        ] {
+            for size in [8_u16, 12, 15, 20] {
+                let mut fixture = Fixture::from(&text);
+                fixture.set_size(2, size);
+                let finding = fixture.finding(false).unwrap_or_default();
+                assert!(
+                    finding.contains("does not hold its identifier"),
+                    "{text} cut to {size}: {finding:?}"
+                );
+            }
+        }
+        // An identifier whose count of parts is not one that exists.
+        let mut fixture = Fixture::from(&format!("{BASE}(D;;FA;;;BU)"));
+        let at = fixture.offset(2) + 8;
+        fixture.list[at + 1] = 0xff;
+        assert!(
+            fixture
+                .finding(false)
+                .unwrap_or_default()
+                .contains("does not hold its identifier")
+        );
+    }
 }
