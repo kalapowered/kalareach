@@ -1,5 +1,11 @@
 //! Permissions on files and directories: writing a protected list from a text form, reading one
 //! back as text, and telling whether an account other than the system's own could change a path.
+//!
+//! The system's own walk that propagates a list to every child (`SetNamedSecurityInfoW`) is used
+//! only by [`set_protected`], for a directory that belongs to the installation and whose children
+//! the installer made itself. A directory that a boundary account can reach, and one that may hold
+//! what a hostile repository wrote, is changed only on a held handle, with nothing propagated:
+//! [`set_protected_when_empty`].
 
 #![allow(unsafe_code)]
 
@@ -7,7 +13,8 @@ use std::ffi::c_void;
 use std::path::Path;
 use std::ptr::null_mut;
 
-use windows_sys::Win32::Foundation::LocalFree;
+use windows_sys::Wdk::Storage::FileSystem::NtSetSecurityObject;
+use windows_sys::Win32::Foundation::{LocalFree, RtlNtStatusToDosError};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
     SetNamedSecurityInfoW,
@@ -20,12 +27,17 @@ use windows_sys::Win32::Security::{
 
 use super::ffi::{Result, Sid, error, from_wide, last, wide_path};
 use super::sd::OwnedSd;
+use super::walk::{AnchorRefusal, DirHandle, LIST};
 
 const SDDL_REVISION_1: u32 = 1;
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const INHERIT_ONLY_ACE: u8 = 0x08;
 
-/// Replaces a path's permissions with a descriptor's list and stops it inheriting.
+/// Replaces a path's permissions with a descriptor's list and stops it inheriting, by the system's
+/// own call, which also walks the path's children. It is for the installation's own directories
+/// (the data, staging and program directories, the proof's scratch directory and the test cases'
+/// folders), which no boundary account can add children to; the system's walk then meets nothing
+/// hostile. A directory that can hold what a boundary account wrote is not changed with it.
 ///
 /// # Errors
 ///
@@ -67,6 +79,78 @@ pub fn set_protected(path: &Path, descriptor: &OwnedSd) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// What [`set_protected_when_empty`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reset {
+    /// The directory was empty and now has the list.
+    Applied,
+    /// The directory holds something, so its list was not changed.
+    NotEmpty,
+    /// The path is not a directory that a walk may anchor on: a reparse point, something that is
+    /// not a directory, or a volume that is not accepted. Nothing was changed.
+    Refused(AnchorRefusal),
+}
+
+const WRITE_DAC: u32 = 0x0004_0000;
+
+/// Replaces a directory's list with a descriptor's list and stops it inheriting, on the directory's
+/// own handle and only when the directory has no child.
+///
+/// The directory is opened as itself, without following a reparse point and without delete
+/// sharing, and stays held from the check that it is empty to the change. The change is made with
+/// `NtSetSecurityObject` on that handle and propagates to nothing, so a child that appears is not
+/// reached. It is for the broker's `run` directory, which holds invocations' private roots and
+/// must not be changed under one. A directory that is not empty is left as it is and reported, so
+/// the caller can leave it or refuse.
+///
+/// # Errors
+///
+/// Returns the platform's error when the descriptor has no list, the directory cannot be opened
+/// or listed, or the list is refused. A path that is not an acceptable directory is the answer
+/// [`Reset::Refused`], not an error.
+pub fn set_protected_when_empty(path: &Path, descriptor: &OwnedSd) -> Result<Reset> {
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut dacl: *mut ACL = null_mut();
+    // SAFETY: the descriptor is valid and the out-parameters are local.
+    let got = unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor.as_ptr(),
+            &raw mut present,
+            &raw mut dacl,
+            &raw mut defaulted,
+        )
+    };
+    if got == 0 || present == 0 {
+        return Err(error(1, "the descriptor has no permission list"));
+    }
+    let held = match DirHandle::open_anchor_with(path, LIST | WRITE_DAC)? {
+        Ok(held) => held,
+        Err(refusal) => return Ok(Reset::Refused(refusal)),
+    };
+    if !held.children()?.is_empty() {
+        return Ok(Reset::NotEmpty);
+    }
+    // SAFETY: the handle is open with the right to change the list and the descriptor lives
+    // through the call.
+    let status = unsafe {
+        NtSetSecurityObject(
+            held.handle().raw(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            descriptor.as_ptr(),
+        )
+    };
+    if status < 0 {
+        // SAFETY: converts a status code to a Windows error number; it reads nothing else.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        return Err(error(
+            code,
+            format!("setting the permissions of {}", path.display()),
+        ));
+    }
+    Ok(Reset::Applied)
 }
 
 /// Reads a path's owner and permission list as text.
