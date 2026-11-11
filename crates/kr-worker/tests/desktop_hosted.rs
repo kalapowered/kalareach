@@ -46,9 +46,10 @@ fn on_a_hosted_runner() -> bool {
 ///
 /// - an application of the run's own, a window with a text field that holds some given text and has
 ///   the focus, which records every key and mouse button that reaches it, the field's text, and
-///   each time it gains or loses the focus: it never loses the focus once it has it, so whatever a
-///   check typed into the application in front was typed into it, and it holds the given text and
-///   nothing else, so no check typed into it or changed what it holds;
+///   each time it gains or loses the focus: it does not lose the focus from before the checks
+///   begin until the person's sentinel has reached it, so whatever a check typed into the
+///   application in front was typed into it, and it holds the given text and nothing else, so no
+///   check typed into it or changed what it holds;
 /// - the session's terminal, whose root program records every byte it reads: it reads the
 ///   person's sentinel and nothing else;
 /// - the file the person nominates, with a file beside it: the names in the directory and each
@@ -289,6 +290,15 @@ mod hosted {
             said(&self.log)
         }
 
+        /// Holds that the window program is still running, and says what it printed when it is not.
+        fn assert_running(&mut self) {
+            assert!(
+                self.child.try_wait().expect("the window's state").is_none(),
+                "the window program ended: {}",
+                std::fs::read_to_string(&self.errors).unwrap_or_default()
+            );
+        }
+
         /// Brings the window to the front, as the person would, and waits until it says typing
         /// would land in its field.
         ///
@@ -297,11 +307,7 @@ mod hosted {
         async fn take_the_focus(&mut self) {
             let started = Instant::now();
             loop {
-                assert!(
-                    self.child.try_wait().expect("the window's state").is_none(),
-                    "the window program ended: {}",
-                    std::fs::read_to_string(&self.errors).unwrap_or_default()
-                );
+                self.assert_running();
                 let _ = system_events(&format!(
                     "set frontmost of (first process whose unix id is {}) to true",
                     self.pid
@@ -517,14 +523,18 @@ mod hosted {
         /// The person at the terminal: a client that holds the input lease.
         async fn person(&self) -> (LocalClient, common::Keys) {
             common::retained_carrying(&self.runtime, b"kr-ready.", 1, LIVENESS).await;
-            let mut client = LocalClient::connect(&self.endpoint, LocalClientKind::Cli, build())
-                .await
-                .expect("connects");
+            let mut client = within(
+                "the person's connection to the worker",
+                LocalClient::connect(&self.endpoint, LocalClientKind::Cli, build()),
+            )
+            .await
+            .expect("connects");
             let mut requested = CanonicalSet::new();
             requested.insert(AttachmentCapability::ObserveTerminal);
             requested.insert(AttachmentCapability::Input);
-            let attached: SessionAttachResult = client
-                .mutate(
+            let attached: SessionAttachResult = within(
+                "the person's attachment to the session",
+                client.mutate(
                     Method::SessionAttach,
                     ActionId::new(kr_ipc::new_uuid()),
                     self.target(),
@@ -536,18 +546,22 @@ mod hosted {
                         terminal_profile_id: Nullable(Some("xterm-256color".to_owned())),
                         requested,
                     },
-                )
-                .await
-                .expect("reaches the worker")
-                .expect("attaches")
-                .to_typed()
-                .expect("decodes");
+                ),
+            )
+            .await
+            .expect("reaches the worker")
+            .expect("attaches")
+            .to_typed()
+            .expect("decodes");
             let attachment: AttachmentId = attached.attachment.attachment_id;
-            let keys = common::take_the_keys(
-                &mut client,
-                self.environment_id,
-                self.session_id,
-                attachment,
+            let keys = within(
+                "the person's input lease",
+                common::take_the_keys(
+                    &mut client,
+                    self.environment_id,
+                    self.session_id,
+                    attachment,
+                ),
             )
             .await;
             (client, keys)
@@ -579,20 +593,27 @@ mod hosted {
         }
     }
 
-    /// Holds that the window kept the focus from the moment it had it.
+    /// Holds that the window had the focus when the checks began, `from` lines into its log, and
+    /// has not lost it since.
     ///
     /// A check that moved the focus would send whatever it typed next to another application,
     /// which this window could not have seen, so a run in which the window lost the focus shows
-    /// nothing about what a check typed.
-    fn kept_the_focus(said: &[Said], until: &str) {
-        let first = said
-            .iter()
-            .position(|line| *line == Said::Focus(true))
-            .expect("the window had the focus");
+    /// nothing about what a check typed. What the window did while it was first being shown is
+    /// not held to this: the case begins to watch once the window says it has the focus.
+    fn kept_the_focus(said: &[Said], from: usize, until: &str) {
+        let had = said[..from].iter().rev().find_map(|line| match line {
+            Said::Focus(focus) => Some(*focus),
+            _ => None,
+        });
+        assert_eq!(
+            had,
+            Some(true),
+            "the window did not have the focus when the checks began: {said:?}"
+        );
         assert!(
-            !said[first..].contains(&Said::Focus(false)),
-            "the window lost the focus before {until}, so a key a check sent would have gone to \
-             another application: {said:?}"
+            !said[from..].contains(&Said::Focus(false)),
+            "the window lost the focus before {until}, so what was typed after that may have gone \
+             to another application, and nothing in this window shows what a check sent: {said:?}"
         );
     }
 
@@ -635,6 +656,8 @@ mod hosted {
             Some(&Said::Text(GIVEN.to_owned())),
             "the field starts with the given text"
         );
+        // What the window says from here on is what the checks did to it: it has the focus now.
+        let from = window.said().len();
 
         // The person's file and the file beside it, in a directory of their own.
         let tree = tempfile::tempdir().expect("a directory of this run's own");
@@ -655,8 +678,7 @@ mod hosted {
         );
 
         let worker = Worker::start(&received).await;
-        let (client, mut keys) =
-            within("the person's attachment to the session", worker.person()).await;
+        let (client, mut keys) = worker.person().await;
         let mut daemon = within("the daemon's checks connection", worker.daemon()).await;
 
         let answer = ask(
@@ -721,11 +743,12 @@ mod hosted {
             "",
             "the launch check left an application it started running"
         );
-        // The window has the focus still: it was never taken from it, and brought back.
-        kept_the_focus(&window.said(), "the checks had answered");
+        // The window has the focus still: it has not lost it since the checks began.
+        kept_the_focus(&window.said(), from, "the checks had answered");
 
         // The person types into the window, which has the focus, and the window is read once it
         // holds that: what a check typed would have come before it.
+        window.assert_running();
         let typed = system_events(&format!("keystroke \"{WINDOW_SENTINEL}\"")).await;
         assert!(
             typed.is_ok(),
@@ -734,10 +757,11 @@ mod hosted {
         let expected = format!("{GIVEN}{WINDOW_SENTINEL}");
         let started = Instant::now();
         loop {
+            window.assert_running();
             let said = window.said();
             // A window that lost the focus never receives the sentinel, so the wait ends here
             // with the reason rather than at its bound.
-            kept_the_focus(&said, "the person's sentinel had reached the window");
+            kept_the_focus(&said, from, "the person's sentinel had reached the window");
             let last_text = said.into_iter().rev().find_map(|line| match line {
                 Said::Text(text) => Some(text),
                 _ => None,
@@ -755,7 +779,7 @@ mod hosted {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let said = window.said();
-        kept_the_focus(&said, "the person's sentinel had been typed");
+        kept_the_focus(&said, from, "the person's sentinel had been typed");
         let pressed: Vec<&str> = said
             .iter()
             .filter_map(|line| match line {

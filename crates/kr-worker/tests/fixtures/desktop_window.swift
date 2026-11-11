@@ -6,7 +6,7 @@
 // It writes one line to the log for each thing that reaches it, so what the checks did to it can be
 // read back without asking the system anything:
 //
-//   text <hex>          the field's whole text, once at the start and again after each change
+//   text <hex>          the field's whole text, once at the start and again after each settled change
 //   key <hex> <code>    a key pressed in this application, with the characters it produced
 //   mouse <type>        a mouse button pressed in one of its windows
 //   scroll              a scroll wheel turned over one of its windows
@@ -35,8 +35,16 @@ func hex(_ text: String) -> String {
     text.utf8.map { String(format: "%02x", $0) }.joined()
 }
 
+// A line that cannot be written ends the program: a log with a line missing would pass for one
+// that says nothing happened.
 func record(_ line: String) {
-    try? log.write(contentsOf: Data((line + "\n").utf8))
+    do {
+        try log.write(contentsOf: Data((line + "\n").utf8))
+    } catch {
+        FileHandle.standardError.write(
+            Data("desktop_window: the log could not be written: \(error)\n".utf8))
+        exit(3)
+    }
 }
 
 final class Window: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
