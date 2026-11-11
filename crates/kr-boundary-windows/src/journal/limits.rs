@@ -18,15 +18,22 @@
 //! |---|---|---|
 //! | `Begin`, `GrantComplete`, `ProcessStarted`, `RootIntent`, `RootMade`, `RootRemoved`, `End` | 1 | refused as out of order: it would say the same thing twice or something that cannot be |
 //! | `RepositorySnapshot` | 4 | not written; the caller records a leftover for the tree that says the journal holds no more snapshots |
-//! | `JobEnded`, `EndUncertain` | 16 each | one that repeats what the journal already says is not written, and the caller is told it is already recorded; one that changes it is not written either, and the caller records a leftover of class `Uncertain` for the tree, which says the journal holds no more end checks |
-//! | `ReleaseVerified` | 16 | one that repeats the standing verification is not written (already recorded); the seventeenth, after sixteen were voided, is not written and the caller records a leftover for the tree that says the verification was made too often |
-//! | `AcceptedState` | 4 | one for a state already accepted is not written (already recorded); another is refused with words for the person, and its leftover stays |
+//! | `JobEnded`, `EndUncertain` | 16 each | one that repeats what the journal already says is not written, and the caller is told it is already recorded; an `EndUncertain` that repeats the state with another reason is not written and the caller is told it differs (the first reason stands, and the caller gives the other to the person in its own answer; it uses none of the sixteen); one that changes the state is not written either, and the caller records a leftover of class `Uncertain` for the tree, which says the journal holds no more end checks |
+//! | `ReleaseVerified` | 16 | one that repeats the standing verification is not written (already recorded); one that repeats it with another count of objects is not written and the caller is told it differs, which it treats as a fault of its own count and ends the invocation unfinished; the seventeenth, after sixteen were voided, is not written and the caller records a leftover for the tree that says the verification was made too often |
+//! | `AcceptedState` | 4 | one for a state already accepted by the same person, at any time, is not written (already recorded); one for it from another person is not written and the caller is told it differs, and the caller tells that person the state was accepted already; another state's acceptance over the count is refused with words for the person, and its leftover stays |
 //! | `Leftover` of class `Repository` | 4 | refused; the caller records a leftover for the tree |
 //! | `Leftover` of class `Root` | 1,024 | refused with words; the removal ends with the leftovers that are there, which already say the root is not whole, and the invocation's end counts them |
 //! | `Leftover` of another class that no release of the invocation reserved room for | 8 | refused; the invocation stays unfinished and its tree blocked, which is what the leftovers already say |
 //!
 //! A row that was refused for room is never lost silently: the caller is given the refusal with the
-//! words that say why, and writes the leftover; a leftover is always admitted within its count.
+//! words that say why, and writes the leftover; a leftover is always admitted within its count. A
+//! row that repeats a recorded one with other content is never taken for the recorded one: the
+//! caller is told it differs, and nothing is written.
+//!
+//! A writer that takes up a file an earlier writer made counts the bytes that are in it: what is
+//! left of the file's bound after those bytes and what the rows that are not an object's may still
+//! add is the most the objects' rows may take, and the file itself refuses a row that would pass
+//! the bound whatever the tracker holds.
 
 use super::framing::FRAME_BYTES;
 
@@ -191,10 +198,25 @@ pub fn cut(text: &str, max: usize) -> String {
     text[..end].to_owned()
 }
 
-/// A reason, an outcome or a name for a row, cut to [`TEXT_BYTES`].
+/// A reason, an outcome or a name for a row: the longest start of the text, cut at a character
+/// boundary, that takes at most [`TEXT_BYTES`] once written as a row writes it. A backslash and a
+/// quote take two bytes there and a control character six, so the cut counts those bytes and not
+/// the text's own: the row that carries the cut text is never refused for its length.
 #[must_use]
 pub fn short(text: &str) -> String {
-    cut(text, TEXT_BYTES)
+    if json_bytes(text) <= TEXT_BYTES {
+        return text.to_owned();
+    }
+    let mut taken = 0;
+    let mut end = 0;
+    for (start, character) in text.char_indices() {
+        taken += json_bytes(character.encode_utf8(&mut [0; 4]));
+        if taken > TEXT_BYTES {
+            break;
+        }
+        end = start + character.len_utf8();
+    }
+    text[..end].to_owned()
 }
 
 /// The bytes of `text` once written as a JSON string, without the quotes.
