@@ -1428,8 +1428,9 @@ async fn a_receiver_ends_when_its_connection_does() {
 /// already sent stays, so the device can use it, and every stream it opens is reset; but the
 /// freeing of those streams, which would grant a stream each, grants nothing: the limit went back
 /// to the control stream's one with the receiver. The device opens the streams its credit allows
-/// and the host resets each; the next open still finds no credit, and the host has sent no further
-/// credit.
+/// and the host resets each; the next open still finds no credit, and the device has told the host
+/// it is blocked. (The host's count of the credit frames it has sent is not asserted: a frame whose
+/// acknowledgement comes late is sent again, with nothing new in it.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_drops_its_receiver_gives_no_more_credit() {
     let harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::DropAfterTheGate).await;
@@ -1452,7 +1453,6 @@ async fn a_host_that_drops_its_receiver_gives_no_more_credit() {
             .expect("a stream"),
         );
     }
-    let sent_before = harness.host_connection.stats().frame_tx.max_streams_bidi;
 
     harness.host.gate.add_permits(1);
     awaited(
@@ -1487,11 +1487,9 @@ async fn a_host_that_drops_its_receiver_gives_no_more_credit() {
         }
     })
     .await;
-    assert!(futures::poll!(&mut next).is_pending());
-    assert_eq!(
-        harness.host_connection.stats().frame_tx.max_streams_bidi,
-        sent_before,
-        "the host sent more credit after it dropped its receiver"
+    assert!(
+        futures::poll!(&mut next).is_pending(),
+        "a device was given credit for a stream after the host dropped its receiver"
     );
     drop(next);
 
