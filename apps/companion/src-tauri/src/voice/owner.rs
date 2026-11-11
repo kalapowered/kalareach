@@ -570,12 +570,22 @@ async fn next_heard(events: &mut Option<CallEvents>) -> Option<Heard> {
     }
 }
 
-/// Waits for the control's next news, or for ever when there is no control.
 /// Writes down one failed attempt to attach the control: its kind, and nothing else.
 fn write_failed_attempt(why: AttemptFailure) {
     tracing::warn!(kind = why.words(), "a voice control attempt failed");
 }
 
+/// What the end of a call makes of one piece of the control's news while the control closes: the
+/// end is kept, a failed attempt is written down as it is while the call runs, and the rest is let go.
+fn note_while_closing(news: ControlNews, last: &mut Option<ControlEnd>) {
+    match news {
+        ControlNews::Ended(end) => *last = Some(end),
+        ControlNews::AttemptFailed(why) => write_failed_attempt(why),
+        _ => {}
+    }
+}
+
+/// Waits for the control's next news, or for ever when there is no control.
 async fn next_news(events: &mut Option<ControlEvents>) -> Option<ControlNews> {
     match events {
         Some(events) => events.next().await,
@@ -2512,9 +2522,7 @@ impl Owner {
             tokio::spawn(async move {
                 let mut last = None;
                 while let Some(news) = events.next().await {
-                    if let ControlNews::Ended(end) = news {
-                        last = Some(end);
-                    }
+                    note_while_closing(news, &mut last);
                 }
                 last
             })
@@ -2924,13 +2932,22 @@ mod tests {
 
     /// Each failed attempt to attach the control is written down once, as its kind and a fixed
     /// sentence, whatever the kind: the line has two fields, so it can hold nothing of the exchange.
+    /// An attempt that fails while the call is being ended is written down too, and the end the
+    /// control tells is still kept.
     #[test]
     fn a_failed_attempt_is_written_down_by_its_kind_and_nothing_else() {
         let written = Written::default();
+        let mut last = None;
         tracing::subscriber::with_default(written.clone(), || {
             super::write_failed_attempt(AttemptFailure::TokenService);
-            super::write_failed_attempt(AttemptFailure::ServerError);
+            super::note_while_closing(
+                ControlNews::AttemptFailed(AttemptFailure::ServerError),
+                &mut last,
+            );
+            super::note_while_closing(ControlNews::Detached, &mut last);
+            super::note_while_closing(ControlNews::Ended(ControlEnd::Unreachable), &mut last);
         });
+        assert_eq!(last, Some(ControlEnd::Unreachable));
         let lines = written.0.lock().expect("the record").clone();
         let said = |kind: &str| {
             BTreeMap::from([
