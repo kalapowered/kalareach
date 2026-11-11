@@ -35,12 +35,14 @@ object VoiceNotificationControls {
     /**
      * Whether the person's microphone is muted once a mute or an unmute has reached the call that
      * is `muted` now. A mute always leaves it muted, however many times it arrives. An unmute opens
-     * it, except where the platform did not ask for the unlock (before API 31) and the phone is
-     * locked: from API 31 the platform has already asked before the action was sent.
+     * it only on a phone that is not locked, on every platform release: from API 31 the platform
+     * asks for the unlock before it sends the notification's own Unmute, which then arrives on an
+     * unlocked phone, but any other holder of the action's pending intent (an enabled notification
+     * listener) can send it at any time, and the platform does not ask that sender for anything.
      */
-    fun mutedAfter(unmute: Boolean, muted: Boolean, locked: Boolean, sdk: Int): Boolean = when {
+    fun mutedAfter(unmute: Boolean, muted: Boolean, locked: Boolean): Boolean = when {
         !unmute -> true
-        sdk >= UNLOCK_PER_ACTION_SDK || !locked -> false
-        else -> muted
+        locked -> muted
+        else -> false
     }
 }

@@ -51,26 +51,28 @@ class VoiceNotificationControlsTest {
     }
 
     /**
-     * A mute leaves the microphone muted whatever reaches the call before it, on every platform,
-     * locked or not: a mute that arrives twice, or after the notification already offers Unmute,
-     * is never an unmute.
+     * A mute leaves the microphone muted whatever reaches the call before it, locked or not: a mute
+     * that arrives twice, or after the notification already offers Unmute, is never an unmute.
      */
     @Test
     fun a_mute_always_leaves_the_microphone_muted() {
-        for (sdk in listOf(platformWithout, platformWithPerActionUnlock, 36)) {
-            for (locked in listOf(true, false)) {
-                for (muted in listOf(true, false)) {
-                    assertTrue(VoiceNotificationControls.mutedAfter(unmute = false, muted = muted, locked = locked, sdk = sdk))
-                }
+        for (locked in listOf(true, false)) {
+            for (muted in listOf(true, false)) {
+                assertTrue(VoiceNotificationControls.mutedAfter(unmute = false, muted = muted, locked = locked))
             }
         }
     }
 
-    /** An Unmute that reaches a locked phone's call is refused where the platform did not ask. */
+    /**
+     * An Unmute never opens the microphone of a locked phone, whoever sends it: from API 31 the
+     * platform asks for the unlock before it sends the notification's own Unmute, but an enabled
+     * notification listener can send the same pending intent while the phone is locked. The rule
+     * takes no platform release, so it holds on every one. The lock screen's own Unmute arrives
+     * after the unlock, so it passes.
+     */
     @Test
-    fun an_unmute_on_a_locked_phone_is_refused_where_the_platform_did_not_ask() {
-        assertTrue(VoiceNotificationControls.mutedAfter(unmute = true, muted = true, locked = true, sdk = platformWithout))
-        assertFalse(VoiceNotificationControls.mutedAfter(unmute = true, muted = true, locked = false, sdk = platformWithout))
-        assertFalse(VoiceNotificationControls.mutedAfter(unmute = true, muted = true, locked = true, sdk = platformWithPerActionUnlock))
+    fun an_unmute_on_a_locked_phone_is_refused_on_every_platform() {
+        assertTrue(VoiceNotificationControls.mutedAfter(unmute = true, muted = true, locked = true))
+        assertFalse(VoiceNotificationControls.mutedAfter(unmute = true, muted = true, locked = false))
     }
 }

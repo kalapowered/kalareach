@@ -210,14 +210,13 @@ class VoiceCallService : android.app.Service() {
                     // service's to change and the notification should not suggest it is.
                     stopCall()
                 } else {
-                    // A muted microphone is not reopened from a locked phone where the platform did
-                    // not ask for the unlock.
+                    // A muted microphone is not reopened on a locked phone, whoever sent the action:
+                    // the notification's own Unmute reaches here after the unlock.
                     val muted = held.isMutedByPerson
                     val after = VoiceNotificationControls.mutedAfter(
                         unmute = act == VoiceServiceActions.Act.UNMUTE,
                         muted = muted,
                         locked = locked,
-                        sdk = Build.VERSION.SDK_INT,
                     )
                     if (after != muted) held.setMutedByPerson(after)
                 }
