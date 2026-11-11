@@ -74,7 +74,7 @@ import { Buffer } from 'node:buffer'
 import { spawnSync } from 'node:child_process'
 import { closeSync, existsSync, openSync, readSync, readdirSync, statSync } from 'node:fs'
 import { basename, dirname, extname, join, relative, resolve } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { startedAs } from './entry-point.mjs'
 
 const ROOT = dirname(import.meta.dirname)
 
@@ -850,7 +850,7 @@ export function report(app, result) {
   return false
 }
 
-if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+if (startedAs(import.meta.url)) {
   const [path] = process.argv.slice(2)
   const app = path ?? builtBundle()
   let code = 2

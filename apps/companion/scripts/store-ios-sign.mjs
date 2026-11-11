@@ -18,7 +18,7 @@ import { spawnSync } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { startedAs } from './entry-point.mjs'
 
 import { plistValue } from './identifiers.mjs'
 import { entitlementsFor, nestedCode } from './sign-ios.mjs'
@@ -88,7 +88,7 @@ export function signArchive(app, team) {
   return wanted
 }
 
-if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+if (startedAs(import.meta.url)) {
   const [app, team, flag] = process.argv.slice(2)
   if (!app || !/^[A-Z0-9]{10}$/.test(team ?? '')) {
     console.error('usage: store-ios-sign.mjs <KalaReach.app> <team> [--print]')

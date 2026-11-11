@@ -37,7 +37,7 @@ import { Buffer } from 'node:buffer'
 import { spawnSync } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { dirname, join, relative } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { startedAs } from './entry-point.mjs'
 
 import {
   OUTPUTS,
@@ -726,7 +726,7 @@ export function report(paths, check) {
   return whole
 }
 
-if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+if (startedAs(import.meta.url)) {
   const [mode, ...paths] = process.argv.slice(2)
   let ok = false
   if (mode === '--ios') {

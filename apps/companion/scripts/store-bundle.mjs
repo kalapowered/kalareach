@@ -56,7 +56,7 @@ import { X509Certificate, createHash } from 'node:crypto'
 import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { startedAs } from './entry-point.mjs'
 
 import { withArchive } from './android-classes.mjs'
 import {
@@ -1294,6 +1294,6 @@ function command(argv, needles, out, err) {
   return 0
 }
 
-if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+if (startedAs(import.meta.url)) {
   process.exitCode = main(process.argv.slice(2))
 }

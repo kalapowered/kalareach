@@ -38,7 +38,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { startedAs } from './entry-point.mjs'
 
 import { declared, plistValue, problemsInBundle } from './identifiers.mjs'
 
@@ -376,7 +376,7 @@ function main(argv) {
   return 1
 }
 
-if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+if (startedAs(import.meta.url)) {
   try {
     process.exitCode = main(process.argv.slice(2))
   } catch (failure) {

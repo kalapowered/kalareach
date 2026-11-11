@@ -16,8 +16,7 @@
 // The directory is removed when this command ends, whether the build succeeded or not. A signal
 // that ends the command first leaves it for the system's own cleanup of the temporary directory.
 import { spawnSync } from 'node:child_process'
-import { realpathSync } from 'node:fs'
-import { pathToFileURL } from 'node:url'
+import { startedAs } from './entry-point.mjs'
 
 import { privateTemporary } from './private-temp.mjs'
 import { toolPath } from './tools.mjs'
@@ -53,7 +52,7 @@ export function refusal(argv) {
 
 // Run only as the command: the entry point is compared by its real path, which is the one Node
 // gives the module, so that a start through a symbolic link still runs.
-if (process.argv[1] && pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url) {
+if (startedAs(import.meta.url)) {
   const argv = process.argv.slice(2)
   const problem = refusal(argv)
   if (problem !== null) {
