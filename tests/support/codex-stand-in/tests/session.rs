@@ -571,8 +571,10 @@ async fn the_server_records_a_turn_with_a_prompt_in_the_agents_folder_only_under
     let question = "(mark) What is 612 plus 1034? Reply with only the number.";
     // The run's root: its temporary directory and its agent folder lie in it. What lies outside it
     // is a directory beside it.
-    let home = std::env::temp_dir().join(format!("kr-si-record-{}", std::process::id()));
-    let outside = std::env::temp_dir().join(format!("kr-si-outside-{}", std::process::id()));
+    // The root has the name and the mode only a run's root has, on a path that holds no link.
+    let temporary = std::fs::canonicalize(std::env::temp_dir()).expect("the temporary directory");
+    let home = temporary.join(format!("krm-{:08x}", std::process::id()));
+    let outside = temporary.join(format!("kr-si-outside-{}", std::process::id()));
     let sideways = home
         .join("agent/..")
         .join("..")
@@ -595,6 +597,8 @@ async fn the_server_records_a_turn_with_a_prompt_in_the_agents_folder_only_under
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&outside);
         std::fs::create_dir_all(home.join("tmp")).expect("a run");
+        std::fs::set_permissions(&home, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("the mode of a run's root");
         std::fs::create_dir_all(&outside).expect("a directory outside it");
         let mut command = Command::new(PROGRAM);
         command
