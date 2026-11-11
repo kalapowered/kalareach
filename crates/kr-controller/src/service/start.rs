@@ -1206,6 +1206,8 @@ impl Controller {
             #[cfg(feature = "testing")]
             before_a_connection_is_registered: ReadPause::default(),
             #[cfg(feature = "testing")]
+            before_a_connection_is_deregistered: ReadPause::default(),
+            #[cfg(feature = "testing")]
             before_the_lease: ReadPause::default(),
             #[cfg(feature = "testing")]
             after_an_acknowledgement: ReadPause::default(),

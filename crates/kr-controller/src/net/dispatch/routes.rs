@@ -16,6 +16,7 @@ use crate::error::Result;
 use crate::given::{Given, Origin};
 
 use super::super::Retained;
+use super::super::chunks::ChunkAdmission;
 use super::decision::{Answered, Asked, unserved_change_set_method};
 use super::forwarding::{OwnClaim, RouteRefusal};
 use super::writes::DeviceWrite;
@@ -180,17 +181,15 @@ impl DeviceRead {
 /// Why this host refuses a paired device a method the method table admits for one, by name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Unserved {
-    /// `upload.status`, `download.begin` and `download.chunk`. A transfer's chunks travel on an
-    /// attachment-chunk stream, a stream kind of its own with its own frame bound, and this host
-    /// opens no such stream on a network connection, so no transfer with a device can complete: a
-    /// download begun for one would stage a copy nothing can read.
+    /// `upload.status`, `download.begin` and `download.chunk`, which this host does not serve to a
+    /// paired device on its control stream: a download begun for one would stage a copy nothing can
+    /// read.
     Transfer,
-    /// `upload.chunk`. A chunk is as large as a control frame may be, and travels on an
-    /// attachment-chunk stream, which this host accepts none of on a network connection.
+    /// `upload.chunk` on the control stream. A chunk is as large as a control frame may not be, and
+    /// travels on an attachment-chunk stream.
     Chunk,
-    /// `upload.begin`, `upload.finish` and `upload.cancel`. A device's upload could not carry a
-    /// chunk, so none could finish, and a begin that no chunk can follow would only hold the
-    /// device's reservation until it expired.
+    /// `upload.begin`, `upload.finish` and `upload.cancel`, which this host does not serve to a
+    /// paired device yet.
     Upload,
     /// `terminal.palette.set`, which no part of this host performs for a paired device.
     Palette,
@@ -204,25 +203,15 @@ impl Unserved {
     pub(super) fn refusal(self, entry: &MethodEntry) -> ProtocolError {
         let name = entry.name;
         match self {
-            Self::Transfer => ProtocolError::new(
+            Self::Transfer | Self::Upload => ProtocolError::new(
                 ErrorCode::UnsupportedCapability,
-                format!(
-                    "{name} is not served to a paired device: a transfer's chunks travel on an \
-                     attachment-chunk stream, and this host opens none on a network connection"
-                ),
+                format!("{name} is not served to a paired device by this host yet"),
             ),
             Self::Chunk => ProtocolError::new(
                 ErrorCode::UnsupportedCapability,
                 format!(
-                    "{name} is not served to a paired device: a transfer's chunks travel on an \
-                     attachment-chunk stream, and this host accepts none on a network connection"
-                ),
-            ),
-            Self::Upload => ProtocolError::new(
-                ErrorCode::UnsupportedCapability,
-                format!(
-                    "{name} is not served to a paired device by this host yet: a device's upload \
-                     could not carry a chunk here, so none could finish"
+                    "{name} is not served on the control stream: a transfer's chunks travel on an \
+                     attachment-chunk stream"
                 ),
             ),
             Self::Palette => ProtocolError::new(
@@ -251,6 +240,16 @@ impl RemoteConnection {
         &self,
         received: kr_transport::listener::ReceivedFrame,
     ) -> Option<Answered> {
+        self.answer_via(received, None).await
+    }
+
+    /// As [`Self::answer`], for a frame that arrived on a data stream when `on_stream` carries the
+    /// stream's admission, and for one that arrived on the control stream when it does not.
+    pub(super) async fn answer_via(
+        &self,
+        received: kr_transport::listener::ReceivedFrame,
+        on_stream: Option<&Arc<ChunkAdmission>>,
+    ) -> Option<Answered> {
         let mut asked = None;
         let mut received = received;
         let hold = received.take_hold();
@@ -258,7 +257,7 @@ impl RemoteConnection {
         let frame = match frame {
             ControlFrame::Request(request) => self.read_decided(&request, &mut asked).await,
             ControlFrame::Mutation(mutation) => {
-                self.mutate_decided(&mutation, &mut asked, received_at, hold)
+                self.mutate_decided(&mutation, &mut asked, received_at, hold, on_stream)
                     .await
             }
             // A host does not call a client, and none of the daemon's own local frames belongs on
@@ -603,7 +602,7 @@ impl RemoteConnection {
     #[cfg(test)]
     pub(super) async fn mutate(&self, mutation: &MutationRequest) -> ControlFrame {
         let received_at = self.controller.clock.now();
-        self.mutate_decided(mutation, &mut None, received_at, None)
+        self.mutate_decided(mutation, &mut None, received_at, None, None)
             .await
     }
 
@@ -618,6 +617,7 @@ impl RemoteConnection {
         asked: &mut Option<Asked>,
         received_at: kr_transport::clock::ContinuousInstant,
         hold: Option<kr_transport::listener::FrameHold>,
+        on_stream: Option<&Arc<ChunkAdmission>>,
     ) -> ControlFrame {
         // Entered among the calls that have not claimed the route of their action from the moment
         // the transport read it, until it claims it or ends, so a refusal of a copy of it that
@@ -626,7 +626,7 @@ impl RemoteConnection {
             .arrival_of(mutation, hold)
             .map_or_else(OwnClaim::none, OwnClaim::arrived);
         match self
-            .serve_mutation(mutation, asked, received_at, &own_claim)
+            .serve_mutation(mutation, asked, received_at, &own_claim, on_stream)
             .await
         {
             Ok(answer) => answer,
@@ -650,6 +650,7 @@ impl RemoteConnection {
         asked: &mut Option<Asked>,
         received_at: kr_transport::clock::ContinuousInstant,
         own_claim: &OwnClaim,
+        on_stream: Option<&Arc<ChunkAdmission>>,
     ) -> std::result::Result<ControlFrame, ProtocolError> {
         // Section 9 measures a requested lifetime from *receipt* time, which is when the listener
         // read the frame ([`kr_transport::listener::ReceivedFrame`]), before anything that can
@@ -707,6 +708,20 @@ impl RemoteConnection {
         if let DeviceWrite::Refused(unserved) = route {
             return Err(unserved.refusal(entry));
         }
+        // A chunk is served on an attachment-chunk stream and on no other, and a stream serves
+        // chunks and nothing else: the stream's policy has held the frame to that already, and this
+        // holds the door to it however the door is reached.
+        match (route, on_stream.is_some()) {
+            (DeviceWrite::Chunk, false) => return Err(Unserved::Chunk.refusal(entry)),
+            (DeviceWrite::Chunk, true) => {}
+            (_, true) => {
+                return Err(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    crate::transfer::WRONG_ENDPOINT,
+                ));
+            }
+            (_, false) => {}
+        }
         // Every store that retains an action is asked in turn, in the order the local ingress asks
         // them: the daemon's own reservations first, then the project service's own record. A
         // project mutation's receipt lives with the project service, so a retry of one that lost
@@ -730,7 +745,7 @@ impl RemoteConnection {
         }
         // A draft write's record is the transfer service's own, written in the transaction that
         // performed it, so a device that lost its reply is answered from it.
-        if held.is_none() && route == DeviceWrite::Transfer {
+        if held.is_none() && matches!(route, DeviceWrite::Transfer | DeviceWrite::Chunk) {
             held = self
                 .controller
                 .transfer
@@ -1769,8 +1784,9 @@ impl RemoteConnection {
                         .map(|answer| framed(mutation.request_id, answer)),
                 )
             }
-            // A draft write is the transfer service's, performed under this device's own principal.
-            DeviceWrite::Transfer => self
+            // A draft write or a chunk is the transfer service's, performed under this device's own
+            // principal.
+            DeviceWrite::Transfer | DeviceWrite::Chunk => self
                 .transfer_write(
                     mutation,
                     entry.method,
@@ -1778,6 +1794,7 @@ impl RemoteConnection {
                     validated,
                     &accepted,
                     own_claim,
+                    on_stream,
                 )
                 .await
                 .map(|given| noting(&mut origin, given))?,

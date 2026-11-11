@@ -120,6 +120,10 @@ pub struct TransferModule {
     /// is what refuses it. Compiled only with the `testing` feature.
     #[cfg(feature = "testing")]
     after_the_outer_check: Arc<crate::attention::Pause>,
+    /// Where this host's own tests hold the lookup that admits a data stream, on its blocking
+    /// thread. Compiled only with the `testing` feature.
+    #[cfg(feature = "testing")]
+    inside_the_stream_lookup: Arc<LookupHold>,
     /// The point a repeat that arrived with no usable window stops at once the claim of its action
     /// has been asked about, before it looks for the record. Compiled only with the `testing`
     /// feature.
@@ -162,6 +166,10 @@ pub struct TransferAdmission {
     /// Whether the service asked this admission where it begins an effect, which it does only once
     /// it has found no record of the action.
     reached: AtomicBool,
+    /// The attachment-chunk stream the mutation arrived on, when it arrived on one. The stream's
+    /// revoked state is part of what the service asks where an effect begins: the loss of the
+    /// control stream, once declared, ends every chunk that has not begun its effect.
+    stream: Option<Arc<crate::service::net::chunks::ChunkAdmission>>,
 }
 
 impl TransferAdmission {
@@ -175,7 +183,35 @@ impl TransferAdmission {
             settling: false,
             refusal: std::sync::Mutex::new(None),
             reached: AtomicBool::new(false),
+            stream: None,
         })
+    }
+
+    /// The admission of a chunk that arrived on `stream`.
+    ///
+    /// The service asks it where the chunk begins an effect, and it refuses first when the stream
+    /// has been taken away: lost with its connection, or replaced by a newer stream of the same
+    /// transfer. The refusal is the admission's own and is not retained, so the same chunk sent on
+    /// the replacement stream is a first admission.
+    pub(crate) fn on_a_stream(
+        controller: Arc<Controller>,
+        carried: crate::authority::AdmittedMutation,
+        stream: Arc<crate::service::net::chunks::ChunkAdmission>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            controller,
+            carried,
+            settling: false,
+            refusal: std::sync::Mutex::new(None),
+            reached: AtomicBool::new(false),
+            stream: Some(stream),
+        })
+    }
+
+    /// The gate of the chunk's transfer, for the blocking call that takes the chunk into the
+    /// service to hold until it ends.
+    fn take_gate(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.stream.as_ref().and_then(|stream| stream.take_gate())
     }
 
     /// The admission of an exact repeat that carries no freshness.
@@ -198,6 +234,7 @@ impl TransferAdmission {
             settling: true,
             refusal: std::sync::Mutex::new(None),
             reached: AtomicBool::new(false),
+            stream: None,
         })
     }
 
@@ -212,6 +249,11 @@ impl TransferAdmission {
 
     /// Asks the check, and keeps its refusal.
     fn check(&self) -> std::result::Result<(), ProtocolError> {
+        if self.stream.as_ref().is_some_and(|stream| !stream.stands()) {
+            return Err(self.refused(&ControllerError::PermissionDenied {
+                detail: "the stream this chunk arrived on has been taken away".to_owned(),
+            }));
+        }
         self.controller
             .check_registration(&self.carried)
             .map_err(|error| self.refused(&error))
@@ -227,6 +269,9 @@ impl TransferAdmission {
     }
 
     fn refused(&self, error: &ControllerError) -> ProtocolError {
+        if let Some(stream) = &self.stream {
+            stream.note_refusal();
+        }
         let refusal = error.to_protocol_error();
         self.refusal
             .lock()
@@ -267,6 +312,79 @@ impl kr_transfer::service::AdmissionHook for TransferAdmission {
         self.controller
             .under_registration(&self.carried, commit)
             .map_err(|error| self.refused(&error))
+    }
+}
+
+/// Holds the lookups that admit data streams, on their blocking threads, while a suite looks at what
+/// the host does meanwhile.
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+struct LookupHold {
+    state: std::sync::Mutex<Option<Arc<LookupHeld>>>,
+}
+
+#[cfg(feature = "testing")]
+#[derive(Debug)]
+struct LookupHeld {
+    arrived: std::sync::mpsc::Sender<()>,
+    released: std::sync::Mutex<bool>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(feature = "testing")]
+impl LookupHold {
+    fn arm(&self) -> (std::sync::mpsc::Receiver<()>, LookupRelease) {
+        let (arrived, arrival) = std::sync::mpsc::channel();
+        let held = Arc::new(LookupHeld {
+            arrived,
+            released: std::sync::Mutex::new(false),
+            changed: std::sync::Condvar::new(),
+        });
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&held));
+        (arrival, LookupRelease(held))
+    }
+
+    /// Says a lookup has arrived and waits here until the hold is released.
+    fn wait(&self) {
+        let held = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(held) = held else { return };
+        let _ = held.arrived.send(());
+        let mut released = held
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*released {
+            released = held
+                .changed
+                .wait(released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+/// The end of [`TransferModule::hold_the_stream_lookups`] that lets the held lookups go, and every
+/// lookup after them.
+#[cfg(feature = "testing")]
+#[derive(Debug)]
+pub struct LookupRelease(Arc<LookupHeld>);
+
+#[cfg(feature = "testing")]
+impl LookupRelease {
+    /// Lets the lookups go.
+    pub fn release(self) {
+        *self
+            .0
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.0.changed.notify_all();
     }
 }
 
@@ -406,6 +524,8 @@ impl TransferModule {
             #[cfg(feature = "testing")]
             after_the_outer_check: Arc::new(crate::attention::Pause::default()),
             #[cfg(feature = "testing")]
+            inside_the_stream_lookup: Arc::new(LookupHold::default()),
+            #[cfg(feature = "testing")]
             after_the_claim_is_asked_about: Arc::new(crate::attention::Pause::default()),
             #[cfg(feature = "testing")]
             after_a_read: Arc::new(crate::attention::Pause::default()),
@@ -429,6 +549,42 @@ impl TransferModule {
         std::sync::mpsc::SyncSender<()>,
     ) {
         self.after_the_outer_check.arm()
+    }
+
+    /// Holds every lookup that admits a data stream, on its blocking thread, until the returned end
+    /// releases them. Returns the end that hears each lookup arrive, one message for each, and the
+    /// release. Compiled only with the `testing` feature.
+    #[cfg(feature = "testing")]
+    pub fn hold_the_stream_lookups(&self) -> (std::sync::mpsc::Receiver<()>, LookupRelease) {
+        self.inside_the_stream_lookup.arm()
+    }
+
+    /// Looks up `actor`'s upload for a data stream's header: where it belongs, when it is receiving
+    /// and has not expired.
+    ///
+    /// The lookup waits for the store, which a deadline cannot cancel, so it runs on a blocking task
+    /// that owns `place`, the lookup place of the device's principal: the place is given back when
+    /// the lookup ends, however long ago the stream that asked was given up.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal every unknown identifier is given.
+    pub(crate) async fn receiving_upload(
+        &self,
+        actor: ActorId,
+        transfer_id: kr_protocol::ids::TransferId,
+        place: tokio::sync::OwnedSemaphorePermit,
+    ) -> Answer<kr_transfer::service::StoredSubject> {
+        let service = Arc::clone(&self.service);
+        #[cfg(feature = "testing")]
+        let hold = Arc::clone(&self.inside_the_stream_lookup);
+        blocking(move || {
+            let _place = place;
+            #[cfg(feature = "testing")]
+            hold.wait();
+            Ok(service.receiving_upload(&actor, transfer_id)?)
+        })
+        .await
     }
 
     /// Arms the pause a repeat that arrived with no usable window stops at once the claim of its
@@ -1051,6 +1207,9 @@ impl TransferModule {
         #[cfg(feature = "testing")]
         let after_the_outer_check = Arc::clone(&self.after_the_outer_check);
         let answer = blocking(move || {
+            // The transfer's gate is held by this call until it ends, and not by the stream's task,
+            // which is aborted when its connection ends while this call goes on.
+            let _gate = admission.take_gate();
             // A look at the record that cannot read it says a record exists, so what it answers is
             // a copy whichever way it is told.
             let looked_at = || {

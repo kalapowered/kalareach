@@ -644,6 +644,11 @@ pub struct Controller {
     /// shipped build.
     #[cfg(feature = "testing")]
     before_a_connection_is_registered: ReadPause,
+    /// Where this host's own tests hold the withdrawal of a connection whose control stream was
+    /// lost, so that the loss is declared while its registration still stands. Compiled away in
+    /// every shipped build.
+    #[cfg(feature = "testing")]
+    before_a_connection_is_deregistered: ReadPause,
     /// Where this host's own tests stop a read whose worker has stopped answering, once it has
     /// asked the kernel and before it looks at what this daemon holds of the session. Compiled
     /// away in every shipped build.

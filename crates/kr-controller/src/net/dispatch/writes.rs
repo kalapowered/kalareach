@@ -9,6 +9,7 @@ use kr_protocol::error::ProtocolError;
 use kr_protocol::ids::{ActorId, AuthorityRevision};
 use kr_protocol::method::Method;
 
+use super::super::chunks::ChunkAdmission;
 use super::forwarding::OwnClaim;
 use super::routes::Unserved;
 use super::{RemoteConnection, failure, outcome_unknown};
@@ -63,6 +64,9 @@ pub(super) enum DeviceWrite {
     Pairing,
     /// The draft writes, performed by the transfer service under the device's own principal.
     Transfer,
+    /// `upload.chunk`, performed by the transfer service under the device's own principal. It is
+    /// served on an attachment-chunk stream and refused by name on the control stream.
+    Chunk,
     /// Forwarded to the worker that owns the session, which serves the method.
     Worker,
     /// Refused by name, for the reason [`Unserved::refusal`] gives.
@@ -102,7 +106,7 @@ impl DeviceWrite {
             Method::UploadBegin | Method::UploadFinish | Method::UploadCancel => {
                 Self::Refused(Unserved::Upload)
             }
-            Method::UploadChunk => Self::Refused(Unserved::Chunk),
+            Method::UploadChunk => Self::Chunk,
             Method::TerminalPaletteSet => Self::Refused(Unserved::Palette),
             Method::InputWrite => Self::Refused(Unserved::RawInput),
             _ if crate::project::ProjectModule::serves(method) => Self::Project,
@@ -119,7 +123,8 @@ impl DeviceWrite {
 }
 
 impl RemoteConnection {
-    /// Performs one draft write under this device's own principal, in the transfer service.
+    /// Performs one draft write, or one chunk that arrived on `on_stream`, under this device's own
+    /// principal, in the transfer service.
     ///
     /// The service scopes every draft by the principal that made it, so nothing the request names
     /// reaches the owner's drafts or another device's. The stored subject is read first, because
@@ -139,6 +144,7 @@ impl RemoteConnection {
         validated: AuthorityRevision,
         accepted: &kr_transport::window::AcceptedDeadline,
         own_claim: &OwnClaim,
+        on_stream: Option<&Arc<ChunkAdmission>>,
     ) -> std::result::Result<Given<ControlFrame>, ProtocolError> {
         self.controller
             .transfer
@@ -155,6 +161,7 @@ impl RemoteConnection {
         let controller = Arc::clone(&self.controller);
         let mutation = mutation.clone();
         let request_id = mutation.request_id;
+        let on_stream = on_stream.map(Arc::clone);
         let effect = tokio::spawn(async move {
             if method == Method::DraftCreate {
                 controller
@@ -166,8 +173,14 @@ impl RemoteConnection {
                     )
                     .await;
             }
-            let admission =
-                crate::transfer::TransferAdmission::new(Arc::clone(&controller), carried);
+            let admission = match on_stream {
+                Some(stream) => crate::transfer::TransferAdmission::on_a_stream(
+                    Arc::clone(&controller),
+                    carried,
+                    stream,
+                ),
+                None => crate::transfer::TransferAdmission::new(Arc::clone(&controller), carried),
+            };
             controller
                 .transfer
                 .write_frame(

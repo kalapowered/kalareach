@@ -68,6 +68,7 @@ mod opening;
 mod output;
 mod overtaking;
 mod routes;
+mod streams;
 mod writes;
 
 pub use acting::GRANT_WATCH;

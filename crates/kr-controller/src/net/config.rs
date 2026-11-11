@@ -41,6 +41,10 @@ pub struct NetworkSettings {
     /// half its validity, so a suite that needs a connection to be renewed gives a short one. No
     /// document key reaches it.
     pub action_window_validity: Option<std::time::Duration>,
+    /// The deadlines a data stream is held to, when a suite supplies its own: the header, the
+    /// lookup that admits it, the wait for a frame, the stall inside one and the write of an answer.
+    /// A host that is given none runs on timers. No document key reaches it.
+    pub data_stream_deadlines: Option<std::sync::Arc<dyn kr_transport::deadlines::Deadlines>>,
 }
 
 impl NetworkSettings {
