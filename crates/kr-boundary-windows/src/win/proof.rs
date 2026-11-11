@@ -27,6 +27,7 @@ use crate::frame::Class;
 use crate::manifest::{GitSet, Manifest, ObjectKind};
 use crate::policy::{RULE_CHECKOUT, RULE_CONNECT};
 use crate::quote::quote_command_line;
+use crate::window::search_is_over;
 
 use super::applocker;
 use super::ffi::{self, Sid};
@@ -482,12 +483,13 @@ pub fn prove(
     let search_until = deadline.checked_sub(DIAGNOSTIC_RESERVE).unwrap_or(deadline);
     let mut attempts = 0_u32;
     let mut refused = false;
+    let mut over = false;
     let mut last = String::from("no launch was made");
     loop {
         if stop.is_set() {
             return fail("the service is stopping");
         }
-        if Instant::now() >= search_until {
+        if over || Instant::now() >= search_until {
             // The log's last words come from the time kept for them, and the query stays within the
             // deadline like everything else.
             let log = applocker::latest(&scratch.0, &environment, deadline)
@@ -521,6 +523,19 @@ pub fn prove(
         if matches!(launched, Err(LaunchError::DeadlinePassed)) {
             continue;
         }
+        // A program that began in the last moments of the search's window was cut by the window's
+        // own end, and ran for no bound of its own: the search is over, not the proof.
+        if matches!(
+            launched,
+            Ok(Captured {
+                outcome: Outcome::TimedOut,
+                ..
+            })
+        ) && search_is_over(true, Instant::now(), search_until, END_RESERVE)
+        {
+            over = true;
+            continue;
+        }
         match judge_launch(launched, refused, &account, attempts) {
             Ok(Seen::Refused) => {
                 refused = true;
@@ -544,9 +559,23 @@ pub fn prove(
                         break;
                     }
                 }
-                Err(_) if Instant::now() >= search_until => {}
+                // A query that began in the last moments of the window was cut by the window's own
+                // end; any other failure of the query is a failure of the proof until the end.
+                Err(error)
+                    if search_is_over(
+                        matches!(error, applocker::Error::TimedOut { .. }),
+                        Instant::now(),
+                        search_until,
+                        END_RESERVE,
+                    ) =>
+                {
+                    over = true;
+                }
                 Err(error) => return fail(error.to_string()),
             }
+        }
+        if over {
+            continue;
         }
         std::thread::sleep(
             LAUNCH_EVERY.min(search_until.saturating_duration_since(Instant::now())),
