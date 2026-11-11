@@ -103,16 +103,95 @@ pub struct Connection {
     stop: Arc<Stop>,
     /// The time after which no transfer on this connection waits, or none.
     deadline: Option<Instant>,
+    /// Set when a transfer that was cancelled did not end: the connection takes no more.
+    stuck: bool,
 }
 
+/// How long a cancelled transfer is waited for. The cancel ends a transfer at once where the pipe's
+/// driver answers it, so this is the one floor beyond a caller's deadline, and a transfer that has
+/// not ended by then is left to end by itself.
+const CANCEL_GRACE_MS: u32 = 100;
+
+/// Seams for the test build: a call the platform would answer is made not to be, so that a case
+/// shows what the connection does then.
+#[cfg(feature = "testing")]
+pub mod testing {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static SKIP_NEXT_CANCEL: AtomicBool = AtomicBool::new(false);
+
+    /// Makes the next cancel of a timed-out transfer not be made, as if the platform had not
+    /// ended the transfer: the connection must give the call back within the deadline and the
+    /// grace, and take no more transfers.
+    pub fn skip_next_cancel() {
+        SKIP_NEXT_CANCEL.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn take_skip() -> bool {
+        SKIP_NEXT_CANCEL.swap(false, Ordering::SeqCst)
+    }
+}
+
+/// One transfer, in storage that the process keeps until the transfer ends: the platform writes the
+/// record, and for a read the buffer, when the transfer completes, and that can be after a
+/// cancelled wait returns, so neither lives on a stack that is gone by then.
+struct Transfer {
+    overlapped: Box<OVERLAPPED>,
+    event: Handle,
+    buffer: Vec<u8>,
+}
+
+impl Transfer {
+    fn new(buffer: Vec<u8>) -> io::Result<Transfer> {
+        // SAFETY: an event with no name; a fresh one for each transfer keeps transfers apart.
+        let event = Handle::new(
+            unsafe { CreateEventW(null(), 1, 0, null()) },
+            "making an event",
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+        // SAFETY: a zeroed record is a valid start; the event is set below.
+        let mut overlapped: Box<OVERLAPPED> = Box::new(unsafe { std::mem::zeroed() });
+        overlapped.hEvent = event.raw();
+        Ok(Transfer {
+            overlapped,
+            event,
+            buffer,
+        })
+    }
+
+    fn record(&mut self) -> *mut OVERLAPPED {
+        &raw mut *self.overlapped
+    }
+}
+
+/// Cancels a transfer and waits for it, for at most [`CANCEL_GRACE_MS`]. Returns whether it ended.
+fn cancel(pipe: HANDLE, transfer: &mut Transfer) -> bool {
+    #[cfg(feature = "testing")]
+    let skipped = testing::take_skip();
+    #[cfg(not(feature = "testing"))]
+    let skipped = false;
+    if !skipped {
+        // SAFETY: the transfer belongs to this connection; the record lives in `transfer`.
+        unsafe {
+            CancelIoEx(pipe, transfer.record());
+        }
+    }
+    // SAFETY: the event handle is open.
+    unsafe { WaitForSingleObject(transfer.event.raw(), CANCEL_GRACE_MS) == WAIT_OBJECT_0 }
+}
+
+/// Waits for a transfer, up to the deadline and until the stop event is set. When it does not
+/// finish in time it is cancelled and waited for for at most [`CANCEL_GRACE_MS`]; a transfer that
+/// still has not ended is left to end by itself, its record and buffer kept for the life of the
+/// process, and `stuck` is set so that the caller takes no more transfers on that pipe.
 fn wait(
     pipe: HANDLE,
-    overlapped: &mut OVERLAPPED,
-    event: &Handle,
+    mut transfer: Transfer,
     stop: &Stop,
     deadline: Option<Instant>,
-) -> io::Result<u32> {
-    let handles = [event.raw(), stop.0.raw()];
+    stuck: &mut bool,
+) -> io::Result<(u32, Transfer)> {
+    let handles = [transfer.event.raw(), stop.0.raw()];
     let milliseconds = deadline.map_or(INFINITE, |deadline| {
         let left = deadline.saturating_duration_since(Instant::now());
         // One less than the longest wait, which means "forever".
@@ -121,11 +200,9 @@ fn wait(
     // SAFETY: both handles are open for the length of the wait.
     let signalled = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, milliseconds) };
     if signalled != WAIT_OBJECT_0 {
-        // SAFETY: the transfer belongs to this connection and is cancelled and waited for.
-        unsafe {
-            CancelIoEx(pipe, overlapped);
-            let mut ignored = 0_u32;
-            GetOverlappedResult(pipe, overlapped, &raw mut ignored, 1);
+        if !cancel(pipe, &mut transfer) {
+            *stuck = true;
+            std::mem::forget(transfer);
         }
         return Err(if signalled == WAIT_TIMEOUT {
             io::Error::new(
@@ -138,40 +215,39 @@ fn wait(
     }
     let mut transferred = 0_u32;
     // SAFETY: the transfer has completed, so the result can be read without waiting.
-    if unsafe { GetOverlappedResult(pipe, overlapped, &raw mut transferred, 0) } == 0 {
+    if unsafe { GetOverlappedResult(pipe, transfer.record(), &raw mut transferred, 0) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(transferred)
+    Ok((transferred, transfer))
 }
 
-fn overlapped_with(event: &Handle) -> OVERLAPPED {
-    // SAFETY: a zeroed record is a valid start; the event is set below.
-    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
-    overlapped.hEvent = event.raw();
-    overlapped
+fn stuck_error() -> io::Error {
+    io::Error::other("a transfer on this connection did not end when it was cancelled")
 }
+
+/// The most bytes one transfer asks for: a read or a write of more is short, as the traits allow.
+const MAX_TRANSFER: usize = 64 * 1024;
 
 impl Read for Connection {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if buffer.is_empty() {
             return Ok(0);
         }
-        // SAFETY: an event with no name; a fresh one for each transfer keeps transfers apart.
-        let event = Handle::new(
-            unsafe { CreateEventW(null(), 1, 0, null()) },
-            "making an event",
-        )
-        .map_err(|error| io::Error::other(error.to_string()))?;
-        let mut overlapped = overlapped_with(&event);
-        let length = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
-        // SAFETY: the buffer and the record outlive the transfer, which `wait` completes or cancels.
+        if self.stuck {
+            return Err(stuck_error());
+        }
+        let length = buffer.len().min(MAX_TRANSFER);
+        let mut transfer = Transfer::new(vec![0; length])?;
+        // SAFETY: the buffer and the record live in `transfer`, which `wait` completes, or cancels
+        // and drops, or keeps for the life of the process when the cancel does not end the
+        // transfer.
         let started = unsafe {
             ReadFile(
                 self.pipe.raw(),
-                buffer.as_mut_ptr(),
-                length,
+                transfer.buffer.as_mut_ptr(),
+                length as u32,
                 null_mut(),
-                &raw mut overlapped,
+                transfer.record(),
             )
         };
         if started == 0 {
@@ -187,12 +263,16 @@ impl Read for Connection {
         }
         match wait(
             self.pipe.raw(),
-            &mut overlapped,
-            &event,
+            transfer,
             &self.stop,
             self.deadline,
+            &mut self.stuck,
         ) {
-            Ok(count) => Ok(count as usize),
+            Ok((count, transfer)) => {
+                let count = count as usize;
+                buffer[..count].copy_from_slice(&transfer.buffer[..count]);
+                Ok(count)
+            }
             Err(failure) if failure.raw_os_error() == Some(109) => Ok(0),
             Err(failure) => Err(failure),
         }
@@ -204,22 +284,19 @@ impl Write for Connection {
         if buffer.is_empty() {
             return Ok(0);
         }
-        // SAFETY: an event with no name; a fresh one for each transfer keeps transfers apart.
-        let event = Handle::new(
-            unsafe { CreateEventW(null(), 1, 0, null()) },
-            "making an event",
-        )
-        .map_err(|error| io::Error::other(error.to_string()))?;
-        let mut overlapped = overlapped_with(&event);
-        let length = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
-        // SAFETY: the buffer and the record outlive the transfer, which `wait` completes or cancels.
+        if self.stuck {
+            return Err(stuck_error());
+        }
+        let length = buffer.len().min(MAX_TRANSFER);
+        let mut transfer = Transfer::new(buffer[..length].to_vec())?;
+        // SAFETY: as for a read: the buffer and the record live in `transfer`.
         let started = unsafe {
             WriteFile(
                 self.pipe.raw(),
-                buffer.as_ptr(),
-                length,
+                transfer.buffer.as_ptr(),
+                length as u32,
                 null_mut(),
-                &raw mut overlapped,
+                transfer.record(),
             )
         };
         if started == 0 {
@@ -230,12 +307,12 @@ impl Write for Connection {
         }
         wait(
             self.pipe.raw(),
-            &mut overlapped,
-            &event,
+            transfer,
             &self.stop,
             self.deadline,
+            &mut self.stuck,
         )
-        .map(|count| count as usize)
+        .map(|(count, _)| count as usize)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -415,19 +492,21 @@ impl Listener {
             Some(pipe) => pipe,
             None => self.instance(false)?,
         };
-        // SAFETY: an event with no name.
-        let event = Handle::new(
-            unsafe { CreateEventW(null(), 1, 0, null()) },
-            "making an event",
-        )?;
-        let mut overlapped = overlapped_with(&event);
-        // SAFETY: the pipe is open and the record outlives the wait.
-        let connected = unsafe { ConnectNamedPipe(pipe.raw(), &raw mut overlapped) };
+        let mut transfer = Transfer::new(Vec::new()).map_err(|failure| {
+            error(
+                failure.raw_os_error().unwrap_or(0) as u32,
+                "making an event",
+            )
+        })?;
+        // SAFETY: the pipe is open and the record lives in `transfer`, which `wait` completes, or
+        // cancels, or keeps when the cancel does not end it.
+        let connected = unsafe { ConnectNamedPipe(pipe.raw(), transfer.record()) };
         if connected == 0 {
             // SAFETY: reads the calling thread's last error.
             let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
             if code == ERROR_IO_PENDING {
-                match wait(pipe.raw(), &mut overlapped, &event, &self.stop, None) {
+                let mut stuck = false;
+                match wait(pipe.raw(), transfer, &self.stop, None, &mut stuck) {
                     Ok(_) => {}
                     Err(failure) if failure.kind() == io::ErrorKind::Interrupted => {
                         return Ok(None);
@@ -447,6 +526,7 @@ impl Listener {
             pipe,
             stop: Arc::clone(&self.stop),
             deadline: None,
+            stuck: false,
         }))
     }
 }
@@ -491,5 +571,6 @@ pub fn connect(expected_server: u32) -> Result<Connection> {
         pipe,
         stop: Stop::new()?,
         deadline: None,
+        stuck: false,
     })
 }

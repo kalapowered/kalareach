@@ -430,6 +430,44 @@ fn installation_lays_down_and_removal_restores() {
     assert!(!late.ready, "{}", late.detail);
     assert!(late.detail.contains("deadline"), "{}", late.detail);
 
+    // A search that ends at its own deadline still reads the log's last words, from the time kept
+    // for them, and ends inside the proof's deadline: the manifest names the wrong identifier for
+    // the account, so no event of the log ever matches and the search has to give up.
+    let mut wrong = Manifest::load(&paths.manifest).unwrap();
+    wrong
+        .objects
+        .iter_mut()
+        .find(|object| object.kind == ObjectKind::Account && object.id == CHECKOUT)
+        .expect("the checkout account is recorded")
+        .detail = Some("S-1-5-21-1-2-3-1999".to_owned());
+    let bound = std::time::Duration::from_secs(30);
+    let began = std::time::Instant::now();
+    let gave_up = kr_boundary_windows::win::proof::prove(
+        &wrong,
+        Class::Checkout,
+        &paths.staging,
+        began + bound,
+        &stop,
+    );
+    let took = began.elapsed();
+    assert!(!gave_up.ready, "{}", gave_up.detail);
+    assert!(
+        gave_up
+            .detail
+            .contains("the application-control log last said"),
+        "the log's last words are read from the reserved time: {}",
+        gave_up.detail
+    );
+    assert!(
+        gave_up.detail.contains("launches in"),
+        "the search made its launches: {}",
+        gave_up.detail
+    );
+    assert!(
+        took <= bound,
+        "the proof ended inside its deadline: {took:?}"
+    );
+
     let (code, output) = setup(&["remove"], "yes\n", &[]);
     assert_eq!(code, 0, "the removal succeeds: {output}");
     assert_eq!(
@@ -1302,6 +1340,51 @@ fn an_answer_that_does_not_come_by_the_deadline_is_not_waited_for() {
         elapsed >= bound && elapsed < bound + std::time::Duration::from_secs(5),
         "the wait ended at the deadline: {elapsed:?}"
     );
+}
+
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_cancelled_receive_that_does_not_end_gives_the_call_back_at_the_deadline_and_the_connection_takes_no_more()
+ {
+    use kr_boundary_windows::win::pipe::{self, Listener, Stop, testing};
+    let stop = Stop::new().unwrap();
+    let system = Sid::parse("S-1-5-18").unwrap();
+    let mut listener = Listener::bind(&[system], std::sync::Arc::clone(&stop)).unwrap();
+    // A broker that accepts and never answers, and keeps the connection until told to stop.
+    let server = std::thread::spawn({
+        let stop = std::sync::Arc::clone(&stop);
+        move || {
+            let held = listener.accept();
+            while !stop.is_set() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            drop(held);
+        }
+    });
+    let mut connection = pipe::connect(std::process::id()).unwrap();
+    let bound = std::time::Duration::from_secs(1);
+    let begun = std::time::Instant::now();
+    connection.set_deadline(Some(begun + bound));
+    // The platform does not end the transfer that was cancelled: the wait for it is bounded by the
+    // deadline and a short grace, not by the transfer.
+    testing::skip_next_cancel();
+    let refused = install::ask(&mut connection, &Request::Status {});
+    let elapsed = begun.elapsed();
+    let text = refused.expect_err("nothing answered").to_string();
+    assert!(text.contains("deadline"), "{text}");
+    assert!(
+        elapsed >= bound && elapsed < bound + std::time::Duration::from_secs(2),
+        "the call came back at the deadline and the grace: {elapsed:?}"
+    );
+    // The transfer is still pending, so nothing more is taken on that connection.
+    let again = install::ask(&mut connection, &Request::Status {})
+        .expect_err("the connection takes no more")
+        .to_string();
+    assert!(again.contains("did not end"), "{again}");
+    drop(connection);
+    stop.set();
+    server.join().unwrap();
 }
 
 #[test]

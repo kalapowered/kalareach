@@ -209,6 +209,7 @@ impl Fixture {
             stderr,
             process_descriptor: descriptor,
             thread_descriptor: descriptor,
+            deadline: None,
         }
     }
 
@@ -592,7 +593,7 @@ fn a_child_is_in_its_job_and_has_run_nothing_until_it_is_resumed() {
         "the child itself reports it is in a job"
     );
     assert_eq!(value_of(&text, "pid"), child.pid.to_string());
-    let ended = job.end(&[&child], Duration::from_secs(10));
+    let ended = job.end(&[&child], Instant::now() + Duration::from_secs(10));
     assert!(ended.all_exited && ended.active_zero);
     assert_eq!(job.state(), State::Ended);
 }
@@ -748,7 +749,7 @@ fn the_process_and_thread_name_the_group_and_the_system_and_the_group_cannot_cha
             "process {process} names the invocation's group"
         );
     }
-    let ended = job.end(&[&child], Duration::from_secs(10));
+    let ended = job.end(&[&child], Instant::now() + Duration::from_secs(10));
     assert!(ended.all_exited && ended.active_zero);
 }
 
@@ -788,7 +789,7 @@ fn the_job_holds_the_whole_tree_with_the_limits_asked_for_and_ends_every_process
         .collect();
     println!("the job holds: {}", names.join(", "));
     assert_eq!(job.active_processes().unwrap() as usize, listed.len());
-    let ended = job.end(&[&child], Duration::from_secs(10));
+    let ended = job.end(&[&child], Instant::now() + Duration::from_secs(10));
     assert!(
         ended.all_exited,
         "every retained process object is signalled"
@@ -839,7 +840,7 @@ fn a_child_that_asks_to_break_away_from_the_job_is_refused_or_stays_in() {
             "a grandchild that was started with the flag is still in a job: {text}"
         );
     }
-    job.end(&[&child], Duration::from_secs(10));
+    job.end(&[&child], Instant::now() + Duration::from_secs(10));
 }
 
 #[test]
@@ -985,7 +986,7 @@ fn a_permit_is_compared_on_the_invocation_the_process_number_and_the_creation_ti
     let running = child.resume(permit).expect("the right permit resumes");
     assert!(running.wait(Duration::from_secs(30)).unwrap().is_some());
     drop(output);
-    job.end(&[&running], Duration::from_secs(10));
+    job.end(&[&running], Instant::now() + Duration::from_secs(10));
 }
 
 #[test]
@@ -1030,7 +1031,7 @@ fn the_journal_makes_no_permit_and_writes_nothing_for_a_child_of_another_invocat
         .expect("the child's own journal makes its permit");
     assert_eq!(permit.invocation(), Some(INVOCATION));
     let running = child.resume(permit).expect("the permit resumes it");
-    job.end(&[&running], Duration::from_secs(10));
+    job.end(&[&running], Instant::now() + Duration::from_secs(10));
 }
 
 #[test]
@@ -1061,9 +1062,55 @@ fn a_suspended_child_that_was_not_seen_to_end_is_reported_to_the_jobs_owner() {
     assert!(reasons[0].contains("not seen to end"), "{reasons:?}");
     // Ending the job observes the job empty: that proves the end, and the report stays.
     let mut job = job;
-    let ended = job.end(&[], Duration::from_secs(10));
+    let ended = job.end(&[], Instant::now() + Duration::from_secs(10));
     assert!(ended.proved(), "{ended:?}");
     assert_eq!(job.unproved_reasons().len(), 1);
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_suspended_child_that_is_dropped_is_waited_for_only_to_the_callers_deadline() {
+    let fixture = Fixture::new();
+    for (left, shortest, longest) in [
+        (
+            Duration::from_secs(1),
+            Duration::from_millis(800),
+            Duration::from_millis(2_500),
+        ),
+        // A deadline that has passed still gets the floor, and no more.
+        (
+            Duration::ZERO,
+            Duration::from_millis(80),
+            Duration::from_millis(1_500),
+        ),
+    ] {
+        let job = Job::new(Limits::INVOCATION).unwrap();
+        let (read, write) = pipe().unwrap();
+        let mut spec = fixture.spec(
+            &job,
+            &fixture.stand_in,
+            &["sleep", "600000"],
+            Std::Pipe(write),
+            Std::Nul,
+        );
+        spec.deadline = Some(Instant::now() + left);
+        let child = launch(spec).expect("the stand-in is started");
+        drop(read);
+        testing::skip_next_termination();
+        let begun = Instant::now();
+        drop(child);
+        let waited = begun.elapsed();
+        assert!(
+            waited >= shortest && waited < longest,
+            "the drop waits to the deadline ({left:?} left), not the five seconds: {waited:?}"
+        );
+        let reasons = job.unproved_reasons();
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert!(reasons[0].contains("not seen to end"), "{reasons:?}");
+        let mut job = job;
+        let ended = job.end(&[], Instant::now() + Duration::from_secs(10));
+        assert!(ended.proved(), "{ended:?}");
+    }
 }
 
 #[test]
@@ -1169,21 +1216,24 @@ fn a_launch_that_fails_after_the_process_was_made_is_an_uncertain_end_for_the_pr
     assert_eq!(control.outcome, Outcome::Ran(0));
     // A failure after the process was made, and the child not seen to end: the runner says the end
     // is uncertain and does not return the launch's own error.
+    // The wait for the child that was made takes the caller's deadline and not the five seconds the
+    // launcher states for a caller that gives none: the call returns at its three-second deadline.
     testing::skip_next_termination();
     testing::fail_next_launch_after_creation();
     let begun = Instant::now();
     let failed = kr_boundary_windows::win::proof::run_captured(
         proof_run(&fixture, "sleep"),
-        Instant::now() + Duration::from_secs(30),
+        Instant::now() + Duration::from_secs(3),
     )
     .expect_err("the launch failed");
     assert!(
         matches!(&failed, LaunchError::EndUncertain(text) if text.contains("not seen to end")),
         "{failed:?}"
     );
+    let took = begun.elapsed();
     assert!(
-        begun.elapsed() < Duration::from_secs(30),
-        "within the deadline"
+        took < Duration::from_millis(4_500),
+        "the error path stays inside the caller's deadline: {took:?}"
     );
     // The control for the same failure when the child ends at once: the launch's own error comes back.
     testing::fail_next_launch_after_creation();
@@ -1310,7 +1360,7 @@ fn a_launch_that_cannot_use_the_job_attribute_starts_nothing() {
 fn a_job_that_has_ended_takes_no_new_child() {
     let fixture = Fixture::new();
     let mut job = Job::new(Limits::INVOCATION).unwrap();
-    job.end(&[], Duration::from_secs(10));
+    job.end(&[], Instant::now() + Duration::from_secs(10));
     let marker = fixture.scratch.join("started.txt");
     let marker_text = marker.display().to_string();
     let before = pids_named("kr-launch-stand-in");
@@ -1353,7 +1403,7 @@ fn a_child_sees_exactly_the_environment_it_was_given() {
         .map(|(name, value)| (name.to_uppercase(), value))
         .collect();
     assert_eq!(seen, given);
-    job.end(&[&child], Duration::from_secs(10));
+    job.end(&[&child], Instant::now() + Duration::from_secs(10));
 }
 
 /// The arguments `CommandLineToArgvW` makes of a line.
@@ -1428,7 +1478,7 @@ fn a_quoted_command_line_is_split_back_by_the_system_and_by_a_real_child() {
         .map(|argument| format!("argument {argument:?}"))
         .collect();
     assert_eq!(seen, want);
-    job.end(&[&child], Duration::from_secs(10));
+    job.end(&[&child], Instant::now() + Duration::from_secs(10));
 }
 
 // ---- the error mode and the crash reporting ----
@@ -1629,7 +1679,7 @@ fn crash_run(fixture: &Fixture, arguments: &[&str], how: Start) -> (String, Vec<
         .filter(|line| line.starts_with("crash "))
         .map(|line| value_of(line, "pid").parse().unwrap())
         .collect();
-    job.end(&[&child], Duration::from_secs(10));
+    job.end(&[&child], Instant::now() + Duration::from_secs(10));
     (text, pids, code)
 }
 
@@ -1705,7 +1755,7 @@ fn a_child_a_grandchild_and_a_child_of_git_inherit_the_brokers_error_mode() {
         mode,
         "a child of git.exe inherits the mode too"
     );
-    job.end(&[&child], Duration::from_secs(10));
+    job.end(&[&child], Instant::now() + Duration::from_secs(10));
 }
 
 /// Whether a crash that the system reports has its dump after a bound, and how soon.
@@ -1809,7 +1859,7 @@ fn a_crash_of_a_child_a_grandchild_or_git_s_child_leaves_no_dump_where_the_defau
             .filter(|line| line.starts_with("crash "))
             .map(|line| value_of(line, "pid").parse::<u32>().unwrap()),
     );
-    job.end(&[], Duration::from_secs(10));
+    job.end(&[], Instant::now() + Duration::from_secs(10));
     // Nothing was reported: no dump and no error-reporting process for a crash that has ended, for
     // as long as three times the control took.
     let started = Instant::now();
@@ -1967,7 +2017,7 @@ Form 'com' {{ $a = [Activator]::CreateInstance([type]::GetTypeFromProgID('MMC20.
         outside.is_empty(),
         "stand-in processes outside the job: {outside:?}"
     );
-    job.end(&[&shell], Duration::from_secs(10));
+    job.end(&[&shell], Instant::now() + Duration::from_secs(10));
     let _ = Command::new("schtasks.exe")
         .args(["/delete", "/tn", "KrLaunchTask", "/f"])
         .output();
