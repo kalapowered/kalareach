@@ -22,6 +22,23 @@ use crate::journal::rows::{RootName, Row};
 use super::launch::{InvocationId, ResumePermit, SuspendedChild};
 use super::root::{RootError, RootRows};
 
+/// Seams for the test build.
+#[cfg(feature = "testing")]
+pub mod testing {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static FAIL_NEXT_WRITE: AtomicBool = AtomicBool::new(false);
+
+    /// Makes the next row's write fail, after the tracker has taken the row, as a full disk would.
+    pub fn fail_next_write() {
+        FAIL_NEXT_WRITE.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn take_failure() -> bool {
+        FAIL_NEXT_WRITE.swap(false, Ordering::SeqCst)
+    }
+}
+
 /// The extension of a journal file.
 const EXTENSION: &str = "journal";
 
@@ -163,9 +180,17 @@ impl Journal {
     }
 
     /// What the rows written so far say.
-    #[must_use]
-    pub fn tracker(&self) -> &Tracker {
-        &self.tracker
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::Closed`] after a write failed: the tracker had taken the row that
+    /// was not written, so it may be ahead of the file, and the file is read again to know what it
+    /// says.
+    pub fn tracker(&self) -> Result<&Tracker, JournalError> {
+        if self.closed {
+            return Err(JournalError::Closed);
+        }
+        Ok(&self.tracker)
     }
 
     /// Writes a row through to the disk. The step the row protects comes after this returns.
@@ -189,11 +214,17 @@ impl Journal {
         // file before any row is written (the tracker of a closed journal may be ahead of the file
         // by that one row).
         self.tracker.apply(row)?;
-        if let Err(error) = self
-            .file
-            .write_all(&framed)
-            .and_then(|()| self.file.sync_all())
-        {
+        #[cfg(feature = "testing")]
+        let injected = testing::take_failure();
+        #[cfg(not(feature = "testing"))]
+        let injected = false;
+        if let Err(error) = if injected {
+            Err(std::io::Error::other("a write failed, as a case asked"))
+        } else {
+            self.file
+                .write_all(&framed)
+                .and_then(|()| self.file.sync_all())
+        } {
             self.closed = true;
             return Err(error.into());
         }
