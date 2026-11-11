@@ -21,15 +21,19 @@ use kr_protocol::envelope::MutationRequest;
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
-use kr_protocol::ids::{ActionId, BuildId, EnvironmentId, SessionEpoch, SessionId, TransferId};
+use kr_protocol::ids::{
+    ActionId, AgentBindingRevision, ApplicationInstanceId, BuildId, EnvironmentId, SessionEpoch,
+    SessionId, TransferId,
+};
 use kr_protocol::limits::UPLOAD_CHUNK_LEN;
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Bytes, Digest256, Nullable, U64};
 use kr_protocol::transfer::{
     ChunkBitmap, ChunkDescriptor, ChunkLayout, DownloadBeginParams, DownloadBeginResult,
-    DownloadSource, DraftCreateParams, DraftCreateResult, UploadBeginParams, UploadBeginResult,
-    UploadFinishParams, UploadFinishResult, UploadState, UploadStatusParams, UploadStatusResult,
+    DownloadSource, DraftCreateParams, DraftCreateResult, DraftUpdateParams, DraftUpdateResult,
+    UploadBeginParams, UploadBeginResult, UploadFinishParams, UploadFinishResult, UploadState,
+    UploadStatusParams, UploadStatusResult,
 };
 use kr_transfer::chunks::{ChunkChannel, chunk_endpoint};
 
@@ -920,6 +924,240 @@ async fn a_draft_is_created_through_the_daemon_and_carries_its_revision() {
     assert_eq!(created.draft.environment_id, host.environment_id);
     assert_eq!(created.draft.revision.get(), 1);
     assert!(created.draft.attachments.is_empty());
+}
+
+/// A target that names `session` and, inside it, `application`.
+fn target_in(
+    host: &Host,
+    session: SessionId,
+    application: Option<ApplicationInstanceId>,
+) -> ActionTarget {
+    ActionTarget {
+        environment_id: host.environment_id,
+        session_id: Nullable::some(session),
+        session_epoch: Nullable::some(SessionEpoch::V1),
+        application_instance_id: Nullable(application),
+        agent_binding_revision: Nullable(application.map(|_| AgentBindingRevision::new(1))),
+    }
+}
+
+/// Asks the daemon for a draft in `session` whose parameters name `carried` and whose target names
+/// `named`.
+async fn a_draft_made_naming(
+    host: &Host,
+    control: &mut LocalClient,
+    session: SessionId,
+    carried: Option<ApplicationInstanceId>,
+    named: Option<ApplicationInstanceId>,
+) -> std::result::Result<ParamsValue, ProtocolError> {
+    control
+        .mutate(
+            Method::DraftCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            target_in(host, session, named),
+            &DraftCreateParams {
+                environment_id: host.environment_id,
+                device_id: Nullable::null(),
+                session_id: Nullable::some(session),
+                application_instance_id: Nullable(carried),
+                text: "have a look".to_owned(),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+}
+
+/// Asks the daemon to replace `draft`'s text under `action`, with a target that names `named`.
+async fn a_draft_updated_naming(
+    host: &Host,
+    control: &mut LocalClient,
+    action: ActionId,
+    draft: &kr_protocol::transfer::DraftRecord,
+    named: Option<ApplicationInstanceId>,
+) -> std::result::Result<ParamsValue, ProtocolError> {
+    let session = draft.session_id.0.expect("a draft of a session");
+    control
+        .mutate(
+            Method::DraftUpdate,
+            action,
+            target_in(host, session, named),
+            &DraftUpdateParams {
+                draft_id: draft.draft_id,
+                expected_revision: draft.revision,
+                text: "changed".to_owned(),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+}
+
+/// KR-REQ-23.41: a `draft.create` names in its target the application its parameters name, as it
+/// names the session: both absent, or the same. A create whose target and parameters differ in the
+/// application is refused; one that agrees is served, and the draft keeps the application.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_through_the_daemon_names_in_its_target_the_application_its_parameters_name() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let session = SessionId::new(kr_ipc::new_uuid());
+    let first = ApplicationInstanceId::new(kr_ipc::new_uuid());
+    let second = ApplicationInstanceId::new(kr_ipc::new_uuid());
+
+    for (carried, named) in [
+        (Some(first), None),
+        (None, Some(first)),
+        (Some(first), Some(second)),
+    ] {
+        let refused =
+            failure(a_draft_made_naming(&host, &mut control, session, carried, named).await);
+        assert_eq!(
+            refused.code,
+            ErrorCode::InvalidArgument,
+            "a create whose parameters name {carried:?} and whose target names {named:?}"
+        );
+    }
+
+    let made: DraftCreateResult = typed(
+        &a_draft_made_naming(&host, &mut control, session, Some(first), Some(first))
+            .await
+            .expect("a create whose target names the application its parameters name succeeds"),
+    );
+    assert_eq!(made.draft.application_instance_id.0, Some(first));
+    assert_eq!(made.draft.session_id.0, Some(session));
+    let plain: DraftCreateResult = typed(
+        &a_draft_made_naming(&host, &mut control, session, None, None)
+            .await
+            .expect("a create that names no application succeeds"),
+    );
+    assert_eq!(plain.draft.application_instance_id.0, None);
+}
+
+/// KR-REQ-23.41: a draft made for an application is updated through the daemon by a request whose
+/// target names that application, and by no other. An update that names another application, or
+/// none, is refused, and so is one that names an application for a draft that has none; each
+/// leaves the draft at its revision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_draft_for_an_application_is_updated_through_the_daemon_only_by_a_request_that_names_it()
+{
+    let host = host().await;
+    let mut control = client(&host).await;
+    let session = SessionId::new(kr_ipc::new_uuid());
+    let application = ApplicationInstanceId::new(kr_ipc::new_uuid());
+    let other = ApplicationInstanceId::new(kr_ipc::new_uuid());
+    let with: DraftCreateResult = typed(
+        &a_draft_made_naming(
+            &host,
+            &mut control,
+            session,
+            Some(application),
+            Some(application),
+        )
+        .await
+        .expect("a draft for an application"),
+    );
+    let without: DraftCreateResult = typed(
+        &a_draft_made_naming(&host, &mut control, session, None, None)
+            .await
+            .expect("a draft for no application"),
+    );
+
+    for (draft, named) in [
+        (&with.draft, None),
+        (&with.draft, Some(other)),
+        (&without.draft, Some(application)),
+    ] {
+        let refused = failure(
+            a_draft_updated_naming(
+                &host,
+                &mut control,
+                ActionId::new(kr_ipc::new_uuid()),
+                draft,
+                named,
+            )
+            .await,
+        );
+        assert_eq!(
+            refused.code,
+            ErrorCode::InvalidArgument,
+            "an update of a draft for {:?} whose target names {named:?}",
+            draft.application_instance_id.0
+        );
+    }
+
+    // The refusals moved nothing: the first update that is served is at the first revision.
+    let served: DraftUpdateResult = typed(
+        &a_draft_updated_naming(
+            &host,
+            &mut control,
+            ActionId::new(kr_ipc::new_uuid()),
+            &with.draft,
+            Some(application),
+        )
+        .await
+        .expect("an update that names the draft's application is served"),
+    );
+    assert_eq!(served.draft.revision.get(), 2);
+    assert_eq!(served.draft.application_instance_id.0, Some(application));
+    let served: DraftUpdateResult = typed(
+        &a_draft_updated_naming(
+            &host,
+            &mut control,
+            ActionId::new(kr_ipc::new_uuid()),
+            &without.draft,
+            None,
+        )
+        .await
+        .expect("an update of a draft for no application that names none is served"),
+    );
+    assert_eq!(served.draft.revision.get(), 2);
+}
+
+/// KR-REQ-23.41 and KR-REQ-09.09: an exact repeat of an update of a draft for an application is
+/// answered from the service's record: it is given the first answer, and the draft stays at the
+/// revision the first update made, so the next update at that revision is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeated_update_of_a_draft_for_an_application_is_answered_from_its_record() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let session = SessionId::new(kr_ipc::new_uuid());
+    let application = ApplicationInstanceId::new(kr_ipc::new_uuid());
+    let made: DraftCreateResult = typed(
+        &a_draft_made_naming(
+            &host,
+            &mut control,
+            session,
+            Some(application),
+            Some(application),
+        )
+        .await
+        .expect("a draft for an application"),
+    );
+    let action = ActionId::new(kr_ipc::new_uuid());
+
+    let first: DraftUpdateResult = typed(
+        &a_draft_updated_naming(&host, &mut control, action, &made.draft, Some(application))
+            .await
+            .expect("the update is served"),
+    );
+    let repeat: DraftUpdateResult = typed(
+        &a_draft_updated_naming(&host, &mut control, action, &made.draft, Some(application))
+            .await
+            .expect("the repeat is answered from the record"),
+    );
+    assert_eq!(first.draft.revision.get(), 2);
+    assert_eq!(repeat, first, "the repeat is given the first answer");
+
+    let next: DraftUpdateResult = typed(
+        &a_draft_updated_naming(
+            &host,
+            &mut control,
+            ActionId::new(kr_ipc::new_uuid()),
+            &first.draft,
+            Some(application),
+        )
+        .await
+        .expect("the next update at the revision the first made is served"),
+    );
+    assert_eq!(next.draft.revision.get(), 3, "the repeat moved nothing");
 }
 
 /// Publishes `bytes` the way a client does, over the daemon's two endpoints, and returns the
