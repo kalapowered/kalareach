@@ -2249,10 +2249,10 @@ fn the_repairs_open_and_the_recorded_directorys_open_complete_at_once_under_a_lo
         "the recorded directory's open meets a sharing violation and does not wait for the lock"
     );
     assert!(recorded.1 < Duration::from_secs(5), "{:?}", recorded.1);
-    assert!(
-        lock.break_was_asked_for(),
-        "the lock was asked to give up, or the case shows nothing"
-    );
+    // The holder learns of the break a moment after the opens return, so the case waits for it.
+    wait_until("the lock was asked to give up", || {
+        lock.break_was_asked_for()
+    });
 }
 
 #[test]
