@@ -129,6 +129,12 @@ impl VerifiedPath {
 pub struct OwnedPipeEnd(Handle);
 
 impl OwnedPipeEnd {
+    /// The handle's value, which a child that inherits it sees unchanged.
+    #[must_use]
+    pub fn raw(&self) -> HANDLE {
+        self.0.raw()
+    }
+
     /// Takes a pipe end that was made inheritable.
     ///
     /// # Errors

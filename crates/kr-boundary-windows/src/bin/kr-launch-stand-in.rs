@@ -5,12 +5,14 @@
 #[allow(unsafe_code)]
 fn main() -> std::process::ExitCode {
     use std::os::windows::process::CommandExt as _;
-    use std::process::{Command, ExitCode};
+    use std::process::{Command, ExitCode, Stdio};
     use std::ptr::{null, null_mut};
 
     use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT};
     use windows_sys::Win32::Storage::FileSystem::GetFileType;
-    use windows_sys::Win32::System::Diagnostics::Debug::{GetErrorMode, RaiseFailFastException};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        GetErrorMode, RaiseFailFastException, SetErrorMode,
+    };
     use windows_sys::Win32::System::JobObjects::IsProcessInJob;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -35,12 +37,36 @@ fn main() -> std::process::ExitCode {
         );
     }
 
+    fn crash(kind: &str) {
+        report("crash");
+        match kind {
+            "access-violation" => {
+                // SAFETY: a deliberate access violation, to see what the system does with it.
+                unsafe { std::ptr::write_volatile(null_mut::<u8>(), 1) };
+            }
+            _ => {
+                // SAFETY: a deliberate fail-fast, for the same reason.
+                unsafe {
+                    RaiseFailFastException(null(), null(), 0);
+                }
+            }
+        }
+    }
+
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let mode = arguments.first().map_or("report", String::as_str);
+    let mut mode = arguments.first().map_or("report", String::as_str);
+    // Git runs an external diff program with seven arguments and no mode: the mode is then in a
+    // file beside this program, or the program only reports.
+    let from_file;
+    if arguments.len() == 7 {
+        let beside = std::env::current_exe()
+            .unwrap()
+            .with_file_name("diff-mode.txt");
+        from_file = std::fs::read_to_string(beside).unwrap_or_else(|_| "report".to_owned());
+        mode = from_file.trim();
+    }
     match mode {
         "report" => report("report"),
-        // The external diff program of Git: Git passes it seven arguments.
-        "diff" => report("diff"),
         "handles" => {
             // Every handle value that is open here, whether it is inheritable and what it is.
             let mut value = 4_usize;
@@ -85,17 +111,41 @@ fn main() -> std::process::ExitCode {
                 Err(error) => println!("breakaway-refused {:?}", error.raw_os_error()),
             }
         }
-        "crash-access-violation" => {
-            report("crash");
-            // SAFETY: a deliberate access violation, to see what the system does with it.
-            unsafe { std::ptr::write_volatile(null_mut::<u8>(), 1) };
-        }
-        "crash-fail-fast" => {
-            report("crash");
-            // SAFETY: a deliberate fail-fast, for the same reason.
+        "crash-access-violation" => crash("access-violation"),
+        "crash-fail-fast" => crash("fail-fast"),
+        // The same crash after asking for the default error mode again: outside what the broker's
+        // mode promises, and the control that shows the system would have reported it.
+        "crash-default-mode" => {
+            // SAFETY: sets the process's error mode, which has no memory safety condition.
             unsafe {
-                RaiseFailFastException(null(), null(), 0);
+                SetErrorMode(0);
             }
+            crash(arguments.get(1).map_or("fail-fast", String::as_str));
+        }
+        // A grandchild that crashes.
+        "spawn-crash" => {
+            report("child");
+            let kind = arguments.get(1).map_or("fail-fast", String::as_str);
+            let output = Command::new(std::env::current_exe().unwrap())
+                .arg(format!("crash-{kind}"))
+                .output();
+            match output {
+                Ok(output) => print!("{}", String::from_utf8_lossy(&output.stdout)),
+                Err(error) => println!("spawn-failed {error}"),
+            }
+        }
+        // A grandchild that stays, so that the job holds a tree.
+        "spawn-hold" => {
+            let grandchild = Command::new(std::env::current_exe().unwrap())
+                .args(["sleep", "120000"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            match grandchild {
+                Ok(grandchild) => println!("grandchild pid={}", grandchild.id()),
+                Err(error) => println!("spawn-failed {error}"),
+            }
+            std::thread::sleep(std::time::Duration::from_secs(120));
         }
         "marker" => {
             // Leaves a file that says it ran, for the cases that look for a program that started
