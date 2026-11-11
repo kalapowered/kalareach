@@ -166,6 +166,7 @@ pub fn run_captured(run: Run<'_>, deadline: Instant) -> Result<Captured, LaunchE
         stderr: Std::Pipe(err_write),
         process_descriptor: &descriptor,
         thread_descriptor: &descriptor,
+        deadline: Some(deadline),
     });
     let suspended = match launched {
         Ok(suspended) => suspended,
@@ -185,10 +186,7 @@ pub fn run_captured(run: Run<'_>, deadline: Instant) -> Result<Captured, LaunchE
                 let waited = child.wait(wait_until.saturating_duration_since(Instant::now()));
                 // Anything the program started ends with the job, which also lets the pipes
                 // reach their end. A program still running at the bound is ended the same way.
-                let ended = job.end(
-                    &[&child],
-                    deadline.saturating_duration_since(Instant::now()),
-                );
+                let ended = job.end(&[&child], deadline);
                 match settled(&job, ended) {
                     Ok(()) => match waited {
                         Ok(Some(code)) => Ok(Outcome::Ran(code)),
@@ -233,7 +231,7 @@ const END_RESERVE: Duration = Duration::from_secs(2);
 /// that cannot be held, a time that cannot be read) and the child it ended on the way may not have
 /// been seen to end. The error is the launch's own unless the end is not proved.
 fn after_failed_launch(job: &mut Job, error: LaunchError, deadline: Instant) -> LaunchError {
-    let ended = job.end(&[], deadline.saturating_duration_since(Instant::now()));
+    let ended = job.end(&[], deadline);
     match settled(job, ended) {
         Ok(()) => error,
         Err(uncertain) => uncertain,
@@ -466,53 +464,15 @@ pub fn prove(
     // is started again, one launch every two seconds, until the refusal and an event of the log
     // that names this rule, this account and this program are both in hand.
     let started = Instant::now();
+    // The search stops this much before the deadline; the log's last words come from the time kept
+    // by that, so every query of the search itself ends by `search_until`, not by the deadline.
     let search_until = deadline.checked_sub(DIAGNOSTIC_RESERVE).unwrap_or(deadline);
     let mut attempts = 0_u32;
     let mut refused = false;
-    let mut last: String;
+    let mut last = String::from("no launch was made");
     loop {
         if stop.is_set() {
             return fail("the service is stopping");
-        }
-        let by = match program_deadline(deadline, search_until) {
-            Ok(by) => by,
-            Err(failed) => return failed,
-        };
-        attempts += 1;
-        let launched = run_program(
-            TokenSpec::Boundary(&token),
-            Some(&group),
-            &unlisted,
-            &[],
-            &scratch.0,
-            &environment,
-            by,
-        );
-        match judge_launch(launched, refused, &account, attempts) {
-            Ok(Seen::Refused) => {
-                refused = true;
-                last = format!("it was refused with {REFUSED_BY_POLICY}");
-            }
-            Ok(Seen::Ran(text)) => last = text,
-            Err(failed) => return failed,
-        }
-        if refused {
-            match applocker::blocked_after(record, &scratch.0, &environment, deadline) {
-                Ok(events) => {
-                    if events.iter().any(|event| {
-                        event.rule_id == rule
-                            && event.user.eq_ignore_ascii_case(&sid)
-                            && same_path(&event.path, &unlisted)
-                    }) {
-                        // The evidence counts only if it was in hand before the deadline.
-                        if let Err(failed) = left_before(deadline) {
-                            return failed;
-                        }
-                        break;
-                    }
-                }
-                Err(error) => return fail(error.to_string()),
-            }
         }
         if Instant::now() >= search_until {
             // The log's last words come from the time kept for them, and the query stays within the
@@ -528,6 +488,52 @@ pub fn prove(
                 "the policy did not show a refusal of the unlisted program to {account} by rule {rule} before the proof's deadline ({seen}; {attempts} launches in {:.0} s; the last: {last}; the application-control log last said: {log})",
                 started.elapsed().as_secs_f32()
             ));
+        }
+        let by = match program_deadline(deadline, search_until) {
+            Ok(by) => by,
+            Err(failed) => return failed,
+        };
+        attempts += 1;
+        let launched = run_program(
+            TokenSpec::Boundary(&token),
+            Some(&group),
+            &unlisted,
+            &[],
+            &scratch.0,
+            &environment,
+            by,
+        );
+        // A launch that the search's own end kept from starting is the end of the search, not a
+        // failure of the proof: the log is read next, from the reserve.
+        if matches!(launched, Err(LaunchError::DeadlinePassed)) {
+            continue;
+        }
+        match judge_launch(launched, refused, &account, attempts) {
+            Ok(Seen::Refused) => {
+                refused = true;
+                last = format!("it was refused with {REFUSED_BY_POLICY}");
+            }
+            Ok(Seen::Ran(text)) => last = text,
+            Err(failed) => return failed,
+        }
+        if refused {
+            match applocker::blocked_after(record, &scratch.0, &environment, search_until) {
+                Ok(events) => {
+                    if events.iter().any(|event| {
+                        event.rule_id == rule
+                            && event.user.eq_ignore_ascii_case(&sid)
+                            && same_path(&event.path, &unlisted)
+                    }) {
+                        // The evidence counts only if it was in hand before the deadline.
+                        if let Err(failed) = left_before(deadline) {
+                            return failed;
+                        }
+                        break;
+                    }
+                }
+                Err(_) if Instant::now() >= search_until => {}
+                Err(error) => return fail(error.to_string()),
+            }
         }
         std::thread::sleep(
             LAUNCH_EVERY.min(search_until.saturating_duration_since(Instant::now())),

@@ -265,6 +265,10 @@ pub struct ChildSpec<'a> {
     pub process_descriptor: &'a OwnedSd,
     /// The descriptor of the child's primary thread.
     pub thread_descriptor: &'a OwnedSd,
+    /// The caller's absolute deadline. A child that is ended on an error path, before it ran, is
+    /// waited for no longer than this (with a floor of [`END_FLOOR_MS`]); none waits for as long
+    /// as [`END_WAIT_MS`].
+    pub deadline: Option<Instant>,
 }
 
 /// A child that exists, is in its job and has run nothing.
@@ -290,6 +294,8 @@ pub struct SuspendedChild {
     invocation: Option<InvocationId>,
     /// Where the job's owner is told that this child could not be shown to have ended.
     reports: Reports,
+    /// The caller's deadline, which the wait for this child's end keeps to when it is dropped.
+    deadline: Option<Instant>,
 }
 
 /// A child that has been resumed.
@@ -332,14 +338,18 @@ pub mod testing {
     }
 }
 
-/// How long a dropped suspended child is waited for.
+/// How long a dropped suspended child is waited for when its caller gave no deadline.
 const END_WAIT_MS: u32 = 5_000;
+/// The least a child that was ended is waited for, whatever the deadline: the call that ends a
+/// process returns before the process is signalled as ended. The one floor beyond a deadline.
+const END_FLOOR_MS: u32 = 100;
 
-/// Ends a child that never ran and waits for it, up to [`END_WAIT_MS`]. A child that is not seen to
-/// end is reported to the job's owner, whatever the call to end it said: no release or removal may
-/// rest on this child's end. The drop of a suspended child and the launch's own error path both end
-/// a child this way.
-fn end_unresumed(process: &Handle, pid: u32, reports: &Reports) {
+/// Ends a child that never ran and waits for it: up to [`END_WAIT_MS`], or up to the caller's
+/// deadline when it gave one (never less than [`END_FLOOR_MS`]). A child that is not seen to end is
+/// reported to the job's owner, whatever the call to end it said: no release or removal may rest on
+/// this child's end. The drop of a suspended child and the launch's own error path both end a
+/// child this way.
+fn end_unresumed(process: &Handle, pid: u32, reports: &Reports, deadline: Option<Instant>) {
     #[cfg(feature = "testing")]
     let skipped = testing::take_skip();
     #[cfg(not(feature = "testing"))]
@@ -347,22 +357,31 @@ fn end_unresumed(process: &Handle, pid: u32, reports: &Reports) {
     // SAFETY: the process handle is open and the process is the caller's own child.
     let terminated = !skipped && unsafe { TerminateProcess(process.raw(), 1) } != 0;
     let terminate_error = (!terminated).then(|| last("ending a suspended child"));
+    let wait_ms = deadline.map_or(END_WAIT_MS, |deadline| {
+        u32::try_from(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis(),
+        )
+        .unwrap_or(END_WAIT_MS)
+        .clamp(END_FLOOR_MS, END_WAIT_MS)
+    });
     // SAFETY: as above.
-    let waited = unsafe { WaitForSingleObject(process.raw(), END_WAIT_MS) };
+    let waited = unsafe { WaitForSingleObject(process.raw(), wait_ms) };
     if waited != WAIT_OBJECT_0 {
         let call = terminate_error.map_or_else(
             || "the call succeeded".to_owned(),
             |error| error.to_string(),
         );
         reports.add(format!(
-            "the suspended child (process {pid}) was not seen to end within {END_WAIT_MS} ms ({call})"
+            "the suspended child (process {pid}) was not seen to end within {wait_ms} ms ({call})"
         ));
     }
 }
 
 impl Drop for SuspendedChild {
     fn drop(&mut self) {
-        end_unresumed(&self.process, self.pid, &self.reports);
+        end_unresumed(&self.process, self.pid, &self.reports, self.deadline);
     }
 }
 
@@ -731,7 +750,12 @@ pub fn launch(spec: ChildSpec<'_>) -> Result<SuspendedChild, LaunchError> {
         Err(error) => {
             // The child is ended and waited for as a dropped one is, and reported when it is not
             // seen to end: the caller reads the job's reports on its way out.
-            end_unresumed(&process, created.dwProcessId, &spec.job.reports());
+            end_unresumed(
+                &process,
+                created.dwProcessId,
+                &spec.job.reports(),
+                spec.deadline,
+            );
             return Err(error.into());
         }
     };
@@ -745,6 +769,7 @@ pub fn launch(spec: ChildSpec<'_>) -> Result<SuspendedChild, LaunchError> {
         suspended: true,
         invocation: spec.invocation,
         reports: spec.job.reports(),
+        deadline: spec.deadline,
     };
     // From here a failure drops `child`, which ends it.
     child.creation_time = time_of(&child.process)?;

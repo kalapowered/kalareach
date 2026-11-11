@@ -359,7 +359,9 @@ impl Job {
         Ok(inside != 0)
     }
 
-    /// Ends every process in the job and waits, up to a bound, until each has gone.
+    /// Ends every process in the job and waits, up to the caller's absolute deadline, until each
+    /// has gone. The deadline is not rebuilt from a duration after the call that ends the job, so
+    /// that call's own time is part of the wait and not an addition to it.
     ///
     /// The completion port wakes the wait; the answer is the job's own active count and the
     /// retained process objects, read after each wake-up. A message that never comes changes
@@ -369,12 +371,11 @@ impl Job {
     /// children reported, and its end is not proved. A refused call to end the job does not by
     /// itself keep the end from being proved: the observation decides, and the refusal is in the
     /// report when the observation fails.
-    pub fn end(&mut self, retained: &[&Child], bound: Duration) -> Ended {
+    pub fn end(&mut self, retained: &[&Child], deadline: Instant) -> Ended {
         self.state = State::Ended;
         // SAFETY: the handle is open.
         let terminated = unsafe { TerminateJobObject(self.handle.raw(), 1) } != 0;
         let terminate_error = (!terminated).then(|| last("ending the job"));
-        let deadline = Instant::now() + bound;
         loop {
             let all_exited = retained.iter().all(|child| {
                 // SAFETY: the retained process handle is open.
