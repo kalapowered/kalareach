@@ -609,13 +609,6 @@
   overflow-y: auto;
   overscroll-behavior-y: contain;
   min-block-size: 0;
-  /*
-   * A link's press area reaches past its words, so the area the pane scrolls holds that reach: it
-   * does not scroll sideways for a link as wide as the line, and does not cut the area of a link at
-   * the line's edge. The margin takes the room back, so the messages stay where they were.
-   */
-  padding-inline: var(--reach-inline);
-  margin-inline: calc(-1 * var(--reach-inline));
 }
 
 /*
@@ -640,6 +633,16 @@
 .m-session[data-pane='semantic'] {
   --stream-floor: calc(3 * var(--stream-size) * var(--stream-leading));
   grid-template-rows: auto minmax(var(--stream-floor), 1fr) auto;
+}
+
+/*
+ * A link's press area reaches past its words, so the area the conversation scrolls holds that reach:
+ * the pane does not scroll sideways for a link as wide as the line, and does not cut the area of a
+ * link at the line's edge. The margin takes the room back, so the messages stay where they were.
+ */
+.m-session[data-pane='semantic'] > .m-pane {
+  padding-inline: var(--reach-inline);
+  margin-inline: calc(-1 * var(--reach-inline));
 }
 
 /* The terminal fills its pane, under the words of a view that has ended. */
@@ -719,9 +722,10 @@
  * inline reach is a quarter of `--target` on each side, and a link of a character or two is widened
  * to `--target`.
  *
- * Where two links are closer than the reach, the words of each stay that link's own: they are a
- * layer above every button's area. A press on a link's words is that link's whichever neighbour's
- * area lies under it, and the area nobody's words are on goes to the link it belongs to.
+ * The area reaches half a line into the lines above and below, as a target this tall must. Where
+ * two links are closer than the reach, the words of each stay that link's own: they are a layer
+ * above every button's area, so a press on a link's words is that link's whichever neighbour's area
+ * lies under it.
  */
 .m-node .md-link {
   --reach-block: 16px;
