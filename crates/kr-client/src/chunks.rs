@@ -863,6 +863,8 @@ enum Unavailable {
 enum Held {
     /// The newest window, received less than half its validity ago and not turned down.
     Carry(ActionWindow),
+    /// The host issued a window that admits nothing.
+    Nothing,
     /// The renewal is due or the window was turned down: the call waits for the next one, until the
     /// window it holds would have expired.
     Renewal { expiry: tokio::time::Instant },
@@ -873,10 +875,10 @@ fn held_window(
     issued: &mut watch::Receiver<Issued>,
     clock: &LaneClock,
     source: Option<&WindowSource>,
-) -> std::result::Result<Held, Unavailable> {
+) -> Held {
     let held = issued.borrow_and_update().clone();
     if held.window.valid_for_ms.get() == 0 {
-        return Err(Unavailable::Nothing);
+        return Held::Nothing;
     }
     // A paired host's window is held to the protocol's longest, so that a host that states a
     // longer one cannot keep a lane waiting on a refused window past that.
@@ -890,11 +892,11 @@ fn held_window(
     let turned_down =
         source.is_some_and(|source| source.turned_down(&held.window.action_window_id));
     if !turned_down && clock.now().saturating_duration_since(held.received_at) < validity / 2 {
-        return Ok(Held::Carry(held.window));
+        return Held::Carry(held.window);
     }
-    Ok(Held::Renewal {
+    Held::Renewal {
         expiry: held.received_at + validity,
-    })
+    }
 }
 
 /// The window a call carries: the newest the host issued, once the lane has received it less than
@@ -910,8 +912,9 @@ async fn newest_window(
     source: Option<&WindowSource>,
 ) -> std::result::Result<ActionWindow, Unavailable> {
     loop {
-        let expiry = match held_window(issued, clock, source)? {
+        let expiry = match held_window(issued, clock, source) {
             Held::Carry(window) => return Ok(window),
+            Held::Nothing => return Err(Unavailable::Nothing),
             // The reader delivers the next window as soon as it arrives.
             Held::Renewal { expiry } => expiry,
         };
@@ -1133,33 +1136,24 @@ impl NetworkCarrier {
         if matches!(self.stream, LaneStream::Ended) {
             return Err(ClientError::ConnectionEnded);
         }
-        // A lane that has carried a chunk holds a stream, and the host resets one that stands idle
-        // for far less than a renewal can take. The lane is between calls, so the stream gives way
-        // before the wait and finishes cleanly, and the call opens another once it has its window.
+        match held_window(&mut self.issued, &self.clock, Some(&self.source)) {
+            Held::Carry(window) => return Ok(window),
+            Held::Nothing => return Err(ClientError::NoActionWindow),
+            Held::Renewal { .. } => {}
+        }
+        // The call has to wait for a window. A lane that has carried a chunk holds a stream, and the
+        // host resets one that stands idle for far less than a renewal can take. The lane is between
+        // calls, so the stream gives way before the wait and finishes cleanly, and the call opens
+        // another once it has its window. A lane that waits holds no stream.
         if let LaneStream::Open(stream) = &self.stream {
-            let header = stream.header().clone();
-            if matches!(
-                held_window(&mut self.issued, &self.clock, Some(&self.source)),
-                Ok(Held::Renewal { .. })
-            ) {
-                self.stream = LaneStream::Unopened(header);
-            }
+            self.stream = LaneStream::Unopened(stream.header().clone());
         }
         // The wait for a renewal ends with the connection: the session keeps its windows after its
         // reader stops, so what says the connection is gone is the revocation of the connection's
-        // streams, which a stream of this lane's own sees as its own, and a lane that has opened no
-        // stream sees through the opener.
-        let stream = &self.stream;
-        let opener = &self.opener;
-        let lost = async {
-            match stream {
-                LaneStream::Open(stream) => stream.handle().revoked().await,
-                LaneStream::Unopened(_) | LaneStream::Ended => opener.revoked().await,
-            }
-        };
+        // streams, which a lane that holds no stream sees through the opener.
         let waited = tokio::select! {
             window = newest_window(&mut self.issued, &self.clock, Some(&self.source)) => Some(window),
-            () = lost => None,
+            () = self.opener.revoked() => None,
         };
         match waited {
             Some(Ok(window)) => Ok(window),
