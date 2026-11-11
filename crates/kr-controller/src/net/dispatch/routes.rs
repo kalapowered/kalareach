@@ -115,6 +115,11 @@ pub(super) enum DeviceRead {
     /// `transfer.streams`: the stream kinds this host takes from a paired device. The answer is
     /// the list the listener is configured with, and reads nothing from the store.
     Transfer,
+    /// `upload.status`: the chunks and the state of one of this device's own uploads, decided over
+    /// the session the stored upload is bound to, or under the pairing grant for an upload that is
+    /// bound to none ([`RemoteConnection::upload_session`]). The answer is a read of recorded state,
+    /// so it goes through the end check a recorded answer is owed.
+    UploadStatus,
     /// Refused by name, for the reason [`Unserved::refusal`] gives.
     Refused(Unserved),
 }
@@ -168,9 +173,8 @@ impl DeviceRead {
             Method::SessionDescribe => Self::Description,
             Method::SessionOpen => Self::Opening,
             Method::TransferStreams => Self::Transfer,
-            Method::UploadStatus | Method::DownloadBegin | Method::DownloadChunk => {
-                Self::Refused(Unserved::Transfer)
-            }
+            Method::UploadStatus => Self::UploadStatus,
+            Method::DownloadBegin | Method::DownloadChunk => Self::Refused(Unserved::Transfer),
             _ if crate::catalogue::CatalogueModule::serves(method) => Self::Catalogue,
             _ if crate::attention::AttentionModule::serves(method) => Self::Attention,
             _ => return None,
@@ -181,16 +185,12 @@ impl DeviceRead {
 /// Why this host refuses a paired device a method the method table admits for one, by name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Unserved {
-    /// `upload.status`, `download.begin` and `download.chunk`, which this host does not serve to a
-    /// paired device on its control stream: a download begun for one would stage a copy nothing can
-    /// read.
+    /// `download.begin` and `download.chunk`, which this host does not serve to a paired device on
+    /// its control stream: a download begun for one would stage a copy nothing can read.
     Transfer,
     /// `upload.chunk` on the control stream. A chunk is as large as a control frame may not be, and
     /// travels on an attachment-chunk stream.
     Chunk,
-    /// `upload.begin`, `upload.finish` and `upload.cancel`, which this host does not serve to a
-    /// paired device yet.
-    Upload,
     /// `terminal.palette.set`, which no part of this host performs for a paired device.
     Palette,
     /// `input.write` sent as a mutation. Raw input is an ordered stream with no action identity,
@@ -203,7 +203,7 @@ impl Unserved {
     pub(super) fn refusal(self, entry: &MethodEntry) -> ProtocolError {
         let name = entry.name;
         match self {
-            Self::Transfer | Self::Upload => ProtocolError::new(
+            Self::Transfer => ProtocolError::new(
                 ErrorCode::UnsupportedCapability,
                 format!("{name} is not served to a paired device by this host yet"),
             ),
@@ -360,7 +360,17 @@ impl RemoteConnection {
         // An `action.read` that names an action only is decided over the session the action was
         // performed on, so what the decision carries at the write boundary is the authority over
         // that session.
-        let named = self.read_session(request, entry);
+        // An `upload.status` names an upload and no session: it is decided over the session the
+        // stored upload is bound to, so a device that holds `files.upload` over that session alone
+        // reads it, and an upload that is no one's of this device's is unknown.
+        let named = if entry.method == Method::UploadStatus {
+            match self.upload_session(request).await {
+                Ok(named) => named,
+                Err(error) => return failure(request.request_id, error),
+            }
+        } else {
+            self.read_session(request, entry)
+        };
         // A read never claims geometry: the condition on `terminal.geometry` is about a request
         // that claims or adds a claim, and only a mutation does either.
         let decided = match self.ask(named, entry, false) {
@@ -575,6 +585,25 @@ impl RemoteConnection {
                 })
                 .map_err(|error| crate::error::ControllerError::InvalidArgument(error.to_string())),
             ),
+            DeviceRead::UploadStatus => {
+                let answer = self
+                    .controller
+                    .transfer
+                    .read_frame(&actor_id, request)
+                    .await;
+                // A recorded answer is owed the check every recorded answer is: a fence this host
+                // owes, or a registration withdrawn or replaced while the record was read, stops
+                // it, and the device is told the answer is not shown.
+                let carried = crate::authority::AdmittedMutation {
+                    connection_id: self.connection_id(),
+                    admitted_revision: validated,
+                    deadline: None,
+                };
+                match self.controller.check_retained_in_hand(&carried).await {
+                    Ok(()) => answer,
+                    Err(_) => failure(request.request_id, outcome_not_shown()),
+                }
+            }
             // Answered before the routes are read, so a request cannot arrive here.
             DeviceRead::Opening => {
                 return failure(
@@ -1827,6 +1856,28 @@ impl RemoteConnection {
             }
             Origin::Withheld => Err(self.withheld_answer(&decided, asked)),
         }
+    }
+}
+
+impl RemoteConnection {
+    /// The session an `upload.status` is decided over: the one the stored upload is bound to, and
+    /// none for an upload that is bound to none, which is asked under the pairing grant.
+    ///
+    /// The upload is looked up under this device's own principal, so another principal's upload and
+    /// one that does not exist are the same unknown answer, and a failed look is never a read that
+    /// names no session.
+    async fn upload_session(
+        &self,
+        request: &Request,
+    ) -> std::result::Result<Option<kr_protocol::ids::SessionId>, ProtocolError> {
+        let params: kr_protocol::transfer::UploadStatusParams = request
+            .params
+            .to_typed()
+            .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
+        self.controller
+            .transfer
+            .stored_session(&self.device.principal(), params.transfer_id)
+            .await
     }
 }
 
