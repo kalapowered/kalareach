@@ -2154,17 +2154,24 @@ fn still_running(identity: &ProcessStartIdentity, what: &str) -> Result<bool, St
 }
 
 /// Whether the command line `command` names the directory `root`: one of its words, or the part of
-/// one after an `=`, is `root` or a path below it, compared by path components. A directory whose
-/// name merely begins with the text of `root`'s is not named, so another host's run directory
-/// `<root>-other` is not this run's.
+/// one after an `=`, is `root` or a path below it, compared by path components, or is the address of
+/// a socket at such a path (`unix://<path>`, as the agent's terminal is given the gateway's). A
+/// directory whose name merely begins with the text of `root`'s is not named, so another host's run
+/// directory `<root>-other` is not this run's.
 #[must_use]
 pub fn names_the_root(command: &str, root: &Path) -> bool {
     command.split_whitespace().any(|word| {
-        Path::new(word).starts_with(root)
+        is_below(word, root)
             || word
                 .split_once('=')
-                .is_some_and(|(_, value)| Path::new(value).starts_with(root))
+                .is_some_and(|(_, value)| is_below(value, root))
     })
+}
+
+/// Whether `text`, a path or the address of a socket at a path (`unix://<path>`), is `root` or lies
+/// below it, compared by path components.
+fn is_below(text: &str, root: &Path) -> bool {
+    Path::new(text.strip_prefix("unix://").unwrap_or(text)).starts_with(root)
 }
 
 /// The session a command line is the worker of: its program, the first word, is exactly `program`,
@@ -2682,6 +2689,34 @@ mod root_tests {
             .join(format!("kr-run-{name}-{}", kr_ipc::new_uuid()));
         std::fs::create_dir_all(&base).expect("a scratch directory");
         base
+    }
+
+    #[test]
+    fn a_path_inside_another_word_names_the_root_only_as_a_socket_address_or_after_an_equals_sign()
+    {
+        let root = Path::new("/tmp/krm-0a1b2c3d");
+        for command in [
+            "codex resume --remote unix:///tmp/krm-0a1b2c3d/s/gw.sock",
+            "codex --remote=unix:///tmp/krm-0a1b2c3d/s/gw.sock",
+            "tool --dir=/tmp/krm-0a1b2c3d/x",
+            "tool unix:///tmp/krm-0a1b2c3d",
+        ] {
+            assert!(names_the_root(command, root), "{command}");
+        }
+        for command in [
+            // Another run's directory that begins with the same text.
+            "codex resume --remote unix:///tmp/krm-0a1b2c3d-other/s/gw.sock",
+            "codex --remote=unix:///tmp/krm-0a1b2c3dx/s/gw.sock",
+            // Another scheme, or text before the scheme, or the path inside a longer word.
+            "codex --remote xunix:///tmp/krm-0a1b2c3d/s/gw.sock",
+            "codex --remote http:///tmp/krm-0a1b2c3d/s/gw.sock",
+            "tool prefix/tmp/krm-0a1b2c3d/x",
+            "tool a=b=/tmp/krm-0a1b2c3d/x",
+            // The scheme is taken once.
+            "tool unix://unix:///tmp/krm-0a1b2c3d/s",
+        ] {
+            assert!(!names_the_root(command, root), "{command}");
+        }
     }
 
     #[test]
