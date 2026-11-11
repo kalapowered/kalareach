@@ -663,6 +663,69 @@ pub(crate) mod tests {
         assert_eq!(names_in(directory.path()), ["settings.json"]);
     }
 
+    /// On Linux a document that carries a POSIX access-control list is refused, and so is one in a
+    /// directory whose default list a replacement would be given. A document with neither is let
+    /// through. The probe behind both offers one byte of the list and takes "longer than the byte"
+    /// as "there is one".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_document_with_a_posix_list_is_told_apart_from_one_without() {
+        // The attribute's own layout: a version, then one eight-byte row per entry, each a tag, the
+        // rights it allows and the user or group it names. Naming a user is what makes the list
+        // say more than the mode bits do, and the user named is this process's own, which every
+        // user namespace maps.
+        let named = rustix::process::getuid().as_raw();
+        let mut list = 2_u32.to_le_bytes().to_vec();
+        for (tag, rights, who) in [
+            (0x0001_u16, 0x0006_u16, u32::MAX),
+            (0x0002, 0x0004, named),
+            (0x0004, 0x0004, u32::MAX),
+            (0x0010, 0x0004, u32::MAX),
+            (0x0020, 0x0004, u32::MAX),
+        ] {
+            list.extend_from_slice(&tag.to_le_bytes());
+            list.extend_from_slice(&rights.to_le_bytes());
+            list.extend_from_slice(&who.to_le_bytes());
+        }
+        let give = |path: &Path, attribute: &str| {
+            rustix::fs::setxattr(path, attribute, &list, rustix::fs::XattrFlags::empty())
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "this host would not put a list on {}: {error}",
+                        path.display()
+                    )
+                });
+        };
+        let directory = tempfile::tempdir().expect("a directory");
+        let document = directory.path().join("settings.json");
+        std::fs::write(&document, b"{}").expect("writes the document");
+        let guarded = directory.path().join("guarded");
+        std::fs::create_dir(&guarded).expect("a directory beside it");
+        let inside = guarded.join("settings.json");
+        std::fs::write(&inside, b"{}").expect("writes the document inside it");
+
+        guard_access_controls(&document, "edit it by hand")
+            .expect("a document with its mode bits alone is let through");
+        guard_access_controls(&inside, "edit it by hand")
+            .expect("so is one in a directory that gives its files nothing");
+
+        give(&document, "system.posix_acl_access");
+        let refused = guard_access_controls(&document, "edit it by hand")
+            .expect_err("a document with a list is refused");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { .. }),
+            "{refused:?}"
+        );
+
+        give(&guarded, "system.posix_acl_default");
+        let refused = guard_access_controls(&inside, "edit it by hand")
+            .expect_err("a document in a directory with a default list is refused");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { .. }),
+            "{refused:?}"
+        );
+    }
+
     /// A document is replaced whole and nothing is left beside it. Where this host reads access
     /// controls, a copy made in the document's own directory keeps who can read it, so the check
     /// at the replacement lets it take the document's place; anywhere else every replacement is

@@ -227,7 +227,7 @@ anyhow = "=1.0.104"
 block2 = "=0.6.2"
 rmcp = { version = "=3.9.0", default-features = false, features = ["macros", "schemars", "server", "transport-io"] }
 rusqlite = "=0.41.1"
-rustix = "=1.1.4"
+rustix = "=1.1.6"
 rustls-pki-types = "=1.15.1"
 # Checks a service's certificate against the platform's own trust store, as the managed-service
 # transport does, for the connections this product opens outside that transport: the rendezvous

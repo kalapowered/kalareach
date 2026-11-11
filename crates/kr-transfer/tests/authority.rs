@@ -998,6 +998,63 @@ fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list(
     );
 }
 
+/// KR-REQ-14.29: a POSIX list too long for the first read's buffer is read back whole.
+///
+/// The first read offers a fixed buffer. When the list does not fit, the read asks the platform for
+/// the list's length and reads again into a buffer of that size. A list of forty named users is
+/// 356 bytes, past the 256 the first read offers, so a length that came back as nothing would show
+/// as a list that is empty or cut short.
+///
+/// The case needs a host that takes forty named users on a list: the kernel refuses a user id its
+/// namespace does not map, and a version 4 XFS volume refuses a list of more than 25 entries, so
+/// it runs where the ids above the file's owner are mapped and the volume takes a list this long.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_posix_list_longer_than_the_first_read_comes_back_whole() {
+    let root = kr_ipc::testing::PrivateTempDir::create();
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
+    let name = RelativeName::parse("long.txt").expect("a name");
+    let file = authority.create_new(&name).expect("a file");
+    let owner = file.owner().expect("the file has an owner");
+    // The attribute's own layout: a version, then one eight-byte row per entry, each a tag, the
+    // rights it allows and the user or group it names. The named users follow the owner's row and
+    // come before the group's.
+    let mut raw = Vec::new();
+    raw.extend_from_slice(&2_u32.to_le_bytes());
+    let mut row = |tag: u16, rights: u16, who: u32| {
+        raw.extend_from_slice(&tag.to_le_bytes());
+        raw.extend_from_slice(&rights.to_le_bytes());
+        raw.extend_from_slice(&who.to_le_bytes());
+    };
+    row(0x0001, 0x0006, u32::MAX);
+    for offset in 1..=40 {
+        row(0x0002, 0x0004, owner.user + offset);
+    }
+    row(0x0004, 0x0004, u32::MAX);
+    row(0x0010, 0x0004, u32::MAX);
+    row(0x0020, 0x0004, u32::MAX);
+    assert_eq!(raw.len(), 356, "the list is past the first read's buffer");
+    let wanted = kr_transfer::AccessControl::Posix(raw);
+    file.set_access_control(&wanted).unwrap_or_else(|error| {
+        panic!("this host would not put a list of 356 bytes on a file: {error}")
+    });
+    drop(file);
+
+    let read = authority
+        .open_read(&name, ObjectPolicy::ReadableFile)
+        .expect("it opens");
+    assert!(
+        read.carries_access_control(),
+        "a file with a long list says so through its own handle"
+    );
+    assert_eq!(
+        read.access_control().expect("reads access control"),
+        wanted,
+        "the whole list came back, not what fits the first buffer"
+    );
+}
+
 /// Makes one file, puts an access-control list on it through its own descriptor, and returns what
 /// the platform reports afterwards, or why it would not take one.
 ///

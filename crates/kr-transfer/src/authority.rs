@@ -2257,11 +2257,7 @@ impl AuthorisedFile {
         {
             use std::os::fd::AsFd as _;
 
-            match rustix::fs::fgetxattr(
-                self.file.as_fd(),
-                "system.posix_acl_access",
-                &mut [0_u8; 0][..],
-            ) {
+            match rustix::fs::fgetxattr_query(self.file.as_fd(), "system.posix_acl_access") {
                 // There is one, and this asked for its length rather than reading it.
                 Ok(_) | Err(rustix::io::Errno::RANGE) => true,
                 // No such attribute, or a filesystem that keeps none.
@@ -3119,11 +3115,8 @@ fn read_linux_access_control(fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result
         Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => Ok(None),
         Err(rustix::io::Errno::RANGE) => {
             for _ in 0..3 {
-                let size = match rustix::fs::fgetxattr(
-                    fd.as_fd(),
-                    "system.posix_acl_access",
-                    &mut [0_u8; 0][..],
-                ) {
+                let size = match rustix::fs::fgetxattr_query(fd.as_fd(), "system.posix_acl_access")
+                {
                     Ok(size) => size,
                     Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => return Ok(None),
                     Err(err) => return Err(err.into()),
