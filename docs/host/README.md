@@ -3336,9 +3336,10 @@ with nothing staged and nothing recorded, so the device sees a reset and no answ
    nothing.
 
 A stream carries `upload.chunk` for the transfer its header names and nothing else. A chunk that
-names another transfer is answered `INVALID_ARGUMENT` and any other mutation
-`UNSUPPORTED_CAPABILITY`, and the stream ends after the answer is written. A frame that is not a
-request ends the stream with no answer. `download.chunk` is refused by name, and the stream stays.
+names another transfer is answered `INVALID_ARGUMENT`, and any other request or mutation is
+answered `UNSUPPORTED_CAPABILITY`; the stream ends after the answer is written. A frame that is
+neither a request nor a mutation ends the stream with no answer. `download.chunk` is refused by
+name, and the stream stays.
 
 Each chunk waits for its transfer's gate, so that at most one chunk of a transfer is inside the
 transfer service across all its streams, and then goes through the admission of any mutation: the
@@ -3353,10 +3354,12 @@ before the newer stream's first chunk enters it.
 A stream is revoked when its connection's control stream is lost, when the device is revoked or its
 connection is withdrawn, and when a newer stream replaces it. The host asks the stream's state after
 each wait, before it replaces another stream, after the gate, and at the transfer service's own
-check under the service's lock. A chunk whose stream was revoked before that check stages nothing,
-and a chunk that passed it is committed whatever happens to the stream after. When the service
-refuses a chunk's admission because a fence is owed or the connection's authority has gone, the
-device is told, and the stream is read no further.
+check under the service's lock. A chunk whose stream was revoked before that check stages nothing.
+A chunk that passed it is committed unless the connection's registration has gone by the commit,
+which the service asks again; the stream's state is not asked again. When the service refuses a
+chunk's admission because a fence is owed or the authority feed has refused the connection, the
+device is told, and the stream is read no further. When the connection's authority has gone, the
+connection is closed and nothing more is written on it.
 
 A device holds at most four live connections. At a fifth the host serves the new connection and
 withdraws the oldest as a revocation withdraws a device's connections: it is closed, a request in
