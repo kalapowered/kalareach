@@ -1069,6 +1069,59 @@ fn a_suspended_child_that_was_not_seen_to_end_is_reported_to_the_jobs_owner() {
 
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_pipe_that_a_writer_outside_the_job_holds_open_after_a_proved_end_is_an_uncertain_end() {
+    use kr_boundary_windows::win::proof::run_captured;
+    let fixture = Fixture::new();
+    let uncertain = |failed: &LaunchError, words: &str| matches!(failed, LaunchError::EndUncertain(text) if text.contains(words));
+
+    // The program runs and ends, and the job is proved empty; a writer outside the job still holds
+    // the pipe, so what the program wrote may be incomplete.
+    testing::hold_next_pipe_writer();
+    let begun = Instant::now();
+    let held = run_captured(
+        proof_run(&fixture, "report"),
+        Instant::now() + Duration::from_secs(4),
+    )
+    .expect_err("a pipe that did not end");
+    let took = begun.elapsed();
+    testing::release_held_pipe_writers();
+    assert!(
+        uncertain(&held, "still open after the end of its job"),
+        "{held:?}"
+    );
+    assert!(
+        took < Duration::from_secs(6),
+        "the readers stop at the deadline: {took:?}"
+    );
+
+    // The run fails on its way (the exit code cannot be read) and the job is proved empty, with the
+    // same writer outside: the error is not the platform's but the uncertain end, which says both.
+    testing::hold_next_pipe_writer();
+    testing::fail_next_exit_code_read();
+    let held = run_captured(
+        proof_run(&fixture, "report"),
+        Instant::now() + Duration::from_secs(4),
+    )
+    .expect_err("the run failed");
+    testing::release_held_pipe_writers();
+    assert!(uncertain(&held, "had also failed"), "{held:?}");
+    assert!(
+        matches!(&held, LaunchError::EndUncertain(text) if text.contains("reading the exit code")),
+        "{held:?}"
+    );
+
+    // The control: the same failure with no writer outside is the platform's error, as it was.
+    testing::fail_next_exit_code_read();
+    let failed = run_captured(
+        proof_run(&fixture, "report"),
+        Instant::now() + Duration::from_secs(30),
+    )
+    .expect_err("the run failed");
+    assert!(matches!(&failed, LaunchError::Platform(_)), "{failed:?}");
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_suspended_child_that_is_dropped_is_waited_for_only_to_the_callers_deadline() {
     let fixture = Fixture::new();
     for (left, shortest, longest) in [

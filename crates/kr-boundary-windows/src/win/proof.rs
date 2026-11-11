@@ -200,20 +200,28 @@ pub fn run_captured(run: Run<'_>, deadline: Instant) -> Result<Captured, LaunchE
         };
         (result, out.join(), err.join())
     });
-    let outcome = result?;
-    // The job's end is proved, so every process of it has exited. A pipe that is still open then
-    // has a writer that is not shown to have ended, and what the program wrote may be incomplete.
-    let (Ok(out), Ok(err)) = (out, err) else {
-        return Err(LaunchError::EndUncertain(
-            "a reader of the program's output failed".to_owned(),
-        ));
-    };
-    if !out.ended || !err.ended {
-        return Err(LaunchError::EndUncertain(format!(
+    // Both readers are read before any error is returned. The job's end may be proved while a pipe
+    // is still held open by a writer that is not in the job, and then what the program wrote may be
+    // incomplete and the end is uncertain, whatever the error says that the run failed on.
+    let readers = match (out, err) {
+        (Ok(out), Ok(err)) if out.ended && err.ended => Ok((out, err)),
+        (Ok(out), Ok(err)) => Err(format!(
             "a pipe of a program of the proof was still open after the end of its job (standard output ended {}, standard error ended {})",
             out.ended, err.ended
-        )));
-    }
+        )),
+        _ => Err("a reader of the program's output failed".to_owned()),
+    };
+    let (outcome, out, err) = match (result, readers) {
+        (Err(error @ LaunchError::EndUncertain(_)), _) => return Err(error),
+        (Err(error), Err(reason)) => {
+            return Err(LaunchError::EndUncertain(format!(
+                "{reason}; the run had also failed: {error}"
+            )));
+        }
+        (Err(error), Ok(_)) => return Err(error),
+        (Ok(_), Err(reason)) => return Err(LaunchError::EndUncertain(reason)),
+        (Ok(outcome), Ok((out, err))) => (outcome, out, err),
+    };
     Ok(Captured {
         outcome,
         stdout: out.bytes,
