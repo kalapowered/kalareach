@@ -160,6 +160,7 @@ fn an_upload_begin_the_host_refuses_inside_the_lock_writes_nothing() {
             &harness.actor,
             &begin_params(&harness, &bytes),
             Some(&action(&harness, "upload.begin", &bytes, &host)),
+            None,
         );
         assert_not_admitted(outcome, refuses, &host);
         assert_eq!(
@@ -183,6 +184,7 @@ fn an_upload_begin_the_host_refuses_inside_the_lock_writes_nothing() {
             &harness.actor,
             &begin_params(&harness, &bytes),
             Some(&action(&harness, "upload.begin", &bytes, &host)),
+            None,
         )
         .expect("under an admission that stands the upload is reserved");
     assert_eq!(harness.service.staged_byte_len().expect("the total"), 4096);
@@ -799,6 +801,7 @@ fn a_repeat_answered_from_its_record_asks_the_host_nothing() {
             &harness.actor,
             &begin_params(&harness, &bytes),
             Some(&performed),
+            None,
         )
         .expect("the upload is reserved");
     let refusing = Host::new(Refuses::WhenAsked);
@@ -812,6 +815,7 @@ fn a_repeat_answered_from_its_record_asks_the_host_nothing() {
             &harness.actor,
             &begin_params(&harness, &bytes),
             Some(&repeat),
+            None,
         )
         .expect("the repeat is answered from the record");
     assert_eq!(again, begun, "one action, one answer");

@@ -1108,6 +1108,7 @@ async fn a_verified_download_publishes_into_a_workspace_this_daemon_created() {
                 original_file_name: "review-notes.bin".to_owned(),
             },
             None,
+            None,
         )
         .expect("upload.begin succeeds");
     transfer

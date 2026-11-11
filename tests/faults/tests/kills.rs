@@ -283,6 +283,7 @@ impl Host {
                     original_file_name: "notes.bin".to_owned(),
                 },
                 None,
+                None,
             )
             .expect("reserves the upload");
         assert_eq!(begun.layout.chunk_count, U64::new(1), "one chunk holds it");

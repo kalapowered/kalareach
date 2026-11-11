@@ -68,7 +68,8 @@ async fn paired_with(
 /// on. The control is a device that does not hold the right to upload: it is told so first, because
 /// the device's rights are asked before the refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_chunk_on_the_control_stream_a_palette_change_and_raw_input_are_refused_by_name_and_record_nothing() {
+async fn a_chunk_on_the_control_stream_a_palette_change_and_raw_input_are_refused_by_name_and_record_nothing()
+ {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let (session_id, _) = an_open_session(&host);

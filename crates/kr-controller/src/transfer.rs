@@ -82,6 +82,22 @@ pub const DEVICE_OPEN_DRAFTS: u64 = 64;
 /// change.
 pub const DEVICE_STAGED_UPLOADS: u64 = 1_024;
 
+/// What a paired device is held to by the transfer service, which the person at this machine is
+/// not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeviceBounds {
+    /// How many drafts the device may keep open ([`DEVICE_OPEN_DRAFTS`]).
+    pub(crate) open_drafts: u64,
+    /// How many uploads the device may keep staged ([`DEVICE_STAGED_UPLOADS`]).
+    pub(crate) staged_uploads: u64,
+}
+
+/// What every paired device is held to, whatever its grant.
+pub(crate) const PAIRED_DEVICE: DeviceBounds = DeviceBounds {
+    open_drafts: DEVICE_OPEN_DRAFTS,
+    staged_uploads: DEVICE_STAGED_UPLOADS,
+};
+
 /// What a transfer call answers with: the method's result, or the refusal the service decided.
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
 
@@ -1135,16 +1151,16 @@ impl TransferModule {
     /// Serves one transfer mutation and returns the frame it answers with, and whether the service
     /// read it from the record of an earlier submission of the action.
     ///
-    /// `admission` and `draft_limit` are as [`Self::write`].
+    /// `admission` and `device` are as [`Self::write`].
     pub(crate) async fn write_frame(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
         admission: Arc<TransferAdmission>,
-        draft_limit: Option<u64>,
+        device: Option<DeviceBounds>,
     ) -> Given<ControlFrame> {
-        self.write(actor_id, mutation, method, admission, draft_limit)
+        self.write(actor_id, mutation, method, admission, device)
             .await
             .map(|answer| frame(mutation.request_id, answer))
     }
@@ -1259,8 +1275,10 @@ impl TransferModule {
     /// it again, inside its own lock, at each place the mutation begins an effect and around each
     /// commit that makes one durable ([`TransferAdmission`]).
     ///
-    /// `draft_limit` is how many open drafts the caller may hold, which only a paired device is
-    /// held to: `None` is the person at this machine, whose drafts have no bound.
+    /// `device` is what a paired device is held to and shown: how many drafts it may keep open and
+    /// how many uploads it may keep staged, and the bytes its own principal has staged where the
+    /// environment's total is shown to anyone else. `None` is the person at this machine, whose
+    /// drafts and uploads have no bound.
     ///
     /// The answer says whether the service read it from the record of an earlier submission of the
     /// action. A copy goes back only under the authority this attempt arrived under, asked once the
@@ -1278,7 +1296,7 @@ impl TransferModule {
         mutation: &MutationRequest,
         method: Method,
         admission: Arc<TransferAdmission>,
-        draft_limit: Option<u64>,
+        device: Option<DeviceBounds>,
     ) -> Given<Answer<ParamsValue>> {
         let digest = match kr_protocol::digest::mutation_digest(mutation, actor_id) {
             Ok(digest) => digest,
@@ -1384,7 +1402,14 @@ impl TransferModule {
                 match method {
                     Method::UploadBegin => encode(
                         &service
-                            .upload_begin(&actor, &typed(&params)?, Some(&performed))
+                            .upload_begin(
+                                &actor,
+                                &typed(&params)?,
+                                Some(&performed),
+                                device.map(|bounds| kr_transfer::service::DeviceView {
+                                    staged_upload_limit: bounds.staged_uploads,
+                                }),
+                            )
                             .map_err(&told)?,
                     ),
                     Method::UploadChunk => encode(
@@ -1404,6 +1429,7 @@ impl TransferModule {
                     ),
                     Method::DraftCreate => {
                         let params: kr_protocol::transfer::DraftCreateParams = typed(&params)?;
+                        let draft_limit = device.map(|bounds| bounds.open_drafts);
                         let mut made =
                             service.draft_create(&actor, &params, Some(&performed), draft_limit);
                         // The refusal at a device's bound is kept as the action's outcome, so it
@@ -1521,15 +1547,16 @@ impl TransferModule {
             };
             match recorded {
                 None => outcome,
-                // The record is the answer both callers get. The three draft writes record their
-                // own action in the transaction that performs it, and hold the journal's lock from
-                // the look that decides whether they begin (the record for a create, the draft's
-                // revision for the other two, which an earlier attempt's success has moved on) to
-                // that commit, so once that call has reached the place it begins an effect, a record
+                // The record is the answer both callers get. The draft writes, an upload's
+                // reservation and a chunk record their own action in the transaction that performs
+                // it, and hold the journal's lock from the look that decides whether they begin
+                // (the record for a create, a reservation and a chunk, the draft's revision for the
+                // other two draft writes, which an earlier attempt's success has moved on) to that
+                // commit, so once that call has reached the place it begins an effect, a record
                 // that it finds after its own success is its own. A create's second try is a call of
-                // its own, and the mark is cleared before it. The upload writes let go of the lock
-                // after their look at the record, so another copy can record in between: any record
-                // read for them, and for every other method, is a copy.
+                // its own, and the mark is cleared before it. A finish and a cancel let go of the
+                // lock between their claim and its completion, so another copy can record in
+                // between: any record read for them, and for every other method, is a copy.
                 Some(retained) => {
                     let performed_here = outcome.is_ok()
                         && admission.reached()
@@ -1538,6 +1565,8 @@ impl TransferModule {
                             Method::DraftCreate
                                 | Method::DraftUpdate
                                 | Method::AgentDraftAddAttachment
+                                | Method::UploadBegin
+                                | Method::UploadChunk
                         );
                     if !performed_here {
                         found.store(true, Ordering::Release);

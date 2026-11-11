@@ -1135,7 +1135,7 @@ async fn a_create_whose_deadline_passes_after_the_doors_check_writes_nothing() {
             &mutation,
             Method::DraftCreate,
             crate::transfer::TransferAdmission::new(std::sync::Arc::clone(&controller), admission),
-            Some(DEVICE_OPEN_DRAFTS),
+            Some(crate::transfer::PAIRED_DEVICE),
         )
     };
 

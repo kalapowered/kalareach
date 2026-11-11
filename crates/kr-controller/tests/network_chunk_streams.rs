@@ -100,6 +100,7 @@ fn begin_of(host: &Host, actor: &ActorId, session: Option<SessionId>, length: u6
                 original_file_name: "notes.bin".to_owned(),
             },
             None,
+            None,
         )
         .expect("the upload begins")
         .transfer_id

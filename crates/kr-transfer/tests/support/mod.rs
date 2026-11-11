@@ -143,6 +143,7 @@ impl Harness {
                 original_file_name: original_file_name.to_owned(),
             },
             None,
+            None,
         )
     }
 

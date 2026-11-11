@@ -1699,6 +1699,7 @@ fn publish_for(
                 ..begin_params(host, bytes, "notes.bin")
             },
             None,
+            None,
         )
         .expect("reserves the upload");
     let (chunk, payload) = chunk_of(bytes, 0);
