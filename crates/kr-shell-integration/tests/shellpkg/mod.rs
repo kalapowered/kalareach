@@ -124,8 +124,9 @@ fn wait_until_ready(stream: &impl AsFd, flags: PollFlags, within: Duration) {
 /// reported as one the shell ended with data of ours unread. macOS can also answer "not
 /// connected": a write that meets the close while it is being made gets it, and so does every
 /// shutdown of a stream whose peer has closed. This is the one place that lists the forms, for
-/// every read, write and shutdown on the endpoint, so that none of them takes a form the others
-/// know as a fault of the harness.
+/// the session's frame writes, its reads and the shutdown of its endpoint, so that none of them
+/// takes a form the others know as a fault of the harness. A write that must reach a live shell
+/// (the handshake's malformed frame) still fails on any error.
 fn peer_has_gone(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),

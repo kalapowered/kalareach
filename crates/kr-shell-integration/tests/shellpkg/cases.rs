@@ -4713,12 +4713,13 @@ pub fn a_revocation_in_the_same_read_binds_the_launch(kind: ShellKind) {
                 .expect("the second piece is there");
             let (typed, rest) = command.split_at(rest_at);
             session.type_bytes(typed.as_bytes());
-            // The reader says before the revocation is sent that the editor holds the typed text,
-            // and after it that the revocation has been read and the text is still there. Each is
-            // the reader's own answer, not a wait for time to pass: a revocation that met an empty
-            // buffer would leave the line whole whatever it did to a full one. The editor takes
-            // typed text from the terminal on its own time, so the first answer is asked for until
-            // it says it holds the text.
+            // The reader says before the revocation is sent that the editor holds text typed at it,
+            // and after it that the revocation has been read and the buffer still holds text. Each
+            // is the reader's own answer, not a wait for time to pass: a revocation that met an
+            // empty buffer would leave the line whole whatever it did to a full one. The line that
+            // runs at the end is what shows the whole of the text survived. The editor takes typed
+            // text from the terminal on its own time, so the first answer is asked for until it
+            // says it holds some.
             let deadline = session.deadline_for(REPLY);
             loop {
                 let held = session.fence_exchange_before(&enter, fence_id(17), deadline.0);
