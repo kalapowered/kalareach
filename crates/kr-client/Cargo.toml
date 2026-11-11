@@ -77,6 +77,8 @@ aws-lc-rs.workspace = true
 # This crate's own tests, with the seams above compiled in.
 kr-client = { path = ".", default-features = false, features = ["testing"] }
 iroh = { workspace = true, features = ["test-utils"] }
+# The deadlines a case fires by what a lane waits for, and never by a time.
+kr-transport = { workspace = true, features = ["testing"] }
 # A disposable owner-only host tree, so a local endpoint in a test lives on the internal disk and
 # disappears with the test.
 kr-ipc = { workspace = true, features = ["testing"] }
