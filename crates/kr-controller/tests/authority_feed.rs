@@ -7969,7 +7969,8 @@ async fn until_it_holds(condition: impl Fn() -> bool) {
 /// and a device at its bound, a new connection waits and one of the device's other connections ends
 /// at the new connection's count; the waiting connection's device sends a request, and the host
 /// dates it during the wait; and when the waiting connection is the least recent, the next
-/// connection above the bound closes it, long before its wait for the feed would have ended.
+/// connection above the bound closes it while the feed is still held, and not when its wait for the
+/// feed ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_connection_that_waits_for_the_feed_counts_and_is_withdrawn_at_once() {
     let rig = Rig::start().await;
@@ -8041,7 +8042,14 @@ async fn a_connection_that_waits_for_the_feed_counts_and_is_withdrawn_at_once() 
             .answered_before_closing(RequestId::new(u64::MAX), Duration::from_secs(20))
             .await,
         Some(false),
-        "the waiting connection ends at once, not when its wait for the feed ends"
+        "the waiting connection ends"
+    );
+    // It ended while the feed is still held: the connection that waits beside it is not served
+    // yet. Were it the end of their wait that closed the first, both would be past it.
+    assert_eq!(
+        rig.host.connections_of(&record),
+        bound - 1,
+        "the waiting connection ended before the feed answered"
     );
 
     // The feed answers: the connection that waited last is served, and no other was withdrawn.
