@@ -87,12 +87,14 @@ pub fn digest(marker: &str, name: &str, value: &str) -> String {
     text
 }
 
-/// The program the shell pipes the digest's input to, by its absolute path.
+/// The program the shell pipes the digest's input to, by its absolute path and started with an
+/// emptied environment: `shasum` is a Perl script whose interpreter reads `PERL5LIB`, `PERL5OPT`
+/// and other names of the session, which no name of the session may reach.
 const fn digest_program() -> &'static str {
     if cfg!(target_os = "macos") {
-        "/usr/bin/shasum -a 256"
+        "/usr/bin/env -i /usr/bin/shasum -a 256"
     } else {
-        "/usr/bin/sha256sum"
+        "/usr/bin/env -i /usr/bin/sha256sum"
     }
 }
 
@@ -200,7 +202,10 @@ impl Expected {
     }
 
     /// The line to type for the digests of part `part`, whose end row carries `tag`. The line holds
-    /// names and the digest program, and no value.
+    /// names and the digest program, and no value. It calls the shell's builtins by their explicit
+    /// form, so that a function or an alias of the session named `printf` or `print` is not called
+    /// with a value, and it turns tracing and echo off before any value is expanded and sets back
+    /// the ones that were on.
     #[must_use]
     pub fn value_line(&self, part: usize, tag: usize) -> String {
         let names: Vec<&str> = self
@@ -209,11 +214,14 @@ impl Expected {
             .map(|(name, _)| name.as_str())
             .collect();
         format!(
-            "for n in {names}; do if [[ ${{parameters[$n]}} == *export* ]]; then \
-             d=$(printf '%s\\0%s\\0%s' \"${{{marker}}}\" \"$n\" \"${{(P)n}}\" | {program}); \
-             print -r -- \"{ROW} value $n ${{d[1,{DIGEST_CHARACTERS}]}}\"; \
-             else print -r -- \"{ROW} value $n missing\"; fi; done; unset d n; \
-             print -r -- \"{ROW} end {tag}\"",
+            "t=; [[ -o xtrace ]] && t=x; [[ -o verbose ]] && t=${{t}}v; \
+             builtin unsetopt xtrace verbose; \
+             for n in {names}; do if [[ ${{parameters[$n]}} == *export* ]]; then \
+             d=$(builtin printf '%s\\0%s\\0%s' \"${{{marker}}}\" \"$n\" \"${{(P)n}}\" | {program}); \
+             builtin print -r -- \"{ROW} value $n ${{d[1,{DIGEST_CHARACTERS}]}}\"; \
+             else builtin print -r -- \"{ROW} value $n missing\"; fi; done; builtin unset d n; \
+             [[ $t == *x* ]] && builtin setopt xtrace; [[ $t == *v* ]] && builtin setopt verbose; \
+             builtin unset t; builtin print -r -- \"{ROW} end {tag}\"",
             names = names.join(" "),
             marker = self.marker_name,
             program = digest_program(),
@@ -228,8 +236,9 @@ impl Expected {
         let (first, last) = (skipped + 1, skipped + PART_NAMES);
         format!(
             "e=(${{(ko)parameters[(R)*export*]}}); i={skipped}; for n in ${{e[{first},{last}]}}; do \
-             i=$((i+1)); print -r -- \"{ROW} exported $i $n\"; done; \
-             print -r -- \"{ROW} total ${{#e}}\"; unset e i n; print -r -- \"{ROW} end {tag}\""
+             i=$((i+1)); builtin print -r -- \"{ROW} exported $i $n\"; done; \
+             builtin print -r -- \"{ROW} total ${{#e}}\"; builtin unset e i n; \
+             builtin print -r -- \"{ROW} end {tag}\""
         )
     }
 
@@ -903,16 +912,23 @@ mod tests {
             &[],
         )
         .expect("an expectation");
-        let run = |environment: &[(String, String)]| -> Answer {
+        // Runs the lines in a shell started with `prelude` typed first, as the session's start-up
+        // text would be, and returns what the shell answered and everything it wrote to its screen
+        // (its output and its error output, as one terminal shows both).
+        let run_after = |prelude: &str, environment: &[(String, String)]| -> (Answer, String) {
+            let shown = std::cell::RefCell::new(String::new());
             let ask = |line: &str| -> Vec<String> {
                 let output = std::process::Command::new(zsh)
                     .args(["-f", "-c"])
-                    .arg(format!("zmodload zsh/parameter; {line}"))
+                    .arg(format!("zmodload zsh/parameter; {prelude}\n{line}"))
                     .env_clear()
                     .envs(environment.iter().cloned())
                     .output()
                     .expect("zsh runs");
                 assert!(output.status.success(), "{output:?}");
+                shown
+                    .borrow_mut()
+                    .push_str(&String::from_utf8_lossy(&output.stderr));
                 String::from_utf8_lossy(&output.stdout)
                     .lines()
                     .map(str::to_owned)
@@ -939,8 +955,9 @@ mod tests {
                     break;
                 }
             }
-            Answer { readings, exported }
+            (Answer { readings, exported }, shown.into_inner())
         };
+        let run = |environment: &[(String, String)]| run_after("", environment).0;
         let given: Vec<(String, String)> = list
             .iter()
             .filter(|(name, _)| !host_owns_variable(name))
@@ -985,6 +1002,54 @@ mod tests {
         assert!(
             why.contains("GROQ_API_KEY") && !why.contains("not-a-real-key"),
             "{why}"
+        );
+        // A shell whose start-up text defines functions named for the builtins the lines call and
+        // turns tracing and echo on, and whose environment holds a name the digest program's
+        // interpreter reads: the answer is the same, and no function is called, and nothing the
+        // shell writes besides the answer holds a value.
+        let prelude = "printf() { builtin print -r -- LEAK-PRINTF \"$@\" >&2; builtin printf \"$@\"; }; \
+                       print() { builtin print -r -- LEAK-PRINT \"$@\" >&2; builtin print \"$@\"; }; \
+                       unset() { builtin print -r -- LEAK-UNSET \"$@\" >&2; builtin unset \"$@\"; }; \
+                       setopt xtrace verbose";
+        let mut hostile = given.clone();
+        hostile.push(("PERL5OPT".to_owned(), "-Mno::such::module".to_owned()));
+        let (answer, shown) = run_after(prelude, &hostile);
+        assert_eq!(expected.judge(&answer.readings, &answer.exported), Ok(()));
+        for called in ["LEAK-PRINTF", "LEAK-PRINT", "LEAK-UNSET"] {
+            assert!(!shown.contains(called), "{called} was called: {shown}");
+        }
+        for (name, value) in &given {
+            assert!(
+                value.len() < SHORTEST_VALUE_CHECKED || !shown.contains(value.as_str()),
+                "the value of {name} is on the shell's screen"
+            );
+        }
+        // The options the line turned off are set back where they were on, and left off where
+        // they were off.
+        let options_after = |before: &str| -> String {
+            let output = std::process::Command::new(zsh)
+                .args(["-f", "-c"])
+                .arg(format!(
+                    "zmodload zsh/parameter; {before}\n{}\n\
+                     [[ -o xtrace ]] && builtin print -r -- XTRACE-ON; \
+                     [[ -o verbose ]] && builtin print -r -- VERBOSE-ON; true",
+                    expected.value_line(0, 0)
+                ))
+                .env_clear()
+                .envs(given.iter().cloned())
+                .output()
+                .expect("zsh runs");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        let on = options_after("setopt xtrace verbose");
+        assert!(
+            on.contains("XTRACE-ON") && on.contains("VERBOSE-ON"),
+            "tracing and echo are set back on: {on}"
+        );
+        let off = options_after("");
+        assert!(
+            !off.contains("XTRACE-ON") && !off.contains("VERBOSE-ON"),
+            "tracing and echo stay off: {off}"
         );
     }
 }

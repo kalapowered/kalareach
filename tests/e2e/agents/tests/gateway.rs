@@ -3508,6 +3508,24 @@ fn gateway_the_session_environment_is_read_at_the_prompt_before_the_first_typing
             .all(|(_, value)| !compared.contains(value.as_str())),
         "a pass holds no value: {compared}"
     );
+    // A function of the session named `printf`, which says so when a word it is given holds the
+    // run's marker, as the check's line hands the marker's value to the builtin: the check calls
+    // the builtin, so the function is not run with a value, and the answer is read as it was. The
+    // word the function prints is made by the shell, so that the typed definition does not show it.
+    session.person.types(&format!(
+        "printf() {{ [[ \"$*\" == *\"${}\"* ]] && builtin print -r -- KR-$((6*7))-PRINTF; \
+         builtin printf \"$@\"; }}",
+        ctx.run.mark().0
+    ));
+    session
+        .person
+        .reads_the_environment(&session.person.expected)
+        .unwrap_or_else(|why| panic!("the check reads past a function named printf: {why}"));
+    let screen = session.person.window.screen().join("\n");
+    assert!(
+        !screen.contains("KR-42-PRINTF"),
+        "the function printf was called with a value by a line of the check: {screen}"
+    );
     let refused = |expected: &Expected| {
         session
             .person
