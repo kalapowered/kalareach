@@ -47,6 +47,11 @@ const LAUNCH_EVERY: Duration = Duration::from_secs(2);
 /// The longest one program of the proof may run, when the deadline leaves that long.
 const PROGRAM_BOUND: Duration = Duration::from_secs(30);
 
+/// How much of the deadline is kept for the application-control log's last words, which the failure
+/// of the search for a refusal quotes. The search stops that long before the deadline, and the query
+/// that follows stays within the deadline itself.
+const DIAGNOSTIC_RESERVE: Duration = Duration::from_secs(20);
+
 /// How much of the time before the deadline is left, or the proof's failure when none is.
 fn left_before(deadline: Instant) -> Result<Duration, Proof> {
     let left = deadline.saturating_duration_since(Instant::now());
@@ -55,6 +60,13 @@ fn left_before(deadline: Instant) -> Result<Duration, Proof> {
     } else {
         Ok(left)
     }
+}
+
+/// The deadline of one program of the proof: the proof's own, or [`PROGRAM_BOUND`] from now when that
+/// comes first, and never later than `limit`. The proof's failure when no time is left.
+fn program_deadline(deadline: Instant, limit: Instant) -> Result<Instant, Proof> {
+    left_before(deadline)?;
+    Ok(limit.min(Instant::now() + PROGRAM_BOUND))
 }
 
 /// The result of a proof.
@@ -110,18 +122,27 @@ pub struct Captured {
     pub stderr: Vec<u8>,
 }
 
-/// Runs a program of the proof to its end, up to a bound, and keeps what it wrote.
+/// Runs a program of the proof to its end, up to an absolute deadline, and keeps what it wrote.
 ///
 /// The program has a job of its own, which is ended before the function returns, so nothing it
 /// started outlives the call. Its process and thread name the token's group and the system, or the
 /// system alone for the broker's own token. It belongs to no invocation, so its permit to resume
 /// is the proof's own: this is the one place that makes one.
 ///
+/// Nothing in the call waits past the deadline: the program is waited for until [`END_RESERVE`]
+/// before it, the job's end and the pipes' end take the rest, and a program that is not shown to
+/// have ended by the deadline is an uncertain end and not a late success.
+///
 /// # Errors
 ///
-/// Returns [`LaunchError::NotStarted`] when the platform refuses to start the program, and the
-/// other errors of [`launch`] and of the pipes.
-pub fn run_captured(run: Run<'_>, bound: Duration) -> Result<Captured, LaunchError> {
+/// Returns [`LaunchError::NotStarted`] when the platform refuses to start the program, the other
+/// errors of [`launch`] and of the pipes, and [`LaunchError::EndUncertain`] when the job's end is
+/// not proved, when a child reported that it was not seen to end (also on a launch that failed
+/// after the process was made), or when a pipe did not reach its end after the job's end.
+pub fn run_captured(run: Run<'_>, deadline: Instant) -> Result<Captured, LaunchError> {
+    if Instant::now() >= deadline {
+        return Err(LaunchError::DeadlinePassed);
+    }
     let mut job = Job::new(Limits::INVOCATION)?;
     let (out_read, out_write) = pipe()?;
     let (err_read, err_write) = pipe()?;
@@ -132,7 +153,7 @@ pub fn run_captured(run: Run<'_>, bound: Duration) -> Result<Captured, LaunchErr
             ..Principals::default()
         },
     )?;
-    let suspended = launch(ChildSpec {
+    let launched = launch(ChildSpec {
         invocation: None,
         token: run.token,
         job: &job,
@@ -145,53 +166,89 @@ pub fn run_captured(run: Run<'_>, bound: Duration) -> Result<Captured, LaunchErr
         stderr: Std::Pipe(err_write),
         process_descriptor: &descriptor,
         thread_descriptor: &descriptor,
-    })?;
-    // The readers stop at a deadline of their own, so that a process that keeps the pipes open
-    // after the job's end is not waited for: the end is then not proved and the call says so.
-    let deadline = Instant::now() + bound + JOB_END_BOUND + READER_GRACE;
+    });
+    let suspended = match launched {
+        Ok(suspended) => suspended,
+        Err(error) => return Err(after_failed_launch(&mut job, error, deadline)),
+    };
+    let wait_until = deadline
+        .checked_sub(END_RESERVE)
+        .unwrap_or_else(Instant::now);
     let (result, out, err) = std::thread::scope(|scope| {
+        // The readers stop at the deadline, so that a process that keeps the pipes open after the
+        // job's end is not waited for: the end is then not proved and the call says so.
         let out = scope.spawn(|| read_pipe(&out_read, deadline));
         let err = scope.spawn(|| read_pipe(&err_read, deadline));
         let permit = ResumePermit::for_proof(&suspended);
         let result = match suspended.resume(permit) {
             Ok(child) => {
-                let waited = child.wait(bound);
+                let waited = child.wait(wait_until.saturating_duration_since(Instant::now()));
                 // Anything the program started ends with the job, which also lets the pipes
                 // reach their end. A program still running at the bound is ended the same way.
-                let ended = job.end(&[&child], JOB_END_BOUND);
-                if ended.proved() {
-                    match waited {
+                let ended = job.end(
+                    &[&child],
+                    deadline.saturating_duration_since(Instant::now()),
+                );
+                match settled(&job, ended) {
+                    Ok(()) => match waited {
                         Ok(Some(code)) => Ok(Outcome::Ran(code)),
                         Ok(None) => Ok(Outcome::TimedOut),
                         Err(error) => Err(LaunchError::Platform(error)),
-                    }
-                } else {
-                    Err(uncertain_end(&job, ended))
+                    },
+                    Err(uncertain) => Err(uncertain),
                 }
             }
-            Err(error) => {
-                let ended = job.end(&[], JOB_END_BOUND);
-                if ended.proved() {
-                    Err(error)
-                } else {
-                    Err(uncertain_end(&job, ended))
-                }
-            }
+            Err(error) => Err(after_failed_launch(&mut job, error, deadline)),
         };
         (result, out.join(), err.join())
     });
+    let outcome = result?;
+    // The job's end is proved, so every process of it has exited. A pipe that is still open then
+    // has a writer that is not shown to have ended, and what the program wrote may be incomplete.
+    let (Ok(out), Ok(err)) = (out, err) else {
+        return Err(LaunchError::EndUncertain(
+            "a reader of the program's output failed".to_owned(),
+        ));
+    };
+    if !out.ended || !err.ended {
+        return Err(LaunchError::EndUncertain(format!(
+            "a pipe of a program of the proof was still open after the end of its job (standard output ended {}, standard error ended {})",
+            out.ended, err.ended
+        )));
+    }
     Ok(Captured {
-        outcome: result?,
-        stdout: out.map(|piped| piped.bytes).unwrap_or_default(),
-        stderr: err.map(|piped| piped.bytes).unwrap_or_default(),
+        outcome,
+        stdout: out.bytes,
+        stderr: err.bytes,
     })
 }
 
-/// How long a proof program's job is waited for after it is ended.
-const JOB_END_BOUND: Duration = Duration::from_secs(10);
+/// How much of a run's time before its deadline is kept for the job's end and for the pipes' end.
+/// A job whose processes are ended is empty within milliseconds, so this is generous, and it is
+/// part of the deadline, not an addition to it.
+const END_RESERVE: Duration = Duration::from_secs(2);
 
-/// How long the readers go on after the end of the job, for what the pipes still hold.
-const READER_GRACE: Duration = Duration::from_secs(5);
+/// What a launch that failed leaves: the job is ended and the job's reports are read, because the
+/// launch may have made a process before it failed (a process that is not in the job, a thread
+/// that cannot be held, a time that cannot be read) and the child it ended on the way may not have
+/// been seen to end. The error is the launch's own unless the end is not proved.
+fn after_failed_launch(job: &mut Job, error: LaunchError, deadline: Instant) -> LaunchError {
+    let ended = job.end(&[], deadline.saturating_duration_since(Instant::now()));
+    match settled(job, ended) {
+        Ok(()) => error,
+        Err(uncertain) => uncertain,
+    }
+}
+
+/// Whether the end of a job is proved and nothing reported otherwise: the job's own count and its
+/// retained processes agree, and no child told the owner that it was not seen to end.
+fn settled(job: &Job, ended: Ended) -> Result<(), LaunchError> {
+    if ended.proved() && job.unproved_reasons().is_empty() {
+        Ok(())
+    } else {
+        Err(uncertain_end(job, ended))
+    }
+}
 
 /// The error for a job that was not shown empty: the end is uncertain, the reasons are the job's
 /// own.
@@ -235,7 +292,7 @@ fn run_program(
     arguments: &[&str],
     cwd: &Path,
     env: &EnvBlock,
-    bound: Duration,
+    deadline: Instant,
 ) -> Result<Captured, LaunchError> {
     let name = program.display().to_string();
     let mut parts = vec![name.as_str()];
@@ -249,7 +306,7 @@ fn run_program(
             cwd,
             env,
         },
-        bound,
+        deadline,
     )
 }
 
@@ -409,6 +466,7 @@ pub fn prove(
     // is started again, one launch every two seconds, until the refusal and an event of the log
     // that names this rule, this account and this program are both in hand.
     let started = Instant::now();
+    let search_until = deadline.checked_sub(DIAGNOSTIC_RESERVE).unwrap_or(deadline);
     let mut attempts = 0_u32;
     let mut refused = false;
     let mut last: String;
@@ -416,8 +474,8 @@ pub fn prove(
         if stop.is_set() {
             return fail("the service is stopping");
         }
-        let left = match left_before(deadline) {
-            Ok(left) => left,
+        let by = match program_deadline(deadline, search_until) {
+            Ok(by) => by,
             Err(failed) => return failed,
         };
         attempts += 1;
@@ -428,7 +486,7 @@ pub fn prove(
             &[],
             &scratch.0,
             &environment,
-            left.min(PROGRAM_BOUND),
+            by,
         );
         match judge_launch(launched, refused, &account, attempts) {
             Ok(Seen::Refused) => {
@@ -456,13 +514,11 @@ pub fn prove(
                 Err(error) => return fail(error.to_string()),
             }
         }
-        if Instant::now() >= deadline {
-            let log = applocker::latest(
-                &scratch.0,
-                &environment,
-                Instant::now() + Duration::from_secs(30),
-            )
-            .unwrap_or_else(|error| format!("unreadable: {error}"));
+        if Instant::now() >= search_until {
+            // The log's last words come from the time kept for them, and the query stays within the
+            // deadline like everything else.
+            let log = applocker::latest(&scratch.0, &environment, deadline)
+                .unwrap_or_else(|error| format!("unreadable: {error}"));
             let seen = if refused {
                 "refused, but the log named no rule"
             } else {
@@ -473,14 +529,16 @@ pub fn prove(
                 started.elapsed().as_secs_f32()
             ));
         }
-        std::thread::sleep(LAUNCH_EVERY.min(deadline.saturating_duration_since(Instant::now())));
+        std::thread::sleep(
+            LAUNCH_EVERY.min(search_until.saturating_duration_since(Instant::now())),
+        );
     }
     let git_exe = Path::new(&git.dir)
         .join("mingw64")
         .join("bin")
         .join("git.exe");
-    let left = match left_before(deadline) {
-        Ok(left) => left,
+    let by = match program_deadline(deadline, deadline) {
+        Ok(by) => by,
         Err(failed) => return failed,
     };
     match run_program(
@@ -490,7 +548,7 @@ pub fn prove(
         &["--version"],
         &scratch.0,
         &environment,
-        left.min(PROGRAM_BOUND),
+        by,
     ) {
         Ok(Captured {
             outcome: Outcome::Ran(0),
@@ -504,8 +562,8 @@ pub fn prove(
         }
         Err(error) => return fail(error.to_string()),
     }
-    let left = match left_before(deadline) {
-        Ok(left) => left,
+    let by = match program_deadline(deadline, deadline) {
+        Ok(by) => by,
         Err(failed) => return failed,
     };
     match run_program(
@@ -515,7 +573,7 @@ pub fn prove(
         &[],
         &scratch.0,
         &environment,
-        left.min(PROGRAM_BOUND),
+        by,
     ) {
         Ok(Captured {
             outcome: Outcome::Ran(0),
@@ -580,8 +638,8 @@ pub fn release(
         if stop.is_set() {
             return fail("the service is stopping");
         }
-        let left = match left_before(deadline) {
-            Ok(left) => left,
+        let by = match program_deadline(deadline, deadline) {
+            Ok(by) => by,
             Err(failed) => return failed,
         };
         attempts += 1;
@@ -592,7 +650,7 @@ pub fn release(
             &["/c", "exit", "0"],
             staging,
             &environment,
-            left.min(PROGRAM_BOUND),
+            by,
         ) {
             Ok(Captured {
                 outcome: Outcome::Ran(0),

@@ -13,7 +13,7 @@ use std::ffi::c_void;
 use std::process::ExitCode;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Once, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::ERROR_FAILED_SERVICE_CONTROLLER_CONNECT;
@@ -39,10 +39,11 @@ use super::token::enable_privilege;
 
 /// The most connections served at once.
 const MAX_CONNECTIONS: usize = 8;
-/// How long after the broker's start the proofs it is asked for may take, all together: the log
-/// names the rule about 170 s after the start of Windows. The deadline is one absolute time, and
-/// every wait and every program of a proof stays within it. A request that comes after it begins a
-/// window of the same length, for a rerun.
+/// How long a cycle of proofs lasts, all the proofs of it together: the log names the rule about
+/// 170 s after the start of Windows. A cycle has one absolute deadline, and every wait, every query
+/// of the log and every program of a proof stays within it. The first cycle begins with the
+/// broker's start. A proof asked after the open cycle has ended is a new cycle of its own, which
+/// begins with that request and has its own deadline; it never extends the one that ended.
 pub const PROOF_BOUND: Duration = Duration::from_secs(300);
 
 /// The error mode of the broker and, by inheritance, of every child it starts: the system shows no
@@ -135,22 +136,42 @@ struct State {
     paths: Paths,
     maintenance: AtomicBool,
     stop: Arc<Stop>,
-    /// When the broker began serving.
-    started: Instant,
+    /// The deadline of the cycle of proofs that is open. The first ends [`PROOF_BOUND`] after the
+    /// broker's start.
+    cycle: Mutex<Instant>,
 }
 
 impl State {
-    /// The deadline of a proof that is asked for now: the one that ends [`PROOF_BOUND`] after the
-    /// broker's start while that is still ahead, so that the proofs of both classes share it, and a
-    /// window of the same length from now when it has passed.
-    fn proof_deadline(&self) -> Instant {
-        let window = self.started + PROOF_BOUND;
-        let now = Instant::now();
-        if now < window {
-            window
-        } else {
-            now + PROOF_BOUND
+    /// The state of a broker that began serving now.
+    fn begun(manifest: Manifest, paths: Paths, stop: Arc<Stop>) -> State {
+        State::with_first_cycle(manifest, paths, stop, Instant::now() + PROOF_BOUND)
+    }
+
+    fn with_first_cycle(
+        manifest: Manifest,
+        paths: Paths,
+        stop: Arc<Stop>,
+        first_deadline: Instant,
+    ) -> State {
+        State {
+            manifest,
+            paths,
+            maintenance: AtomicBool::new(false),
+            stop,
+            cycle: Mutex::new(first_deadline),
         }
+    }
+
+    /// The deadline of a proof that is asked for now: that of the open cycle, so that the proofs of
+    /// both classes asked within it share it. When the open cycle has ended, this request begins
+    /// the next one, [`PROOF_BOUND`] long, and the deadline of the earlier one is not touched.
+    fn proof_deadline(&self) -> Instant {
+        let mut open = self.cycle.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        if now >= *open {
+            *open = now + PROOF_BOUND;
+        }
+        *open
     }
 }
 
@@ -234,13 +255,9 @@ fn serve() -> Result<(), String> {
         .collect();
     let mut listener =
         Listener::bind(&people, Arc::clone(&stop)).map_err(|error| error.to_string())?;
-    let state = Arc::new(State {
-        manifest,
-        paths,
-        maintenance: AtomicBool::new(false),
-        stop: Arc::clone(&stop),
-        started: Instant::now(),
-    });
+    // The cycle begins before the service reports that it runs, so a client that sees it running
+    // begins its own count no earlier than the broker's.
+    let state = Arc::new(State::begun(manifest, paths, Arc::clone(&stop)));
     report(SERVICE_RUNNING, 0, 0);
     run(&mut listener, &state)
 }
@@ -281,7 +298,6 @@ fn run(listener: &mut Listener, state: &Arc<State>) -> Result<(), String> {
 #[cfg(feature = "testing")]
 pub mod testing {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
 
     use crate::manifest::Manifest;
 
@@ -304,13 +320,7 @@ pub mod testing {
     ) -> Result<(), String> {
         let mut listener =
             Listener::bind(people, Arc::clone(&stop)).map_err(|error| error.to_string())?;
-        let state = Arc::new(State {
-            manifest,
-            paths,
-            maintenance: AtomicBool::new(false),
-            stop,
-            started: std::time::Instant::now(),
-        });
+        let state = Arc::new(State::begun(manifest, paths, stop));
         run(&mut listener, &state)
     }
 }
@@ -502,4 +512,44 @@ pub fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_with_first_cycle_ending(deadline: Instant) -> State {
+        State::with_first_cycle(
+            Manifest::begin(),
+            Paths::system(),
+            Stop::new().expect("an event is made"),
+            deadline,
+        )
+    }
+
+    #[test]
+    fn the_proofs_of_an_open_cycle_share_its_deadline() {
+        let ends = Instant::now() + Duration::from_secs(3600);
+        let state = state_with_first_cycle_ending(ends);
+        assert_eq!(state.proof_deadline(), ends);
+        assert_eq!(state.proof_deadline(), ends, "the second class shares it");
+    }
+
+    #[test]
+    fn a_proof_asked_after_the_cycle_ended_begins_a_cycle_of_its_own_that_later_requests_share() {
+        let ended = Instant::now();
+        let state = state_with_first_cycle_ending(ended);
+        let asked = Instant::now();
+        let next = state.proof_deadline();
+        assert!(next >= asked + PROOF_BOUND, "a window of its own");
+        assert!(
+            next > ended + PROOF_BOUND / 2,
+            "the ended cycle gives it nothing"
+        );
+        assert_eq!(
+            state.proof_deadline(),
+            next,
+            "the cycle's other requests share it"
+        );
+    }
 }

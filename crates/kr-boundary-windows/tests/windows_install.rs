@@ -520,7 +520,7 @@ fn removal_keeps_an_administrators_later_rule_and_the_rule_that_lets_others_run(
             cwd: &folder,
             env: &environment,
         },
-        std::time::Duration::from_secs(30),
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
     )
     .unwrap()
     .outcome;
@@ -830,6 +830,44 @@ fn recorded_calls(log: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The newest record number of the application-control log, read by the case itself.
+fn newest_log_record() -> u64 {
+    let output = Command::new("wevtutil")
+        .args([
+            "qe",
+            "Microsoft-Windows-AppLocker/EXE and DLL",
+            "/c:1",
+            "/rd:true",
+            "/f:xml",
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.split("<EventRecordID>")
+        .nth(1)
+        .and_then(|rest| rest.split('<').next())
+        .and_then(|number| number.parse().ok())
+        .unwrap_or(0)
+}
+
+/// What the installation recorded of the policy's write and of the event it took for the platform's
+/// report of it: the record the write began after and the record of the event.
+fn policy_records(calls: &[String]) -> (u64, u64) {
+    let number = |prefix: &str| -> u64 {
+        calls
+            .iter()
+            .find_map(|call| call.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("the installation recorded no {prefix:?}: {calls:?}"))
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    (
+        number("policy written after record "),
+        number("policy applied by record "),
+    )
+}
+
 fn call_log() -> PathBuf {
     let log = std::env::temp_dir().join(format!(
         "krcalls-{}.txt",
@@ -855,6 +893,7 @@ fn an_application_identity_service_that_already_runs_is_never_stopped_and_the_ev
     appid
         .wait_for(false, std::time::Duration::from_secs(60))
         .unwrap();
+    let log_before_install = newest_log_record();
     let log = call_log();
     let (code, output) = case.payload(
         "payload",
@@ -867,6 +906,18 @@ fn an_application_identity_service_that_already_runs_is_never_stopped_and_the_ev
             .iter()
             .any(|call| call == "appid stop" || call == "appid start"),
         "a running service is neither stopped nor started: {calls:?}"
+    );
+    // The event the installation took came after the write: its record is past the one the writing
+    // process read right before it wrote, which is past everything the log held before the
+    // installation began. The order of the messages shows none of this.
+    let (after_record, applied_record) = policy_records(&calls);
+    assert!(
+        after_record >= log_before_install,
+        "the record was read by the installation, after the case's own read: {after_record} < {log_before_install}"
+    );
+    assert!(
+        applied_record > after_record,
+        "the event is past the record read before the write: {applied_record} <= {after_record}"
     );
     assert!(output.contains("already running"), "{output}");
     assert!(
@@ -910,6 +961,7 @@ fn a_stopped_application_identity_service_is_started_once_and_its_first_event_co
         !original.appid_running,
         "the guest begins with the service stopped"
     );
+    let log_before_install = newest_log_record();
     let log = call_log();
     let (code, output) = case.payload(
         "payload",
@@ -921,6 +973,12 @@ fn a_stopped_application_identity_service_is_started_once_and_its_first_event_co
         calls.iter().filter(|call| *call == "appid start").count(),
         1,
         "{calls:?}"
+    );
+    let (after_record, applied_record) = policy_records(&calls);
+    assert!(after_record >= log_before_install, "{calls:?}");
+    assert!(
+        applied_record > after_record,
+        "the event after the write is not one of the service's first: {applied_record} <= {after_record}"
     );
     assert!(!calls.iter().any(|call| call == "appid stop"), "{calls:?}");
     let started = output
@@ -934,6 +992,40 @@ fn a_stopped_application_identity_service_is_started_once_and_its_first_event_co
     assert_eq!(code, 0, "{output}");
     assert_eq!(snapshot(), original);
     let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn an_answer_that_does_not_come_by_the_deadline_is_not_waited_for() {
+    use kr_boundary_windows::win::pipe::{self, Listener, Stop};
+    let stop = Stop::new().unwrap();
+    let system = Sid::parse("S-1-5-18").unwrap();
+    let mut listener = Listener::bind(&[system], std::sync::Arc::clone(&stop)).unwrap();
+    // A broker that accepts and never answers: it holds the connection until it is told to stop.
+    let server = std::thread::spawn({
+        let stop = std::sync::Arc::clone(&stop);
+        move || {
+            let held = listener.accept();
+            while !stop.is_set() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            drop(held);
+        }
+    });
+    let mut connection = pipe::connect(std::process::id()).unwrap();
+    let bound = std::time::Duration::from_secs(2);
+    let begun = std::time::Instant::now();
+    connection.set_deadline(Some(begun + bound));
+    let refused = install::ask(&mut connection, &Request::Status {});
+    let elapsed = begun.elapsed();
+    stop.set();
+    server.join().unwrap();
+    let text = refused.expect_err("nothing answered").to_string();
+    assert!(text.contains("deadline"), "{text}");
+    assert!(
+        elapsed >= bound && elapsed < bound + std::time::Duration::from_secs(5),
+        "the wait ended at the deadline: {elapsed:?}"
+    );
 }
 
 /// How long the process has existed.

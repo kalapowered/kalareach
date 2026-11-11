@@ -49,7 +49,7 @@ use kr_boundary_windows::win::ffi::{Handle, Sid, system_windows_directory};
 use kr_boundary_windows::win::job::{Job, LIMIT_FLAGS, Limits, ReadBack, State};
 use kr_boundary_windows::win::journal::{Journal, JournalError, file_name};
 use kr_boundary_windows::win::launch::{
-    ChildSpec, InvocationId, LaunchError, ResumePermit, Std, SuspendedChild, TokenSpec,
+    ChildSpec, InvocationId, LaunchError, Outcome, ResumePermit, Std, SuspendedChild, TokenSpec,
     VerifiedPath, launch, pipe, read_pipe, testing,
 };
 use kr_boundary_windows::win::sd::{OwnedSd, Principals, SdKind, descriptor, descriptor_from_text};
@@ -1087,6 +1087,136 @@ fn a_reader_of_a_pipe_that_a_process_still_holds_open_stops_at_its_deadline() {
     let closed = read_pipe(&read, Instant::now() + Duration::from_secs(60));
     assert!(closed.bytes.is_empty());
     assert!(closed.ended);
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_reader_of_a_pipe_that_a_writer_keeps_supplying_stops_at_its_deadline() {
+    let (read, write) = pipe().unwrap();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let bound = Duration::from_millis(500);
+    let (piped, elapsed) = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            let chunk = [b'x'; 4096];
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let mut written = 0_u32;
+                // SAFETY: the write end is open and the buffer is the length given.
+                let ok = unsafe {
+                    WriteFile(
+                        write.raw(),
+                        chunk.as_ptr().cast(),
+                        chunk.len() as u32,
+                        &raw mut written,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 {
+                    break;
+                }
+            }
+        });
+        let begun = Instant::now();
+        let piped = read_pipe(&read, begun + bound);
+        let elapsed = begun.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        // A write that is blocked on a full pipe is released by draining it.
+        let _ = read_pipe(&read, Instant::now() + Duration::from_millis(200));
+        drop(writer);
+        (piped, elapsed)
+    });
+    assert!(!piped.ended, "a pipe a writer still fills has not ended");
+    assert!(!piped.bytes.is_empty(), "what was read is kept");
+    assert!(
+        elapsed >= bound && elapsed < bound + Duration::from_secs(2),
+        "the reader returned at its deadline although data was always waiting: {elapsed:?}"
+    );
+}
+
+/// A program of the proof that is the stand-in with one mode: `report` ends at once, `sleep` does not.
+fn proof_run<'a>(fixture: &'a Fixture, mode: &str) -> kr_boundary_windows::win::proof::Run<'a> {
+    let arguments: &[&str] = if mode == "sleep" {
+        &["sleep", "600000"]
+    } else {
+        &["report"]
+    };
+    let name = fixture.stand_in.display().to_string();
+    let mut parts = vec![name.as_str()];
+    parts.extend_from_slice(arguments);
+    kr_boundary_windows::win::proof::Run {
+        token: TokenSpec::Boundary(&fixture.token),
+        group: Some(&fixture.group),
+        program: VerifiedPath::new(&fixture.stand_in).unwrap(),
+        command_line: quote_command_line(&parts),
+        cwd: &fixture.scratch,
+        env: &fixture.env,
+    }
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_launch_that_fails_after_the_process_was_made_is_an_uncertain_end_for_the_proofs_runner() {
+    let fixture = Fixture::new();
+    // The control: a program that runs and ends is a success, with its pipes ended.
+    let control = kr_boundary_windows::win::proof::run_captured(
+        proof_run(&fixture, "report"),
+        Instant::now() + Duration::from_secs(30),
+    )
+    .expect("a program that runs is a success");
+    assert_eq!(control.outcome, Outcome::Ran(0));
+    // A failure after the process was made, and the child not seen to end: the runner says the end
+    // is uncertain and does not return the launch's own error.
+    testing::skip_next_termination();
+    testing::fail_next_launch_after_creation();
+    let begun = Instant::now();
+    let failed = kr_boundary_windows::win::proof::run_captured(
+        proof_run(&fixture, "sleep"),
+        Instant::now() + Duration::from_secs(30),
+    )
+    .expect_err("the launch failed");
+    assert!(
+        matches!(&failed, LaunchError::EndUncertain(text) if text.contains("not seen to end")),
+        "{failed:?}"
+    );
+    assert!(
+        begun.elapsed() < Duration::from_secs(30),
+        "within the deadline"
+    );
+    // The control for the same failure when the child ends at once: the launch's own error comes back.
+    testing::fail_next_launch_after_creation();
+    let failed = kr_boundary_windows::win::proof::run_captured(
+        proof_run(&fixture, "sleep"),
+        Instant::now() + Duration::from_secs(30),
+    )
+    .expect_err("the launch failed");
+    assert!(
+        matches!(&failed, LaunchError::Platform(_)),
+        "an end that is proved leaves the launch's own error: {failed:?}"
+    );
+    // A deadline that has passed starts nothing.
+    let late =
+        kr_boundary_windows::win::proof::run_captured(proof_run(&fixture, "sleep"), Instant::now());
+    assert!(matches!(late, Err(LaunchError::DeadlinePassed)), "{late:?}");
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_program_that_outlasts_the_deadline_is_ended_and_the_call_returns_within_it() {
+    let fixture = Fixture::new();
+    let bound = Duration::from_secs(8);
+    let begun = Instant::now();
+    let ran =
+        kr_boundary_windows::win::proof::run_captured(proof_run(&fixture, "sleep"), begun + bound)
+            .expect("a program that outlasts the deadline is ended and proved ended");
+    let elapsed = begun.elapsed();
+    assert_eq!(ran.outcome, Outcome::TimedOut);
+    assert!(
+        elapsed < bound + Duration::from_millis(500),
+        "the call returned within its deadline, the end of the job and of the pipes included: {elapsed:?}"
+    );
+    assert!(
+        elapsed > bound - Duration::from_secs(4),
+        "the program was given the time before the reserve for the end: {elapsed:?}"
+    );
 }
 
 /// The name a pipe has in the pipe namespace, from the platform.
