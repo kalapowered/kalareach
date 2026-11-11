@@ -212,6 +212,153 @@ fn a_leftover_comes_before_the_end_and_an_end_out_of_order_is_refused() {
     assert!(tracker.holds_the_slot());
 }
 
+/// Rows that bring a tracker to the point a refusal is shown from, and the row that is refused there.
+fn refused_after(rows: &[Row], refused: &Row) -> bool {
+    let mut tracker = Tracker::new();
+    for row in rows {
+        tracker.apply(row).expect("the setup rows are in order");
+    }
+    tracker.apply(refused).is_err()
+}
+
+#[test]
+fn every_row_that_comes_out_of_order_is_refused() {
+    let intent = |path: &str| Row::RootIntent {
+        path: path.to_owned(),
+    };
+    let verified = Row::ReleaseVerified {
+        objects: 0,
+        leftovers: 0,
+    };
+    let leftover = |class| Row::Leftover {
+        object: "x".to_owned(),
+        reason: "r".to_owned(),
+        class,
+        snapshot: None,
+    };
+    let cases: Vec<(&str, Vec<Row>, Row)> = vec![
+        ("a first row that does not begin", vec![], intent("a")),
+        ("a second beginning", vec![begin()], begin()),
+        (
+            "a snapshot written twice",
+            vec![begin(), snapshot(1, SnapshotKind::Initial)],
+            snapshot(1, SnapshotKind::Changed),
+        ),
+        ("a second root", vec![begin(), intent("a")], intent("b")),
+        (
+            "a root made without its intent",
+            vec![begin()],
+            Row::RootMade {
+                path: "a".to_owned(),
+                key: key(9),
+            },
+        ),
+        (
+            "a root made at another path than its intent",
+            vec![begin(), intent("a")],
+            Row::RootMade {
+                path: "b".to_owned(),
+                key: key(9),
+            },
+        ),
+        (
+            "an object granted after the grant was complete",
+            vec![begin(), Row::GrantComplete { count: 0 }],
+            Row::Grant {
+                key: key(1),
+                path: "p".to_owned(),
+                kind: kr_boundary_windows::journal::rows::ObjectKind::File,
+                owner: "o".to_owned(),
+                dacl_bytes: vec![],
+                control_flags: 0,
+                protected: false,
+                link_count: 1,
+                added_ace: "a".to_owned(),
+            },
+        ),
+        (
+            "a grant complete twice",
+            vec![begin(), Row::GrantComplete { count: 0 }],
+            Row::GrantComplete { count: 0 },
+        ),
+        (
+            "a grant that counts other objects than the rows hold",
+            vec![begin()],
+            Row::GrantComplete { count: 1 },
+        ),
+        (
+            "a second primary process",
+            vec![
+                begin(),
+                Row::ProcessStarted {
+                    pid: 1,
+                    creation_time: 2,
+                },
+            ],
+            Row::ProcessStarted {
+                pid: 3,
+                creation_time: 4,
+            },
+        ),
+        (
+            "an uncertain end after the end",
+            vec![begin(), verified.clone(), Row::End { root_leftovers: 0 }],
+            Row::EndUncertain {
+                reason: "r".to_owned(),
+            },
+        ),
+        (
+            "a release begun while the end is not proved",
+            vec![
+                begin(),
+                Row::EndUncertain {
+                    reason: "r".to_owned(),
+                },
+            ],
+            release_intent(1),
+        ),
+        (
+            "an object released without its intent",
+            vec![begin()],
+            released(1),
+        ),
+        (
+            "a root removed that was not made",
+            vec![begin()],
+            Row::RootRemoved,
+        ),
+        (
+            "a state accepted that no leftover names",
+            vec![begin(), snapshot(1, SnapshotKind::Changed)],
+            Row::AcceptedState {
+                snapshot: 1,
+                person: "p".to_owned(),
+                time: 1,
+            },
+        ),
+        (
+            "a leftover cleared that was not open",
+            vec![begin()],
+            Row::LeftoverCleared {
+                key: "x".to_owned(),
+            },
+        ),
+        (
+            "an end twice",
+            vec![begin(), verified.clone(), Row::End { root_leftovers: 0 }],
+            Row::End { root_leftovers: 0 },
+        ),
+        (
+            "an end that counts other root leftovers than the rows hold",
+            vec![begin(), verified, leftover(LeftoverClass::Root)],
+            Row::End { root_leftovers: 0 },
+        ),
+    ];
+    for (what, rows, row) in cases {
+        assert!(refused_after(&rows, &row), "{what} is refused");
+    }
+}
+
 #[test]
 fn a_leftover_that_names_a_snapshot_never_written_is_refused() {
     let mut tracker = Tracker::new();
