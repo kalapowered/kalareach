@@ -232,17 +232,24 @@ lock_screen_leg() {
     fi
 
     # Mute, from the locked screen.
-    if lock_control Mute "$dump" && lock_wait 10 lock_record_has '"Unmute"' && lock_showing \
-        && lock_wait 10 lock_says "Microphone muted" "$dump"; then
-        lock_check "Mute from the lock screen mutes the call with no unlock" 1 "the notification now offers Unmute and says the microphone is muted; the screen stayed locked"
+    local muted_ok=0 found_mute=""
+    if lock_control Mute "$dump"; then
+        found_mute="Mute was pressed on the lock screen;"
+        lock_wait 10 lock_record_has '"Unmute"' && found_mute="$found_mute the notification offers Unmute;" || found_mute="$found_mute the notification does not offer Unmute;"
+        lock_showing && found_mute="$found_mute the screen stayed locked;" || found_mute="$found_mute the screen is not locked;"
+        lock_wait 10 lock_says "Microphone muted" "$dump" && found_mute="$found_mute the lock screen says the microphone is muted;" || found_mute="$found_mute the lock screen does not say so;"
+        case "$found_mute" in
+            *"does not"* | *"not locked"*) muted_ok=0 ;;
+            *) muted_ok=1 ;;
+        esac
     else
-        lock_check "Mute from the lock screen mutes the call with no unlock" 0 "the notification did not change to Unmute"
+        found_mute="the Mute control was not on the lock screen"
     fi
+    lock_check "Mute from the lock screen mutes the call with no unlock" "$muted_ok" "${found_mute# }"
 
     # Unmute, from the locked screen: the system asks for the credential and the call stays muted.
     local asked=0 found=""
     if lock_control Unmute "$dump"; then
-        lock_device shell date +%s%N >"$harness/unmute-tap-at.txt"
         sleep 3
         lock_dump "$artefacts/lock-screen/locked-2-unmute.xml"
         lock_still 3-unmute-asks
@@ -261,11 +268,11 @@ lock_screen_leg() {
         found="the Unmute control was not on the lock screen"
     fi
     lock_check "Unmute from the lock screen asks for the unlock and leaves the call muted" "$asked" "${found# }"
-    # The device's own clock, as the application's record of the microphone is, just before the
-    # credential is given.
-    lock_device shell date +%s%N >"$harness/unlock-at.txt"
-    # The person unlocks: the unmute then goes through.
+    # The person unlocks: the unmute then goes through. The device's own clock, as the application's
+    # record of the microphone is, is read between typing the credential and submitting it: the
+    # earliest instant the unlock can happen.
     lock_device shell input text "$lock_pin"
+    lock_device shell date +%s%N >"$harness/unlock-at.txt"
     lock_device shell input keyevent KEYCODE_ENTER
     if lock_wait 15 lock_record_has '"Mute"'; then
         lock_check "Unmute goes through once the screen is unlocked" 1 "the notification offers Mute again"
@@ -296,31 +303,29 @@ lock_screen_leg() {
 # Reads the application's record of the microphone against the time the person gave the credential:
 # the call was open, was muted from the lock screen, and was opened again only after the unlock.
 lock_judge_trail() { # <result file>
-    local line at tap verdict
+    local line at verdict
     line="$(grep '^check=the microphone followed the taps on the lock screen ok=' "$1" | head -1)"
     at=""
-    tap=""
     [ ! -s "$harness/unlock-at.txt" ] || at="$(tr -d '\r\n' <"$harness/unlock-at.txt")"
-    [ ! -s "$harness/unmute-tap-at.txt" ] || tap="$(tr -d '\r\n' <"$harness/unmute-tap-at.txt")"
-    verdict="$(python3 -I - "$line" "$at" "$tap" <<'PY'
+    verdict="$(python3 -I - "$line" "$at" <<'PY'
 import re
 import sys
 
-line, unlock_ns, tap_ns = sys.argv[1], sys.argv[2], sys.argv[3]
+line, unlock_ns = sys.argv[1], sys.argv[2]
 detail = line.split("detail=", 1)[-1]
-steps = re.findall(r"(open|muted)@(\d+)", detail)
-gap = re.search(r"widest gap (\d+) ms", detail)
-order = [word for word, _ in steps]
-if order != ["open", "muted", "open"] or not unlock_ns.isdigit() or not tap_ns.isdigit() or not gap:
-    print("0 %s" % (" ".join("%s@%s" % each for each in steps) or "no record"))
+# Each change is `<state>@<first look at the new state>/<last look at the earlier one>`.
+steps = re.findall(r"(open|muted)@(\d+)/(\d+)", detail)
+order = [word for word, _, _ in steps]
+if order != ["open", "muted", "open"] or not unlock_ns.isdigit():
+    print("0 %s" % (detail or "no record"))
 else:
-    reopened, unlocked, tapped = int(steps[2][1]), int(unlock_ns) // 1_000_000, int(tap_ns) // 1_000_000
-    # The application looks at the microphone about four times a second. A reopen made when the Unmute
-    # was pressed would be seen within the widest gap between two looks, so the order against the
-    # credential holds only where that gap is shorter than the time between the press and the credential.
-    margin = unlocked - tapped
-    ok = reopened >= unlocked and int(gap.group(1)) < margin
-    print("%d the microphone reopened %d ms after the leg gave the credential; the application looked at it at least every %s ms, against %d ms between the Unmute press and the credential" % (ok, reopened - unlocked, gap.group(1), margin))
+    # The microphone reopened after the last look that still saw it muted. If that look was made at or
+    # after the credential was submitted, the reopen came after it: no look, however late, can place it
+    # earlier.
+    unlocked = int(unlock_ns) // 1_000_000
+    last_muted_look = int(steps[2][2])
+    ok = last_muted_look >= unlocked
+    print("%d the microphone was still muted %d ms after the leg submitted the credential and was seen open %d ms after it" % (ok, last_muted_look - unlocked, int(steps[2][1]) - unlocked))
 PY
 )"
     lock_check "the microphone stayed muted until the unlock" "${verdict%% *}" "${verdict#* }"

@@ -12,8 +12,8 @@ package to.kala.reach.companion.mobile
  * From Android 12 (API 31) the platform can ask for the unlock before a single action runs, so the
  * notification keeps its Unmute and marks it as needing one. Before that the platform has no such
  * lock for one action, so while the phone is locked the notification offers no Unmute at all and
- * an Unmute that arrives anyway is refused; the person unlocks and uses the notification in the
- * shade or the call's own screen.
+ * an Unmute that arrives anyway is refused; the person unlocks the phone and uses the notification
+ * in the shade.
  */
 object VoiceNotificationControls {
     /** The first platform release that can ask for the unlock before one notification action runs. */
@@ -33,8 +33,14 @@ object VoiceNotificationControls {
     }
 
     /**
-     * Whether an unmute that reaches the call now may reopen the microphone. From API 31 the
-     * platform has already asked for the unlock before the action was sent.
+     * Whether the person's microphone is muted once a mute or an unmute has reached the call that
+     * is `muted` now. A mute always leaves it muted, however many times it arrives. An unmute opens
+     * it, except where the platform did not ask for the unlock (before API 31) and the phone is
+     * locked: from API 31 the platform has already asked before the action was sent.
      */
-    fun mayUnmute(locked: Boolean, sdk: Int): Boolean = sdk >= UNLOCK_PER_ACTION_SDK || !locked
+    fun mutedAfter(unmute: Boolean, muted: Boolean, locked: Boolean, sdk: Int): Boolean = when {
+        !unmute -> true
+        sdk >= UNLOCK_PER_ACTION_SDK || !locked -> false
+        else -> muted
+    }
 }

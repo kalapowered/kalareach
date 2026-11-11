@@ -241,7 +241,7 @@ The lock screen shows the notification folded: "Voice call running" and what the
 
 - **Mute** and **Stop** work with no unlock, because they only take something away from the call.
 - **Unmute** asks for the unlock, because it opens the microphone again. From Android 12 (API 31) the platform holds the action until the person unlocks the phone.
-- The application supports Android 10 (API 29) and later. On Android 10 and 11 the platform cannot hold a single action, so while the phone is locked the notification offers no Unmute and the service refuses one that arrives. The person unlocks the phone and uses the notification in the shade, or the call's own screen.
+- The application supports Android 10 (API 29) and later. On Android 10 and 11 the platform cannot hold a single action, so while the phone is locked the notification offers no Unmute and the service refuses one that arrives. The person unlocks the phone and uses the notification in the shade.
 
 The person's own notification settings for the application have the last word on whether it shows on the lock screen. `scripts/e2e-voice-call-device.sh android lock-screen` runs a call on the Android 16 emulator, locks it, reads the notification from the system's records and presses Mute, Unmute and Stop on the lock screen.
 

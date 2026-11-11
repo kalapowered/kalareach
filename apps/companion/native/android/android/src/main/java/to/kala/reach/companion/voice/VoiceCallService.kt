@@ -118,7 +118,9 @@ class VoiceCallService : android.app.Service() {
          * Tells the notification what the microphone is doing.
          *
          * The screen and the notification say the same thing about capture, because while the
-         * screen is locked the notification is the only one of the two a person can read.
+         * screen is locked the notification is the only one of the two a person can read. The one
+         * difference is a microphone the person muted, which reads as unavailable once the recorder
+         * stops with the muted track: the notification says it is muted, as its control does.
          */
         @JvmStatic
         fun publishCapture(context: Context, call: Long, state: VoiceCaptureState) {
@@ -203,15 +205,21 @@ class VoiceCallService : android.app.Service() {
             }
             VoiceServiceActions.Act.MUTE, VoiceServiceActions.Act.UNMUTE -> {
                 val held = VoiceCallHolder.current(call)
-                when {
+                if (held == null) {
                     // No call owns this notification any more, so the microphone is not this
                     // service's to change and the notification should not suggest it is.
-                    held == null -> stopCall()
-                    act == VoiceServiceActions.Act.MUTE -> held.setMutedByPerson(true)
-                    // Where the platform did not ask for the unlock, a muted microphone is not
-                    // reopened from a locked phone.
-                    VoiceNotificationControls.mayUnmute(locked, Build.VERSION.SDK_INT) ->
-                        held.setMutedByPerson(false)
+                    stopCall()
+                } else {
+                    // A muted microphone is not reopened from a locked phone where the platform did
+                    // not ask for the unlock.
+                    val muted = held.isMutedByPerson
+                    val after = VoiceNotificationControls.mutedAfter(
+                        unmute = act == VoiceServiceActions.Act.UNMUTE,
+                        muted = muted,
+                        locked = locked,
+                        sdk = Build.VERSION.SDK_INT,
+                    )
+                    if (after != muted) held.setMutedByPerson(after)
                 }
             }
             VoiceServiceActions.Act.CAPTURE -> {
@@ -332,15 +340,21 @@ class VoiceCallService : android.app.Service() {
     }
 
     private fun notification(): Notification {
-        val controls = VoiceNotificationControls.controls(muted, locked, Build.VERSION.SDK_INT)
+        val isMuted = muted
+        val controls = VoiceNotificationControls.controls(isMuted, locked, Build.VERSION.SDK_INT)
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Voice call running")
             // What the microphone is doing, in the person's own words, on the one surface that
             // exists while the screen is locked. A microphone the person muted is said to be
             // muted, as the control beside it says: the capture state of a muted call reads as no
-            // microphone, since the recorder stops with the muted track.
+            // microphone, since the recorder stops with the muted track. Any other state the
+            // system put the capture in is said as it is.
             .setContentText(
-                if (muted) VoiceCaptureState.MUTED_BY_PERSON.display else capture.display,
+                if (isMuted && capture == VoiceCaptureState.UNAVAILABLE) {
+                    VoiceCaptureState.MUTED_BY_PERSON.display
+                } else {
+                    capture.display
+                },
             )
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)

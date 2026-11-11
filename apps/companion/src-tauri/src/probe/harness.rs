@@ -69,6 +69,9 @@ const FINALISED_WITHIN: Duration = Duration::from_secs(30);
 /// The look between two reads of the call's state.
 const LOOK: Duration = Duration::from_millis(250);
 
+/// How often a lock-screen run looks at the microphone.
+const MUTE_LOOK: Duration = Duration::from_millis(40);
+
 /// How long a call that is connected is given, by default, to show the audio it carried in each
 /// direction.
 const MEDIA_SECONDS: u64 = 60;
@@ -275,6 +278,15 @@ fn now_ms() -> u128 {
 /// Looks until `look` finds something or `within` passes.
 pub(super) async fn until<T, Fut: Future<Output = Option<T>>>(
     within: Duration,
+    look: impl FnMut() -> Fut,
+) -> Option<T> {
+    until_every(within, LOOK, look).await
+}
+
+/// As [`until`], waiting `pace` between two looks.
+async fn until_every<T, Fut: Future<Output = Option<T>>>(
+    within: Duration,
+    pace: Duration,
     mut look: impl FnMut() -> Fut,
 ) -> Option<T> {
     let end = Instant::now() + within;
@@ -285,7 +297,7 @@ pub(super) async fn until<T, Fut: Future<Output = Option<T>>>(
         if Instant::now() >= end {
             return None;
         }
-        tokio::time::sleep(LOOK).await;
+        tokio::time::sleep(pace).await;
     }
 }
 
@@ -561,16 +573,17 @@ enum HowItEnds {
     LockScreen,
 }
 
-/// Whether the microphone was muted, at each change, with the time of the change in milliseconds
-/// since the Unix epoch: the order in which the person's taps on the notification reached the call.
-/// The times are those of the looks, so the widest gap between two looks is kept beside them: a
-/// change is known to have happened no earlier than a gap before the look that saw it.
+/// Whether the microphone was muted, at each change: the order in which the person's taps on the
+/// notification reached the call. A change is known to have happened after the last look that still
+/// saw the earlier state and no later than the look that saw the new one, so both looks' times, in
+/// milliseconds since the Unix epoch, are kept (`muted@<first look at the new state>/<last look at
+/// the earlier one>`), with the widest gap between two looks beside them.
 #[derive(Default)]
 struct MuteTrail(std::sync::Mutex<MuteLooks>);
 
 #[derive(Default)]
 struct MuteLooks {
-    changes: Vec<(bool, u128)>,
+    changes: Vec<(bool, u128, u128)>,
     last_look: Option<u128>,
     widest_gap_ms: u128,
 }
@@ -585,10 +598,11 @@ impl MuteTrail {
         if let Some(last) = seen.last_look {
             seen.widest_gap_ms = seen.widest_gap_ms.max(now.saturating_sub(last));
         }
-        seen.last_look = Some(now);
-        if seen.changes.last().map(|(was, _)| *was) != Some(muted) {
-            seen.changes.push((muted, now));
+        if seen.changes.last().map(|(was, _, _)| *was) != Some(muted) {
+            let before = seen.last_look.unwrap_or(now);
+            seen.changes.push((muted, now, before));
         }
+        seen.last_look = Some(now);
     }
 
     fn text(&self) -> String {
@@ -599,7 +613,9 @@ impl MuteTrail {
         let changes = seen
             .changes
             .iter()
-            .map(|(muted, at)| format!("{}@{at}", if *muted { "muted" } else { "open" }))
+            .map(|(muted, at, before)| {
+                format!("{}@{at}/{before}", if *muted { "muted" } else { "open" })
+            })
             .collect::<Vec<_>>()
             .join(" ");
         format!("{changes}; widest gap {} ms", seen.widest_gap_ms)
@@ -611,7 +627,7 @@ impl MuteTrail {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .changes
             .iter()
-            .any(|(muted, _)| *muted)
+            .any(|(muted, _, _)| *muted)
     }
 }
 
@@ -665,7 +681,14 @@ async fn end<R: Runtime>(
             "the call is up and waits for the person's taps on its notification",
         ));
     }
-    let ended = until(END_WITHIN, || async move {
+    // The microphone is looked at often in a lock-screen run: how closely a change is placed
+    // against the person's unlock depends on it.
+    let pace = if ending == HowItEnds::LockScreen {
+        MUTE_LOOK
+    } else {
+        LOOK
+    };
+    let ended = until_every(END_WITHIN, pace, || async move {
         let state = call_state(app).await;
         looked.see(&state);
         if ending == HowItEnds::LockScreen

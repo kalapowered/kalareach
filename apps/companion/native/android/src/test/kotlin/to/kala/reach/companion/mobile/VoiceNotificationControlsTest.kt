@@ -50,11 +50,27 @@ class VoiceNotificationControlsTest {
         )
     }
 
+    /**
+     * A mute leaves the microphone muted whatever reaches the call before it, on every platform,
+     * locked or not: a mute that arrives twice, or after the notification already offers Unmute,
+     * is never an unmute.
+     */
+    @Test
+    fun a_mute_always_leaves_the_microphone_muted() {
+        for (sdk in listOf(platformWithout, platformWithPerActionUnlock, 36)) {
+            for (locked in listOf(true, false)) {
+                for (muted in listOf(true, false)) {
+                    assertTrue(VoiceNotificationControls.mutedAfter(unmute = false, muted = muted, locked = locked, sdk = sdk))
+                }
+            }
+        }
+    }
+
     /** An Unmute that reaches a locked phone's call is refused where the platform did not ask. */
     @Test
     fun an_unmute_on_a_locked_phone_is_refused_where_the_platform_did_not_ask() {
-        assertFalse(VoiceNotificationControls.mayUnmute(locked = true, sdk = platformWithout))
-        assertTrue(VoiceNotificationControls.mayUnmute(locked = false, sdk = platformWithout))
-        assertTrue(VoiceNotificationControls.mayUnmute(locked = true, sdk = platformWithPerActionUnlock))
+        assertTrue(VoiceNotificationControls.mutedAfter(unmute = true, muted = true, locked = true, sdk = platformWithout))
+        assertFalse(VoiceNotificationControls.mutedAfter(unmute = true, muted = true, locked = false, sdk = platformWithout))
+        assertFalse(VoiceNotificationControls.mutedAfter(unmute = true, muted = true, locked = true, sdk = platformWithPerActionUnlock))
     }
 }
