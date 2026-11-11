@@ -67,7 +67,7 @@ use super::proof;
 use super::registry;
 use super::sd::{self, Principals, SdKind};
 use super::service;
-use super::walk::{DirHandle, Kind, LIST, Opened};
+use super::walk::{AnchorRefusal, DirHandle, Kind, LIST, Opened};
 use super::{account, boot, pipe, token, verify};
 
 /// The broker's service name.
@@ -1402,9 +1402,13 @@ enum Cure {
     /// a name it does not give, a directory nested deeper than it makes anything): remove that
     /// entry.
     RemoveEntry,
-    /// The entry could not be opened to be checked, or the directory is not a plain one: another
-    /// program holds it open or its list forbids the check.
+    /// The entry could not be opened to be checked: another program holds it open or its list
+    /// forbids the check.
     Open,
+    /// The directory is on a volume that the installation does not use (not NTFS, on another
+    /// computer, on removable media, or not an ordinary disk): neither a change of owner or list
+    /// nor closing a program cures that.
+    Volume,
 }
 
 /// The refusal of an entry below a directory of a scope.
@@ -1424,6 +1428,10 @@ fn within_refusal(
                 Cure::OwnerAndList => "Make the Administrators group, or the system, its owner and leave the system and the Administrators group as the only accounts that may change it, then run the setup program again. Do not remove it: the manifest records it and stays where it is.".to_owned(),
                 Cure::RemoveEntry => format!(
                     "Remove {}, and nothing else: it is not something that the installation makes there, and a change of its owner or its list does not cure that. A repair makes the program files again. Then run the setup program again.",
+                    entry.display()
+                ),
+                Cure::Volume => format!(
+                    "{} is on a volume that the installation does not use: it keeps its program directory on a fixed, local NTFS volume, and nothing in it can be corrected to make another volume one. Do not remove the program directory: the manifest records it and stays where it is. Move the system's Program Files folder to such a volume, or install on a computer where it is on one, then run the setup program again.",
                     entry.display()
                 ),
                 Cure::Open => format!(
@@ -1476,7 +1484,14 @@ fn check_program_parents(paths: &Paths) -> Result<(), Error> {
             {
                 return Ok(());
             }
-            Err(failure) => return Err(failure.into()),
+            // Any other answer is not an absence: the folder could not be checked, and the person
+            // is told what can be done about that.
+            Err(failure) => {
+                return Err(Error::Refused(format!(
+                    "{} is a folder above the boundary's program directory (the program that the service runs as the system). It could not be opened to be checked ({failure}). Another program may hold it open, or its list may forbid the check: close that program, or correct who may open the folder, then run the setup program again. A change of its owner does not close a handle. Do not remove the program directory: the manifest records it and stays where it is.",
+                    folder.display()
+                )));
+            }
         };
         let mut tag = FILE_ATTRIBUTE_TAG_INFO {
             FileAttributes: 0,
@@ -1557,13 +1572,19 @@ fn check_program_directory(paths: &Paths) -> Result<(), Error> {
     let held = match DirHandle::open_anchor_with(&paths.program, LIST | READ_CONTROL)? {
         Ok(held) => held,
         Err(refusal) => {
+            // Only the volume is a refusal that no change of owner, list or open handle cures: a
+            // link or a file at the program directory's name is removed.
+            let cure = match refusal {
+                AnchorRefusal::Volume(_) => Cure::Volume,
+                AnchorRefusal::ReparsePoint | AnchorRefusal::NotADirectory => Cure::RemoveEntry,
+            };
             return Err(within_refusal(
                 paths,
                 Scope::Program,
                 paths.program.parent().unwrap_or(&paths.program),
                 &program,
                 &refusal.to_string(),
-                Cure::Open,
+                cure,
             ));
         }
     };
