@@ -22,9 +22,10 @@
 //! its request identifier comes from the same counter as the session's.
 //!
 //! The client owns the bound on every wait for a paired host in a lane: the open of the stream
-//! (thirty seconds), which waits for the host's credit and writes the header, the write of a chunk
-//! (two minutes), and the wait for its answer (one minute). A host that gives no credit, or holds a
-//! chunk and never answers, ends the lane; the driver reads what the host holds and goes on.
+//! (thirty seconds), which waits for the host's credit and writes the header, and a chunk's write
+//! with the wait for its answer (two minutes together). A host that gives no credit, or holds a
+//! chunk and never answers, ends the lane, whose stream is reset and dropped at once; the driver
+//! reads what the host holds and goes on.
 //!
 //! What travels is the control union. A chunk is an ordinary `upload.chunk` mutation, with its own
 //! action identifier, window and requested lifetime, and a read of one is an ordinary
@@ -216,8 +217,9 @@ impl ChunkRoute {
     /// host refuses the caller, the host's refusal of the hello, and a refusal when the host that
     /// answered belongs to another environment or shares no protocol major with this client.
     ///
-    /// On a network route, returns [`ClientError::ConnectionEnded`] when the connection, or the
-    /// sign-in it was opened under, has ended, a transport failure (a deadline of the header kind)
+    /// On a network route, returns [`ClientError::ConnectionEnded`] when the sign-in the connection
+    /// was opened under has ended, a transport failure when the connection or the stream is gone,
+    /// a transport failure (a deadline of the header kind)
     /// when the host gave no credit for the stream or did not take its header within thirty
     /// seconds, and the bulk-limit refusal when the connection already holds as many transfer
     /// streams as it allows.
@@ -375,7 +377,9 @@ impl ChunkLane {
     /// Takes this lane's reading of time out of the runtime's hands and puts it `by` after the
     /// moment the lane was opened, for this crate's own tests: it stands there until this is
     /// called again, and a window the lane holds falls due, or runs out, by that reading, without
-    /// the test waiting for it. Windows the lane receives from then on are stamped with it.
+    /// the test waiting for it. On a local lane the windows it receives from then on are stamped
+    /// with it; a network lane takes its windows from the session, which stamps them with the
+    /// runtime's clock.
     #[cfg(feature = "testing")]
     pub fn hold_clock_at(&self, by: Duration) {
         let clock = match &self.carrier {
@@ -862,7 +866,15 @@ async fn newest_window(
         if held.window.valid_for_ms.get() == 0 {
             return Err(Unavailable::Nothing);
         }
-        let validity = held.validity();
+        // A paired host's window is held to the protocol's longest, so that a host that states a
+        // longer one cannot keep a lane waiting on a refused window past that.
+        let validity = if source.is_some() {
+            held.validity().min(Duration::from_millis(
+                kr_protocol::limits::MAX_ACTION_WINDOW.get(),
+            ))
+        } else {
+            held.validity()
+        };
         let turned_down =
             source.is_some_and(|source| source.turned_down(&held.window.action_window_id));
         if !turned_down && clock.now().saturating_duration_since(held.received_at) < validity / 2 {
@@ -888,14 +900,18 @@ async fn newest_window(
 /// window with another identifier.
 struct WindowSource {
     issued: watch::Receiver<Issued>,
-    turned_down: std::sync::Mutex<Option<ActionWindowId>>,
+    turned_down: std::sync::Mutex<std::collections::VecDeque<ActionWindowId>>,
 }
+
+/// How many refused windows a route remembers. Lanes of one route answer in any order, so a late
+/// refusal of an older window must not make the route forget the refusal of the current one.
+const REMEMBERED_REFUSALS: usize = 8;
 
 impl WindowSource {
     const fn new(issued: watch::Receiver<Issued>) -> Self {
         Self {
             issued,
-            turned_down: std::sync::Mutex::new(None),
+            turned_down: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -903,15 +919,21 @@ impl WindowSource {
         self.turned_down
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            == Some(window)
+            .contains(window)
     }
 
     fn turn_down(&self, window: &ActionWindowId) {
-        *self
+        let mut remembered = self
             .turned_down
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(window.clone());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if remembered.contains(window) {
+            return;
+        }
+        if remembered.len() == REMEMBERED_REFUSALS {
+            remembered.pop_front();
+        }
+        remembered.push_back(window.clone());
     }
 }
 
@@ -920,20 +942,19 @@ impl WindowSource {
 /// seconds), and the write of the header.
 const OPEN_BOUND: Duration = Duration::from_secs(30);
 
-/// How long the write of one chunk may take, counted from its start. A chunk is a frame of about a
-/// mebibyte, so a link slower than about nine kibibytes a second cannot carry one in it.
-const WRITE_BOUND: Duration = Duration::from_secs(120);
+/// How long a chunk may take, counted from the start of its write to the end of its answer. The
+/// write ends when the connection has taken the frame into its buffer, which a chunk of about a
+/// mebibyte fits, so the frame travels while the lane waits for the answer: this bound covers the
+/// link and the host's turn together, and a link slower than about nine kibibytes a second cannot
+/// carry a chunk in it.
+const CHUNK_BOUND: Duration = Duration::from_secs(120);
 
-/// How long the host has to answer a chunk once it has been written whole.
-const ANSWER_BOUND: Duration = Duration::from_secs(60);
-
-/// The bounds a network lane waits under: the stream's header phase is the open, a frame's write is
-/// the chunk's, and the wait for the next frame is the wait for the answer.
+/// The bounds a network lane waits under: the stream's header phase is the open, and the wait for
+/// the next frame, begun with the write of the chunk, is the chunk's.
 fn lane_bounds() -> TimerDeadlines {
     TimerDeadlines {
         header: OPEN_BOUND,
-        write: WRITE_BOUND,
-        idle: ANSWER_BOUND,
+        idle: CHUNK_BOUND,
         ..TimerDeadlines::default()
     }
 }
@@ -945,10 +966,12 @@ fn lane_bounds() -> TimerDeadlines {
 /// own, and its request identifier comes from the session's counter.
 ///
 /// Every wait on the host is under a bound of the lane's own: the open and the write of the header,
-/// the write of a chunk, and the wait for its answer. A bound that passes ends the lane and resets
-/// its stream, so the host stops waiting for a frame and the bulk slot is free for the next.
+/// and a chunk's write with the wait for its answer. A bound that passes ends the lane, which
+/// resets and drops its stream at once, so the host stops waiting for a frame and the bulk slot is
+/// free for the next whether or not the caller still holds the lane.
 struct NetworkCarrier {
-    stream: DataStream,
+    /// The lane's stream, until the lane ends.
+    stream: Option<DataStream>,
     issued: watch::Receiver<Issued>,
     source: Arc<WindowSource>,
     clock: LaneClock,
@@ -970,8 +993,10 @@ impl Drop for NetworkCarrier {
         // A call dropped before its answer was read whole leaves a stream the host may be part way
         // through reading, which is reset so that it stops. One dropped between calls is finished
         // and the host reads a clean end.
-        if self.ended {
-            self.stream.handle().revoke();
+        if self.ended
+            && let Some(stream) = &self.stream
+        {
+            stream.handle().revoke();
         }
     }
 }
@@ -986,7 +1011,7 @@ impl NetworkCarrier {
                 .swap(true, std::sync::atomic::Ordering::AcqRel)
         });
         Self {
-            stream,
+            stream: Some(stream),
             issued: network.windows.issued.clone(),
             source: Arc::clone(&network.windows),
             clock: LaneClock::new(tokio::time::Instant::now()),
@@ -1006,20 +1031,24 @@ impl NetworkCarrier {
     /// The transport is asked each time: the sign-in the connection was opened under can end after
     /// the lane opened, and the next chunk then stops with the reason the transport recorded.
     fn usable(&mut self) -> Result<()> {
-        if self.ended || self.stream.is_revoked() {
-            return Err(self.end(ClientError::ConnectionEnded));
-        }
+        // Asked first: a sign-out that ended the connection also revoked its streams, and the
+        // reason the transport recorded is what the caller is told, not that a stream was revoked.
         if let Some(reason) = self.transport.ended_by_this_device() {
             return Err(self.end(ClientError::Host(reason)));
+        }
+        if self.ended || self.stream.as_ref().is_none_or(DataStream::is_revoked) {
+            return Err(self.end(ClientError::ConnectionEnded));
         }
         Ok(())
     }
 
-    /// Ends this lane: nothing more goes on it, and its stream is reset, so that the host stops
-    /// waiting for a frame and the stream's bulk slot is free.
+    /// Ends this lane: nothing more goes on it, and its stream is reset and dropped, so that the
+    /// host stops waiting for a frame and the stream's bulk slot is free.
     fn end(&mut self, error: ClientError) -> ClientError {
         self.ended = true;
-        self.stream.handle().revoke();
+        if let Some(stream) = self.stream.take() {
+            stream.reset();
+        }
         error
     }
 
@@ -1031,10 +1060,24 @@ impl NetworkCarrier {
     /// or the one this lane holds would have expired, or was turned down, before another came, and
     /// [`ClientError::ConnectionEnded`] when the session's reader stopped while this waited.
     async fn window(&mut self) -> Result<ActionWindow> {
-        match newest_window(&mut self.issued, &self.clock, Some(&self.source)).await {
-            Ok(window) => Ok(window),
-            Err(Unavailable::Nothing | Unavailable::RanOut) => Err(ClientError::NoActionWindow),
-            Err(Unavailable::SourceEnded) => Err(self.end(ClientError::ConnectionEnded)),
+        let Some(stream) = &self.stream else {
+            return Err(ClientError::ConnectionEnded);
+        };
+        // The wait for a renewal ends with the connection: the session keeps its windows after its
+        // reader stops, so what says the connection is gone is the revocation of this lane's stream.
+        let revoked = stream.handle();
+        let waited = tokio::select! {
+            window = newest_window(&mut self.issued, &self.clock, Some(&self.source)) => Some(window),
+            () = revoked.revoked() => None,
+        };
+        match waited {
+            Some(Ok(window)) => Ok(window),
+            Some(Err(Unavailable::Nothing | Unavailable::RanOut)) => {
+                Err(ClientError::NoActionWindow)
+            }
+            Some(Err(Unavailable::SourceEnded)) | None => {
+                Err(self.end(ClientError::ConnectionEnded))
+            }
         }
     }
 
@@ -1049,23 +1092,19 @@ impl NetworkCarrier {
         frame: &ControlFrame,
         request_id: RequestId,
     ) -> Result<ParamsValue> {
-        if self.ended {
+        let Some(stream) = self.stream.as_mut().filter(|_| !self.ended) else {
             return Err(ClientError::ConnectionEnded);
-        }
+        };
         self.ended = true;
         let bounds = Arc::clone(&self.bounds);
-        if let Err(error) = bounded(bounds.as_ref(), DeadlineKind::Write, async {
-            self.stream
+        // The write and the wait for the answer are one bound: the write ends when the connection
+        // has buffered the frame, and the frame goes to the host while the answer is awaited.
+        let answer = match bounded(bounds.as_ref(), DeadlineKind::Idle, async {
+            stream
                 .write_message(frame)
                 .await
-                .map_err(ClientError::from)
-        })
-        .await
-        {
-            return Err(self.end(error));
-        }
-        let answer = match bounded(bounds.as_ref(), DeadlineKind::Idle, async {
-            self.stream
+                .map_err(ClientError::from)?;
+            stream
                 .read_message::<ControlFrame>()
                 .await
                 .map_err(ClientError::from)
@@ -1118,8 +1157,10 @@ impl NetworkCarrier {
     #[cfg(feature = "testing")]
     fn carried_one(&mut self) {
         self.carried += 1;
-        if self.reset_after == Some(self.carried) {
-            self.stream.handle().revoke();
+        if self.reset_after == Some(self.carried)
+            && let Some(stream) = &self.stream
+        {
+            stream.handle().revoke();
         }
     }
 }
@@ -1275,6 +1316,32 @@ mod tests {
             "and it stays unusable"
         );
         serving.abort();
+    }
+
+    /// Two lanes of one route answer in any order: the refusal of an older window, arriving after
+    /// the refusal of the current one, leaves the current one refused.
+    #[test]
+    fn a_late_refusal_of_an_older_window_leaves_the_current_one_refused() {
+        let (_issued, held) = watch::channel(Issued {
+            window: ActionWindow {
+                action_window_id: ActionWindowId::new("window-1").expect("a window"),
+                connection_id: kr_protocol::ids::ConnectionId::new(
+                    kr_protocol::scalars::Uuid::from_bytes([1; 16]),
+                ),
+                boot_epoch: kr_protocol::ids::BootEpoch::new(1),
+                issued_at_ms: kr_protocol::scalars::TimestampMs::new(0),
+                valid_for_ms: DurationMs::new(60_000),
+            },
+            received_at: tokio::time::Instant::now(),
+        });
+        let source = WindowSource::new(held);
+        let older = ActionWindowId::new("older").expect("a window");
+        let current = ActionWindowId::new("current").expect("a window");
+        source.turn_down(&current);
+        source.turn_down(&older);
+        assert!(source.turned_down(&current), "the current refusal is kept");
+        assert!(source.turned_down(&older));
+        assert!(!source.turned_down(&ActionWindowId::new("fresh").expect("a window")));
     }
 
     #[test]

@@ -568,7 +568,9 @@ async fn serve_stream(
         };
         let outcome = match next {
             Chunk::Hold => {
-                std::future::pending::<()>().await;
+                // Held until the client ends the stream, as a host that reads and does not answer
+                // is: its side of the stream goes when the peer's reset reaches it.
+                let _ = stream.read_message::<ControlFrame>().await;
                 return;
             }
             Chunk::Refuse(code) => Err(ProtocolError::new(code, "refused")),
@@ -1034,7 +1036,7 @@ async fn a_host_that_gives_no_stream_credit_ends_the_open_and_returns_its_slot()
     for attempt in 1..=5 {
         let opening = route.open(transfer);
         let cutting = bounds.fire_when_armed(DeadlineKind::Header);
-        let (opened, ()) = tokio::join!(within(opening), cutting);
+        let (opened, ()) = within(async { tokio::join!(opening, cutting) }).await;
         let error = opened.expect_err("the open is cut");
         assert_eq!(
             deadline_of(&error),
@@ -1043,6 +1045,96 @@ async fn a_host_that_gives_no_stream_credit_ends_the_open_and_returns_its_slot()
         );
         assert_eq!(error.code(), ErrorCode::ResourceUnavailable);
     }
+}
+
+/// A chunk for a lane, of a transfer the scripted host does not check.
+fn some_chunk(transfer: TransferId) -> UploadChunkParams {
+    let bytes = bytes_of(64);
+    UploadChunkParams {
+        transfer_id: transfer,
+        chunk: kr_protocol::transfer::ChunkDescriptor {
+            index: U64::new(0),
+            byte_len: U64::new(bytes.len() as u64),
+            digest: Digest256::from_bytes(kr_cbor::sha256(&bytes)),
+        },
+        bytes: Bytes::new(bytes),
+    }
+}
+
+/// A lane the client's bound ended gives its stream and its bulk slot back at once, though the
+/// caller keeps the lane: five lanes in a row end at the bound and are all kept, and the fifth open,
+/// past the connection's four slots, is not refused for want of one.
+#[tokio::test]
+async fn a_lane_the_bound_ended_gives_its_slot_back_while_the_caller_keeps_it() {
+    let script = Script::new(true);
+    let pair = pair(Arc::clone(&script)).await;
+    let bounds = ManualDeadlines::new();
+    let route = ChunkRoute::network(&pair.session, environment())
+        .await
+        .expect("a route")
+        .bounded_by(bounds.clone());
+    let transfer = TransferId::new(Uuid::from_bytes([4; 16]));
+    let chunk = some_chunk(transfer);
+    let at = target();
+    let mut kept = Vec::new();
+    for attempt in 1..=5 {
+        script.will(Chunk::Hold);
+        let mut lane = within(route.open(transfer))
+            .await
+            .unwrap_or_else(|error| panic!("attempt {attempt}: the open was refused: {error}"));
+        let sending = lane.send_chunk(&at, &chunk, TTL);
+        let cutting = async {
+            script
+                .until("the held chunk", |seen| seen.chunks.len() == attempt)
+                .await;
+            bounds.fire_when_armed(DeadlineKind::Idle).await;
+        };
+        let (sent, ()) = within(async { tokio::join!(sending, cutting) }).await;
+        let error = sent.expect_err("the held chunk is cut");
+        assert_eq!(deadline_of(&error), Some(DeadlineKind::Idle), "{error}");
+        kept.push(lane);
+    }
+    assert_eq!(kept.len(), 5);
+}
+
+/// A connection lost while a lane waits for a window ends the wait. The lane's one window was
+/// refused and no other will come, so without the connection's end the wait would run to the
+/// window's expiry.
+#[tokio::test]
+async fn a_lost_connection_ends_the_wait_for_a_window() {
+    let script = Script::new(true);
+    let pair = pair(Arc::clone(&script)).await;
+    let refused = pair.session.action_window().await.action_window_id;
+    *script.ended_window.lock().expect("the script") = Some(refused);
+    let route = ChunkRoute::network(&pair.session, environment())
+        .await
+        .expect("a route");
+    let transfer = TransferId::new(Uuid::from_bytes([5; 16]));
+    let chunk = some_chunk(transfer);
+    let at = target();
+    let mut lane = within(route.open(transfer)).await.expect("a lane");
+    let first = within(lane.send_chunk(&at, &chunk, TTL))
+        .await
+        .expect_err("the host refuses the window");
+    assert_eq!(first.code(), ErrorCode::PermissionDenied);
+
+    // The lane now waits: the window it holds is the one the host turned down.
+    let waiting = lane.send_chunk(&at, &chunk, TTL);
+    let closing = async {
+        script
+            .until("the first chunk", |seen| seen.chunks.len() == 1)
+            .await;
+        tokio::task::yield_now().await;
+        pair.session.close();
+    };
+    let (second, ()) = within(async { tokio::join!(waiting, closing) }).await;
+    let ended = second.expect_err("the wait ends with the connection");
+    assert_eq!(ended.code(), ErrorCode::ResourceUnavailable, "{ended}");
+    assert_eq!(
+        script.seen(|seen| seen.chunks.len()),
+        1,
+        "the refused window was not carried again"
+    );
 }
 
 /// A host that ended the upload while its lookup waited refuses the stream after its header. The
@@ -1203,7 +1295,10 @@ async fn a_lane_stops_when_the_transport_says_this_device_ended_the_connection()
         .await
         .expect("the first chunk goes");
 
+    // The account watcher records the reason and closes the connection, which revokes its streams:
+    // the lane is told the reason, and not that a stream was revoked.
     ended.store(true, Ordering::Release);
+    session.transport().revoke_streams();
     upload
         .accept(uploads::Answer::Chunked(Box::new(UploadChunkResult {
             transfer_id: begun.transfer_id,
