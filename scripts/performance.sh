@@ -171,6 +171,10 @@ check_no_survivors() {
 echo "building the release profile"
 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build --release --workspace
 
+# The session worker program's size by its largest parts, recorded at every run: each idle session
+# runs one worker, and the sum of resident sizes counts what they all map once for each of them.
+bash "$root/scripts/worker-size.sh" || true
+
 # Runs one measurement out of a named target.
 #
 # The target matters: the resource and attach measurements live beside the suite that closes the
