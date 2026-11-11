@@ -12,7 +12,7 @@
 //! earlier-state record is written once, before the first change, and never rewritten: a repair
 //! keeps the first baseline.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Write as _};
 use std::path::Path;
 
@@ -226,7 +226,7 @@ impl Prior {
     pub fn write_once(&self, path: &Path) -> Result<bool, StoreError> {
         let bytes = serde_json::to_vec_pretty(self)
             .map_err(|error| StoreError::Unreadable(error.to_string()))?;
-        match OpenOptions::new().write(true).create_new(true).open(path) {
+        match create(path, true) {
             Ok(mut file) => {
                 file.write_all(&bytes)?;
                 file.sync_all()?;
@@ -255,12 +255,33 @@ impl Prior {
     }
 }
 
+/// Opens a record for writing: new when `only_new` (the call fails when anything is at the name),
+/// else emptied. On Windows the call that makes the file carries its whole descriptor, owner
+/// included, so the record is the Administrators group's whoever runs the installation.
+fn create(path: &Path, only_new: bool) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        crate::win::fresh::record_file(path, only_new)
+    }
+    #[cfg(not(windows))]
+    {
+        if only_new {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+        } else {
+            File::create(path)
+        }
+    }
+}
+
 /// Writes a file whole: to a sibling first, then over the name, so a reader sees the old record or
 /// the new one and never half of either.
 fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let staging = path.with_extension("new");
     {
-        let mut file: File = File::create(&staging)?;
+        let mut file: File = create(&staging, false)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }

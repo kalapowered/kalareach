@@ -28,9 +28,9 @@ use crate::manifest::{GitSet, Manifest, ObjectKind};
 use crate::policy::{RULE_CHECKOUT, RULE_CONNECT};
 use crate::quote::quote_command_line;
 
-use super::acl;
 use super::applocker;
 use super::ffi::{self, Sid};
+use super::fresh;
 use super::install::Paths;
 use super::job::{Ended, Job, Limits};
 use super::launch::{
@@ -331,18 +331,18 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(under: &Path) -> Result<Scratch, String> {
-        let dir = under.join(format!("proof-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&dir)
-            .map_err(|error| format!("making {}: {error}", dir.display()))?;
-        let readable = descriptor(
+        // The name is new and random and the descriptor is in the call that makes the directory:
+        // no list is changed by path, and nothing that was there before can be in it.
+        let dir = fresh::directory(
+            under,
+            "proof",
             SdKind::AdminDir,
             &Principals {
                 users_may_read: true,
                 ..Principals::default()
             },
         )
-        .map_err(|error| error.to_string())?;
-        acl::set_protected(&dir, &readable).map_err(|error| error.to_string())?;
+        .map_err(|error| format!("making a directory in {}: {error}", under.display()))?;
         Ok(Scratch(dir))
     }
 }

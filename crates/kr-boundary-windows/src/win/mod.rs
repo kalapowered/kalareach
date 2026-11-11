@@ -31,6 +31,7 @@ pub mod applocker;
 pub mod boot;
 pub mod broker;
 pub mod ffi;
+pub mod fresh;
 pub mod install;
 pub mod job;
 pub mod journal;
