@@ -183,9 +183,12 @@ impl Journal {
         {
             return Err(OrderError("the row begins another invocation".to_owned()).into());
         }
-        let mut next = self.tracker.clone();
-        next.apply(row)?;
         let framed = framing::encode(&row.to_bytes())?;
+        // The tracker is not copied for each row: a refused row changes nothing, and a row that
+        // was applied and then not written closes the journal, which is taken up again from the
+        // file before any row is written (the tracker of a closed journal may be ahead of the file
+        // by that one row).
+        self.tracker.apply(row)?;
         if let Err(error) = self
             .file
             .write_all(&framed)
@@ -194,7 +197,6 @@ impl Journal {
             self.closed = true;
             return Err(error.into());
         }
-        self.tracker = next;
         self.rows += 1;
         Ok(DurableRow { rows: self.rows })
     }
