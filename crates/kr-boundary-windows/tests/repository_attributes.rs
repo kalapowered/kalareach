@@ -133,6 +133,12 @@ fn the_scan_reads_a_line_as_git_could_and_more() {
     // A quoted pattern is scanned as well, so a quote that Git would not close hides nothing.
     assert_eq!(rule("\"a\\q filter=lfs\"\n"), RULE_FILTER);
     assert_eq!(rule("\"a b\" filter=lfs\n"), RULE_FILTER);
+    // An attribute may follow the closing quotation mark with no space, and a quoted pattern that
+    // is spelled like an attribute is read as one: the scan refuses both.
+    assert_eq!(rule("\"x\"filter=lfs\n"), RULE_FILTER);
+    assert_eq!(rule("\"a b\"diff=foo\n"), RULE_DIFF);
+    assert_eq!(rule("\"filter=lfs\" text\n"), RULE_FILTER);
+    assert_eq!(rule("a\"filter=lfs\n"), RULE_FILTER);
     assert_eq!(rule("\"a\" \"b\" diff=foo\n"), RULE_DIFF);
     // Only a line feed ends a line, so a carriage return does not hide the next line's driver.
     assert_eq!(rule("*.x text\rfilter=lfs\n"), RULE_FILTER);

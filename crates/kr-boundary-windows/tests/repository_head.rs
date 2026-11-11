@@ -85,8 +85,8 @@ fn a_reference_outside_the_branches_is_refused_by_name() {
 fn a_branch_name_outside_the_grammar_is_refused_by_name() {
     for name in [
         "", "a..b", "a//b", "a/", "/a", "a.", ".a", "-a", "a/.b", "a/-b", "a.lock", "a/b.lock",
-        "a.lock/b", "a b", "a\tb", "a@{1}", "a:b", "a~1", "a^", "a?b", "a*b", "a[b", "a\\b",
-        "\u{e9}", "a\u{e9}",
+        "a.lock/b", "a b", "a\tb", "a@{1}", "a@b", "@", "a:b", "a~1", "a^", "a?b", "a*b", "a[b",
+        "a\\b", "\u{e9}", "a\u{e9}",
     ] {
         assert_eq!(
             refused(format!("ref: refs/heads/{name}\n").as_bytes()),
@@ -199,7 +199,7 @@ fn the_branch_name_grammar_is_the_one_the_tables_use() {
     )));
     for name in [
         "", "/", "//", "a//b", "/a", "a/", "a.", ".a", "-a", "_a", "a/.b", "a..b", "a.lock",
-        "a/b.lock", "a b", "a@{u}", "a:b", "a\\b", "a\n", "\u{e9}",
+        "a/b.lock", "a b", "a@{u}", "a@b", "@", "a:b", "a\\b", "a\n", "\u{e9}",
     ] {
         assert!(!is_branch_name(name), "{name:?}");
     }

@@ -7,8 +7,8 @@
 //! cannot run is refused before Git starts.
 //!
 //! The scan reads text. It cuts a line into the pieces Git could take for an attribute, at any
-//! byte up to the space, and looks at each piece after the pattern, so a spelling Git would read
-//! differently can only make it refuse more, never less.
+//! byte up to the space and at every quotation mark, and looks at each piece after the pattern, so
+//! a spelling Git would read differently can only make it refuse more, never less.
 
 use crate::frame::invocation::RefusedKind;
 use crate::refusal::Refusal;
@@ -73,10 +73,12 @@ pub fn scan_attributes(bytes: &[u8]) -> Result<(), Refusal> {
             ));
         }
         // The first piece is the pattern, unless it opens with a quotation mark: Git may or may
-        // not read such a pattern as quoted, so every piece of that line is looked at.
+        // not read such a pattern as quoted, and an attribute may follow its closing quotation
+        // mark with no space between, so a quotation mark ends a piece and every piece of such a
+        // line is looked at.
         let skip = usize::from(!line.starts_with(b"\""));
         for piece in line
-            .split(|byte| *byte <= b' ' || *byte == 0x7f)
+            .split(|byte| *byte <= b' ' || *byte == 0x7f || *byte == b'"')
             .filter(|piece| !piece.is_empty())
             .skip(skip)
         {

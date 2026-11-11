@@ -16,8 +16,7 @@ pub const OID_DIGITS: usize = 40;
 /// component that starts with `.` or `-`, spaces and every character Git refuses in a name.
 #[must_use]
 pub fn is_branch_name(name: &str) -> bool {
-    if name.is_empty() || name.len() > MAX_NAME_BYTES || name.contains("..") || name.ends_with('.')
-    {
+    if name.len() > MAX_NAME_BYTES || name.contains("..") || name.ends_with('.') {
         return false;
     }
     name.split('/').all(|component| {
