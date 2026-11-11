@@ -24,10 +24,14 @@ use windows_sys::Win32::UI::Shell::DeleteProfileW;
 use super::ffi::{Result, Sid, error, last, wide};
 use super::registry;
 
-/// The rights that refuse an account sign-in at the screen and by Remote Desktop.
-pub const DENY_RIGHTS: [&str; 2] = [
+/// The rights that refuse an account sign-in at the screen and by Remote Desktop, and the two
+/// that refuse it a batch logon and a service logon, which a scheduled task or a service would
+/// need to start a process for the account outside the invocation's job.
+pub const DENY_RIGHTS: [&str; 4] = [
     "SeDenyInteractiveLogonRight",
     "SeDenyRemoteInteractiveLogonRight",
+    "SeDenyBatchLogonRight",
+    "SeDenyServiceLogonRight",
 ];
 
 /// The key whose values name the accounts the sign-in screen does not list.

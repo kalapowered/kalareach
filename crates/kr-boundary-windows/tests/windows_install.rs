@@ -29,7 +29,7 @@ use kr_boundary_windows::win::ffi::Sid;
 use kr_boundary_windows::win::install::{CHECKOUT, CONNECT, Paths, SERVICE, STEPS};
 use kr_boundary_windows::win::launch::{Outcome, TokenSpec, VerifiedPath};
 use kr_boundary_windows::win::proof::{Run, run_captured};
-use kr_boundary_windows::win::{account, acl, registry, service, token};
+use kr_boundary_windows::win::{account, acl, boot, registry, service, token};
 
 const CLEAR: &str = r#"<AppLockerPolicy Version="1"><RuleCollection Type="Exe" EnforcementMode="NotConfigured" /></AppLockerPolicy>"#;
 const SPECIAL_ACCOUNTS: &str =
@@ -246,9 +246,11 @@ fn installation_lays_down_and_removal_restores() {
         privileges_in(&sc(&["qprivs", SERVICE])),
         [
             "SeAssignPrimaryTokenPrivilege",
+            "SeBackupPrivilege",
             "SeChangeNotifyPrivilege",
             "SeImpersonatePrivilege",
             "SeIncreaseQuotaPrivilege",
+            "SeRestorePrivilege",
             "SeTcbPrivilege"
         ],
         "the service holds the privileges it uses and no others"
@@ -282,6 +284,79 @@ fn installation_lays_down_and_removal_restores() {
         let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes));
         assert_eq!(object.detail.as_deref(), Some(digest.as_str()));
     }
+
+    // The journal's directory and the parent of the private roots are the administrators' alone and
+    // empty; the directory Git's own settings point at holds nothing but empty names.
+    for directory in [&paths.journal, &paths.run] {
+        assert!(directory.is_dir(), "{} exists", directory.display());
+        assert_eq!(acl::changeable_by_others(directory, false).unwrap(), None);
+        let described = acl::describe(directory).unwrap();
+        for everyone in [";;;BU)", ";;;WD)", ";;;AU)"] {
+            assert!(
+                !described.contains(everyone),
+                "no account but the administrators and the system is named on {}: {described}",
+                directory.display()
+            );
+        }
+        assert_eq!(std::fs::read_dir(directory).unwrap().count(), 0);
+    }
+    assert_eq!(
+        std::fs::metadata(paths.git.join("config")).unwrap().len(),
+        0,
+        "the global configuration Git is pointed at is empty"
+    );
+    for part in ["hooks", "template"] {
+        let directory = paths.git.join(part);
+        assert!(directory.is_dir(), "{} exists", directory.display());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+    }
+    assert_eq!(acl::changeable_by_others(&paths.git, false).unwrap(), None);
+    assert!(
+        kr_boundary_windows::win::walk::DirHandle::open_anchor(&paths.run)
+            .unwrap()
+            .is_ok(),
+        "the directory of the private roots is a directory the walk accepts as its anchor"
+    );
+    // The boot marker is made under the service's key, which only the system and the
+    // administrators can write, and is the same on the next read.
+    let first = boot::marker().unwrap();
+    assert!(first.trusted, "the marker is believed: {:?}", first.reason);
+    assert!(first.made, "the first read since the start made it");
+    assert!(
+        uuid::Uuid::parse_str(&first.id).is_ok(),
+        "the marker is a GUID: {}",
+        first.id
+    );
+    let second = boot::marker().unwrap();
+    assert_eq!(
+        (second.id.as_str(), second.made),
+        (first.id.as_str(), false)
+    );
+    // No hive of an account's is loaded, no profile folder is made, and neither a window station nor
+    // a desktop of ours exists: the boundary's tokens run with none of them.
+    let loaded = Command::new("reg.exe")
+        .args(["query", "HKU"])
+        .output()
+        .unwrap();
+    let loaded = String::from_utf8_lossy(&loaded.stdout).into_owned();
+    for (name, sid) in [CHECKOUT, CONNECT].iter().zip(&sids) {
+        assert!(
+            !loaded.contains(&sid.to_text()),
+            "no hive of {name} is loaded: {loaded}"
+        );
+        assert!(
+            !Path::new(&format!(r"C:\Users\{name}")).exists(),
+            "no profile folder of {name} is made"
+        );
+    }
+    let stations = kr_boundary_windows::win::ffi::window_station_names().unwrap();
+    assert!(
+        stations
+            .iter()
+            .all(|name| !name.to_lowercase().contains("kalareach")
+                && !name.to_lowercase().contains("krb")),
+        "no window station of ours exists: {stations:?}"
+    );
 
     // The policy is what was written, and the Application Identity service is on.
     let (_, effective) = channel().effective().unwrap();

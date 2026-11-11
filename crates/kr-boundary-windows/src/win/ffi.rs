@@ -253,3 +253,29 @@ impl Sid {
         }
     }
 }
+
+/// The names of the window stations the caller's session can see, for a case that shows the
+/// boundary made none of its own.
+///
+/// # Errors
+///
+/// Returns an error when the platform cannot list them.
+pub fn window_station_names() -> Result<Vec<String>> {
+    use std::sync::Mutex;
+
+    use windows_sys::Win32::System::StationsAndDesktops::EnumWindowStationsW;
+
+    static NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    unsafe extern "system" fn collect(name: *const u16, _: isize) -> i32 {
+        // SAFETY: the platform passes a NUL-terminated name that lives through the call.
+        let name = unsafe { from_wide(name) };
+        NAMES.lock().unwrap_or_else(|e| e.into_inner()).push(name);
+        1
+    }
+    NAMES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    // SAFETY: the callback has the signature the call wants and touches only the static list.
+    if unsafe { EnumWindowStationsW(Some(collect), 0) } == 0 {
+        return Err(last("listing the window stations"));
+    }
+    Ok(NAMES.lock().unwrap_or_else(|e| e.into_inner()).clone())
+}
