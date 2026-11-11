@@ -334,10 +334,20 @@ fn a_scan_that_finds_fewer_pages_than_the_kernel_is_refused_and_one_that_finds_m
         "the refusal names the process and the kernel's figure: {refused}"
     );
     // Within the tolerance, short.
-    assert!(scan(4096 + 60).is_ok(), "63 KiB short is inside 64 KiB");
+    let inside = scan(4096 + 60).expect("60 KiB short is inside 64 KiB");
+    assert_eq!(
+        inside.shortfall_kib, 60,
+        "and what the scan may have missed is recorded"
+    );
+    assert_eq!(
+        inside.held_kib(),
+        4096 + 60,
+        "and the figure the bound is held to includes it"
+    );
     // The kernel's figure is under the scan's: the zero pages a resident size leaves out.
     let more = scan(4096 - 8).expect("a scan above the kernel's size is accepted");
     assert_eq!(more.beyond_kib, 8, "the excess is recorded");
+    assert_eq!(more.shortfall_kib, 0, "and nothing was missed");
     assert_eq!(
         more.combined_kib, 4096,
         "and the pages it found are counted"

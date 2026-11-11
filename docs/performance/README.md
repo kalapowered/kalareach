@@ -128,8 +128,9 @@ against 512,000 KiB:
   is recorded on the `scan` line. A scan that finds
   fewer pages than a process's kernel resident size, by more than the larger of 64 KiB and one per
   cent, has lost pages: the reading is refused and the measurement fails with the process named.
-  A scan inside that tolerance is accepted, so the reading can fall short of what a process holds
-  by up to that much. The pages of an `anon_inode:` mapping, which belong to a kernel object and
+  A scan inside that tolerance is accepted, and the sum of what each scan fell short of the
+  kernel's size by is added to the figure asserted and printed on the `resident set` line, so a
+  reading that misses pages never reads below what the group holds. The pages of an `anon_inode:` mapping, which belong to a kernel object and
   not to a file other processes share, are counted for each process.
 - The root shell of each session is counted with the workers and the daemon.
 

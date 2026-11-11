@@ -20,7 +20,8 @@
 //! the kernel's size, and the excess is kept in [`Reading::beyond_kib`]. A scan that finds fewer
 //! pages than the kernel's resident size by more than the larger of 64 KiB and one per cent has lost
 //! some and is refused, so an accepted reading can fall short of the pages a process holds by up to
-//! that much. A page in swap (bit 62 of its entry) is not resident, but it is counted apart for the
+//! that much, and the sum of what each process was accepted short by is added to the figure the bound
+//! is held to ([`Reading::shortfall_kib`]). A page in swap (bit 62 of its entry) is not resident, but it is counted apart for the
 //! process whose page map shows it, and the figure the bound is held to includes it
 //! ([`Reading::held_kib`]): a reading taken while the host swaps must not read lower than the same
 //! group's resident size on a host that does not.
@@ -129,6 +130,9 @@ pub struct Reading {
     /// How far the scan's pages are above the kernel's own resident sizes, in all: the zero pages
     /// and huge pages it leaves out of a resident size.
     pub beyond_kib: u64,
+    /// How far the scan's pages are below the kernel's own resident sizes, in all, where the
+    /// agreement rule accepted it: what a scan may have missed.
+    pub shortfall_kib: u64,
     /// Each class apart. A file page that two classes map counts once in each, so these do not add
     /// up to the whole.
     pub classes: Vec<ClassReading>,
@@ -143,10 +147,11 @@ impl Reading {
         self.files.iter().find(|file| file.path == path)
     }
 
-    /// The figure the memory bound is held to: the pages in memory and the pages in swap.
+    /// The figure the memory bound is held to: the pages in memory, the pages in swap, and what
+    /// the agreement rule let the scan miss.
     #[must_use]
     pub fn held_kib(&self) -> u64 {
-        self.combined_kib + self.swapped_kib
+        self.combined_kib + self.swapped_kib + self.shortfall_kib
     }
 
     /// The reading of one class.
@@ -159,14 +164,15 @@ impl Reading {
     #[must_use]
     pub fn to_lines(&self) -> Vec<String> {
         let mut lines = vec![format!(
-            "memory.group {} {} {} {} {} {} {}",
+            "memory.group {} {} {} {} {} {} {} {}",
             self.processes,
             self.resident_kib,
             self.own_kib,
             self.files_kib,
             self.combined_kib,
             self.beyond_kib,
-            self.swapped_kib
+            self.swapped_kib,
+            self.shortfall_kib
         )];
         for class in &self.classes {
             lines.push(format!(
@@ -225,6 +231,7 @@ impl Reading {
                     combined,
                     beyond,
                     swapped,
+                    shortfall,
                 ] = numbers(&fields)?[..]
                 else {
                     return Err("the reader's group line has the wrong number of fields".to_owned());
@@ -237,6 +244,7 @@ impl Reading {
                     combined_kib: combined,
                     swapped_kib: swapped,
                     beyond_kib: beyond,
+                    shortfall_kib: shortfall,
                     classes: Vec::new(),
                     files: Vec::new(),
                 });
@@ -324,16 +332,27 @@ pub fn with_retries<T>(mut scan: impl FnMut() -> Result<T, Failure>) -> Result<T
     Err(format!("{last}, and still after {ATTEMPTS} scans"))
 }
 
-/// Whether a scan's resident pages agree with the kernel's own resident size, and how far above it
+/// How far an accepted scan is from the kernel's own resident size, in kibibytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Agreement {
+    /// How far the scan is above the kernel's size: the zero pages and huge pages a resident size
+    /// leaves out.
+    pub beyond_kib: u64,
+    /// How far the scan is below the kernel's size, inside the tolerance: what it may have missed.
+    pub shortfall_kib: u64,
+}
+
+/// Whether a scan's resident pages agree with the kernel's own resident size, and how far from it
 /// they are.
 ///
 /// A scan that finds fewer pages than the kernel by more than the larger of 64 KiB and one per cent
-/// has lost some. One that finds more is accepted, and the difference is returned.
+/// has lost some. One that finds more is accepted, and so is one that finds fewer inside that
+/// tolerance; the distance is returned, above or below.
 ///
 /// # Errors
 ///
 /// The scan found too few pages.
-pub fn agreement(pid: u32, found_kib: u64, kernel_kib: u64) -> Result<u64, String> {
+pub fn agreement(pid: u32, found_kib: u64, kernel_kib: u64) -> Result<Agreement, String> {
     let tolerance = LEAST_TOLERANCE_KIB.max(kernel_kib / 100);
     if found_kib + tolerance < kernel_kib {
         return Err(format!(
@@ -341,7 +360,10 @@ pub fn agreement(pid: u32, found_kib: u64, kernel_kib: u64) -> Result<u64, Strin
              {kernel_kib} KiB"
         ));
     }
-    Ok(found_kib.saturating_sub(kernel_kib))
+    Ok(Agreement {
+        beyond_kib: found_kib.saturating_sub(kernel_kib),
+        shortfall_kib: kernel_kib.saturating_sub(found_kib),
+    })
 }
 
 /// One line of a process's `maps`.
@@ -403,6 +425,8 @@ struct Scan {
     by_file: HashMap<(String, u64), (String, u64)>,
     /// How far above the kernel's resident size the scan is, in kibibytes.
     beyond_kib: u64,
+    /// How far below it the scan is, inside the tolerance, in kibibytes.
+    shortfall_kib: u64,
 }
 
 /// A `/proc` directory and the page size its page maps are indexed by.
@@ -485,6 +509,7 @@ impl Proc {
             files: HashSet::new(),
             by_file: HashMap::new(),
             beyond_kib: 0,
+            shortfall_kib: 0,
         };
         let mut buffer = vec![0_u8; usize::try_from(CHUNK_PAGES * 8).unwrap_or(usize::MAX)];
         for mapping in &listing {
@@ -549,8 +574,9 @@ impl Proc {
             )));
         }
         let found_kib = scan.resident * self.page_bytes / 1024;
-        scan.beyond_kib =
-            agreement(pid, found_kib, self.rss_kib(pid)?).map_err(Failure::Refused)?;
+        let agreed = agreement(pid, found_kib, self.rss_kib(pid)?).map_err(Failure::Refused)?;
+        scan.beyond_kib = agreed.beyond_kib;
+        scan.shortfall_kib = agreed.shortfall_kib;
         Ok(scan)
     }
 
@@ -569,6 +595,7 @@ impl Proc {
         let mut swapped = 0;
         let mut own = 0;
         let mut beyond_kib = 0;
+        let mut shortfall_kib = 0;
         let mut processes = 0;
         for class in classes {
             let mut within: HashSet<FilePage> = HashSet::new();
@@ -584,6 +611,7 @@ impl Proc {
                 class_swapped += scan.swapped;
                 class_own += scan.own;
                 beyond_kib += scan.beyond_kib;
+                shortfall_kib += scan.shortfall_kib;
                 for (file, (path, pages)) in scan.by_file {
                     each_by_file.entry(file).or_insert_with(|| (path, 0)).1 += pages;
                 }
@@ -637,6 +665,7 @@ impl Proc {
             combined_kib: kib(own + whole.len() as u64),
             swapped_kib: kib(swapped),
             beyond_kib,
+            shortfall_kib,
             classes: kinds,
             files,
         })

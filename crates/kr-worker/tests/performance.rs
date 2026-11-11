@@ -892,6 +892,48 @@ fn memory_is_held_to_what_the_group_holds_where_that_is_read() {
     );
 }
 
+/// KR-PERF-003: the asserted figure includes what the reader's agreement rule lets a scan miss, so a
+/// group whose scan is 8 KiB short of the kernel's resident size and whose pages found are 4 KiB under
+/// the bound fails it, and the same group whose scan missed nothing passes.
+#[cfg(target_os = "linux")]
+#[test]
+fn memory_held_includes_what_the_scan_was_accepted_short_by() {
+    let reference = record::Conditions::supplied(4, 8 * 1024, Some(0.0));
+    let reading = |shortfall_kib: u64| memory::Reading {
+        processes: 1,
+        resident_kib: RESIDENT_BOUND_KIB - 4,
+        own_kib: RESIDENT_BOUND_KIB - 4,
+        files_kib: 0,
+        combined_kib: RESIDENT_BOUND_KIB - 4,
+        swapped_kib: 0,
+        beyond_kib: 0,
+        shortfall_kib,
+        classes: Vec::new(),
+        files: Vec::new(),
+    };
+    let idle = |shortfall_kib: u64| {
+        Idle::new(
+            0.0075,
+            400_000,
+            Some(reading(shortfall_kib).held_kib()),
+            &reference,
+        )
+    };
+
+    assert_eq!(
+        idle(0).check(),
+        Ok(()),
+        "4 KiB under the bound, nothing missed"
+    );
+    assert!(
+        idle(8)
+            .check()
+            .is_err_and(|failure| failure.contains("idle resident memory")),
+        "4 KiB under the bound with 8 KiB the scan may have missed fails: {:?}",
+        idle(8).check()
+    );
+}
+
 /// The sum is watched, not held to the requirement: a rise of it above its recorded level by more
 /// than the step stops the measurement with the words that a ruling is needed.
 #[test]
@@ -1010,16 +1052,18 @@ async fn held_memory(
     };
     let mut lines = vec![
         format!(
-            "  resident set      {} KiB with each resident page counted once for the group and \
-             each page in swap counted for each process that shows it, against \
-             {RESIDENT_BOUND_KIB} KiB: the asserted figure ({} KiB in memory, of which {} KiB is \
-             counted for each process that holds it and {} KiB is file pages counted once, and \
-             {} KiB in swap)",
+            "  resident set      {} KiB with each resident page counted once for the group, each \
+             page in swap counted for each process that shows it, and what the scan may have \
+             missed, against {RESIDENT_BOUND_KIB} KiB: the asserted figure ({} KiB in memory, of \
+             which {} KiB is counted for each process that holds it and {} KiB is file pages \
+             counted once; {} KiB in swap; {} KiB the scan was accepted short of the kernel's \
+             resident sizes by)",
             reading.held_kib(),
             reading.combined_kib,
             reading.own_kib,
             reading.files_kib,
-            reading.swapped_kib
+            reading.swapped_kib,
+            reading.shortfall_kib
         ),
         format!(
             "  by class          held, then the resident pages the scan counted for each process: the \
