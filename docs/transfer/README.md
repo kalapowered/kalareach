@@ -117,22 +117,25 @@ paired device's actor is that device, and a local caller's actor is the operatin
 could change it per request would give itself another allowance.
 
 A paired device's open drafts are bounded as well, at 64 for each device. A draft is open until a
-prompt sends it to a session, which is how a device frees its place, or the session it targets
-closes, and a draft no longer open takes no place. `draft.create` counts the device's open drafts and
+prompt sends it to a session, the session it targets closes, the agent has taken every file bound to
+it (all of its attachments are `accepted_by_agent`, and there is at least one), or the device ends
+it with `draft.discard`; a draft no longer open takes no place. A draft with an attachment
+`inserting` or `unknown` goes on counting, because a retry or a report may still come for it. `draft.create` counts the device's open drafts and
 writes the new one in one transaction under the journal's write lock, so two creates that each find
 one place left cannot both take it, and it asks the host's admission again before it counts, so a
 device whose authority has gone is never told how many it holds. Past the bound the refusal is
-`QUOTA_EXCEEDED`, with the bound in its message. A refused create leaves no draft, and the service
+`QUOTA_EXCEEDED`, with the bound and the ways a place is freed in its message. A refused create
+leaves no draft, and the service
 writes no record of it. The host keeps the refusal in the transfer journal as that action's outcome,
 as it does any other refusal of the service, so the same action asked again is given the same
 refusal even when a place is free, and a device that has freed a place takes a new action for its
 new attempt. The person at this machine is held to no bound, and nothing a device sends changes it:
 the number is a constant of the host that an owner cannot change.
 
-A device cannot end a draft itself, because this level has no method that discards one. Sent and
-orphaned drafts stay in the journal, and each `draft.update` adds a row to the journal's events,
-which nothing removes, and a receipt that holds the updated draft until the de-duplication window
-ends. A draft that names no session is freed only by a prompt that sends it.
+Sent and orphaned drafts stay in the journal, and each `draft.update` adds a row to the journal's
+events, which nothing removes, and a receipt that holds the updated draft until the de-duplication
+window ends. A draft that names no session is freed by a prompt that sends it, by the agent taking
+its files, or by `draft.discard`.
 
 Bytes stay charged until the payload they name is actually gone. Closing an upload's row marks it
 for cleanup and keeps its reservation; removing the file releases it. A removal that fails, or a
