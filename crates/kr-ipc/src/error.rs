@@ -201,6 +201,17 @@ impl IpcError {
         Self::Socket { operation, source }
     }
 
+    /// Reads the failure of `operation` on a connected local stream: [`Self::PeerClosed`] when
+    /// [`peer_has_gone`] says the peer has gone, and a socket failure otherwise.
+    #[must_use]
+    pub fn stream(operation: &'static str, source: std::io::Error) -> Self {
+        if peer_has_gone(&source) {
+            Self::PeerClosed
+        } else {
+            Self::socket(operation, source)
+        }
+    }
+
     /// Returns the stable protocol code this failure is reported under.
     #[must_use]
     pub fn code(&self) -> ErrorCode {
@@ -285,6 +296,28 @@ fn mending_command(
     }
     let text = path.to_str()?;
     Some(format!("chmod 700 '{}'", text.replace('\'', "'\\''")))
+}
+
+/// Whether `failure`, what a write, a read or a shutdown on a connected local stream answered,
+/// says that the peer has gone.
+///
+/// This is the one rule for every such operation. A peer that closes can be answered in three
+/// forms, and which one depends on the system and on where the operation falls in the close: a
+/// broken pipe (a write after the peer closed), a reset (a write or a read at the close, or a read
+/// when the peer closed with bytes of this end's unread) and "not connected" (a write that races
+/// the close, and a shutdown after it, on macOS). A named pipe on Windows is answered by its
+/// broken-pipe and no-data errors, which the standard library reports as a broken pipe.
+///
+/// A failure of the network, or of connecting, is not a peer that has gone: a connection that was
+/// refused never had a peer, and what a network connection answers is its own transport's to read.
+#[must_use]
+pub fn peer_has_gone(failure: &std::io::Error) -> bool {
+    matches!(
+        failure.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::NotConnected
+    )
 }
 
 /// Whether an I/O failure is a connection's refusal of its caller by account, carried inside it.
@@ -394,5 +427,46 @@ mod tests {
             std::io::Error::from(std::io::ErrorKind::PermissionDenied),
         );
         assert_eq!(denied.code(), ErrorCode::ResourceUnavailable);
+    }
+
+    /// A connected local stream whose peer has gone answers in three forms, and the system picks
+    /// among them. A real socket gives "not connected" to a read only on some systems and in no
+    /// round a case can count on, so this holds every form to the rule for each operation, and
+    /// holds the failures that are not a gone peer to being failures of the socket.
+    #[test]
+    fn a_stream_failure_of_a_gone_peer_is_the_peer_closing_in_every_form() {
+        use std::io::ErrorKind;
+
+        for form in [
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+            ErrorKind::NotConnected,
+        ] {
+            for operation in ["write", "read", "shut down"] {
+                let failure = IpcError::stream(operation, std::io::Error::from(form));
+                assert!(
+                    matches!(failure, IpcError::PeerClosed),
+                    "{operation}: {form:?} gave {failure:?}"
+                );
+            }
+        }
+        for other in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidInput,
+            ErrorKind::TimedOut,
+            ErrorKind::ConnectionRefused,
+        ] {
+            let failure = IpcError::stream("write", std::io::Error::from(other));
+            assert!(
+                matches!(
+                    failure,
+                    IpcError::Socket {
+                        operation: "write",
+                        ..
+                    }
+                ),
+                "{other:?} gave {failure:?}"
+            );
+        }
     }
 }

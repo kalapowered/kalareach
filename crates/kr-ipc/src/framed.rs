@@ -22,7 +22,7 @@ use tokio::io::AsyncWrite as _;
 use tokio::io::{AsyncReadExt as _, ReadHalf, WriteHalf};
 
 use crate::endpoint::Connection;
-use crate::error::{IpcError, Result};
+use crate::error::{IpcError, Result, peer_has_gone};
 
 /// The frames a link read and wrote, kept in order for a test that records a real exchange.
 ///
@@ -62,6 +62,19 @@ impl Tap {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+}
+
+/// How many bytes a read of the stream took, as the reader counts them.
+///
+/// A peer that has gone is the end of the stream whichever way the system says so: a count of
+/// none, as a read after a clean close answers, or the failure [`peer_has_gone`] names, as a read
+/// answers when the peer closed with bytes of this end's unread. The reader then ends the frame in
+/// hand the same way for both.
+fn bytes_read(answer: std::io::Result<usize>) -> Result<usize> {
+    match answer {
+        Err(error) if peer_has_gone(&error) => Ok(0),
+        other => other.map_err(|error| IpcError::socket("read", error)),
     }
 }
 
@@ -351,11 +364,11 @@ impl FrameReader {
                 if room == 0 {
                     return Ok(None);
                 }
-                let read = self
-                    .half
-                    .read(&mut self.prefix[self.prefix_filled..self.prefix_filled + room])
-                    .await
-                    .map_err(|error| IpcError::socket("read", error))?;
+                let read = bytes_read(
+                    self.half
+                        .read(&mut self.prefix[self.prefix_filled..self.prefix_filled + room])
+                        .await,
+                )?;
                 if read == 0 {
                     return if self.prefix_filled == 0 {
                         // A clean end at a frame boundary is the peer going away, not a broken
@@ -386,11 +399,11 @@ impl FrameReader {
             if room == 0 {
                 return Ok(None);
             }
-            let read = self
-                .half
-                .read(&mut self.payload[self.payload_filled..self.payload_filled + room])
-                .await
-                .map_err(|error| IpcError::socket("read", error))?;
+            let read = bytes_read(
+                self.half
+                    .read(&mut self.payload[self.payload_filled..self.payload_filled + room])
+                    .await,
+            )?;
             if read == 0 {
                 return Err(IpcError::TruncatedFrame {
                     received: self.payload_filled,
@@ -547,7 +560,8 @@ impl FrameWriter {
     ///
     /// # Errors
     ///
-    /// Returns an error when the socket is already gone or refuses the shutdown.
+    /// Returns [`IpcError::PeerClosed`] when the socket is already gone or its peer has closed, and
+    /// a socket failure when the system refuses the shutdown for another reason.
     #[cfg(all(unix, feature = "testing"))]
     pub fn shut_down(&self, how: std::net::Shutdown) -> Result<()> {
         let Some(descriptor) = self.descriptor.as_ref() else {
@@ -559,7 +573,7 @@ impl FrameWriter {
             std::net::Shutdown::Both => rustix::net::Shutdown::Both,
         };
         rustix::net::shutdown(descriptor, how)
-            .map_err(|error| IpcError::socket("shut down", error.into()))
+            .map_err(|error| IpcError::stream("shut down", error.into()))
     }
 
     /// Asks the operating system what has become of the peer, reading nothing and waiting for
@@ -591,9 +605,7 @@ impl FrameWriter {
                     .and_then(|waiting| usize::try_from(waiting).ok())
                     .map_or(1, |waiting| waiting.max(1)),
             ),
-            Err(
-                rustix::io::Errno::PIPE | rustix::io::Errno::CONNRESET | rustix::io::Errno::NOTCONN,
-            ) => PeerState::Gone,
+            Err(error) if peer_has_gone(&error.into()) => PeerState::Gone,
             Err(_) => PeerState::Quiet,
         }
     }
@@ -835,10 +847,7 @@ impl FrameWriter {
                 Ok(written) => self.sent += written,
                 Err(rustix::io::Errno::AGAIN) => return Ok(CheckedWrite::Blocked),
                 Err(rustix::io::Errno::INTR) => {}
-                Err(rustix::io::Errno::PIPE | rustix::io::Errno::CONNRESET) => {
-                    return Err(IpcError::PeerClosed);
-                }
-                Err(error) => return Err(IpcError::socket("write", error.into())),
+                Err(error) => return Err(IpcError::stream("write", error.into())),
             }
         }
         Ok(CheckedWrite::Complete)
@@ -875,12 +884,7 @@ impl FrameWriter {
                 Poll::Pending => return Ok(CheckedWrite::Blocked),
                 Poll::Ready(Ok(0)) => return Err(IpcError::PeerClosed),
                 Poll::Ready(Ok(written)) => self.sent += written,
-                Poll::Ready(Err(error))
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                    ) =>
-                {
+                Poll::Ready(Err(error)) if peer_has_gone(&error) => {
                     return Err(IpcError::PeerClosed);
                 }
                 Poll::Ready(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {

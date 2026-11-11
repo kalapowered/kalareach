@@ -45,10 +45,12 @@ fn a_worker_is_on_its_way_out(error: &ControllerError) -> bool {
 
     match error {
         ControllerError::Ipc(IpcError::PeerClosed | IpcError::TruncatedFrame { .. }) => true,
-        ControllerError::Ipc(IpcError::Socket { source, .. }) => matches!(
-            source.kind(),
-            ErrorKind::NotFound | ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset
-        ),
+        ControllerError::Ipc(IpcError::Socket { source, .. }) => {
+            matches!(
+                source.kind(),
+                ErrorKind::NotFound | ErrorKind::ConnectionRefused
+            ) || kr_ipc::error::peer_has_gone(source)
+        }
         _ => false,
     }
 }
