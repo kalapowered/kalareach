@@ -591,14 +591,18 @@ impl Parser<'_> {
                     let (left, right) = (self.qualify(left)?, self.qualify(right)?);
                     self.checks.push(Check::ResolveRange {
                         index: self.argv.len(),
-                        left: left.spec.clone(),
+                        left: left.spec().to_owned(),
                         dots: *dots,
-                        right: right.spec.clone(),
+                        right: right.spec().to_owned(),
                     });
                     self.symbolic_check(&left);
                     self.symbolic_check(&right);
-                    self.argv
-                        .push(format!("{}{}{}", left.spec, dots_text(*dots), right.spec));
+                    self.argv.push(format!(
+                        "{}{}{}",
+                        left.spec(),
+                        dots_text(*dots),
+                        right.spec()
+                    ));
                     self.at += 1;
                 }
                 _ => break,
@@ -615,9 +619,9 @@ impl Parser<'_> {
     /// A revision that starts at a branch has that reference checked: a symbolic reference could
     /// make another one, a tag among them, answer to the branch's name.
     fn symbolic_check(&mut self, revision: &Revision) {
-        if let Some(refname) = &revision.branch {
+        if let Some(refname) = revision.branch() {
             self.checks.push(Check::NotSymbolic {
-                refname: refname.clone(),
+                refname: refname.to_owned(),
             });
         }
     }
@@ -626,12 +630,12 @@ impl Parser<'_> {
     fn revision(&mut self, text: &str) -> Result<(), Refusal> {
         let revision = self.qualify(text)?;
         self.checks.push(Check::Resolve {
-            spec: revision.spec.clone(),
+            spec: revision.spec().to_owned(),
             replaces: Some(self.argv.len()),
             tree_target: false,
         });
         self.symbolic_check(&revision);
-        self.argv.push(revision.spec);
+        self.argv.push(revision.into_spec());
         self.at += 1;
         Ok(())
     }
@@ -739,13 +743,13 @@ impl Parser<'_> {
                     Some(Arg::Rev(text)) => {
                         let revision = self.qualify(text)?;
                         self.checks.push(Check::Resolve {
-                            spec: revision.spec.clone(),
+                            spec: revision.spec().to_owned(),
                             replaces: Some(self.argv.len() + 1),
                             tree_target: true,
                         });
                         self.symbolic_check(&revision);
                         self.argv.push("--detach".to_owned());
-                        self.argv.push(revision.spec);
+                        self.argv.push(revision.into_spec());
                         self.argv.push("--".to_owned());
                         self.at = 2;
                         self.end()
@@ -759,12 +763,12 @@ impl Parser<'_> {
             Some(Arg::Rev(text)) => {
                 let revision = self.qualify(text)?;
                 self.checks.push(Check::Resolve {
-                    spec: revision.spec.clone(),
+                    spec: revision.spec().to_owned(),
                     replaces: Some(self.argv.len()),
                     tree_target: true,
                 });
                 self.symbolic_check(&revision);
-                self.argv.push(revision.spec);
+                self.argv.push(revision.into_spec());
                 self.at = 1;
                 self.paths(true)?;
                 self.end()

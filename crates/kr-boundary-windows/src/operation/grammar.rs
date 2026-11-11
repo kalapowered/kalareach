@@ -162,15 +162,36 @@ pub fn revision(text: &str) -> Result<Revision, &'static str> {
     })
 }
 
-/// A revision as [`revision`] qualified it.
+/// A revision as [`revision`] qualified it. Only the grammar builds one, so a revision that starts
+/// at a branch always carries the reference to check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Revision {
     /// The form the command line carries: the base, qualified, and the steps.
-    pub spec: String,
+    spec: String,
     /// The reference `refs/heads/<name>` the revision starts at, when its base is a branch name. A
     /// revision that starts at `HEAD` or an identifier has none. It comes from the grammar's own
     /// parse of the base, so no check of a reference can be lost for want of parsing it again.
-    pub branch: Option<String>,
+    branch: Option<String>,
+}
+
+impl Revision {
+    /// The form the command line carries: the base, qualified, and the steps.
+    #[must_use]
+    pub fn spec(&self) -> &str {
+        &self.spec
+    }
+
+    /// The same, taken by value.
+    #[must_use]
+    pub fn into_spec(self) -> String {
+        self.spec
+    }
+
+    /// The reference `refs/heads/<name>` the revision starts at, when its base is a branch name.
+    #[must_use]
+    pub fn branch(&self) -> Option<&str> {
+        self.branch.as_deref()
+    }
 }
 
 /// Takes a qualified revision, as [`revision`] returns it or as a reader is given it, apart into

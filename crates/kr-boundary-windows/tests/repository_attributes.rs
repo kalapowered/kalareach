@@ -319,8 +319,21 @@ fn a_line_is_read_as_git_reads_it_and_whole_because_git_ends_it_at_a_nul() {
         scan_attributes(b"x diff=cpp\0\n").unwrap_err().rule,
         RULE_DIFF
     );
-    // Each reading is of one line: a NUL ends nothing of the next line.
+    // A NUL in the middle of a name ends it for Git too: the attribute is `filter`.
+    assert_eq!(
+        scan_attributes(b"*.x filter\0ignored\n").unwrap_err().rule,
+        RULE_FILTER
+    );
+    // A NUL ends nothing of the next line in a file Git reads from disk; a copy from the index or
+    // a tree ends at its first NUL and Git reads no later line of it. The scan reads every line,
+    // each cut at its NUL and whole, so both readings are shown on a later line too.
     let refusal = scan_attributes(b"* text\0\n*.x filter=lfs\n").unwrap_err();
+    assert!(refusal.detail().contains("line 2"), "{refusal}");
+    let refusal = scan_attributes(b"* text\n\"q filter=lfs\0\"\n").unwrap_err();
+    assert_eq!(refusal.rule, RULE_FILTER);
+    assert!(refusal.detail().contains("line 2"), "{refusal}");
+    let refusal = scan_attributes(b"* text\nx\0 filter=lfs\n").unwrap_err();
+    assert_eq!(refusal.rule, RULE_FILTER);
     assert!(refusal.detail().contains("line 2"), "{refusal}");
     assert!(scan_attributes(b"* text\0 more\n*.x text\n").is_ok());
     assert!(scan_attributes(b"\"a b\0\" text\n").is_ok());

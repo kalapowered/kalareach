@@ -626,8 +626,9 @@ const FALL_BACK_PREFIX: &[u8] = b"gi7d29";
 /// has it (read in the sources of Git 2.50.1 and 2.53.0, where the function is the same, and
 /// checked against the recording of `git fsck --strict` in both builds): `.gitattributes` in any
 /// case; or its first six letters, `~` and one digit from 1 to 4; or a fall-back short name, the
-/// first bytes of `gi7d29` followed by `~` and digits, eight bytes in all. Each may be followed by
-/// spaces and periods and then a `:` (an alternate stream) or the end.
+/// first bytes of `gi7d29` followed by `~`, a first digit from 1 to 9 (a 0 there does not match)
+/// and further digits of any value, eight bytes in all. Each may be followed by spaces and periods
+/// and then a `:` (an alternate stream) or the end.
 fn is_ntfs_dotgitattributes(name: &[u8]) -> bool {
     // The end of the name is a NUL, as in the C string Git reads.
     let at = |i: usize| name.get(i).copied().unwrap_or(0);

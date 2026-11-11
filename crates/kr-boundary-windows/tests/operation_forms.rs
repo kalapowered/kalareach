@@ -2638,7 +2638,7 @@ fn a_revision_names_the_branch_it_starts_at_from_its_own_parse() {
         (&format!("{OID}^"), &format!("{OID}^"), None),
     ] {
         let found = revision(text).unwrap_or_else(|rule| panic!("{text}: {rule}"));
-        assert_eq!(found.spec, spec, "{text}");
-        assert_eq!(found.branch.as_deref(), branch, "{text}");
+        assert_eq!(found.spec(), spec, "{text}");
+        assert_eq!(found.branch(), branch, "{text}");
     }
 }

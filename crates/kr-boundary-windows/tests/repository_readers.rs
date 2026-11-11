@@ -548,7 +548,7 @@ fn a_revision_the_grammar_takes_is_read_whole_after_the_prefix_is_added() {
     // reader takes only its own part, so none of them has a bound the other parts exceed.
     let written = format!("{}{}", "n".repeat(200), "^{commit}".repeat(4));
     assert_eq!(written.len(), 236);
-    let qualified = grammar::revision(&written).unwrap().spec;
+    let qualified = grammar::revision(&written).unwrap().into_spec();
     assert_eq!(qualified.len(), 247);
     let parts = resolved(&qualified);
     let Base::Reference(reference) = &parts.base else {
@@ -935,6 +935,10 @@ fn the_names_ntfs_gives_gitattributes_are_picked_exactly_as_git_matches_them() {
         ("gi7d29~1:s", true),
         ("g~12345 .", false),
         ("gi7d2~10 ", true),
+        // Two boundaries of the fall-back loop, recorded in Apple Git 2.50.1: a 9 after the first
+        // digit, and a byte over 0x7f at a prefix position.
+        ("gi7d2~19", true),
+        ("gi7dé~1", false),
     ];
     for (name, matched) in recorded {
         let entries = [entry(0o100_644, OID, 0, format!("d/{name}").as_bytes())];

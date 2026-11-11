@@ -13,9 +13,12 @@
 //!
 //! Two things Git does depend on where the bytes came from or on how it stores a line, so the scan
 //! reads the file more than one way and reports what any reading shows. Git reads a line as a C
-//! string, which ends at its first NUL, so each line is read cut at the NUL and whole. Git removes a
-//! UTF-8 byte order mark from line 1 of a file it reads from disk and keeps it in a copy from the
-//! index or a tree, so a file that starts with the mark is read with it and without it.
+//! string, which ends at its first NUL, so each line is read cut at the NUL and whole. A NUL ends
+//! nothing of the next line in a file Git reads from disk; a copy from the index or a tree ends at
+//! its first NUL, and Git reads none of what follows. The scan reads every line of the file either
+//! way, so it can report more than Git applies and never less. Git removes a UTF-8 byte order mark
+//! from line 1 of a file it reads from disk and keeps it in a copy from the index or a tree, so a
+//! file that starts with the mark is read with it and without it.
 
 use crate::frame::invocation::RefusedKind;
 use crate::refusal::Refusal;
@@ -83,9 +86,10 @@ const BYTE_ORDER_MARK: &[u8] = b"\xef\xbb\xbf";
 fn scan_text(bytes: &[u8]) -> Result<(), Refusal> {
     for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
         let at = index + 1;
-        // Git reads a line as a C string, which ends at its first NUL; what follows is invisible
-        // to it. The line is read cut there, which is what Git sees, and whole, which shows what
-        // a reader that does not stop at a NUL would see; either reading may refuse.
+        // Git reads a line as a C string, which ends at its first NUL; what follows on the line is
+        // invisible to it, and in a copy from the index or a tree so is every later line. The line
+        // is read cut there, which is what Git sees, and whole, which shows what a reader that does
+        // not stop at a NUL would see; either reading may refuse, and later lines are read anyway.
         let seen = line.split(|byte| *byte == 0).next().unwrap_or_default();
         scan_line(seen, at)?;
         if seen.len() != line.len() {
