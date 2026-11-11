@@ -99,8 +99,9 @@ use kr_e2e_agents::account::{KEY_SCAN_VARIABLE, Ledger};
 use kr_e2e_agents::build::{self, Account, Build, InstallSwitch, Probe};
 use kr_e2e_agents::held::{
     Absent, Audit, CONFIG_DIRECTORY, HeldKeys, ISOLATION_UNPROVEN, MetaGuard, Recorded, RunScan,
-    Stop, absent_paths, audit_turns, conversations_root, grouped_output, kept_panic_text,
-    other_agent_processes, other_agents_refusal, panic_text, person_home, turns_recorded,
+    Stop, absent_paths, audit_turns, conversations_relative, grouped_output, kept_panic_text,
+    other_agent_processes, other_agents_refusal, panic_text, person_home, read_record,
+    turns_recorded, unchanged_before_the_charge,
 };
 use kr_e2e_agents::outcome::Outcome;
 use kr_e2e_agents::stage::{Installation, closed_port, session_variables};
@@ -553,8 +554,10 @@ impl Real {
     }
 
     /// Charges one turn to the entry's budget before a prompt the model answers is sent, once no
-    /// other process of this user runs the agent's executable outside `run`: one that started
-    /// since the run began stops the case here, with no turn charged or spent.
+    /// other process of this user is the agent outside `run` and the person's own agent files are as
+    /// they stood at the start: a process that started since the run began, and any change of the
+    /// files since (by a process the listing missed, or any other writer), stops the case here with
+    /// no turn charged or spent.
     fn charge(&self, run: &Run, case: &str, what: &str) {
         let others = other_agent_processes(&executable_name(&self.build.command), Some(run.root()))
             .unwrap_or_else(|why| panic!("no turn is charged: {why}"));
@@ -563,43 +566,28 @@ impl Real {
             "{}",
             other_agents_refusal(&others, "right before the charge, so no turn was charged")
         );
+        unchanged_before_the_charge(&self.person)
+            .unwrap_or_else(|why| panic!("no turn is charged: the person's files changed: {why}"));
         let _ = self
             .ledger
             .charge(case, what)
             .unwrap_or_else(|why| panic!("{why}"));
     }
 
-    /// The text of every file under the agent's conversation directory.
+    /// The text of every file under the agent's conversation directory, read as the audit of the
+    /// turns reads the record: through directory handles with no link followed, so nothing is
+    /// read through a link.
     ///
     /// # Errors
     ///
-    /// Returns the entry of the record that could not be read: a record that is not whole shows
-    /// nothing.
+    /// Returns why the record could not be read whole: a record that is not whole shows nothing.
     fn conversations(&self, run: &Run) -> Result<String, String> {
         let mut text = String::new();
-        let mut pending = vec![conversations_root(&self.account, &Self::config(run))];
-        while let Some(path) = pending.pop() {
-            let metadata = match std::fs::metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(format!("{}: {error}", path.display())),
-            };
-            if metadata.is_dir() {
-                let entries = std::fs::read_dir(&path)
-                    .map_err(|error| format!("{}: {error}", path.display()))?;
-                for entry in entries {
-                    pending.push(
-                        entry
-                            .map_err(|error| format!("{}: {error}", path.display()))?
-                            .path(),
-                    );
-                }
-            } else {
-                let bytes =
-                    std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-                text.push_str(&String::from_utf8_lossy(&bytes));
-            }
-        }
+        read_record(
+            run.root(),
+            &conversations_relative(&self.account),
+            &mut |_, content| text.push_str(&String::from_utf8_lossy(content)),
+        )?;
         Ok(text)
     }
 }
@@ -1801,7 +1789,8 @@ fn ends(
         if let Some(run) = &run {
             let recorded = turns_recorded(
                 &real.account,
-                &conversations_root(&real.account, &run.root().join(CONFIG_DIRECTORY)),
+                run.root(),
+                &conversations_relative(&real.account),
             );
             match audit_turns(result.is_ok(), charged, &recorded) {
                 Audit::Agrees => {}
