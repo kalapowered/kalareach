@@ -276,13 +276,13 @@ impl MouseReporting {
                         self.motion = set && mode == 1003;
                     }
                 }
-                // One encoding state, as a terminal keeps it: a set of 1005 or 1006 replaces the
-                // encoding in force, and a reset of either returns the default, also when it names
-                // the one that is not in force. Only the SGR report is spelled, so the console is
-                // spelled it while 1006 is the one in force, and the original report otherwise,
-                // which is also what UTF-8 coordinates (1005) are spelled as. A frame of a worker
-                // of an earlier build that holds both flags on draws `?1005h ?1006h`, which reads
-                // as 1006, the later number.
+                // One encoding state, as Terminal.app and iTerm keep it: a set of 1005 or 1006
+                // replaces the encoding in force, and a reset of either returns the default, also
+                // when it names the one that is not in force. Only the SGR report is spelled, so
+                // the console is spelled it while 1006 is the one in force, and the original
+                // report otherwise, which is also what UTF-8 coordinates (1005) are spelled as. A
+                // frame of a worker of an earlier build that holds both flags on draws
+                // `?1005h ?1006h`, which reads as 1006, the later number.
                 1005 | 1006 => self.sgr = set && mode == 1006,
                 _ => {}
             }

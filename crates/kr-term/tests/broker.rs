@@ -963,7 +963,7 @@ fn the_mouse_tracking_is_one_state_as_a_terminal_keeps_it() {
     assert_eq!(held, [(1000, false), (1002, true), (1003, false)]);
 }
 
-/// KR-REQ-01.11: the mouse encoding is one state, as the terminals this product runs in keep it.
+/// KR-REQ-01.11: the mouse encoding is one state, as Terminal.app and iTerm keep it.
 ///
 /// A set of 1005 or 1006 makes that one the encoding in force and clears the other, and a reset of
 /// either returns the default encoding, also when it names the one that is not in force. What the
