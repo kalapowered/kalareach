@@ -279,6 +279,9 @@ pub fn render(
     }
     // The session holds the mouse tracking as one state (at most one of the three modes is on), and
     // what is written is that one, found here and written where the first of the three is reached.
+    // The operations come from this build's engine, which cannot hold two on, so there is no choice
+    // to make between two; the projected display, which can read a screen from a worker of an
+    // earlier build, takes the widest.
     let tracking_entries: Vec<_> = operations
         .iter()
         .filter_map(|operation| match operation {
@@ -1853,7 +1856,8 @@ mod tests {
                 Keyboard::Install,
                 Scope::WholeScreen,
             );
-            let mut tracking = None;
+            // The terminal was reporting before the restoration: an all-off screen must turn it off.
+            let mut tracking = Some(1003);
             for (_, mode, set) in dec_switches(&rendered.bytes) {
                 if matches!(mode, 1000 | 1002 | 1003) {
                     tracking = set.then_some(mode);
