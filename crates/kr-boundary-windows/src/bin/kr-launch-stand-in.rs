@@ -72,6 +72,7 @@ fn main() -> std::process::ExitCode {
         "marker",
         "sleep",
         "write-stderr",
+        "shell",
         "arguments",
         "environment",
     ];
@@ -181,6 +182,36 @@ fn main() -> std::process::ExitCode {
             std::thread::sleep(std::time::Duration::from_millis(milliseconds));
         }
         "write-stderr" => eprintln!("on the error stream"),
+        // Starts PowerShell with a hidden console of its own, which a detached program has to ask
+        // for because PowerShell needs one, and passes on what it wrote.
+        "shell" => {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            let root = std::env::var("SystemRoot").unwrap_or_default();
+            let shell = std::path::Path::new(&root)
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe");
+            let output = Command::new(shell)
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-EncodedCommand",
+                    arguments.get(1).map_or("", String::as_str),
+                ])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+            match output {
+                Ok(output) => {
+                    println!("shell exit {:?}", output.status.code());
+                    print!("{}", String::from_utf8_lossy(&output.stdout));
+                    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+                }
+                Err(error) => println!("shell-failed {error}"),
+            }
+        }
         "arguments" => {
             for argument in std::env::args().skip(2) {
                 println!("argument {argument:?}");

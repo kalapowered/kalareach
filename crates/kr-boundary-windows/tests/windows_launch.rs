@@ -1536,53 +1536,6 @@ fn the_brokers_own_crash_leaves_no_dump_where_the_default_mode_does() {
 fn the_four_ways_to_start_a_program_outside_the_job_start_nothing_from_a_launched_child() {
     let fixture = Fixture::new();
     let mut job = Job::new(Limits::INVOCATION).unwrap();
-    // First, which of the programs the script needs can run as a child at all: each is run under the
-    // boundary token and under the broker's own, and its exit code and output are printed.
-    let system = system_windows_directory().unwrap();
-    let system32 = Path::new(&system).join("System32");
-    let shell = system32
-        .join("WindowsPowerShell")
-        .join("v1.0")
-        .join("powershell.exe");
-    for (what, program, arguments) in [
-        (
-            "cmd",
-            system32.join("cmd.exe"),
-            vec!["/c", "echo hello & exit 5"],
-        ),
-        (
-            "powershell",
-            shell.clone(),
-            vec![
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Write-Output hello; exit 5",
-            ],
-        ),
-    ] {
-        for token_name in ["boundary", "own"] {
-            let (read, write) = pipe().unwrap();
-            let (error_read, error_write) = pipe().unwrap();
-            let mut spec = fixture.spec(
-                &job,
-                &program,
-                &arguments,
-                Std::Pipe(write),
-                Std::Pipe(error_write),
-            );
-            if token_name == "own" {
-                spec.token = TokenSpec::Own;
-            }
-            let child = resume(launch(spec).unwrap());
-            let code = child.wait(Duration::from_secs(60)).unwrap();
-            println!(
-                "{what} as {token_name}: exit {code:?}, stdout {:?}, stderr {:?}",
-                read_to_end(&read),
-                read_to_end(&error_read)
-            );
-        }
-    }
     let program = fixture.stand_in.display().to_string();
     let scratch = fixture.scratch.display().to_string();
     let script = format!(
@@ -1602,24 +1555,15 @@ Form 'com' {{ $a = [Activator]::CreateInstance([type]::GetTypeFromProgID('MMC20.
         .flat_map(|unit| unit.to_le_bytes())
         .collect();
     let encoded = base64(&units);
-    let powershell = Path::new(&system_windows_directory().unwrap())
-        .join("System32")
-        .join("WindowsPowerShell")
-        .join("v1.0")
-        .join("powershell.exe");
+    // PowerShell needs a console, which a detached child has none of: the stand-in starts it with a
+    // hidden console of its own, as a program that Git starts might, and it is a descendant in the
+    // job all the same.
     let (read, write) = pipe().unwrap();
     let (error_read, error_write) = pipe().unwrap();
     let suspended = launch(fixture.spec(
         &job,
-        &powershell,
-        &[
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-EncodedCommand",
-            &encoded,
-        ],
+        &fixture.stand_in,
+        &["shell", &encoded],
         Std::Pipe(write),
         Std::Pipe(error_write),
     ))
