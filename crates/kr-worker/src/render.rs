@@ -277,7 +277,7 @@ pub fn render(
             *held = enabled;
         }
     }
-    // The three mouse tracking modes are carried as three settings and a terminal keeps one, so
+    // The three mouse tracking modes are carried as three settings and Terminal.app and xterm keep one, so
     // what is written is the widest of them that is on, found here and written where the first of
     // them is reached.
     let tracking_entries: Vec<_> = operations
@@ -1826,6 +1826,45 @@ mod tests {
             vec![(1049, true), (7, true)],
             "the buffer is entered once, by the selection, and the mode that names it adds nothing"
         );
+    }
+
+    /// KR-REQ-01.11: a restoration leaves a terminal reporting the mouse the way the screen holds it.
+    ///
+    /// Read as Terminal.app and xterm keep it, the tracking is one state: a set of any of the three
+    /// modes replaces it and a reset of any of them turns it off. The three entries of a screen are
+    /// carried in numeric order, so a reset that follows the set would leave nothing on.
+    #[test]
+    fn a_restoration_leaves_the_terminal_reporting_the_mouse_the_screen_holds() {
+        let tracking_after = |flags: [bool; 3]| {
+            let operations: Vec<RestoreOp> = [1000_u16, 1002, 1003]
+                .into_iter()
+                .zip(flags)
+                .map(|(mode, enabled)| RestoreOp::SetMode {
+                    entry: ModeEntry {
+                        kind: kr_term::modes::ModeKind::Dec,
+                        mode,
+                        enabled,
+                    },
+                })
+                .collect();
+            let rendered = render(
+                &operations,
+                viewport(24, 80),
+                Keyboard::Install,
+                Scope::WholeScreen,
+            );
+            let mut tracking = None;
+            for (_, mode, set) in dec_switches(&rendered.bytes) {
+                if matches!(mode, 1000 | 1002 | 1003) {
+                    tracking = set.then_some(mode);
+                }
+            }
+            tracking
+        };
+        assert_eq!(tracking_after([true, false, false]), Some(1000));
+        assert_eq!(tracking_after([false, true, false]), Some(1002));
+        assert_eq!(tracking_after([false, false, true]), Some(1003));
+        assert_eq!(tracking_after([false, false, false]), None);
     }
 
     #[test]

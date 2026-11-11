@@ -649,7 +649,7 @@ impl<'a> Writer<'a> {
     /// Installs which mouse events the destination reports, as the one setting a terminal keeps.
     ///
     /// The screen holds modes 1000, 1002 and 1003 as three settings and the widest one that is on
-    /// is what the application asked for. A terminal holds one tracking state: setting any of them
+    /// is what the application asked for. Terminal.app and xterm hold one tracking state: setting any of them
     /// replaces the one in force, and resetting any of them turns tracking off whichever was on.
     /// Written one by one in the screen's order, with the ones that are off among them, the last
     /// reset would leave the destination reporting nothing, so all three are reset first and the
@@ -3297,13 +3297,13 @@ mod safety {
             let mode = std::str::from_utf8(&rest[..digits])
                 .ok()
                 .and_then(|text| text.parse::<u16>().ok());
-            if let (Some(mode), Some(last)) = (mode, rest.get(digits)) {
-                if matches!(mode, 1000 | 1002 | 1003) {
-                    match last {
-                        b'h' => tracking = Some(mode),
-                        b'l' => tracking = None,
-                        _ => {}
-                    }
+            if let (Some(mode), Some(last)) = (mode, rest.get(digits))
+                && matches!(mode, 1000 | 1002 | 1003)
+            {
+                match last {
+                    b'h' => tracking = Some(mode),
+                    b'l' => tracking = None,
+                    _ => {}
                 }
             }
         }

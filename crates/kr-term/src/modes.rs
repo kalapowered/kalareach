@@ -81,7 +81,7 @@ pub const ALTERNATE_BUFFER_MODES: &[u16] = &[47, 1047, 1049];
 /// The DEC modes that choose which mouse events are reported, narrowest first: presses, releases
 /// and the wheel (1000), those and a move with a button held (1002), and every move (1003).
 ///
-/// The engine keeps them as three settings. A terminal keeps one: setting any of them replaces the
+/// The engine keeps them as three settings. Terminal.app and xterm keep one: setting any of them replaces the
 /// tracking in force, and resetting any of them turns tracking off whichever of them had set it.
 pub const MOUSE_TRACKING_MODES: &[u16] = &[1000, 1002, 1003];
 

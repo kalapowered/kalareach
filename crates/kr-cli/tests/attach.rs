@@ -1208,7 +1208,7 @@ async fn a_terminal_that_reported_its_modes_is_put_back_into_them_after_a_kill()
 /// the outer terminal once the attachment has drawn the session.
 ///
 /// The session's screen keeps the three tracking modes as three settings, and a frame writes every
-/// mode it tracks, the ones that are off among them. A terminal keeps one tracking state: setting
+/// mode it tracks, the ones that are off among them. Terminal.app and xterm keep one tracking state: setting
 /// any of `1000`, `1002` and `1003` replaces the one in force, and resetting any of them turns it
 /// off. A frame that wrote the `1003 l` of a mode that was never on after the `1002 h` that was
 /// asked for left Terminal.app reporting no mouse at all, so what is read here is the state a
@@ -1230,6 +1230,10 @@ async fn an_application_that_turned_the_mouse_on_before_the_attachment_is_sent_i
     let display = hosted.display.get().to_string();
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     let queries = answer_keyboard_queries(&output, pty.master.take_writer().expect("a writer"));
+    // The application has set its modes before anything attaches: what it printed is retained, so the
+    // session's screen holds them, and what the attachment then draws is the replay of that screen
+    // and not the application's own bytes arriving live.
+    session_retained(&hosted, b"ready", LIVENESS_DEADLINE).await;
     let mut shell = pty
         .slave
         .spawn_command(shell_running(
