@@ -1307,7 +1307,7 @@ fn read_record_by(
 }
 
 /// The turns the agent's own record holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Recorded {
     /// How many turns the model ran, as the record counts them.
     pub turns: u64,
@@ -1315,6 +1315,29 @@ pub struct Recorded {
     pub unnamed: u64,
     /// How many files of the record were read: none where the record's directory is not there.
     pub files: u64,
+    /// How many distinct turn names are UUIDs, which count once across the record's files.
+    pub by_uuid: u64,
+    /// How many turn names, each for its file, are not UUIDs, and count once for each file.
+    pub by_other_name: u64,
+    /// The forms of the names that are not UUIDs (a digit as `9`, a lower-case letter as `a`, an
+    /// upper-case one as `A`, anything else as it is, at most forty characters, at most five
+    /// forms), so that the record says what the names look like though the run's directory, and
+    /// with it the agent's record, is removed.
+    pub forms: Vec<String>,
+}
+
+/// The form of a turn name that is not a UUID: see [`Recorded::forms`]. No letter or digit of the
+/// name is kept.
+fn form_of(name: &str) -> String {
+    name.chars()
+        .take(40)
+        .map(|character| match character {
+            '0'..='9' => '9',
+            'a'..='z' => 'a',
+            'A'..='Z' => 'A',
+            other => other,
+        })
+        .collect()
 }
 
 /// Whether `name` is a UUID in its written form: 8, 4, 4, 4 and 12 hexadecimal digits between
@@ -1358,6 +1381,9 @@ pub fn turns_recorded(
             .to_owned()
     })?;
     let mut turns: BTreeSet<String> = BTreeSet::new();
+    let mut by_uuid: BTreeSet<String> = BTreeSet::new();
+    let mut by_other_name: BTreeSet<String> = BTreeSet::new();
+    let mut forms: BTreeSet<String> = BTreeSet::new();
     let mut unnamed = 0_u64;
     let files = read_record(within, relative, &mut |place, content| {
         for line in String::from_utf8_lossy(content).lines() {
@@ -1368,10 +1394,14 @@ pub fn turns_recorded(
                     .and_then(turn_identifier);
                 match named {
                     Some(named) if is_uuid(&named) => {
+                        by_uuid.insert(named.clone());
                         turns.insert(named);
                     }
                     Some(named) => {
-                        turns.insert(format!("{}\0{named}", String::from_utf8_lossy(place)));
+                        let own = format!("{}\0{named}", String::from_utf8_lossy(place));
+                        by_other_name.insert(own.clone());
+                        turns.insert(own);
+                        forms.insert(form_of(&named));
                     }
                     None => unnamed += 1,
                 }
@@ -1385,6 +1415,9 @@ pub fn turns_recorded(
             .saturating_add(unnamed),
         unnamed,
         files,
+        by_uuid: u64::try_from(by_uuid.len()).unwrap_or(u64::MAX),
+        by_other_name: u64::try_from(by_other_name.len()).unwrap_or(u64::MAX),
+        forms: forms.into_iter().take(5).collect(),
     })
 }
 
@@ -1790,16 +1823,16 @@ mod tests {
             Ok(Recorded {
                 turns: 3 + 2 + 3 + 3,
                 unnamed: 6,
-                files: 6
+                files: 6,
+                by_uuid: 3,
+                by_other_name: 2,
+                // The non-UUID name is a digit: its form is one digit, and no value is kept.
+                forms: vec!["9".to_owned()],
             })
         );
         assert_eq!(
             turns_recorded(&account(), &root, Path::new("none")),
-            Ok(Recorded {
-                turns: 0,
-                unnamed: 0,
-                files: 0
-            })
+            Ok(Recorded::default())
         );
         let mut unnamed = account();
         unnamed.turn_line = None;
@@ -2124,11 +2157,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(run.join("agent-config"));
         assert_eq!(
             turns_recorded(&account, &run, sessions),
-            Ok(Recorded {
-                turns: 0,
-                unnamed: 0,
-                files: 0
-            })
+            Ok(Recorded::default())
         );
         std::fs::remove_dir_all(&run).expect("clean up");
         std::fs::remove_dir_all(&elsewhere).expect("clean up");
@@ -2160,8 +2189,8 @@ mod tests {
         let found = |turns, files| {
             Ok(Recorded {
                 turns,
-                unnamed: 0,
                 files,
+                ..Recorded::default()
             })
         };
         // The record is not there, or holds files with no turn in them: a passed case with a
