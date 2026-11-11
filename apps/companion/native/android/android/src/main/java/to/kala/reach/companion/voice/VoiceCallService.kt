@@ -321,7 +321,6 @@ class VoiceCallService : android.app.Service() {
                 setSound(null, null)
                 enableVibration(false)
                 enableLights(false)
-                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             },
         )
     }

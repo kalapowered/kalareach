@@ -91,6 +91,20 @@ lock_press() { # <dump> <label>
     lock_device shell input tap $point
 }
 
+# Presses the control labelled `$1`. The lock screen draws the notification folded, with its controls
+# under "Expand", so this expands it first when the control is not there; the screen is read into `$2`.
+lock_control() { # <label> <dump>
+    local tries=0
+    while [ "$tries" -lt 8 ]; do
+        lock_dump "$2"
+        lock_press "$2" "$1" && return 0
+        lock_press "$2" Expand
+        sleep 1
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
 lock_still() { # <name>
     lock_device exec-out screencap -p >"$artefacts/lock-screen/$1.png" 2>/dev/null
 }
@@ -185,16 +199,15 @@ lock_screen_leg() {
     fi
 
     # Mute, from the locked screen.
-    if lock_press "$dump" Mute && lock_wait 10 lock_record_has '"Unmute"'; then
+    if lock_control Mute "$dump" && lock_wait 10 lock_record_has '"Unmute"'; then
         lock_check "Mute from the lock screen mutes the call with no unlock" 1 "the notification now offers Unmute; the screen stayed locked: $(lock_showing && echo yes || echo no)"
     else
         lock_check "Mute from the lock screen mutes the call with no unlock" 0 "the notification did not change to Unmute"
     fi
 
     # Unmute, from the locked screen: the system asks for the credential and the call stays muted.
-    lock_dump "$dump"
     local asked=0
-    if lock_press "$dump" Unmute; then
+    if lock_control Unmute "$dump"; then
         sleep 3
         lock_dump "$artefacts/lock-screen/locked-2-unmute.xml"
         lock_still 3-unmute-asks
@@ -204,6 +217,8 @@ lock_screen_leg() {
         fi
     fi
     lock_check "Unmute from the lock screen asks for the unlock and leaves the call muted" "$asked" "the credential prompt shows, the screen is still locked and the notification still offers Unmute"
+    # The device's own clock, as the application's record of the microphone is, just before the
+    # credential is given.
     lock_device shell date +%s%N >"$harness/unlock-at.txt"
     # The person unlocks: the unmute then goes through.
     lock_device shell input text "$lock_pin"
@@ -216,9 +231,8 @@ lock_screen_leg() {
 
     # Stop, from the locked screen.
     lock_the_screen
-    lock_dump "$dump"
     lock_still 4-locked-again
-    lock_press "$dump" Stop
+    lock_control Stop "$dump"
     local gone=0 waited=0
     while [ "$waited" -lt 15 ]; do
         if [ -z "$(lock_record)" ]; then gone=1; break; fi
@@ -253,7 +267,7 @@ if order != ["open", "muted", "open"] or not unlock_ns.isdigit():
     print("0 %s" % (" ".join("%s@%s" % each for each in steps) or "no record"))
 else:
     reopened, unlocked = int(steps[2][1]), int(unlock_ns) // 1_000_000
-    print("%d the microphone reopened %d ms after the credential prompt was answered" % (reopened >= unlocked, reopened - unlocked))
+    print("%d the microphone reopened %d ms after the leg gave the credential" % (reopened >= unlocked, reopened - unlocked))
 PY
 )"
     lock_check "the microphone stayed muted until the unlock" "${verdict%% *}" "${verdict#* }"
