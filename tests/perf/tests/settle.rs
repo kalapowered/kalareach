@@ -23,28 +23,28 @@ use std::process::Command;
 /// the last line from there on.
 const SYSCTL: &str = r#"#!/bin/sh
 [ "$*" = "-n vm.loadavg" ] || exit 1
-n=$(cat "$KR_STAND_IN_STATE/waited")
-reading=$(sed -n "$((n + 1))p" "$KR_STAND_IN_STATE/readings")
-[ -n "$reading" ] || reading=$(tail -n 1 "$KR_STAND_IN_STATE/readings")
+n=$(cat "$STAND_IN_STATE/waited")
+reading=$(sed -n "$((n + 1))p" "$STAND_IN_STATE/readings")
+[ -n "$reading" ] || reading=$(tail -n 1 "$STAND_IN_STATE/readings")
 echo "{ $reading 5.18 7.26 }"
 "#;
 
 /// Time passes only when the script waits: each wait is one step along the readings.
 const SLEEP: &str = r#"#!/bin/sh
-n=$(cat "$KR_STAND_IN_STATE/waited")
-echo $((n + 1)) > "$KR_STAND_IN_STATE/waited"
+n=$(cat "$STAND_IN_STATE/waited")
+echo $((n + 1)) > "$STAND_IN_STATE/waited"
 "#;
 
 /// Every invocation is kept. A build succeeds at once. A measurement keeps the one-minute load it
 /// started at, and leaves the load back at the first reading, as a build or a measurement leaves
 /// a machine busy; every other suite succeeds at once.
 const CARGO: &str = r#"#!/bin/sh
-echo "$*" >> "$KR_STAND_IN_STATE/calls"
+echo "$*" >> "$STAND_IN_STATE/calls"
 case "$*" in
   build*) exit 0 ;;
   *--ignored*)
-    sysctl -n vm.loadavg | tr -d '{}' | awk '{ print $1 }' >> "$KR_STAND_IN_STATE/started"
-    echo 0 > "$KR_STAND_IN_STATE/waited"
+    sysctl -n vm.loadavg | tr -d '{}' | awk '{ print $1 }' >> "$STAND_IN_STATE/started"
+    echo 0 > "$STAND_IN_STATE/waited"
     echo "the measurement"
     echo "test result: ok. 1 passed; 0 failed; 0 ignored"
     ;;
@@ -98,7 +98,7 @@ fn performance(readings: &[&str], bound: Option<&str>) -> Run {
             format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()),
         )
         .env("TMPDIR", &temporary)
-        .env("KR_STAND_IN_STATE", &state)
+        .env("STAND_IN_STATE", &state)
         .env_remove("KR_PERF_SETTLE_LOAD");
     if let Some(bound) = bound {
         command.env("KR_PERF_SETTLE_LOAD", bound);

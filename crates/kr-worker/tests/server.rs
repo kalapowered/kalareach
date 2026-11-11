@@ -75,8 +75,8 @@ fn stand_in() -> Arc<StandIn> {
 
 fn presented(variants: &str, command: &str) -> Vec<(OsString, OsString)> {
     [
-        ("KR_STAND_IN", variants),
-        ("KR_STAND_IN_COMMAND", command),
+        ("STAND_IN", variants),
+        ("STAND_IN_COMMAND", command),
         ("KR_REGISTRATION", "/not/for/the/server"),
         ("KR_CREDENTIAL", "not-for-the-server"),
     ]

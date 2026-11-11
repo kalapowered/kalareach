@@ -896,17 +896,17 @@ impl Person {
     /// Exports the stand-in's variables for the next command: its variants, the file that releases
     /// it, and the file the server notes what it received in.
     fn exports(&self, ctx: &Context, variants: &str) {
-        self.types(&format!("export KR_STAND_IN={variants}"));
+        self.types(&format!("export STAND_IN={variants}"));
         self.types(&format!(
-            "export KR_STAND_IN_RELEASE={}",
+            "export STAND_IN_RELEASE={}",
             release_of(ctx).display()
         ));
         self.types(&format!(
-            "export KR_STAND_IN_RECEIVED={}",
+            "export STAND_IN_RECEIVED={}",
             received_by(ctx).display()
         ));
         self.types(&format!(
-            "export KR_STAND_IN_COMMAND='{}'",
+            "export STAND_IN_COMMAND='{}'",
             command(&ctx.tools)
         ));
     }
@@ -1168,7 +1168,7 @@ fn kr_req_12_07_a_codex_typed_in_a_managed_root_shell_is_served_by_a_gateway_and
 
     // A program found running that the integration did not launch is adopted and given no
     // gateway.
-    person.types("export KR_STAND_IN=idle");
+    person.types("export STAND_IN=idle");
     person.types(&format!("{absolute} --remote unix:///nonexistent"));
     let adopted = first_instance(&ctx, &remote, person.session_id);
     assert_eq!(adopted.mode, IntegrationMode::NativeTerminal);
@@ -1279,7 +1279,7 @@ fn kr_req_12_05_a_second_session_is_not_served_a_conversation_the_first_runs_aga
     let (_device, _paired, remote) = ctx.pair(&host);
     let first = Person::enters(&ctx, &host);
     first.exports(&ctx, "stay");
-    first.types("export KR_STAND_IN_SAVED=thread-9,thread-10,thread-11");
+    first.types("export STAND_IN_SAVED=thread-9,thread-10,thread-11");
     let _ = first.types_until_it_shows(
         "codex resume thread-9",
         "TUI: turn/completed",
@@ -1294,7 +1294,7 @@ fn kr_req_12_05_a_second_session_is_not_served_a_conversation_the_first_runs_aga
     // The second session is served another conversation beside it, and ends that.
     let second = Person::enters_among(&ctx, &host, &[first.session_id]);
     second.exports(&ctx, "stay");
-    second.types("export KR_STAND_IN_SAVED=thread-9,thread-10,thread-11");
+    second.types("export STAND_IN_SAVED=thread-9,thread-10,thread-11");
     let _ = second.types_until_it_shows(
         "codex resume thread-10",
         "TUI: turn/completed",
@@ -2372,9 +2372,9 @@ fn a_prompt_whose_server_dies_under_it_is_an_outcome_nobody_can_establish() {
     let person = Person::enters(&ctx, &host);
     // The server starts no command of its own here: it is killed, and a command it started would
     // be left for the closure to find, which is another case's.
-    person.types("export KR_STAND_IN=die-on-second-turn,stay");
+    person.types("export STAND_IN=die-on-second-turn,stay");
     person.types(&format!(
-        "export KR_STAND_IN_RECEIVED={}",
+        "export STAND_IN_RECEIVED={}",
         received_by(&ctx).display()
     ));
     let _ = person.types_until_it_shows(
