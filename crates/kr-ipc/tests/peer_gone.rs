@@ -275,3 +275,134 @@ async fn a_peer_that_has_sent_more_than_the_runtime_holds_is_counted_and_the_cou
         "a frame the peer sent could not be written"
     );
 }
+
+/// How many connections each case below makes. The close races the write only in a narrow window,
+/// so a case that meets the window once in a few hundred rounds is run past it every time.
+#[cfg(unix)]
+const ROUNDS: usize = 5_000;
+
+/// A listener that serves one connection after another, for a case that needs many.
+#[cfg(unix)]
+struct Rounds {
+    _tree: kr_ipc::testing::TempHost,
+    endpoint: kr_ipc::paths::Endpoint,
+    listener: Listener,
+}
+
+/// One connection, as its two ends hold it.
+#[cfg(unix)]
+type Ends = (FrameReader, FrameWriter);
+
+#[cfg(unix)]
+impl Rounds {
+    fn new() -> Self {
+        let tree = kr_ipc::testing::TempHost::create();
+        let endpoint = tree
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint path");
+        let listener = Listener::bind(&endpoint).expect("a local endpoint");
+        Self {
+            _tree: tree,
+            endpoint,
+            listener,
+        }
+    }
+
+    /// A new connection: the end the listener accepted, then the end that connected.
+    async fn connection(&self) -> (Ends, Ends) {
+        let (client, accepted) =
+            tokio::join!(Connection::connect(&self.endpoint), self.listener.accept());
+        let (server, _peer) = accepted.expect("accepts the client");
+        (
+            split(server, StreamKind::Control),
+            split(client.expect("connects"), StreamKind::Control),
+        )
+    }
+}
+
+/// Writes frames to `writer` until a write fails, while `peer` is closed from another thread, and
+/// returns the failure. Both threads start together and nothing waits between the start and the
+/// close, so the writer is mid-write when the close begins.
+#[cfg(unix)]
+fn write_while_the_peer_closes(writer: &mut FrameWriter, peer: Ends) -> kr_ipc::error::IpcError {
+    let frame = FrameWriter::encode(
+        StreamKind::Control,
+        &ControlFrame::Event(ControlEvent::Keepalive),
+    )
+    .expect("encodes");
+    let together = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let closing = {
+        let together = together.clone();
+        std::thread::spawn(move || {
+            together.wait();
+            drop(peer);
+        })
+    };
+    together.wait();
+    let mut step = writer.begin_frame(&frame);
+    let failure = loop {
+        step = match step {
+            Ok(kr_ipc::framed::Wrote::Complete) => writer.begin_frame(&frame),
+            Ok(kr_ipc::framed::Wrote::Blocked) => {
+                std::thread::yield_now();
+                writer.resume_frame()
+            }
+            Err(failure) => break failure,
+        };
+    };
+    closing.join().expect("the closing thread ends");
+    failure
+}
+
+/// A write that meets the peer's close says the peer closed, whichever error the system answers
+/// it with. macOS answers a write that races the close with "not connected" in a large share of
+/// the rounds, and Linux with a broken pipe or a reset.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_write_that_races_the_peers_close_says_the_peer_closed() {
+    let rounds = Rounds::new();
+    for round in 0..ROUNDS {
+        let (mut ours, theirs) = rounds.connection().await;
+        let failure = write_while_the_peer_closes(&mut ours.1, theirs);
+        assert!(
+            matches!(failure, kr_ipc::error::IpcError::PeerClosed),
+            "round {round} of {ROUNDS}: {failure:?}"
+        );
+    }
+}
+
+/// Ending a connection whose peer has closed is not a failure of the socket. macOS answers "not
+/// connected" every time, and Linux accepts it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_shutdown_after_the_peer_closed_does_not_fail_the_socket() {
+    let rounds = Rounds::new();
+    for round in 0..ROUNDS {
+        let (ours, theirs) = rounds.connection().await;
+        drop(theirs);
+        let ended = ours.1.shut_down(std::net::Shutdown::Both);
+        assert!(
+            matches!(ended, Ok(()) | Err(kr_ipc::error::IpcError::PeerClosed)),
+            "round {round} of {ROUNDS}: {ended:?}"
+        );
+    }
+}
+
+/// A read after the peer closed says the peer closed, also when the peer closed with bytes of this
+/// end's own unread: Linux answers that read with a reset, and macOS with the end of the stream.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_read_after_the_peer_closed_with_bytes_unread_says_the_peer_closed() {
+    let rounds = Rounds::new();
+    for round in 0..ROUNDS {
+        let (mut ours, theirs) = rounds.connection().await;
+        send(&mut ours.1);
+        drop(theirs);
+        let failure = ours.0.read_payload().await.expect_err("the peer has gone");
+        assert!(
+            matches!(failure, kr_ipc::error::IpcError::PeerClosed),
+            "round {round} of {ROUNDS}: {failure:?}"
+        );
+    }
+}
