@@ -61,6 +61,14 @@
 # it. A leg that breaks by itself on every attempt fails, and a leg that passed only on a replay ends
 # with exit 4, partial, naming each attempt's failure: a rerun is not a pass.
 #
+# The fourth mode, `lock-screen` (Android only), runs a call against the peer and, while it is up, locks
+# the emulator's screen and reads the lock screen: the notification manager's record of the call's
+# notification, the keyguard's state and a still of the screen (under the run's evidence folder). It
+# presses the notification's controls there: Mute acts with no unlock, Unmute asks for the unlock and
+# leaves the call muted until it is given, and Stop ends the call with no unlock. The emulator's
+# notification settings stay as they are. Its lock credential is set for the run and cleared, and its
+# lock setting put back, whatever the run finds (`scripts/lib/voice-call-lock-screen.sh`).
+#
 # `delegating` with no leg runs them all, one after another, with one build and one device. The
 # simulator has no recorder, so a run with the peer's file naming a synthetic recorder gives the call
 # a recording device of its own that makes a tone, opens no microphone of this machine and is the
@@ -90,7 +98,7 @@
 #
 # Usage:
 #   scripts/e2e-voice-call-device.sh ios [native-failure|outage]
-#   scripts/e2e-voice-call-device.sh android [native-failure|outage]
+#   scripts/e2e-voice-call-device.sh android [native-failure|outage|lock-screen]
 #   scripts/e2e-voice-call-device.sh ios|android delegating [<leg>]
 #
 # Exit codes: 0 every check passed, 2 bad usage or a failed check, 3 the device is not available,
@@ -105,7 +113,7 @@ companion="$here/apps/companion"
 platform="${1:-}"
 mode="${2:-native-failure}"
 usage() {
-    printf 'usage: %s ios|android [native-failure|outage]\n       %s ios|android delegating [production|positive|first_utterance|mute|gap|dtx|malformed|late_fragment|broker_disagrees]\n' "$0" "$0" >&2
+    printf 'usage: %s ios|android [native-failure|outage]\n       %s android lock-screen\n       %s ios|android delegating [production|positive|first_utterance|mute|gap|dtx|malformed|late_fragment|broker_disagrees]\n' "$0" "$0" "$0" >&2
     exit 2
 }
 case "$platform" in
@@ -114,6 +122,7 @@ case "$platform" in
 esac
 case "$mode" in
     native-failure | outage | delegating) ;;
+    lock-screen) [ "$platform" = android ] || usage ;;
     *) usage ;;
 esac
 all_legs=(production positive first_utterance mute gap dtx malformed late_fragment broker_disagrees)
@@ -170,6 +179,12 @@ say() { printf '== [voice-call-device] %s\n' "$*" | tee -a "${log:-/dev/null}"; 
 
 # shellcheck source=scripts/lib/voice-call-judge.sh
 . "$here/scripts/lib/voice-call-judge.sh"
+# shellcheck source=scripts/lib/voice-call-lock-screen.sh
+. "$here/scripts/lib/voice-call-lock-screen.sh"
+
+# Whether the run's call is answered by the application's own peer, so that it connects and carries
+# audio and stays up until something ends it.
+with_peer() { [ "$mode" = outage ] || [ "$mode" = delegating ] || [ "$mode" = lock-screen ]; }
 
 # Starts one run: a name, a directory for its evidence, a directory on the internal disk for the
 # harness's files (they hold an invitation's secret), and a loopback port and a token for the
@@ -199,6 +214,8 @@ begin_run() { # <leg>
 end_run() {
     [ -n "$harness" ] || return 0
     touch "$harness/finish" 2>/dev/null
+    # A leg that stopped between its steps leaves the virtual device's lock as the leg made it.
+    [ "$emulator_checked" != 1 ] || lock_screen_restore
     # A later launch of the installed application must not find this run's request or start its peer.
     [ -z "$app_data_directory" ] || rm -f "${app_data_directory:?}/request.json" "${app_data_directory:?}/peer.json"
     if [ -n "$harness_pid" ]; then
@@ -275,7 +292,7 @@ PY
 # the host hold one real session, and names its leg, which the answer may depend on.
 start_harness() { # <peer>
     local audio_port="" audio_token="" sessions="" harness_leg=""
-    if [ "$mode" = outage ] || [ "$mode" = delegating ]; then
+    if with_peer; then
         audio_port="$peer_port"
         audio_token="$peer_token"
     fi
@@ -359,6 +376,31 @@ set_required_checks() {
                 "the media stopped on this device"
                 "the host revoked the grant"
                 "the closure of the call at the service is not confirmed"
+                "nothing held after the end"
+            )
+            ;;
+        lock-screen)
+            required_checks=(
+                "paired"
+                "connected to the host"
+                "voice is allowed"
+                "a call is prepared"
+                "the host started the call"
+                "the call runs with its control attached"
+                "native code holds the call"
+                "the call waits for the lock screen"
+                "the screen is locked"
+                "the call's notification is on the lock screen with Mute and Stop"
+                "Mute from the lock screen mutes the call with no unlock"
+                "Unmute from the lock screen asks for the unlock and leaves the call muted"
+                "Unmute goes through once the screen is unlocked"
+                "the microphone stayed muted until the unlock"
+                "Stop from the lock screen ends the call with no unlock"
+                "the call ends from its notification on the lock screen"
+                "the microphone followed the taps on the lock screen"
+                "the media stopped on this device"
+                "the host revoked the grant"
+                "the voice service was told the call is over"
                 "nothing held after the end"
             )
             ;;
@@ -478,6 +520,19 @@ take_the_service_away_when_cued() { # <the result text so far>
     [ ! -e "$harness/down" ] || return 0
     case "$1" in
         *"check=the first audio played out ok="*) touch "$harness/down"; say "the voice service is taken away" ;;
+    esac
+}
+
+# Runs the lock-screen leg once the application says its call is up and waits for it.
+lock_the_screen_when_cued() { # <the result text so far>
+    [ "$mode" = lock-screen ] || return 0
+    [ ! -e "$harness/lock-screen-run" ] || return 0
+    case "$1" in
+        *"check=the call waits for the lock screen ok=1"*)
+            touch "$harness/lock-screen-run"
+            say "the call is up: the leg locks the screen"
+            lock_screen_leg
+            ;;
     esac
 }
 
@@ -689,7 +744,7 @@ android_run() { # <adb> <serial> <package>
     service_forward="$port"
     # The other way: the application's peer listens on the emulator's loopback interface, and this
     # machine reaches it on the same port number.
-    if [ "$mode" = outage ] || [ "$mode" = delegating ]; then
+    if with_peer; then
         # Without a rebind, so that a port someone else forwarded since it was chosen is not taken over.
         "$adb" -s "$serial" forward --no-rebind "tcp:$peer_port" "tcp:$peer_port" >/dev/null \
             || { say "the application's peer could not be forwarded to this machine"; return 2; }
@@ -704,7 +759,7 @@ android_run() { # <adb> <serial> <package>
     "$adb" -s "$serial" push "$request" "$remote" >/dev/null
     "$adb" -s "$serial" shell run-as "$app_id" cp "$remote" kr-probe/request.json
     "$adb" -s "$serial" shell rm -f "$remote"
-    if [ "$mode" = outage ] || [ "$mode" = delegating ]; then
+    if with_peer; then
         local peer_remote="/data/local/tmp/kr-peer-$run.json" peer_local="$harness/peer.json"
         ( umask 077; printf '{"port":%s,"token":"%s"}\n' "$peer_port" "$peer_token" >"$peer_local" )
         "$adb" -s "$serial" push "$peer_local" "$peer_remote" >/dev/null
@@ -726,10 +781,16 @@ android_run() { # <adb> <serial> <package>
         text="$("$adb" -s "$serial" shell run-as "$app_id" cat "kr-probe/$result_name" 2>/dev/null | tr -d '\r')"
         case "$text" in *done=1*) break ;; esac
         take_the_service_away_when_cued "$text"
+        lock_the_screen_when_cued "$text"
         sleep 2
         [ "$SECONDS" -lt "$until" ] || break
     done
     printf '%s\n' "$text" >"$artefacts/$result_name"
+    # What the lock-screen leg found, in the lines the application's own checks have.
+    if [ "$mode" = lock-screen ] && [ -s "$harness/script-checks.txt" ]; then
+        lock_judge_trail "$artefacts/$result_name"
+        cat "$harness/script-checks.txt" >>"$artefacts/$result_name"
+    fi
     # What the application said while it ran, kept for a run that wrote no result.
     if [ -n "$pid" ]; then
         "$adb" -s "$serial" logcat -d --pid="$pid" 2>/dev/null \
@@ -776,7 +837,7 @@ run_android() {
     # The call's audio needs the guest to have an audio device, so the outage and delegating modes
     # do not disable audio support; `-audio none` is the first thing tried (see the header).
     local audio=(-no-audio)
-    if [ "$mode" = outage ] || [ "$mode" = delegating ]; then
+    if with_peer; then
         read -r -a audio <<<"${KR_EMULATOR_AUDIO_ARGS--audio none}"
     fi
     say "starting the emulator $avd, audio arguments: ${audio[*]-none}"

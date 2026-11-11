@@ -102,6 +102,9 @@ pub enum Mode {
     NativeFailure,
     /// The answer is a peer's: the call carries audio and then the voice service goes away.
     Outage,
+    /// The answer is a peer's and the call stays up until the person ends it from its
+    /// notification on the phone's lock screen, which the script that runs the device drives.
+    LockScreen,
     /// The answer is a peer's, the call hands spoken requests to the host, and the probe plays one
     /// leg of what the gate does with them.
     Delegating,
@@ -549,15 +552,62 @@ impl Trace {
     }
 }
 
+/// How the call a run reads to its end is meant to end.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HowItEnds {
+    /// Its connection fails, and native code ends it.
+    ConnectionFails,
+    /// The person ends it from its notification on the phone's lock screen.
+    LockScreen,
+}
+
+/// Whether the microphone was muted, at each change, with the time of the change in milliseconds
+/// since the Unix epoch: the order in which the person's taps on the notification reached the call.
+#[derive(Default)]
+struct MuteTrail(std::sync::Mutex<Vec<(bool, u128)>>);
+
+impl MuteTrail {
+    fn see(&self, muted: bool) {
+        let mut seen = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if seen.last().map(|(was, _)| *was) != Some(muted) {
+            seen.push((muted, now_ms()));
+        }
+    }
+
+    fn text(&self) -> String {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(muted, at)| format!("{}@{at}", if *muted { "muted" } else { "open" }))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn muted_once(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|(muted, _)| *muted)
+    }
+}
+
 /// Reads a started call to its end and checks what the end did.
 async fn end<R: Runtime>(
     app: &AppHandle<R>,
     platform: &dyn CallPlatform,
     voice_session_id: &str,
+    ending: HowItEnds,
     checks: &mut Checks<'_>,
 ) {
     let trace = Trace::new();
     let looked = &trace;
+    let mutes = MuteTrail::default();
+    let muted = &mutes;
     let running = until(RUN_WITHIN, || async move {
         let state = call_state(app).await;
         looked.see(&state);
@@ -587,9 +637,24 @@ async fn end<R: Runtime>(
         )),
     }
 
+    if ending == HowItEnds::LockScreen {
+        // The script that runs the device reads this line as its cue: the call is up, so the
+        // notification is posted, and the screen can be locked.
+        checks.push(Check::found(
+            "the call waits for the lock screen",
+            running.is_some(),
+            "the call is up and waits for the person's taps on its notification",
+        ));
+    }
     let ended = until(END_WITHIN, || async move {
         let state = call_state(app).await;
         looked.see(&state);
+        if ending == HowItEnds::LockScreen
+            && let Ok(held) = platform.held().await
+            && held.call.is_some()
+        {
+            muted.see(held.microphone_muted);
+        }
         (state["running"] == false && state["ended"].is_object()).then_some(state)
     })
     .await;
@@ -597,11 +662,25 @@ async fn end<R: Runtime>(
         .as_ref()
         .and_then(|state| state["ended"]["cause"].as_str())
         .unwrap_or("none");
-    checks.push(Check::found(
-        "native code ends a call whose connection fails",
-        matches!(cause, "native_failed" | "native_ended"),
-        format!("cause {cause}; {}", trace.text()),
-    ));
+    match ending {
+        HowItEnds::ConnectionFails => checks.push(Check::found(
+            "native code ends a call whose connection fails",
+            matches!(cause, "native_failed" | "native_ended"),
+            format!("cause {cause}; {}", trace.text()),
+        )),
+        HowItEnds::LockScreen => {
+            checks.push(Check::found(
+                "the call ends from its notification on the lock screen",
+                cause == "native_ended",
+                format!("cause {cause}; {}", trace.text()),
+            ));
+            checks.push(Check::found(
+                "the microphone followed the taps on the lock screen",
+                mutes.muted_once(),
+                mutes.text(),
+            ));
+        }
+    }
     let Some(ended) = ended else {
         return;
     };
@@ -959,7 +1038,9 @@ pub async fn call_check<R: Runtime>(
             .app_data_dir()
             .map_err(|error| error.to_string())
             .and_then(|data| PeerDriver::from_files(&data, harness)),
-        Mode::NativeFailure | Mode::Outage => Err("this mode plays no leg".to_owned()),
+        Mode::NativeFailure | Mode::Outage | Mode::LockScreen => {
+            Err("this mode plays no leg".to_owned())
+        }
     };
     call_check_with(
         app,
@@ -1009,7 +1090,26 @@ pub async fn call_check_with<R: Runtime>(
         && let Some(voice_session_id) = start(app, &harness.session_ids, &mut checks).await
     {
         match mode {
-            Mode::NativeFailure => end(app, platform, &voice_session_id, &mut checks).await,
+            Mode::NativeFailure => {
+                end(
+                    app,
+                    platform,
+                    &voice_session_id,
+                    HowItEnds::ConnectionFails,
+                    &mut checks,
+                )
+                .await;
+            }
+            Mode::LockScreen => {
+                end(
+                    app,
+                    platform,
+                    &voice_session_id,
+                    HowItEnds::LockScreen,
+                    &mut checks,
+                )
+                .await;
+            }
             Mode::Outage => {
                 let media = Duration::from_secs(harness.media_seconds);
                 outage(app, platform, &voice_session_id, media, &mut checks).await;

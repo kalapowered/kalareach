@@ -3,7 +3,9 @@
 
     voice-call-host-judge.py <report.json> <mode> <platform> [<leg>] [--send-unmeasured]
 
-`mode` is `native-failure` (the answer leads nowhere and native code ends the call), `outage` (the
+`mode` is `native-failure` (the answer leads nowhere and native code ends the call), `lock-screen` (the
+answer is the phone's own peer and the person ends the call from its notification on the lock screen;
+the host sees what it sees of any call the person ends), `outage` (the
 answer is the phone's own peer, the call carries audio and then the voice service goes away) or
 `delegating` (the call hands spoken requests to the host; `leg` says which of the legs the run
 played, and what the voice service carried to the model is read against what that leg expects).
@@ -68,7 +70,7 @@ def checks_for(report, mode, platform, send_unmeasured):
             len(report["control_tokens"]),
         ),
     ]
-    if mode == "native-failure":
+    if mode in ("native-failure", "lock-screen"):
         checks += [
             ("the host told the service the call is over", int(report["host_closes"] >= 1), report["host_closes"]),
             (
@@ -222,7 +224,7 @@ def main():
         return 2
     path, mode, platform = arguments[:3]
     leg = arguments[3] if len(arguments) == 4 else None
-    if mode not in ("native-failure", "outage", "delegating") or platform not in ("ios", "android"):
+    if mode not in ("native-failure", "lock-screen", "outage", "delegating") or platform not in ("ios", "android"):
         print(__doc__, file=sys.stderr)
         return 2
     if (mode == "delegating") != (leg is not None) or (leg is not None and leg not in LEGS):
