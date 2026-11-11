@@ -61,15 +61,22 @@ async fn awaited<T>(what: &str, step: impl Future<Output = T>) -> T {
 }
 
 /// What a test host does with the streams the listener hands it.
+///
+/// The connection's stream limit is raised at the first `recv` of the host's receiver, so a host
+/// that is to hold streams back without reading them polls `recv` once, which raises the limit and
+/// takes nothing, and a host that has not taken streams yet does not poll it at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Taking {
     /// Forwards each one to the case.
     Forward,
-    /// Holds the receiver without reading it until the case opens the gate, and then forwards.
+    /// Polls `recv` once and then holds the receiver until the case opens the gate, and then
+    /// forwards.
     AfterTheGate,
-    /// Drops the receiver as soon as it has the session.
+    /// Does not poll `recv` until the case opens the gate, and then forwards.
+    NotYet,
+    /// Polls `recv` once and drops the receiver as soon as it has the session.
     Never,
-    /// Holds the receiver, without reading it, until the case opens the gate, and then drops it.
+    /// Polls `recv` once and holds the receiver until the case opens the gate, and then drops it.
     DropAfterTheGate,
 }
 
@@ -82,7 +89,7 @@ type SessionSender = oneshot::Sender<(Arc<StreamRegistry>, Connection)>;
 struct ChunkHost {
     client: PairedPeer,
     taking: Taking,
-    /// Opened by the case when [`Taking::AfterTheGate`] may start reading.
+    /// Opened by the case when a host that was holding back may start reading, or drop its receiver.
     gate: Semaphore,
     /// Where each stream the host takes is forwarded.
     forwarded: mpsc::UnboundedSender<DataStream>,
@@ -210,6 +217,9 @@ impl HostHandler for ChunkHost {
             }
             match self.taking {
                 Taking::Never | Taking::DropAfterTheGate => {
+                    // One poll raises the connection's stream limit, as any host's first read
+                    // does, and takes nothing.
+                    let _ = session.data_streams.recv().now_or_never();
                     if self.taking == Taking::DropAfterTheGate {
                         self.gate
                             .acquire()
@@ -222,11 +232,14 @@ impl HostHandler for ChunkHost {
                     self.dropped.notify_waiters();
                     while session.control.recv().await.is_some() {}
                 }
-                Taking::Forward | Taking::AfterTheGate => {
+                Taking::Forward | Taking::AfterTheGate | Taking::NotYet => {
                     let mut admitted = session.data_streams;
                     let host = Arc::clone(&self);
                     let forwarding = tokio::spawn(async move {
                         if host.taking == Taking::AfterTheGate {
+                            let _ = admitted.recv().now_or_never();
+                        }
+                        if matches!(host.taking, Taking::AfterTheGate | Taking::NotYet) {
                             host.gate
                                 .acquire()
                                 .await
@@ -1200,6 +1213,102 @@ async fn a_host_opens_no_stream_to_a_device() {
         "a device accepted a stream the host cannot open"
     );
     drop(from_the_host);
+
+    harness.finish().await;
+}
+
+/// A host that has not taken streams yet leaves its device one stream: the stream limit is raised
+/// when the host first reads, and not when it authorises the connection. The host is serving and
+/// has not polled its receiver, so a second open finds no credit, the host reports it granted
+/// nothing, and when the host starts reading the same open completes and its stream is taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_has_not_taken_streams_leaves_a_device_one_stream_until_it_does() {
+    let mut harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::NotYet).await;
+
+    let mut second = Box::pin(harness.connection.open_bi());
+    assert!(
+        futures::poll!(&mut second).is_pending(),
+        "a device had room for a second stream before the host took any"
+    );
+    awaited("the host being told the device is blocked", async {
+        while harness
+            .host_connection
+            .stats()
+            .frame_rx
+            .streams_blocked_bidi
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert_eq!(
+        harness.host_connection.stats().frame_tx.max_streams_bidi,
+        0,
+        "the host granted credit before it read its first stream"
+    );
+
+    harness.host.gate.add_permits(1);
+    let (mut send, _recv) = awaited("the second stream, once the host reads", second)
+        .await
+        .expect("a second stream");
+    let header = attachment_header(harness.authorised.connection_id, 1);
+    write_header(&mut send, &header, None).await;
+    assert_eq!(harness.next().await.header(), &header);
+
+    harness.finish().await;
+}
+
+/// A host that drops its queue while the listener is reading a stream's header ends that read:
+/// the stream is reset at once, not when its header deadline passes, and nothing the listener held
+/// for it is kept. The header deadline here is never fired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_drops_its_queue_releases_a_header_being_read() {
+    let harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::DropAfterTheGate).await;
+    let header = attachment_header(harness.authorised.connection_id, 1);
+    let (mut half_send, mut half_recv) = harness.connection.open_bi().await.expect("a stream");
+    write_header(&mut half_send, &header, Some(12)).await;
+    awaited(
+        "the listener reading the header",
+        harness.deadlines.wait_armed(DeadlineKind::Header),
+    )
+    .await;
+
+    harness.host.gate.add_permits(1);
+    assert_eq!(reset_code(&mut half_recv).await, u64::from(STREAM_REVOKED));
+    assert!(harness.registry.is_empty());
+    assert_eq!(harness.registry.budget().open_bulk_streams(), 0);
+
+    harness.finish().await;
+}
+
+/// A stream that was revoked while it waited in the queue is reset and skipped, and never handed to
+/// the host: the host keeps a transfer's stream where it could replace the device's live one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_revoked_while_queued_is_reset_and_not_handed_over() {
+    let mut harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::AfterTheGate).await;
+    let (_send, mut recv) = harness
+        .raw(&attachment_header(harness.authorised.connection_id, 1))
+        .await;
+    awaited("the stream being admitted", async {
+        while harness.registry.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    harness.registry.revoke_all();
+
+    harness.host.gate.add_permits(1);
+    assert_eq!(reset_code(&mut recv).await, u64::from(STREAM_REVOKED));
+    assert!(
+        harness.admitted.try_recv().is_err(),
+        "a stream that was revoked in the queue was handed to the host"
+    );
+    awaited(
+        "the stream leaving the registry",
+        emptied(&harness.registry),
+    )
+    .await;
 
     harness.finish().await;
 }
