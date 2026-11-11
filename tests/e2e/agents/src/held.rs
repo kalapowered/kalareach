@@ -894,41 +894,23 @@ impl ProcessRow {
         };
         self.executable.as_deref().is_some_and(file) || file(&self.argv0)
     }
-
-    /// What is said of this process in a refusal: the path of its executable as the system gives
-    /// it, and nothing else, not the name its parent gave it; where that path lies under
-    /// `agent_folder`, the person's own agent folder, only that it does, since the path would name
-    /// something under the folder; and where the system names no executable, that it does not.
-    fn said(&self, agent_folder: Option<&Path>) -> String {
-        match self.executable.as_deref() {
-            Some(path)
-                if agent_folder.is_some_and(|folder| Path::new(path).starts_with(folder)) =>
-            {
-                UNDER_THE_AGENT_FOLDER.to_owned()
-            }
-            Some(path) => path.to_owned(),
-            None => "an executable the system does not name".to_owned(),
-        }
-    }
 }
 
-/// What a refusal says of a process whose executable lies under the person's own agent folder.
-const UNDER_THE_AGENT_FOLDER: &str = "an executable under the person's agent folder";
-
-/// The processes of `user` that are the agent called `agent` ([`ProcessRow::is_the_agent`]) and are
-/// not the run's, each as the refusal says it ([`ProcessRow::said`], with `agent_folder`): a process is the run's when it or an ancestor of it
-/// is one of `marked`, the processes whose command line names the run's directory. Nothing else of
-/// a process is said: no argument, no directory, no file it has open.
+/// The process ids of the processes of `user` that are the agent called `agent`
+/// ([`ProcessRow::is_the_agent`]) and are not the run's, in ascending order: a process is the run's
+/// when it or an ancestor of it is one of `marked`, the processes whose command line names the run's
+/// directory. Nothing else of a process is kept: no path, no name, no argument, no directory, no
+/// file it has open.
 fn outside_the_run(
     rows: &[ProcessRow],
     marked: &BTreeSet<u32>,
     user: u32,
     agent: &str,
-    agent_folder: Option<&Path>,
-) -> Vec<String> {
+) -> Vec<u32> {
     let parents: std::collections::BTreeMap<u32, u32> =
         rows.iter().map(|row| (row.pid, row.parent)).collect();
-    rows.iter()
+    let mut found: Vec<u32> = rows
+        .iter()
         .filter(|row| row.user == user && row.is_the_agent(agent))
         .filter(|row| {
             let mut pid = row.pid;
@@ -944,19 +926,22 @@ fn outside_the_run(
             }
             true
         })
-        .map(|row| row.said(agent_folder))
-        .collect()
+        .map(|row| row.pid)
+        .collect();
+    found.sort_unstable();
+    found
 }
 
 /// The processes of this user that are the agent called `agent` (`codex`) outside the run whose
-/// directory is `run_root`, where there is a run, each as the path of its executable: found by a
-/// listing of the processes and, for each of this user's, the path of the file it runs as the
+/// directory is `run_root`, where there is a run, each as its process id and nothing else: found by
+/// a listing of the processes and, for each of this user's, the path of the file it runs as the
 /// system says it (`proc_pidpath` on macOS), which reads no file under the person's agent
 /// directory. A process counts when the file name of that path or of the name its parent gave it
 /// (`argv[0]`) is the agent's ([`names_the_agent`]: `codex`, the release files `codex-<target>`, the
 /// desktop application's main process `Codex`, in any case). A process of the run's own, an agent
-/// it started among them, is not counted. Where a counted process runs a file under `agent_folder`,
-/// the person's own agent folder, the refusal says that and not the path.
+/// it started among them, is not counted. No path is kept, so none can be said: a path under the
+/// person's agent folder would name something there, and no comparison with the folder can tell
+/// every spelling of it.
 ///
 /// This is a help and not a proof. It does not find an agent that runs as another program (a
 /// Node script, a wrapper under another name that has no `codex` child), a process of another user,
@@ -968,11 +953,7 @@ fn outside_the_run(
 ///
 /// Returns why the listing is not known: a listing that cannot be read says nothing of which
 /// processes run, so it is never read as none.
-pub fn other_agent_processes(
-    agent: &str,
-    run_root: Option<&Path>,
-    agent_folder: Option<&Path>,
-) -> Result<Vec<String>, String> {
+pub fn other_agent_processes(agent: &str, run_root: Option<&Path>) -> Result<Vec<u32>, String> {
     let mut ps = std::process::Command::new("/bin/ps");
     ps.args(["-A", "-ww", "-o", "pid=,ppid=,uid=,comm="])
         .env_clear()
@@ -1018,25 +999,24 @@ pub fn other_agent_processes(
             .collect(),
         None => BTreeSet::new(),
     };
-    Ok(outside_the_run(&rows, &marked, me, agent, agent_folder))
+    Ok(outside_the_run(&rows, &marked, me, agent))
 }
 
-/// What a driver says when processes of the user are the agent outside the run: the count and the
-/// path of each one's executable as the system gives it (never the name its parent gave it), and
-/// what to do. The guard over the person's agent
-/// directory compares the whole of it at the end, and cannot tell a write of theirs from one of the
-/// run's agent.
+/// What a driver says when processes of the user are the agent outside the run: how many there are,
+/// their process ids, and what to do; nothing else of a process, no path and no name. The guard over
+/// the person's agent directory compares the whole of it at the end, and cannot tell a write of
+/// theirs from one of the run's agent.
 #[must_use]
-pub fn other_agents_refusal(found: &[String], when: &str) -> String {
-    let mut paths: Vec<&str> = found.iter().map(String::as_str).collect();
-    paths.sort_unstable();
-    paths.dedup();
+pub fn other_agents_refusal(found: &[u32], when: &str) -> String {
+    let mut ids = found.to_vec();
+    ids.sort_unstable();
+    let ids: Vec<String> = ids.iter().map(u32::to_string).collect();
     format!(
-        "{} process(es) of this user are the agent outside the run ({}), {when}: a \
+        "{} process(es) of this user are the agent outside the run (process ids {}), {when}: a \
          write of theirs to the person's agent directory would be taken for the run's, so no turn \
          is started or charged while they run; end them, and start again",
         found.len(),
-        paths.join(", ")
+        ids.join(", ")
     )
 }
 
@@ -1975,52 +1955,52 @@ mod tests {
         ];
         let marked: BTreeSet<u32> = [10].into_iter().collect();
         assert_eq!(
-            outside_the_run(&rows, &marked, 501, "codex", None),
-            vec![
-                "/opt/homebrew/lib/codex/bin/codex".to_owned(),
-                "/opt/homebrew/lib/codex/bin/codex-code-mode-host".to_owned(),
-                "/Applications/Codex.app/Contents/MacOS/Codex".to_owned(),
-                "/Applications/Codex.app/Contents/Frameworks/Codex Helper.app/Codex Helper (Renderer)"
-                    .to_owned(),
-                "/usr/local/bin/codex-aarch64-apple-darwin".to_owned(),
-                "/usr/bin/vim".to_owned(),
-                "an executable the system does not name".to_owned(),
-            ],
+            outside_the_run(&rows, &marked, 501, "codex"),
+            vec![20, 21, 60, 61, 62, 63, 64],
             "the run's agent, another user's, other programs and lookalike names are not counted, \
-             and the name a parent gave is never said"
+             and the name a parent gave is not kept"
         );
         // Before a run exists nothing is the run's: the pinned file's process counts too.
         assert_eq!(
-            outside_the_run(&rows, &BTreeSet::new(), 501, "codex", None).len(),
+            outside_the_run(&rows, &BTreeSet::new(), 501, "codex").len(),
             9
         );
-        // A counted executable that lies under the person's agent folder is said to, never named;
-        // one beside it, or under a folder of a like name, is named as before.
-        let folder = Path::new("/Users/r/.codex");
-        let under = [
-            row(
-                70,
-                1,
-                501,
-                "codex",
-                Some("/Users/r/.codex/bin/secret-name/codex"),
-            ),
-            row(71, 1, 501, "codex", Some("/Users/r/.codex-other/codex")),
-            row(72, 1, 501, "codex", Some("/Users/r/bin/codex")),
-        ];
-        let said = outside_the_run(&under, &BTreeSet::new(), 501, "codex", Some(folder));
-        assert_eq!(
-            said,
-            vec![
-                "an executable under the person's agent folder".to_owned(),
-                "/Users/r/.codex-other/codex".to_owned(),
-                "/Users/r/bin/codex".to_owned(),
-            ]
-        );
-        assert!(!said.iter().any(|text| text.contains("secret-name")));
-        let said = other_agents_refusal(&["/x/codex".to_owned(), "/x/codex".to_owned()], "now");
+        // The refusal says how many and which processes, and nothing else of them.
+        let said = other_agents_refusal(&[12, 7], "now");
         assert!(
-            said.starts_with("2 process(es)") && said.contains("(/x/codex)"),
+            said.starts_with("2 process(es)") && said.contains("process ids 7, 12"),
+            "{said}"
+        );
+        assert!(!said.contains('/'), "{said}");
+    }
+
+    #[test]
+    fn a_refusal_names_no_path_whatever_the_spelling_of_the_agents_folder() {
+        // The same folder under other spellings (a link's target, another case), and a file the
+        // system names no path for: no text of the refusal carries a path.
+        let row = |pid, executable: Option<&str>| ProcessRow {
+            pid,
+            parent: 1,
+            user: 501,
+            argv0: "codex".to_owned(),
+            executable: executable.map(str::to_owned),
+        };
+        let rows = [
+            row(70, Some("/private/Users/r/.codex/bin/secret-name/codex")),
+            row(71, Some("/USERS/R/.CODEX/bin/secret-name/codex")),
+            row(72, Some("/Users/r/.codex/bin/secret-name/codex")),
+            row(73, Some("/Users/r/bin/secret-name/codex")),
+            row(74, None),
+        ];
+        let found = outside_the_run(&rows, &BTreeSet::new(), 501, "codex");
+        assert_eq!(found, vec![70, 71, 72, 73, 74]);
+        let said = other_agents_refusal(&found, "now");
+        assert!(
+            said.starts_with("5 process(es)") && said.contains("process ids 70, 71, 72, 73, 74"),
+            "{said}"
+        );
+        assert!(
+            !said.contains("secret-name") && !said.contains('/'),
             "{said}"
         );
     }
@@ -2053,19 +2033,11 @@ mod tests {
             start("other-file", "codex"),
             start("another-file", "another-name"),
         ];
-        // The system gives the path as it resolves it.
-        let own = std::fs::canonicalize(&directory)
-            .expect("its path")
-            .display()
-            .to_string();
-        let here = |seen: &[String], file: &str| {
-            seen.iter()
-                .any(|said| said.starts_with(&own) && said.ends_with(file))
-        };
+        let ids: Vec<u32> = children.iter().map(std::process::Child::id).collect();
         let started = std::time::Instant::now();
         let seen = loop {
-            let seen = other_agent_processes("codex", None, None).expect("a listing");
-            if (here(&seen, "/codex") && here(&seen, "/other-file"))
+            let seen = other_agent_processes("codex", None).expect("a listing");
+            if (seen.contains(&ids[0]) && seen.contains(&ids[1]))
                 || started.elapsed() > std::time::Duration::from_secs(20)
             {
                 break seen;
@@ -2077,15 +2049,22 @@ mod tests {
             child.wait().expect("reaped");
         }
         std::fs::remove_dir_all(&directory).expect("clean up");
+        // A failure says how many were counted, not which.
         assert!(
-            here(&seen, "/codex"),
-            "found by its executable's path: {seen:?}"
+            seen.contains(&ids[0]),
+            "the copy called `codex` was not found by its executable ({} counted)",
+            seen.len()
         );
         assert!(
-            here(&seen, "/other-file"),
-            "found by the name its parent gave it: {seen:?}"
+            seen.contains(&ids[1]),
+            "the copy started under the name `codex` was not found by that name ({} counted)",
+            seen.len()
         );
-        assert!(!here(&seen, "/another-file"), "{seen:?}");
+        assert!(
+            !seen.contains(&ids[2]),
+            "the copy under another file and name was counted ({} counted)",
+            seen.len()
+        );
     }
 
     /// The process the listing test starts under the name `codex`: a copy of this test program that
@@ -2114,32 +2093,30 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("it starts");
-        let own = std::fs::canonicalize(&codex).expect("its path");
-        // `ps` gives the executable's path where the system keeps one (macOS) and its bare name
-        // where it keeps only that (Linux).
-        let ours = |path: &String| {
-            Path::new(path) == own || Path::new(path) == directory.join("codex") || path == "codex"
-        };
+        let id = running.id();
         let started = std::time::Instant::now();
         let seen = loop {
-            let seen = other_agent_processes("codex", None, None).expect("a listing");
-            if seen.iter().any(ours) || started.elapsed() > std::time::Duration::from_secs(20) {
+            let seen = other_agent_processes("codex", None).expect("a listing");
+            if seen.contains(&id) || started.elapsed() > std::time::Duration::from_secs(20) {
                 break seen;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         };
         // Inside a run whose directory its command line names, it is the run's.
-        let inside = other_agent_processes("codex", Some(&directory), None).expect("a listing");
+        let inside = other_agent_processes("codex", Some(&directory)).expect("a listing");
         running.kill().expect("ended by its own handle");
         running.wait().expect("reaped");
         std::fs::remove_dir_all(&directory).expect("clean up");
+        // A failure says how many were counted, not which.
         assert!(
-            seen.iter().any(ours),
-            "the listing names the executable: {seen:?}"
+            seen.contains(&id),
+            "the listing did not count the process ({} counted)",
+            seen.len()
         );
         assert!(
-            !inside.iter().any(|path| Path::new(path) == own),
-            "a process the run's directory names is the run's: {inside:?}"
+            !inside.contains(&id),
+            "a process the run's directory names is the run's ({} counted)",
+            inside.len()
         );
     }
 
