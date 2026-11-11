@@ -95,6 +95,8 @@ pub mod outcome;
 #[cfg(unix)]
 pub mod provenance;
 #[cfg(unix)]
+pub mod session_environment;
+#[cfg(unix)]
 pub mod stage;
 #[cfg(unix)]
 pub mod stub;
