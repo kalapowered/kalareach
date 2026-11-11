@@ -242,19 +242,15 @@ impl Paths {
     /// The installation's places on this computer.
     #[must_use]
     pub fn system() -> Paths {
-        let program_files =
-            std::env::var_os("ProgramFiles").unwrap_or_else(|| "C:\\Program Files".into());
-        let program_data =
-            std::env::var_os("ProgramData").unwrap_or_else(|| "C:\\ProgramData".into());
-        let data = PathBuf::from(program_data)
-            .join("KalaReach")
-            .join("Boundary");
-        let program = PathBuf::from(&program_files)
-            .join("KalaReach")
-            .join("Boundary");
+        let program_files = ffi::known_folder(ffi::KnownFolder::ProgramFiles)
+            .unwrap_or_else(|_| PathBuf::from(r"C:\Program Files"));
+        let program_data = ffi::known_folder(ffi::KnownFolder::ProgramData)
+            .unwrap_or_else(|_| PathBuf::from(r"C:\ProgramData"));
+        let data = program_data.join("KalaReach").join("Boundary");
+        let program = program_files.join("KalaReach").join("Boundary");
         Paths {
             git: program.join("git"),
-            program_top: PathBuf::from(program_files),
+            program_top: program_files,
             program,
             staging: data.join("staging"),
             journal: data.join("journal"),
@@ -267,7 +263,8 @@ impl Paths {
 }
 
 fn git_dir() -> PathBuf {
-    PathBuf::from(std::env::var_os("ProgramFiles").unwrap_or_else(|| "C:\\Program Files".into()))
+    ffi::known_folder(ffi::KnownFolder::ProgramFiles)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Program Files"))
         .join("Git")
 }
 
@@ -1825,7 +1822,7 @@ fn refuse_smart_app_control() -> Result<(), Error> {
 }
 
 fn refuse_code_integrity() -> Result<(), Error> {
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_owned());
+    let root = ffi::system_windows_directory().unwrap_or_else(|_| r"C:\Windows".to_owned());
     let tool = Path::new(&root).join("System32").join("CiTool.exe");
     let output = Command::new(&tool)
         .args(["--list-policies", "--json"])

@@ -97,6 +97,52 @@ pub fn system_windows_directory() -> Result<String> {
     Ok(String::from_utf16_lossy(&buffer[..length]))
 }
 
+/// One of the system's own folders that the installation is laid in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KnownFolder {
+    /// `Program Files`, where the program directory is.
+    ProgramFiles,
+    /// `ProgramData`, where the data directory is.
+    ProgramData,
+}
+
+/// A system folder as the shell's own call gives it. It is never read from the environment: an
+/// unelevated session of the same account can set its own variables, and the installation runs
+/// elevated and lays programs down that the system runs.
+///
+/// # Errors
+///
+/// Returns the platform's error when the folder cannot be read.
+pub fn known_folder(which: KnownFolder) -> Result<std::path::PathBuf> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_ProgramData, FOLDERID_ProgramFiles, SHGetKnownFolderPath,
+    };
+    let id = match which {
+        KnownFolder::ProgramFiles => &FOLDERID_ProgramFiles,
+        KnownFolder::ProgramData => &FOLDERID_ProgramData,
+    };
+    let mut text: *mut u16 = null_mut();
+    // SAFETY: the identifier is a constant, the token is the calling process's own and the answer
+    // is an out-parameter that is freed below.
+    let status = unsafe { SHGetKnownFolderPath(id, 0, null_mut(), &raw mut text) };
+    if status < 0 || text.is_null() {
+        // SAFETY: frees what the call allocated, if it did.
+        unsafe { CoTaskMemFree(text.cast()) };
+        return Err(error(
+            status as u32,
+            "reading one of the system's own folders",
+        ));
+    }
+    // SAFETY: the answer is a NUL-terminated string that the call allocated.
+    let length = unsafe { (0..).take_while(|&at| *text.add(at) != 0).count() };
+    // SAFETY: as above, and `length` units are before the terminator.
+    let path = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
+    // SAFETY: frees what the call allocated, once.
+    unsafe { CoTaskMemFree(text.cast()) };
+    Ok(std::path::PathBuf::from(path))
+}
+
 /// How long Windows has been running, in milliseconds.
 #[must_use]
 pub fn uptime_millis() -> u64 {
