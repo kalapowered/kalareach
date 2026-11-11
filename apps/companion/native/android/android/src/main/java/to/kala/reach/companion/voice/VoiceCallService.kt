@@ -52,7 +52,8 @@ class VoiceCallService : android.app.Service() {
          * its own and this one is deleted when the service starts.
          *
          * Remove this and its deletion in [ensureChannel] once no installed application can still
-         * hold it: when the oldest release the stores still serve already has [CHANNEL_ID].
+         * hold it: when the oldest release an installed application may update from already has
+         * [CHANNEL_ID].
          */
         private const val LOW_IMPORTANCE_CHANNEL_ID = "kr-voice-call"
 
@@ -62,8 +63,11 @@ class VoiceCallService : android.app.Service() {
         /** Stop the call. Reachable from the notification while the screen is locked. */
         const val ACTION_STOP = VoiceServiceActions.STOP
 
-        /** Mute or unmute the person's own microphone, from the notification. */
-        const val ACTION_TOGGLE_MUTE = VoiceServiceActions.TOGGLE_MUTE
+        /** Mute the person's own microphone, from the notification. */
+        const val ACTION_MUTE = VoiceServiceActions.MUTE
+
+        /** Open the person's own microphone again, from the notification, after the unlock. */
+        const val ACTION_UNMUTE = VoiceServiceActions.UNMUTE
 
         /** Republish the notification with what the microphone is doing now. */
         const val ACTION_CAPTURE = VoiceServiceActions.CAPTURE
@@ -166,7 +170,8 @@ class VoiceCallService : android.app.Service() {
         // Decided from the call the action names: one naming a call other than the one this
         // service runs for arrived late, or from an earlier call's notification, and changes
         // nothing.
-        when (VoiceServiceActions.decide(intent?.action, named, if (running) call else null)) {
+        val act = VoiceServiceActions.decide(intent?.action, named, if (running) call else null)
+        when (act) {
             VoiceServiceActions.Act.START -> {
                 call = named
                 // What the microphone is doing arrives from the call itself, straight after.
@@ -196,20 +201,17 @@ class VoiceCallService : android.app.Service() {
                 VoiceCallHolder.current(named)?.stop()
                 stopCall()
             }
-            VoiceServiceActions.Act.TOGGLE_MUTE -> {
+            VoiceServiceActions.Act.MUTE, VoiceServiceActions.Act.UNMUTE -> {
                 val held = VoiceCallHolder.current(call)
-                if (held != null) {
-                    // Where the platform did not ask for the unlock, a muted microphone is not
-                    // reopened from a locked phone.
-                    if (!held.isMutedByPerson ||
-                        VoiceNotificationControls.mayUnmute(locked, Build.VERSION.SDK_INT)
-                    ) {
-                        held.setMutedByPerson(!held.isMutedByPerson)
-                    }
-                } else {
+                when {
                     // No call owns this notification any more, so the microphone is not this
                     // service's to change and the notification should not suggest it is.
-                    stopCall()
+                    held == null -> stopCall()
+                    act == VoiceServiceActions.Act.MUTE -> held.setMutedByPerson(true)
+                    // Where the platform did not ask for the unlock, a muted microphone is not
+                    // reopened from a locked phone.
+                    VoiceNotificationControls.mayUnmute(locked, Build.VERSION.SDK_INT) ->
+                        held.setMutedByPerson(false)
                 }
             }
             VoiceServiceActions.Act.CAPTURE -> {
@@ -283,7 +285,11 @@ class VoiceCallService : android.app.Service() {
                 addAction(Intent.ACTION_SCREEN_OFF)
                 addAction(Intent.ACTION_USER_PRESENT)
             },
-            ContextCompat.RECEIVER_NOT_EXPORTED,
+            // Exported, because the three actions are protected broadcasts that only the system
+            // can send, and a receiver that is not exported asks the sender for a permission of
+            // this application's own on these platforms, which the system's user interface, the
+            // sender of the unlock, does not hold. All the receiver does is republish.
+            ContextCompat.RECEIVER_EXPORTED,
         )
         watchingLock = true
     }
@@ -330,8 +336,12 @@ class VoiceCallService : android.app.Service() {
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Voice call running")
             // What the microphone is doing, in the person's own words, on the one surface that
-            // exists while the screen is locked.
-            .setContentText(capture.display)
+            // exists while the screen is locked. A microphone the person muted is said to be
+            // muted, as the control beside it says: the capture state of a muted call reads as no
+            // microphone, since the recorder stops with the muted track.
+            .setContentText(
+                if (muted) VoiceCaptureState.MUTED_BY_PERSON.display else capture.display,
+            )
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -340,9 +350,9 @@ class VoiceCallService : android.app.Service() {
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
         when (controls.toggle) {
             VoiceNotificationControls.Toggle.MUTE ->
-                builder.addAction(action("Mute", ACTION_TOGGLE_MUTE, 1, controls.needsUnlock))
+                builder.addAction(action("Mute", ACTION_MUTE, 1, controls.needsUnlock))
             VoiceNotificationControls.Toggle.UNMUTE ->
-                builder.addAction(action("Unmute", ACTION_TOGGLE_MUTE, 1, controls.needsUnlock))
+                builder.addAction(action("Unmute", ACTION_UNMUTE, 3, controls.needsUnlock))
             VoiceNotificationControls.Toggle.NONE -> Unit
         }
         return builder

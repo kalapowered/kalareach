@@ -123,8 +123,9 @@ Android's microphone foreground service:
   unlock. Unmute asks for the unlock. From Android 12 (API 31) the platform holds the action until the
   phone is unlocked. On Android 10 and 11 (the application's floor is API 29) the notification offers
   no Unmute while the phone is locked, and the service refuses one that arrives.
-  `scripts/e2e-voice-call-device.sh android lock-screen` reads all of this from the emulator's lock
-  screen, with a lock credential of its own for the run.
+  `scripts/e2e-voice-call-device.sh android lock-screen` runs a call on the Android 16 emulator, locks
+  it with a lock credential of its own for the run, and presses Mute, Unmute and Stop on the lock
+  screen. It does not cover Android 10 and 11.
 - **Unattended activation forbidden**: building a call makes its offer with the recorder and the
   microphone track off, and opens no audio session and no foreground service. Nothing records until
   the host's answer to a start permits the call. That answer names the voice session and the moment

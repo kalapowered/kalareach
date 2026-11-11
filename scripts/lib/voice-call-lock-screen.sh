@@ -105,6 +105,12 @@ lock_control() { # <label> <dump>
     return 1
 }
 
+# Whether the lock screen, read afresh into `$2`, shows the words `$1`.
+lock_says() { # <words> <dump>
+    lock_dump "$2"
+    python3 -I "$here/scripts/lib/ui-node.py" has "$2" "$1"
+}
+
 lock_still() { # <name>
     lock_device exec-out screencap -p >"$artefacts/lock-screen/$1.png" 2>/dev/null
 }
@@ -118,14 +124,40 @@ lock_the_screen() {
     lock_wait 15 lock_showing
 }
 
+# Puts the virtual device's lock back as the leg found it. The leg's marker is made before its first
+# change, and is kept until the credential is cleared and the lock setting reads as it did, so that
+# the run's end tries again after a failure here. Returns 1 when something could not be put back.
 lock_screen_restore() {
-    [ -e "$harness/credential-set" ] || return 0
-    lock_device shell locksettings clear --old "$lock_pin" >/dev/null 2>&1
-    if [ -s "$harness/lock-disabled-before" ]; then
-        lock_device shell locksettings set-disabled "$(cat "$harness/lock-disabled-before")" >/dev/null 2>&1
+    [ -e "$harness/lock-changed" ] || return 0
+    local before output ok=1
+    before="$(cat "$harness/lock-disabled-before" 2>/dev/null)"
+    if [ -e "$harness/credential-set" ]; then
+        if output="$(lock_device shell locksettings clear --old "$lock_pin" 2>&1)" && ! printf '%s' "$output" | grep -q -i 'fail\|error\|incorrect'; then
+            /bin/rm -f "${harness:?}/credential-set"
+        else
+            ok=0
+        fi
     fi
-    /bin/rm -f "${harness:?}/credential-set"
-    say "the emulator's lock credential and lock setting are put back"
+    if [ "$ok" = 1 ] && [ -n "$before" ]; then
+        lock_device shell locksettings set-disabled "$before" >/dev/null 2>&1
+        [ "$(lock_device shell locksettings get-disabled 2>/dev/null | tr -d '\r')" = "$before" ] || ok=0
+    fi
+    if [ "$ok" = 1 ]; then
+        /bin/rm -f "${harness:?}/lock-changed"
+        say "the emulator's lock credential and lock setting are put back"
+        return 0
+    fi
+    say "the emulator's lock could not be put back as it was"
+    return 1
+}
+
+# Puts the lock back and says whether it is back, as a check of the leg.
+lock_screen_restore_check() {
+    if lock_screen_restore; then
+        lock_check "the emulator's lock is put back as the leg found it" 1 "the credential is cleared and the lock setting reads as it did"
+    else
+        lock_check "the emulator's lock is put back as the leg found it" 0 "the credential or the lock setting could not be put back; the run's end tries again"
+    fi
 }
 
 # Ends the call through the unlocked shade, so that a run which found no Stop on the lock screen does
@@ -150,12 +182,13 @@ lock_screen_leg() {
     local before
     before="$(lock_device shell locksettings get-disabled 2>/dev/null | tr -d '\r')"
     printf '%s\n' "${before:-true}" >"$harness/lock-disabled-before"
+    touch "$harness/lock-changed"
     lock_device shell locksettings set-disabled false >/dev/null 2>&1
     if lock_device shell locksettings set-pin "$lock_pin" 2>&1 | grep -q -i 'password set\|pin set\|set to'; then
         touch "$harness/credential-set"
     else
         lock_check "the leg holds a lock credential of its own" 0 "the emulator already had a credential, or set-pin was refused"
-        lock_screen_restore
+        lock_screen_restore_check
         return 0
     fi
 
@@ -199,24 +232,35 @@ lock_screen_leg() {
     fi
 
     # Mute, from the locked screen.
-    if lock_control Mute "$dump" && lock_wait 10 lock_record_has '"Unmute"'; then
-        lock_check "Mute from the lock screen mutes the call with no unlock" 1 "the notification now offers Unmute; the screen stayed locked: $(lock_showing && echo yes || echo no)"
+    if lock_control Mute "$dump" && lock_wait 10 lock_record_has '"Unmute"' && lock_showing \
+        && lock_wait 10 lock_says "Microphone muted" "$dump"; then
+        lock_check "Mute from the lock screen mutes the call with no unlock" 1 "the notification now offers Unmute and says the microphone is muted; the screen stayed locked"
     else
         lock_check "Mute from the lock screen mutes the call with no unlock" 0 "the notification did not change to Unmute"
     fi
 
     # Unmute, from the locked screen: the system asks for the credential and the call stays muted.
-    local asked=0
+    local asked=0 found=""
     if lock_control Unmute "$dump"; then
+        lock_device shell date +%s%N >"$harness/unmute-tap-at.txt"
         sleep 3
         lock_dump "$artefacts/lock-screen/locked-2-unmute.xml"
         lock_still 3-unmute-asks
-        if lock_showing && lock_record_has '"Unmute"' \
-            && python3 -I "$here/scripts/lib/ui-node.py" ids "$artefacts/lock-screen/locked-2-unmute.xml" "" | grep -q -i 'pin'; then
-            asked=1
+        lock_showing && found="$found the screen is still locked;" || found="$found the screen is not locked;"
+        lock_record_has '"Unmute"' && found="$found the notification still offers Unmute;" || found="$found the notification no longer offers Unmute;"
+        if python3 -I "$here/scripts/lib/ui-node.py" ids "$artefacts/lock-screen/locked-2-unmute.xml" "" | grep -q -i 'pin'; then
+            found="$found the credential prompt shows;"
+        else
+            found="$found no credential prompt shows;"
         fi
+        case "$found" in
+            *"not locked"* | *"no longer"* | *"no credential"*) asked=0 ;;
+            *) asked=1 ;;
+        esac
+    else
+        found="the Unmute control was not on the lock screen"
     fi
-    lock_check "Unmute from the lock screen asks for the unlock and leaves the call muted" "$asked" "the credential prompt shows, the screen is still locked and the notification still offers Unmute"
+    lock_check "Unmute from the lock screen asks for the unlock and leaves the call muted" "$asked" "${found# }"
     # The device's own clock, as the application's record of the microphone is, just before the
     # credential is given.
     lock_device shell date +%s%N >"$harness/unlock-at.txt"
@@ -230,44 +274,53 @@ lock_screen_leg() {
     fi
 
     # Stop, from the locked screen.
-    lock_the_screen
+    local armed=0 tapped=0 gone=0 waited=0
+    if lock_the_screen && [ -n "$(lock_record)" ]; then armed=1; fi
     lock_still 4-locked-again
-    lock_control Stop "$dump"
-    local gone=0 waited=0
-    while [ "$waited" -lt 15 ]; do
+    if [ "$armed" = 1 ] && lock_control Stop "$dump"; then tapped=1; fi
+    while [ "$tapped" = 1 ] && [ "$waited" -lt 15 ]; do
         if [ -z "$(lock_record)" ]; then gone=1; break; fi
         sleep 1
         waited=$((waited + 1))
     done
     if [ "$gone" = 1 ] && lock_showing; then
-        lock_check "Stop from the lock screen ends the call with no unlock" 1 "the notification is gone and the screen is still locked"
+        lock_check "Stop from the lock screen ends the call with no unlock" 1 "the screen was locked with the notification on it, Stop was pressed there, the notification is gone and the screen is still locked"
     else
-        lock_check "Stop from the lock screen ends the call with no unlock" 0 "notification gone: $gone"
+        lock_check "Stop from the lock screen ends the call with no unlock" 0 "locked with the notification on it: $armed; Stop pressed: $tapped; notification gone: $gone"
         lock_stop_through_the_shade
     fi
-    lock_screen_restore
+    lock_screen_restore_check
     return 0
 }
 
 # Reads the application's record of the microphone against the time the person gave the credential:
 # the call was open, was muted from the lock screen, and was opened again only after the unlock.
 lock_judge_trail() { # <result file>
-    local line at verdict
+    local line at tap verdict
     line="$(grep '^check=the microphone followed the taps on the lock screen ok=' "$1" | head -1)"
     at=""
+    tap=""
     [ ! -s "$harness/unlock-at.txt" ] || at="$(tr -d '\r\n' <"$harness/unlock-at.txt")"
-    verdict="$(python3 -I - "$line" "$at" <<'PY'
+    [ ! -s "$harness/unmute-tap-at.txt" ] || tap="$(tr -d '\r\n' <"$harness/unmute-tap-at.txt")"
+    verdict="$(python3 -I - "$line" "$at" "$tap" <<'PY'
 import re
 import sys
 
-line, unlock_ns = sys.argv[1], sys.argv[2]
-steps = re.findall(r"(open|muted)@(\d+)", line.split("detail=", 1)[-1])
+line, unlock_ns, tap_ns = sys.argv[1], sys.argv[2], sys.argv[3]
+detail = line.split("detail=", 1)[-1]
+steps = re.findall(r"(open|muted)@(\d+)", detail)
+gap = re.search(r"widest gap (\d+) ms", detail)
 order = [word for word, _ in steps]
-if order != ["open", "muted", "open"] or not unlock_ns.isdigit():
+if order != ["open", "muted", "open"] or not unlock_ns.isdigit() or not tap_ns.isdigit() or not gap:
     print("0 %s" % (" ".join("%s@%s" % each for each in steps) or "no record"))
 else:
-    reopened, unlocked = int(steps[2][1]), int(unlock_ns) // 1_000_000
-    print("%d the microphone reopened %d ms after the leg gave the credential" % (reopened >= unlocked, reopened - unlocked))
+    reopened, unlocked, tapped = int(steps[2][1]), int(unlock_ns) // 1_000_000, int(tap_ns) // 1_000_000
+    # The application looks at the microphone about four times a second. A reopen made when the Unmute
+    # was pressed would be seen within the widest gap between two looks, so the order against the
+    # credential holds only where that gap is shorter than the time between the press and the credential.
+    margin = unlocked - tapped
+    ok = reopened >= unlocked and int(gap.group(1)) < margin
+    print("%d the microphone reopened %d ms after the leg gave the credential; the application looked at it at least every %s ms, against %d ms between the Unmute press and the credential" % (ok, reopened - unlocked, gap.group(1), margin))
 PY
 )"
     lock_check "the microphone stayed muted until the unlock" "${verdict%% *}" "${verdict#* }"

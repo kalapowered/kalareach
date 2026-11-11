@@ -563,34 +563,53 @@ enum HowItEnds {
 
 /// Whether the microphone was muted, at each change, with the time of the change in milliseconds
 /// since the Unix epoch: the order in which the person's taps on the notification reached the call.
+/// The times are those of the looks, so the widest gap between two looks is kept beside them: a
+/// change is known to have happened no earlier than a gap before the look that saw it.
 #[derive(Default)]
-struct MuteTrail(std::sync::Mutex<Vec<(bool, u128)>>);
+struct MuteTrail(std::sync::Mutex<MuteLooks>);
+
+#[derive(Default)]
+struct MuteLooks {
+    changes: Vec<(bool, u128)>,
+    last_look: Option<u128>,
+    widest_gap_ms: u128,
+}
 
 impl MuteTrail {
     fn see(&self, muted: bool) {
+        let now = now_ms();
         let mut seen = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if seen.last().map(|(was, _)| *was) != Some(muted) {
-            seen.push((muted, now_ms()));
+        if let Some(last) = seen.last_look {
+            seen.widest_gap_ms = seen.widest_gap_ms.max(now.saturating_sub(last));
+        }
+        seen.last_look = Some(now);
+        if seen.changes.last().map(|(was, _)| *was) != Some(muted) {
+            seen.changes.push((muted, now));
         }
     }
 
     fn text(&self) -> String {
-        self.0
+        let seen = self
+            .0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changes = seen
+            .changes
             .iter()
             .map(|(muted, at)| format!("{}@{at}", if *muted { "muted" } else { "open" }))
             .collect::<Vec<_>>()
-            .join(" ")
+            .join(" ");
+        format!("{changes}; widest gap {} ms", seen.widest_gap_ms)
     }
 
     fn muted_once(&self) -> bool {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .changes
             .iter()
             .any(|(muted, _)| *muted)
     }

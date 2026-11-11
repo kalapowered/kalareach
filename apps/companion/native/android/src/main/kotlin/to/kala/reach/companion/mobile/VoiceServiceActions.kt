@@ -16,8 +16,15 @@ object VoiceServiceActions {
     /** End the call. Reachable from the notification while the screen is locked. */
     const val STOP = "to.kala.reach.voice.STOP"
 
-    /** Mute or unmute the person's own microphone, from the notification. */
-    const val TOGGLE_MUTE = "to.kala.reach.voice.TOGGLE_MUTE"
+    /** Mute the person's own microphone, from the notification. Muting twice is muting once. */
+    const val MUTE = "to.kala.reach.voice.MUTE"
+
+    /**
+     * Open the person's own microphone again, from the notification. It is an action of its own so
+     * that the platform can ask for the unlock before this one and no other: a mute is never read
+     * as an unmute, however many times it arrives.
+     */
+    const val UNMUTE = "to.kala.reach.voice.UNMUTE"
 
     /** Show on the notification what the microphone is doing now. */
     const val CAPTURE = "to.kala.reach.voice.CAPTURE"
@@ -30,8 +37,11 @@ object VoiceServiceActions {
         /** End the call the action names, and the service with it. */
         STOP,
 
-        /** Change the mute of the call the service is running for. */
-        TOGGLE_MUTE,
+        /** Mute the call the service is running for. */
+        MUTE,
+
+        /** Open the microphone of the call the service is running for. */
+        UNMUTE,
 
         /** Show what the microphone of the call the service is running for is doing. */
         CAPTURE,
@@ -53,7 +63,8 @@ object VoiceServiceActions {
             own == null -> if (action == STOP) Act.STOP else Act.END
             named != own -> Act.IGNORE
             action == STOP -> Act.STOP
-            action == TOGGLE_MUTE -> Act.TOGGLE_MUTE
+            action == MUTE -> Act.MUTE
+            action == UNMUTE -> Act.UNMUTE
             action == CAPTURE -> Act.CAPTURE
             // Anything else, including a restart the system decided on its own, is not a call the
             // person started, and opening the microphone for it would be the silent activation

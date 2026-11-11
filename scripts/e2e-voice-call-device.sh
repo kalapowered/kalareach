@@ -397,6 +397,7 @@ set_required_checks() {
                 "Unmute goes through once the screen is unlocked"
                 "the microphone stayed muted until the unlock"
                 "Stop from the lock screen ends the call with no unlock"
+                "the emulator's lock is put back as the leg found it"
                 "the call ends from its notification on the lock screen"
                 "the microphone followed the taps on the lock screen"
                 "the media stopped on this device"

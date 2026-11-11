@@ -17,7 +17,12 @@ class VoiceServiceActionsTest {
      */
     @Test
     fun an_action_for_an_earlier_call_changes_nothing() {
-        for (action in listOf(VoiceServiceActions.STOP, VoiceServiceActions.TOGGLE_MUTE, VoiceServiceActions.CAPTURE)) {
+        for (action in listOf(
+            VoiceServiceActions.STOP,
+            VoiceServiceActions.MUTE,
+            VoiceServiceActions.UNMUTE,
+            VoiceServiceActions.CAPTURE,
+        )) {
             assertEquals(action, VoiceServiceActions.Act.IGNORE, VoiceServiceActions.decide(action, old, current))
         }
     }
@@ -26,9 +31,10 @@ class VoiceServiceActionsTest {
     @Test
     fun an_action_for_the_running_call_acts() {
         assertEquals(VoiceServiceActions.Act.STOP, VoiceServiceActions.decide(VoiceServiceActions.STOP, current, current))
+        assertEquals(VoiceServiceActions.Act.MUTE, VoiceServiceActions.decide(VoiceServiceActions.MUTE, current, current))
         assertEquals(
-            VoiceServiceActions.Act.TOGGLE_MUTE,
-            VoiceServiceActions.decide(VoiceServiceActions.TOGGLE_MUTE, current, current),
+            VoiceServiceActions.Act.UNMUTE,
+            VoiceServiceActions.decide(VoiceServiceActions.UNMUTE, current, current),
         )
         assertEquals(
             VoiceServiceActions.Act.CAPTURE,
@@ -40,11 +46,26 @@ class VoiceServiceActionsTest {
     /** A service running for no call ends itself for anything but a start or a stop. */
     @Test
     fun a_service_with_no_call_ends_itself() {
-        assertEquals(VoiceServiceActions.Act.END, VoiceServiceActions.decide(VoiceServiceActions.TOGGLE_MUTE, old, null))
+        assertEquals(VoiceServiceActions.Act.END, VoiceServiceActions.decide(VoiceServiceActions.MUTE, old, null))
+        assertEquals(VoiceServiceActions.Act.END, VoiceServiceActions.decide(VoiceServiceActions.UNMUTE, old, null))
         assertEquals(VoiceServiceActions.Act.END, VoiceServiceActions.decide(VoiceServiceActions.CAPTURE, old, null))
         assertEquals(VoiceServiceActions.Act.END, VoiceServiceActions.decide(null, old, null))
         assertEquals(VoiceServiceActions.Act.STOP, VoiceServiceActions.decide(VoiceServiceActions.STOP, old, null))
         assertEquals(VoiceServiceActions.Act.END, VoiceServiceActions.decide("something.else", current, current))
+    }
+
+    /**
+     * KR-ACC-014: a mute is never an unmute. The two are different actions, so the platform can ask
+     * for the unlock before an unmute and before nothing else, and a mute that arrives twice, or
+     * after the notification already offers Unmute, still only mutes.
+     */
+    @Test
+    fun a_mute_is_never_an_unmute() {
+        assertNotEquals(VoiceServiceActions.MUTE, VoiceServiceActions.UNMUTE)
+        assertNotEquals(
+            VoiceServiceActions.decide(VoiceServiceActions.MUTE, current, current),
+            VoiceServiceActions.decide(VoiceServiceActions.UNMUTE, current, current),
+        )
     }
 
     /**
