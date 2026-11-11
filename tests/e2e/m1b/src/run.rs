@@ -52,6 +52,37 @@ pub struct Owned {
     pub what: String,
 }
 
+/// The program the harness itself starts once the agent under test has run: the rest are started
+/// by the daemon before the agent does, or by the programs themselves.
+pub const HARNESS_PROGRAM: &str = "kr";
+
+/// The place of a copied binary below the run's directory.
+#[must_use]
+pub fn binary_place(name: &str) -> PathBuf {
+    Path::new("b").join(name)
+}
+
+/// The largest file [`Run::note_placed`] reads whole.
+const PLACED_AT_MOST: i64 = 1 << 30;
+
+/// What the system keeps of a file, by which a file that was written to, replaced or linked is told
+/// from the one that was placed: where it is, how long it is, when its bytes and its record changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Stamp {
+    device: i128,
+    inode: i128,
+    size: i128,
+    modified: (i128, i128),
+    changed: (i128, i128),
+}
+
+/// A file the run placed, as it stood right after.
+#[derive(Clone, Debug)]
+struct Placed {
+    stamp: Stamp,
+    digest: [u8; 32],
+}
+
 /// One leg's run.
 #[derive(Debug)]
 pub struct Run {
@@ -75,6 +106,8 @@ pub struct Run {
     /// The proposed labels whose job, as the service manager prints it, is not a worker program of
     /// this run. They are left alone: nothing is asked of the service manager about them again.
     jobs_left_alone: Mutex<Vec<String>>,
+    /// The files the run placed and later runs, as each stood right after it was placed.
+    placed: Mutex<Vec<(PathBuf, Placed)>>,
     /// Set once the closing check has passed, so the directory can go.
     passed: Mutex<bool>,
 }
@@ -123,6 +156,7 @@ impl Run {
             undiscovered: Mutex::new(Vec::new()),
             job_labels: Mutex::new(Vec::new()),
             jobs_left_alone: Mutex::new(Vec::new()),
+            placed: Mutex::new(Vec::new()),
             passed: Mutex::new(false),
         };
         // A start that fails here has started nothing and holds nothing but the binaries copied so
@@ -141,6 +175,9 @@ impl Run {
                     &["--version"],
                 );
             }
+            // The one program the harness starts itself once the agent under test has run.
+            run.note_placed(&binary_place(HARNESS_PROGRAM))
+                .unwrap_or_else(|why| panic!("{why}"));
         }));
         if let Err(panic) = placed {
             let _ = run.closing_check();
@@ -163,6 +200,7 @@ impl Run {
             undiscovered: Mutex::new(Vec::new()),
             job_labels: Mutex::new(Vec::new()),
             jobs_left_alone: Mutex::new(Vec::new()),
+            placed: Mutex::new(Vec::new()),
             passed: Mutex::new(false),
         }
     }
@@ -189,7 +227,110 @@ impl Run {
     /// Where one copied binary is.
     #[must_use]
     pub fn binary(&self, name: &str) -> PathBuf {
-        self.root.join("b").join(name)
+        self.root.join(binary_place(name))
+    }
+
+    /// Records the file at `relative`, below the run's directory, as it stands now: opened through
+    /// the run's handles (a regular file with one name, on the run's file system, beneath the pinned
+    /// place), its identity, size and times, and the digest of its bytes. A later
+    /// [`Run::placed_as_it_was`] compares what is there with this.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the file is not a regular file of the run with one name, or why it was not read.
+    pub fn note_placed(&self, relative: &Path) -> Result<(), String> {
+        let placed = self.look_at_placed(relative)?;
+        let mut all = self.placed.lock().unwrap_or_else(PoisonError::into_inner);
+        all.retain(|(path, _)| path != relative);
+        all.push((relative.to_path_buf(), placed));
+        Ok(())
+    }
+
+    /// Checks that the file at `relative` is still the file [`Run::note_placed`] recorded: a regular
+    /// file with one name, opened through the run's handles, with the identity, size and times it
+    /// had, or, where those differ, with the bytes it had. A file whose bytes were rewritten in
+    /// place, replaced, linked or given a second name is not the file that was placed.
+    ///
+    /// # Errors
+    ///
+    /// Returns what is not as it was placed, as a class and no name outside the run.
+    pub fn placed_as_it_was(&self, relative: &Path) -> Result<(), String> {
+        let recorded = self
+            .placed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|(path, _)| path == relative)
+            .map(|(_, placed)| placed.clone())
+            .ok_or_else(|| {
+                format!(
+                    "the run's copy of {} was not recorded when it was placed",
+                    relative.display()
+                )
+            })?;
+        let now = self.look_at_placed(relative)?;
+        if now.digest != recorded.digest {
+            return Err(format!(
+                "the run's copy of {} is not the file that was placed: its bytes differ",
+                relative.display()
+            ));
+        }
+        if now.stamp != recorded.stamp {
+            // The same bytes under other times or another inode: what is there now is recorded.
+            self.placed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter_mut()
+                .filter(|(path, _)| path == relative)
+                .for_each(|(_, placed)| *placed = now.clone());
+        }
+        Ok(())
+    }
+
+    /// The file at `relative` as it stands: through the run's handles, then its stamp and digest.
+    /// The digest is read again only where the stamp differs from the one recorded, since a write
+    /// changes the time the system keeps of the last change to the file's own record, which no
+    /// process of the account can set back.
+    fn look_at_placed(&self, relative: &Path) -> Result<Placed, String> {
+        let said = |why: &dyn std::fmt::Display| {
+            format!(
+                "the run's copy of {} cannot be looked at as the file that was placed: {why}",
+                relative.display()
+            )
+        };
+        let file = open_file_below(&self.root, &self.pin, relative)
+            .map_err(|why| said(&why))?
+            .ok_or_else(|| said(&"it is not there"))?;
+        let stat = rustix::fs::fstat(&file).map_err(|why| said(&why))?;
+        let stamp = Stamp {
+            device: i128::from(stat.st_dev),
+            inode: i128::from(stat.st_ino),
+            size: i128::from(stat.st_size),
+            modified: (i128::from(stat.st_mtime), i128::from(stat.st_mtime_nsec)),
+            changed: (i128::from(stat.st_ctime), i128::from(stat.st_ctime_nsec)),
+        };
+        let known = self
+            .placed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|(path, _)| path == relative)
+            .map(|(_, placed)| placed.clone());
+        if let Some(known) = known
+            && known.stamp == stamp
+        {
+            return Ok(known);
+        }
+        if stat.st_size > PLACED_AT_MOST {
+            return Err(said(&"it is larger than a program the run places"));
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::fs::File::from(file), &mut bytes)
+            .map_err(|why| said(&why))?;
+        Ok(Placed {
+            stamp,
+            digest: kr_cbor::sha256(&bytes),
+        })
     }
 
     /// Places another program this build made at `destination`, for a leg that needs it beside the
@@ -991,6 +1132,35 @@ fn open_file_below_by(
     relative: &Path,
     before_look: &mut dyn FnMut(&[u8]),
 ) -> Result<Option<std::os::fd::OwnedFd>, Refusal> {
+    Ok(walk_below(root, pin, relative, before_look, false)?.and_then(|(file, _)| file))
+}
+
+/// The device and inode of the socket `relative` below the run's directory `root`, found by the
+/// same walk as [`open_file_below`] makes (each directory on the way opened through its parent's
+/// handle with no link followed, on the run's file system, beneath the pinned place) and looked at
+/// with no link followed: a link, or anything but a socket, is a [`Refusal`]; `Ok(None)` is a path
+/// that is not there. Nothing is opened, since a socket is not opened but connected to.
+///
+/// # Errors
+///
+/// Returns why the path is not a socket of the run.
+pub fn socket_below(
+    root: &Path,
+    pin: &RootPin,
+    relative: &Path,
+) -> Result<Option<(i128, i128)>, Refusal> {
+    Ok(walk_below(root, pin, relative, &mut |_| {}, true)?.map(|(_, identity)| identity))
+}
+
+/// The walk of [`open_file_below`] and [`socket_below`]: the file opened (a regular file with one
+/// name; none for a socket) and its device and inode.
+fn walk_below(
+    root: &Path,
+    pin: &RootPin,
+    relative: &Path,
+    before_look: &mut dyn FnMut(&[u8]),
+    socket: bool,
+) -> Result<Option<(Option<std::os::fd::OwnedFd>, (i128, i128))>, Refusal> {
     use rustix::fs::{FileType, Mode, OFlags};
     let mut directory = open_directory(root).map_err(|error| match error {
         rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => Refusal::RootChanged,
@@ -1048,6 +1218,16 @@ fn open_file_below_by(
     let Some(looked) = look_below(&directory, last.as_c_str(), device)? else {
         return Ok(None);
     };
+    if socket {
+        return match FileType::from_raw_mode(looked.st_mode) {
+            FileType::Socket => Ok(Some((
+                None,
+                (i128::from(looked.st_dev), i128::from(looked.st_ino)),
+            ))),
+            FileType::Symlink => Err(Refusal::Link),
+            _ => Err(Refusal::NotAFile),
+        };
+    }
     match FileType::from_raw_mode(looked.st_mode) {
         FileType::RegularFile => {}
         FileType::Symlink => return Err(Refusal::Link),
@@ -1077,7 +1257,10 @@ fn open_file_below_by(
     if !pin.contains(&file) {
         return Err(Refusal::Moved);
     }
-    Ok(Some(file))
+    Ok(Some((
+        Some(file),
+        (i128::from(opened.st_dev), i128::from(opened.st_ino)),
+    )))
 }
 
 /// How much of the end of a file [`read_tail_below`] reads at most.
