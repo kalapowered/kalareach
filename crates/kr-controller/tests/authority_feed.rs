@@ -24,13 +24,14 @@ use kr_client::services::{HttpDeadlines, HttpService, ServiceHttp, managed_respo
 use kr_controller::authority_feed::FeedRuntime;
 use kr_controller::grants::restored::{self, Found};
 use kr_controller::service::Clocks;
+use kr_controller::service::net::DEVICE_LIVE_CONNECTIONS;
 use kr_controller::testing::HeldTimer;
 use kr_crypto::keys::{AuthorisationKeyPair, DeviceKeys};
 use kr_crypto::sign::{SigningTranscript, sign};
 use kr_protocol::attention::{AttentionReadParams, AttentionReadResult, AttentionRule};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::hostinfo::{DoctorStatus, HostDoctorResult};
-use kr_protocol::ids::{AuthorityRevision, DeviceId, RevocationRequestId};
+use kr_protocol::ids::{AuthorityRevision, DeviceId, RequestId, RevocationRequestId};
 use kr_protocol::method::Method;
 use kr_protocol::organisation::{HostPolicyConfirmParams, HostPolicyConfirmResult};
 use kr_protocol::pairing::{
@@ -44,7 +45,7 @@ use kr_protocol::scalars::{
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use kr_protocol::sharing::{DeviceListParams, DeviceListResult, OfflineValidityPolicy};
 use kr_service_stand_in::{Moment, Served, serve};
-use net_support::{Device, Host, MovedWall, connect, pair_with, paired_dial, proposal};
+use net_support::{Device, Host, MovedWall, RawDevice, connect, pair_with, paired_dial, proposal};
 
 const AUTHORITY: &str = "/api/authority/sync";
 
@@ -7916,4 +7917,137 @@ async fn when_a_withdrawal_the_host_cannot_verify_names_every_owner_device_the_r
     rig.serves(&new_owner.0, &new_owner.1)
         .await
         .expect("nothing the withdrawal names is live, so no refusal rises");
+}
+
+/// Parameters of a method that takes none.
+#[derive(serde::Serialize)]
+struct NoParams {}
+
+/// Connects the paired device to the host once more, trying again until the admission bucket gives
+/// the host a place for it.
+async fn connected_again(
+    rig: &Rig,
+    device: &Device,
+    record: &kr_controller::service::net::devices::DeviceRecord,
+) -> RawDevice {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match RawDevice::admitted(&rig.host, device, record).await {
+            Ok(raw) => {
+                raw.claim();
+                return raw;
+            }
+            Err(error) if tokio::time::Instant::now() >= deadline => {
+                panic!("the paired device connects: {error:?}");
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+}
+
+/// Whether a connection of a device is served: it answers a read.
+async fn is_served(raw: &RawDevice) -> bool {
+    matches!(
+        raw.try_read(Method::HostInfo, &NoParams {}).await,
+        Some(Ok(_))
+    )
+}
+
+/// Waits until `condition` holds, polling it.
+async fn until_it_holds(condition: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the condition came to hold");
+}
+
+/// KR-REQ-23.21: a connection that waits for the feed is counted from the moment it is admitted,
+/// and it ends at once when it is the one the host heard from least recently. With the feed held
+/// and a device at its bound, a new connection waits and one of the device's other connections ends
+/// at the new connection's count; the waiting connection's device sends a request, and the host
+/// dates it during the wait; and when the waiting connection is the least recent, the next
+/// connection above the bound closes it, long before its wait for the feed would have ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_that_waits_for_the_feed_counts_and_is_withdrawn_at_once() {
+    let rig = Rig::start().await;
+    let (phone, record) = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.poll().await;
+    let bound = u32::try_from(DEVICE_LIVE_CONNECTIONS).expect("a small bound");
+    let mut connections = Vec::new();
+    for _ in 0..DEVICE_LIVE_CONNECTIONS {
+        let raw = connected_again(&rig, &phone, &record).await;
+        assert!(
+            is_served(&raw).await,
+            "a connection within the bound is served"
+        );
+        connections.push(raw);
+    }
+    assert_eq!(rig.host.connections_of(&record), bound);
+
+    // The feed holds its next read, and a connection waits for a synchronisation for a minute.
+    rig.runtime()
+        .wait_for_a_synchronisation_at_most(Duration::from_secs(60));
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "read", 1, Moment::Hold);
+    let waiting = connected_again(&rig, &phone, &record).await;
+
+    // It is counted while it waits: one of the connections that were served ends, and the waiting
+    // one is not served yet.
+    until_it_holds(|| rig.host.connections_of(&record) == bound - 1).await;
+    let mut alive = Vec::new();
+    for raw in &connections {
+        if is_served(raw).await {
+            alive.push(raw);
+        }
+    }
+    assert_eq!(
+        alive.len(),
+        connections.len() - 1,
+        "exactly one connection ended"
+    );
+
+    // Its device sends a request, which the host does not read, and the host dates what its
+    // transport received while it waits, not at the next connection.
+    let counted = rig.host.heard_from_of(&record);
+    assert_eq!(
+        counted.len(),
+        DEVICE_LIVE_CONNECTIONS,
+        "the waiting connection is counted"
+    );
+    let before = counted[DEVICE_LIVE_CONNECTIONS - 1];
+    let _ = tokio::time::timeout(
+        Duration::from_millis(200),
+        waiting.try_read(Method::HostInfo, &NoParams {}),
+    )
+    .await;
+    until_it_holds(|| rig.host.heard_from_of(&record)[DEVICE_LIVE_CONNECTIONS - 1] > before).await;
+
+    // The waiting connection is the one heard from least recently: the others answer after it was
+    // last heard from. The next connection above the bound closes it at once.
+    rig.host.silence_connections_of(
+        &record,
+        DEVICE_LIVE_CONNECTIONS - 1..DEVICE_LIVE_CONNECTIONS,
+    );
+    for raw in &alive {
+        assert!(is_served(raw).await, "the others answer");
+    }
+    let second = connected_again(&rig, &phone, &record).await;
+    assert_eq!(
+        waiting
+            .answered_before_closing(RequestId::new(u64::MAX), Duration::from_secs(20))
+            .await,
+        Some(false),
+        "the waiting connection ends at once, not when its wait for the feed ends"
+    );
+
+    // The feed answers: the connection that waited last is served, and no other was withdrawn.
+    rig.served.web().release_held();
+    assert!(is_served(&second).await, "the newest connection is served");
+    for raw in &alive {
+        assert!(is_served(raw).await, "no other connection was withdrawn");
+    }
 }
