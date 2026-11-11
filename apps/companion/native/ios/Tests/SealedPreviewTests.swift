@@ -155,6 +155,68 @@ final class SealedPreviewTests: XCTestCase {
         }
     }
 
+    /// The keys the golden names, kept as the keychain keeps them: asked for by identifier, and
+    /// gone once the application has cleared them. It records what was asked for.
+    private final class ClearableKeys: PreviewKeyReading {
+        private let lock = NSLock()
+        private let golden: Golden
+        private var held = true
+        private var asked: [String] = []
+
+        init(_ golden: Golden) { self.golden = golden }
+
+        func clear() {
+            lock.lock()
+            held = false
+            lock.unlock()
+        }
+
+        var requests: [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            return asked
+        }
+
+        func recipientSeed(forRecipient recipientKeyID: Data) throws -> Data {
+            lock.lock()
+            defer { lock.unlock() }
+            asked.append("recipient " + recipientKeyID.base64EncodedString())
+            guard held, recipientKeyID == golden.recipientKeyID else { throw PreviewKeyUnavailable.notProvisioned }
+            return golden.recipientSeed
+        }
+
+        func senderKey(forSender senderKeyID: Data) throws -> Data {
+            lock.lock()
+            defer { lock.unlock() }
+            asked.append("sender " + senderKeyID.base64EncodedString())
+            guard held, senderKeyID == golden.senderKeyID else { throw PreviewKeyUnavailable.notProvisioned }
+            return golden.senderKey
+        }
+    }
+
+    /// The real opener, counting the seeds the extension hands it.
+    private final class CountingOpener: PreviewOpening {
+        private let lock = NSLock()
+        private var given: [Data] = []
+
+        var seeds: [Data] {
+            lock.lock()
+            defer { lock.unlock() }
+            return given
+        }
+
+        func open(preview: String, alert: String, seed: Data, senderKey: Data, nowMilliseconds: UInt64)
+            -> PreviewOpened
+        {
+            lock.lock()
+            given.append(seed)
+            lock.unlock()
+            return RustPreviewOpener().open(
+                preview: preview, alert: alert, seed: seed, senderKey: senderKey,
+                nowMilliseconds: nowMilliseconds)
+        }
+    }
+
     /// The real opener, held at the start of its work until the test lets it go.
     private final class HeldOpener: PreviewOpening {
         let opening = DispatchSemaphore(value: 0)
@@ -310,5 +372,43 @@ final class SealedPreviewTests: XCTestCase {
 
     func testTheExtensionLeavesTheGenericAlertForAHostItHoldsNoKeyFor() throws {
         XCTAssertEqual(try shown(holdingTheSender: false), try golden().alert)
+    }
+
+    /// KR-REQ-13.24: the notification extension, which the system starts with no application and no
+    /// page running, asks the key store for the two keys the sealed preview names and no others,
+    /// opens the preview with them and shows it. Once the application has cleared the keys, as
+    /// turning previews off or signing out does, an extension started afresh finds none, hands the
+    /// library no seed and leaves the generic alert. Not shown here: the keychain itself, which a
+    /// bundle with no host application has no entitlement to reach; the device probes read it on a
+    /// phone.
+    func testTheExtensionReadsOnlyTheKeysThePreviewNamesUsesThemAndFindsNoneOnceTheyAreCleared() throws {
+        let sealed = try golden()
+        let earlier = NotificationService.parts
+        defer { NotificationService.parts = earlier }
+        let keys = ClearableKeys(sealed)
+        let opener = CountingOpener()
+        NotificationService.parts = ExtensionParts(
+            keys: keys, opener: opener, nowMilliseconds: { sealed.nowMilliseconds })
+
+        let first = HandedBack()
+        NotificationService().didReceive(request(for: sealed)) { first.add($0.body) }
+        XCTAssertEqual(first.bodies, [sealed.summary])
+        XCTAssertEqual(
+            Set(keys.requests),
+            [
+                "recipient " + sealed.recipientKeyID.base64EncodedString(),
+                "sender " + sealed.senderKeyID.base64EncodedString(),
+            ],
+            "no key but the two the preview names was asked for")
+        XCTAssertFalse(opener.seeds.isEmpty, "the preview was opened with the seed read")
+        XCTAssertTrue(opener.seeds.allSatisfy { $0 == sealed.recipientSeed })
+        let opened = opener.seeds.count
+
+        // The application clears the keys, and the system starts the extension again.
+        keys.clear()
+        let second = HandedBack()
+        NotificationService().didReceive(request(for: sealed)) { second.add($0.body) }
+        XCTAssertEqual(second.bodies, [sealed.alert])
+        XCTAssertEqual(opener.seeds.count, opened, "a cleared store hands the library nothing")
     }
 }
