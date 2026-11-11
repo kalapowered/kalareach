@@ -16,6 +16,8 @@
 //! | [`manifest`] | The record of what the installation laid down, and the record of what was there before |
 //! | [`events`] | What the platform's application-control log says about a program it refused |
 //! | [`frame`] | The broker's pipe protocol: framed messages with limits, and the requests and answers |
+//! | [`env`] | The environment of every child, built from a fixed table and nothing of the caller's |
+//! | [`quote`] | A child's command line, quoted so that the platform's own splitting gives back its parts |
 //! | [`state`] | What the doctor says in each state of the installation |
 //!
 //! The calls that touch the machine live in `win`, which builds on Windows only. Everything above
@@ -29,11 +31,13 @@
 //! start a program they were not given. An administrator can change the rules; the boundary guards
 //! against a hostile repository and a misbehaving Git, not against an administrator.
 
+pub mod env;
 pub mod events;
 pub mod frame;
 pub mod manifest;
 pub mod notice;
 pub mod policy;
+pub mod quote;
 pub mod state;
 
 #[cfg(windows)]
