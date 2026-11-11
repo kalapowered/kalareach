@@ -31,7 +31,7 @@ use crate::transfer::DEVICE_OPEN_DRAFTS;
 /// How long a case waits for a copy to reach the place it is stopped at.
 const WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
 
-fn create_params(
+pub(super) fn create_params(
     world: &fake::Silent,
     session: Option<SessionId>,
     label: Option<DeviceId>,
@@ -47,7 +47,7 @@ fn create_params(
 }
 
 /// A write of `method` on `connection` that names `session`, or the whole environment.
-fn write_naming(
+pub(super) fn write_naming(
     world: &fake::Silent,
     connection: &super::RemoteConnection,
     method: Method,
@@ -126,7 +126,7 @@ fn a_draft_of(
 }
 
 /// The result an answer carries.
-fn result_of<T: kr_protocol::wire::WireMessage>(answer: &ControlFrame) -> T {
+pub(super) fn result_of<T: kr_protocol::wire::WireMessage>(answer: &ControlFrame) -> T {
     let ControlFrame::Response(kr_protocol::envelope::Response {
         outcome: Outcome::Ok(value),
         ..
@@ -146,7 +146,7 @@ fn update_of(draft_id: DraftId, expected_revision: DraftRevision, text: &str) ->
 }
 
 /// One draft for `actor` that nothing bounds, made in the service directly.
-fn a_draft_for(
+pub(super) fn a_draft_for(
     world: &fake::Silent,
     actor: &ActorId,
     session: Option<SessionId>,
@@ -165,7 +165,7 @@ fn a_draft_for(
         .draft
 }
 
-fn the_owner() -> ActorId {
+pub(super) fn the_owner() -> ActorId {
     ActorId::new("local:test").expect("a principal")
 }
 
