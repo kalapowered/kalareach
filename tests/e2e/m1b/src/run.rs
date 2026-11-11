@@ -77,7 +77,8 @@ impl Run {
     ///
     /// Panics when a binary this build should have produced is missing. `scripts/e2e-m1b.sh`
     /// builds them before it runs a leg; a leg that skipped instead would report a pass for a path
-    /// it never ran.
+    /// it never ran. It also panics when the directory cannot be made or a binary cannot be placed
+    /// in it, and the directory it made, which holds nothing but copied binaries, is removed first.
     #[must_use]
     pub fn start(leg: &str) -> Self {
         let built = built_directory();
@@ -100,14 +101,14 @@ impl Run {
         } else {
             std::env::temp_dir()
         };
-        let root = base.join(format!("krm-{}", &suffix[..8]));
-        kr_ipc::paths::create_private_tree(&root, &root)
+        let made = base.join(format!("krm-{}", &suffix[..8]));
+        kr_ipc::paths::create_private_tree(&made, &made)
             .expect("an owner-only directory for this run on the internal disk");
-        let root = std::fs::canonicalize(&root).expect("the run's directory resolves");
-        for directory in ["b", "h", "w"] {
-            kr_ipc::paths::create_private_tree(&root, &root.join(directory))
-                .expect("an owner-only directory inside the run's own");
-        }
+        let root = std::fs::canonicalize(&made).unwrap_or_else(|error| {
+            // Nothing is in the directory yet.
+            let _ = std::fs::remove_dir_all(&made);
+            panic!("the run's directory resolves: {error}")
+        });
         let run = Self {
             leg: leg.to_owned(),
             root,
@@ -116,14 +117,26 @@ impl Run {
             undiscovered: Mutex::new(Vec::new()),
             passed: Mutex::new(false),
         };
-        for name in BINARIES {
-            // Run once here, where nothing is timed: the operating system checks a newly written
-            // executable the first time it starts, and that can take seconds.
-            kr_ipc::testing::place_and_start_once(
-                &built.join(name),
-                &run.binary(name),
-                &["--version"],
-            );
+        // A start that fails here has started nothing and holds nothing but the binaries copied so
+        // far, so its directory goes with it and is not kept as a failed leg's is.
+        let placed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for directory in ["b", "h", "w"] {
+                kr_ipc::paths::create_private_tree(&run.root, &run.root.join(directory))
+                    .expect("an owner-only directory inside the run's own");
+            }
+            for name in BINARIES {
+                // Run once here, where nothing is timed: the operating system checks a newly
+                // written executable the first time it starts, and that can take seconds.
+                kr_ipc::testing::place_and_start_once(
+                    &built.join(name),
+                    &run.binary(name),
+                    &["--version"],
+                );
+            }
+        }));
+        if let Err(panic) = placed {
+            let _ = run.closing_check();
+            std::panic::resume_unwind(panic);
         }
         println!("the {leg} leg runs in {}", run.root.display());
         run
