@@ -65,6 +65,11 @@ fn started() -> Row {
     }
 }
 
+/// The grant's completion for an invocation that granted nothing: a process may start after it.
+fn grant_done() -> Row {
+    Row::GrantComplete { count: 0 }
+}
+
 fn uncertain() -> Row {
     Row::EndUncertain {
         reason: "the session is still there".to_owned(),
@@ -297,6 +302,7 @@ fn every_row_that_comes_out_of_order_is_refused() {
             "a second primary process",
             vec![
                 begin(),
+                grant_done(),
                 Row::ProcessStarted {
                     pid: 1,
                     creation_time: 2,
@@ -326,7 +332,7 @@ fn every_row_that_comes_out_of_order_is_refused() {
         ),
         (
             "a release begun while a process that started has no proved end",
-            vec![begin(), started()],
+            vec![begin(), grant_done(), started()],
             release_intent(1),
         ),
         (
@@ -336,7 +342,7 @@ fn every_row_that_comes_out_of_order_is_refused() {
         ),
         (
             "a release verified while a process that started has no proved end",
-            vec![begin(), started()],
+            vec![begin(), grant_done(), started()],
             verified.clone(),
         ),
         (
@@ -451,10 +457,11 @@ fn a_proved_end_is_required_after_a_process_started_or_an_uncertain_end_and_then
     ]);
     assert_eq!(tracker.standing(), Standing::Finished);
     // After an uncertain end that a later try proved, the release is journalled.
-    let tracker = tracker_after(&[begin(), started(), uncertain()]);
+    let tracker = tracker_after(&[begin(), grant_done(), started(), uncertain()]);
     assert_eq!(tracker.standing(), Standing::Uncertain);
     let tracker = tracker_after(&[
         begin(),
+        grant_done(),
         started(),
         uncertain(),
         uncertain(),
@@ -489,6 +496,300 @@ fn a_release_that_begins_after_the_verification_voids_it() {
     assert!(tracker.apply(&Row::End { root_leftovers: 0 }).is_err());
     tracker.apply(&verified).unwrap();
     tracker.apply(&Row::End { root_leftovers: 0 }).unwrap();
+}
+
+fn grant(n: u64) -> Row {
+    Row::Grant {
+        key: key(n),
+        path: format!(r"C:\work\tree\f{n}"),
+        kind: kr_boundary_windows::journal::rows::ObjectKind::File,
+        owner: "S-1-5-21-1-2-3-1000".to_owned(),
+        dacl_bytes: vec![1, 2, 3, 4],
+        control_flags: 0,
+        protected: false,
+        link_count: 1,
+        added_ace: "A;;FA;;;S-1-9-1-2-3-4".to_owned(),
+    }
+}
+
+fn verified(objects: u64) -> Row {
+    Row::ReleaseVerified {
+        objects,
+        leftovers: 0,
+    }
+}
+
+fn tree_leftover(object: &str) -> Row {
+    Row::Leftover {
+        object: object.to_owned(),
+        reason: "in use".to_owned(),
+        class: LeftoverClass::Tree,
+        snapshot: None,
+    }
+}
+
+#[test]
+fn after_a_verification_no_grant_no_process_and_no_root_begins() {
+    let intent = Row::RootIntent { name: root_name(1) };
+    let made = Row::RootMade {
+        name: root_name(1),
+        key: key(9),
+    };
+    let cases: Vec<(&str, Vec<Row>, Row)> = vec![
+        ("a grant", vec![begin(), verified(0)], grant(1)),
+        (
+            "a grant after a release began that voided the verification",
+            vec![begin(), verified(0), release_intent(1)],
+            grant(2),
+        ),
+        (
+            "a grant after the verification was voided and written again",
+            vec![
+                begin(),
+                verified(0),
+                release_intent(1),
+                released(1),
+                verified(0),
+            ],
+            grant(2),
+        ),
+        (
+            "the grant's completion",
+            vec![begin(), verified(0)],
+            grant_done(),
+        ),
+        (
+            "a process",
+            vec![begin(), grant_done(), verified(0)],
+            started(),
+        ),
+        (
+            "a root's intent",
+            vec![begin(), verified(0)],
+            intent.clone(),
+        ),
+        ("a root made", vec![begin(), intent, verified(0)], made),
+    ];
+    for (what, rows, row) in cases {
+        assert!(
+            refused_after(&rows, &row),
+            "{what} after a verification is refused"
+        );
+    }
+    // The reviewers' first sequence ends in a finished invocation with a granted key nobody
+    // releases; here it stops at the grant.
+    let mut tracker = Tracker::new();
+    for row in [begin(), verified(0)] {
+        tracker.apply(&row).unwrap();
+    }
+    assert!(tracker.apply(&grant(1)).is_err());
+    assert!(tracker.apply(&Row::End { root_leftovers: 0 }).is_ok());
+}
+
+#[test]
+fn a_verification_is_refused_while_a_granted_key_has_neither_its_release_nor_a_tree_leftover() {
+    let granted = |count: u64| {
+        let mut rows = vec![begin()];
+        rows.extend((1..=count).map(grant));
+        rows.push(Row::GrantComplete { count });
+        rows
+    };
+    // The second sequence: granted, started, ended, verified, and no row for the key.
+    let mut rows = granted(1);
+    rows.extend([started(), Row::JobEnded]);
+    assert!(
+        refused_after(&rows, &verified(0)),
+        "the key was never released"
+    );
+    // One released and one not.
+    let mut rows = granted(2);
+    rows.extend([release_intent(1), released(1)]);
+    assert!(
+        refused_after(&rows, &verified(1)),
+        "the second key was never released"
+    );
+    // The release of each key is the way through.
+    let mut rows = granted(2);
+    rows.extend([
+        release_intent(1),
+        released(1),
+        release_intent(2),
+        released(2),
+    ]);
+    let tracker = tracker_after(
+        &[
+            rows.clone(),
+            vec![verified(2), Row::End { root_leftovers: 0 }],
+        ]
+        .concat(),
+    );
+    assert_eq!(tracker.standing(), Standing::Finished);
+    // So is a leftover of the tree that names the key by its text or by its path, once cleared (an
+    // open one refuses the verification by itself).
+    for object in [key(1).to_string(), grant_path(1)] {
+        let mut rows = granted(1);
+        rows.push(tree_leftover(&object));
+        assert!(
+            refused_after(&rows, &verified(0)),
+            "an open leftover refuses it"
+        );
+        rows.push(Row::LeftoverCleared { key: object });
+        tracker_after(&[rows, vec![verified(0)]].concat());
+    }
+    // A leftover that names another object does not cover the key.
+    let mut rows = granted(1);
+    rows.extend([
+        tree_leftover("somewhere else"),
+        Row::LeftoverCleared {
+            key: "somewhere else".to_owned(),
+        },
+    ]);
+    assert!(refused_after(&rows, &verified(0)));
+    // A leftover of the private root is not a leftover of the tree.
+    let mut rows = granted(1);
+    rows.push(Row::Leftover {
+        object: key(1).to_string(),
+        reason: "in use".to_owned(),
+        class: LeftoverClass::Root,
+        snapshot: None,
+    });
+    assert!(refused_after(&rows, &verified(0)));
+}
+
+fn grant_path(n: u64) -> String {
+    match grant(n) {
+        Row::Grant { path, .. } => path,
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn a_process_starts_only_after_the_grant_is_complete() {
+    assert!(refused_after(&[begin()], &started()), "no grant at all");
+    assert!(
+        refused_after(&[begin(), grant(1)], &started()),
+        "a grant that is not complete"
+    );
+    tracker_after(&[
+        begin(),
+        grant(1),
+        Row::GrantComplete { count: 1 },
+        started(),
+    ]);
+}
+
+#[test]
+fn a_root_with_its_intent_alone_can_have_its_removal_recorded_and_no_end_leaves_a_root_standing() {
+    let intent = Row::RootIntent { name: root_name(1) };
+    let made = Row::RootMade {
+        name: root_name(1),
+        key: key(9),
+    };
+    let root_leftover = Row::Leftover {
+        object: "tmp/held".to_owned(),
+        reason: "in use".to_owned(),
+        class: LeftoverClass::Root,
+        snapshot: None,
+    };
+    // A recovery that finds the directory absent, or removes it, records the removal.
+    let tracker = tracker_after(&[begin(), intent.clone(), Row::RootRemoved]);
+    assert_eq!(tracker.root(), &RootState::Removed);
+    // An end with the root standing and no leftover that says what is left is refused, whether the
+    // root was made or only begun.
+    assert!(refused_after(
+        &[begin(), intent.clone(), verified(0)],
+        &Row::End { root_leftovers: 0 }
+    ));
+    assert!(refused_after(
+        &[begin(), intent.clone(), made.clone(), verified(0)],
+        &Row::End { root_leftovers: 0 }
+    ));
+    // With the removal recorded, or with a leftover of the root, it comes.
+    tracker_after(&[
+        begin(),
+        intent.clone(),
+        made.clone(),
+        Row::RootRemoved,
+        verified(0),
+        Row::End { root_leftovers: 0 },
+    ]);
+    // The reviewer's sequence: the directory may exist, its removal failed, the invocation ended
+    // carrying the leftover, and a later sweep can still record the removal.
+    let mut tracker = tracker_after(&[
+        begin(),
+        intent,
+        Row::JobEnded,
+        root_leftover,
+        verified(0),
+        Row::End { root_leftovers: 1 },
+    ]);
+    assert_eq!(tracker.standing(), Standing::Finished);
+    tracker
+        .apply(&Row::LeftoverCleared {
+            key: "tmp/held".to_owned(),
+        })
+        .unwrap();
+    tracker.apply(&Row::RootRemoved).unwrap();
+    assert_eq!(tracker.root(), &RootState::Removed);
+    assert!(
+        refused_after(&[begin()], &Row::RootRemoved),
+        "a root never begun"
+    );
+}
+
+#[test]
+fn a_grant_that_would_take_the_journal_past_its_bound_is_refused_before_it_is_written() {
+    use kr_boundary_windows::journal::replay::ROWS_APART_FROM_OBJECTS;
+    // For each bound, grant objects until one is refused, then release every granted object the
+    // way the release does, and the whole file is within the bound.
+    let mut stopped_at = Vec::new();
+    for room in (0..60).map(|step| step * 2_000) {
+        let limit = ROWS_APART_FROM_OBJECTS + room;
+        let mut tracker = Tracker::bounded(limit);
+        let mut rows = vec![begin()];
+        tracker.apply(&begin()).unwrap();
+        let mut granted = 0;
+        for n in 1..=50 {
+            match tracker.apply(&grant(n)) {
+                Ok(()) => {
+                    rows.push(grant(n));
+                    granted += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        stopped_at.push(granted);
+        rows.push(Row::GrantComplete { count: granted });
+        tracker.apply(rows.last().unwrap()).unwrap();
+        for n in 1..=granted {
+            for row in [release_intent(n), released(n)] {
+                tracker.apply(&row).unwrap();
+                rows.push(row);
+            }
+        }
+        for row in [verified(granted), Row::End { root_leftovers: 0 }] {
+            tracker.apply(&row).unwrap();
+            rows.push(row);
+        }
+        assert!(
+            file_of(&rows).len() <= limit,
+            "{granted} objects with their release rows fit a bound of {limit} bytes"
+        );
+    }
+    assert!(
+        stopped_at.contains(&0),
+        "a bound too small for any object stops the grant"
+    );
+    assert!(stopped_at.contains(&50), "a roomy bound stops nothing");
+    assert!(
+        stopped_at.windows(2).all(|pair| pair[0] <= pair[1]),
+        "more room never grants fewer objects: {stopped_at:?}"
+    );
+    // A refused grant changed nothing: the same tracker takes a row that fits.
+    let mut tracker = Tracker::bounded(ROWS_APART_FROM_OBJECTS);
+    tracker.apply(&begin()).unwrap();
+    assert!(tracker.apply(&grant(1)).is_err());
+    tracker.apply(&Row::GrantComplete { count: 0 }).unwrap();
 }
 
 #[test]
@@ -938,6 +1239,7 @@ mod native {
         let dir = Dir::new();
         let mut journal = Journal::create(&dir.0, id()).unwrap();
         journal.append(&begin()).unwrap();
+        journal.append(&super::grant_done()).unwrap();
         journal
             .append(&Row::ProcessStarted {
                 pid: 12,
