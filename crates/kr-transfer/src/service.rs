@@ -1939,6 +1939,16 @@ impl TransferService {
         self.locked()?.open_drafts(actor)
     }
 
+    /// Returns the sessions the drafts `actor` holds open target: the places a host that knows of a
+    /// closed session can free by recording its end ([`Self::end_session_insertions`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the sessions cannot be read.
+    pub fn open_draft_sessions(&self, actor: &ActorId) -> Result<BTreeSet<SessionId>> {
+        self.locked()?.open_draft_sessions(actor)
+    }
+
     /// Creates a durable draft.
     ///
     /// `open_limit` is how many open drafts `actor` may hold, `None` for an actor with no bound. A

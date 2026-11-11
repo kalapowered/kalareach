@@ -1108,6 +1108,35 @@ impl Store {
         open_drafts(&self.connection, actor_id)
     }
 
+    /// The sessions the drafts an actor holds open target, which is where an open draft stops
+    /// counting once the session is recorded ended. At most as many as the actor has open drafts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the sessions cannot be read.
+    pub fn open_draft_sessions(
+        &self,
+        actor_id: &ActorId,
+    ) -> Result<std::collections::BTreeSet<SessionId>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT session_id FROM drafts
+                  WHERE actor_id = ?1 AND state <> 'orphaned' AND session_id IS NOT NULL
+                    AND NOT EXISTS (SELECT 1 FROM draft_prompts
+                                     WHERE draft_prompts.draft_id = drafts.draft_id)",
+            )
+            .map_err(TransferError::store)?;
+        let rows = statement
+            .query_map(params![actor_id.as_str()], |row| uuid_column(row, 0))
+            .map_err(TransferError::store)?;
+        let mut sessions = std::collections::BTreeSet::new();
+        for row in rows {
+            sessions.insert(SessionId::new(row.map_err(TransferError::store)?));
+        }
+        Ok(sessions)
+    }
+
     fn count(&self, sql: &str, parameters: impl rusqlite::Params) -> Result<u64> {
         let count: i64 = self
             .connection

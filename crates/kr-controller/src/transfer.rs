@@ -159,8 +159,10 @@ pub struct TransferAdmission {
     /// claimed and may begin nothing.
     settling: bool,
     refusal: std::sync::Mutex<Option<ProtocolError>>,
-    /// Whether the service asked this admission where it begins an effect, which it does only once
-    /// it has found no record of the action.
+    /// Whether the service asked this admission where it begins an effect. A draft write does so
+    /// only once it has found no record of the action, as a draft whose revision an earlier attempt
+    /// moved on is refused, or answered from its record, before it asks. The upload writes ask
+    /// before they have looked for a record.
     reached: AtomicBool,
 }
 
@@ -717,26 +719,48 @@ impl TransferModule {
         }
     }
 
-    /// Writes the end of every session the registry holds as closed, when `actor_id` already holds
-    /// `limit` open drafts or more, before a create is counted against them.
+    /// Writes the end of each session the registry holds as closed among the sessions the drafts
+    /// `actor_id` holds open target, before a create is counted against them.
     ///
     /// A session's closure queues the write that ends its drafts on a task of its own, so a create
     /// that follows closely, or a write that failed and waits for the next sweep or start, would
-    /// count drafts of a session that has ended. Where the bound is about to speak, the registry's
-    /// closures are written first, so a draft stops counting when its session is recorded closed.
-    /// A pass that cannot be written does not stop the create: the service counts what it holds.
-    pub(crate) async fn settle_closures_when_full(
+    /// count drafts of a session that has ended. Every create settles its own principal's sessions
+    /// first, whatever the count is and whatever another create is doing, so a draft stops counting
+    /// when its session is recorded closed and the bound refuses only for drafts that are open. The
+    /// work is bounded by the principal's open drafts, not by the sessions the host has closed. A
+    /// pass that cannot be made does not stop the create: the service counts what it holds.
+    pub(crate) async fn settle_closures_of_open_drafts(
         &self,
         owner: &Arc<Controller>,
         actor_id: &ActorId,
-        limit: u64,
     ) {
         let service = Arc::clone(&self.service);
+        let owner = Arc::clone(owner);
         let actor = actor_id.clone();
-        let full = blocking(move || Ok(service.open_drafts(&actor)? >= limit)).await;
-        if matches!(full, Ok(true)) {
-            let _ = end_the_insertions_of_closed_sessions(owner).await;
-        }
+        let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+            let unreadable =
+                |error: kr_transfer::TransferError| ControllerError::RegistryUnavailable {
+                    detail: error.to_string(),
+                };
+            let targeted = service.open_draft_sessions(&actor).map_err(unreadable)?;
+            if targeted.is_empty() {
+                return Ok(());
+            }
+            let mut closed = std::collections::BTreeSet::new();
+            {
+                let registry = owner.registry_handle().blocking_lock();
+                for session_id in targeted {
+                    if registry.closure(session_id)?.is_some() {
+                        closed.insert(session_id);
+                    }
+                }
+            }
+            service
+                .end_session_insertions(&closed)
+                .map(|_| ())
+                .map_err(unreadable)
+        })
+        .await;
     }
 
     /// Records that a prompt sends a draft to a session, which moves the draft's attachments, and
@@ -1052,7 +1076,8 @@ impl TransferModule {
         let after_the_outer_check = Arc::clone(&self.after_the_outer_check);
         let answer = blocking(move || {
             // A look at the record that cannot read it says a record exists, so what it answers is
-            // a copy whichever way it is told.
+            // a copy whichever way it is told. The other places this work cannot read or write a
+            // record answer the fixed word that the outcome is unknown, which carries no record.
             let looked_at = || {
                 let looked = kept(&service, &actor, action_id, name, digest);
                 if looked
@@ -1233,10 +1258,12 @@ impl TransferModule {
                 None => outcome,
                 // The record is the answer both callers get. The three draft writes record their
                 // own action in the transaction that performs it, and hold the journal's lock from
-                // their own look at the record to that commit, so once the service has reached the
-                // place it begins an effect, a record that an attempt finds is its own. The upload
-                // writes let go of the lock while they verify a file, so another copy can record in
-                // between: any record read for them, and for every other method, is a copy.
+                // the look that decides whether they begin (the record for a create, the draft's
+                // revision for the other two, which an earlier attempt's success has moved on) to
+                // that commit, so once the service has reached the place it begins an effect, a
+                // record that an attempt finds is its own. The upload writes let go of the lock
+                // while they verify a file, so another copy can record in between: any record read
+                // for them, and for every other method, is a copy.
                 Some(retained) => {
                     let performed_here = outcome.is_ok()
                         && admission.reached()

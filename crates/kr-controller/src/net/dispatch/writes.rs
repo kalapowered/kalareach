@@ -159,11 +159,7 @@ impl RemoteConnection {
             if method == Method::DraftCreate {
                 controller
                     .transfer
-                    .settle_closures_when_full(
-                        &controller,
-                        &actor_id,
-                        crate::transfer::DEVICE_OPEN_DRAFTS,
-                    )
+                    .settle_closures_of_open_drafts(&controller, &actor_id)
                     .await;
             }
             let admission =
