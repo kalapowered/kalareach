@@ -623,8 +623,11 @@ end. A registry made
 without deadlines, which is how a client opens its streams, waits for its peer as long as the peer
 takes. That includes the open itself: `StreamRegistry::open` waits for the host's stream credit
 while it holds the bulk slot, then writes the header, and neither step has a deadline, so a client
-puts one bound around the whole of it, the open, the header write and the wait for the host's
-answer.
+puts its own bounds on them: one around the open and the header write, and one around a frame's
+write and the wait for the host's answer to it. `StreamRegistry::revoked()` resolves once the
+control stream has ended, or at once when it already has: the moment every stream of the connection
+is revoked. A client that holds no stream yet waits on it to learn that the connection is gone; it
+registers for the wake before it reads the state, so a revocation between the two is not missed.
 
 ### Stream limits
 

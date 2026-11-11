@@ -409,7 +409,9 @@ that stands idle for less, so a stream held through the wait would be dead when 
 it. A lane that waits holds no stream and none of the connection's four transfer slots: one that
 has carried a chunk finishes its stream before the wait, between two calls, so the host reads a
 clean end, and opens another for the call once it has its window. The failures of an open come
-back from the call that makes it.
+back from the call that makes it. A lane that holds no stream learns that the connection ended from
+`StreamOpener::revoked()`, which resolves when the connection's streams are revoked, and a lane
+that holds one watches its own stream.
 The lane asks the transport whether this device ended the connection, as a sign-out does, before
 each chunk and on every way out of a call or a wait, and stops with the reason the transport
 recorded.

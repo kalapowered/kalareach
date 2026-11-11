@@ -253,8 +253,8 @@ async fn a_paired_device_sends_two_full_chunks_and_a_short_one_and_the_host_publ
 }
 
 /// KR-REQ-23.21: a stream that ends after the first chunk is replaced by a new one for the same
-/// transfer, which the host takes, and only the chunks the host's status lacks are sent on it; the
-/// upload is published.
+/// transfer, which the host takes: two streams carry the upload, the host stages the file once and the
+/// upload is published. Which chunks the new stream carries is the scripted host's case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stream_that_ends_after_the_first_chunk_is_replaced_and_the_host_publishes_the_file() {
     let owner = DeviceKeys::generate().expect("owner keys");

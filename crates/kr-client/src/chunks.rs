@@ -395,18 +395,22 @@ impl ChunkLane {
     /// # Errors
     ///
     /// Returns a refusal, before anything is sent, for a chunk of another transfer;
-    /// [`ClientError::NoActionWindow`] when the host has issued none;
-    /// [`ClientError::ConnectionEnded`] when the connection failed, whether or not the host
-    /// received the chunk; the host's own refusal under its code; and a refusal when the answer
-    /// names another transfer or chunk.
+    /// [`ClientError::NoActionWindow`] when the host has issued none, or the window the lane holds
+    /// was turned down or ran out before another came; [`ClientError::ConnectionEnded`] when the
+    /// connection failed, whether or not the host received the chunk; the host's own refusal under
+    /// its code; and a refusal when the answer names another transfer or chunk.
+    ///
+    /// On a paired host's connection, a transport that records why this device ended the connection
+    /// (a sign-out) has that reason returned as [`ClientError::Host`] in place of whatever the lane
+    /// saw first: the wait for a window, the open and the exchange all end through it.
     ///
     /// A call of a lane on a paired host's connection that has no stream (the first call, and a call
     /// that followed a wait for a window) also opens the lane's stream, once it has its window, and
-    /// returns what the open fails with: a transport failure (a deadline of
-    /// the header kind) when the host gave no credit for the stream or did not take its header
-    /// within thirty seconds, and the bulk-limit refusal when the connection already holds as many
-    /// transfer streams as it allows. The lane has ended then, as it has when any call fails on
-    /// the connection.
+    /// returns what the open fails with: a transport failure (`ControlLost` when the connection's
+    /// streams were revoked, a deadline of the header kind when the host gave no credit for the
+    /// stream or did not take its header within thirty seconds, a stream failure when the host reset
+    /// it), and the bulk-limit refusal when the connection already holds as many transfer streams
+    /// as it allows. The lane has ended then, as it has when any call fails on the connection.
     pub async fn send_chunk(
         &mut self,
         target: &ActionTarget,
@@ -460,8 +464,9 @@ impl ChunkLane {
     ///
     /// Returns [`ClientError::ConnectionEnded`] when the connection failed, the host's own refusal
     /// under its code, and `ATTACHMENT_INTEGRITY` when the answer is not the chunk described. On a
-    /// paired host's connection the first call opens the lane's stream, and returns the failures of
-    /// the open that [`ChunkLane::send_chunk`] names.
+    /// paired host's connection a call that has no stream opens the lane's stream, and returns the
+    /// failures of the open that [`ChunkLane::send_chunk`] names, and the reason this device ended
+    /// the connection, as [`ClientError::Host`], when the transport recorded one.
     pub async fn read_chunk(&mut self, expected: &ChunkDescriptor) -> Result<Bytes> {
         let carrier = &mut self.carrier;
         carrier.usable()?;
@@ -1120,8 +1125,10 @@ impl NetworkCarrier {
     /// # Errors
     ///
     /// Returns [`ClientError::NoActionWindow`] when the host issued a window that admits nothing,
-    /// or the one this lane holds would have expired, or was turned down, before another came, and
-    /// [`ClientError::ConnectionEnded`] when the session's reader stopped while this waited.
+    /// or the one this lane holds would have expired, or was turned down, before another came (the
+    /// lane has ended then), [`ClientError::ConnectionEnded`] when the session's reader stopped
+    /// while this waited, and [`ClientError::Host`] with the reason this device ended the
+    /// connection when the transport recorded one.
     async fn window(&mut self) -> Result<ActionWindow> {
         if matches!(self.stream, LaneStream::Ended) {
             return Err(ClientError::ConnectionEnded);
