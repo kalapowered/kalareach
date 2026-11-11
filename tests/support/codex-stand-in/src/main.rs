@@ -9,6 +9,9 @@
 //!   session of its own, as the pinned release's server does.
 //! * `codex --rewrite-config` appends a line to the configuration file `CODEX_HOME` names, as an
 //!   agent that rewrites its configuration at a start does.
+//! * `codex --move-work` moves the directory it runs in to a place beside the directory that
+//!   holds it and makes an empty directory of the same name in its place, as an agent that moves
+//!   its working directory away at a start does.
 //!
 //! Every frame either side writes or reads is checked against the schemas that release publishes
 //! (see `contract`), so a gateway that makes a frame the pinned release would not write is caught.
@@ -41,6 +44,8 @@ async fn main() {
         // What an agent that rewrites its own configuration at a start does: a line is added to the
         // `config.toml` that `CODEX_HOME` names.
         ["--rewrite-config"] => rewrite_config(),
+        // What an agent that moves its working directory out from under its caller does.
+        ["--move-work"] => move_work(),
         ["app-server", "--listen", "stdio://"] => server::run(variants).await,
         ["--remote", remote, words @ ..] | [words @ .., "--remote", remote]
             if remote.starts_with("unix://") =>
@@ -80,6 +85,28 @@ fn rewrite_config() {
         .expect("the configuration file");
     writeln!(file, "# rewritten by a start of the agent").expect("appends to it");
     println!("codex-cli rewrote its configuration");
+}
+
+/// Moves the directory it runs in to a sibling of the directory that holds it, named after that
+/// directory with `-moved` added, makes an empty directory at the old place, and says so.
+///
+/// # Panics
+///
+/// Panics when the directory has no parent or cannot be moved or made again.
+#[cfg(unix)]
+fn move_work() {
+    let work = std::env::current_dir().expect("the working directory");
+    let holder = work
+        .parent()
+        .expect("a directory that holds the working directory");
+    let mut name = holder
+        .file_name()
+        .expect("a name for the directory that holds it")
+        .to_os_string();
+    name.push("-moved");
+    std::fs::rename(&work, holder.with_file_name(name)).expect("moves the directory away");
+    std::fs::create_dir(&work).expect("makes another directory at the old place");
+    println!("codex-cli moved its working directory");
 }
 
 #[cfg(not(unix))]
