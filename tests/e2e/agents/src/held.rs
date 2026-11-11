@@ -444,6 +444,21 @@ pub fn absent_paths(
         .collect()
 }
 
+/// Whether nothing is at `path`, looked at with no link followed at its last component: "not found"
+/// is absent, any entry (a link that leads nowhere included) is present, and any other answer is an
+/// error, since an absence the system did not show is not one.
+///
+/// # Errors
+///
+/// Returns what the system said when it said anything but "not found".
+pub fn is_absent(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
 /// What stops a driver, as a class and the words that say it.
 pub type Stop = (&'static str, String);
 
@@ -521,7 +536,8 @@ impl RunScan {
                 Removal::Left(why) => Some(why.to_string()),
             },
         };
-        let gone = !root.exists();
+        // No link's target is looked at, and a look the system did not answer is not "gone".
+        let gone = is_absent(root).unwrap_or(false);
         let mut evidence = json!({ "run_gone": gone });
         if let Some(why) = &left {
             evidence["run_left"] = json!(why);
@@ -2693,6 +2709,44 @@ mod tests {
         assert!(again.is_dir(), "the run was left");
         assert_eq!(evidence["run_gone"], json!(false));
         std::fs::remove_dir_all(&again).expect("clean up");
+    }
+
+    /// A run's path that is a link which leads nowhere is not "gone": the removal left it, and the
+    /// answer to whether the run is gone looks at no link's target. The check of an absent name is
+    /// the same: a link there is present, a name that is not there is absent, and an answer that is
+    /// neither is an error.
+    #[test]
+    fn a_link_that_leads_nowhere_is_present_and_an_unlooked_at_name_is_no_absence() {
+        let base = scratch("absent");
+        let link = base.join("run");
+        std::os::unix::fs::symlink(base.join("nowhere"), &link).expect("a link that leads nowhere");
+        assert!(!is_absent(&link).expect("a look"), "a link is an entry");
+        assert!(is_absent(&base.join("not-there")).expect("a look"));
+        std::fs::write(base.join("file"), b"x").expect("a file");
+        assert!(!is_absent(&base.join("file")).expect("a look"));
+        assert!(
+            is_absent(&base.join("file/below")).is_err(),
+            "a name below a file is not shown absent, it is not looked at"
+        );
+        // The run's path is such a link: the scan refuses it, the removal leaves it, and the
+        // evidence does not call the run gone.
+        let (stops, evidence) = RunScan::of(
+            &link,
+            &RunRules::new(&pinned(&base), Vec::new()),
+            &HeldKeys {
+                key: Some(("LOGIN".to_owned(), "login-value-0123456789".to_owned())),
+                others: Vec::new(),
+            },
+        )
+        .finish(&link, "held-test", true);
+        assert_eq!(evidence["run_gone"], json!(false), "{evidence}");
+        assert!(
+            stops
+                .iter()
+                .any(|(class, _)| *class == "key_scan_incomplete"),
+            "{stops:?}"
+        );
+        std::fs::remove_dir_all(&base).expect("clean up");
     }
 
     /// A directory that is not the one the run made, put at the run's path, is not read, scanned or
