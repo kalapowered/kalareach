@@ -598,7 +598,10 @@ impl TransferModule {
     /// Returns [`ControllerError::InvalidArgument`] when the two disagree.
     pub fn check_subject(method: Method, mutation: &MutationRequest) -> Result<()> {
         if mutation.target.application_instance_id.is_present()
-            && !matches!(method, Method::AgentDraftAddAttachment)
+            && !matches!(
+                method,
+                Method::AgentDraftAddAttachment | Method::DraftDiscard
+            )
         {
             return Err(ControllerError::InvalidArgument(format!(
                 "{} does not act on an application instance",
@@ -952,11 +955,12 @@ impl TransferModule {
         let actor = actor_id.clone();
         let stored = blocking(move || match service.stored_subject(&actor, subject) {
             Ok(stored) => Ok(Some(stored)),
-            // A draft that is gone is not refused here when the call is the one that ends it: an
-            // action that ended it is answered from its record by the service, which refuses any
-            // other action as unknown in the words it uses for every draft the caller does not hold.
+            // A draft that is gone is not refused here: a draft can be ended while a copy of an
+            // action that wrote it is on its way, and the service answers an action it performed
+            // from its record, and refuses any other as unknown in the words it uses for every
+            // draft the caller does not hold.
             Err(kr_transfer::TransferError::UnknownDraft { .. })
-                if method == Method::DraftDiscard =>
+                if matches!(subject, Subject::Draft(_)) =>
             {
                 Ok(None)
             }

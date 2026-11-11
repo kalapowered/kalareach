@@ -1108,8 +1108,10 @@ impl Store {
         open_drafts(&self.connection, actor_id)
     }
 
-    /// The sessions the drafts an actor holds open target, which is where an open draft stops
-    /// counting once the session is recorded ended. At most as many as the actor has open drafts.
+    /// The sessions the drafts an actor holds that no prompt has sent and that are not orphaned
+    /// target, which is where an open draft stops counting once the session is recorded ended. At
+    /// most as many as the actor has such drafts; one whose files the agent took is among them,
+    /// though it no longer counts.
     ///
     /// # Errors
     ///
@@ -2538,7 +2540,7 @@ impl Store {
         if sent {
             return Err(TransferError::DraftConflict {
                 detail:
-                    "a prompt sent this draft to a session, so it stays until that session ends"
+                    "a prompt sent this draft to a session, so it is kept as the record of what the session was sent"
                         .to_owned(),
             });
         }
@@ -2553,10 +2555,38 @@ impl Store {
             .map_err(TransferError::store)?;
         if offered {
             return Err(TransferError::DraftConflict {
-                detail: "an attachment of this draft was offered to the agent, so it stays until \
-                         its session ends"
+                detail: "an attachment of this draft was offered to the agent, so it is kept as \
+                         the record of what the agent was offered"
                     .to_owned(),
             });
+        }
+        // A session noted as one whose agent may have been sent a prompt naming a draft without this
+        // host being told has no `draft_prompts` row to show it: a draft that targets one, or holds
+        // an upload of one, may be a sent draft, and is kept until the note is settled.
+        let noted = noted_sessions(&transaction)?;
+        if !noted.is_empty() {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT session_id FROM drafts WHERE draft_id = ?1 AND session_id IS NOT NULL
+                     UNION
+                     SELECT upload.session_id
+                       FROM draft_attachments AS binding
+                       JOIN uploads AS upload ON upload.transfer_id = binding.transfer_id
+                      WHERE binding.draft_id = ?1 AND upload.session_id IS NOT NULL",
+                )
+                .map_err(TransferError::store)?;
+            let sessions = statement
+                .query_map(params![draft], |row| uuid_column(row, 0))
+                .map_err(TransferError::store)?;
+            for session in sessions {
+                if noted.contains(&SessionId::new(session.map_err(TransferError::store)?)) {
+                    return Err(TransferError::DraftConflict {
+                        detail: "a session this host cannot yet say was not sent this draft holds \
+                                 it, so it is kept as the record of what that session was sent"
+                            .to_owned(),
+                    });
+                }
+            }
         }
         transaction
             .execute(
