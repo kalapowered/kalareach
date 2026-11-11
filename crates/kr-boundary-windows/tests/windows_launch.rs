@@ -29,9 +29,7 @@ use windows_sys::Win32::Security::{
     GetAce, GetAclInformation, GetSecurityDescriptorControl, ImpersonateLoggedOnUser,
     OWNER_SECURITY_INFORMATION, RevertToSelf, SECURITY_ATTRIBUTES,
 };
-use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile, WriteFile,
-};
+use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::Diagnostics::Debug::GetErrorMode;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
