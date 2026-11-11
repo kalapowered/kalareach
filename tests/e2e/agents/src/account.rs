@@ -562,16 +562,14 @@ fn scan_directory(
             }
             // A run holds the links the harness itself makes (the one to the installed build and
             // the ones to its runtimes), which nothing is read through; any other link is counted.
-            FileType::Symlink if strict => {
-                if !crate::stage::is_an_installation_link(&shown) {
-                    scan.unread.push(format!(
-                        "{shown}: {}",
-                        not_scanned("a link the harness did not make")
-                    ));
-                }
+            FileType::Symlink if strict && !crate::stage::is_an_installation_link(&shown) => {
+                scan.unread.push(format!(
+                    "{shown}: {}",
+                    not_scanned("a link the harness did not make")
+                ));
             }
-            // A link in a place of the person's own, a socket or a pipe holds no bytes of its own to
-            // search, and nothing is read through it.
+            // The harness's own links, a link in a place of the person's own, a socket or a pipe
+            // hold no bytes of their own to search, and nothing is read through them.
             _ => {}
         }
     }
