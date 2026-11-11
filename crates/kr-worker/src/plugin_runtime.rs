@@ -141,7 +141,7 @@ pub async fn link(request: RuntimeRequest, broker: Weak<Broker>) {
         &broker,
     ))));
     #[cfg(feature = "testing")]
-    link_trace::start_from_environment();
+    link_trace::start_if_asked();
     let mut link = Link {
         request,
         client: None,

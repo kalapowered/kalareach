@@ -7,16 +7,19 @@
 //! ended, each loss with its kind, each wait before the next try, and each report it made to a
 //! binding.
 //!
-//! It exists only where the `testing` feature is on, and then it does nothing unless the worker's
-//! environment holds [`SWITCH`], which only the cases that look into the link set. A worker that
-//! has it on adds the last entries of its record to the reason of each component report it sends,
-//! after [`MARKER`]; the reason before the marker is exactly what the worker sends without it.
+//! It exists only where the `testing` feature is on, and then it does nothing unless a file named
+//! by [`switch_beside`] lies next to the worker's program, which only the cases that look into the
+//! link make. A file is the switch because a service manager decides the environment a worker is
+//! started with, and one of them gives it none of the launch's own variables. A worker that has it
+//! on adds the last entries of its record to the reason of each component report it sends, after
+//! [`MARKER`]; the reason before the marker is exactly what the worker sends without it.
 //!
 //! A record is a ring of [`ENTRIES`] entries in memory and is written nowhere. An entry holds a
 //! time on the monotonic clock, fixed words, counts, the last six digits of a binding's identifier
 //! and a time limit: no error text, no path, no payload and no value of the environment.
 
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -26,8 +29,17 @@ use kr_protocol::ids::BrokerBindingId;
 use kr_protocol::limits::MAX_REPORT_DETAIL_BYTES;
 use kr_protocol::scalars::Nullable;
 
-/// The environment variable that turns the record on in a worker, when it is `1`.
-pub const SWITCH: &str = "KR_PLUGIN_LINK_TRACE";
+/// What is added to a worker's program file name to name the file that turns the record on.
+const SWITCH_SUFFIX: &str = ".link-trace";
+
+/// The file that turns the record on in the worker that runs `program`: a file beside it, named
+/// like it with a suffix. It is asked for by its presence, and what it holds is not read.
+#[must_use]
+pub fn switch_beside(program: &Path) -> PathBuf {
+    let mut name = program.file_name().unwrap_or_default().to_owned();
+    name.push(SWITCH_SUFFIX);
+    program.with_file_name(name)
+}
 
 /// What starts the record's tail in a reason. A reason is text a person reads, and the two
 /// separators in it are control characters no reason holds.
@@ -436,17 +448,18 @@ pub fn tail_of(reason: &str) -> Option<&str> {
     reason.split_once(MARKER).map(|(_, tail)| tail)
 }
 
-/// This worker's record, once the link has found [`SWITCH`] set.
+/// This worker's record, once the link has found the file of [`switch_beside`] beside its program.
 static ON: OnceLock<LinkTrace> = OnceLock::new();
 
-/// Whether an environment's value for [`SWITCH`] asks for the record.
-fn asked(value: Option<&std::ffi::OsStr>) -> bool {
-    value.is_some_and(|value| value == "1")
+/// Whether the file that asks for the record lies beside `program`: a regular file, taken as it
+/// is where it is found and not by a link that leads to one.
+fn asked(program: &Path) -> bool {
+    std::fs::symlink_metadata(switch_beside(program)).is_ok_and(|found| found.file_type().is_file())
 }
 
-/// Starts this worker's record where its environment holds [`SWITCH`].
-pub fn start_from_environment() {
-    if asked(std::env::var_os(SWITCH).as_deref()) {
+/// Starts this worker's record where the file that asks for it lies beside this worker's program.
+pub fn start_if_asked() {
+    if std::env::current_exe().is_ok_and(|program| asked(&program)) {
         let _ = ON.set(LinkTrace::new());
     }
 }
@@ -612,19 +625,46 @@ mod tests {
     }
 
     #[test]
-    fn only_a_value_of_one_asks_for_the_record() {
-        use std::ffi::OsStr;
-        assert!(!asked(None));
-        assert!(!asked(Some(OsStr::new(""))));
-        assert!(!asked(Some(OsStr::new("0"))));
-        assert!(!asked(Some(OsStr::new("true"))));
-        assert!(asked(Some(OsStr::new("1"))));
+    fn only_a_file_beside_the_program_with_its_name_asks_for_the_record() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let program = directory.path().join("kr-worker");
+        assert!(!asked(&program));
+        std::fs::write(directory.path().join("kr-worker-other.link-trace"), "").expect("a file");
+        std::fs::write(directory.path().join("kr-worker.link"), "").expect("a file");
+        assert!(!asked(&program));
+        std::fs::write(switch_beside(&program), "").expect("a file");
+        assert!(asked(&program));
+        assert_eq!(
+            switch_beside(&program)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("kr-worker.link-trace")
+        );
+        // A file of the program's own name in another directory is not beside this one.
+        let elsewhere = tempfile::tempdir().expect("a directory");
+        assert!(!asked(&elsewhere.path().join("kr-worker")));
     }
 
     #[test]
-    fn a_worker_whose_environment_does_not_ask_sends_its_reports_as_they_are() {
-        // This process's environment does not hold the switch, and nothing here sets it.
-        start_from_environment();
+    fn a_directory_or_a_link_in_the_place_of_the_file_does_not_ask_for_the_record() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let program = directory.path().join("kr-worker");
+        std::fs::create_dir(switch_beside(&program)).expect("a directory");
+        assert!(!asked(&program));
+        std::fs::remove_dir(switch_beside(&program)).expect("the directory removed");
+        #[cfg(unix)]
+        {
+            let real = directory.path().join("real");
+            std::fs::write(&real, "").expect("a file");
+            std::os::unix::fs::symlink(&real, switch_beside(&program)).expect("a link");
+            assert!(!asked(&program));
+        }
+    }
+
+    #[test]
+    fn a_worker_with_no_file_beside_its_program_sends_its_reports_as_they_are() {
+        // Nothing beside this test program asks for the record, and nothing here makes it.
+        start_if_asked();
         assert!(ON.get().is_none());
         for original in [None, Some("registering with the plugin runtime")] {
             let sent = report(ComponentState::Pending, original);

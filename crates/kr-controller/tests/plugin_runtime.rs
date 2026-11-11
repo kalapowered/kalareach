@@ -368,13 +368,15 @@ impl Recording {
 impl WorkerSupervisor for Recording {
     fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
         // The worker adds its link's account to the reports it sends only where it is asked to,
-        // and only the cases of this file ask.
-        let mut told = launch.clone();
-        told.desktop_environment.push((
-            kr_worker::plugin_link_trace::SWITCH.to_owned(),
-            "1".to_owned(),
-        ));
-        let outcome = self.inner.start(&told);
+        // and only the cases of this file ask: by a file beside the copy of its program that this
+        // case's tree made, which every service manager leaves where it is.
+        let asked = kr_worker::plugin_link_trace::switch_beside(&launch.program);
+        let outcome = match std::fs::write(&asked, "") {
+            Ok(()) => self.inner.start(launch),
+            Err(error) => LaunchOutcome::NotStarted {
+                detail: format!("the file that asks for the link's account: {error}"),
+            },
+        };
         self.note(Requested::Worker(launch.session_id), &outcome);
         outcome
     }
