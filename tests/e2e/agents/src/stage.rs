@@ -411,17 +411,44 @@ pub fn free_port() -> u16 {
     closed_port()
 }
 
+/// The directory of a run that holds the links to the installed build and to the runtimes it needs.
+const INSTALLATION_DIRECTORY: &str = "agent";
+
+/// The link in [`INSTALLATION_DIRECTORY`] to the installed build.
+const CURRENT_LINK: &str = "current";
+
+/// The directory in [`INSTALLATION_DIRECTORY`] that holds a link to each runtime the build needs.
+const RUNTIME_DIRECTORY: &str = "runtime";
+
+/// Whether `place`, the names of an entry below a run's directory joined by `/`, is a link the
+/// harness makes itself when it installs a build ([`Installation::link`]): the link to the installed
+/// build, or a link directly in the directory of the runtimes. A link in any other place is not.
+#[must_use]
+pub fn is_an_installation_link(place: &str) -> bool {
+    let mut names = place.split('/');
+    match (names.next(), names.next(), names.next(), names.next()) {
+        (Some(INSTALLATION_DIRECTORY), Some(CURRENT_LINK), None, None) => true,
+        (Some(INSTALLATION_DIRECTORY), Some(RUNTIME_DIRECTORY), Some(name), None) => {
+            !name.is_empty()
+        }
+        _ => false,
+    }
+}
+
 /// The directories a session searches, in order: the run's link to the installed build, the run's
 /// links to the runtimes the build needs, and the system's own.
 #[must_use]
 pub fn session_path(run: &Run) -> String {
-    let agent = run.root().join("agent");
-    [agent.join("current").join("bin"), agent.join("runtime")]
-        .iter()
-        .map(|directory| directory.display().to_string())
-        .chain(["/usr/bin".to_owned(), "/bin".to_owned()])
-        .collect::<Vec<_>>()
-        .join(":")
+    let agent = run.root().join(INSTALLATION_DIRECTORY);
+    [
+        agent.join(CURRENT_LINK).join("bin"),
+        agent.join(RUNTIME_DIRECTORY),
+    ]
+    .iter()
+    .map(|directory| directory.display().to_string())
+    .chain(["/usr/bin".to_owned(), "/bin".to_owned()])
+    .collect::<Vec<_>>()
+    .join(":")
 }
 
 /// The directory the session's PATH names first, `agent/current/bin` in the run's directory:
@@ -441,10 +468,10 @@ impl Installation {
     /// Panics when a link cannot be made.
     #[must_use]
     pub fn link(run: &Run, prefix: &Path, runtime: &[PathBuf]) -> Self {
-        let directory = run.root().join("agent");
-        let runtimes = directory.join("runtime");
+        let directory = run.root().join(INSTALLATION_DIRECTORY);
+        let runtimes = directory.join(RUNTIME_DIRECTORY);
         kr_ipc::paths::create_private_tree(run.root(), &runtimes).expect("the installation");
-        let current = directory.join("current");
+        let current = directory.join(CURRENT_LINK);
         std::os::unix::fs::symlink(prefix, &current).expect("links the installed build");
         for executable in runtime {
             let name = executable.file_name().expect("a runtime executable's name");

@@ -444,7 +444,9 @@ pub fn files_holding_any(root: &Path, values: &[&[u8]]) -> KeyScan {
 /// [`files_holding`] for a run's own directory, which holds no file with a second name: a file whose
 /// link count is not one is the same file under another name, possibly one of the person's, and is
 /// told as not scanned (which leaves the scan incomplete) and never read. The root is opened with no
-/// link followed at its last component, as a run's directory is.
+/// link followed at its last component, as a run's directory is; below it the links the harness
+/// makes ([`crate::stage::is_an_installation_link`]) are skipped, and any other link is told as not
+/// scanned.
 ///
 /// # Panics
 ///
@@ -558,8 +560,18 @@ fn scan_directory(
                     scan,
                 );
             }
-            // A link, a socket or a pipe holds no bytes of its own to search, and nothing is read
-            // through it.
+            // A run holds the links the harness itself makes (the one to the installed build and
+            // the ones to its runtimes), which nothing is read through; any other link is counted.
+            FileType::Symlink if strict => {
+                if !crate::stage::is_an_installation_link(&shown) {
+                    scan.unread.push(format!(
+                        "{shown}: {}",
+                        not_scanned("a link the harness did not make")
+                    ));
+                }
+            }
+            // A link in a place of the person's own, a socket or a pipe holds no bytes of its own to
+            // search, and nothing is read through it.
             _ => {}
         }
     }
@@ -701,7 +713,7 @@ fn scan_root(root: &Path, strict: bool, holds: &dyn Fn(&[u8]) -> bool, scan: &mu
 }
 
 /// [`files_holding_any`] and [`run_files_holding_any`]: `strict` refuses a file with more than one
-/// name and a root that is a link.
+/// name, a root that is a link, and a link the harness did not make.
 fn scan_files(root: &Path, values: &[&[u8]], strict: bool) -> KeyScan {
     assert!(
         values.iter().all(|value| value.len() >= 8),
@@ -2036,13 +2048,77 @@ mod tests {
         assert_eq!(lenient.held_by.len(), 2);
         std::fs::remove_file(run.join("a/second-name")).expect("removed");
         // A symbolic link, to a file and to a directory that hold the key, is read through by
-        // nothing, and a link in a run is the harness's own and does not make the scan incomplete.
+        // nothing; a run's scan counts it as a link the harness did not make, and a place of the
+        // person's own, which may hold links, skips it.
         std::os::unix::fs::symlink(elsewhere.join("theirs"), run.join("a/linked-file"))
             .expect("a link");
         std::os::unix::fs::symlink(&elsewhere, run.join("a/linked-directory")).expect("a link");
         let scan = run_files_holding(&run, key);
-        assert!(scan.complete(), "{:?}", scan.unread);
+        assert!(!scan.complete());
+        assert_eq!(
+            scan.unread
+                .iter()
+                .filter(|entry| entry.contains("not scanned: a link the harness did not make"))
+                .count(),
+            2,
+            "{:?}",
+            scan.unread
+        );
         assert_eq!(scan.held_by.len(), 1, "{:?}", scan.held_by);
+        let lenient = files_holding(&run, key);
+        assert!(lenient.complete(), "{:?}", lenient.unread);
+        assert_eq!(lenient.held_by.len(), 1, "{:?}", lenient.held_by);
+    }
+
+    /// The links the harness makes in a run, the one to the installed build and the ones to its
+    /// runtimes, are skipped by name and place; a link anywhere else, or a link named like one of
+    /// them in another place, is counted as a link the harness did not make.
+    #[test]
+    fn a_run_s_scan_skips_the_links_the_harness_makes_and_counts_every_other_link() {
+        let scratch = Scratch::new("scan-links");
+        let run = scratch.0.join("run");
+        let elsewhere = scratch.0.join("elsewhere");
+        std::fs::create_dir_all(run.join("agent/runtime")).expect("a run");
+        std::fs::create_dir_all(run.join("other/agent")).expect("a run");
+        std::fs::create_dir_all(elsewhere.join("build")).expect("outside");
+        let key = b"the-key-value-0123456789";
+        std::fs::write(elsewhere.join("build/theirs"), key).expect("a file that holds the key");
+        std::fs::write(run.join("own"), b"nothing to find here").expect("a clean file");
+        let link = |target: &Path, place: &str| {
+            std::os::unix::fs::symlink(target, run.join(place)).expect("a link");
+        };
+        link(&elsewhere.join("build"), "agent/current");
+        link(&elsewhere.join("build/theirs"), "agent/runtime/node");
+        // What the harness makes: the scan is whole and reads through neither.
+        let scan = run_files_holding(&run, key);
+        assert!(scan.complete(), "{:?}", scan.unread);
+        assert!(scan.held_by.is_empty(), "{:?}", scan.held_by);
+        // Every other link is counted, whatever it points at and whatever it is called.
+        for place in [
+            "agent/other",
+            "agent/current-next",
+            "agent/runtime/inner/deeper",
+            "other/agent/current",
+            "linked",
+        ] {
+            if let Some(parent) = Path::new(place).parent() {
+                std::fs::create_dir_all(run.join(parent)).expect("a directory");
+            }
+            link(&elsewhere.join("build"), place);
+            let scan = run_files_holding(&run, key);
+            assert!(!scan.complete(), "{place}");
+            assert_eq!(
+                scan.unread
+                    .iter()
+                    .filter(|entry| entry.contains("not scanned: a link the harness did not make"))
+                    .count(),
+                1,
+                "{place}: {:?}",
+                scan.unread
+            );
+            assert!(scan.held_by.is_empty(), "{place}: {:?}", scan.held_by);
+            std::fs::remove_file(run.join(place)).expect("removed");
+        }
     }
 
     /// The root of a run's scan is opened as the record's root is, with no link followed at its last
