@@ -38,6 +38,10 @@ pub const RECEIVED_VARIABLE: &str = "KR_STAND_IN_RECEIVED";
 /// `resume <word>` can resume one by either.
 pub const SAVED_VARIABLE: &str = "KR_STAND_IN_SAVED";
 
+/// The program the terminal runs once, before it connects, under the `leave-a-host` variant: what an
+/// agent that rewrites the host's state in the account it runs in does.
+pub const LEAVE_VARIABLE: &str = "KR_STAND_IN_LEAVE";
+
 /// The ways a run can differ from the default.
 #[derive(Clone, Debug, Default)]
 pub struct Variants {
@@ -117,6 +121,9 @@ pub struct Variants {
     /// waits for the file `KR_STAND_IN_RELEASE` names with `.thread` added before it starts a
     /// thread.
     pub hold_before_thread: bool,
+    /// The terminal runs the program `KR_STAND_IN_LEAVE` names once, before it connects, and goes
+    /// on when it has ended.
+    pub leave_a_host: bool,
 }
 
 impl Variants {
@@ -163,10 +170,28 @@ impl Variants {
                 "keep-reading" => variants.keep_reading = true,
                 "die-on-second-turn" => variants.die_on_second_turn = true,
                 "hold-before-thread" => variants.hold_before_thread = true,
+                "leave-a-host" => variants.leave_a_host = true,
                 other => panic!("{VARIABLE} names a variant this program does not have: {other}"),
             }
         }
         variants
+    }
+
+    /// Runs the program `KR_STAND_IN_LEAVE` names, and waits for it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the variable is not set, or the program does not start or does not end well.
+    pub fn leave() {
+        let program = std::env::var(LEAVE_VARIABLE)
+            .unwrap_or_else(|_| panic!("{LEAVE_VARIABLE} names the program the terminal runs"));
+        let status = std::process::Command::new(&program)
+            .status()
+            .unwrap_or_else(|error| panic!("{LEAVE_VARIABLE} {program}: {error}"));
+        assert!(
+            status.success(),
+            "{LEAVE_VARIABLE} {program} ended with {status}"
+        );
     }
 
     /// The command the server starts for a turn, if the environment names one.

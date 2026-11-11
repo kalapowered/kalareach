@@ -375,7 +375,10 @@ pub enum Absent {
 /// `{config}` and `{work}` are the run's configuration and working directories, `{home}` the home
 /// the agent runs with, `{person}` the person's own home, `{user}` the account name the system has
 /// for the person, as `id -un` says it, and `{ancestors}` the working folder and each folder above
-/// it, as given and as the system resolves it.
+/// it, as given and as the system resolved it before the agent started: `resolved_work` is that
+/// resolution, made once by the caller ([`folder_of`]) and kept, since the run's tree can change once
+/// the agent has run, and a link left at the working directory would send a second resolution
+/// outside.
 ///
 /// # Panics
 ///
@@ -386,6 +389,7 @@ pub fn absent_paths(
     run: &Run,
     home: &Path,
     person: &Path,
+    resolved_work: &Path,
     which: Absent,
 ) -> Vec<PathBuf> {
     let home = home.display().to_string();
@@ -405,7 +409,7 @@ pub fn absent_paths(
         });
     let folders: Vec<String> = {
         let mut seen = Vec::new();
-        for start in [run.work(), folder_of(run)] {
+        for start in [run.work(), resolved_work.to_path_buf()] {
             for folder in start.ancestors() {
                 let text = folder.display().to_string();
                 let text = if text == "/" { String::new() } else { text };
@@ -456,6 +460,29 @@ pub fn is_absent(path: &Path) -> std::io::Result<bool> {
         Ok(_) => Ok(false),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(error),
+    }
+}
+
+/// Whether nothing is at `path`, for a path of the run: below the run's directory `root`, which
+/// `pin` names, it is looked at by a walk from the pin that follows no link at any component, so a
+/// link at `w`, `h` or the configuration directory is a class and nothing is looked at through it;
+/// a path outside the run is a fixed place and is looked at as [`is_absent`] does.
+///
+/// # Errors
+///
+/// Returns why the absence was not shown.
+pub fn absent_below(
+    root: &Path,
+    pin: &kr_e2e_m1b::run::RootPin,
+    path: &Path,
+) -> Result<bool, String> {
+    match path.strip_prefix(root) {
+        Ok(relative) if !relative.as_os_str().is_empty() => {
+            kr_e2e_m1b::run::entry_below(root, pin, relative)
+                .map(|present| !present)
+                .map_err(|refusal| refusal.to_string())
+        }
+        _ => is_absent(path).map_err(|error| error.to_string()),
     }
 }
 
@@ -2709,6 +2736,45 @@ mod tests {
         assert!(again.is_dir(), "the run was left");
         assert_eq!(evidence["run_gone"], json!(false));
         std::fs::remove_dir_all(&again).expect("clean up");
+    }
+
+    /// A path below the run is looked at by a walk from the pin that follows no link at any
+    /// component: a link at the working directory, the home or the configuration directory is a
+    /// class and what it names is not looked at; a link at the last name is an entry; a path outside
+    /// the run is looked at as before.
+    #[test]
+    fn a_path_below_the_run_is_looked_at_with_no_link_followed_at_any_component() {
+        let base = scratch("absent-below");
+        let root = base.join("run");
+        for name in ["w", "h", "agent-config"] {
+            std::fs::create_dir_all(root.join(name)).expect("a directory of the run");
+        }
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).expect("a directory outside");
+        std::fs::write(outside.join("AGENTS.md"), b"the person's").expect("a file outside");
+        let pin = pinned(&root);
+        assert!(
+            absent_below(&root, &pin, &root.join("w/AGENTS.md")).expect("a look"),
+            "nothing is there"
+        );
+        std::fs::write(root.join("h/AGENTS.md"), b"x").expect("a file in the run");
+        assert!(!absent_below(&root, &pin, &root.join("h/AGENTS.md")).expect("a look"));
+        for name in ["w", "h", "agent-config"] {
+            std::fs::remove_dir_all(root.join(name)).expect("the directory goes");
+            std::os::unix::fs::symlink(&outside, root.join(name)).expect("a link at the name");
+            let said = absent_below(&root, &pin, &root.join(name).join("AGENTS.md"))
+                .expect_err("a link on the way is not looked through");
+            assert!(said.contains("symbolic link"), "{name}: {said}");
+        }
+        std::os::unix::fs::symlink(base.join("nowhere"), root.join("last"))
+            .expect("a link that leads nowhere");
+        assert!(
+            !absent_below(&root, &pin, &root.join("last")).expect("a look"),
+            "a link at the last name is an entry"
+        );
+        assert!(absent_below(&root, &pin, &base.join("not-there")).expect("a look"));
+        assert!(!absent_below(&root, &pin, &outside.join("AGENTS.md")).expect("a look"));
+        std::fs::remove_dir_all(&base).expect("clean up");
     }
 
     /// A run's path that is a link which leads nowhere is not "gone": the removal left it, and the

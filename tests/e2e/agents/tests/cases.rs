@@ -2106,8 +2106,10 @@ fn staged(
     let root = run.root().to_path_buf();
     let rules = scan_rules(
         &run,
-        &inputs.build.prefix,
         &inputs.build.pinned,
+        std::fs::canonicalize(inputs.build.prefix.join(&inputs.build.pinned))
+            .ok()
+            .as_deref(),
         &inputs.build.runtime,
     );
     // An agent that keeps its conversations in a database: the files the part reads are exported from
@@ -3577,6 +3579,7 @@ fn absent_paths(stage: &Stage<'_, '_>, which: Absent) -> Vec<PathBuf> {
         stage.run,
         &login_home(stage),
         &login.person_home,
+        &folder_of(stage.run),
         which,
     )
 }

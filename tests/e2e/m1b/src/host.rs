@@ -20,7 +20,7 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use kr_ipc::identity::{ProcessQuery, query_process};
@@ -229,6 +229,9 @@ pub struct Host<'r> {
     control: Mutex<Option<Result<(i128, i128), String>>>,
     /// Whether the agent under test has been started ([`Host::agent_starts`]).
     agent_started: AtomicBool,
+    /// The `kr` commands asked for after the agent under test started, each as its arguments: none
+    /// is run, and the record shows that none was asked for either.
+    kr_after_start: Arc<Mutex<Vec<String>>>,
 }
 
 #[derive(Debug)]
@@ -286,6 +289,7 @@ impl<'r> Host<'r> {
             daemon: Mutex::new(None),
             control: Mutex::new(None),
             agent_started: AtomicBool::new(false),
+            kr_after_start: Arc::default(),
         };
         // The port was free when it was chosen, and it is bound when the daemon starts: other legs
         // choose theirs meanwhile, on this machine and on a shared one, and two can choose alike.
@@ -445,6 +449,25 @@ impl<'r> Host<'r> {
     /// is stopped, and dropped, by ending what the run recorded by identity instead.
     pub fn agent_starts(&self) {
         self.agent_started.store(true, Ordering::SeqCst);
+    }
+
+    /// The record of the `kr` commands asked for after the agent under test started, which the
+    /// record outlives the host to show: it holds nothing when none was asked for.
+    #[must_use]
+    pub fn kr_after_the_agent_started(&self) -> Arc<Mutex<Vec<String>>> {
+        Arc::clone(&self.kr_after_start)
+    }
+
+    /// Whether `kr` is asked for after the agent under test started, which it is never given.
+    fn kr_is_refused(&self, arguments: &[&str]) -> bool {
+        let started = self.agent_started.load(Ordering::SeqCst);
+        if started {
+            self.kr_after_start
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(arguments.join(" "));
+        }
+        started
     }
 
     /// The run this host belongs to.
@@ -684,7 +707,7 @@ impl<'r> Host<'r> {
     #[must_use]
     pub fn command(&self, arguments: &[&str]) -> Command {
         assert!(
-            !self.agent_started.load(Ordering::SeqCst),
+            !self.kr_is_refused(arguments),
             "kr {arguments:?} is not run once the agent under test has started"
         );
         let mut command = Command::new(self.run.binary("kr"));
@@ -707,7 +730,7 @@ impl<'r> Host<'r> {
     /// Returns why it was not run or did not finish; it is never run once the agent under test has
     /// started ([`Host::agent_starts`]).
     pub fn kr_within(&self, arguments: &[&str], within: Duration) -> Result<Output, String> {
-        if self.agent_started.load(Ordering::SeqCst) {
+        if self.kr_is_refused(arguments) {
             return Err("the agent under test has started, and no kr is run after it".to_owned());
         }
         self.run.placed_as_it_was(&binary_place(HARNESS_PROGRAM))?;
@@ -1121,6 +1144,7 @@ mod shutdown_tests {
             daemon: Mutex::new(None),
             control: Mutex::new(None),
             agent_started: AtomicBool::new(false),
+            kr_after_start: Arc::default(),
         }
     }
 
@@ -1358,13 +1382,13 @@ mod shutdown_tests {
         accepting: Option<std::thread::JoinHandle<()>>,
         worker: std::process::Child,
         mark: PathBuf,
+        asked: Arc<Mutex<Vec<String>>>,
     }
 
     impl Rewritten {
         fn leave(host: &Host<'_>, mark: &Path) -> Self {
             use std::os::unix::net::UnixListener;
             use std::os::unix::process::CommandExt as _;
-            use std::sync::Arc;
             use std::sync::atomic::AtomicUsize;
             let run = host.run;
             // A process that stands for the daemon: the interrupt ends it well.
@@ -1427,6 +1451,7 @@ mod shutdown_tests {
                 accepting: Some(accepting),
                 worker,
                 mark: mark.to_path_buf(),
+                asked: host.kr_after_the_agent_started(),
             }
         }
 
@@ -1445,6 +1470,13 @@ mod shutdown_tests {
                 "something connected to the socket of the host the identity named"
             );
             assert_eq!(runs(&self.mark), 0, "a kr was run after the agent started");
+            assert!(
+                self.asked
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_empty(),
+                "a kr was asked for after the agent started"
+            );
             let alive: Vec<String> = run
                 .owned()
                 .iter()
@@ -1460,6 +1492,42 @@ mod shutdown_tests {
                 run.owned().iter().map(|o| &o.what).collect::<Vec<_>>()
             );
         }
+    }
+
+    /// Once the agent under test has started, a `kr` that is asked for is not run, and the record
+    /// of what was asked for after the start says it.
+    #[test]
+    fn a_kr_asked_for_after_the_agent_started_is_not_run_and_is_recorded() {
+        let root = scratch("kr-after");
+        let (run, mark) = host_with_a_kr(&root);
+        run.note_placed(Path::new("b/kr"))
+            .expect("the placed kr is recorded");
+        let host = host_over(&run);
+        host.kr_within(&["list"], Duration::from_secs(10))
+            .expect("kr runs before the agent has started");
+        assert_eq!(runs(&mark), 1);
+        assert!(
+            host.kr_after_the_agent_started()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
+        host.agent_starts();
+        let why = host
+            .kr_within(&["list"], Duration::from_secs(10))
+            .expect_err("no kr is run after the agent started");
+        assert!(why.contains("no kr is run after it"), "{why}");
+        assert_eq!(runs(&mark), 1, "the placed kr ran once, before the start");
+        assert_eq!(
+            *host
+                .kr_after_the_agent_started()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            ["list".to_owned()]
+        );
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     /// A `kr` that connects to the socket named in the run's home, as the product's `kr` connects
