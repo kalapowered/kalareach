@@ -356,6 +356,9 @@ fn the_least_set_of_privileges_that_removes_a_root_of_hostile_objects_is_backup_
             "privileges {name}: {} leftover(s), root removed: {gone}",
             leftovers.len()
         );
+        for leftover in &leftovers {
+            println!("    left: {leftover}");
+        }
         if !gone {
             // A root that stays is removed with the full pair so that the folder can be cleaned.
             let guard = privilege::enter().unwrap();
