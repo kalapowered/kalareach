@@ -862,6 +862,99 @@ fn ending_a_draft_the_host_refuses_inside_the_lock_deletes_nothing_and_says_noth
     assert_eq!(kept.code(), ErrorCode::DraftConflict);
 }
 
+/// A draft for the session `draft_params` names whose one attachment the agent took, so the draft
+/// takes no place against a bound.
+fn a_draft_whose_file_the_agent_took(harness: &Harness) -> kr_protocol::transfer::DraftRecord {
+    use kr_protocol::broker::ActionProvenance;
+    use kr_protocol::ids::ActionId;
+    use kr_protocol::insertion::ReportedOutcome;
+
+    let session = SessionId::new(Uuid::from_bytes([9; 16]));
+    let draft = a_draft_holding_an_attachment(harness);
+    let transfer_id = harness
+        .service
+        .draft(&harness.actor, draft.draft_id)
+        .expect("reads the draft")
+        .attachments[0]
+        .handle
+        .transfer_id;
+    let action = ActionId::new(Uuid::from_bytes([3; 16]));
+    harness
+        .claim(session, draft.draft_id, transfer_id, action)
+        .expect("claims the binding for an offer");
+    let begin = harness.begin_of(session, draft.draft_id, transfer_id, action);
+    harness
+        .report(
+            session,
+            &begin,
+            ReportedOutcome::AcceptedByAgent {
+                provenance: ActionProvenance::UpstreamTypedRpc,
+                evidence: "upstream part msg_01H".to_owned(),
+            },
+        )
+        .expect("records the acceptance");
+    harness
+        .service
+        .draft(&harness.actor, draft.draft_id)
+        .expect("reads the draft")
+}
+
+/// KR-REQ-09.09 and KR-REQ-23.41: a binding that brings a draft back into the count of a device at
+/// its bound is refused for its admission when the host's answer is no, wherever it turns to no, and
+/// the bound speaks only to an admission that stands: a device whose authority has gone is not told
+/// how many drafts it holds. The control is the same binding under an admission that stands, which is
+/// refused for the bound under the quota code.
+#[test]
+fn a_binding_at_the_bound_whose_admission_is_gone_is_told_that_and_not_the_count() {
+    for refuses in REFUSALS {
+        let harness = Harness::create();
+        let spent = a_draft_whose_file_the_agent_took(&harness);
+        for _ in 0..2 {
+            harness
+                .service
+                .draft_create(&harness.actor, &draft_params(&harness), None, Some(2))
+                .expect("a place is free");
+        }
+        let handle = harness.publish(&pattern(4096), "image/png", "second.png");
+        let bind = |host: &Arc<Host>| {
+            harness.service.draft_add_attachment(
+                &harness.actor,
+                &AgentDraftAddAttachmentParams {
+                    draft_id: spent.draft_id,
+                    expected_revision: spent.revision,
+                    transfer_id: handle.transfer_id,
+                    contribution: AttachmentContribution {
+                        operation_id: "attach".to_owned(),
+                        accepted_media_types: vec![handle.declared_media_type.clone()],
+                        max_byte_len: U64::new(1024 * 1024),
+                        max_count: U64::new(4),
+                        insertion_method: InsertionMethod::TypedSubmission,
+                        external_destination: Nullable::null(),
+                        model_media_capability: false,
+                    },
+                },
+                Some(&action(
+                    &harness,
+                    "agent.draft.add_attachment",
+                    b"bind",
+                    host,
+                )),
+                Some(2),
+            )
+        };
+        let host = Host::new(refuses);
+        assert_not_admitted(bind(&host), refuses, &host);
+
+        let host = Host::new(Refuses::Never);
+        let refused = bind(&host).expect_err("a device at its bound");
+        assert_eq!(refused.code(), ErrorCode::QuotaExceeded, "{refuses:?}");
+        assert!(
+            host.asked.load(Ordering::SeqCst) > 0,
+            "{refuses:?}: the bound spoke only after the host was asked"
+        );
+    }
+}
+
 /// An answer a call already holds is not a new effect and is not asked about: a repeat of a
 /// completed action is answered from its record whatever the host now says, and the host is not
 /// asked.

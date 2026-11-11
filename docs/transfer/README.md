@@ -225,7 +225,8 @@ filesystem of the directory above it, is still the recorded one.
 ## The journal, and what makes a transfer resumable
 
 `transfers.sqlite` runs in write-ahead-logging mode with full synchronisation and forward-only
-migrations. Every state change commits together with the outbox row that announces it.
+migrations. Every state change commits together with the outbox row that announces it, except the end
+of a draft by `draft.discard`, which the action's own record traces.
 
 | Table | What it holds |
 | --- | --- |
@@ -652,7 +653,9 @@ the draft's own principal may end it: another principal's draft and a draft that
 alike, `INVALID_ARGUMENT`. A draft that a prompt named, or that holds an attachment `inserting`,
 `accepted_by_agent` or `unknown`, is refused `DRAFT_CONFLICT` and nothing is deleted, because those
 records show what the agent was offered or took: such a draft is kept. Attachments
-`recorded` or `failed` go with the draft. The call changes no upload: the bytes, their quota charge,
+`recorded` or `failed` go with the draft: the agent was given nothing from them. Ending a draft
+commits no outbox row; the action's own record and its retained answer are its trace. The call
+changes no upload: the bytes, their quota charge,
 the session an upload was bound to and its expiry stay as they are, and only `upload.cancel` of an
 upload still receiving releases bytes. The same action asked again is answered from its record, and a
 new action for a draft that is gone is refused as unknown, which a caller reads as already ended.

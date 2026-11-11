@@ -1160,6 +1160,8 @@ pub fn table() -> Vec<Store> {
                 name: "transfers",
                 children: &["*"],
             }],
+            // `DraftDiscardResult`, which `actions.result` also keeps, is a known type of this store
+            // (`known`), to be declared here at the store's next raise.
             kept: vec![
                 protocol::<transfer::UploadBeginResult>("UploadBeginResult"),
                 protocol::<transfer::UploadChunkResult>("UploadChunkResult"),

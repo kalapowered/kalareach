@@ -2106,7 +2106,7 @@ impl TransferService {
     /// read grants of its attachments. Nothing an upload owns is touched: its bytes, their charge,
     /// the session it was bound to and its expiry are the upload's. A draft a prompt named, and one
     /// with an attachment the agent was offered or took, are the record of what the agent was given:
-    /// they are refused whole and stay until their session ends.
+    /// they are refused whole and stay in the journal, whether or not their session has ended.
     ///
     /// An action this service already performed is answered from its record before the draft is
     /// looked for, because the draft that action ended is gone and a repeat is owed the answer, not
