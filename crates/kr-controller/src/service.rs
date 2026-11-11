@@ -228,9 +228,16 @@ impl ReadPause {
 /// arrived. They go when the test sets the end it was given to `true` or drops it.
 #[cfg(feature = "testing")]
 #[derive(Debug, Default)]
-struct DeregistrationHold(
-    std::sync::Mutex<Option<(Option<oneshot::Sender<()>>, watch::Receiver<bool>)>>,
-);
+struct DeregistrationHold(std::sync::Mutex<Option<ArmedDeregistrationHold>>);
+
+/// What an armed [`DeregistrationHold`] holds: the end that says a withdrawal has arrived, until one
+/// has, and the end that tells them to go.
+#[cfg(feature = "testing")]
+#[derive(Debug)]
+struct ArmedDeregistrationHold {
+    arrived: Option<oneshot::Sender<()>>,
+    opened: watch::Receiver<bool>,
+}
 
 #[cfg(feature = "testing")]
 impl DeregistrationHold {
@@ -242,7 +249,10 @@ impl DeregistrationHold {
         *self
             .0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((Some(arrived), opened));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ArmedDeregistrationHold {
+            arrived: Some(arrived),
+            opened,
+        });
         (arrival, open)
     }
 
@@ -254,15 +264,13 @@ impl DeregistrationHold {
                 .0
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some((arrived, opened)) = armed.as_mut() else {
+            let Some(hold) = armed.as_mut() else {
                 return;
             };
-            if announce {
-                if let Some(arrived) = arrived.take() {
-                    let _ = arrived.send(());
-                }
+            if announce && let Some(arrived) = hold.arrived.take() {
+                let _ = arrived.send(());
             }
-            opened.clone()
+            hold.opened.clone()
         };
         let _ = opened.wait_for(|open| *open).await;
     }
