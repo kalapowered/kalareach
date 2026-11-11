@@ -1074,6 +1074,8 @@ pub enum Refusal {
     Replaced,
     /// An entry that was opened is no longer beneath the run's directory.
     Moved,
+    /// An entry the run placed is not there.
+    Missing,
     /// The system refused a look or an opening.
     Refused(rustix::io::Errno),
 }
@@ -1099,6 +1101,7 @@ impl std::fmt::Display for Refusal {
                 "an entry was another one when it was opened than when it was looked at",
             ),
             Self::Moved => formatter.write_str("an entry is no longer beneath the run's directory"),
+            Self::Missing => formatter.write_str("an entry the run placed is not there"),
             Self::Refused(error) => {
                 write!(
                     formatter,
@@ -1254,6 +1257,101 @@ fn parent_below(
         last: last.clone(),
         device,
     }))
+}
+
+/// A directory of the run as the run placed it: its device and inode, and where below the run's
+/// directory it was. A program is started in it only through [`PlacedDirectory::place_for_a_start`],
+/// which reaches it by the walk of [`parent_below`] with no link followed and starts nothing where
+/// the directory is not the one that was placed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlacedDirectory {
+    relative: PathBuf,
+    device: i128,
+    inode: i128,
+}
+
+impl PlacedDirectory {
+    /// Records the directory `relative` below the run's directory `root` as it stands now, reached
+    /// by the walk with no link followed.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the path is not a directory of the run.
+    pub fn record(root: &Path, pin: &RootPin, relative: &Path) -> Result<Self, String> {
+        let handle = directory_below(root, pin, relative).map_err(|why| why.to_string())?;
+        let stat = rustix::fs::fstat(&handle).map_err(|error| error.to_string())?;
+        Ok(Self {
+            relative: relative.to_path_buf(),
+            device: i128::from(stat.st_dev),
+            inode: i128::from(stat.st_ino),
+        })
+    }
+
+    /// The place to start a program in: the directory is reached again by the walk from the pin
+    /// that follows no link, and must be the directory that was recorded, by its device and inode
+    /// on the same handle. The place returned is the one that handle has now, which no link names,
+    /// so a link left where the directory was, or another directory in its place, is a refusal and
+    /// the program is not started.
+    ///
+    /// # Errors
+    ///
+    /// Returns what is not as it was placed, as a class and no name outside the run.
+    pub fn place_for_a_start(&self, root: &Path, pin: &RootPin) -> Result<PathBuf, String> {
+        let said = |what: &dyn std::fmt::Display| {
+            format!(
+                "the directory {} is not as the run placed it: {what}",
+                self.relative.display()
+            )
+        };
+        let handle = directory_below(root, pin, &self.relative).map_err(|why| said(&why))?;
+        let stat = rustix::fs::fstat(&handle).map_err(|error| said(&error))?;
+        if (i128::from(stat.st_dev), i128::from(stat.st_ino)) != (self.device, self.inode) {
+            return Err(said(&"it is another directory"));
+        }
+        current_place(&handle).ok_or_else(|| said(&"the system names no place for it"))
+    }
+}
+
+/// Opens the directory `relative` below the run's directory `root` by the walk of [`parent_below`]:
+/// no link is followed at any component, the last included, and the handle is checked to be what was
+/// looked at and to lie beneath the pinned place.
+fn directory_below(
+    root: &Path,
+    pin: &RootPin,
+    relative: &Path,
+) -> Result<std::os::fd::OwnedFd, Refusal> {
+    use rustix::fs::{FileType, Mode, OFlags};
+    let Some(parent) = parent_below(root, pin, relative, &mut |_| {})? else {
+        return Err(Refusal::Missing);
+    };
+    let Some(looked) = look_below(&parent.directory, parent.last.as_c_str(), parent.device)? else {
+        return Err(Refusal::Missing);
+    };
+    match FileType::from_raw_mode(looked.st_mode) {
+        FileType::Directory => {}
+        FileType::Symlink => return Err(Refusal::Link),
+        _ => return Err(Refusal::NotAFile),
+    }
+    let handle = rustix::fs::openat(
+        &parent.directory,
+        parent.last.as_c_str(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| match error {
+        rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR | rustix::io::Errno::NOENT => {
+            Refusal::Replaced
+        }
+        other => Refusal::Refused(other),
+    })?;
+    let opened = rustix::fs::fstat(&handle).map_err(Refusal::Refused)?;
+    if (opened.st_dev, opened.st_ino) != (looked.st_dev, looked.st_ino) {
+        return Err(Refusal::Replaced);
+    }
+    if !pin.contains(&handle) {
+        return Err(Refusal::Moved);
+    }
+    Ok(handle)
 }
 
 /// Whether anything is at `relative` below the run's directory `root`, found by the walk of
