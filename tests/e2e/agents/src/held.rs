@@ -16,11 +16,11 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use kr_e2e_m1b::run::Run;
+use kr_e2e_m1b::run::{Removal, Run, remove_run_directory};
 use serde_json::{Value, json};
 
 use crate::account::{
-    self, KeyScan, now_ms, record_key_scan, run_files_holding, run_files_holding_any,
+    self, KeyScan, RunRules, now_ms, record_key_scan, run_files_holding, run_files_holding_any,
 };
 use crate::build::Account;
 use crate::{confine, keys};
@@ -453,21 +453,29 @@ pub type Stop = (&'static str, String);
 pub struct RunScan {
     key: Option<(String, KeyScan)>,
     others: Option<KeyScan>,
+    pin: kr_e2e_m1b::run::RootPin,
 }
 
 impl RunScan {
-    /// Searches `root` for the login's value and, together, for the other keys' values.
+    /// Searches `root` for the login's value and, together, for the other keys' values, under
+    /// `rules`: the directory the run made, and the links the harness made.
     #[must_use]
-    pub fn of(root: &Path, held: &HeldKeys) -> Self {
-        let key = held
-            .key
-            .as_ref()
-            .map(|(name, value)| (name.clone(), run_files_holding(root, value.as_bytes())));
+    pub fn of(root: &Path, rules: &RunRules, held: &HeldKeys) -> Self {
+        let key = held.key.as_ref().map(|(name, value)| {
+            (
+                name.clone(),
+                run_files_holding(root, rules, value.as_bytes()),
+            )
+        });
         let others = (!held.others.is_empty()).then(|| {
             let values: Vec<&[u8]> = held.others.iter().map(String::as_bytes).collect();
-            run_files_holding_any(root, &values)
+            run_files_holding_any(root, rules, &values)
         });
-        Self { key, others }
+        Self {
+            key,
+            others,
+            pin: rules.pin().clone(),
+        }
     }
 
     /// Whether a key was searched for at all.
@@ -476,8 +484,23 @@ impl RunScan {
         self.key.is_some() || self.others.is_some()
     }
 
-    /// Removes the run's directory, checks it gone, records the search by path and what became of
-    /// the directory, and says what stops the driver: a search that could not read everything, a
+    /// Why the run's directory is to be left where it is, as a class: the search met a volume
+    /// mounted below it, or its root was not the directory the run made.
+    fn left_in_place(&self) -> Option<&'static str> {
+        let scans = || self.key.iter().map(|(_, scan)| scan).chain(&self.others);
+        if scans().any(|scan| scan.root_changed) {
+            Some("the root was not the directory the run made")
+        } else if scans().any(|scan| scan.crossed_a_mount) {
+            Some("an entry below it lies on another file system")
+        } else {
+            None
+        }
+    }
+
+    /// Removes the run's directory (through handles, inside the run: nothing on another file system
+    /// is entered or removed, and a directory the search found a volume below, or whose root was not
+    /// the run's, is left where it is), checks it gone, records the search by path and what became
+    /// of the directory, and says what stops the driver: a search that could not read everything, a
     /// directory still there, a process that may still have been writing during the search, and
     /// another key's value found in a file. The login's own value found in a file is recorded, as
     /// the qualification cases record it, and stops nothing. Call it once the run is dropped, so the
@@ -485,9 +508,22 @@ impl RunScan {
     #[must_use]
     pub fn finish(self, root: &Path, case: &str, writers_ended: bool) -> (Vec<Stop>, Value) {
         let mut stops: Vec<Stop> = Vec::new();
-        let _ = std::fs::remove_dir_all(root);
+        let left = match self.left_in_place() {
+            Some(why) => Some(why.to_owned()),
+            None => match remove_run_directory(root, &self.pin) {
+                Removal::Removed => None,
+                Removal::Left(why) => Some(why.to_string()),
+            },
+        };
         let gone = !root.exists();
         let mut evidence = json!({ "run_gone": gone });
+        if let Some(why) = &left {
+            evidence["run_left"] = json!(why);
+            stops.push((
+                "run_left_in_place",
+                format!("the run's directory was left where it is: {why}"),
+            ));
+        }
         if let Some((name, scan)) = &self.key {
             record_key_scan(case, name, scan, now_ms(), gone);
             evidence["variable"] = json!(name);
@@ -565,6 +601,12 @@ pub(crate) enum Class {
     /// name, so only the device tells it from the run's own. The reading refuses it before anything
     /// on it is opened.
     OtherDevice,
+    /// The path the reading was asked to start from is not the directory the run made: another
+    /// directory, or a mounted volume, is there.
+    RootChanged,
+    /// A directory or file the reading holds open is no longer beneath the run's directory: it was
+    /// moved out of the run, or into a directory that was.
+    Moved,
     /// The system refused a look or a listing.
     Refused(rustix::io::Errno),
     /// The tree is deeper than the walk goes.
@@ -601,6 +643,15 @@ impl std::fmt::Display for Unlooked {
                 formatter,
                 "a directory became another kind of entry while the tree was looked at (after \
                  {seen} entries)"
+            ),
+            Class::RootChanged => write!(
+                formatter,
+                "the run's directory is not the directory the run made (after {seen} entries)"
+            ),
+            Class::Moved => write!(
+                formatter,
+                "an entry is no longer beneath the run's directory, which is refused and read \
+                 through by nothing (after {seen} entries)"
             ),
             Class::OtherDevice => write!(
                 formatter,
@@ -1131,6 +1182,13 @@ fn turn_identifier(value: &Value) -> Option<String> {
     }
 }
 
+/// What a reading of a run's record stays within: the look at the run's directory, whose file system
+/// every entry must lie on, and the directory the run made, beneath which every handle must stay.
+struct Bounds<'a> {
+    root: rustix::fs::Stat,
+    pin: &'a kr_e2e_m1b::run::RootPin,
+}
+
 /// Opens the directory `relative` below `within`, one component at a time, each looked at and opened
 /// with no link followed and checked to be the directory that was looked at, and returns it with the
 /// look at `within`, the file system the record is read on: `None` where a component is not there
@@ -1138,10 +1196,11 @@ fn turn_identifier(value: &Value) -> Option<String> {
 /// another file system than `within`, is a failure of the look, and nothing is read through it.
 /// `within` itself is opened with no link followed at its last component, as the run's directory it
 /// is.
-fn record_directory(
+fn record_directory<'a>(
     within: &Path,
+    pin: &'a kr_e2e_m1b::run::RootPin,
     relative: &Path,
-) -> Result<Option<(std::os::fd::OwnedFd, rustix::fs::Stat)>, Unlooked> {
+) -> Result<Option<(std::os::fd::OwnedFd, Bounds<'a>)>, Unlooked> {
     use rustix::fs::{AtFlags, FileType, Mode, OFlags};
     let unlooked = |class| Unlooked { class, seen: 0 };
     let mut directory = rustix::fs::open(
@@ -1151,6 +1210,11 @@ fn record_directory(
     )
     .map_err(|error| unlooked(opening_failed(error)))?;
     let root = rustix::fs::fstat(&directory).map_err(|error| unlooked(Class::Refused(error)))?;
+    // The run's directory is the one the run made: not a mount point, and not another directory
+    // renamed to its path.
+    if !pin.holds(&directory) {
+        return Err(unlooked(Class::RootChanged));
+    }
     for component in relative.components() {
         let std::path::Component::Normal(name) = component else {
             return Err(unlooked(Class::NotAFile));
@@ -1163,6 +1227,7 @@ fn record_directory(
                 Err(rustix::io::Errno::NOENT) => return Ok(None),
                 Err(error) => return Err(unlooked(Class::Refused(error))),
             };
+        // The check is for mounts only: the system's own volumes share one device number.
         if looked.st_dev != root.st_dev {
             return Err(unlooked(Class::OtherDevice));
         }
@@ -1172,8 +1237,11 @@ fn record_directory(
             _ => return Err(unlooked(Class::NotAFile)),
         }
         directory = opened_directory(&directory, name.as_c_str(), &looked, 0)?;
+        if !pin.contains(&directory) {
+            return Err(unlooked(Class::Moved));
+        }
     }
-    Ok(Some((directory, root)))
+    Ok(Some((directory, Bounds { root, pin })))
 }
 
 /// Reads every file of the directory `directory` and below through handles, handing each file's
@@ -1185,7 +1253,7 @@ fn record_directory(
 /// the look at the record's root, is a failure and nothing is read through it.
 fn read_files(
     directory: &std::os::fd::OwnedFd,
-    root: &rustix::fs::Stat,
+    bounds: &Bounds<'_>,
     relative: &[u8],
     depth: usize,
     seen: &mut usize,
@@ -1232,8 +1300,9 @@ fn read_files(
             })?;
         *seen += 1;
         // A volume attached below the record is no link and its files have one name: only the
-        // device tells it from the run's own.
-        if looked.st_dev != root.st_dev {
+        // device tells it from the run's own (a check for mounts only: the system's own volumes
+        // share one device number).
+        if looked.st_dev != bounds.root.st_dev {
             return Err(unlooked(Class::OtherDevice, seen));
         }
         let mut path = relative.to_vec();
@@ -1245,7 +1314,11 @@ fn read_files(
             FileType::Directory => {
                 between(Moment::Looked, name.to_bytes());
                 let child = opened_directory(directory, name.as_c_str(), &looked, *seen)?;
-                read_files(&child, root, &path, depth + 1, seen, visit, between)?;
+                // A directory moved out of the run since it was looked at is not read.
+                if !bounds.pin.contains(&child) {
+                    return Err(unlooked(Class::Moved, seen));
+                }
+                read_files(&child, bounds, &path, depth + 1, seen, visit, between)?;
             }
             FileType::RegularFile => {
                 // A file with a second name is the same file under another name, whoever made
@@ -1273,6 +1346,10 @@ fn read_files(
                 if opened.st_nlink != 1 {
                     return Err(unlooked(Class::Link, seen));
                 }
+                // A file moved into a directory that was moved out of the run is not the run's.
+                if !bounds.pin.contains(&handle) {
+                    return Err(unlooked(Class::Moved, seen));
+                }
                 let mut bytes = Vec::new();
                 std::fs::File::from(handle)
                     .read_to_end(&mut bytes)
@@ -1296,38 +1373,42 @@ fn read_files(
 /// Reads the agent's own record: every file below `relative` in `within`, the run's directory,
 /// through directory handles with no link followed at any step ([`record_directory`],
 /// [`read_files`]), handing each file's place in the record and its content to `visit`, and returns
-/// how many files were read. A record that is not there is none (`Ok(0)`); a link anywhere in it, an
-/// entry that is neither a file nor a directory, or an entry on another file system than `within`
-/// (a volume attached below the record) is refused before a byte is read through it, since the
-/// person's own files must never be read, and what is said is a class and a count, never a name.
+/// how many files were read. A record that is not there is none (`Ok(0)`); a `within` that is not
+/// the directory `pin` names, a link anywhere in it, an entry that is neither a file nor a
+/// directory, an entry on another file system than `within` (a volume attached below the record),
+/// and a handle no longer beneath the run's directory are refused before a byte is read through
+/// them, since the person's own files must never be read, and what is said is a class and a count,
+/// never a name.
 ///
 /// # Errors
 ///
 /// Returns why the record could not be read whole.
 pub fn read_record(
     within: &Path,
+    pin: &kr_e2e_m1b::run::RootPin,
     relative: &Path,
     visit: &mut dyn FnMut(&[u8], &[u8]),
 ) -> Result<u64, String> {
-    read_record_by(within, relative, visit, &mut |_, _| {})
+    read_record_by(within, pin, relative, visit, &mut |_, _| {})
 }
 
 /// [`read_record`] with the two moments of the walk at which a test changes what is being read.
 fn read_record_by(
     within: &Path,
+    pin: &kr_e2e_m1b::run::RootPin,
     relative: &Path,
     visit: &mut dyn FnMut(&[u8], &[u8]),
     between: &mut dyn FnMut(Moment, &[u8]),
 ) -> Result<u64, String> {
     let said = |why: Unlooked| format!("the agent's record cannot be read whole: {why}");
-    let Some((directory, root)) = record_directory(within, relative).map_err(said)? else {
+    let Some((directory, bounds)) = record_directory(within, pin, relative).map_err(said)? else {
         return Ok(0);
     };
     let mut seen = 0_usize;
     let mut files = 0_u64;
     read_files(
         &directory,
-        &root,
+        &bounds,
         b"",
         1,
         &mut seen,
@@ -1413,6 +1494,7 @@ fn is_uuid(name: &str) -> bool {
 pub fn turns_recorded(
     account: &Account,
     within: &Path,
+    pin: &kr_e2e_m1b::run::RootPin,
     relative: &Path,
 ) -> Result<Recorded, String> {
     let marker = account.turn_line.as_deref().ok_or_else(|| {
@@ -1424,7 +1506,7 @@ pub fn turns_recorded(
     let mut by_other_name: BTreeSet<String> = BTreeSet::new();
     let mut forms: BTreeSet<String> = BTreeSet::new();
     let mut unnamed = 0_u64;
-    let files = read_record(within, relative, &mut |place, content| {
+    let files = read_record(within, pin, relative, &mut |place, content| {
         for line in String::from_utf8_lossy(content).lines() {
             if line.contains(marker) {
                 let named = serde_json::from_str::<Value>(line)
@@ -1686,6 +1768,11 @@ mod tests {
         directory
     }
 
+    /// The pin of `root`, as the run that made it holds it.
+    fn pinned(root: &Path) -> kr_e2e_m1b::run::RootPin {
+        kr_e2e_m1b::run::RootPin::of(root).expect("a directory to pin")
+    }
+
     fn account() -> Account {
         serde_json::from_value(json!({
             "login": "l", "stored": "s", "home": "run", "budget": "b", "turns": 3,
@@ -1858,7 +1945,7 @@ mod tests {
         )
         .expect("lines with an empty name");
         assert_eq!(
-            turns_recorded(&account(), &root, Path::new("")),
+            turns_recorded(&account(), &root, &pinned(&root), Path::new("")),
             Ok(Recorded {
                 turns: 3 + 2 + 3 + 3,
                 unnamed: 6,
@@ -1870,12 +1957,12 @@ mod tests {
             })
         );
         assert_eq!(
-            turns_recorded(&account(), &root, Path::new("none")),
+            turns_recorded(&account(), &root, &pinned(&root), Path::new("none")),
             Ok(Recorded::default())
         );
         let mut unnamed = account();
         unnamed.turn_line = None;
-        assert!(turns_recorded(&unnamed, &root, Path::new("")).is_err());
+        assert!(turns_recorded(&unnamed, &root, &pinned(&root), Path::new("")).is_err());
         std::fs::remove_dir_all(&root).expect("clean up");
     }
 
@@ -2148,22 +2235,26 @@ mod tests {
         // The record as the agent writes it.
         make();
         assert_eq!(
-            turns_recorded(&account, &run, sessions).map(|found| found.turns),
+            turns_recorded(&account, &run, &pinned(&run), sessions).map(|found| found.turns),
             Ok(1)
         );
         // The sessions directory itself is a link into the person's files.
         make();
         std::fs::remove_dir_all(run.join("agent-config/sessions")).expect("removed");
         std::os::unix::fs::symlink(&elsewhere, run.join("agent-config/sessions")).expect("a link");
-        let why =
-            refused(turns_recorded(&account, &run, sessions).expect_err("a linked directory"));
+        let why = refused(
+            turns_recorded(&account, &run, &pinned(&run), sessions)
+                .expect_err("a linked directory"),
+        );
         assert!(why.contains("symbolic link"), "{why}");
         // A directory above it is.
         make();
         std::fs::remove_dir_all(run.join("agent-config")).expect("removed");
         std::fs::create_dir_all(elsewhere.join("sessions")).expect("a directory");
         std::os::unix::fs::symlink(&elsewhere, run.join("agent-config")).expect("a link");
-        refused(turns_recorded(&account, &run, sessions).expect_err("a linked parent"));
+        refused(
+            turns_recorded(&account, &run, &pinned(&run), sessions).expect_err("a linked parent"),
+        );
         // An entry of the record is a link, to a file and to a directory, and nothing in either is
         // read.
         for target in [elsewhere.join("outside-name.jsonl"), elsewhere.clone()] {
@@ -2171,7 +2262,7 @@ mod tests {
             std::os::unix::fs::symlink(&target, run.join("agent-config/sessions/2026/linked"))
                 .expect("a link");
             let mut read = Vec::new();
-            let why = read_record(&run, sessions, &mut |place, content| {
+            let why = read_record(&run, &pinned(&run), sessions, &mut |place, content| {
                 read.push((place.to_vec(), content.to_vec()));
             })
             .expect_err("a link in the record");
@@ -2187,6 +2278,7 @@ mod tests {
         let mut read = Vec::new();
         let why = read_record_by(
             &run,
+            &pinned(&run),
             sessions,
             &mut |_, content| read.push(content.to_vec()),
             &mut |moment, name| {
@@ -2215,7 +2307,7 @@ mod tests {
             std::fs::hard_link(&target, run.join("agent-config/sessions/2026/hard.jsonl"))
                 .expect("a hard link");
             let mut read = Vec::new();
-            let why = read_record(&run, sessions, &mut |_, content| {
+            let why = read_record(&run, &pinned(&run), sessions, &mut |_, content| {
                 read.push(content.to_vec())
             })
             .expect_err("a file with a second name");
@@ -2231,6 +2323,7 @@ mod tests {
         let mut read = Vec::new();
         let why = read_record_by(
             &run,
+            &pinned(&run),
             sessions,
             &mut |_, content| read.push(content.to_vec()),
             &mut |moment, name| {
@@ -2252,11 +2345,14 @@ mod tests {
             .status()
             .expect("mkfifo starts");
         assert!(made.success());
-        refused(turns_recorded(&account, &run, sessions).expect_err("a pipe in the record"));
+        refused(
+            turns_recorded(&account, &run, &pinned(&run), sessions)
+                .expect_err("a pipe in the record"),
+        );
         // A record that is not there is none.
         let _ = std::fs::remove_dir_all(run.join("agent-config"));
         assert_eq!(
-            turns_recorded(&account, &run, sessions),
+            turns_recorded(&account, &run, &pinned(&run), sessions),
             Ok(Recorded::default())
         );
         std::fs::remove_dir_all(&run).expect("clean up");
@@ -2303,13 +2399,13 @@ mod tests {
         let mut read = Vec::new();
         // The directory is refused before it is opened, not only the entries on it after.
         let not_opened = matches!(
-            record_directory(&run, sessions),
+            record_directory(&run, &pinned(&run), sessions),
             Err(Unlooked {
                 class: Class::OtherDevice,
                 ..
             })
         );
-        let said = read_record(&run, sessions, &mut |place, content| {
+        let said = read_record(&run, &pinned(&run), sessions, &mut |place, content| {
             read.push((place.to_vec(), content.to_vec()));
         });
         volume.detach();
@@ -2324,7 +2420,7 @@ mod tests {
         std::fs::write(mount.join("outside-name.jsonl"), format!("{line}\n"))
             .expect("a file of the person's, with one name, on the volume");
         let mut read = Vec::new();
-        let said = read_record(&run, sessions, &mut |place, content| {
+        let said = read_record(&run, &pinned(&run), sessions, &mut |place, content| {
             read.push((place.to_vec(), content.to_vec()));
         });
         volume.detach();
@@ -2341,6 +2437,7 @@ mod tests {
         let mut read = Vec::new();
         let said = read_record_by(
             &run,
+            &pinned(&run),
             sessions,
             &mut |_, content| read.push(content.to_vec()),
             &mut |moment, name| {
@@ -2380,7 +2477,8 @@ mod tests {
         let root = scratch("forms");
         let line = r#"{"type":"task_started","turn_id":"/\u79d8\u5bc6/file-1"}"#;
         std::fs::write(root.join("a.jsonl"), format!("{line}\n")).expect("a record");
-        let found = turns_recorded(&account(), &root, Path::new("")).expect("a count");
+        let found =
+            turns_recorded(&account(), &root, &pinned(&root), Path::new("")).expect("a count");
         assert_eq!(found.forms, vec!["????aaaa-9".to_owned()]);
         std::fs::remove_dir_all(&root).expect("clean up");
     }
@@ -2557,7 +2655,7 @@ mod tests {
             key: Some(("LOGIN".to_owned(), own.to_owned())),
             others: vec![other.to_owned()],
         };
-        let scan = RunScan::of(&root, &held);
+        let scan = RunScan::of(&root, &RunRules::new(&pinned(&root), Vec::new()), &held);
         assert!(scan.searched());
         let (stops, evidence) = scan.finish(&root, "held-test", true);
         assert!(!root.exists(), "the run's directory is removed");
@@ -2573,8 +2671,219 @@ mod tests {
             key: Some(("LOGIN".to_owned(), own.to_owned())),
             others: Vec::new(),
         };
-        let (stops, _) = RunScan::of(&again, &held).finish(&again, "held-test", false);
+        let (stops, _) = RunScan::of(&again, &RunRules::new(&pinned(&again), Vec::new()), &held)
+            .finish(&again, "held-test", false);
         assert_eq!(stops.len(), 1, "{stops:?}");
         assert_eq!(stops[0].0, "key_scan_incomplete");
+    }
+
+    /// A directory that is not the one the run made, put at the run's path, is not read, scanned or
+    /// removed, and the run's own directory is known by its identity, not by its path.
+    #[test]
+    fn a_directory_that_is_not_the_one_the_run_made_is_not_read_scanned_or_removed() {
+        use kr_e2e_m1b::run::{Left, remove_run_directory};
+        let run = scratch("pinned");
+        let sessions = Path::new("agent-config/sessions");
+        let line = r#"{"type":"task_started","turn_id":"019a0000-0000-7000-8000-0000000000aa"}"#;
+        std::fs::create_dir_all(run.join(sessions)).expect("a record");
+        std::fs::write(run.join(sessions).join("own.jsonl"), format!("{line}\n")).expect("a file");
+        let pin = pinned(&run);
+        let rules = RunRules::new(&pin, Vec::new());
+        // The run's directory is renamed away, and another directory that holds a record of the
+        // person's is put at its path.
+        let away = run.with_file_name(format!(
+            "{}-away",
+            run.file_name().expect("a name").to_string_lossy()
+        ));
+        std::fs::rename(&run, &away).expect("renamed away");
+        std::fs::create_dir_all(run.join(sessions)).expect("another record");
+        std::fs::write(run.join(sessions).join("theirs.jsonl"), format!("{line}\n"))
+            .expect("a file");
+        let mut read = Vec::new();
+        let why = read_record(&run, &pin, sessions, &mut |_, content| {
+            read.push(content.to_vec())
+        })
+        .expect_err("another directory at the run's path");
+        assert!(why.contains("not the directory the run made"), "{why}");
+        assert!(
+            !why.contains("theirs") && !why.contains("agent-config"),
+            "{why}"
+        );
+        assert!(read.is_empty(), "nothing was read");
+        let scan = run_files_holding(&run, &rules, b"019a0000-0000-7000-8000-0000000000aa");
+        assert!(
+            scan.root_changed && !scan.complete() && scan.held_by.is_empty(),
+            "{scan:?}"
+        );
+        assert_eq!(
+            remove_run_directory(&run, &pin),
+            Removal::Left(Left::RootChanged)
+        );
+        assert!(
+            run.join(sessions).join("theirs.jsonl").exists(),
+            "nothing was removed"
+        );
+        // The directory the run made is found by its identity wherever it now is.
+        assert_eq!(remove_run_directory(&away, &pin), Removal::Removed);
+        assert!(!away.exists());
+        std::fs::remove_dir_all(&run).expect("clean up");
+    }
+
+    /// A directory the walk holds open that is moved out of the run, and a file moved into it, are
+    /// not read.
+    #[test]
+    fn a_directory_moved_out_of_the_run_during_the_walk_and_a_file_moved_into_it_are_not_read() {
+        let run = scratch("moved");
+        let elsewhere = scratch("moved-elsewhere");
+        let sessions = Path::new("agent-config/sessions");
+        let line = r#"{"type":"task_started","turn_id":"019a0000-0000-7000-8000-0000000000aa"}"#;
+        std::fs::create_dir_all(run.join("agent-config/sessions/2026/11")).expect("a record");
+        std::fs::write(run.join("agent-config/sessions/2026/11/own.jsonl"), b"x\n")
+            .expect("a file");
+        std::fs::write(elsewhere.join("theirs.jsonl"), format!("{line}\n"))
+            .expect("a file of the person's");
+        let mut read = Vec::new();
+        let mut moved = false;
+        let why = read_record_by(
+            &run,
+            &pinned(&run),
+            sessions,
+            &mut |_, content| read.push(content.to_vec()),
+            &mut |moment, name| {
+                // The directory `11` is open and its entry `own.jsonl` is listed: the directory is
+                // moved out of the run and the person's file is put in the entry's place.
+                if moment == Moment::Listed && name == b"own.jsonl" && !moved {
+                    moved = true;
+                    std::fs::rename(
+                        run.join("agent-config/sessions/2026/11"),
+                        elsewhere.join("11"),
+                    )
+                    .expect("moved out");
+                    std::fs::rename(
+                        elsewhere.join("theirs.jsonl"),
+                        elsewhere.join("11/own.jsonl"),
+                    )
+                    .expect("a file moved in");
+                }
+            },
+        )
+        .expect_err("a directory moved out of the run");
+        assert!(moved && why.contains("no longer beneath"), "{why}");
+        assert!(read.is_empty(), "nothing was read");
+        // A directory above the one being opened is moved out of the run: the directories below it
+        // are no longer the run's either.
+        std::fs::create_dir_all(run.join("agent-config/sessions/2026/11")).expect("a record");
+        std::fs::write(run.join("agent-config/sessions/2026/11/own.jsonl"), b"x\n")
+            .expect("a file");
+        let mut read = Vec::new();
+        let mut moved = false;
+        let mut listed_inside = false;
+        let why = read_record_by(
+            &run,
+            &pinned(&run),
+            sessions,
+            &mut |_, content| read.push(content.to_vec()),
+            &mut |moment, name| {
+                listed_inside |= moment == Moment::Listed && name == b"own.jsonl";
+                if moment == Moment::Listed && name == b"11" && !moved {
+                    moved = true;
+                    std::fs::rename(
+                        run.join("agent-config/sessions/2026"),
+                        elsewhere.join("2026"),
+                    )
+                    .expect("moved out");
+                }
+            },
+        )
+        .expect_err("a directory moved out of the run");
+        assert!(moved && why.contains("no longer beneath"), "{why}");
+        assert!(read.is_empty(), "nothing was read");
+        assert!(
+            !listed_inside,
+            "the directory moved out was not even listed"
+        );
+        std::fs::remove_dir_all(&run).expect("clean up");
+        std::fs::remove_dir_all(&elsewhere).expect("clean up");
+    }
+
+    /// A volume mounted below the run, or on its root, is not entered or removed by the removal of
+    /// the run, which then leaves the whole directory where it is; the search's own end does the
+    /// same, and says so.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_removal_of_a_run_enters_no_volume_mounted_in_it_and_leaves_the_run() {
+        use kr_e2e_m1b::run::{Left, remove_run_directory};
+        use kr_ipc::testing::volumes::{Volume, not_attachable};
+        let images = scratch("removal-images");
+        let key = "login-value-0123456789";
+        let made = || {
+            let run = scratch("removal");
+            std::fs::create_dir_all(run.join("a/mounted")).expect("a run");
+            for number in 0..12 {
+                std::fs::write(run.join(format!("a/own-{number}")), b"the run's own file")
+                    .expect("a file");
+            }
+            run
+        };
+        let own_files =
+            |run: &Path| (0..12).all(|number| run.join(format!("a/own-{number}")).exists());
+        // Below the run, by the removal itself.
+        let run = made();
+        let pin = pinned(&run);
+        let volume = Volume::attach(&run.join("a/mounted"), &images, "below")
+            .unwrap_or_else(|| not_attachable());
+        std::fs::write(run.join("a/mounted/theirs"), b"a file of the person's")
+            .expect("a file on the volume");
+        let before = std::fs::read_dir(run.join("a/mounted"))
+            .expect("the volume")
+            .count();
+        let removal = remove_run_directory(&run, &pin);
+        let after = std::fs::read_dir(run.join("a/mounted"))
+            .expect("the volume")
+            .count();
+        let theirs = run.join("a/mounted/theirs").exists();
+        let own = own_files(&run);
+        volume.detach();
+        assert_eq!(removal, Removal::Left(Left::AnotherFileSystem));
+        assert!(
+            theirs && before == after,
+            "every file on the volume is still there"
+        );
+        assert!(own, "the run was left whole");
+        // Below the run, by the end of the search: the search meets the volume, and the run stays.
+        let volume = Volume::attach(&run.join("a/mounted"), &images, "finish")
+            .unwrap_or_else(|| not_attachable());
+        std::fs::write(run.join("a/mounted/theirs"), b"a file of the person's")
+            .expect("a file on the volume");
+        let held = HeldKeys {
+            key: Some(("LOGIN".to_owned(), key.to_owned())),
+            others: Vec::new(),
+        };
+        let scan = RunScan::of(&run, &RunRules::new(&pin, Vec::new()), &held);
+        let (stops, evidence) = scan.finish(&run, "held-test", true);
+        let theirs = run.join("a/mounted/theirs").exists();
+        volume.detach();
+        assert!(theirs, "the file on the volume is still there");
+        assert_eq!(evidence["run_gone"], json!(false));
+        assert!(evidence["run_left"].is_string(), "{evidence}");
+        assert!(
+            stops.iter().any(|(class, _)| *class == "run_left_in_place"),
+            "{stops:?}"
+        );
+        // With the volume gone, the run goes.
+        assert_eq!(remove_run_directory(&run, &pin), Removal::Removed);
+        // On the run's root: a volume put at its path is not the directory the run made.
+        let run = made();
+        let pin = pinned(&run);
+        let volume = Volume::attach(&run, &images, "root").unwrap_or_else(|| not_attachable());
+        std::fs::write(run.join("theirs"), b"a file of the person's")
+            .expect("a file on the volume");
+        let removal = remove_run_directory(&run, &pin);
+        let theirs = run.join("theirs").exists();
+        volume.detach();
+        assert_eq!(removal, Removal::Left(Left::RootChanged));
+        assert!(theirs, "the file on the volume is still there");
+        std::fs::remove_dir_all(&run).expect("clean up");
+        std::fs::remove_dir_all(&images).expect("clean up");
     }
 }
