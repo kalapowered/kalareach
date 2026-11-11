@@ -420,9 +420,26 @@ impl Invocation {
     }
 }
 
-/// The most bytes of a journal file that are read. A file longer than this is read up to the limit
-/// and its invocation is unreadable.
-pub const MAX_FILE: usize = 128 * 1024 * 1024;
+/// The most objects the grant's walk covers for one invocation: a larger tree is refused at
+/// admission. The grant writes one row for each object, and the release two more.
+pub const OBJECTS_PER_TREE: usize = 100_000;
+
+/// What the rows of one object take in the journal, as a figure to multiply: its grant row, its
+/// release intent and its release written. With a path up to 260 characters and each permission
+/// list up to about 900 bytes (it is written in hex, so twice that), the three rows come to about
+/// 2.5 KiB, and this allows 4 KiB.
+pub const BYTES_PER_OBJECT: usize = 4096;
+
+/// The most bytes of a journal file that are read: [`OBJECTS_PER_TREE`] objects of
+/// [`BYTES_PER_OBJECT`] each, about 390 MiB, which is what one invocation's journal reaches when
+/// its tree is as large as the grant admits and its paths and lists are of the usual size.
+///
+/// The rows' own bounds allow far more and cannot hold the read: a record may be up to
+/// [`framing::MAX_RECORD`], a path up to 32,767 characters and a permission list up to 65,535
+/// bytes, so a tree of 100,000 objects could in theory write tens of gigabytes. What stops the read
+/// is this figure. A file longer than it is read up to the limit and its invocation is unreadable:
+/// its tree stays blocked and its first rows are kept, as for any damage.
+pub const MAX_FILE: usize = OBJECTS_PER_TREE * BYTES_PER_OBJECT;
 
 /// What a file turned out to be.
 #[derive(Debug)]
