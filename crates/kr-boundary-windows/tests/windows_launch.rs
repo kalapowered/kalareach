@@ -124,6 +124,9 @@ impl Fixture {
         )
         .unwrap();
         acl::set_protected(&scratch, &private).unwrap();
+        // The private root's own folders, made under it so that they inherit the group's right.
+        std::fs::create_dir_all(scratch.join("tmp")).unwrap();
+        std::fs::create_dir_all(scratch.join("home")).unwrap();
         let stand_in = dir.join("kr-launch-stand-in.exe");
         std::fs::copy(bin().join("kr-launch-stand-in.exe"), &stand_in).unwrap();
         let env = build_env(
@@ -828,7 +831,40 @@ fn a_suspended_child_that_is_dropped_is_ended_and_leaves_no_process() {
 
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
-fn a_launch_that_cannot_use_the_job_starts_nothing() {
+fn a_launch_that_cannot_use_the_job_attribute_starts_nothing() {
+    let fixture = Fixture::new();
+    let job = Job::new(Limits::INVOCATION).unwrap();
+    // A handle to the job that may only query it: the platform cannot make a process in that job.
+    let restricted = job.query_only_copy().unwrap();
+    let marker = fixture.scratch.join("started.txt");
+    let marker_text = marker.display().to_string();
+    let before = pids_named("kr-launch-stand-in");
+    let result = launch(fixture.spec(
+        &restricted,
+        &fixture.stand_in,
+        &["marker", &marker_text],
+        Std::Nul,
+        Std::Nul,
+    ));
+    let error = result.expect_err("a job that may not be used takes no child");
+    println!("a launch into a job it may not use: {error}");
+    assert!(
+        matches!(error, LaunchError::NotStarted(_) | LaunchError::Job(_)),
+        "nothing was created: {error:?}"
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(!marker.exists(), "the program did not run");
+    assert_eq!(
+        pids_named("kr-launch-stand-in"),
+        before,
+        "no process was made"
+    );
+    assert_eq!(job.active_processes().unwrap(), 0, "the job holds nothing");
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_job_that_has_ended_takes_no_new_child() {
     let fixture = Fixture::new();
     let mut job = Job::new(Limits::INVOCATION).unwrap();
     job.end(&[], Duration::from_secs(10));
@@ -842,12 +878,7 @@ fn a_launch_that_cannot_use_the_job_starts_nothing() {
         Std::Nul,
         Std::Nul,
     ));
-    let error = result.expect_err("a job that has ended takes no child");
-    println!("a launch into an ended job: {error}");
-    assert!(
-        matches!(error, LaunchError::NotStarted(_) | LaunchError::Job(_)),
-        "nothing was created: {error:?}"
-    );
+    assert!(matches!(result, Err(LaunchError::Job(_))));
     std::thread::sleep(Duration::from_secs(2));
     assert!(!marker.exists(), "the program did not run");
     assert_eq!(
@@ -1020,6 +1051,12 @@ impl Dumps {
             .filter(|name| name.to_lowercase().ends_with(".dmp"))
             .collect()
     }
+
+    fn has_dump_of(&self, pid: u32) -> bool {
+        self.dumps()
+            .iter()
+            .any(|name| name.contains(&format!(".{pid}.")))
+    }
 }
 
 impl Drop for Dumps {
@@ -1030,36 +1067,53 @@ impl Drop for Dumps {
     }
 }
 
+/// The names of the files in a folder, for a diagnostic.
+fn names_in(folder: &str) -> String {
+    std::fs::read_dir(folder)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_else(|error| format!("unreadable: {error}"))
+}
+
 /// Waits until a crash that was expected to be reported has written its dump, and says how long
-/// that took.
+/// that took after the crashed process ended. A dump may be written before the process has gone,
+/// so the time can be nothing.
 fn wait_for_dump(dumps: &Dumps, pid: u32, deadline: Duration) -> Duration {
     let started = Instant::now();
     loop {
         let reporting = pids_named("werfault");
-        let found = dumps
-            .dumps()
-            .iter()
-            .any(|name| name.contains(&format!(".{pid}.")));
-        if found && reporting.is_empty() {
+        if dumps.has_dump_of(pid) && reporting.is_empty() {
             return started.elapsed();
         }
-        assert!(
-            started.elapsed() < deadline,
-            "the control crash left no dump: the dump settings do not work here, so a case that sees none shows nothing"
-        );
+        if started.elapsed() >= deadline {
+            panic!(
+                "the control crash of {pid} left no dump, so a case that sees none shows nothing. \
+                 dumps: [{}]; error-reporting processes: {reporting:?}; WER Temp: [{}]; \
+                 report queue: [{}]; events: {}",
+                names_in(&dumps.folder.display().to_string()),
+                names_in(r"C:\ProgramData\Microsoft\Windows\WER\Temp"),
+                names_in(r"C:\ProgramData\Microsoft\Windows\WER\ReportQueue"),
+                application_error_events("")
+            );
+        }
         std::thread::sleep(Duration::from_millis(250));
     }
 }
 
-/// The reports of crashes the system's event log holds for a program, newest first.
+/// The crash reports the system's event log holds for the last few minutes, one line each.
 fn application_error_events(image: &str) -> String {
-    let query = "*[System[Provider[@Name='Application Error'] and TimeCreated[timediff(@SystemTime) <= 300000]]]";
+    let query = "*[System[Provider[@Name='Application Error'] and TimeCreated[timediff(@SystemTime) <= 600000]]]";
     let output = Command::new("wevtutil.exe")
         .args([
             "qe",
             "Application",
             &format!("/q:{query}"),
-            "/c:20",
+            "/c:30",
             "/rd:true",
             "/f:text",
         ])
@@ -1071,12 +1125,91 @@ fn application_error_events(image: &str) -> String {
         .map(|event| {
             event
                 .lines()
-                .filter(|line| line.contains("Date:") || line.contains("Faulting"))
+                .filter(|line| line.contains("Date:") || line.contains("Faulting process id"))
+                .map(str::trim)
                 .collect::<Vec<_>>()
                 .join(" | ")
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Whether the system's event log names a crash of this process.
+fn logged_a_crash_of(pid: u32) -> bool {
+    application_error_events("")
+        .to_lowercase()
+        .contains(&format!("faulting process id: {:#x}", pid))
+}
+
+/// Runs the stand-in and returns what it wrote, the process that crashed and how it ended.
+fn crash_run(
+    fixture: &Fixture,
+    arguments: &[&str],
+    mode_when_started: Option<u32>,
+) -> (String, Vec<u32>, Option<u32>) {
+    let mut job = Job::new(Limits::INVOCATION).unwrap();
+    let (read, write) = pipe().unwrap();
+    // A child inherits the mode its parent has when the child is made.
+    let kept = mode_when_started.map(set_own_error_mode);
+    let made = launch(fixture.spec(
+        &job,
+        &fixture.stand_in,
+        arguments,
+        Std::Pipe(write),
+        Std::Nul,
+    ));
+    if let Some(kept) = kept {
+        set_own_error_mode(kept);
+    }
+    let child = resume(made.expect("the stand-in is started"));
+    let text = read_to_end(&read);
+    let code = child.wait(Duration::from_secs(60)).unwrap();
+    let pids: Vec<u32> = text
+        .lines()
+        .filter(|line| line.starts_with("crash "))
+        .map(|line| value_of(line, "pid").parse().unwrap())
+        .collect();
+    job.end(&[&child], Duration::from_secs(10));
+    (text, pids, code)
+}
+
+fn set_own_error_mode(mode: u32) -> u32 {
+    // SAFETY: sets the process's error mode, which has no memory safety condition.
+    unsafe { windows_sys::Win32::System::Diagnostics::Debug::SetErrorMode(mode) }
+}
+
+/// Git run as the boundary token with the stand-in as its external diff program, which Git starts
+/// as its own child.
+fn git_with_helper(fixture: &Fixture, job: &Job) -> (String, String, Option<u32>) {
+    let one = fixture.scratch.join("one.txt");
+    let two = fixture.scratch.join("two.txt");
+    std::fs::write(&one, "one\n").unwrap();
+    std::fs::write(&two, "two\n").unwrap();
+    let helper = fixture.stand_in.display().to_string().replace('\\', "/");
+    let config = format!("diff.external={helper}");
+    let (read, write) = pipe().unwrap();
+    let (error_read, error_write) = pipe().unwrap();
+    let suspended = launch(fixture.spec(
+        job,
+        &guest_git(),
+        &[
+            "-c",
+            &config,
+            "diff",
+            "--no-index",
+            "--ext-diff",
+            &one.display().to_string(),
+            &two.display().to_string(),
+        ],
+        Std::Pipe(write),
+        Std::Pipe(error_write),
+    ))
+    .unwrap();
+    let git = resume(suspended);
+    let text = read_to_end(&read);
+    let errors = read_to_end(&error_read);
+    let code = git.wait(Duration::from_secs(60)).unwrap();
+    (text, errors, code)
 }
 
 #[test]
@@ -1098,44 +1231,21 @@ fn a_child_a_grandchild_and_a_child_of_git_inherit_the_brokers_error_mode() {
     assert_eq!(child.wait(Duration::from_secs(30)).unwrap(), Some(0));
     let modes: Vec<u32> = text.lines().map(parse_mode).collect();
     assert_eq!(modes, [mode, mode], "the child and its grandchild: {text}");
-    // A child of the pinned Git, which starts the stand-in as its external diff program.
-    let one = fixture.scratch.join("one.txt");
-    let two = fixture.scratch.join("two.txt");
-    std::fs::write(&one, "one\n").unwrap();
-    std::fs::write(&two, "two\n").unwrap();
-    let helper = fixture.stand_in.display().to_string().replace('\\', "/");
-    let config = format!("diff.external={helper}");
-    let (read, write) = pipe().unwrap();
-    let suspended = launch(fixture.spec(
-        &job,
-        &guest_git(),
-        &[
-            "-c",
-            &config,
-            "diff",
-            "--no-index",
-            "--ext-diff",
-            &one.display().to_string(),
-            &two.display().to_string(),
-        ],
-        Std::Pipe(write),
-        Std::Nul,
-    ))
-    .unwrap();
-    let git = resume(suspended);
-    let text = read_to_end(&read);
-    git.wait(Duration::from_secs(60)).unwrap();
-    println!("git's output: {text}");
-    let helper_mode = parse_mode(
-        text.lines()
-            .find(|line| line.starts_with("diff "))
-            .expect("Git ran the helper"),
-    );
+    // A child of the pinned Git.
+    let (text, errors, code) = git_with_helper(&fixture, &job);
+    println!("git ended with {code:?}\nstdout: {text}\nstderr: {errors}");
+    let helper = text
+        .lines()
+        .find(|line| line.starts_with("diff "))
+        .unwrap_or_else(|| {
+            panic!("Git ran the helper: exit {code:?}, stdout {text:?}, stderr {errors:?}")
+        });
     assert_eq!(
-        helper_mode, mode,
+        parse_mode(helper),
+        mode,
         "a child of git.exe inherits the mode too"
     );
-    job.end(&[&child, &git], Duration::from_secs(10));
+    job.end(&[&child], Duration::from_secs(10));
 }
 
 #[test]
@@ -1143,70 +1253,60 @@ fn a_child_a_grandchild_and_a_child_of_git_inherit_the_brokers_error_mode() {
 fn a_crash_of_a_child_a_grandchild_or_git_s_child_leaves_no_dump_where_the_default_mode_does() {
     let fixture = Fixture::new();
     let dumps = Dumps::new(&["kr-launch-stand-in.exe"], &fixture.dir.join("dumps"));
-    let run = |arguments: &[&str]| -> (String, Vec<u32>) {
-        let mut job = Job::new(Limits::INVOCATION).unwrap();
-        let (suspended, output) = fixture.start(&job, arguments);
-        let child = resume(suspended);
-        let text = read_to_end(&output);
-        child.wait(Duration::from_secs(60)).unwrap();
-        let pids: Vec<u32> = text
-            .lines()
-            .filter(|line| line.starts_with("crash "))
-            .map(|line| value_of(line, "pid").parse().unwrap())
-            .collect();
-        job.end(&[&child], Duration::from_secs(10));
-        (text, pids)
-    };
-    // The control first: a child that asks for the default mode again is reported, which shows that
-    // dumps are on for this program and how long the system takes to write one.
-    let (_, control) = run(&["crash-default-mode", "fail-fast"]);
-    let latency = wait_for_dump(&dumps, control[0], Duration::from_secs(180));
-    println!("the control crash wrote its dump after {latency:?}");
+    // The controls first. A child that is started by a process whose own mode is the default, and
+    // one that asks for the default mode itself, are the cases the broker's mode does not cover:
+    // the system reports their crashes. They show that dumps are on for this program under this
+    // token, and how long the system takes to write one.
+    let (text, started_default, code) = crash_run(&fixture, &["crash-fail-fast"], Some(0));
+    println!("control, started from the default mode: {text} ended {code:?}");
+    let (text, asked_default, code) =
+        crash_run(&fixture, &["crash-default-mode", "fail-fast"], None);
+    println!("control, asks for the default mode: {text} ended {code:?}");
+    let latency = wait_for_dump(&dumps, started_default[0], Duration::from_secs(90));
+    println!(
+        "the control dump of a child started from the default mode was there {latency:?} after its end"
+    );
+    let latency = latency.max(wait_for_dump(
+        &dumps,
+        asked_default[0],
+        Duration::from_secs(90),
+    ));
+    println!(
+        "the control crashes were logged by the system: {} and {}",
+        logged_a_crash_of(started_default[0]),
+        logged_a_crash_of(asked_default[0])
+    );
     let settle = (latency * 3).max(Duration::from_secs(20));
     let before = dumps.dumps();
+    let mut crashed = Vec::new();
     for arguments in [
         &["crash-fail-fast"][..],
         &["crash-access-violation"][..],
         &["spawn-crash", "fail-fast"][..],
         &["spawn-crash", "access-violation"][..],
     ] {
-        let (_, crashed) = run(arguments);
-        assert_eq!(crashed.len(), 1, "{arguments:?} crashed one process");
+        let (text, pids, code) = crash_run(&fixture, arguments, None);
+        println!("{arguments:?}: {text} ended {code:?}");
+        assert_eq!(pids.len(), 1, "{arguments:?} crashed one process");
+        crashed.extend(pids);
     }
     // A child of the pinned Git that fail-fasts.
     std::fs::write(fixture.dir.join("diff-mode.txt"), "crash-fail-fast").unwrap();
-    let one = fixture.scratch.join("one.txt");
-    let two = fixture.scratch.join("two.txt");
-    std::fs::write(&one, "one\n").unwrap();
-    std::fs::write(&two, "two\n").unwrap();
-    let helper = fixture.stand_in.display().to_string().replace('\\', "/");
-    let config = format!("diff.external={helper}");
     let mut job = Job::new(Limits::INVOCATION).unwrap();
-    let (read, write) = pipe().unwrap();
-    let git = resume(
-        launch(fixture.spec(
-            &job,
-            &guest_git(),
-            &[
-                "-c",
-                &config,
-                "diff",
-                "--no-index",
-                "--ext-diff",
-                &one.display().to_string(),
-                &two.display().to_string(),
-            ],
-            Std::Pipe(write),
-            Std::Nul,
-        ))
-        .unwrap(),
+    let (text, errors, code) = git_with_helper(&fixture, &job);
+    println!("git with a crashing helper ended {code:?}\nstdout: {text}\nstderr: {errors}");
+    assert!(
+        text.contains("crash pid="),
+        "Git's helper crashed: {text} {errors}"
     );
-    let text = read_to_end(&read);
-    git.wait(Duration::from_secs(60)).unwrap();
-    assert!(text.contains("crash pid="), "Git's helper crashed: {text}");
-    job.end(&[&git], Duration::from_secs(10));
-    // Nothing was reported: no dump and no error-reporting process for a crash that has ended,
-    // for as long as three times the control took.
+    crashed.extend(
+        text.lines()
+            .filter(|line| line.starts_with("crash "))
+            .map(|line| value_of(line, "pid").parse::<u32>().unwrap()),
+    );
+    job.end(&[], Duration::from_secs(10));
+    // Nothing was reported: no dump and no error-reporting process for a crash that has ended, for
+    // as long as three times the control took.
     let started = Instant::now();
     while started.elapsed() < settle {
         assert!(
@@ -1216,11 +1316,16 @@ fn a_crash_of_a_child_a_grandchild_or_git_s_child_leaves_no_dump_where_the_defau
         assert_eq!(dumps.dumps(), before, "a dump was written");
         std::thread::sleep(Duration::from_millis(250));
     }
-    println!("no dump and no reporting process in {settle:?} after five crashes");
     println!(
-        "events: {}",
-        application_error_events("kr-launch-stand-in.exe")
+        "no dump and no reporting process in {settle:?} after {} crashes",
+        crashed.len()
     );
+    for pid in crashed {
+        println!(
+            "crash of {pid} logged by the system: {}",
+            logged_a_crash_of(pid)
+        );
+    }
 }
 
 #[test]
@@ -1240,8 +1345,7 @@ fn the_brokers_own_crash_leaves_no_dump_where_the_default_mode_does() {
     let dumps = Dumps::new(&["kr-boundary-broker.exe"], &work.join("dumps"));
     // The broker is started from a process whose own mode is the default, so that only the
     // broker's own start-up can set the mode it crashes under.
-    // SAFETY: sets the process's error mode, which has no memory safety condition.
-    let kept = unsafe { windows_sys::Win32::System::Diagnostics::Debug::SetErrorMode(0) };
+    let kept = set_own_error_mode(0);
     let crash = |kind: &str, default_mode: bool| -> u32 {
         let mut command = Command::new(&broker_exe);
         command.arg(format!("--crash-after-init={kind}"));
@@ -1252,19 +1356,18 @@ fn the_brokers_own_crash_leaves_no_dump_where_the_default_mode_does() {
         let pid = child.id();
         let status = child.wait().unwrap();
         println!(
-            "the broker {kind} (default mode asked again: {default_mode}) ended with {status}"
+            "the broker {kind} (default mode asked again: {default_mode}) pid {pid} ended with {status}"
         );
         pid
     };
     let control = crash("fail-fast", true);
-    let latency = wait_for_dump(&dumps, control, Duration::from_secs(180));
-    println!("the control crash of the broker wrote its dump after {latency:?}");
+    let latency = wait_for_dump(&dumps, control, Duration::from_secs(90));
+    println!("the control crash of the broker had its dump {latency:?} after its end");
     let control_access = crash("access-violation", true);
-    wait_for_dump(&dumps, control_access, Duration::from_secs(180));
+    wait_for_dump(&dumps, control_access, Duration::from_secs(90));
     let settle = (latency * 3).max(Duration::from_secs(20));
     let before = dumps.dumps();
-    crash("fail-fast", false);
-    crash("access-violation", false);
+    let claimed = [crash("fail-fast", false), crash("access-violation", false)];
     let started = Instant::now();
     while started.elapsed() < settle {
         assert!(
@@ -1275,14 +1378,18 @@ fn the_brokers_own_crash_leaves_no_dump_where_the_default_mode_does() {
         std::thread::sleep(Duration::from_millis(250));
     }
     println!("no dump of the broker and no reporting process in {settle:?} after two crashes");
-    println!(
-        "events: {}",
-        application_error_events("kr-boundary-broker.exe")
-    );
-    // SAFETY: puts back the mode this process had.
-    unsafe {
-        windows_sys::Win32::System::Diagnostics::Debug::SetErrorMode(kept);
+    for (what, pid) in [
+        ("control fail-fast", control),
+        ("control access violation", control_access),
+        ("fail-fast", claimed[0]),
+        ("access violation", claimed[1]),
+    ] {
+        println!(
+            "the broker's {what} (pid {pid}) is in the system's crash log: {}",
+            logged_a_crash_of(pid)
+        );
     }
+    set_own_error_mode(kept);
     drop(dumps);
     let _ = std::fs::remove_dir_all(&work);
 }
@@ -1297,15 +1404,22 @@ fn the_four_ways_to_start_a_program_outside_the_job_start_nothing_from_a_launche
     let program = fixture.stand_in.display().to_string();
     let scratch = fixture.scratch.display().to_string();
     let script = format!(
-        r#"$m = '{program}'; $d = '{scratch}';
-'ran' | Out-File -FilePath "$d\ran.txt";
+        r#"$m = '{program}'; $d = '{scratch}'
+'ran' | Out-File -FilePath "$d\ran.txt"
 function Form($name, [scriptblock]$body) {{ try {{ & $body; "$name finished" }} catch {{ "$name failed: $($_.Exception.GetType().Name) $($_.Exception.Message.Trim())" }} }}
-Form 'wmi' {{ $r = ([wmiclass]'Win32_Process').Create("`"$m`" marker `"$d\wmi.txt`""); "wmi returned $($r.ReturnValue)" }};
-Form 'task' {{ schtasks.exe /create /tn KrLaunchTask /tr "`"$m`" marker `"$d\task.txt`"" /sc once /st 00:00 /f; schtasks.exe /run /tn KrLaunchTask }};
-Form 'bits' {{ bitsadmin.exe /create /download KrLaunchJob; bitsadmin.exe /addfile KrLaunchJob C:\Windows\System32\drivers\etc\hosts "$d\bits-out.txt"; bitsadmin.exe /setnotifycmdline KrLaunchJob $m "x marker $d\bits.txt"; bitsadmin.exe /resume KrLaunchJob; Start-Sleep 10; bitsadmin.exe /complete KrLaunchJob }};
-Form 'com' {{ $a = [Activator]::CreateInstance([type]::GetTypeFromProgID('MMC20.Application')); $a.Document.ActiveView.ExecuteShellCommand($m, $d, "marker `"$d\com.txt`"", '7') }};
+Form 'wmi' {{ $r = ([wmiclass]'Win32_Process').Create("`"$m`" marker `"$d\wmi.txt`""); "wmi returned $($r.ReturnValue)" }}
+Form 'task' {{ schtasks.exe /create /tn KrLaunchTask /tr "`"$m`" marker `"$d\task.txt`"" /sc once /st 00:00 /f; schtasks.exe /run /tn KrLaunchTask }}
+Form 'bits' {{ bitsadmin.exe /create /download KrLaunchJob; bitsadmin.exe /addfile KrLaunchJob C:\Windows\System32\drivers\etc\hosts "$d\bits-out.txt"; bitsadmin.exe /setnotifycmdline KrLaunchJob $m "x marker $d\bits.txt"; bitsadmin.exe /resume KrLaunchJob; Start-Sleep 10; bitsadmin.exe /complete KrLaunchJob }}
+Form 'com' {{ $a = [Activator]::CreateInstance([type]::GetTypeFromProgID('MMC20.Application')); $a.Document.ActiveView.ExecuteShellCommand($m, $d, "marker `"$d\com.txt`"", '7') }}
 'done' | Out-File -FilePath "$d\done.txt""#
     );
+    // The script crosses as an encoded command, so that no quoting rule of PowerShell's own decides
+    // what it reads.
+    let units: Vec<u8> = script
+        .encode_utf16()
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect();
+    let encoded = base64(&units);
     let powershell = Path::new(&system_windows_directory().unwrap())
         .join("System32")
         .join("WindowsPowerShell")
@@ -1321,8 +1435,8 @@ Form 'com' {{ $a = [Activator]::CreateInstance([type]::GetTypeFromProgID('MMC20.
             "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
-            "-Command",
-            &script,
+            "-EncodedCommand",
+            &encoded,
         ],
         Std::Pipe(write),
         Std::Pipe(error_write),
@@ -1333,6 +1447,7 @@ Form 'com' {{ $a = [Activator]::CreateInstance([type]::GetTypeFromProgID('MMC20.
     let text = read_to_end(&read);
     let errors = read_to_end(&error_read);
     println!("PowerShell ended with {finished:?}\nstdout: {text}\nstderr: {errors}");
+    println!("scratch holds: [{}]", names_in(&scratch));
     assert!(
         fixture.scratch.join("ran.txt").exists(),
         "the script ran, so each form was tried"
@@ -1363,5 +1478,25 @@ Form 'com' {{ $a = [Activator]::CreateInstance([type]::GetTypeFromProgID('MMC20.
     let _ = Command::new("bitsadmin.exe")
         .args(["/reset", "/allusers"])
         .output();
-    let _ = (&fixture.account, &fixture.sid);
+}
+
+/// Standard base64, for the encoded command.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut text = String::new();
+    for chunk in bytes.chunks(3) {
+        let word = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        for index in 0..4 {
+            if index <= chunk.len() {
+                text.push(char::from(
+                    ALPHABET[(word >> (18 - 6 * index) & 63) as usize],
+                ));
+            } else {
+                text.push('=');
+            }
+        }
+    }
+    text
 }
