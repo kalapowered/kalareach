@@ -1625,6 +1625,7 @@ impl Replacement {
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", run.home())
+            .env(run.mark().0, run.mark().1)
             .current_dir(run.root())
             .stdin(Stdio::null())
             .stdout(log.try_clone().expect("the daemon's log"))

@@ -18,12 +18,15 @@
 //! table, and it is this run's only when its program is exactly the worker the run placed
 //! ([`Run::record_worker`]); no file of the host's is opened for it.
 //!
-//! The closing check asks four questions, and a run that leaves anything behind fails on it:
-//! whether any recorded process still runs, whether any process at all still runs out of this
-//! run's directory, whether the service manager still holds a job of this run's workers, and
-//! whether every search for the processes a leg's host started finished. A search that did not
-//! finish fails the check for good: a later one that finished cannot show what the earlier one
-//! missed.
+//! The closing check asks five questions, and a run that leaves anything behind fails on it:
+//! whether any recorded process still runs, whether any process's command line still names this
+//! run's directory, whether any process of this user whose environment the system shows still
+//! carries the run's marker ([`MARK_VARIABLE`], which every program the run starts is given),
+//! whether the service manager still holds a job of this run's workers, and whether every search for
+//! the processes a leg's host started finished. A search that did not finish fails the check for
+//! good: a later one that finished cannot show what the earlier one missed. What the check cannot
+//! show: a process that left the run's process group and cleared its environment, and whose command
+//! line names nothing of the run, is not found.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -63,6 +66,11 @@ pub const HARNESS_PROGRAM: &str = "kr";
 pub fn binary_place(name: &str) -> PathBuf {
     Path::new("b").join(name)
 }
+
+/// The variable every program this run starts is given, with a value of the run's own
+/// ([`Run::mark`]): a process that keeps its environment and is left behind carries it, and the
+/// closing check looks for it ([`processes_with_mark`]).
+pub const MARK_VARIABLE: &str = "E2E_RUN_MARK";
 
 /// The largest file [`Run::note_placed`] reads whole.
 const PLACED_AT_MOST: i64 = 1 << 30;
@@ -111,6 +119,8 @@ pub struct Run {
     jobs_left_alone: Mutex<Vec<String>>,
     /// The files the run placed and later runs, as each stood right after it was placed.
     placed: Mutex<Vec<(PathBuf, Placed)>>,
+    /// The value of [`MARK_VARIABLE`] in the environment of every program this run starts.
+    mark: String,
     /// Set once the closing check has passed, so the directory can go.
     passed: Mutex<bool>,
 }
@@ -163,6 +173,7 @@ impl Run {
             job_labels: Mutex::new(Vec::new()),
             jobs_left_alone: Mutex::new(Vec::new()),
             placed: Mutex::new(Vec::new()),
+            mark: kr_ipc::new_uuid().to_string(),
             passed: Mutex::new(false),
         };
         // A start that fails here has started nothing and holds nothing but the binaries copied so
@@ -208,6 +219,7 @@ impl Run {
             job_labels: Mutex::new(Vec::new()),
             jobs_left_alone: Mutex::new(Vec::new()),
             placed: Mutex::new(Vec::new()),
+            mark: kr_ipc::new_uuid().to_string(),
             passed: Mutex::new(false),
         }
     }
@@ -229,6 +241,14 @@ impl Run {
     #[must_use]
     pub fn pin(&self) -> &RootPin {
         &self.pin
+    }
+
+    /// The variable and value that every program this run starts is given in its environment: a
+    /// process this run started that keeps its environment carries them wherever it goes, and the
+    /// closing check finds it by them ([`processes_with_mark`]).
+    #[must_use]
+    pub fn mark(&self) -> (&'static str, &str) {
+        (MARK_VARIABLE, &self.mark)
     }
 
     /// Where one copied binary is.
@@ -571,11 +591,24 @@ impl Run {
                     format!("the system program {} (process {pid})", path.display())
                 }),
         );
+        let mut under = Vec::new();
         match processes_under(&self.root) {
+            Ok(found) => {
+                under = found.iter().map(|(pid, _)| *pid).collect();
+                left.extend(
+                    found
+                        .into_iter()
+                        .map(|(pid, command)| format!("process {pid} running {command}")),
+                );
+            }
+            Err(why) => left.push(why),
+        }
+        match processes_with_mark(&self.mark) {
             Ok(found) => left.extend(
                 found
                     .into_iter()
-                    .map(|(pid, command)| format!("process {pid} running {command}")),
+                    .filter(|pid| !under.contains(pid))
+                    .map(|pid| format!("process {pid} holds the run's marker")),
             ),
             Err(why) => left.push(why),
         }
@@ -593,8 +626,9 @@ impl Run {
         if left.is_empty() {
             let alone = self.jobs_left_alone().len();
             Ok(format!(
-                "none of the {} processes this run started is running, no process runs out of \
-                 its directory and no job of its workers is loaded{}",
+                "none of the {} processes this run started is running, no process's command line \
+                 names its directory, no process of this user whose environment the system shows \
+                 carries its marker, and no job of its workers is loaded{}",
                 owned.len(),
                 if alone == 0 {
                     String::new()
@@ -2125,6 +2159,80 @@ pub fn processes_under(root: &Path) -> Result<Vec<(u32, String)>, String> {
         .collect())
 }
 
+/// The number of every process of this user, other than this one, whose environment the system shows
+/// and which holds [`MARK_VARIABLE`] with the value `mark`. A process whose environment the system
+/// does not show (on macOS, the system's own protected programs), or that cleared its own, is not
+/// found: that is what this search shows, and no more.
+///
+/// Other processes' environments can hold secrets of the person's own programs, so each is tested
+/// for the marker in memory and nothing of it is kept: no environment, no variable name or value
+/// and no command line of a process that does not hold the marker is stored, returned, printed or
+/// put in an error, and what is returned for a process that does is its number alone.
+///
+/// # Errors
+///
+/// Returns why the processes could not be searched, without any output of the search.
+pub fn processes_with_mark(mark: &str) -> Result<Vec<u32>, String> {
+    let word = format!("{MARK_VARIABLE}={mark}");
+    let own = std::process::id();
+    #[cfg(target_os = "macos")]
+    {
+        // `ps -E` appends each process's environment to its command line, for this user's own
+        // processes. Its output stays in this function: each line is tested for the marker and
+        // dropped.
+        let mut ps = std::process::Command::new("/bin/ps");
+        ps.args(["-A", "-ww", "-E", "-o", "pid=,command="])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin");
+        let output = output_within(ps, SERVICE_MANAGER_BOUND)
+            .map_err(|_| "the environments could not be read: ps did not finish".to_owned())?;
+        if !output.status.success() {
+            return Err(format!(
+                "the environments could not be read: ps ended with {}",
+                output.status
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let (pid, rest) = line.trim_start().split_once(' ')?;
+                let pid: u32 = pid.parse().ok()?;
+                (pid != own && rest.split_whitespace().any(|found| found == word)).then_some(pid)
+            })
+            .collect())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let needle = word.into_bytes();
+        let entries = std::fs::read_dir("/proc")
+            .map_err(|_| "the environments could not be read: /proc is not readable".to_owned())?;
+        let mut found = Vec::new();
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if pid == own {
+                continue;
+            }
+            // Not shown for a process of another user, or one that ended since: not this search's.
+            let Ok(environment) = std::fs::read(entry.path().join("environ")) else {
+                continue;
+            };
+            if environment
+                .split(|byte| *byte == 0)
+                .any(|pair| pair == needle.as_slice())
+            {
+                found.push(pid);
+            }
+        }
+        Ok(found)
+    }
+}
+
 /// How long a command a leg runs to ask the operating system something is given.
 pub const SERVICE_MANAGER_BOUND: Duration = Duration::from_secs(20);
 
@@ -2253,6 +2361,116 @@ mod tests {
             None,
             "only a refusal is taken for another user"
         );
+    }
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+
+    /// The child the tests below start: this test executable, which runs the test that follows and
+    /// sleeps. Its own environment is shown by the system on every platform; the system's own
+    /// protected programs (`sleep`, `sh`) show none on macOS.
+    #[test]
+    #[ignore = "started by the closing check's case as the child it looks for"]
+    fn a_sleeper_the_closing_checks_case_starts() {
+        if std::env::var_os("KR_E2E_SLEEPER").is_some() {
+            std::thread::sleep(Duration::from_secs(300));
+        }
+    }
+
+    /// Starts a child that leaves the process group of the one that started it and is adopted by the
+    /// system's first process, whose command line names nothing of the run, with the run's marker
+    /// in its environment or with the environment cleared; returns its number.
+    fn detached(root: &Path, run: &Run, keeps_environment: bool) -> u32 {
+        use std::io::Read as _;
+        let mut command = std::process::Command::new("/usr/bin/perl");
+        command
+            .args([
+                "-MPOSIX",
+                "-e",
+                "my $p = fork(); if ($p) { print \"$p\\n\"; exit 0 } POSIX::setsid(); \
+                 open(STDOUT, '>', '/dev/null'); open(STDERR, '>', '/dev/null'); \
+                 open(STDIN, '<', '/dev/null'); \
+                 exec $ARGV[0], '--exact', 'run::marker_tests::a_sleeper_the_closing_checks_case_starts', \
+                 '--ignored', '--nocapture';",
+                &std::env::current_exe()
+                    .expect("this test executable")
+                    .display()
+                    .to_string(),
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("KR_E2E_SLEEPER", "1")
+            .current_dir(root.join("w"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        if keeps_environment {
+            command.env(run.mark().0, run.mark().1);
+        }
+        let mut parent = command.spawn().expect("the child's parent starts");
+        let mut printed = String::new();
+        parent
+            .stdout
+            .take()
+            .expect("its output")
+            .read_to_string(&mut printed)
+            .expect("the child's number");
+        let _ = parent.wait();
+        printed.trim().parse().expect("a number")
+    }
+
+    fn ended(pid: u32) {
+        let _ = std::process::Command::new("/bin/kill")
+            .arg(pid.to_string())
+            .status();
+        let started = Instant::now();
+        while std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+            && started.elapsed() < Duration::from_secs(10)
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// A child that leaves the process group, is adopted by the system's first process and names
+    /// nothing of the run is found at the close by the marker in its environment, and the close
+    /// fails on it; the child that cleared its environment is not found, which is the limit the
+    /// closing text names, and the text of a passing close says what the check shows.
+    #[test]
+    fn a_child_that_leaves_its_group_and_keeps_its_environment_is_found_at_the_close() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .expect("the temporary directory")
+            .join(format!("kr-run-marker-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(root.join("w")).expect("a scratch directory");
+        let run = Run::over(&root);
+        let (kept, cleared) = (detached(&root, &run, true), detached(&root, &run, false));
+        let said = run
+            .nothing_running()
+            .expect_err("the child that kept its environment is found");
+        assert!(
+            said.contains(&format!("process {kept} holds the run's marker")),
+            "{said}"
+        );
+        assert!(
+            !said.contains(&format!("process {cleared} ")),
+            "the child that cleared its environment is not named: {said}"
+        );
+        ended(kept);
+        let passed = run
+            .nothing_running()
+            .expect("with the marked child ended the close passes, the cleared one still running");
+        assert!(
+            passed.contains("whose environment the system shows"),
+            "{passed}"
+        );
+        ended(cleared);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
     }
 }
 
