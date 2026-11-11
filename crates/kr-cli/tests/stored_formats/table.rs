@@ -69,7 +69,7 @@ fn reading_through(entry: ReleaseStore, through: u32) -> ReleaseStore {
 pub fn known() -> Vec<Known> {
     use kr_protocol::{
         account, attention, automation, changeset, delivery, error, host_account, identity,
-        pairing, push, sharing, skill,
+        pairing, push, sharing, skill, transfer,
     };
 
     let source = |store, name, file, pinned| Known {
@@ -385,6 +385,13 @@ pub fn known() -> Vec<Known> {
             "ErrorCode",
             "1adf42bfb02be22cdba273eadccfff60f55bf8bac135c476a56678a211e3f353",
         ),
+        // The answer of a draft a device ended, which the transfers store keeps in `actions.result`
+        // as the bytes the method answered, beside the answers its own declaration lists.
+        known_protocol::<transfer::DraftDiscardResult>(
+            "transfers",
+            "DraftDiscardResult",
+            "da7f26b9971c4e3450b20922b3573827c5bffd47956665dd06ab3d9ddb647e78",
+        ),
         // The code a refused workflow action keeps in `action_records.error_code`, read back as the
         // code it names.
         known_protocol::<error::ErrorCode>(
@@ -449,6 +456,7 @@ pub fn kept_without_a_holder() -> Vec<(&'static str, &'static str)> {
         ("changesets", "ChangesetMaterializeResult"),
         ("changesets", "DiffApplyResult"),
         ("changesets", "ErrorCode"),
+        ("transfers", "DraftDiscardResult"),
         ("workflows", "ErrorCode"),
         // The parameters of a stored workflow's node, which admission decodes at each admission.
         ("workflows", "ChangesetMaterializeParams"),
