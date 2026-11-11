@@ -385,6 +385,7 @@ impl<'r> Host<'r> {
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", self.run.home())
+            .env(self.run.mark().0, self.run.mark().1)
             .current_dir(self.run.root())
             .stdin(Stdio::null())
             .stdout(log.try_clone().expect("the daemon's log"))
@@ -677,6 +678,10 @@ impl<'r> Host<'r> {
                 packages.display().to_string(),
             ));
         }
+        // Every program the run starts has it, the sessions' shells and the agent among them: they
+        // are created with the environment these variables make.
+        let (name, value) = self.run.mark();
+        variables.push((name.to_owned(), value.to_owned()));
         variables
     }
 
