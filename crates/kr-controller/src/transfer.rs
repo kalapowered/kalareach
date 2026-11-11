@@ -381,7 +381,9 @@ impl LookupHold {
 }
 
 /// The end of [`TransferModule::hold_the_stream_lookups`] that lets the held lookups go, and every
-/// lookup after them.
+/// lookup after them. Dropping it lets them go too: a holder that fails or ends while lookups are
+/// held would otherwise leave their blocking threads waiting for good, and a runtime does not shut
+/// down until its blocking threads have returned.
 #[cfg(feature = "testing")]
 #[derive(Debug)]
 pub struct LookupRelease(Arc<LookupHeld>);
@@ -390,6 +392,13 @@ pub struct LookupRelease(Arc<LookupHeld>);
 impl LookupRelease {
     /// Lets the lookups go.
     pub fn release(self) {
+        drop(self);
+    }
+}
+
+#[cfg(feature = "testing")]
+impl Drop for LookupRelease {
+    fn drop(&mut self) {
         *self
             .0
             .released
