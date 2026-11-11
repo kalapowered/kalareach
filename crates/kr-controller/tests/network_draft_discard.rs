@@ -10,7 +10,7 @@ mod net_support;
 
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{ActionId, DraftRevision};
+use kr_protocol::ids::{ActionId, AgentBindingRevision, ApplicationInstanceId, DraftRevision};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Nullable;
@@ -18,7 +18,7 @@ use kr_protocol::transfer::{
     DraftCreateParams, DraftCreateResult, DraftDiscardParams, DraftDiscardResult,
     DraftUpdateParams, DraftUpdateResult,
 };
-use net_support::{Device, Host, RawDevice, on_the_host};
+use net_support::{Device, Host, RawDevice, an_open_session, on_the_host, on_the_session};
 
 fn draft_params(host: &Host, text: &str) -> DraftCreateParams {
     DraftCreateParams {
@@ -186,6 +186,79 @@ async fn a_stale_update_tells_the_device_the_current_revision_as_the_service_wro
         stale.message, "this draft is at revision 2 and the update expects 1",
         "the sentence a client reads the revision from reaches the device as written"
     );
+    raw.close();
+    host.stop().await;
+}
+
+/// KR-REQ-23.41: a draft written for an application is ended by a request that names that
+/// application, as the host asks of a request that acts on the draft, and a request that names none is
+/// refused and leaves the draft.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_draft_written_for_an_application_is_ended_by_a_request_that_names_it() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (session_id, _) = an_open_session(&host);
+    let device = Device::create().await;
+    let record = net_support::pair_with(
+        &host,
+        &device,
+        &owner,
+        net_support::proposal(&[ActionRight::SessionView]),
+    )
+    .await;
+    let target = on_the_session(&host, session_id);
+    let raw = RawDevice::connect(&host, &device, &record).await;
+    raw.claim();
+
+    let application = ApplicationInstanceId::new(kr_ipc::new_uuid());
+    let mut params = draft_params(&host, "for an application");
+    params.session_id = Nullable::some(session_id);
+    params.application_instance_id = Nullable::some(application);
+    let made: DraftCreateResult = raw
+        .mutate(
+            Method::DraftCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &params,
+        )
+        .await
+        .expect("the device makes a draft for an application")
+        .to_typed()
+        .expect("a result of the declared shape");
+    let ending = DraftDiscardParams {
+        draft_id: made.draft.draft_id,
+    };
+
+    let naming_none = raw
+        .mutate(
+            Method::DraftDiscard,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &ending,
+        )
+        .await
+        .expect_err("a request that names no application");
+    assert_eq!(
+        naming_none.code,
+        ErrorCode::InvalidArgument,
+        "{naming_none:?}"
+    );
+
+    let mut naming = target;
+    naming.application_instance_id = Nullable::some(application);
+    naming.agent_binding_revision = Nullable::some(AgentBindingRevision::new(1));
+    let ended: DraftDiscardResult = raw
+        .mutate(
+            Method::DraftDiscard,
+            ActionId::new(kr_ipc::new_uuid()),
+            naming,
+            &ending,
+        )
+        .await
+        .expect("the request that names the application ends the draft")
+        .to_typed()
+        .expect("a result of the declared shape");
+    assert_eq!(ended.draft_id, made.draft.draft_id);
     raw.close();
     host.stop().await;
 }

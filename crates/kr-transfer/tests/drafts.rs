@@ -1863,6 +1863,13 @@ fn ending_a_draft_deletes_it_with_what_it_holds_and_changes_no_upload() {
     harness.service.read_grant(grant).expect("the grant holds");
     let staged = harness.service.staged_byte_len().expect("reads the total");
     assert!(staged > 0, "the uploads charge their bytes");
+    let handle_of = |handle: &AttachmentHandle| {
+        harness
+            .service
+            .attachment_handle(&harness.actor, handle.transfer_id)
+            .expect("the upload is published")
+    };
+    let before = [handle_of(&manual), handle_of(&typed)];
     assert_eq!(
         harness.service.open_drafts(&harness.actor).expect("counts"),
         1
@@ -1893,12 +1900,11 @@ fn ending_a_draft_deletes_it_with_what_it_holds_and_changes_no_upload() {
             .code(),
         ErrorCode::PermissionDenied
     );
-    for handle in [&manual, &typed] {
-        harness
-            .service
-            .attachment_handle(&harness.actor, handle.transfer_id)
-            .expect("the upload is still published");
-    }
+    assert_eq!(
+        [handle_of(&manual), handle_of(&typed)],
+        before,
+        "each upload is as it was: its session, its expiry and its state"
+    );
     assert_eq!(
         harness.service.staged_byte_len().expect("reads the total"),
         staged,
@@ -2158,4 +2164,49 @@ fn a_draft_ended_by_an_action_is_answered_from_its_record_when_the_action_is_ask
         .draft_discard(&harness.actor, &params, Some(&reused))
         .expect_err("the identifier carried another payload");
     assert_eq!(conflict.code(), ErrorCode::IdConflict);
+}
+
+/// KR-REQ-23.41: while this host cannot yet say that no session of an earlier build was sent a draft
+/// (its worker may have taken a prompt that names one without the host being told), a draft that
+/// targets such a session may be a sent draft and is kept: ending it is refused `DRAFT_CONFLICT` and
+/// the draft stands. A draft for another session is ended as ever.
+#[test]
+fn a_draft_a_session_of_an_earlier_build_may_have_been_sent_is_kept() {
+    let harness = Harness::create();
+    let noted = draft(&harness);
+    let session = noted.session_id.0.expect("a session");
+    let other_session = SessionId::new(Uuid::from_bytes([3; 16]));
+    let other = harness
+        .service
+        .draft_create(
+            &harness.actor,
+            &DraftCreateParams {
+                environment_id: harness.environment_id(),
+                device_id: Nullable::null(),
+                session_id: Nullable::some(other_session),
+                application_instance_id: Nullable::null(),
+                text: "for another session".to_owned(),
+            },
+            None,
+            None,
+        )
+        .expect("creates the draft")
+        .draft;
+    harness
+        .service
+        .note_unseen_prompt_sessions(&std::collections::BTreeSet::from([session]))
+        .expect("notes the session");
+    let discard = |draft_id: DraftId| {
+        harness
+            .service
+            .draft_discard(&harness.actor, &DraftDiscardParams { draft_id }, None)
+    };
+
+    let refused = discard(noted.draft_id).expect_err("the session may have been sent it");
+    assert_eq!(refused.code(), ErrorCode::DraftConflict, "{refused}");
+    harness
+        .service
+        .draft(&harness.actor, noted.draft_id)
+        .expect("the draft stands");
+    discard(other.draft_id).expect("a draft for another session is ended");
 }

@@ -696,7 +696,7 @@ its attachment records and its prompt record, and revokes the read grants of its
 the draft's own principal may end it: another principal's draft and a draft that is gone are refused
 alike, `INVALID_ARGUMENT`. A draft that a prompt named, or that holds an attachment `inserting`,
 `accepted_by_agent` or `unknown`, is refused `DRAFT_CONFLICT` and nothing is deleted, because those
-records show what the agent was offered or took: such a draft ends with its session. Attachments
+records show what the agent was offered or took: such a draft is kept. Attachments
 `recorded` or `failed` go with the draft. The call changes no upload: the bytes, their quota charge,
 the session an upload was bound to and its expiry stay as they are, and only `upload.cancel` of an
 upload still receiving releases bytes. The same action asked again is answered from its record, and a

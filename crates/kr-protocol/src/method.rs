@@ -1272,7 +1272,7 @@ methods! {
     selectors: [Draft],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
     confirmation: None, idempotency: ACTION,
-    doc: "End a draft of the caller's own and release the places it holds. A draft a prompt named, or one an attachment of which the agent was offered, is refused and kept until its session ends. Uploads the draft bound are not changed.";
+    doc: "End a draft of the caller's own and release the places it holds. A draft a prompt named, or one an attachment of which the agent was offered, is refused and kept as the record of what the agent was sent. Uploads the draft bound are not changed.";
 
     AgentDraftAddAttachment = "agent.draft.add_attachment", DraftsAndMedia,
     effect: Write, ingress: [LocalIpc, PairedDevice],
