@@ -424,9 +424,10 @@ records.
 The mouse is a virtual-terminal operation on this path too. It is not a record the session spells.
 The command reads what the session writes to learn whether the application asked for mouse
 reporting: DEC mode 1000 for presses and the wheel, 1002 for a move with a button held, 1003 for
-every move, and 1006 for the SGR encoding. The three tracking modes are settings of their own, and
-the widest one that is set counts. A screen the command draws writes every mode it tracks, the ones
-that are off among them, so a mode that is reset says nothing of the others.
+every move, and 1006 for the SGR encoding. The tracking is one setting, as it is on a terminal and
+in the session's screen: setting one of the three modes replaces the one in force, and resetting any
+of them turns tracking off. A screen the command draws resets the three first and then sets the one
+that is on.
 
 While the application asks and this attachment may send input, the command asks the console for
 mouse records, which takes the mouse away from the console's text selection. It gives the mouse back
