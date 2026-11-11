@@ -775,10 +775,15 @@ pub(crate) const RECORD_ENTRIES_AT_MOST: usize = 100_000;
 /// the per-file bound (clones cost no disk) must not make the audit read for hours.
 pub(crate) const RECORD_BYTES_AT_MOST: u64 = 256 << 20;
 
-/// The most turn names the audit keeps in all. Each non-UUID name is kept with its file's place,
-/// about two hundred bytes in two sets, so the sets stay within about forty megabytes; a real
-/// record names a handful.
-pub(crate) const RECORD_NAMES_AT_MOST: usize = 100_000;
+/// The most distinct turn names the audit keeps in all. Each is kept in two sets, a non-UUID name
+/// with its file's place, so the figure alone does not bound what is held ([`RECORD_NAME_BYTES_AT_MOST`]
+/// does); a real record names a handful.
+pub(crate) const RECORD_NAMES_AT_MOST: usize = 50_000;
+
+/// The most bytes of turn names the audit keeps in all, a non-UUID name counted with its file's
+/// place, which is up to sixteen kilobytes in a deep tree: each name is held in two sets, so the
+/// sets hold at most twice this.
+pub(crate) const RECORD_NAME_BYTES_AT_MOST: usize = 16 << 20;
 
 /// What the audit's walk of the agent's record reads at most. A walk past either is a failure of
 /// its own ([`Class::TooLarge`], [`Class::TooMany`]): nothing of the file is read, and the audit says
@@ -791,8 +796,10 @@ pub(crate) struct Limits {
     pub(crate) entries: usize,
     /// The most bytes read, in all.
     pub(crate) bytes: u64,
-    /// The most turn names kept, in all.
+    /// The most distinct turn names kept, in all.
     pub(crate) names: usize,
+    /// The most bytes of the names kept, in all.
+    pub(crate) name_bytes: usize,
 }
 
 impl Limits {
@@ -802,6 +809,7 @@ impl Limits {
         entries: RECORD_ENTRIES_AT_MOST,
         bytes: RECORD_BYTES_AT_MOST,
         names: RECORD_NAMES_AT_MOST,
+        name_bytes: RECORD_NAME_BYTES_AT_MOST,
     };
 }
 
@@ -1719,6 +1727,7 @@ fn turns_recorded_within(
     let mut forms: BTreeSet<String> = BTreeSet::new();
     let mut unnamed = 0_u64;
     let mut too_many_names = false;
+    let mut kept_bytes = 0_usize;
     let files = read_record_within(
         within,
         pin,
@@ -1727,25 +1736,36 @@ fn turns_recorded_within(
         &mut |place, content| {
             for line in String::from_utf8_lossy(content).lines() {
                 if line.contains(marker) {
-                    // The names kept in all are bound: past the bound nothing more is kept.
-                    if turns.len() + by_uuid.len() + by_other_name.len() >= limits.names {
-                        too_many_names = true;
-                        return;
-                    }
                     let named = serde_json::from_str::<Value>(line)
                         .ok()
                         .as_ref()
                         .and_then(turn_identifier);
                     match named {
-                        Some(named) if is_uuid(&named) => {
-                            by_uuid.insert(named.clone());
-                            turns.insert(named);
-                        }
                         Some(named) => {
-                            let own = format!("{}\0{named}", String::from_utf8_lossy(place));
-                            by_other_name.insert(own.clone());
+                            let uuid = is_uuid(&named);
+                            let own = if uuid {
+                                named.clone()
+                            } else {
+                                format!("{}\0{named}", String::from_utf8_lossy(place))
+                            };
+                            // The names kept in all are bound, in number and in bytes: past
+                            // either bound no name that is new is kept.
+                            if !turns.contains(&own) {
+                                if turns.len() >= limits.names
+                                    || kept_bytes.saturating_add(own.len()) > limits.name_bytes
+                                {
+                                    too_many_names = true;
+                                    return;
+                                }
+                                kept_bytes += own.len();
+                            }
+                            if uuid {
+                                by_uuid.insert(own.clone());
+                            } else {
+                                by_other_name.insert(own.clone());
+                                forms.insert(form_of(&named));
+                            }
                             turns.insert(own);
-                            forms.insert(form_of(&named));
                         }
                         None => unnamed += 1,
                     }
@@ -1757,8 +1777,9 @@ fn turns_recorded_within(
     if too_many_names {
         return Err(format!(
             "{RECORD_BEYOND_THE_BOUNDS}: the record names more turns than the audit keeps ({} \
-             names), and the turns were not counted ({files} files read by then, no content kept)",
-            limits.names
+             names or {} bytes of them), and the turns were not counted ({files} files read by \
+             then, no content kept)",
+            limits.names, limits.name_bytes
         ));
     }
     // A name and an occurrence cannot be the same turn: they are kept apart, and counted together.
@@ -2936,6 +2957,20 @@ mod tests {
             audit_turns(true, 1, &Err(why.clone())),
             Audit::Incomplete(why)
         );
+        // The bytes of the names kept in all: a name is kept with its file's place, so a few names
+        // in deep places are past a bound of a few bytes though they are few.
+        let bytes_of_names = Limits {
+            file: 2 << 10,
+            name_bytes: 40,
+            ..Limits::RECORD
+        };
+        let why = turns_recorded_within(&account(), &run, &pinned(&run), sessions, bytes_of_names)
+            .expect_err("more bytes of names than the bound in all");
+        assert!(why.starts_with(RECORD_BEYOND_THE_BOUNDS), "{why}");
+        assert!(
+            why.contains("bytes of them") && !why.contains("a1"),
+            "{why}"
+        );
         // Within the bounds the same record is counted.
         let whole = Limits {
             file: 2 << 10,
@@ -2971,6 +3006,29 @@ mod tests {
         )
         .expect_err("more entries listed in all than the bound");
         assert!(why.starts_with(RECORD_BEYOND_THE_BOUNDS), "{why}");
+        // A directory that lists more entries than the bound is refused when it is listed, before
+        // any entry of it is looked at: none of its files is read.
+        let wide = scratch("record-wide");
+        std::fs::create_dir_all(wide.join("agent-config/sessions")).expect("a directory");
+        for file in 0..15 {
+            std::fs::write(
+                wide.join(format!("agent-config/sessions/f{file}.jsonl")),
+                "{}\n",
+            )
+            .expect("a file");
+        }
+        let mut handed = 0;
+        let why = read_record_within(
+            &wide,
+            &pinned(&wide),
+            sessions,
+            few,
+            &mut |_, _| handed += 1,
+            &mut |_, _| {},
+        )
+        .expect_err("a directory that lists more entries than the bound");
+        assert!(why.starts_with(RECORD_BEYOND_THE_BOUNDS), "{why}");
+        assert_eq!(handed, 0, "no file of the directory was read");
     }
 
     #[test]
