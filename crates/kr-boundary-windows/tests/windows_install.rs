@@ -20,12 +20,14 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use kr_boundary_windows::env::{Kind, QualifiedGit, RootPaths, build_env};
 use kr_boundary_windows::manifest::{InstallState, Manifest, ObjectKind, Prior};
 use kr_boundary_windows::policy::{self, Policy, RULE_ALLOW_ALL};
+use kr_boundary_windows::quote::quote_command_line;
 use kr_boundary_windows::win::applocker::Channel;
 use kr_boundary_windows::win::ffi::Sid;
 use kr_boundary_windows::win::install::{CHECKOUT, CONNECT, Paths, SERVICE, STEPS};
-use kr_boundary_windows::win::launch::{Outcome, run_as};
+use kr_boundary_windows::win::launch::{Outcome, Run, TokenSpec, VerifiedPath, run_captured};
 use kr_boundary_windows::win::{account, acl, registry, service, token};
 
 const CLEAR: &str = r#"<AppLockerPolicy Version="1"><RuleCollection Type="Exe" EnforcementMode="NotConfigured" /></AppLockerPolicy>"#;
@@ -356,16 +358,32 @@ fn removal_keeps_an_administrators_later_rule_and_the_rule_that_lets_others_run(
     let copy = folder.join("outside.exe");
     std::fs::copy(r"C:\Windows\System32\hostname.exe", &copy).unwrap();
     let ordinary = token::baseline_token(&case.name).unwrap();
-    let environment = [("SystemRoot", r"C:\Windows".to_owned())];
-    let outcome = run_as(
-        &ordinary,
-        &copy,
-        "outside.exe",
-        &folder,
-        &environment,
-        std::time::Duration::from_secs(30),
+    let environment = build_env(
+        Kind::Proof,
+        &RootPaths {
+            system: r"C:\Windows".to_owned(),
+            boundary: r"C:\Program Files\KalaReach\Boundary".to_owned(),
+            private_root: folder.display().to_string(),
+        },
+        None,
+        &QualifiedGit {
+            dir: r"C:\Program Files\Git".to_owned(),
+        },
     )
     .unwrap();
+    let outcome = run_captured(
+        Run {
+            token: TokenSpec::Boundary(&ordinary),
+            group: None,
+            program: VerifiedPath::new(&copy).unwrap(),
+            command_line: quote_command_line(&["outside.exe"]),
+            cwd: &folder,
+            env: &environment,
+        },
+        std::time::Duration::from_secs(30),
+    )
+    .unwrap()
+    .outcome;
     let _ = std::fs::remove_dir_all(&folder);
     assert_eq!(
         outcome,

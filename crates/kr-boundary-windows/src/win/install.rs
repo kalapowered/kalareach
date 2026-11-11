@@ -35,6 +35,7 @@ use super::acl;
 use super::applocker::{self, Channel};
 use super::ffi::{self, Sid};
 use super::registry;
+use super::sd::{self, Principals, SdKind};
 use super::service;
 use super::{account, pipe, token, verify};
 
@@ -587,9 +588,15 @@ pub fn install(paths: &Paths, options: &Options, repair: bool) -> Result<(), Err
 fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Error> {
     let paths = run.paths.clone();
     fs::create_dir_all(&paths.data).map_err(io_error("making the data directory"))?;
-    acl::set_protected(&paths.data, acl::ADMIN_ONLY)?;
+    acl::set_protected(
+        &paths.data,
+        &sd::descriptor(SdKind::AdminDir, &Principals::default())?,
+    )?;
     fs::create_dir_all(&paths.staging).map_err(io_error("making the staging directory"))?;
-    acl::set_protected(&paths.staging, acl::ADMIN_ONLY)?;
+    acl::set_protected(
+        &paths.staging,
+        &sd::descriptor(SdKind::AdminDir, &Principals::default())?,
+    )?;
     let channel = Channel::new(&paths.staging);
     let sweep = |staging: &Path| {
         if let Ok(entries) = fs::read_dir(staging) {
@@ -671,7 +678,16 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         None,
     )?;
     fs::create_dir_all(&paths.program).map_err(io_error("making the program directory"))?;
-    acl::set_protected(&paths.program, acl::READABLE_PROTECTED)?;
+    acl::set_protected(
+        &paths.program,
+        &sd::descriptor(
+            SdKind::AdminDir,
+            &Principals {
+                users_may_read: true,
+                ..Principals::default()
+            },
+        )?,
+    )?;
     for file in &staged {
         let target = paths.program.join(file.name);
         run.record(

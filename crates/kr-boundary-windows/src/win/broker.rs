@@ -13,10 +13,13 @@ use std::ffi::c_void;
 use std::process::ExitCode;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Once, OnceLock};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::ERROR_FAILED_SERVICE_CONTROLLER_CONNECT;
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX, SetErrorMode,
+};
 use windows_sys::Win32::System::Services::{
     RegisterServiceCtrlHandlerExW, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP,
     SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_RUNNING,
@@ -38,6 +41,34 @@ use super::token::enable_privilege;
 const MAX_CONNECTIONS: usize = 8;
 /// How long a proof may wait for the policy to bind.
 const PROOF_BOUND: Duration = Duration::from_secs(240);
+
+/// The error mode of the broker and, by inheritance, of every child it starts: the system shows no
+/// critical-error box, invokes no Windows Error Reporting for a crash, and shows no open-file box.
+const ERROR_MODE: u32 = SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX;
+
+static ERROR_MODE_SET: Once = Once::new();
+
+/// Sets the broker's error mode, once, at the start of the program. Nothing changes it afterwards:
+/// the mode belongs to the whole process, so a mode that is set and restored around a launch would
+/// leave a window in which a concurrent crash is handled by the other mode.
+///
+/// A child inherits its parent's error mode when it is created, which is how the mode reaches the
+/// programs the broker starts. **What this claims, and no more:** the system's own crash
+/// reporting is not invoked for the broker, nor for a child that inherits the mode, on the
+/// Windows builds the cases have run on. The broker's crash leaves no dump of its memory, which
+/// holds invocations' data, and a hostile Git's crash leaves none either. A process that asks for
+/// the default mode, or that writes a dump of itself, is outside the claim, and so is a computer
+/// on which an administrator configured error reporting for the broker's own program. The job's
+/// limit that ends a process on an unhandled exception is a second wall and does not keep a
+/// fail-fast from leaving a dump.
+pub fn init() {
+    ERROR_MODE_SET.call_once(|| {
+        // SAFETY: sets the process's error mode, which has no memory safety condition.
+        unsafe {
+            SetErrorMode(ERROR_MODE);
+        }
+    });
+}
 
 static STOP: OnceLock<Arc<Stop>> = OnceLock::new();
 static STATUS: OnceLock<usize> = OnceLock::new();
@@ -274,8 +305,46 @@ fn answer(mut connection: Connection, state: &State) {
     }
 }
 
+/// What the guest cases ask of a broker they start: to crash after it has set its error mode, with
+/// or without the default mode asked for again. A build that ships has no such request.
+#[cfg(feature = "testing")]
+fn crash_when_asked() {
+    let arguments: Vec<String> = std::env::args().collect();
+    let Some(kind) = arguments
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--crash-after-init="))
+    else {
+        return;
+    };
+    if arguments
+        .iter()
+        .any(|argument| argument == "--default-error-mode")
+    {
+        // SAFETY: sets the process's error mode, which has no memory safety condition.
+        unsafe {
+            SetErrorMode(0);
+        }
+    }
+    match kind {
+        // SAFETY: a deliberate access violation: the case exists to see what the system does.
+        "access-violation" => unsafe { std::ptr::write_volatile(std::ptr::null_mut::<u8>(), 1) },
+        // SAFETY: a deliberate fail-fast, for the same reason.
+        "fail-fast" => unsafe {
+            windows_sys::Win32::System::Diagnostics::Debug::RaiseFailFastException(
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            );
+        },
+        _ => {}
+    }
+}
+
 /// Runs the broker as the service the service manager started.
 pub fn main() -> ExitCode {
+    init();
+    #[cfg(feature = "testing")]
+    crash_when_asked();
     let name = wide(SERVICE);
     let table = [
         SERVICE_TABLE_ENTRYW {

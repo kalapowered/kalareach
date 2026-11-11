@@ -33,11 +33,14 @@ windows-sys = { workspace = true, features = [
     "Win32_Security_Cryptography_Catalog",
     "Win32_Security_Cryptography_Sip",
     "Win32_Security_WinTrust",
+    "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Kernel",
     "Win32_System_Memory",
     "Win32_System_Registry",
     "Win32_System_Services",
     "Win32_System_StationsAndDesktops",
+    "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
     "Win32_UI_Shell",
 ] }
@@ -58,6 +61,13 @@ path = "src/bin/kr-boundary-broker.rs"
 [[bin]]
 name = "kr-boundary-credential"
 path = "src/bin/kr-boundary-credential.rs"
+
+# The program the launch cases start as a child, a grandchild and a Git helper: it reports what it
+# inherited and crashes on request. It exists only in the guest's test builds.
+[[bin]]
+name = "kr-launch-stand-in"
+path = "src/bin/kr-launch-stand-in.rs"
+required-features = ["testing"]
 
 # The workspace forbids unsafe code, which a crate that asks the operating system for accounts,
 # services, logon tokens and processes cannot honour. This crate denies it instead and allows it in
