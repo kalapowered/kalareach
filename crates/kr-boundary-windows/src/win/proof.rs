@@ -29,7 +29,7 @@ use super::acl;
 use super::applocker;
 use super::ffi::{self, Sid};
 use super::install::Paths;
-use super::job::{Job, Limits};
+use super::job::{Ended, Job, Limits};
 use super::launch::{
     ChildSpec, LaunchError, Outcome, REFUSED_BY_POLICY, ResumePermit, Std, TokenSpec, VerifiedPath,
     launch, pipe, read_pipe,
@@ -117,6 +117,7 @@ pub fn run_captured(run: Run<'_>, bound: Duration) -> Result<Captured, LaunchErr
         },
     )?;
     let suspended = launch(ChildSpec {
+        invocation: None,
         token: run.token,
         job: &job,
         program: run.program,
@@ -129,34 +130,61 @@ pub fn run_captured(run: Run<'_>, bound: Duration) -> Result<Captured, LaunchErr
         process_descriptor: &descriptor,
         thread_descriptor: &descriptor,
     })?;
+    // The readers stop at a deadline of their own, so that a process that keeps the pipes open
+    // after the job's end is not waited for: the end is then not proved and the call says so.
+    let deadline = Instant::now() + bound + JOB_END_BOUND + READER_GRACE;
     let (result, out, err) = std::thread::scope(|scope| {
-        let out = scope.spawn(|| read_pipe(&out_read));
-        let err = scope.spawn(|| read_pipe(&err_read));
+        let out = scope.spawn(|| read_pipe(&out_read, deadline));
+        let err = scope.spawn(|| read_pipe(&err_read, deadline));
         let permit = ResumePermit::for_proof(&suspended);
         let result = match suspended.resume(permit) {
             Ok(child) => {
                 let waited = child.wait(bound);
                 // Anything the program started ends with the job, which also lets the pipes
                 // reach their end. A program still running at the bound is ended the same way.
-                job.end(&[&child], Duration::from_secs(10));
-                match waited {
-                    Ok(Some(code)) => Ok(Outcome::Ran(code)),
-                    Ok(None) => Ok(Outcome::TimedOut),
-                    Err(error) => Err(LaunchError::Platform(error)),
+                let ended = job.end(&[&child], JOB_END_BOUND);
+                if ended.proved() {
+                    match waited {
+                        Ok(Some(code)) => Ok(Outcome::Ran(code)),
+                        Ok(None) => Ok(Outcome::TimedOut),
+                        Err(error) => Err(LaunchError::Platform(error)),
+                    }
+                } else {
+                    Err(uncertain_end(&job, ended))
                 }
             }
             Err(error) => {
-                job.end(&[], Duration::from_secs(10));
-                Err(error)
+                let ended = job.end(&[], JOB_END_BOUND);
+                if ended.proved() {
+                    Err(error)
+                } else {
+                    Err(uncertain_end(&job, ended))
+                }
             }
         };
         (result, out.join(), err.join())
     });
     Ok(Captured {
         outcome: result?,
-        stdout: out.unwrap_or_default(),
-        stderr: err.unwrap_or_default(),
+        stdout: out.map(|piped| piped.bytes).unwrap_or_default(),
+        stderr: err.map(|piped| piped.bytes).unwrap_or_default(),
     })
+}
+
+/// How long a proof program's job is waited for after it is ended.
+const JOB_END_BOUND: Duration = Duration::from_secs(10);
+
+/// How long the readers go on after the end of the job, for what the pipes still hold.
+const READER_GRACE: Duration = Duration::from_secs(5);
+
+/// The error for a job that was not shown empty: the end is uncertain, the reasons are the job's
+/// own.
+fn uncertain_end(job: &Job, ended: Ended) -> LaunchError {
+    let reasons = job.unproved_reasons().join("; ");
+    LaunchError::EndUncertain(format!(
+        "a program of the proof was not shown to have ended (exited {}, job empty {}): {reasons}",
+        ended.all_exited, ended.active_zero
+    ))
 }
 
 /// The system's own Windows directory, from the platform and not from any environment.

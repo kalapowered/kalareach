@@ -29,7 +29,9 @@ use windows_sys::Win32::Security::{
     GetAce, GetAclInformation, GetSecurityDescriptorControl, ImpersonateLoggedOnUser,
     OWNER_SECURITY_INFORMATION, RevertToSelf, SECURITY_ATTRIBUTES,
 };
-use windows_sys::Win32::Storage::FileSystem::ReadFile;
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile, WriteFile,
+};
 use windows_sys::Win32::System::Diagnostics::Debug::GetErrorMode;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -45,9 +47,10 @@ use kr_boundary_windows::env::{EnvBlock, Kind, QualifiedGit, RootPaths, build_en
 use kr_boundary_windows::quote::quote_command_line;
 use kr_boundary_windows::win::ffi::{Handle, Sid, system_windows_directory};
 use kr_boundary_windows::win::job::{Job, LIMIT_FLAGS, Limits, ReadBack, State};
+use kr_boundary_windows::win::journal::{Journal, JournalError, file_name};
 use kr_boundary_windows::win::launch::{
     ChildSpec, InvocationId, LaunchError, ResumePermit, Std, SuspendedChild, TokenSpec,
-    VerifiedPath, launch, pipe,
+    VerifiedPath, launch, pipe, read_pipe, testing,
 };
 use kr_boundary_windows::win::sd::{OwnedSd, Principals, SdKind, descriptor, descriptor_from_text};
 use kr_boundary_windows::win::{account, acl, broker, token};
@@ -196,6 +199,7 @@ impl Fixture {
         let mut parts = vec![name.as_str()];
         parts.extend_from_slice(arguments);
         ChildSpec {
+            invocation: Some(INVOCATION),
             token: TokenSpec::Boundary(&self.token),
             job,
             program: VerifiedPath::new(program).unwrap(),
@@ -900,6 +904,245 @@ fn a_child_runs_only_with_the_permit_made_for_it() {
     let runs = resume(second);
     assert_eq!(runs.wait(Duration::from_secs(30)).unwrap(), Some(0));
     assert!(read_to_end(&second_output).contains("report pid="));
+}
+
+/// A copy of a process handle that outlives the child value that owns the original.
+fn copy_of(process: &Handle) -> Handle {
+    let mut copy: HANDLE = std::ptr::null_mut();
+    // SAFETY: both handles are open; the copy is owned by the value made below.
+    unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            process.raw(),
+            GetCurrentProcess(),
+            &raw mut copy,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        );
+    }
+    Handle::new(copy, "a copy of a process handle").unwrap()
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_permit_is_compared_on_the_invocation_the_process_number_and_the_creation_time_each_alone() {
+    let fixture = Fixture::new();
+    let mut job = Job::new(Limits::INVOCATION).unwrap();
+    let other = InvocationId([8; 16]);
+    // Each permit differs from the child's identity in one fact and names the rest right.
+    type Forge = fn(&SuspendedChild) -> ResumePermit;
+    let forged: [(&str, Forge); 3] = [
+        ("the invocation", |child| {
+            ResumePermit::with_identity(Some(InvocationId([8; 16])), child.pid, child.creation_time)
+        }),
+        ("the process number", |child| {
+            ResumePermit::with_identity(Some(INVOCATION), child.pid ^ 4, child.creation_time)
+        }),
+        ("the creation time", |child| {
+            ResumePermit::with_identity(Some(INVOCATION), child.pid, child.creation_time ^ 1)
+        }),
+    ];
+    assert_ne!(other, INVOCATION);
+    for (what, forge) in forged {
+        let marker = fixture
+            .dir
+            .join(format!("never-{}.txt", what.replace(' ', "-")));
+        let marker_text = marker.display().to_string();
+        let (child, _output) = fixture.start(&job, &["marker", &marker_text]);
+        let process = copy_of(&child.process);
+        let permit = forge(&child);
+        let refused = child.resume(permit);
+        assert!(
+            matches!(refused, Err(LaunchError::PermitForAnotherChild)),
+            "a permit that differs in {what} is refused"
+        );
+        // SAFETY: the copy is open.
+        assert_eq!(
+            unsafe { WaitForSingleObject(process.raw(), 30_000) },
+            WAIT_OBJECT_0,
+            "the child refused for {what} was ended"
+        );
+        assert!(!marker.exists(), "the child refused for {what} never ran");
+    }
+    // The control: a permit with all three right resumes the child.
+    let (child, output) = fixture.start(&job, &["report"]);
+    let permit = ResumePermit::with_identity(Some(INVOCATION), child.pid, child.creation_time);
+    let running = child.resume(permit).expect("the right permit resumes");
+    assert!(running.wait(Duration::from_secs(30)).unwrap().is_some());
+    drop(output);
+    job.end(&[&running], Duration::from_secs(10));
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_journal_makes_no_permit_and_writes_nothing_for_a_child_of_another_invocation() {
+    let fixture = Fixture::new();
+    let mut job = Job::new(Limits::INVOCATION).unwrap();
+    let (child, _output) = fixture.start(&job, &["sleep", "600000"]);
+    assert_eq!(child.invocation(), Some(INVOCATION));
+    let dir = fixture.dir.join("journal");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut journal = Journal::create(&dir, InvocationId([9; 16])).unwrap();
+    let refused = journal.append_process_started(&child);
+    assert!(
+        matches!(refused, Err(JournalError::OtherChild)),
+        "{refused:?}"
+    );
+    let path = dir.join(file_name(InvocationId([9; 16])));
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        0,
+        "no row was written"
+    );
+    // The control: the child's own invocation gets a permit once its row is written.
+    let mut own = Journal::create(&dir, INVOCATION).unwrap();
+    own.append(&kr_boundary_windows::journal::rows::Row::Begin {
+        invocation: hex::encode(INVOCATION.0),
+        boot_marker: "boot".to_owned(),
+        session_luid: 1,
+        group_sid: fixture.group.to_text(),
+        client_sid: fixture.sid.to_text(),
+        client_pid: 1,
+        client_creation_time: 1,
+        chain: Vec::new(),
+        tree_path: String::new(),
+    })
+    .unwrap();
+    let permit = own
+        .append_process_started(&child)
+        .expect("the child's own journal makes its permit");
+    assert_eq!(permit.invocation(), Some(INVOCATION));
+    let running = child.resume(permit).expect("the permit resumes it");
+    job.end(&[&running], Duration::from_secs(10));
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_suspended_child_that_was_not_seen_to_end_is_reported_to_the_jobs_owner() {
+    let fixture = Fixture::new();
+    let job = Job::new(Limits::INVOCATION).unwrap();
+    let (child, _output) = fixture.start(&job, &["sleep", "600000"]);
+    let process = copy_of(&child.process);
+    assert!(job.unproved_reasons().is_empty());
+    // As if the platform refused the call to end it: the child stays, and the drop's wait runs out.
+    testing::skip_next_termination();
+    drop(child);
+    // SAFETY: the copy is open.
+    assert_ne!(
+        unsafe { WaitForSingleObject(process.raw(), 0) },
+        WAIT_OBJECT_0,
+        "the process was not ended by the drop"
+    );
+    let reasons = job.unproved_reasons();
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(reasons[0].contains("not seen to end"), "{reasons:?}");
+    // Ending the job observes the job empty: that proves the end, and the report stays.
+    let mut job = job;
+    let ended = job.end(&[], Duration::from_secs(10));
+    assert!(ended.proved(), "{ended:?}");
+    assert_eq!(job.unproved_reasons().len(), 1);
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_reader_of_a_pipe_that_a_process_still_holds_open_stops_at_its_deadline() {
+    let (read, write) = pipe().unwrap();
+    let mut written = 0_u32;
+    // SAFETY: the write end is open and the buffer is the length given.
+    let ok = unsafe {
+        WriteFile(
+            write.raw(),
+            b"abc".as_ptr().cast(),
+            3,
+            &raw mut written,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(ok, 0);
+    // A writer that never closes: the reader returns at its deadline with what the pipe held.
+    let held = read_pipe(&read, Instant::now() + Duration::from_millis(300));
+    assert_eq!(held.bytes, b"abc");
+    assert!(!held.ended, "the end of a held pipe is not proved");
+    // Once every writer has closed, the end is the pipe's own.
+    drop(write);
+    let closed = read_pipe(&read, Instant::now() + Duration::from_secs(60));
+    assert!(closed.bytes.is_empty());
+    assert!(closed.ended);
+}
+
+/// The name a pipe has in the pipe namespace, from the platform.
+fn pipe_name(pipe: &Handle) -> Vec<u16> {
+    const FILE_NAME_INFO: i32 = 2;
+    let mut buffer = vec![0_u8; 1024];
+    // SAFETY: the pipe is open and the buffer is the length given.
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandleEx(
+            pipe.raw(),
+            FILE_NAME_INFO,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    assert_ne!(ok, 0, "the pipe's name can be read");
+    let length = u32::from_le_bytes(buffer[..4].try_into().unwrap()) as usize;
+    let name: Vec<u16> = buffer[4..4 + length]
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    let mut full: Vec<u16> = r"\\.\pipe".encode_utf16().collect();
+    full.extend(name);
+    full.push(0);
+    full
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_capture_pipe_has_an_explicit_descriptor_that_only_the_system_can_open() {
+    let fixture = Fixture::new();
+    let (read, _write) = pipe().unwrap();
+    let found = security_of(read.raw());
+    assert_eq!(found.owner, SYSTEM_SID);
+    assert!(found.protected, "the list takes nothing from a default");
+    assert_eq!(
+        found
+            .allowed
+            .iter()
+            .map(|(sid, _)| sid.as_str())
+            .collect::<Vec<_>>(),
+        [SYSTEM_SID],
+        "the system is the only entry"
+    );
+    // A sibling's token cannot open the pipe object by its name.
+    let name = pipe_name(&read);
+    let token = fixture.token.raw() as usize;
+    let denied = std::thread::spawn(move || {
+        // SAFETY: the token handle outlives the thread because the case joins it.
+        unsafe {
+            assert_ne!(ImpersonateLoggedOnUser(token as HANDLE), 0);
+        }
+        // SAFETY: the name is NUL-terminated.
+        let raw = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                0xC000_0000,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        let result = Handle::new(raw, "the capture pipe").map(|_| ());
+        // SAFETY: ends the impersonation this thread began.
+        unsafe {
+            RevertToSelf();
+        }
+        result.map_err(|error| error.code)
+    })
+    .join()
+    .unwrap();
+    assert_eq!(denied, Err(5), "access is denied to the sibling's token");
 }
 
 #[test]
