@@ -24,13 +24,14 @@ use futures::future::select_all;
 use iroh::endpoint::{Connection, ReadError, RecvStream, SendStream, WriteError};
 use kr_cbor::CanonicalValue;
 use kr_crypto::connect::PairedPeer;
-use kr_protocol::envelope::{ControlEvent, ControlFrame, ParamsValue};
+use kr_protocol::envelope::{ControlEvent, ControlFrame, ParamsValue, Request};
 use kr_protocol::frame::{StreamHeader, StreamKind, StreamResource};
 use kr_protocol::hello::ALPN;
 use kr_protocol::ids::{
     ActorId, AttachmentId, AuthorityRevision, ConnectionId, ControllerGeneration, DeviceId,
-    EnvironmentId, SessionId, TransferId,
+    EnvironmentId, RequestId, SessionId, TransferId,
 };
+use kr_protocol::method::Method;
 use kr_protocol::scalars::{EndpointKey, Nullable, Uuid};
 use kr_transport::codec::STREAM_REVOKED;
 use kr_transport::config::EndpointConfig;
@@ -257,9 +258,16 @@ impl HostHandler for ChunkHost {
                     self.receiver_dropped.store(true, Ordering::Release);
                     self.dropped.notify_waiters();
                     // The frames the device sends are answered with themselves, so a device can
-                    // make one round trip on the control stream.
+                    // make one round trip on the control stream. The listener's own keepalive
+                    // reaches a device at any moment, and here it comes before every answer, so
+                    // that a device that takes the first frame it reads for the answer takes the
+                    // wrong one.
                     while let Some(received) = session.control.recv().await {
                         let (frame, _) = received.into_parts();
+                        let _ = session
+                            .control
+                            .send(&ControlFrame::Event(ControlEvent::Keepalive))
+                            .await;
                         let _ = session.control.send(&frame).await;
                     }
                 }
@@ -1526,22 +1534,40 @@ async fn a_host_that_drops_its_receiver_gives_no_more_credit() {
         }
     })
     .await;
+    // The device's frame is one the host's answer can be told by: the listener sends a keepalive
+    // every ten seconds, so a keepalive of the device's own, or the first frame the host sends,
+    // would stand for an answer that has not come.
+    let probe = RequestId::new(0x5eed);
     harness
         .authorised
         .control_writer
-        .write_message(&ControlFrame::Event(ControlEvent::Keepalive))
+        .write_message(&ControlFrame::Request(Request {
+            request_id: probe,
+            method: Method::TransferStreams.into(),
+            method_version: Method::TransferStreams.entry().version,
+            params: ParamsValue::empty(),
+        }))
         .await
         .expect("the device writes to the control stream");
-    awaited(
-        "the host's answer on the control stream",
-        harness
-            .authorised
-            .control_reader
-            .read_message::<ControlFrame>(),
-    )
-    .await
-    .expect("the control stream is readable")
-    .expect("the host answers");
+    let answered = awaited("the host's answer to that frame", async {
+        loop {
+            let frame = harness
+                .authorised
+                .control_reader
+                .read_message::<ControlFrame>()
+                .await
+                .expect("the control stream is readable")
+                .expect("the host answers");
+            if matches!(&frame, ControlFrame::Request(request) if request.request_id == probe) {
+                return frame;
+            }
+        }
+    })
+    .await;
+    assert!(
+        matches!(&answered, ControlFrame::Request(request) if request.request_id == probe),
+        "the wait ended on a frame that is not the host's answer to the device's"
+    );
 
     let mut next = Box::pin(harness.connection.open_bi());
     assert!(
