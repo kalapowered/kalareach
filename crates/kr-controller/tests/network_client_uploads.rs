@@ -19,7 +19,7 @@ use kr_client::uploads::{self, Held, Progress, Stage, Subject, Upload};
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::envelope::ControlFrame;
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ProtocolError;
 use kr_protocol::frame::StreamHeader;
 use kr_protocol::hello::{ActionWindow, ReceiveLimits};
 use kr_protocol::ids::{ActionId, ConnectionId, SessionId, TransferId};
