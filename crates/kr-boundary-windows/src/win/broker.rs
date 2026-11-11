@@ -14,7 +14,7 @@ use std::process::ExitCode;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Once, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::ERROR_FAILED_SERVICE_CONTROLLER_CONNECT;
 use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -39,9 +39,11 @@ use super::token::enable_privilege;
 
 /// The most connections served at once.
 const MAX_CONNECTIONS: usize = 8;
-/// How long a proof may wait for the platform's refusal and for the log's event that names the rule:
-/// the log names it about 170 s after the start of Windows.
-const PROOF_BOUND: Duration = Duration::from_secs(300);
+/// How long after the broker's start the proofs it is asked for may take, all together: the log
+/// names the rule about 170 s after the start of Windows. The deadline is one absolute time, and
+/// every wait and every program of a proof stays within it. A request that comes after it begins a
+/// window of the same length, for a rerun.
+pub const PROOF_BOUND: Duration = Duration::from_secs(300);
 
 /// The error mode of the broker and, by inheritance, of every child it starts: the system shows no
 /// critical-error box, invokes no Windows Error Reporting for a crash, and shows no open-file box.
@@ -133,6 +135,23 @@ struct State {
     paths: Paths,
     maintenance: AtomicBool,
     stop: Arc<Stop>,
+    /// When the broker began serving.
+    started: Instant,
+}
+
+impl State {
+    /// The deadline of a proof that is asked for now: the one that ends [`PROOF_BOUND`] after the
+    /// broker's start while that is still ahead, so that the proofs of both classes share it, and a
+    /// window of the same length from now when it has passed.
+    fn proof_deadline(&self) -> Instant {
+        let window = self.started + PROOF_BOUND;
+        let now = Instant::now();
+        if now < window {
+            window
+        } else {
+            now + PROOF_BOUND
+        }
+    }
 }
 
 fn report(state: u32, exit_code: u32, wait_hint: u32) {
@@ -220,6 +239,7 @@ fn serve() -> Result<(), String> {
         paths,
         maintenance: AtomicBool::new(false),
         stop: Arc::clone(&stop),
+        started: Instant::now(),
     });
     report(SERVICE_RUNNING, 0, 0);
     run(&mut listener, &state)
@@ -289,6 +309,7 @@ pub mod testing {
             paths,
             maintenance: AtomicBool::new(false),
             stop,
+            started: std::time::Instant::now(),
         });
         run(&mut listener, &state)
     }
@@ -386,7 +407,7 @@ fn answer(mut connection: Connection, state: &State) {
                     &state.manifest,
                     class,
                     &state.paths.staging,
-                    PROOF_BOUND,
+                    state.proof_deadline(),
                     &state.stop,
                 );
                 Response::Proof {
@@ -399,7 +420,7 @@ fn answer(mut connection: Connection, state: &State) {
                     &state.manifest,
                     class,
                     &state.paths.staging,
-                    PROOF_BOUND,
+                    Instant::now() + PROOF_BOUND,
                     &state.stop,
                 );
                 Response::Proof {

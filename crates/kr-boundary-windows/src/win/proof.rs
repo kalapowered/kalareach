@@ -13,8 +13,11 @@
 //!
 //! The policy binds a moment after it is written, and how long that takes was not the same twice
 //! on the guest it was measured on, so the first question is asked again until the platform
-//! answers it. The wait ends on the platform's own answer or on a bound; a bound that runs out is
-//! a proof that did not succeed, not a pass.
+//! answers it. The wait ends on the platform's own answer or on an absolute deadline, which every
+//! wait, every query of the log and every program of the proof stays within and which is checked
+//! again before a success is taken; a deadline that runs out is a proof that did not succeed, not a
+//! pass. An unlisted program that runs after an earlier refusal fails the proof: the refusal the
+//! log names would then belong to an enforcement that has stopped.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -40,6 +43,19 @@ use super::token::{boundary_token, new_invocation_group};
 
 /// How long the proof waits between two launches of the unlisted program.
 const LAUNCH_EVERY: Duration = Duration::from_secs(2);
+
+/// The longest one program of the proof may run, when the deadline leaves that long.
+const PROGRAM_BOUND: Duration = Duration::from_secs(30);
+
+/// How much of the time before the deadline is left, or the proof's failure when none is.
+fn left_before(deadline: Instant) -> Result<Duration, Proof> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        Err(fail("the proof's deadline passed"))
+    } else {
+        Ok(left)
+    }
+}
 
 /// The result of a proof.
 pub struct Proof {
@@ -269,13 +285,85 @@ impl Drop for Scratch {
     }
 }
 
-/// Proves that the policy refuses an unlisted program to a class's token and runs a listed one.
+/// What one launch of the unlisted program showed.
+enum Seen {
+    /// The policy refused it.
+    Refused,
+    /// It ran, with nothing refused before: the policy may not bind yet. The text says how it ended.
+    Ran(String),
+}
+
+/// What the proof makes of one launch of the unlisted program. A launch that runs after an earlier
+/// refusal fails the proof: the policy has stopped refusing, so a refusal that the log names late
+/// belongs to enforcement that is no longer in force.
+fn judge_launch(
+    launched: Result<Captured, LaunchError>,
+    refused_before: bool,
+    account: &str,
+    attempts: u32,
+) -> Result<Seen, Proof> {
+    match launched {
+        Err(LaunchError::NotStarted(code)) if code == REFUSED_BY_POLICY => Ok(Seen::Refused),
+        Err(LaunchError::NotStarted(code)) => Err(fail(format!(
+            "the unlisted program could not be started for {account}, with error {code} and not the policy's {REFUSED_BY_POLICY}"
+        ))),
+        Ok(Captured {
+            outcome: Outcome::Ran(code),
+            stdout,
+            stderr,
+        }) => {
+            let text = format!(
+                "it ended with {code} after writing {} and {} bytes",
+                stdout.len(),
+                stderr.len()
+            );
+            if refused_before {
+                Err(fail(format!(
+                    "the unlisted program ran for {account} after it was refused ({attempts} launches; {text})"
+                )))
+            } else {
+                Ok(Seen::Ran(text))
+            }
+        }
+        Ok(Captured {
+            outcome: Outcome::TimedOut,
+            ..
+        }) => Err(fail("the unlisted program ran for its whole bound")),
+        Err(error) => Err(fail(error.to_string())),
+    }
+}
+
+/// What the cases use to judge a launch as the proof does.
+#[cfg(feature = "testing")]
+pub mod testing {
+    use super::{Captured, LaunchError, Seen, judge_launch};
+
+    /// Judges one launch of the unlisted program: `Ok(true)` when it was refused, `Ok(false)` when
+    /// it ran with nothing refused before, and the failure's text when the proof fails on it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the proof's failure text.
+    pub fn judge(
+        launched: Result<Captured, LaunchError>,
+        refused_before: bool,
+    ) -> Result<bool, String> {
+        match judge_launch(launched, refused_before, "the account", 1) {
+            Ok(Seen::Refused) => Ok(true),
+            Ok(Seen::Ran(_)) => Ok(false),
+            Err(failed) => Err(failed.detail),
+        }
+    }
+}
+
+/// Proves that the policy refuses an unlisted program to a class's token and runs a listed one,
+/// all before the deadline.
 #[must_use]
 pub fn prove(
     manifest: &Manifest,
     class: Class,
     staging: &Path,
-    bound: Duration,
+    deadline: Instant,
     stop: &Stop,
 ) -> Proof {
     let Some((account, sid)) = account_of(manifest, class) else {
@@ -311,7 +399,7 @@ pub fn prove(
         Ok(environment) => environment,
         Err(reason) => return fail(reason),
     };
-    let record = match applocker::newest_record(&scratch.0, &environment) {
+    let record = match applocker::newest_record(&scratch.0, &environment, deadline) {
         Ok(record) => record,
         Err(error) => return fail(error.to_string()),
     };
@@ -328,75 +416,73 @@ pub fn prove(
         if stop.is_set() {
             return fail("the service is stopping");
         }
+        let left = match left_before(deadline) {
+            Ok(left) => left,
+            Err(failed) => return failed,
+        };
         attempts += 1;
-        match run_program(
+        let launched = run_program(
             TokenSpec::Boundary(&token),
             Some(&group),
             &unlisted,
             &[],
             &scratch.0,
             &environment,
-            Duration::from_secs(30),
-        ) {
-            Err(LaunchError::NotStarted(code)) if code == REFUSED_BY_POLICY => {
+            left.min(PROGRAM_BOUND),
+        );
+        match judge_launch(launched, refused, &account, attempts) {
+            Ok(Seen::Refused) => {
                 refused = true;
                 last = format!("it was refused with {REFUSED_BY_POLICY}");
             }
-            Err(LaunchError::NotStarted(code)) => {
-                return fail(format!(
-                    "the unlisted program could not be started for {account}, with error {code} and not the policy's {REFUSED_BY_POLICY}"
-                ));
-            }
-            Ok(Captured {
-                outcome: Outcome::Ran(code),
-                stdout,
-                stderr,
-            }) => {
-                last = format!(
-                    "it ended with {code} after writing {} and {} bytes",
-                    stdout.len(),
-                    stderr.len()
-                );
-            }
-            Ok(Captured {
-                outcome: Outcome::TimedOut,
-                ..
-            }) => return fail("the unlisted program ran for 30 seconds"),
-            Err(error) => return fail(error.to_string()),
+            Ok(Seen::Ran(text)) => last = text,
+            Err(failed) => return failed,
         }
         if refused {
-            match applocker::blocked_after(record, &scratch.0, &environment) {
+            match applocker::blocked_after(record, &scratch.0, &environment, deadline) {
                 Ok(events) => {
                     if events.iter().any(|event| {
                         event.rule_id == rule
                             && event.user.eq_ignore_ascii_case(&sid)
                             && same_path(&event.path, &unlisted)
                     }) {
+                        // The evidence counts only if it was in hand before the deadline.
+                        if let Err(failed) = left_before(deadline) {
+                            return failed;
+                        }
                         break;
                     }
                 }
                 Err(error) => return fail(error.to_string()),
             }
         }
-        if started.elapsed() >= bound {
-            let log = applocker::latest(&scratch.0, &environment)
-                .unwrap_or_else(|error| format!("unreadable: {error}"));
+        if Instant::now() >= deadline {
+            let log = applocker::latest(
+                &scratch.0,
+                &environment,
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap_or_else(|error| format!("unreadable: {error}"));
             let seen = if refused {
                 "refused, but the log named no rule"
             } else {
                 "not refused"
             };
             return fail(format!(
-                "the policy did not show a refusal of the unlisted program to {account} by rule {rule} in {} seconds ({seen}; {attempts} launches; the last: {last}; the application-control log last said: {log})",
-                bound.as_secs()
+                "the policy did not show a refusal of the unlisted program to {account} by rule {rule} before the proof's deadline ({seen}; {attempts} launches in {:.0} s; the last: {last}; the application-control log last said: {log})",
+                started.elapsed().as_secs_f32()
             ));
         }
-        std::thread::sleep(LAUNCH_EVERY);
+        std::thread::sleep(LAUNCH_EVERY.min(deadline.saturating_duration_since(Instant::now())));
     }
     let git_exe = Path::new(&git.dir)
         .join("mingw64")
         .join("bin")
         .join("git.exe");
+    let left = match left_before(deadline) {
+        Ok(left) => left,
+        Err(failed) => return failed,
+    };
     match run_program(
         TokenSpec::Boundary(&token),
         Some(&group),
@@ -404,7 +490,7 @@ pub fn prove(
         &["--version"],
         &scratch.0,
         &environment,
-        Duration::from_secs(30),
+        left.min(PROGRAM_BOUND),
     ) {
         Ok(Captured {
             outcome: Outcome::Ran(0),
@@ -418,6 +504,10 @@ pub fn prove(
         }
         Err(error) => return fail(error.to_string()),
     }
+    let left = match left_before(deadline) {
+        Ok(left) => left,
+        Err(failed) => return failed,
+    };
     match run_program(
         TokenSpec::Own,
         None,
@@ -425,7 +515,7 @@ pub fn prove(
         &[],
         &scratch.0,
         &environment,
-        Duration::from_secs(30),
+        left.min(PROGRAM_BOUND),
     ) {
         Ok(Captured {
             outcome: Outcome::Ran(0),
@@ -443,6 +533,10 @@ pub fn prove(
             ));
         }
     }
+    // A success is taken only before the deadline.
+    if let Err(failed) = left_before(deadline) {
+        return failed;
+    }
     Proof {
         ready: true,
         detail: format!(
@@ -452,13 +546,13 @@ pub fn prove(
     }
 }
 
-/// Proves that a program the policy refused runs again for a class's token.
+/// Proves that a program the policy refused runs again for a class's token, before the deadline.
 #[must_use]
 pub fn release(
     manifest: &Manifest,
     class: Class,
     staging: &Path,
-    bound: Duration,
+    deadline: Instant,
     stop: &Stop,
 ) -> Proof {
     let Some((account, _)) = account_of(manifest, class) else {
@@ -486,6 +580,10 @@ pub fn release(
         if stop.is_set() {
             return fail("the service is stopping");
         }
+        let left = match left_before(deadline) {
+            Ok(left) => left,
+            Err(failed) => return failed,
+        };
         attempts += 1;
         match run_program(
             TokenSpec::Boundary(&token),
@@ -494,12 +592,15 @@ pub fn release(
             &["/c", "exit", "0"],
             staging,
             &environment,
-            Duration::from_secs(30),
+            left.min(PROGRAM_BOUND),
         ) {
             Ok(Captured {
                 outcome: Outcome::Ran(0),
                 ..
             }) => {
+                if let Err(failed) = left_before(deadline) {
+                    return failed;
+                }
                 return Proof {
                     ready: true,
                     detail: format!(
@@ -512,12 +613,14 @@ pub fn release(
             Ok(other) => return fail(format!("cmd.exe for {account}: {:?}", other.outcome)),
             Err(error) => return fail(error.to_string()),
         }
-        if started.elapsed() >= bound {
+        if Instant::now() >= deadline {
             return fail(format!(
-                "cmd.exe is still refused to {account} after {} seconds ({attempts} launches)",
-                bound.as_secs()
+                "cmd.exe is still refused to {account} after {:.0} seconds ({attempts} launches)",
+                started.elapsed().as_secs_f32()
             ));
         }
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(
+            Duration::from_secs(1).min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
 }

@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::env::EnvBlock;
 use crate::events::{self, LogEvent};
@@ -184,9 +184,24 @@ impl Channel {
     }
 }
 
-/// Runs the event log tool with the arguments and returns what it wrote.
-fn wevtutil(arguments: &[&str], scratch: &Path, env: &EnvBlock) -> Result<String, Error> {
+/// The longest one query of the event log may take, when the deadline leaves that long.
+const QUERY_BOUND: Duration = Duration::from_secs(60);
+
+/// Runs the event log tool with the arguments and returns what it wrote. The query runs no longer
+/// than the time left before the deadline, and none starts after it.
+fn wevtutil(
+    arguments: &[&str],
+    scratch: &Path,
+    env: &EnvBlock,
+    deadline: Instant,
+) -> Result<String, Error> {
     let what = "the event log query";
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(Error::Unreadable(
+            "the deadline passed before the event log was asked".to_owned(),
+        ));
+    }
     let program = system_root().join("System32").join("wevtutil.exe");
     let name = program.display().to_string();
     let mut parts = vec![name.as_str()];
@@ -202,7 +217,7 @@ fn wevtutil(arguments: &[&str], scratch: &Path, env: &EnvBlock) -> Result<String
             cwd: scratch,
             env,
         },
-        Duration::from_secs(60),
+        remaining.min(QUERY_BOUND),
     )
     .map_err(launch_error)?;
     let text = String::from_utf8_lossy(&captured.stdout).into_owned();
@@ -220,10 +235,15 @@ fn wevtutil(arguments: &[&str], scratch: &Path, env: &EnvBlock) -> Result<String
     }
 }
 
-fn query(extra: &[&str], scratch: &Path, env: &EnvBlock) -> Result<Vec<LogEvent>, Error> {
+fn query(
+    extra: &[&str],
+    scratch: &Path,
+    env: &EnvBlock,
+    deadline: Instant,
+) -> Result<Vec<LogEvent>, Error> {
     let mut arguments = vec!["qe", LOG, "/f:xml", "/e:Events"];
     arguments.extend_from_slice(extra);
-    let text = wevtutil(&arguments, scratch, env)?;
+    let text = wevtutil(&arguments, scratch, env, deadline)?;
     events::parse(&text).map_err(|error| Error::Unreadable(error.to_string()))
 }
 
@@ -232,8 +252,13 @@ fn query(extra: &[&str], scratch: &Path, env: &EnvBlock) -> Result<Vec<LogEvent>
 /// # Errors
 ///
 /// Returns an error when the query fails.
-pub fn latest(scratch: &Path, env: &EnvBlock) -> Result<String, Error> {
-    let text = wevtutil(&["qe", LOG, "/c:3", "/rd:true", "/f:text"], scratch, env)?;
+pub fn latest(scratch: &Path, env: &EnvBlock, deadline: Instant) -> Result<String, Error> {
+    let text = wevtutil(
+        &["qe", LOG, "/c:3", "/rd:true", "/f:text"],
+        scratch,
+        env,
+        deadline,
+    )?;
     let words: Vec<&str> = text.split_whitespace().collect();
     let flat = words.join(" ");
     Ok(if flat.is_empty() {
@@ -249,8 +274,8 @@ pub fn latest(scratch: &Path, env: &EnvBlock) -> Result<String, Error> {
 /// # Errors
 ///
 /// Returns an error when the query fails or its answer cannot be read.
-pub fn newest_record(scratch: &Path, env: &EnvBlock) -> Result<u64, Error> {
-    let events = query(&["/c:1", "/rd:true"], scratch, env)?;
+pub fn newest_record(scratch: &Path, env: &EnvBlock, deadline: Instant) -> Result<u64, Error> {
+    let events = query(&["/c:1", "/rd:true"], scratch, env, deadline)?;
     Ok(events.iter().map(|event| event.record).max().unwrap_or(0))
 }
 
@@ -259,29 +284,17 @@ pub fn newest_record(scratch: &Path, env: &EnvBlock) -> Result<u64, Error> {
 /// # Errors
 ///
 /// Returns an error when the query fails or its answer cannot be read.
-pub fn policy_applied_after(record: u64, scratch: &Path, env: &EnvBlock) -> Result<bool, Error> {
+pub fn policy_applied_after(
+    record: u64,
+    scratch: &Path,
+    env: &EnvBlock,
+    deadline: Instant,
+) -> Result<bool, Error> {
     let filter = format!(
         "/q:*[System[(EventID={}) and (EventRecordID>{record})]]",
         events::APPLIED
     );
-    Ok(!query(&[&filter, "/c:1"], scratch, env)?.is_empty())
-}
-
-/// Whether the log holds the platform's "policy applied" event from the last `milliseconds`.
-///
-/// # Errors
-///
-/// Returns an error when the query fails or its answer cannot be read.
-pub fn policy_applied_within(
-    milliseconds: u64,
-    scratch: &Path,
-    env: &EnvBlock,
-) -> Result<bool, Error> {
-    let filter = format!(
-        "/q:*[System[(EventID={}) and TimeCreated[timediff(@SystemTime) <= {milliseconds}]]]",
-        events::APPLIED
-    );
-    Ok(!query(&[&filter, "/c:1"], scratch, env)?.is_empty())
+    Ok(!query(&[&filter, "/c:1"], scratch, env, deadline)?.is_empty())
 }
 
 /// The refusals the log has recorded after a record number.
@@ -289,10 +302,15 @@ pub fn policy_applied_within(
 /// # Errors
 ///
 /// Returns an error when the query fails or its answer cannot be read.
-pub fn blocked_after(record: u64, scratch: &Path, env: &EnvBlock) -> Result<Vec<LogEvent>, Error> {
+pub fn blocked_after(
+    record: u64,
+    scratch: &Path,
+    env: &EnvBlock,
+    deadline: Instant,
+) -> Result<Vec<LogEvent>, Error> {
     let filter = format!(
         "/q:*[System[(EventID={}) and (EventRecordID>{record})]]",
         events::BLOCKED
     );
-    query(&[&filter], scratch, env)
+    query(&[&filter], scratch, env, deadline)
 }
