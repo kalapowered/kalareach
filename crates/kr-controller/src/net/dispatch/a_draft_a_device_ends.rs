@@ -28,12 +28,24 @@ use super::write_boundary::paired_connection;
 use crate::service::a_close_a_worker_never_answers as fake;
 use crate::transfer::DEVICE_OPEN_DRAFTS;
 
-/// A `draft.discard` of `draft_id` on `connection`.
+/// A `draft.discard` of `draft_id` on `connection`, for a draft that names no session.
 fn discard(
     world: &fake::Silent,
     connection: &super::RemoteConnection,
     request_id: u64,
     draft_id: DraftId,
+) -> MutationRequest {
+    discard_naming(world, connection, request_id, draft_id, None)
+}
+
+/// A `draft.discard` of `draft_id` on `connection`, naming `session`: a draft written for a session
+/// is written only by a request that names it.
+fn discard_naming(
+    world: &fake::Silent,
+    connection: &super::RemoteConnection,
+    request_id: u64,
+    draft_id: DraftId,
+    session: Option<SessionId>,
 ) -> MutationRequest {
     write_naming(
         world,
@@ -41,7 +53,7 @@ fn discard(
         Method::DraftDiscard,
         request_id,
         &DraftDiscardParams { draft_id },
-        None,
+        session,
     )
 }
 
@@ -119,14 +131,15 @@ async fn an_ended_draft_frees_its_place_at_once() {
     for _ in 1..DEVICE_OPEN_DRAFTS {
         a_draft_for(&world, &device, None);
     }
+    let session = world.session_id;
     let create = |request_id: u64| {
         write_naming(
             &world,
             &connection,
             Method::DraftCreate,
             request_id,
-            &create_params(&world, None, None, "one more"),
-            None,
+            &create_params(&world, Some(session), None, "one more"),
+            Some(session),
         )
     };
 
@@ -147,15 +160,21 @@ async fn an_ended_draft_frees_its_place_at_once() {
                 &another,
                 Method::DraftCreate,
                 1,
-                &create_params(&world, None, None, "the other device's"),
-                None,
+                &create_params(&world, Some(session), None, "the other device's"),
+                Some(session),
             ))
             .await,
     );
 
     let _: DraftDiscardResult = result_of(
         &connection
-            .mutate(&discard(&world, &connection, 3, last.draft.draft_id))
+            .mutate(&discard_naming(
+                &world,
+                &connection,
+                3,
+                last.draft.draft_id,
+                Some(session),
+            ))
             .await,
     );
     let _: DraftCreateResult = result_of(&connection.mutate(&create(4)).await);
@@ -279,14 +298,15 @@ async fn a_create_is_served_once_the_agent_has_taken_the_files_of_a_draft() {
     for _ in 1..DEVICE_OPEN_DRAFTS {
         a_draft_for(&world, &device, None);
     }
+    let session = world.session_id;
     let create = |request_id: u64| {
         write_naming(
             &world,
             &connection,
             Method::DraftCreate,
             request_id,
-            &create_params(&world, None, None, "one more"),
-            None,
+            &create_params(&world, Some(session), None, "one more"),
+            Some(session),
         )
     };
     assert_eq!(

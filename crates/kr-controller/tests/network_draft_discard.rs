@@ -10,7 +10,9 @@ mod net_support;
 
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{ActionId, AgentBindingRevision, ApplicationInstanceId, DraftRevision};
+use kr_protocol::ids::{
+    ActionId, AgentBindingRevision, ApplicationInstanceId, DraftRevision, SessionId,
+};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Nullable;
@@ -18,13 +20,15 @@ use kr_protocol::transfer::{
     DraftCreateParams, DraftCreateResult, DraftDiscardParams, DraftDiscardResult,
     DraftUpdateParams, DraftUpdateResult,
 };
-use net_support::{Device, Host, RawDevice, an_open_session, on_the_host, on_the_session};
+use net_support::{Device, Host, RawDevice, an_open_session, on_the_session};
 
-fn draft_params(host: &Host, text: &str) -> DraftCreateParams {
+/// The parameters of a draft written for `session`, which is what a paired device makes: a device's
+/// draft names the session it is for.
+fn draft_params(host: &Host, session: SessionId, text: &str) -> DraftCreateParams {
     DraftCreateParams {
         environment_id: host.environment_id,
         device_id: Nullable::null(),
-        session_id: Nullable::null(),
+        session_id: Nullable::some(session),
         application_instance_id: Nullable::null(),
         text: text.to_owned(),
     }
@@ -39,6 +43,7 @@ fn draft_params(host: &Host, text: &str) -> DraftCreateParams {
 async fn a_repeat_of_a_discard_on_a_replacement_connection_is_answered_from_its_record() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
+    let (session_id, _) = an_open_session(&host);
     let device = Device::create().await;
     let record = net_support::pair_with(
         &host,
@@ -47,7 +52,7 @@ async fn a_repeat_of_a_discard_on_a_replacement_connection_is_answered_from_its_
         net_support::proposal(&[ActionRight::SessionView]),
     )
     .await;
-    let target = on_the_host(&host);
+    let target = on_the_session(&host, session_id);
 
     let first = RawDevice::connect(&host, &device, &record).await;
     first.claim();
@@ -56,7 +61,7 @@ async fn a_repeat_of_a_discard_on_a_replacement_connection_is_answered_from_its_
             Method::DraftCreate,
             ActionId::new(kr_ipc::new_uuid()),
             target.clone(),
-            &draft_params(&host, "to be ended"),
+            &draft_params(&host, session_id, "to be ended"),
         )
         .await
         .expect("the device makes a draft")
@@ -131,6 +136,7 @@ async fn a_repeat_of_a_discard_on_a_replacement_connection_is_answered_from_its_
 async fn a_stale_update_tells_the_device_the_current_revision_as_the_service_wrote_it() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
+    let (session_id, _) = an_open_session(&host);
     let device = Device::create().await;
     let record = net_support::pair_with(
         &host,
@@ -139,7 +145,7 @@ async fn a_stale_update_tells_the_device_the_current_revision_as_the_service_wro
         net_support::proposal(&[ActionRight::SessionView]),
     )
     .await;
-    let target = on_the_host(&host);
+    let target = on_the_session(&host, session_id);
     let raw = RawDevice::connect(&host, &device, &record).await;
     raw.claim();
 
@@ -148,7 +154,7 @@ async fn a_stale_update_tells_the_device_the_current_revision_as_the_service_wro
             Method::DraftCreate,
             ActionId::new(kr_ipc::new_uuid()),
             target.clone(),
-            &draft_params(&host, "first"),
+            &draft_params(&host, session_id, "first"),
         )
         .await
         .expect("the device makes a draft")
@@ -211,14 +217,16 @@ async fn a_draft_written_for_an_application_is_ended_by_a_request_that_names_it(
     raw.claim();
 
     let application = ApplicationInstanceId::new(kr_ipc::new_uuid());
-    let mut params = draft_params(&host, "for an application");
-    params.session_id = Nullable::some(session_id);
+    let mut params = draft_params(&host, session_id, "for an application");
     params.application_instance_id = Nullable::some(application);
+    let mut naming = target.clone();
+    naming.application_instance_id = Nullable::some(application);
+    naming.agent_binding_revision = Nullable::some(AgentBindingRevision::new(1));
     let made: DraftCreateResult = raw
         .mutate(
             Method::DraftCreate,
             ActionId::new(kr_ipc::new_uuid()),
-            target.clone(),
+            naming.clone(),
             &params,
         )
         .await
@@ -244,9 +252,6 @@ async fn a_draft_written_for_an_application_is_ended_by_a_request_that_names_it(
         "{naming_none:?}"
     );
 
-    let mut naming = target;
-    naming.application_instance_id = Nullable::some(application);
-    naming.agent_binding_revision = Nullable::some(AgentBindingRevision::new(1));
     let ended: DraftDiscardResult = raw
         .mutate(
             Method::DraftDiscard,
