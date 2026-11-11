@@ -8,7 +8,8 @@ use kr_boundary_windows::operation::state::{
 use kr_boundary_windows::refusal::Refusal;
 use kr_boundary_windows::repository::head::HeadKind;
 use kr_boundary_windows::repository::readers::{
-    Output, RULE_READER_DEADLINE, RULE_READER_FRAMING, RULE_UNRESOLVED, Symbolic, parse_r1,
+    Exists, Output, RULE_READER_DEADLINE, RULE_READER_EXIT, RULE_READER_FRAMING, Symbolic,
+    parse_r1c,
 };
 
 const OID: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -149,36 +150,43 @@ fn a_symbolic_reference_is_refused_by_name() {
     assert_eq!(refusal.detail(), "symbolic ref refs/heads/a");
 }
 
-fn lookup(exit: Option<u32>, stdout: &[u8]) -> Result<String, Refusal> {
-    parse_r1(&Output { exit, stdout }, "refs/tags/main")
+fn lookup(exit: Option<u32>, stdout: &[u8]) -> Result<Exists, Refusal> {
+    parse_r1c(&Output { exit, stdout })
 }
 
 #[test]
 fn a_tag_of_the_same_name_makes_a_branch_name_ambiguous() {
-    let answer = format!("{OID}\n");
-    let refusal = check_no_tag("main", &lookup(Some(0), answer.as_bytes())).unwrap_err();
+    // Exit 0 is a tag that exists, whatever it names: Git answers the same for a tag of a commit,
+    // of a blob and of a tree.
+    let refusal = check_no_tag("main", &lookup(Some(0), b"")).unwrap_err();
     assert_eq!(refusal.kind, RefusedKind::Operation);
     assert_eq!(refusal.rule, RULE_AMBIGUOUS_NAME);
     assert_eq!(refusal.detail(), "ambiguous name main");
 }
 
 #[test]
-fn no_tag_of_that_name_is_a_lookup_that_found_nothing() {
-    for code in [1, 128] {
-        let result = lookup(Some(code), b"");
-        assert_eq!(result.as_ref().unwrap_err().rule, RULE_UNRESOLVED);
-        assert!(check_no_tag("main", &result).is_ok(), "{code}");
-    }
+fn no_tag_of_that_name_is_exit_2_with_nothing_printed() {
+    assert!(check_no_tag("main", &lookup(Some(2), b"")).is_ok());
 }
 
 #[test]
-fn a_lookup_that_failed_for_another_reason_is_returned_as_it_is() {
+fn a_lookup_that_did_not_find_nothing_is_never_taken_for_no_tag() {
+    // A crash code, a fatal error, a failed lookup and an undocumented code are refusals of the
+    // reader's own name, and so is partial output beside the one code that proves absence.
+    for code in [1, 3, 128, 255, 3_221_225_781] {
+        let result = lookup(Some(code), b"");
+        let refusal = check_no_tag("main", &result).unwrap_err();
+        assert_eq!(refusal.rule, RULE_READER_EXIT, "{code}");
+        assert_eq!(refusal, result.unwrap_err());
+    }
+    for stdout in [&b"\n"[..], b"x", b"refs/tags/main\n"] {
+        let result = lookup(Some(2), stdout);
+        let refusal = check_no_tag("main", &result).unwrap_err();
+        assert_eq!(refusal.rule, RULE_READER_FRAMING, "{stdout:?}");
+        assert_eq!(refusal, result.unwrap_err());
+    }
     let deadline = lookup(None, b"");
     let refusal = check_no_tag("main", &deadline).unwrap_err();
     assert_eq!(refusal.rule, RULE_READER_DEADLINE);
     assert_eq!(refusal, deadline.unwrap_err());
-    let cut = lookup(Some(0), b"not an identifier\n");
-    let refusal = check_no_tag("main", &cut).unwrap_err();
-    assert_eq!(refusal.rule, RULE_READER_FRAMING);
-    assert_eq!(refusal, cut.unwrap_err());
 }
