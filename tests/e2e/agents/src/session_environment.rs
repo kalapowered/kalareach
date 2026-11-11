@@ -49,6 +49,9 @@ const NAME_CHARACTERS: usize = 60;
 /// How a failure begins when the shell's environment is not as the harness gave it.
 pub const NOT_AS_GIVEN: &str = "the session's environment is not as the harness gave it:";
 
+/// How the line a pass prints begins.
+pub const PASSED: &str = "the session's environment, read at its prompt before the first typing:";
+
 /// How a failure begins when the answer could not be read whole.
 pub const NOT_READ_WHOLE: &str =
     "the session's environment could not be read whole before the first typing:";
@@ -226,6 +229,17 @@ impl Expected {
             "e=(${{(ko)parameters[(R)*export*]}}); for n in ${{e[{first},{last}]}}; do \
              print -r -- \"{ROW} exported $n\"; done; print -r -- \"{ROW} total ${{#e}}\"; \
              unset e n; print -r -- \"{ROW} end {tag}\""
+        )
+    }
+
+    /// The line a pass prints, so that a log shows the check ran and what it compared: the names
+    /// compared, `ok`, and how many names the shell exports. Never a value and never a digest.
+    #[must_use]
+    pub fn passed_line(&self, exported: usize) -> String {
+        format!(
+            "{PASSED} ok: {} ({} names compared, {exported} exported names read)",
+            self.names().join(", "),
+            self.kept.len()
         )
     }
 
@@ -703,6 +717,31 @@ mod tests {
             read_exported(7, &wide).is_err(),
             "a wrapped row is not a name"
         );
+    }
+
+    #[test]
+    fn a_pass_prints_the_names_it_compared_and_ok_and_no_value_and_no_digest() {
+        let expected = expected(&[], &[]);
+        let line = expected.passed_line(12);
+        assert!(line.starts_with(PASSED), "{line}");
+        assert!(line.contains(": ok: ") && !line.contains('\n'), "{line}");
+        assert!(
+            line.ends_with("(4 names compared, 12 exported names read)"),
+            "{line}"
+        );
+        for name in ["CODEX_HOME", "E2E_RUN_MARK", "HOME", "PROVIDER_LOGIN"] {
+            assert!(line.contains(name), "{name} is in {line}");
+        }
+        for (name, value) in &the_list() {
+            assert!(
+                !line.contains(value.as_str()),
+                "the value of {name} is in {line}"
+            );
+            assert!(
+                !line.contains(&digest("run-1", name, value)),
+                "the digest of {name} is in {line}"
+            );
+        }
     }
 
     #[test]
