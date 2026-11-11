@@ -20,6 +20,9 @@
 //! | [`env`] | The environment of every child, built from a fixed table and nothing of the caller's |
 //! | [`quote`] | A child's command line, quoted so that the platform's own splitting gives back its parts |
 //! | [`journal`] | The framing of the journal's records: a length, the bytes and a checksum, with a torn tail dropped |
+//! | [`repository`] | What the broker reads of a repository before it starts Git, from bytes alone: its `HEAD`, its attributes and its configuration listing |
+//! | [`refusal`] | The refusal those readers give: a kind, the rule's name and a short text |
+//! | [`names`] | The grammar of the branch names and object identifiers the broker admits |
 //! | [`state`] | What the doctor says in each state of the installation |
 //!
 //! The calls that touch the machine live in `win`, which builds on Windows only. Everything above
@@ -48,9 +51,12 @@ pub mod filekey;
 pub mod frame;
 pub mod journal;
 pub mod manifest;
+pub mod names;
 pub mod notice;
 pub mod policy;
 pub mod quote;
+pub mod refusal;
+pub mod repository;
 pub mod state;
 
 #[cfg(windows)]
