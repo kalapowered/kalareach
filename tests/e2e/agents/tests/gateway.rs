@@ -3021,6 +3021,134 @@ fn gateway_a_stand_in_the_agent_replaced_is_not_run_by_the_next_start() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// A child the agent leaves running outside its process group.
+// ---------------------------------------------------------------------------------------------
+
+/// The child the cases below start: this test executable, which runs the test that follows and
+/// sleeps. Its own environment is shown by the system on every platform; the system's own
+/// protected programs (`sleep`, `sh`) show none on macOS.
+#[test]
+#[ignore = "started by the cases that leave a child behind"]
+fn a_sleeper_the_cases_that_leave_a_child_start() {
+    if std::env::var_os("KR_E2E_SLEEPER").is_some() {
+        std::thread::sleep(Duration::from_secs(300));
+    }
+}
+
+/// A stand-in agent that, once it has started, starts a child that leaves its process group, is
+/// adopted by the system's first process, and names nothing of the run on its command line, in the
+/// run's working directory, with the environment the agent has or with none. The host is then
+/// stopped and the run's closing check made: the child that kept its environment, which carries the
+/// run's marker, is found and fails the check, and ended by its number the check then passes; the
+/// child that cleared its environment is the limit the check names, and passes.
+fn an_agent_leaves_a_child_outside_its_group(keeps_environment: bool) {
+    if std::env::var_os(BUILD_VARIABLE).is_some_and(|value| !value.is_empty()) {
+        // The stand-in is the agent here; a real agent is never asked to leave a child behind.
+        return;
+    }
+    let shell = match shells::managed_zsh() {
+        Ok(shell) => shell,
+        Err(why) if shells::required() => panic!("the managed shell: {why}"),
+        Err(why) => {
+            eprintln!("skipping: {why}");
+            return;
+        }
+    };
+    let scratch = std::fs::canonicalize(std::env::temp_dir())
+        .expect("the temporary directory")
+        .join(format!("kr-detached-{}", kr_ipc::new_uuid()));
+    std::fs::create_dir_all(&scratch).expect("a directory for the case's files");
+    let mut ctx = Context::new(
+        shell,
+        Route::StandIn,
+        Run::start("gateway-detaches"),
+        runtime(),
+    );
+    ctx.place();
+    let started = scratch.join("child");
+    let leave = scratch.join("leave.sh");
+    let environment = if keeps_environment {
+        ""
+    } else {
+        "/usr/bin/env -i PATH=/usr/bin:/bin "
+    };
+    std::fs::write(
+        &leave,
+        format!(
+            "#!/bin/sh\ncd '{work}' || exit 1\n{environment}KR_E2E_SLEEPER=1 /usr/bin/perl -MPOSIX -e \
+             'my $p = fork(); if ($p) {{ print \"$p\\n\"; exit 0 }} POSIX::setsid(); \
+             open(STDOUT, \">\", \"/dev/null\"); open(STDERR, \">\", \"/dev/null\"); \
+             open(STDIN, \"<\", \"/dev/null\"); \
+             exec $ARGV[0], \"--exact\", \"a_sleeper_the_cases_that_leave_a_child_start\", \
+             \"--ignored\", \"--nocapture\";' '{exe}' > '{started}'\n",
+            work = ctx.run.work().display(),
+            exe = std::env::current_exe().expect("this test executable").display(),
+            started = started.display(),
+        ),
+    )
+    .expect("the program the stand-in runs");
+    std::fs::set_permissions(&leave, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("executable");
+    let session = Session::open(&ctx, "answer-when-released,keep-reading,stay,leave-a-host");
+    session
+        .person
+        .types(&format!("export KR_STAND_IN_LEAVE={}", leave.display()));
+    let _ = session.starts_the_agent(&[], None, &[]);
+    let child: u32 = std::fs::read_to_string(&started)
+        .expect("the child's number")
+        .trim()
+        .parse()
+        .expect("a number");
+    session.host.stop().expect("the host stops");
+    let closing = ctx.run.closing_check();
+    if keeps_environment {
+        let said = closing.expect_err("the child that kept its environment is found");
+        assert!(
+            said.contains(&format!("process {child} holds the run's marker")),
+            "{said}"
+        );
+    } else {
+        let passed = closing.expect("the child that cleared its environment is the named limit");
+        assert!(
+            passed.contains("whose environment the system shows"),
+            "{passed}"
+        );
+    }
+    let _ = std::process::Command::new("/bin/kill")
+        .arg(child.to_string())
+        .status();
+    let waited = Instant::now();
+    while std::process::Command::new("/bin/kill")
+        .args(["-0", &child.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+        && waited.elapsed() < LIVENESS
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    ctx.run
+        .closing_check()
+        .unwrap_or_else(|why| panic!("with the child ended the close passes: {why}"));
+    drop(session);
+    std::fs::remove_dir_all(&scratch).expect("the case's files go");
+}
+
+/// A child the agent leaves outside its process group, which keeps its environment, is found by the
+/// run's marker at the close, and the close fails on it.
+#[test]
+fn gateway_a_child_outside_the_agents_group_that_keeps_its_environment_fails_the_close() {
+    an_agent_leaves_a_child_outside_its_group(true);
+}
+
+/// One that cleared its environment is the limit the closing text names: the close passes, and says
+/// only what it checked.
+#[test]
+fn gateway_a_child_outside_the_agents_group_that_cleared_its_environment_is_the_named_limit() {
+    an_agent_leaves_a_child_outside_its_group(false);
+}
+
+// ---------------------------------------------------------------------------------------------
 // The launch the real route types.
 // ---------------------------------------------------------------------------------------------
 
