@@ -628,8 +628,13 @@ impl Run {
             Ok(format!(
                 "none of the {} processes this run started is running, no process's command line \
                  names its directory, no process of this user whose environment the system shows \
-                 carries its marker, and no job of its workers is loaded{}",
+                 carries its marker, and {}{}",
                 owned.len(),
+                if cfg!(target_os = "macos") {
+                    "no job of its workers is loaded"
+                } else {
+                    "no job of a service manager was looked for on this platform"
+                },
                 if alone == 0 {
                     String::new()
                 } else {
