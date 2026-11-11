@@ -546,7 +546,7 @@ fn the_least_set_of_privileges_that_removes_a_root_of_hostile_objects_is_backup_
         assert_ne!(
             process_state(name),
             Some(true),
-            "{name} is not enabled on the process token the case runs under"
+            "{name} is enabled on the process token the case runs under. The service's own token, which the installer gives a list of required privileges, has none of them enabled and lacks the debug privilege; a scheduled task's system token has it enabled, so the runner's token differs from the service's and this case needs a token of the service's form"
         );
     }
     let mut table = Vec::new();
