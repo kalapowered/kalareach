@@ -108,7 +108,7 @@ fn the_root_is_made_by_one_call_with_the_descriptor_it_was_sent_and_its_rows_com
     let (leftovers, log) = remove_with_the_walks_privileges(&root);
     assert!(leftovers.is_empty(), "{leftovers:?}");
     assert_eq!(log, ["removed"], "the removed row is written once, last");
-    assert!(!root.path().exists());
+    assert!(common::is_gone(root), "the root is gone");
 }
 
 /// A throwaway account and two tokens of it with two invocation groups: the sibling case.
@@ -252,7 +252,7 @@ fn a_hard_link_name_is_removed_while_the_other_names_and_the_data_stay() {
     assert_eq!(before.links, 3, "the file has three names");
     let (leftovers, _) = remove_with_the_walks_privileges(&root);
     assert!(leftovers.is_empty(), "{leftovers:?}");
-    assert!(!root.path().exists(), "the root is gone");
+    assert!(common::is_gone(root), "the root is gone");
     let after = look_at(&outside);
     assert_eq!(after.links, 2, "exactly one name went");
     assert_eq!(after.bytes, before.bytes, "the data stayed");
@@ -313,7 +313,7 @@ fn a_junction_and_a_symbolic_link_are_removed_as_themselves_and_their_targets_st
     .collect();
     let (leftovers, _) = remove_with_the_walks_privileges(&root);
     assert!(leftovers.is_empty(), "{leftovers:?}");
-    assert!(!root.path().exists(), "the links and the root are gone");
+    assert!(common::is_gone(root), "the links and the root are gone");
     let after: Vec<Outside> = [
         target_dir.clone(),
         target_dir.join("file.txt"),
@@ -355,7 +355,7 @@ fn objects_whose_list_refuses_the_system_and_read_only_files_are_removed_and_not
     let (leftovers, log) = remove_with_the_walks_privileges(&root);
     assert!(leftovers.is_empty(), "{leftovers:?}");
     assert_eq!(log, ["removed"]);
-    assert!(!root.path().exists());
+    assert!(common::is_gone(root), "the root is gone");
     assert_eq!(
         look_at(&outside),
         before,
@@ -438,7 +438,7 @@ fn long_names_case_sensitive_names_and_streams_are_removed() {
     let (leftovers, _) = remove_with_the_walks_privileges(&root);
     assert!(leftovers.is_empty(), "{leftovers:?}");
     assert!(
-        !root.path().exists(),
+        common::is_gone(root),
         "everything is gone, the stream's file and both names included"
     );
 }
@@ -489,7 +489,7 @@ fn a_file_in_use_with_delete_sharing_goes_at_once_and_one_without_it_is_a_leftov
     let (rest, log) = remove_with_the_walks_privileges(&root);
     assert!(rest.is_empty(), "{rest:?}");
     assert_eq!(log, ["removed"]);
-    assert!(!root.path().exists());
+    assert!(common::is_gone(root), "the root is gone");
 }
 
 #[test]

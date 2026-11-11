@@ -2,9 +2,10 @@
 //! rows may come in, a torn tail, and the file that writes each row through before the step it
 //! protects.
 //!
-//! The reading half runs everywhere on bytes. The file half runs on Windows; the cases that make a
-//! private root or read the boot marker need an elevated SYSTEM session and run only in a disposable
-//! guest.
+//! The reading half runs everywhere on bytes. The file half runs on Windows; the case that makes a
+//! private root needs an elevated SYSTEM session and runs only in a disposable guest. The marker that
+//! the `Begin` row carries is read from the installed service's key, which the installation case
+//! reads.
 
 use kr_boundary_windows::filekey::FileKey;
 use kr_boundary_windows::journal::framing;
@@ -461,14 +462,13 @@ mod guest {
     use kr_boundary_windows::journal::framing;
     use kr_boundary_windows::journal::replay::RootState;
     use kr_boundary_windows::journal::rows::Row;
-    use kr_boundary_windows::win::boot;
     use kr_boundary_windows::win::journal::{Journal, file_name, replay as replay_dir};
     use kr_boundary_windows::win::launch::InvocationId;
     use kr_boundary_windows::win::privilege;
     use kr_boundary_windows::win::root::{RootError, RootRows, create_root, remove_root};
 
+    use super::begin;
     use super::common::{Scratch, group, run_dir};
-    use super::{ID, begin};
 
     fn id() -> InvocationId {
         InvocationId(*b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f")
@@ -548,27 +548,5 @@ mod guest {
         let unfinished = replay_dir(&journals, super::BOOT).unwrap();
         assert_eq!(unfinished[0].tracker.root(), &RootState::Removed);
         assert!(journals.join(file_name(id())).exists());
-    }
-
-    #[test]
-    #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest"]
-    fn the_boot_marker_in_the_begin_row_is_the_one_the_platform_reports_until_the_next_start() {
-        let scratch = Scratch::new();
-        let marker = boot::marker().expect("the marker can be read");
-        assert!(marker.trusted, "{:?}", marker.reason);
-        let mut journal = Journal::create(&scratch.dir, id()).unwrap();
-        let mut row = begin();
-        if let Row::Begin { boot_marker, .. } = &mut row {
-            boot_marker.clone_from(&marker.id);
-        }
-        journal.append(&row).unwrap();
-        let again = boot::marker().expect("the marker can be read again");
-        assert_eq!(again.id, marker.id, "one marker for the whole boot");
-        assert!(!again.made, "only the first read of a boot makes the key");
-        let same = replay_dir(&scratch.dir, &again.id).unwrap();
-        assert_eq!(same[0].id, ID);
-        assert!(same[0].same_boot);
-        let other = replay_dir(&scratch.dir, "another boot").unwrap();
-        assert!(!other[0].same_boot);
     }
 }

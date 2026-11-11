@@ -350,7 +350,17 @@ fn the_least_set_of_privileges_that_removes_a_root_of_hostile_objects_is_backup_
         let mut rows = Rows::default();
         let leftovers = remove_root(&root, &guard, &mut rows).expect("the removal runs");
         drop(guard);
-        let gone = !root.path().exists();
+        let gone = if leftovers.is_empty() {
+            common::is_gone(root)
+        } else {
+            // A root that stays is removed with the full pair so that the folder can be cleaned.
+            let again = privilege::enter().unwrap();
+            let mut more = Rows::default();
+            let _ = remove_root(&root, &again, &mut more);
+            drop(again);
+            drop(root);
+            false
+        };
         table.push((name.clone(), leftovers.len(), gone));
         println!(
             "privileges {name}: {} leftover(s), root removed: {gone}",
@@ -358,12 +368,6 @@ fn the_least_set_of_privileges_that_removes_a_root_of_hostile_objects_is_backup_
         );
         for leftover in &leftovers {
             println!("    left: {leftover}");
-        }
-        if !gone {
-            // A root that stays is removed with the full pair so that the folder can be cleaned.
-            let guard = privilege::enter().unwrap();
-            let mut rows = Rows::default();
-            let _ = remove_root(&root, &guard, &mut rows);
         }
     }
     let works = |wanted: &str| table.iter().find(|(name, _, _)| name == wanted).unwrap().2;
