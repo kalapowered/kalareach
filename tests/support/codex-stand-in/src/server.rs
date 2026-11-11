@@ -519,6 +519,26 @@ impl Server {
         .await;
     }
 
+    /// Under `answer-the-sum`, writes the sum a turn's input asks for as the agent's message of
+    /// that turn, worked out from the input; says nothing for an input that asks none.
+    async fn answers_the_sum(&mut self, request: &Value, thread_id: &str, turn_id: &str) {
+        if !self.variants.answer_the_sum {
+            return;
+        }
+        if let Some(sum) = crate::variants::sum_asked(request) {
+            self.send(json!({
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "itemId": "item-1",
+                    "delta": sum
+                }
+            }))
+            .await;
+        }
+    }
+
     async fn turn(&mut self, id: &Value, frame: &Value) {
         if self.variants.die_on_second_turn && self.turns_made >= 1 {
             std::process::exit(0);
@@ -542,6 +562,7 @@ impl Server {
                 "params": { "threadId": thread_id, "turn": turn(&turn_id, "inProgress") }
             }))
             .await;
+            self.answers_the_sum(frame, &thread_id, &turn_id).await;
             self.send(json!({
                 "method": "turn/completed",
                 "params": { "threadId": thread_id, "turn": turn(&turn_id, "completed") }
@@ -589,6 +610,7 @@ impl Server {
             self.send(started).await;
             self.send(approval).await;
         }
+        self.answers_the_sum(frame, &thread_id, &turn_id).await;
         if let Some(size) = Variants::pad() {
             let text = padded(size, |text| {
                 json!({
