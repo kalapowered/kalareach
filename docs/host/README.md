@@ -3368,16 +3368,19 @@ sharing desk), and the rest is room for the copies a lossy path leaves: a replac
 stays with the host for the transport's idle time of 30 seconds, and a link replaced more than once
 in that time leaves a copy for each. At the first connection above the bound the host serves the new
 connection and withdraws the device's connection that it has heard from least recently, never the new
-one, and the older of two that were heard from at the same moment. A connection is heard from when the
-transport receives an authenticated packet from the device on it, keepalives included, and a live
-device sends one at least every 10 seconds. A copy that has been silent for longer than that is
-withdrawn before a connection the device still sends on; a copy that went silent more recently can
-look as recent as a live idle connection, and on a lossy path a lost keepalive makes a connection in
-use look older. A link the device has left, which still waits for replies, sends keepalives as a
-link in use does, and the host cannot tell the two apart: only the device's own count keeps it
-below the bound. The withdrawn connection is closed as a revocation withdraws a
-device's connections: a request in flight on it gets no answer, and the device presents the same
-action on a newer connection and settles it as it would after any lost connection. Another device's
+one; of two that were heard from at the same moment, the one counted first. A connection is heard
+from when the transport receives an authenticated packet from the device on it, keepalives included,
+and a live device sends one at least every 10 seconds. The host dates a packet when it reads the
+transport's counters, once a second and again when it chooses, so a stamp can be one reading late,
+and two connections whose packets came within a reading of each other can be taken in either order.
+A connection silent for much longer than a keepalive interval is withdrawn before one the device
+still sends on, but the host cannot know that the device has gone: a link in use that loses its
+keepalives is as silent. A link the device has left, which still waits for replies, sends keepalives
+as a link in use does, and the host cannot tell the two apart: only the device's own count keeps it
+below the bound. The withdrawn connection is closed as a revocation withdraws a device's
+connections, and one that still waits for the authority feed is closed at its transport at once: a
+request in flight on it gets no answer, and the device presents the same action on a newer
+connection and settles it as it would after any lost connection. Another device's
 connections are not touched. An owner cannot change the bound.
 
 The transfer service performs a device's uploads under the device's own principal, which the host
