@@ -1849,9 +1849,21 @@ fn a_delete_call_that_does_not_end_is_given_up_and_no_further_call_is_made_for_t
         "the given-up call is still in the system"
     );
     // A second removal of the root, while the first call is still in the system, makes no delete
-    // call, no listing and no cancel, and says why.
+    // call, no listing, no open and no cancel, and says why.
     let cancels = removal::cancels(&name);
+    let recording = walking::record(name.as_str());
     let again = remove_on_a_thread(done.root, LIMITS, Duration::from_secs(30));
+    assert_eq!(
+        recording.listing_calls(""),
+        0,
+        "the second removal asked the platform for entries"
+    );
+    assert!(
+        recording.opens().is_empty(),
+        "the second removal opened {:?}",
+        recording.opens()
+    );
+    drop(recording);
     assert_eq!(
         again.leftovers,
         [Leftover {
@@ -1914,22 +1926,24 @@ fn delete_calls_that_each_end_just_inside_their_limit_spend_the_total_and_stop_t
 
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
-fn a_delete_call_just_over_the_grace_is_charged_whole_against_the_total() {
+fn a_delete_call_far_over_the_grace_is_charged_whole_against_the_total() {
     let scratch = Scratch::new();
     let (_run, root, _owner) = made_root(&scratch);
     let tmp = root.tmp();
     std::fs::remove_dir(root.home()).unwrap();
-    for index in 0..12 {
+    for index in 0..6 {
         std::fs::write(tmp.join(format!("f{index}.txt")), b"x").unwrap();
     }
     let name = root.name().clone();
-    // Each call takes about 60 milliseconds, ten more than the 50 an ordinary delete is allowed.
-    // Charged whole, about seven of them spend a total of 400 milliseconds; if only what is over
-    // the 50 were charged, twelve would cost about 120 and the total would never be spent.
-    let delay = removal::delay_deletes(&name, Duration::from_millis(60));
+    // Each call takes about 400 milliseconds, eight times the 50 an ordinary delete is allowed.
+    // The total is 1.18 seconds, a little under three calls: charged whole, the third call spends
+    // it and exactly three of the six files go. If only what is over the 50 were charged, a call
+    // would cost 350 and a fourth would be needed; if nothing were charged, all six would go. A
+    // run that makes each call up to 90 milliseconds slower still ends after the third.
+    let delay = removal::delay_deletes(&name, Duration::from_millis(400));
     let limits = Limits {
-        wait_each: Duration::from_secs(1),
-        wait_total: Duration::from_millis(400),
+        wait_each: Duration::from_secs(2),
+        wait_total: Duration::from_millis(1180),
         ..ROOT_LIMITS
     };
     let done = remove_on_a_thread(root, limits, Duration::from_secs(30));
@@ -1940,15 +1954,117 @@ fn a_delete_call_just_over_the_grace_is_charged_whole_against_the_total() {
             reason: "the waits for objects in use are spent".to_owned()
         }]
     );
-    let removed = 12 - names_in(&tmp).len();
-    assert!(
-        (4..=8).contains(&removed),
-        "the calls were charged whole: {removed} of twelve went before the total was spent"
+    assert_eq!(
+        6 - names_in(&tmp).len(),
+        3,
+        "the calls were charged whole: three of six went before the total was spent: {:?}",
+        names_in(&tmp)
     );
     drop(delay);
     let (rest, _) = remove_with_the_walks_privileges(&done.root);
     assert!(rest.is_empty(), "the next removal finishes: {rest:?}");
     assert!(common::is_gone(done.root), "the root is gone");
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_root_delete_that_succeeds_and_spends_the_total_leaves_nothing_behind() {
+    let scratch = Scratch::new();
+    let (_run, root, _owner) = made_root(&scratch);
+    let tmp = root.tmp();
+    std::fs::remove_dir(root.home()).unwrap();
+    for index in 0..2 {
+        std::fs::write(tmp.join(format!("f{index}.txt")), b"x").unwrap();
+    }
+    let name = root.name().clone();
+    // Four calls of about 300 milliseconds each: the two files, `tmp` and the root. The total,
+    // 1.18 seconds, is more than the first three spend and less than all four, so the root's own
+    // call, which succeeds, is the one that spends the last of it. Nothing comes after it, so the
+    // removal ends clean and writes its row.
+    let delay = removal::delay_deletes(&name, Duration::from_millis(300));
+    let limits = Limits {
+        wait_each: Duration::from_secs(2),
+        wait_total: Duration::from_millis(1180),
+        ..ROOT_LIMITS
+    };
+    let done = remove_on_a_thread(root, limits, Duration::from_secs(30));
+    assert!(
+        done.leftovers.is_empty(),
+        "no leftover after the root's own call: {:?}",
+        done.leftovers
+    );
+    assert_eq!(done.log, ["removed"], "the row is written");
+    drop(delay);
+    assert!(common::is_gone(done.root), "the root is gone");
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn two_removals_of_one_root_at_the_same_time_leave_the_work_to_one() {
+    let scratch = Scratch::new();
+    let (_run, root, _owner) = made_root(&scratch);
+    let tmp = root.tmp();
+    std::fs::write(tmp.join("a.txt"), b"x").unwrap();
+    std::fs::write(tmp.join("b.txt"), b"x").unwrap();
+    let name = root.name().clone();
+    let recording = walking::record(name.as_str());
+    // The first removal waits in its first listing, before it opens or deletes anything, until the
+    // second removal has returned. The second starts while the first is inside its work.
+    let (reached, reached_wait) = std::sync::mpsc::channel::<()>();
+    let (go, go_wait) = std::sync::mpsc::channel::<()>();
+    let reached = std::sync::Mutex::new(reached);
+    let go_wait = std::sync::Mutex::new(go_wait);
+    removal::set(&name, move |event| {
+        if let Event::Listed { directory, .. } = event
+            && directory.is_empty()
+        {
+            reached.lock().unwrap().send(()).unwrap();
+            go_wait
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the second removal returned");
+        }
+    });
+    let run_one = |root: &PrivateRoot| {
+        let guard = privilege::enter().unwrap();
+        let mut rows = Rows::default();
+        let started = Instant::now();
+        let leftovers = remove_root_within(root, &guard, LIMITS, &mut rows).unwrap();
+        (leftovers, rows.log, started.elapsed())
+    };
+    let (first, second, calls_before, calls_after) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| run_one(&root));
+        reached_wait
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the first removal listed the root");
+        let before = (recording.listing_calls(""), recording.opens().len());
+        let second = scope.spawn(|| run_one(&root)).join().unwrap();
+        let after = (recording.listing_calls(""), recording.opens().len());
+        go.send(()).unwrap();
+        (first.join().unwrap(), second, before, after)
+    });
+    removal::clear(&name);
+    assert_eq!(
+        second.0,
+        [Leftover {
+            path: String::new(),
+            reason: "another removal of this root is running".to_owned()
+        }]
+    );
+    assert!(second.1.is_empty(), "the second removal wrote no row");
+    assert!(second.2 < Duration::from_secs(1), "{:?}", second.2);
+    assert_eq!(
+        calls_after, calls_before,
+        "the second removal made no listing call and no open"
+    );
+    assert!(
+        first.0.is_empty(),
+        "the first removal did the work: {:?}",
+        first.0
+    );
+    assert_eq!(first.1, ["removed"]);
+    assert!(common::is_gone(root), "the root is gone");
 }
 
 #[test]

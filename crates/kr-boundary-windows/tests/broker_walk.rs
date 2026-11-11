@@ -481,13 +481,22 @@ fn the_system_volume_is_accepted_and_every_other_kind_of_volume_is_refused_with_
         DirHandle::open_anchor(&scratch.dir).unwrap().is_ok(),
         "an NTFS fixed volume is accepted"
     );
-    let share = format!(
-        r"\\localhost\C$\Users\Public\{}",
+    let tail = format!(
+        r"localhost\C$\Users\Public\{}",
         scratch.dir.file_name().unwrap().to_string_lossy()
     );
-    match DirHandle::open_anchor(Path::new(&share)).expect("the platform answers") {
-        Err(AnchorRefusal::Volume(VolumeRefusal::Remote)) => {}
-        other => panic!("a share of this computer is a remote volume: {other:?}"),
+    // The same share in each form that names one: the plain UNC path, and the two prefixes that
+    // would otherwise be read as a local drive.
+    for share in [
+        format!(r"\\{tail}"),
+        format!(r"\\?\UNC\{tail}"),
+        format!(r"\\.\UNC\{tail}"),
+        format!(r"\\?\unc\{tail}"),
+    ] {
+        match DirHandle::open_anchor(Path::new(&share)).expect("the platform answers") {
+            Err(AnchorRefusal::Volume(VolumeRefusal::Remote)) => {}
+            other => panic!("{share} is a share of this computer, a remote volume: {other:?}"),
+        }
     }
     let fat =
         Disk::new(&scratch, "fat32", 100, 'R').expect("a FAT32 disk can be made on the guest");

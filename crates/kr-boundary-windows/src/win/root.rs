@@ -157,9 +157,10 @@ pub enum RootError {
     Refused(String),
 }
 
-/// An object the removal could not remove, or the root itself when the removal stopped. The removal
-/// changes nothing on it, with one exception: when the reason says that a delete call did not end,
-/// that call may still complete later, and whether the object is gone is not known.
+/// An object the removal could not remove, or the root itself when the removal stopped or did not
+/// start. The removal changes nothing on it, with one exception: when the reason says that a delete
+/// call did not end, that call may still complete later, and whether the object is gone is not
+/// known.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Leftover {
     /// Where it is, below the root, with the root's name left out.
@@ -309,13 +310,23 @@ fn make_root(
 /// Removes the private root and everything under it. The privileged thread's guard is the proof
 /// that the call runs inside a walk.
 ///
-/// Returns what could not be removed. When nothing is left over the root itself is gone and the
-/// `removed` row is written; otherwise the root stays, and so does everything the removal could
-/// not take. Two cases leave the state uncertain, and the leftovers say so: an object whose delete
-/// call did not end, which that call may still remove, and the objects that a stopped removal did
-/// not reach, which a delete that succeeded may have been the last to spare (the root's leftover
-/// says why it stopped). A removal of a root whose earlier delete call has still not ended makes no
-/// call and no listing and returns one leftover for the root that says so.
+/// Returns what could not be removed. When nothing is left over the root itself is gone (its name
+/// goes when the caller's handle closes) and the `removed` row is written; otherwise the root
+/// stays, and so does everything the removal could not take. Three outcomes are not an object that
+/// refused, and each has its leftover:
+///
+/// - The waits for objects in use are spent. The removal makes no further delete call and returns
+///   one leftover for the root; the objects it did not reach stay. The call that spent the waits
+///   may itself have succeeded. A root delete that succeeds ends the removal whatever its time:
+///   nothing comes after it.
+/// - A delete call did not end. The removal gives it up and makes no further call; the object's
+///   leftover says so, the call may still complete, and whether the object is gone is not known.
+/// - The root is reserved by another removal, or by a given-up delete call that has not ended. The
+///   removal lists nothing, deletes nothing and returns one leftover for the root that says why.
+///
+/// `PrivateRoot` is shared, so two removals of one root can overlap by type; the reservation, made
+/// before anything is listed and kept until the removal returns (or, after a give-up, until the
+/// abandoned call's thread has ended), lets only one of them work.
 ///
 /// # Errors
 ///
@@ -339,12 +350,18 @@ pub fn remove_root_within(
     limits: Limits,
     rows: &mut dyn RootRows,
 ) -> Result<Vec<Leftover>, RootError> {
-    if call_pending(root.name.as_str()) {
-        return Ok(vec![Leftover {
-            path: String::new(),
-            reason: "a delete call of an earlier removal of this root has not ended".to_owned(),
-        }]);
-    }
+    let claim = match Claim::make(root.name.as_str()) {
+        Ok(claim) => claim,
+        Err(reason) => {
+            return Ok(vec![Leftover {
+                path: String::new(),
+                reason: reason.to_owned(),
+            }]);
+        }
+    };
+    // Dropped after the removal's state, so the root is free again only once the removal's own
+    // thread has let go of the delete thread.
+    let _reservation = Reservation(claim.clone());
     let mut state = Removal {
         limits,
         listed: 0,
@@ -352,7 +369,7 @@ pub fn remove_root_within(
         too_large: false,
         stopped: false,
         leftovers: Vec::new(),
-        deleter: Deleter::start(root.name.as_str())?,
+        deleter: Deleter::start(claim)?,
     };
     state.empty(&root.dir, "", 1);
     if state.leftovers.is_empty() {
@@ -415,39 +432,86 @@ struct Deleter {
     jobs: Sender<Job>,
     answers: Receiver<Result<(), super::ffi::Error>>,
     thread: JoinHandle<()>,
-    /// Set by the thread when it ends, which it does after the call it is in has returned.
-    ended: Arc<AtomicBool>,
+    claim: Arc<Claim>,
+}
+
+/// A removal's hold on a root, kept in [`CLAIMS`] by the root's name.
+struct Claim {
     root: String,
+    /// The removal has not returned.
+    running: AtomicBool,
+    /// The removal gave up a delete call that may not have returned.
+    abandoned: AtomicBool,
+    /// The thread that makes the delete calls has ended, which it does after its call returned.
+    ended: AtomicBool,
 }
 
-/// The roots whose delete thread was given up in a call that had not returned, with the flag that
-/// says when the thread has ended. While one is pending no removal of the root makes a delete call,
-/// so that at most one thread is ever inside a delete call for a root.
-static ABANDONED: Mutex<Vec<(String, Arc<AtomicBool>)>> = Mutex::new(Vec::new());
+/// The roots that a removal of this process works on, or whose given-up delete call may still be
+/// in the system. While a root is here no other removal of it lists or deletes anything, so that
+/// at most one removal, and one thread inside a delete call, is ever at work on a root. The list
+/// is this process's: a removal in a new process does not see a call that an earlier process gave
+/// up, and may make one more delete call beside it.
+static CLAIMS: Mutex<Vec<Arc<Claim>>> = Mutex::new(Vec::new());
 
-/// Whether an earlier removal of the root named `root` gave up a delete call that is still in the
-/// system.
-fn call_pending(root: &str) -> bool {
-    let mut abandoned = ABANDONED.lock().unwrap();
-    abandoned.retain(|(_, ended)| !ended.load(Ordering::Acquire));
-    abandoned.iter().any(|(name, _)| name == root)
+impl Claim {
+    /// Reserves the root named `root`, or says why it is not free. The check and the entry are one
+    /// step under the list's lock.
+    fn make(root: &str) -> Result<Arc<Claim>, &'static str> {
+        let mut claims = CLAIMS.lock().unwrap();
+        claims.retain(|claim| claim.held());
+        if let Some(held) = claims.iter().find(|claim| claim.root == root) {
+            return Err(if held.running.load(Ordering::Acquire) {
+                "another removal of this root is running"
+            } else {
+                "a delete call of an earlier removal of this root has not ended"
+            });
+        }
+        let claim = Arc::new(Claim {
+            root: root.to_owned(),
+            running: AtomicBool::new(true),
+            abandoned: AtomicBool::new(false),
+            ended: AtomicBool::new(false),
+        });
+        claims.push(claim.clone());
+        Ok(claim)
+    }
+
+    /// Whether the root is still reserved: its removal is running, or it gave up a call whose
+    /// thread has not ended.
+    fn held(&self) -> bool {
+        self.running.load(Ordering::Acquire) || self.pending()
+    }
+
+    /// Whether a given-up delete call may still be in the system.
+    fn pending(&self) -> bool {
+        self.abandoned.load(Ordering::Acquire) && !self.ended.load(Ordering::Acquire)
+    }
 }
 
-/// Sets a flag when it is dropped, by a panic too.
-struct SetOnDrop(Arc<AtomicBool>);
+/// Ends the removal's reservation when it is dropped, early returns and panics included. A given-up
+/// call keeps the root reserved until its thread has ended.
+struct Reservation(Arc<Claim>);
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.0.running.store(false, Ordering::Release);
+    }
+}
+
+/// Sets a claim's flag for its thread's end when it is dropped, by a panic too.
+struct SetOnDrop(Arc<Claim>);
 
 impl Drop for SetOnDrop {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
+        self.0.ended.store(true, Ordering::Release);
     }
 }
 
 impl Deleter {
-    fn start(root: &str) -> Result<Deleter, RootError> {
+    fn start(claim: Arc<Claim>) -> Result<Deleter, RootError> {
         let (jobs, work) = std::sync::mpsc::channel::<Job>();
         let (reply, answers) = std::sync::mpsc::channel();
-        let ended = Arc::new(AtomicBool::new(false));
-        let ending = SetOnDrop(ended.clone());
+        let ending = SetOnDrop(claim.clone());
         let thread = std::thread::Builder::new()
             .name("private-root-delete".to_owned())
             .spawn(move || {
@@ -474,8 +538,7 @@ impl Deleter {
             jobs,
             answers,
             thread,
-            ended,
-            root: root.to_owned(),
+            claim,
         })
     }
 
@@ -483,7 +546,7 @@ impl Deleter {
         let job = Job {
             handle,
             #[cfg(feature = "testing")]
-            root: self.root.clone(),
+            root: self.claim.root.clone(),
         };
         if self.jobs.send(job).is_err() {
             return Call::DidNotEnd;
@@ -494,17 +557,14 @@ impl Deleter {
             Err(RecvTimeoutError::Timeout) => {}
         }
         #[cfg(feature = "testing")]
-        testing::note_cancel(&self.root);
+        testing::note_cancel(&self.claim.root);
         // SAFETY: the thread's handle is open while its join handle lives, and the call only asks
         // the system to cancel the synchronous request that thread has pending, if it has one.
         unsafe { CancelSynchronousIo(self.thread.as_raw_handle()) };
         match self.answers.recv_timeout(CANCEL_GRACE) {
             Ok(result) => Call::Cancelled(result),
             Err(_) => {
-                ABANDONED
-                    .lock()
-                    .unwrap()
-                    .push((self.root.clone(), self.ended.clone()));
+                self.claim.abandoned.store(true, Ordering::Release);
                 Call::DidNotEnd
             }
         }
@@ -664,7 +724,11 @@ pub mod testing {
     /// the system.
     #[must_use]
     pub fn call_pending(root: &RootName) -> bool {
-        super::call_pending(root.as_str())
+        super::CLAIMS
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|claim| claim.root == root.as_str() && claim.pending())
     }
 
     pub(super) fn note_cancel(root: &str) {
@@ -747,7 +811,7 @@ impl Removal {
         self.listed += listing.children.len();
         #[cfg(feature = "testing")]
         testing::fire(
-            &self.deleter.root,
+            &self.deleter.claim.root,
             &testing::Event::Listed {
                 directory: at,
                 names: listing.children.iter().map(Child::display).collect(),
@@ -793,7 +857,7 @@ impl Removal {
             }
         };
         #[cfg(feature = "testing")]
-        testing::fire(&self.deleter.root, &testing::Event::Opened { path });
+        testing::fire(&self.deleter.claim.root, &testing::Event::Opened { path });
         match opened.kind() {
             Kind::File | Kind::ReparsePoint => self.remove(opened.into_handle(), path),
             Kind::Directory if !listed_directory => {
@@ -904,7 +968,8 @@ impl Removal {
                 self.stop("a delete call did not end");
             }
         }
-        if elapsed > DELETE_GRACE && self.waited >= self.limits.wait_total {
+        // Nothing comes after the root's own call, so it has no stop to make.
+        if !path.is_empty() && elapsed > DELETE_GRACE && self.waited >= self.limits.wait_total {
             self.stop("the waits for objects in use are spent");
         }
     }
@@ -937,8 +1002,9 @@ impl Removal {
     }
 }
 
-/// Deletes the object behind the handle with POSIX semantics: the name goes at once, whatever
-/// else has the object open, and the read-only attribute does not stop it. The handle must be
+/// Deletes the object behind the handle with POSIX semantics: the name goes when the handle's file
+/// object is cleaned up (the last handle to it closed), whatever else has the object open through
+/// other handles, and the read-only attribute does not stop it. The handle must be
 /// open with the right to delete. On a link or a reparse point it removes that name only.
 fn delete(handle: &Handle) -> Result<(), super::ffi::Error> {
     let information = FILE_DISPOSITION_INFORMATION_EX {
