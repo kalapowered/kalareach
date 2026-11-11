@@ -9,8 +9,13 @@
 //! The scan reads a line as Git does. The blanks are a space, a tab, a carriage return and a line
 //! feed and no other byte. The pattern is a quoted string that unquotes, or else the text up to the
 //! first blank; every token after it is an attribute, up to the next blank, and a value is all of
-//! the token after its first `=`, quotation marks included. A byte the scan does not model, a NUL
-//! for one, is an ordinary byte, so the scan can only read more of a line than Git does, never less.
+//! the token after its first `=`, quotation marks included.
+//!
+//! Two things Git does depend on where the bytes came from or on how it stores a line, so the scan
+//! reads the file more than one way and reports what any reading shows. Git reads a line as a C
+//! string, which ends at its first NUL, so each line is read cut at the NUL and whole. Git removes a
+//! UTF-8 byte order mark from line 1 of a file it reads from disk and keeps it in a copy from the
+//! index or a tree, so a file that starts with the mark is read with it and without it.
 
 use crate::frame::invocation::RefusedKind;
 use crate::refusal::Refusal;
@@ -61,29 +66,57 @@ pub fn scan_attributes(bytes: &[u8]) -> Result<(), Refusal> {
             "an attributes file of this repository is too large for this release",
         ));
     }
+    scan_text(bytes)?;
+    // Git removes a byte order mark from the start of line 1 of a file it reads from disk (the
+    // working tree and `info/attributes`) and keeps it in a copy from the index or a tree. The
+    // scan does not know which it was given, so it reads the file both ways.
+    if let Some(without) = bytes.strip_prefix(BYTE_ORDER_MARK) {
+        scan_text(without)?;
+    }
+    Ok(())
+}
+
+/// The UTF-8 encoding of U+FEFF.
+const BYTE_ORDER_MARK: &[u8] = b"\xef\xbb\xbf";
+
+/// Scans the lines of a text, each as Git reads it and whole.
+fn scan_text(bytes: &[u8]) -> Result<(), Refusal> {
     for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
-        let line = skip_blanks(line);
-        if line.is_empty() || line.starts_with(b"#") {
-            continue;
-        }
         let at = index + 1;
-        let (pattern, attributes) = read_pattern(line);
-        if pattern.starts_with(MACRO_PREFIX) {
-            return Err(line_refusal(
-                RULE_MACRO,
-                "defines an attribute macro, which this release does not support",
-                at,
-            ));
+        // Git reads a line as a C string, which ends at its first NUL; what follows is invisible
+        // to it. The line is read cut there, which is what Git sees, and whole, which shows what
+        // a reader that does not stop at a NUL would see; either reading may refuse.
+        let seen = line.split(|byte| *byte == 0).next().unwrap_or_default();
+        scan_line(seen, at)?;
+        if seen.len() != line.len() {
+            scan_line(line, at)?;
         }
-        // Every token after the pattern is an attribute, up to the next blank, and a value is
-        // everything after the first `=` of its token.
-        for token in attributes
-            .split(|byte| is_blank(*byte))
-            .filter(|token| !token.is_empty())
-        {
-            if let Some((rule, detail)) = selects_driver(token) {
-                return Err(line_refusal(rule, detail, at));
-            }
+    }
+    Ok(())
+}
+
+/// Scans one line, the bytes between two line feeds or up to a NUL.
+fn scan_line(line: &[u8], at: usize) -> Result<(), Refusal> {
+    let line = skip_blanks(line);
+    if line.is_empty() || line.starts_with(b"#") {
+        return Ok(());
+    }
+    let (pattern, attributes) = read_pattern(line);
+    if pattern.starts_with(MACRO_PREFIX) {
+        return Err(line_refusal(
+            RULE_MACRO,
+            "defines an attribute macro, which this release does not support",
+            at,
+        ));
+    }
+    // Every token after the pattern is an attribute, up to the next blank, and a value is
+    // everything after the first `=` of its token.
+    for token in attributes
+        .split(|byte| is_blank(*byte))
+        .filter(|token| !token.is_empty())
+    {
+        if let Some((rule, detail)) = selects_driver(token) {
+            return Err(line_refusal(rule, detail, at));
         }
     }
     Ok(())
