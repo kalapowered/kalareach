@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       macos:
-        description: "Run the macOS jobs (macos, macos-demonstrations, macos-powershell, macos-reference, and the companion's macos-15 leg). Turned off, a manual run checks Linux and Windows only. A push or a pull request always runs them."
+        description: "Run the macOS jobs (macos, macos-demonstrations, macos-powershell, macos-shell-packages, macos-reference, and the companion's macos-15 leg). Turned off, a manual run checks Linux and Windows only. A push or a pull request always runs them."
         type: boolean
         default: true
       ios:
@@ -1747,8 +1747,12 @@ jobs:
       # job's. This job built them above, so it runs those cases with --include-ignored, and a
       # package that is missing, or is not the one this tree gives, fails the case that needed it.
       # The module and relocation suites load a native module into the built Zsh package and start
-      # a copy of its tree from another path.
+      # a copy of its tree from another path. The cases that depend on how the editor draws run
+      # under a byte locale and a UTF-8 locale, and a runner that lists no UTF-8 locale fails them
+      # instead of running the first alone.
       - name: Drive the built packages through the contract
+        env:
+          KR_REQUIRE_UTF8_LOCALE: "1"
         run: |
           cargo test --locked -p kr-shell-integration \
             --test zsh --test bash --test fish --test pwsh --test module_abi --test relocation \
@@ -3024,6 +3028,130 @@ jobs:
       - name: Drive the PowerShell package through the contract
         timeout-minutes: 65
         run: cargo test --locked -p kr-shell-integration --test pwsh -- --test-threads=1 --include-ignored
+
+  # The Zsh, Bash and Fish packages' cases on the macOS runner, against packages built here from
+  # the pinned upstream sources, as the release tree builds them for its macOS targets. The
+  # shell-packages job runs these cases on Linux only, and how an editor draws and how a terminal
+  # answers depend on the platform's C library, so a change to a package or to its bridge is run
+  # on macOS at the landing and not first at a release. The cases are not steps of the macos job:
+  # it is the longest job of the run, and its limits add up to 344 of its 355 minutes. This job
+  # holds one runner for the length of its own steps and takes nothing from that budget. Every
+  # step has a limit of its own, and the limits add up to less than the job's.
+  macos-shell-packages:
+    name: macos-shell-packages
+    # Skipped, and shown as skipped, only in a manual run started with the macOS jobs turned off.
+    if: github.event_name != 'workflow_dispatch' || inputs.macos
+    runs-on: macos-15
+    timeout-minutes: 160
+    steps:
+      - name: Check out
+        timeout-minutes: 5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # What this runner is, printed before anything asserts on it: the locale variables it
+      # carries and the UTF-8 locales it lists are what the cases below run under. The build here
+      # is given one job per processor, as the macos job's builds are.
+      - name: What this runner is
+        timeout-minutes: 2
+        run: |
+          sw_vers
+          uname -srm
+          echo "processors: $(sysctl -n hw.logicalcpu) logical, $(sysctl -n machdep.cpu.brand_string)"
+          echo "memory: $(( $(sysctl -n hw.memsize) / 1073741824 )) GiB"
+          df -h /System/Volumes/Data
+          echo "locale variables: $(env | grep -E '^(LANG|LC_)' | tr '\n' ' ')"
+          echo "UTF-8 locales listed: $(locale -a | grep -i -E 'utf-?8$' | head -5 | tr '\n' ' ')"
+          echo "CARGO_BUILD_JOBS=$(sysctl -n hw.logicalcpu)" >> "$GITHUB_ENV"
+
+      - name: Install the pinned toolchain
+        timeout-minutes: 5
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      # What the shells need to configure and build from their own release tarballs: the fish package
+      # is a Rust shell built through CMake, whose build turns the message catalogues with gettext.
+      - name: Install the shells' build dependencies
+        timeout-minutes: 10
+        run: |
+          command -v cmake >/dev/null 2>&1 || brew install cmake
+          if ! command -v msgfmt >/dev/null 2>&1; then
+            brew install gettext
+            echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
+          fi
+
+      # What the shells are built from is pinned: the upstream sources are placed by digest, and the
+      # fish package then builds offline, with proxy variables that point at a port nothing listens
+      # on so that a client which obeys them and still tries a server fails here at once.
+      - name: Place the upstream sources
+        timeout-minutes: 10
+        run: |
+          echo "KR_SHELL_PREFIX=$RUNNER_TEMP/shells" >> "$GITHUB_ENV"
+          KR_SHELL_PREFIX="$RUNNER_TEMP/shells" bash scripts/place-shell-sources.sh --all
+
+      - name: Build the shell packages
+        timeout-minutes: 15
+        run: bash scripts/build-shells.sh --zsh --bash --no-upstream-tests
+
+      - name: Build the fish package
+        timeout-minutes: 15
+        env:
+          HTTPS_PROXY: http://127.0.0.1:9
+          HTTP_PROXY: http://127.0.0.1:9
+          ALL_PROXY: http://127.0.0.1:9
+        run: |
+          # Some clients read only the lower-case names, and a workflow's names are not case-sensitive.
+          export https_proxy="$HTTPS_PROXY" http_proxy="$HTTP_PROXY" all_proxy="$ALL_PROXY"
+          bash scripts/build-shells.sh --fish --no-upstream-tests
+
+      # Built apart from the step that runs them, so that a build that fails and a case that fails
+      # are two steps and the run's duration says which took the time.
+      - name: Build the test programs of the shell cases
+        timeout-minutes: 30
+        run: |
+          cargo test --locked -p kr-shell-integration \
+            --test zsh --test bash --test fish --test fish_sources --test module_abi --no-run
+
+      # The same suites the release tree runs against the packages it built. A package that is
+      # missing, or is not the one this tree gives, fails the case that needed it. The cases that
+      # depend on how the editor draws run under a byte locale and a UTF-8 locale, and a runner
+      # that lists no UTF-8 locale fails them. A run of nothing passes, so the step reads its own
+      # log: each of the five files has to have run and passed cases, and each of the three
+      # packages has to have run one under the UTF-8 locale.
+      - name: Requalify the shell packages built here
+        timeout-minutes: 40
+        env:
+          KR_REQUIRE_UTF8_LOCALE: "1"
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/shell-cases.log"
+          cargo test --locked -p kr-shell-integration \
+            --test zsh --test bash --test fish --test fish_sources --test module_abi \
+            -- --test-threads=1 --include-ignored 2>&1 | tee "$log"
+          files="$(grep -c -E '^test result: ok\. [1-9][0-9]* passed; 0 failed' "$log" || true)"
+          if [ "$files" -ne 5 ]; then
+            echo "::error::$files of the 5 case files ran cases and passed them"
+            exit 1
+          fi
+          for shell in Zsh Bash Fish; do
+            if ! grep -q -F "($shell): run under the UTF-8 locale" "$log"; then
+              echo "::error::no $shell case ran under the UTF-8 locale"
+              exit 1
+            fi
+          done
+
+      # The case that compares each package with the pin the register names. A filter that matches
+      # no case runs none and passes, so the case has to be there to run. The list is read whole
+      # before it is searched, because a search that stops at its first match closes the pipe on a
+      # writer that is still listing.
+      - name: Compare each package with its pin
+        timeout-minutes: 15
+        run: |
+          cases="$(cargo test --locked -p kr-shell-integration --test qualification -- --list --include-ignored)"
+          grep -qx 'the_packages_built_here_were_built_from_the_registers_pins: test' <<<"$cases"
+          cargo test --locked -p kr-shell-integration --test qualification \
+            -- the_packages_built_here_were_built_from_the_registers_pins --include-ignored
 
   # The idle measurement on a host that meets section 27's reference host: four processors and
   # more than 8 GiB, the operating system and architecture recorded beside the figure. The

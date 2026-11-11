@@ -274,8 +274,12 @@ jobs:
       # native-module proof, and the case that compares each package with the pin the register
       # names. The whole corpus, with the startup customisations that are pinned for two of the four
       # targets, the second Zsh build and the PowerShell package that no release tree carries, runs
-      # in core-ci's shell-packages job. KR_SHELL_PREFIX names the packages built above.
+      # in core-ci's shell-packages job. KR_SHELL_PREFIX names the packages built above. The cases
+      # that depend on how the editor draws run under a byte locale and a UTF-8 locale, and a
+      # runner that lists no UTF-8 locale fails them here instead of running the first alone.
       - name: Requalify the shell packages built here
+        env:
+          KR_REQUIRE_UTF8_LOCALE: "1"
         run: |
           cargo test --locked -p kr-shell-integration \
             --test zsh --test bash --test fish --test fish_sources --test module_abi \
