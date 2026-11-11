@@ -151,19 +151,24 @@ The record keeps these lines: `resident` (the sum of the resident sizes, countin
 each process), `resident set` (the figure asserted; when the reading is refused, the reason, after
 which the measurement fails), `by class` (the daemon, the session workers and the root shells, each
 class's own figure beside the resident pages the scan counted for each of its processes, so a file
-page two classes map counts once in each), `scan`, `worker program` (how much of the worker program
+page two classes map counts once in each), `scan` (the pages present and the pages in swap for each
+class, and the excess over the kernel's sizes), `worker program` (how much of the worker program
 one worker holds resident, which the sum counts twenty times) and `largest files`.
 
 The sum stays recorded because it shows a growth of the worker program twenty times enlarged. It
 carries an alarm: `SUM_RECORDED_KIB` is where it stood when the figure was last read on a 64-processor
 Linux host, and a sum more than `SUM_ALARM_STEP_KIB` above that fails the measurement with the
-words that a ruling is needed. The alarm is not the requirement, and a low sum, which the kernel's
-reclaim of mapped pages gives, does not fire it.
+words that a ruling is needed, and the record gets an `alarm` line. The alarm is not the requirement,
+and a low sum, which the kernel's reclaim of mapped pages gives, does not fire it.
 
 Where no reader of the held figure is available, which is macOS (it has no page map a process of
 the same user can read, and the memory-object counts of `proc_pidinfo` describe the object and not
 the process), the bound is asserted against the sum of the resident sizes. The sum is never below
-what the group holds, so asserting it is stricter and not weaker.
+what the group holds, so asserting it is stricter and not weaker. A sum over the bound fails the
+measurement with words that say the figure is the sum, which counts a shared page once for each
+process, and that Linux holds the bound to the figure that counts each page once; the record's
+verdict says the figure is not shown on this host, and `scripts/bench-all.sh` lists that as a
+shortfall and not as a missed target.
 
 ### Stress: 50 sessions with sustained output
 
