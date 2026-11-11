@@ -1488,6 +1488,130 @@ fn the_program_directory_holds_only_the_names_the_installation_gives_each_of_its
     let _ = std::fs::remove_dir_all(&folder);
 }
 
+/// The refusal of the folder above the data directory offers the remedy that its reason and what the
+/// folder's handle shows allow. A folder that another account owns, or a link, was not made by the
+/// installation: the text says so, offers to move it aside, and neither removes it nor corrects its
+/// content into place, whether or not a data directory is in it. A folder that the system's class owns
+/// and whose data directory cannot be looked up offers no removal. A folder that another program holds
+/// open is cured by closing that program, and not by a change of owner or list.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_data_parents_refusal_offers_only_the_remedy_that_its_reason_and_its_handle_allow() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let name = format!("krowner{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
+    let owner = account::create(&name).unwrap();
+    let never = |text: &str, said: &[&str]| {
+        for said in said {
+            assert!(!text.contains(said), "`{said}` in {text}");
+        }
+    };
+
+    // Another account owns it: with or without a data directory in it, the installation did not
+    // make it.
+    let foreign = inherited_folder();
+    give_to(&foreign, &name);
+    for with_data in [false, true] {
+        if with_data {
+            owned_dir(foreign.join("Boundary"));
+        }
+        let text = install::check_data_parent(&paths_under(&foreign))
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains(&owner.to_text()), "{text}");
+        assert!(
+            text.contains("The installation did not make this folder"),
+            "{text}"
+        );
+        assert!(text.contains("Move the folder aside"), "{text}");
+        assert!(
+            text.contains("unless you know that your own installation wrote it"),
+            "{text}"
+        );
+        never(
+            &text,
+            &[
+                "Remove the folder",
+                "remove the folder",
+                "Correct it instead",
+                "loses nothing",
+            ],
+        );
+    }
+
+    // A link is not the installation's either.
+    let target = inherited_folder();
+    let link = PathBuf::from(r"C:\ProgramData").join(format!(
+        "krparent-link-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ));
+    let made = Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(&link)
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+    let text = install::check_data_parent(&paths_under(&link))
+        .unwrap_err()
+        .to_string();
+    assert!(text.contains("it is a link or not a folder"), "{text}");
+    assert!(text.contains("Move the folder aside"), "{text}");
+    never(
+        &text,
+        &[
+            "Remove the folder",
+            "remove the folder",
+            "Correct it instead",
+        ],
+    );
+    std::fs::remove_dir(&link).unwrap();
+
+    // The system's class owns it and the data directory cannot be looked up (a name too long for
+    // the file system answers with something other than not found): removal is not offered.
+    let folder = inherited_folder();
+    let unreadable = Paths {
+        data: folder.join("a".repeat(300)),
+        ..Paths::system()
+    };
+    let text = install::check_data_parent(&unreadable)
+        .unwrap_err()
+        .to_string();
+    assert!(text.contains("could not be read"), "{text}");
+    assert!(text.contains("Correct it instead"), "{text}");
+    never(
+        &text,
+        &["Remove the folder", "remove the folder", "loses nothing"],
+    );
+
+    // Another program holds it open and shares nothing: that is cured by closing the program.
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .custom_flags(0x0200_0000)
+        .open(&folder)
+        .unwrap();
+    let text = install::check_data_parent(&paths_under(&folder))
+        .unwrap_err()
+        .to_string();
+    drop(held);
+    assert!(text.contains("another program holds it open"), "{text}");
+    assert!(
+        text.contains("Close the program that holds it open"),
+        "{text}"
+    );
+    assert!(text.contains("Do not remove it"), "{text}");
+    never(
+        &text,
+        &["Remove the folder", "protected list", "Correct it instead"],
+    );
+
+    let _ = account::delete(&name);
+    let _ = std::fs::remove_dir_all(&foreign);
+    let _ = std::fs::remove_dir_all(&target);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
 /// Every folder above the program directory that the installation did not make is read part by part
 /// before the program directory is used: one that another account can add to, rename or delete in,
 /// or whose list it can change, and one that is a link, is refused in a repair and in a removal
@@ -1913,12 +2037,13 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
     let paths = paths_in(&folder);
     // Whatever is refused, what the person does leaves the manifest and the journal in place, and
     // the text says one remedy: an entry that the layout does not give is to be removed; a record
-    // that the layout gives is to be corrected, and is never to be removed.
+    // that the layout gives and that the system's class owns is to be corrected, and is never to be
+    // removed; one that another account owns, or a link, is not the installation's: it is moved
+    // aside, and is neither removed nor corrected into place.
     let refusal = |words: &str| {
         let refused = install::make_data_directory(&paths).expect_err("the directory is refused");
         let text = refused.to_string();
         assert!(text.contains(words), "{text}");
-        assert!(text.contains("stay where they are"), "{text}");
         text
     };
     let removal_text = |text: &str| {
@@ -1927,21 +2052,39 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
             "{text}"
         );
         assert!(!text.contains("Do not remove"), "{text}");
+        assert!(text.contains("stay where they are"), "{text}");
     };
     let correction_text = |text: &str| {
         assert!(text.contains("Correct what the reason names"), "{text}");
         assert!(text.contains("Do not remove"), "{text}");
         assert!(!text.contains("Remove "), "{text}");
+        assert!(text.contains("stay where they are"), "{text}");
+    };
+    let moved_aside_text = |text: &str| {
+        assert!(text.contains("did not make"), "{text}");
+        assert!(text.contains("Move it aside"), "{text}");
+        assert!(text.contains("do not remove it"), "{text}");
+        assert!(!text.contains("Remove "), "{text}");
+        assert!(!text.contains("Correct what the reason names"), "{text}");
     };
     let refused_with = |words: &str| {
         let text = refusal(words);
         assert!(
-            text.contains("Remove ") != text.contains("Do not remove"),
+            [
+                text.contains("Remove "),
+                text.contains("Do not remove"),
+                text.contains("Move it aside")
+            ]
+            .iter()
+            .filter(|said| **said)
+            .count()
+                == 1,
             "one remedy: {text}"
         );
     };
     let removal_with = |words: &str| removal_text(&refusal(words));
     let correction_with = |words: &str| correction_text(&refusal(words));
+    let moved_aside_with = |words: &str| moved_aside_text(&refusal(words));
 
     // A directory that the installation made is accepted, with journal files of an earlier run in
     // it, and each of its directories is made with its own protected list in the creating call and
@@ -2024,7 +2167,7 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
         .output()
         .unwrap();
     assert!(owned.status.success(), "{owned:?}");
-    correction_with("S-1-5-32-545");
+    moved_aside_with("S-1-5-32-545");
     let _ = Command::new("icacls")
         .arg(&journal_file)
         .args(["/setowner", "Administrators"])
@@ -2032,6 +2175,13 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
     owned_file(paths.journal.join("notes.txt"), b"x");
     removal_with("notes.txt");
     std::fs::remove_file(paths.journal.join("notes.txt")).unwrap();
+
+    // A journal file of the system's class with a second name is a record to correct, and is never
+    // removed.
+    let second_name = paths.journal.join(format!("{}.journal", "cd".repeat(16)));
+    std::fs::hard_link(&journal_file, &second_name).unwrap();
+    correction_with("more than one name");
+    std::fs::remove_file(&second_name).unwrap();
 
     // A link at a child's name is refused, and the tree it leads to keeps its list.
     let target = inherited_folder();
@@ -2044,7 +2194,7 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
         .output()
         .unwrap();
     assert!(made.status.success(), "{made:?}");
-    correction_with("it is a link");
+    moved_aside_with("it is a link");
     assert_eq!(summary_of(&target), targets_list);
     std::fs::remove_dir(&paths.run).unwrap();
     let _ = std::fs::remove_dir_all(&target);
@@ -2069,7 +2219,7 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
         .output()
         .unwrap();
     assert!(linked.status.success(), "{linked:?}");
-    correction_with("it is a link");
+    moved_aside_with("it is a link");
     match install::entry(&paths) {
         Err(error) => assert!(error.to_string().contains("it is a link"), "{error}"),
         Ok(_) => panic!("the manifest is read through a link"),
@@ -2325,7 +2475,9 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
         .to_string();
     assert!(text.contains(&"ab".repeat(16)), "{text}");
     assert!(text.contains(&owner.to_text()), "{text}");
-    assert!(text.contains("Do not remove"), "{text}");
+    assert!(text.contains("did not make"), "{text}");
+    assert!(text.contains("Move it aside"), "{text}");
+    assert!(!text.contains("Remove "), "{text}");
     give_to(&root, "Administrators");
     std::fs::write(root.join("anything"), b"x").unwrap();
     install::make_data_directory(&paths).expect("a private root the administrators own");
@@ -2347,15 +2499,16 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
     std::fs::remove_file(&stray).unwrap();
     install::make_data_directory(&paths).expect("the proof directory holds only its program");
 
-    // A record the layout gives is refused with the owner and the list to correct, never with its
-    // removal: the manifest and the journal directory.
+    // A record the layout gives that another account owns is not the installation's: it is refused
+    // with the account named and the entry to move aside, never with its removal and never with a
+    // correction of its owner into place: the manifest, the journal directory and the replacement.
     give_to(&paths.journal, &name);
     let text = install::make_data_directory(&paths)
         .expect_err("a journal directory that is owned")
         .to_string();
     assert!(text.contains("journal"), "{text}");
     assert!(!text.contains("Remove "), "{text}");
-    assert!(text.contains("stay where they are"), "{text}");
+    assert!(text.contains("Move it aside"), "{text}");
     give_to(&paths.journal, "Administrators");
     give_to(&paths.manifest, &name);
     let text = install::make_data_directory(&paths)
@@ -2363,11 +2516,12 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
         .to_string();
     assert!(text.contains("manifest.json"), "{text}");
     assert!(!text.contains("Remove "), "{text}");
-    // The text names the account that owns it and the correction to make, and says not to remove
-    // the record.
+    // The text names the account that owns it, says that the installation did not make it and not
+    // to correct it into place, and says not to remove it.
     assert!(text.contains(&owner.to_text()), "{text}");
-    assert!(text.contains("Correct what the reason names"), "{text}");
-    assert!(text.contains("Do not remove"), "{text}");
+    assert!(text.contains("did not make"), "{text}");
+    assert!(text.contains("Move it aside"), "{text}");
+    assert!(text.contains("do not remove it"), "{text}");
     give_to(&paths.manifest, "Administrators");
     install::make_data_directory(&paths).expect("the records are the administrators' again");
 
@@ -2386,7 +2540,7 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
         "{text}"
     );
     assert!(!text.contains("Remove "), "{text}");
-    assert!(text.contains("Correct what the reason names"), "{text}");
+    assert!(text.contains("Move it aside"), "{text}");
     assert_eq!(std::fs::read(&replacement).unwrap(), b"half");
     give_to(&replacement, "Administrators");
     std::fs::remove_file(&replacement).unwrap();
