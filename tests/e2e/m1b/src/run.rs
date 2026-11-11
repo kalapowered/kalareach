@@ -102,21 +102,11 @@ impl Run {
         } else {
             std::env::temp_dir()
         };
-        // Made by this call and no other: a directory that was there is never taken, so what a
-        // failed start or a passed run removes is only what this run made.
-        let made = made_root(&base, || kr_ipc::new_uuid().to_string());
-        kr_ipc::paths::create_private_tree(&made, &made)
-            .expect("an owner-only directory for this run on the internal disk");
-        let root = std::fs::canonicalize(&made).unwrap_or_else(|error| {
-            // Nothing is in the directory yet.
-            let _ = std::fs::remove_dir_all(&made);
-            panic!("the run's directory resolves: {error}")
-        });
-        // Pinned right after it was made, before anything else could be put in its place.
-        let pin = RootPin::of(&root).unwrap_or_else(|why| {
-            let _ = std::fs::remove_dir_all(&made);
-            panic!("{why}")
-        });
+        // Made by this call and no other, and pinned from the handle it was opened by: a directory
+        // that was there is never taken, a mount or a link put in its place is refused, and a start
+        // that fails here leaves the path where it is and removes nothing.
+        let (root, pin) = make_root(&base, &mut || kr_ipc::new_uuid().to_string(), &mut |_| {})
+            .unwrap_or_else(|why| panic!("{why}"));
         let run = Self {
             leg: leg.to_owned(),
             root,
@@ -587,41 +577,103 @@ impl Run {
     }
 }
 
-/// Makes the run's root directory under `base`, owner-only, named `krm-` and the first eight
-/// characters of a name from `names`, and returns it. The directory is created exclusively: a name
-/// that is taken, by a directory of another run or by anything else, is left as it is and the next
-/// name is tried, so the directory returned is one this call made.
+/// Makes the run's own directory below `base`, with a name `names` gives (eight characters of it),
+/// and pins it, through handles only: `base` is opened as a handle, the directory is made with
+/// `mkdirat` on it and opened with `openat` and no link followed, and on that handle the directory
+/// must be on `base`'s device (a volume mounted on the new name is refused), owner-only, and empty (a
+/// directory moved in is refused). The pin and the directory's resolved path are read from that
+/// handle. `between` is told the new name once it is made and before it is opened, which is where a
+/// test puts something else in its place.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics when the directory cannot be made for a reason other than its name being taken, or when
-/// sixty-four names are all taken.
-fn made_root(base: &Path, mut names: impl FnMut() -> String) -> PathBuf {
+/// Returns why the directory was not made or is not the directory this call made, as a class and no
+/// name. Nothing is removed in any case: a failed start leaves the path where it is.
+fn make_root(
+    base: &Path,
+    names: &mut dyn FnMut() -> String,
+    between: &mut dyn FnMut(&Path),
+) -> Result<(PathBuf, RootPin), String> {
+    use rustix::fs::{Mode, OFlags};
+    let said = |what: &str, error: rustix::io::Errno| {
+        format!("the run's directory {what}: {error}; whatever is at its path was left where it is")
+    };
+    let base_handle = rustix::fs::open(
+        base,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| said("cannot be made, its base cannot be opened", error))?;
+    let base_stat = rustix::fs::fstat(&base_handle)
+        .map_err(|error| said("cannot be made, its base cannot be looked at", error))?;
+    let mut name = None;
     for _ in 0..64 {
-        let made = base.join(format!("krm-{}", &names()[..8]));
-        match make_exclusively(&made) {
-            Ok(()) => return made,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                panic!("an owner-only directory for this run on the internal disk: {error}")
+        let candidate = format!("krm-{}", &names()[..8]);
+        match rustix::fs::mkdirat(&base_handle, candidate.as_str(), Mode::from_raw_mode(0o700)) {
+            Ok(()) => {
+                name = Some(candidate);
+                break;
             }
+            Err(rustix::io::Errno::EXIST) => {}
+            Err(error) => return Err(said("cannot be made", error)),
         }
     }
-    panic!("the run's directory has no free name among sixty-four tries")
-}
-
-/// Creates the one directory `path`, owner-only where the platform has modes, and fails with
-/// `AlreadyExists` where anything is at `path`, a symbolic link included.
-fn make_exclusively(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        std::fs::DirBuilder::new().mode(0o700).create(path)
+    let name = name
+        .ok_or_else(|| "the run's directory has no free name among sixty-four tries".to_owned())?;
+    between(&base.join(&name));
+    let handle = rustix::fs::openat(
+        &base_handle,
+        name.as_str(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        said(
+            "is not the directory that was made, a link or another entry is there",
+            error,
+        )
+    })?;
+    let stat = rustix::fs::fstat(&handle).map_err(|error| said("cannot be looked at", error))?;
+    if stat.st_dev != base_stat.st_dev {
+        return Err(
+            "the run's directory is on another file system than its base, as a mounted \
+                    volume is; it was left where it is"
+                .to_owned(),
+        );
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir(path)
+    if stat.st_uid != rustix::process::getuid().as_raw() || stat.st_mode & 0o077 != 0 {
+        return Err("the run's directory is not owner-only; it was left where it is".to_owned());
     }
+    let entries = rustix::fs::Dir::read_from(&handle)
+        .map_err(|error| said("cannot be listed", error))?
+        .filter(|entry| {
+            entry.as_ref().map_or(true, |entry| {
+                entry.file_name().to_bytes() != b"." && entry.file_name().to_bytes() != b".."
+            })
+        })
+        .count();
+    if entries != 0 {
+        return Err(
+            "the run's directory is not empty, so it is not the directory that was made \
+                    (the count of its entries is {entries}); it was left where it is"
+                .replace("{entries}", &entries.to_string()),
+        );
+    }
+    let pin = RootPin::of_handle(&handle)?;
+    // The access list, which the handle's mode does not show, is read from the path the handle
+    // has, and the directory found there is checked to be the pinned one.
+    let root = pin.place.clone();
+    kr_ipc::paths::create_private_tree(&root, &root)
+        .map_err(|error| format!("the run's directory is not private: {error}"))?;
+    let again = open_directory(&root).map_err(|error| said("is not at its place", error))?;
+    if !pin.holds(&again) {
+        return Err(
+            "the run's directory is not the directory that was made; it was left where \
+                    it is"
+                .to_owned(),
+        );
+    }
+    Ok((root, pin))
 }
 
 /// The directory a run made: its device and inode from the handle opened on it right after it was
@@ -668,10 +720,20 @@ impl RootPin {
     ///
     /// Returns why it could not be opened and looked at.
     pub fn of(path: &Path) -> Result<Self, String> {
-        let said =
-            |error: rustix::io::Errno| format!("the run's directory cannot be pinned: {error}");
-        let handle = open_directory(path).map_err(said)?;
-        let stat = rustix::fs::fstat(&handle).map_err(said)?;
+        let handle = open_directory(path)
+            .map_err(|error| format!("the run's directory cannot be pinned: {error}"))?;
+        Self::of_handle(&handle)
+    }
+
+    /// Pins the directory `handle` is open on: its device and inode, and the place the system says
+    /// it has now.
+    ///
+    /// # Errors
+    ///
+    /// Returns why it could not be looked at.
+    pub fn of_handle(handle: impl std::os::fd::AsFd) -> Result<Self, String> {
+        let stat = rustix::fs::fstat(&handle)
+            .map_err(|error| format!("the run's directory cannot be pinned: {error}"))?;
         let place = current_place(&handle)
             .ok_or_else(|| "the system names no place for the run's directory".to_owned())?;
         Ok(Self {
@@ -705,6 +767,9 @@ pub enum Left {
     /// An entry lies on another file system than the run's directory, as a mounted volume does:
     /// nothing is entered or removed on it, and nothing else is removed either.
     AnotherFileSystem,
+    /// A directory the removal held open is no longer beneath the run's directory: it was moved
+    /// out, and nothing more is unlinked through it.
+    MovedOut,
     /// The system refused a look, an opening or a removal.
     Refused,
 }
@@ -714,6 +779,7 @@ impl std::fmt::Display for Left {
         formatter.write_str(match self {
             Self::RootChanged => "the path is not the directory the run made",
             Self::AnotherFileSystem => "an entry below it lies on another file system",
+            Self::MovedOut => "a directory it held open is no longer beneath it",
             Self::Refused => "the system refused a look or a removal",
         })
     }
@@ -739,8 +805,10 @@ const DEEPEST_REMOVAL: usize = 128;
 fn walk_for_removal(
     directory: &std::os::fd::OwnedFd,
     device: rustix::fs::Dev,
+    pin: &RootPin,
     depth: usize,
     remove: bool,
+    before_unlink: &mut dyn FnMut(&[u8]),
 ) -> Result<(), Left> {
     use rustix::fs::{AtFlags, FileType};
     if depth > DEEPEST_REMOVAL {
@@ -778,12 +846,26 @@ fn walk_for_removal(
             if (opened.st_dev, opened.st_ino) != (looked.st_dev, looked.st_ino) {
                 return Err(Left::AnotherFileSystem);
             }
-            walk_for_removal(&child, device, depth + 1, remove)?;
+            // A directory moved out of the run since it was looked at is not the run's to empty.
+            if !pin.contains(&child) {
+                return Err(Left::MovedOut);
+            }
+            walk_for_removal(&child, device, pin, depth + 1, remove, before_unlink)?;
             if remove {
+                before_unlink(name.to_bytes());
+                if !pin.contains(directory) {
+                    return Err(Left::MovedOut);
+                }
                 rustix::fs::unlinkat(directory, name.as_c_str(), AtFlags::REMOVEDIR)
                     .map_err(|_| Left::Refused)?;
             }
         } else if remove {
+            before_unlink(name.to_bytes());
+            // Checked just before the unlink: the directory this name is in may have been moved
+            // out of the run since it was opened, and a name there is not the run's.
+            if !pin.contains(directory) {
+                return Err(Left::MovedOut);
+            }
             rustix::fs::unlinkat(directory, name.as_c_str(), AtFlags::empty())
                 .map_err(|_| Left::Refused)?;
         }
@@ -795,9 +877,21 @@ fn walk_for_removal(
 /// one `pin` names, and it is looked through once for an entry on another file system before
 /// anything is removed. A volume mounted below the run, or a root that is not the directory the run
 /// made, leaves the whole directory where it is, and the removal enters and removes nothing on
-/// another device in any case.
+/// another device in any case; a directory that is moved out of the run is left, and nothing more is
+/// unlinked through it. The root's own name is removed relative to its parent's handle, after a look
+/// through that handle shows the name is still the pinned directory.
 #[must_use]
 pub fn remove_run_directory(root: &Path, pin: &RootPin) -> Removal {
+    remove_run_directory_by(root, pin, &mut |_| {})
+}
+
+/// [`remove_run_directory`] with the moment before each unlink, told the name about to be unlinked
+/// (the root's own name is told as an empty one), at which a test changes the tree.
+fn remove_run_directory_by(
+    root: &Path,
+    pin: &RootPin,
+    before_unlink: &mut dyn FnMut(&[u8]),
+) -> Removal {
     let handle = match open_directory(root) {
         Ok(handle) => handle,
         Err(rustix::io::Errno::NOENT) => return Removal::Removed,
@@ -813,11 +907,34 @@ pub fn remove_run_directory(root: &Path, pin: &RootPin) -> Removal {
         return Removal::Left(Left::Refused);
     };
     for remove in [false, true] {
-        if let Err(left) = walk_for_removal(&handle, stat.st_dev, 1, remove) {
+        if let Err(left) = walk_for_removal(&handle, stat.st_dev, pin, 1, remove, before_unlink) {
             return Removal::Left(left);
         }
     }
-    match rustix::fs::rmdir(root) {
+    // The root's own name, relative to its parent's handle.
+    let (Some(parent), Some(name)) = (root.parent(), root.file_name()) else {
+        return Removal::Left(Left::Refused);
+    };
+    let Ok(name) = std::ffi::CString::new(name.as_encoded_bytes()) else {
+        return Removal::Left(Left::Refused);
+    };
+    let Ok(parent) = open_directory(parent) else {
+        return Removal::Left(Left::Refused);
+    };
+    before_unlink(b"");
+    match rustix::fs::statat(
+        &parent,
+        name.as_c_str(),
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+    ) {
+        Ok(looked)
+            if i128::from(looked.st_dev) == pin.device
+                && i128::from(looked.st_ino) == pin.inode => {}
+        Ok(_) => return Removal::Left(Left::RootChanged),
+        Err(rustix::io::Errno::NOENT) => return Removal::Removed,
+        Err(_) => return Removal::Left(Left::Refused),
+    }
+    match rustix::fs::unlinkat(&parent, name.as_c_str(), rustix::fs::AtFlags::REMOVEDIR) {
         Ok(()) | Err(rustix::io::Errno::NOENT) => Removal::Removed,
         Err(_) => Removal::Left(Left::Refused),
     }
@@ -1328,23 +1445,180 @@ mod tests {
 mod root_tests {
     use super::*;
 
+    fn scratch(name: &str) -> PathBuf {
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .expect("the temporary directory")
+            .join(format!("kr-run-{name}-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&base).expect("a scratch directory");
+        base
+    }
+
     #[test]
     fn a_root_that_was_there_is_left_as_it_is_and_another_name_is_taken() {
-        let base = std::env::temp_dir().join(format!("kr-run-root-{}", kr_ipc::new_uuid()));
-        std::fs::create_dir_all(&base).expect("a scratch directory");
+        let base = scratch("root");
         // A directory of another run, owner-only, which a start that took it would remove.
         let taken = base.join("krm-aaaaaaaa");
-        make_exclusively(&taken).expect("a directory of another run");
+        std::fs::create_dir(&taken).expect("a directory of another run");
         std::fs::write(taken.join("kept"), b"evidence").expect("a file in it");
         // A name taken by a link is taken too.
         std::os::unix::fs::symlink(&taken, base.join("krm-bbbbbbbb")).expect("a link");
-        let mut names = ["aaaaaaaa", "bbbbbbbb", "cccccccc"].into_iter();
-        let made = made_root(&base, || names.next().expect("a name").to_owned());
+        let mut names = ["aaaaaaaa", "bbbbbbbb", "cccccccc"]
+            .into_iter()
+            .map(str::to_owned);
+        let (made, pin) =
+            make_root(&base, &mut || names.next().expect("a name"), &mut |_| {}).expect("a root");
         assert_eq!(made, base.join("krm-cccccccc"));
+        assert!(pin.holds(open_directory(&made).expect("it opens")));
         assert!(
             taken.join("kept").is_file(),
             "the other run's directory is untouched"
         );
         std::fs::remove_dir_all(&base).expect("clean up");
+    }
+
+    /// A link, or a directory with something in it, put at the new name between its making and its
+    /// opening is refused, and nothing is written into it or removed from it; a failed start removes
+    /// nothing.
+    #[test]
+    fn a_link_or_a_full_directory_put_in_the_new_root_s_place_is_refused_and_nothing_is_removed() {
+        let base = scratch("swap");
+        let theirs = scratch("swap-theirs");
+        std::fs::write(theirs.join("personal"), b"a file of the person's").expect("a file");
+        let put_in_place = |place: &Path, with: &dyn Fn(&Path)| {
+            let away = place.with_extension("away");
+            std::fs::rename(place, &away).expect("the new directory moved away");
+            with(place);
+        };
+        // A link to a directory of the person's.
+        let why = make_root(&base, &mut || "dddddddd".to_owned(), &mut |place| {
+            put_in_place(place, &|place| {
+                std::os::unix::fs::symlink(&theirs, place).expect("a link");
+            });
+        })
+        .expect_err("a link put in the new root's place");
+        assert!(why.contains("a link or another entry"), "{why}");
+        assert_eq!(std::fs::read_dir(&theirs).expect("theirs").count(), 1);
+        assert!(theirs.join("personal").is_file());
+        // A directory of the person's with a file in it, moved into the place.
+        let full = base.join("full");
+        std::fs::create_dir(&full).expect("a directory");
+        std::fs::set_permissions(&full, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("owner-only");
+        std::fs::write(full.join("personal"), b"a file of the person's").expect("a file");
+        let why = make_root(&base, &mut || "eeeeeeee".to_owned(), &mut |place| {
+            put_in_place(place, &|place| {
+                std::fs::rename(&full, place).expect("moved in");
+            });
+        })
+        .expect_err("a full directory put in the new root's place");
+        assert!(why.contains("not empty"), "{why}");
+        assert!(base.join("krm-eeeeeeee/personal").is_file());
+        std::fs::remove_dir_all(&base).expect("clean up");
+        std::fs::remove_dir_all(&theirs).expect("clean up");
+    }
+
+    /// A volume mounted on the new name between its making and its opening is refused, and nothing
+    /// is written into it or removed from it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_volume_mounted_on_the_new_root_is_refused_and_nothing_on_it_is_touched() {
+        use kr_ipc::testing::volumes::{Volume, not_attachable};
+        let base = scratch("mount");
+        let images = scratch("mount-images");
+        let mut volume = None;
+        let mut before = 0;
+        let why = make_root(&base, &mut || "ffffffff".to_owned(), &mut |place| {
+            let attached =
+                Volume::attach(place, &images, "root").unwrap_or_else(|| not_attachable());
+            std::fs::write(place.join("theirs"), b"a file of the person's").expect("a file");
+            before = std::fs::read_dir(place).expect("the volume").count();
+            volume = Some(attached);
+        })
+        .expect_err("a volume mounted on the new root");
+        let there = base.join("krm-ffffffff/theirs").is_file();
+        let entries = std::fs::read_dir(base.join("krm-ffffffff"))
+            .expect("the volume")
+            .count();
+        volume.expect("it was attached").detach();
+        assert!(why.contains("another file system"), "{why}");
+        assert!(
+            there && entries == before,
+            "nothing was written or removed on the volume"
+        );
+        std::fs::remove_dir_all(&base).expect("clean up");
+        std::fs::remove_dir_all(&images).expect("clean up");
+    }
+
+    /// A directory moved out of the run between the first pass and the second, with a file put under
+    /// an entry's name, is not emptied; and the root's own name is not removed when it is another
+    /// directory by then.
+    #[test]
+    fn a_directory_moved_out_during_the_removal_is_left_and_so_is_a_directory_put_at_the_root() {
+        let base = scratch("removal");
+        let elsewhere = scratch("removal-elsewhere");
+        let root = base.join("krm-gggggggg");
+        let run = |root: &Path| {
+            std::fs::create_dir_all(root.join("a/inner")).expect("a run");
+            std::fs::write(root.join("a/inner/x"), b"the run's own file").expect("a file");
+            std::fs::write(root.join("a/y"), b"the run's own file").expect("a file");
+            RootPin::of(root).expect("a pin")
+        };
+        // The directory `inner` is moved out and a file of the person's is put under the name `x`.
+        let pin = run(&root);
+        let mut moved = false;
+        let removal = remove_run_directory_by(&root, &pin, &mut |name| {
+            if name == b"x" && !moved {
+                moved = true;
+                std::fs::rename(root.join("a/inner"), elsewhere.join("inner")).expect("moved out");
+                std::fs::remove_file(elsewhere.join("inner/x")).expect("the run's own file");
+                std::fs::write(elsewhere.join("inner/x"), b"a file of the person's")
+                    .expect("a file put under the name");
+            }
+        });
+        assert!(moved);
+        assert_eq!(removal, Removal::Left(Left::MovedOut));
+        assert!(
+            elsewhere.join("inner/x").is_file(),
+            "the file put under the name is still there"
+        );
+        // The same for the name of an emptied directory in a directory that was moved out before its
+        // unlink: an empty directory of the person's put under that name is still there.
+        std::fs::remove_dir_all(&root).expect("clean up");
+        std::fs::remove_dir_all(elsewhere.join("inner")).expect("clean up");
+        let pin = run(&root);
+        let mut moved = false;
+        let removal = remove_run_directory_by(&root, &pin, &mut |name| {
+            if name == b"inner" && !moved {
+                moved = true;
+                std::fs::rename(root.join("a"), elsewhere.join("a")).expect("moved out");
+                std::fs::remove_dir(elsewhere.join("a/inner")).expect("the emptied directory");
+                std::fs::create_dir(elsewhere.join("a/inner")).expect("another empty directory");
+            }
+        });
+        assert!(moved);
+        assert_eq!(removal, Removal::Left(Left::MovedOut));
+        assert!(
+            elsewhere.join("a/inner").is_dir(),
+            "the directory put under the name is still there"
+        );
+        std::fs::remove_dir_all(&root).expect("clean up");
+        // The root is renamed away after the walk, and an empty directory is put at its path.
+        let pin = run(&root);
+        let mut swapped = false;
+        let removal = remove_run_directory_by(&root, &pin, &mut |name| {
+            if name.is_empty() && !swapped {
+                swapped = true;
+                std::fs::rename(&root, base.join("away")).expect("renamed away");
+                std::fs::create_dir(&root).expect("another directory at the path");
+            }
+        });
+        assert!(swapped);
+        assert_eq!(removal, Removal::Left(Left::RootChanged));
+        assert!(
+            root.is_dir(),
+            "the directory put at the root's path is still there"
+        );
+        std::fs::remove_dir_all(&base).expect("clean up");
+        std::fs::remove_dir_all(&elsewhere).expect("clean up");
     }
 }
