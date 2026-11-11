@@ -9,8 +9,9 @@
 //! The guard cannot be sent to another thread, so the privilege cannot be used where it was not
 //! asked for, and the functions that act with the privilege take the guard as an argument, so the
 //! compiler shows that none runs outside one. If the thread's own token cannot be taken away
-//! again, the thread is not trusted any more: it runs no further walk, and the service is told to
-//! stop accepting requests until it has been restarted.
+//! again, the broker's process ends at once, with [`FAIL_CLOSED_EXIT`]: no thread goes on with the
+//! enabled token and no open connection is served again. The service's failure action starts the
+//! broker anew, and its journal says what was unfinished.
 
 #![allow(unsafe_code)]
 
@@ -29,6 +30,7 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken, SetThreadToken,
+    TerminateProcess,
 };
 
 use super::ffi::{Handle, Result, error, last, wide};
@@ -57,8 +59,14 @@ impl Privilege {
 /// The privileges a walk enables: the least set the cases showed is enough.
 pub const WALK_PRIVILEGES: [Privilege; 2] = [Privilege::Backup, Privilege::Restore];
 
-/// Set when a thread's own token could not be taken away; the service reads it before it accepts
-/// a request and stops accepting them while it is set.
+/// The exit code of a broker that could not give a privilege back and ended at once. The service
+/// manager sees a process that ended without reporting its stop and applies the service's failure
+/// action.
+pub const FAIL_CLOSED_EXIT: u32 = 0x4B52_0001;
+
+/// Set when a thread's own token could not be taken away. Ending the process follows at once, so
+/// nothing in a running broker sees it set; the service's loops read it as well, so that a
+/// connection that outlives a stand-in for the exit is dropped and not served.
 static REVERT_FAILED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
@@ -71,8 +79,7 @@ thread_local! {
     static FORCE_REVERT_FAILURE: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Whether a thread ever failed to give its privileges back, which keeps the service from
-/// accepting requests until it has been restarted.
+/// Whether a thread ever failed to give its privileges back: nothing is served after that.
 #[must_use]
 pub fn revert_failed() -> bool {
     REVERT_FAILED.load(Ordering::SeqCst)
@@ -138,10 +145,27 @@ impl Drop for PrivGuard {
         if !reverted {
             POISONED.set(true);
             REVERT_FAILED.store(true, Ordering::SeqCst);
+            fail_closed();
         }
         // The token handle closes when `self.token` drops, after the thread stopped using it.
         let _ = &self.token;
     }
+}
+
+/// Ends the broker's process at once: this thread still holds the enabled token, and nothing may go
+/// on with it. No destructor runs, and nothing is written, since the thread that failed cannot be
+/// trusted to write anything.
+fn fail_closed() {
+    #[cfg(feature = "testing")]
+    if testing::stand_in_for_exit() {
+        return;
+    }
+    // SAFETY: ends the calling process; the pseudo-handle of the current process is always valid.
+    unsafe {
+        TerminateProcess(GetCurrentProcess(), FAIL_CLOSED_EXIT);
+    }
+    // The call does not return. If it did, a process that cannot be ended is stopped another way.
+    std::process::abort();
 }
 
 fn revert() -> bool {
@@ -264,19 +288,45 @@ pub fn thread_has_token() -> bool {
     true
 }
 
-/// What the cases use to make the next revert on a thread fail, and to clear the service's latch
-/// afterwards.
+/// What the cases use to make the next revert on a thread fail, to see the process end, and to clear
+/// the latch afterwards.
 #[cfg(feature = "testing")]
 pub mod testing {
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static STAND_IN: AtomicBool = AtomicBool::new(false);
+    static EXIT_ASKED: AtomicBool = AtomicBool::new(false);
 
     /// The next guard dropped on this thread fails to revert.
     pub fn fail_next_revert() {
         super::FORCE_REVERT_FAILURE.set(true);
     }
 
+    /// Makes the end of the process, after a failed revert, a record that a case reads with
+    /// [`exit_was_asked`], so that a case can go on in the same process and see that nothing is
+    /// served afterwards. A case that shows the real end runs a program of its own.
+    pub fn stand_in_for_the_process_end() {
+        STAND_IN.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn stand_in_for_exit() -> bool {
+        if STAND_IN.load(Ordering::SeqCst) {
+            EXIT_ASKED.store(true, Ordering::SeqCst);
+            return true;
+        }
+        false
+    }
+
+    /// Whether a failed revert asked for the end of the process while the stand-in was in place.
+    #[must_use]
+    pub fn exit_was_asked() -> bool {
+        EXIT_ASKED.load(Ordering::SeqCst)
+    }
+
     /// Clears the latch and the thread's poisoned state after a case.
     pub fn clear() {
+        STAND_IN.store(false, Ordering::SeqCst);
+        EXIT_ASKED.store(false, Ordering::SeqCst);
         super::REVERT_FAILED.store(false, Ordering::SeqCst);
         super::POISONED.set(false);
         super::ENTERED.set(false);

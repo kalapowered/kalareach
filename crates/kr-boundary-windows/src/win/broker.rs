@@ -74,12 +74,64 @@ pub fn init() {
 static STOP: OnceLock<Arc<Stop>> = OnceLock::new();
 static STATUS: OnceLock<usize> = OnceLock::new();
 
+/// The slots that bound how many connections are served at once.
+#[derive(Debug)]
+pub struct Slots {
+    active: AtomicUsize,
+    most: usize,
+}
+
+/// One slot in use, given back when this value is dropped, however its thread ended: a return, an
+/// error or a panic.
+#[derive(Debug)]
+pub struct Slot(Arc<Slots>);
+
+impl Slots {
+    /// Slots for at most `most` connections.
+    #[must_use]
+    pub fn new(most: usize) -> Arc<Slots> {
+        Arc::new(Slots {
+            active: AtomicUsize::new(0),
+            most,
+        })
+    }
+
+    /// Takes a slot, or none when all are in use.
+    #[must_use]
+    pub fn take(self: &Arc<Slots>) -> Option<Slot> {
+        let mut seen = self.active.load(Ordering::SeqCst);
+        loop {
+            if seen >= self.most {
+                return None;
+            }
+            match self
+                .active
+                .compare_exchange(seen, seen + 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return Some(Slot(Arc::clone(self))),
+                Err(now) => seen = now,
+            }
+        }
+    }
+
+    /// How many slots are in use.
+    #[must_use]
+    pub fn in_use(&self) -> usize {
+        self.active.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// What every connection shares.
 struct State {
     manifest: Manifest,
     paths: Paths,
     maintenance: AtomicBool,
-    active: AtomicUsize,
     stop: Arc<Stop>,
 }
 
@@ -167,32 +219,79 @@ fn serve() -> Result<(), String> {
         manifest,
         paths,
         maintenance: AtomicBool::new(false),
-        active: AtomicUsize::new(0),
         stop: Arc::clone(&stop),
     });
     report(SERVICE_RUNNING, 0, 0);
+    run(&mut listener, &state)
+}
+
+/// Takes connections and answers each on a thread of its own, until the service is told to stop.
+///
+/// A thread that could not give its privileges back ends the whole process at once, so nothing here
+/// sees the latch set in a running broker. The checks are for the connections that outlive a
+/// stand-in for that end in a case: none is accepted, and none that is open is served again.
+fn run(listener: &mut Listener, state: &Arc<State>) -> Result<(), String> {
+    let slots = Slots::new(MAX_CONNECTIONS);
     let mut threads = Vec::new();
     while let Some(connection) = listener.accept().map_err(|error| error.to_string())? {
-        // A thread that could not give its privileges back is not trusted again: no request is
-        // taken until the service has been restarted.
         if super::privilege::revert_failed() {
-            continue;
+            break;
         }
-        if state.active.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+        let Some(slot) = slots.take() else {
             continue;
-        }
-        state.active.fetch_add(1, Ordering::SeqCst);
-        let shared = Arc::clone(&state);
+        };
+        let shared = Arc::clone(state);
         threads.push(std::thread::spawn(move || {
+            // The slot goes back when this thread ends, a panic included.
+            let _slot = slot;
             answer(connection, &shared);
-            shared.active.fetch_sub(1, Ordering::SeqCst);
         }));
         threads.retain(|thread| !thread.is_finished());
     }
     for thread in threads {
         let _ = thread.join();
     }
+    if super::privilege::revert_failed() {
+        return Err("a thread could not give its privileges back".to_owned());
+    }
     Ok(())
+}
+
+/// What the cases use to run the broker's loop in their own process.
+#[cfg(feature = "testing")]
+pub mod testing {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use crate::manifest::Manifest;
+
+    use super::super::ffi::Sid;
+    use super::super::install::Paths;
+    use super::super::pipe::{Listener, Stop};
+    use super::{State, run};
+
+    /// Binds the service's pipe for these people and serves it until `stop` is set or a thread
+    /// could not give its privileges back, as the service does.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the pipe could not be made or the loop ended.
+    pub fn serve(
+        manifest: Manifest,
+        paths: Paths,
+        people: &[Sid],
+        stop: Arc<Stop>,
+    ) -> Result<(), String> {
+        let mut listener =
+            Listener::bind(people, Arc::clone(&stop)).map_err(|error| error.to_string())?;
+        let state = Arc::new(State {
+            manifest,
+            paths,
+            maintenance: AtomicBool::new(false),
+            stop,
+        });
+        run(&mut listener, &state)
+    }
 }
 
 fn refuse(reason: Refusal, detail: &str) -> Response {
@@ -258,6 +357,10 @@ fn answer(mut connection: Connection, state: &State) {
             }
             Err(_) => return,
         };
+        // A request that arrives after a thread failed to give its privileges back is not served.
+        if super::privilege::revert_failed() {
+            return;
+        }
         let response = match request {
             Request::Hello { .. } => refuse(Refusal::Malformed, "hello was already said"),
             Request::Status {} => Response::Status {
