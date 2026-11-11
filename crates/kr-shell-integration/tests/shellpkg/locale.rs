@@ -13,11 +13,12 @@
 //! A platform that cannot be asked at all is a failure whatever the switch says: a probe that
 //! could not run has not found that there is no UTF-8 locale.
 
-use std::cell::RefCell;
 use std::env::VarError;
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::thread::{self, ThreadId};
 
 use kr_shell_integration::contract::qualification::ShellKind;
 
@@ -27,20 +28,30 @@ const REQUIRE: &str = "KR_REQUIRE_UTF8_LOCALE";
 /// The locale of every shell the harness starts when no case has chosen another.
 const BYTE_LOCALE: &str = "C";
 
-thread_local! {
-    /// The locale name of the run [`in_each_locale`] is making on this thread, if it is making one.
-    static IN_FORCE: RefCell<Option<String>> = const { RefCell::new(None) };
+/// The locale name of the run [`in_each_locale`] is making on each thread that is making one.
+///
+/// A static list keyed by thread and not a `thread_local!`: the conformance report reads this
+/// module for the functions a case calls, and a macro it does not know in a module makes it
+/// distrust every call it cannot prove, which would drop the keyed tests that reach the cases
+/// through here. A thread id has no order and a hash map cannot be built in a static, so a list of
+/// the few threads that run a case at once is what this holds.
+static IN_FORCE: Mutex<Vec<(ThreadId, String)>> = Mutex::new(Vec::new());
+
+/// The runs in force. A case that panics holds no lock, and a poisoned list is as good as any
+/// other.
+fn runs() -> MutexGuard<'static, Vec<(ThreadId, String)>> {
+    IN_FORCE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The locale a shell started now runs in: the one of the run [`in_each_locale`] is making, and
-/// the byte locale outside one.
+/// The locale a shell started now runs in: the one of the run [`in_each_locale`] is making on this
+/// thread, and the byte locale outside one.
 #[must_use]
 pub fn locale_in_force() -> String {
-    IN_FORCE.with(|name| {
-        name.borrow()
-            .clone()
-            .unwrap_or_else(|| BYTE_LOCALE.to_owned())
-    })
+    let this = thread::current().id();
+    runs()
+        .iter()
+        .find(|(thread, _)| *thread == this)
+        .map_or_else(|| BYTE_LOCALE.to_owned(), |(_, name)| name.clone())
 }
 
 /// Holds a locale in force while it lives, and puts the byte locale back when it ends, however
@@ -54,21 +65,21 @@ impl InForce {
     /// locale back in force for what is left of the outer one, under a log line that names
     /// another.
     fn set(name: &str) -> Self {
-        IN_FORCE.with(|current| {
-            let mut current = current.borrow_mut();
-            assert!(
-                current.is_none(),
-                "`in_each_locale` is running inside a run of its own"
-            );
-            *current = Some(name.to_owned());
-        });
+        let this = thread::current().id();
+        let mut held = runs();
+        assert!(
+            !held.iter().any(|(thread, _)| *thread == this),
+            "`in_each_locale` is running inside a run of its own"
+        );
+        held.push((this, name.to_owned()));
         Self
     }
 }
 
 impl Drop for InForce {
     fn drop(&mut self) {
-        IN_FORCE.with(|current| *current.borrow_mut() = None);
+        let this = thread::current().id();
+        runs().retain(|(thread, _)| *thread != this);
     }
 }
 
