@@ -99,12 +99,14 @@ use kr_e2e_agents::account::{KEY_SCAN_VARIABLE, Ledger};
 use kr_e2e_agents::build::{self, Account, Build, InstallSwitch, Probe};
 use kr_e2e_agents::held::{
     Absent, Audit, CONFIG_DIRECTORY, HeldKeys, ISOLATION_UNPROVEN, MetaGuard, RunScan, Stop,
-    absent_paths, audit_turns, conversations_relative, grouped_output, is_absent, kept_panic_text,
-    other_agent_processes, other_agents_refusal, panic_text, person_home, read_record,
-    turns_recorded, unchanged_before_the_charge,
+    absent_below, absent_paths, audit_turns, conversations_relative, folder_of, grouped_output,
+    kept_panic_text, other_agent_processes, other_agents_refusal, panic_text, person_home,
+    read_record, turns_recorded, unchanged_before_the_charge,
 };
 use kr_e2e_agents::outcome::Outcome;
-use kr_e2e_agents::stage::{Installation, closed_port, scan_rules, session_variables};
+use kr_e2e_agents::stage::{
+    Installation, PlacedProgram, closed_port, scan_rules, session_variables,
+};
 use kr_e2e_agents::stub::RequestStub;
 use kr_e2e_m1b::device::{Device, PairedHost, Remote, RequestError};
 use kr_e2e_m1b::host::{Host, HostOptions, Preparation};
@@ -270,6 +272,8 @@ struct Real {
     held: HeldKeys,
     home: PathBuf,
     person: MetaGuard,
+    /// The agent's program as the run placed it, recorded once before the agent first starts.
+    placed: std::sync::OnceLock<PlacedProgram>,
 }
 
 impl Route {
@@ -321,6 +325,7 @@ impl Route {
             held,
             home,
             person,
+            placed: std::sync::OnceLock::new(),
         }))
     }
 }
@@ -424,12 +429,27 @@ impl Real {
         }
     }
 
-    /// Fails the case when a file the entry says would load the person's own settings, hooks or
-    /// servers into the agent exists before it starts: every path of the entry's list, with every
-    /// template filled in.
-    fn checks_absent(&self, run: &Run) {
-        for path in absent_paths(&self.account, run, &run.home(), &self.home, Absent::All) {
-            match is_absent(&path) {
+    /// The paths of the entry's list of files that would load the person's own settings, hooks or
+    /// servers into the agent, with every template filled in. Made once, before the agent first
+    /// starts, from the working directory as the system resolves it then, and kept: nothing is
+    /// resolved again once the agent has run.
+    fn absent_list(&self, run: &Run) -> Vec<PathBuf> {
+        absent_paths(
+            &self.account,
+            run,
+            &run.home(),
+            &self.home,
+            &folder_of(run),
+            Absent::All,
+        )
+    }
+
+    /// Fails the case when a file of `absent`, the entry's list ([`Real::absent_list`]), exists:
+    /// each path in the run is looked at by a walk from the run's pinned directory that follows no
+    /// link at any component.
+    fn checks_absent(&self, run: &Run, absent: &[PathBuf]) {
+        for path in absent {
+            match absent_below(run.root(), run.pin(), path) {
                 Ok(true) => {}
                 Ok(false) => panic!(
                     "{ISOLATION_UNPROVEN} {} exists, which would load the person's own settings, \
@@ -483,11 +503,10 @@ impl Real {
             .any(|argument| argument.contains("{stub}"))
             .then(RequestStub::start)
             .transpose()?;
-        let mut command = std::process::Command::new("/bin/sh");
+        // The program is started by the absolute path recorded when it was placed, once the route to
+        // it is checked to be as it was: the agent's earlier start may have left another link.
+        let mut command = self.placed().command(run.root(), run.pin())?;
         command
-            .arg("-c")
-            .arg("exec \"$0\" \"$@\"")
-            .arg(&self.build.command)
             .args(probe.arguments.iter().map(|argument| match &stub {
                 Some(stub) => argument.replace("{stub}", stub.address()),
                 None => argument.clone(),
@@ -535,6 +554,25 @@ impl Real {
                 probe.check(&text, &[], None)
             }
         }
+    }
+
+    /// The agent's program as the run placed it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when it is asked for before the program was placed.
+    fn placed(&self) -> &PlacedProgram {
+        self.placed
+            .get()
+            .expect("the agent's program is placed before the agent starts")
+    }
+
+    /// Fails the case unless the route the agent's name is found by, right before it is typed, is
+    /// the one the run placed.
+    fn checks_the_route(&self, run: &Run) {
+        self.placed()
+            .checked(run.root(), run.pin())
+            .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
     }
 
     /// The text of the slash command `which`.
@@ -658,6 +696,23 @@ impl Context {
                     "the pinned build is the file the entry's digest names"
                 );
                 let installation = Installation::link(run, &real.build.prefix, &real.build.runtime);
+                let placed = PlacedProgram::record(
+                    &real.build.prefix,
+                    &real.build.runtime,
+                    &real.build.command,
+                    &real.build.pinned,
+                )
+                .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+                if real.build.launch == build::Launch::Native {
+                    assert_eq!(
+                        std::fs::canonicalize(&pinned).ok().as_deref(),
+                        Some(placed.resolved()),
+                        "{ISOLATION_UNPROVEN} the command the entry names is not the file it pins"
+                    );
+                }
+                real.placed
+                    .set(placed)
+                    .expect("the agent's program is placed once");
                 (pinned, installation.bin())
             }
         };
@@ -1126,10 +1181,23 @@ impl Person {
     /// is one second) is typed again on a cleared screen; a launcher that refused the launch fails
     /// the case at once.
     fn types_until_it_shows(&self, line: &str, needle: &str, why: &str) -> Vec<String> {
+        self.types_until_it_shows_checked(line, needle, why, &|| {})
+    }
+
+    /// [`Person::types_until_it_shows`], with `before_typing` called right before each time the line
+    /// is typed: each is a start of the agent, and a line that ran as typed is typed again.
+    fn types_until_it_shows_checked(
+        &self,
+        line: &str,
+        needle: &str,
+        why: &str,
+        before_typing: &dyn Fn(),
+    ) -> Vec<String> {
         let started = Instant::now();
         let mut typed = 0_usize;
         loop {
             self.clears_the_screen();
+            before_typing();
             self.types(line);
             typed += 1;
             loop {
@@ -1633,7 +1701,8 @@ impl<'a> Session<'a> {
                 // The files that would load the person's own settings are known absent before the
                 // agent's first start, as they are before any part's.
                 if not.is_none() {
-                    real.checks_absent(&self.ctx.run);
+                    let absent = real.absent_list(&self.ctx.run);
+                    real.checks_absent(&self.ctx.run, &absent);
                     // The entry's isolation probes, with the run's configuration directory and no
                     // switch typed: no prompt, no turn, and no model.
                     // No probe is given the login: none of them needs an account, and the account
@@ -1642,12 +1711,15 @@ impl<'a> Session<'a> {
                         &self.ctx.run,
                         &self.ctx.without_login(&self.ctx.variables(&self.host)),
                     );
-                    real.checks_absent(&self.ctx.run);
+                    real.checks_absent(&self.ctx.run, &absent);
                 }
-                let _ = self.person.types_until_it_shows(
+                // The shell finds the agent by its name on a search path that starts in the run, which
+                // an earlier start may have changed: the route is checked before each typing.
+                let _ = self.person.types_until_it_shows_checked(
                     &real.typed(extra),
                     &real.account.composer,
                     "the agent reaches its composer",
+                    &|| real.checks_the_route(&self.ctx.run),
                 );
             }
         }
@@ -1880,8 +1952,8 @@ fn ends(
         if let (Some(run), Ok(())) = (&run, &readable) {
             let rules = scan_rules(
                 run,
-                &real.build.prefix,
                 &real.build.pinned,
+                real.placed.get().and_then(PlacedProgram::pinned_resolved),
                 &real.build.runtime,
             );
             scan = Some(RunScan::of(run.root(), &rules, &real.held));
@@ -2629,6 +2701,181 @@ fn gateway_a_device_prompt_over_a_running_turn_is_refused_and_reaches_nothing() 
             }
         },
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The shutdown of a host whose state the agent rewrote.
+// ---------------------------------------------------------------------------------------------
+
+/// How the host an agent left another host's state in is ended.
+#[derive(Clone, Copy, Debug)]
+enum Ending {
+    /// A case that passed: the host is stopped, and the run's closing check is made.
+    Stop,
+    /// A case that failed: the host is dropped, as a failing case leaves it.
+    Drop,
+}
+
+/// A stand-in agent that, once it has started, rewrites the environment's identity in the run's
+/// state to that of a second daemon and links that daemon's socket at the place the identity gives,
+/// which is all `kr` needs to act on the second daemon. The second daemon is the case's own, with a
+/// session open, in a run directory of its own; the host is then ended as `ending` says. Nothing is
+/// asked of the second daemon: its session is still open, and the host's record shows no `kr`
+/// asked for after the agent started. The run's own processes are ended all the same.
+fn an_agent_leaves_another_host_and_the_host_ends(ending: Ending) {
+    if std::env::var_os(BUILD_VARIABLE).is_some_and(|value| !value.is_empty()) {
+        // The stand-in is the agent here; a real agent is never asked to rewrite a host's state.
+        return;
+    }
+    let shell = match shells::managed_zsh() {
+        Ok(shell) => shell,
+        Err(why) if shells::required() => panic!("the managed shell: {why}"),
+        Err(why) => {
+            eprintln!("skipping: {why}");
+            return;
+        }
+    };
+    // The second daemon, in a directory of its own, with two sessions open that no terminal is on:
+    // the run has one session of its own, number 1, so the second session's number is one the
+    // run's own `kr` has no local record of, which it then asks the daemon it reaches to close.
+    let other_run = Run::start("gateway-other");
+    let other = Host::start(
+        &other_run,
+        &HostOptions {
+            shell_packages: Some(shell.prefix.clone()),
+        },
+    );
+    for _ in 0..2 {
+        let _ = other.kr_json(&[
+            "new",
+            "--invisible",
+            "--headless",
+            "--shell-mode",
+            "native_compat",
+            "--shell",
+            "/bin/zsh",
+        ]);
+    }
+    let opened = other.live_sessions();
+    assert_eq!(opened.len(), 2, "the second daemon's sessions: {opened:?}");
+    // What the stand-in runs when it starts: the identity of the second daemon written over the
+    // run's own, and the second daemon's socket linked at the place that identity gives.
+    let mut ctx = Context::new(
+        shell,
+        Route::StandIn,
+        Run::start("gateway-leaves"),
+        runtime(),
+    );
+    let socket = other
+        .environment()
+        .controller_endpoint()
+        .expect("the second daemon's endpoint")
+        .as_path()
+        .to_path_buf();
+    let prefix = socket
+        .parent()
+        .and_then(Path::file_name)
+        .expect("the endpoint's directory")
+        .to_owned();
+    let runtime_directory = ctx.run.root().join("r").join(&prefix);
+    let leave = other_run.root().join("leave.sh");
+    std::fs::write(
+        &leave,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' '{}' > '{}'\n/bin/mkdir -m 700 '{}'\n/bin/ln -s '{}' '{}'\n",
+            other.environment_id(),
+            ctx.run.root().join("s/environment-id").display(),
+            runtime_directory.display(),
+            socket.display(),
+            runtime_directory.join("c.sock").display(),
+        ),
+    )
+    .expect("the program the stand-in runs");
+    std::fs::set_permissions(&leave, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("executable");
+    ctx.place();
+    let session = Session::open(&ctx, "answer-when-released,keep-reading,stay,leave-a-host");
+    session
+        .person
+        .types(&format!("export KR_STAND_IN_LEAVE={}", leave.display()));
+    let _ = session.starts_the_agent(&[], None, &[]);
+    assert_eq!(
+        std::fs::read_to_string(ctx.run.root().join("s/environment-id"))
+            .expect("the identity")
+            .trim(),
+        other.environment_id().to_string(),
+        "the stand-in rewrote the environment's identity"
+    );
+    assert!(
+        std::fs::symlink_metadata(runtime_directory.join("c.sock"))
+            .expect("the link the stand-in made")
+            .file_type()
+            .is_symlink(),
+        "the stand-in linked the second daemon's socket at the place the identity gives"
+    );
+    // The control: what the stand-in left is enough for the run's own `kr`, started here by the
+    // case and not by the host, to list the second daemon's sessions and not the run's own.
+    let mut listing = std::process::Command::new(ctx.run.binary("kr"));
+    listing
+        .args(["list", "--json"])
+        .env_clear()
+        .envs(session.host.variables())
+        .current_dir(ctx.run.root());
+    let listed = kr_e2e_m1b::run::output_within(listing, LIVENESS).expect("the control's kr list");
+    let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+    for session in &opened {
+        assert!(
+            listed.contains(
+                session["session_id"]
+                    .as_str()
+                    .expect("a session identifier")
+            ),
+            "kr, run against the state the stand-in left, lists the second daemon's sessions: {listed}"
+        );
+    }
+    let asked = session.host.kr_after_the_agent_started();
+    match ending {
+        Ending::Stop => {
+            ctx.close(&session.host);
+            drop(session);
+        }
+        Ending::Drop => {
+            drop(session);
+            let closing = ctx
+                .run
+                .closing_check()
+                .unwrap_or_else(|why| panic!("the dropped host left processes: {why}"));
+            println!("{closing}");
+        }
+    }
+    assert!(
+        asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "a kr was asked for after the agent started"
+    );
+    assert_eq!(
+        other.live_sessions().len(),
+        2,
+        "the second daemon's sessions are all still open"
+    );
+    other.stop().expect("the second host stops");
+    other_run
+        .closing_check()
+        .unwrap_or_else(|why| panic!("{why}"));
+}
+
+/// The host of a case that passed is stopped without `kr`, and the second daemon is left alone.
+#[test]
+fn gateway_an_agent_that_rewrote_the_hosts_state_is_not_obeyed_when_the_host_stops() {
+    an_agent_leaves_another_host_and_the_host_ends(Ending::Stop);
+}
+
+/// The host of a case that failed is dropped without `kr`, and the second daemon is left alone.
+#[test]
+fn gateway_an_agent_that_rewrote_the_hosts_state_is_not_obeyed_when_the_host_is_dropped() {
+    an_agent_leaves_another_host_and_the_host_ends(Ending::Drop);
 }
 
 // ---------------------------------------------------------------------------------------------

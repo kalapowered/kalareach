@@ -103,8 +103,9 @@ pub struct Run {
     /// the reservation each was started with: a command line only proposes a label, and a job is
     /// this run's only when the service manager itself says it runs this run's worker program.
     job_labels: Mutex<Vec<String>>,
-    /// The proposed labels whose job, as the service manager prints it, is not a worker program of
-    /// this run. They are left alone: nothing is asked of the service manager about them again.
+    /// The targets (a domain and a proposed label) whose job, as the service manager prints it, is
+    /// not the worker this run placed. They are left alone: nothing is asked of the service manager
+    /// about them again. A decoy under a label in one domain says nothing about the other domain.
     jobs_left_alone: Mutex<Vec<String>>,
     /// The files the run placed and later runs, as each stood right after it was placed.
     placed: Mutex<Vec<(PathBuf, Placed)>>,
@@ -548,8 +549,8 @@ impl Run {
                     String::new()
                 } else {
                     format!(
-                        " ({alone} job label(s) a process proposed were left alone: the job is not \
-                         a worker program of this run)"
+                        " ({alone} job(s) a process proposed were left alone: the job is not \
+                         the worker this run placed)"
                     )
                 }
             ))
@@ -615,16 +616,16 @@ impl Run {
         let uid = rustix::process::getuid().as_raw();
         let mut held = HeldJobs::default();
         for label in labels {
-            if self
-                .jobs_left_alone
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .contains(&label)
-            {
-                continue;
-            }
             for domain in [format!("gui/{uid}"), format!("user/{uid}")] {
                 let target = format!("{domain}/{label}");
+                if self
+                    .jobs_left_alone
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .contains(&target)
+                {
+                    continue;
+                }
                 let answer = ask(&["print", &target]);
                 match answer.as_ref().map(|output| output.status.code()) {
                     // 112 is a domain that is not there and 113 a job the domain does not have.
@@ -637,16 +638,16 @@ impl Run {
                                 .unwrap_or_default(),
                         )
                         .into_owned();
-                        if self.runs_this_runs_worker(&printed) {
-                            held.verified.push(target);
-                        } else {
-                            let mut left = self
+                        match self.program_shown(&printed) {
+                            Program::Placed => held.verified.push(target),
+                            Program::Other => self
                                 .jobs_left_alone
                                 .lock()
-                                .unwrap_or_else(PoisonError::into_inner);
-                            if !left.contains(&label) {
-                                left.push(label.clone());
-                            }
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .push(target),
+                            Program::Unclear => held.unclear.push(format!(
+                                "{target} (launchctl print does not show exactly one program line)"
+                            )),
                         }
                     }
                     Ok(other) => held
@@ -661,17 +662,22 @@ impl Run {
         held
     }
 
-    /// Whether a job as `launchctl print` shows it runs this run's own worker program: its `program`
-    /// is the file `kr-worker` below this run's directory.
-    fn runs_this_runs_worker(&self, printed: &str) -> bool {
-        printed
+    /// What `launchctl print` shows of a job's program. The print is trusted only where it holds
+    /// exactly one line that starts with `program = ` after trimming, and then only for the worker
+    /// this run placed, by the path it was placed at, as written: a name in the print that holds a
+    /// line break makes a second such line, a path with `..` or through a link is not that path, and
+    /// neither is taken for it.
+    fn program_shown(&self, printed: &str) -> Program {
+        let mut programs = printed
             .lines()
-            .find_map(|line| line.trim_start().strip_prefix("program = "))
-            .map(Path::new)
-            .is_some_and(|program| {
-                program.starts_with(&self.root)
-                    && program.file_name().is_some_and(|name| name == "kr-worker")
-            })
+            .filter_map(|line| line.trim().strip_prefix("program = "));
+        match (programs.next(), programs.next()) {
+            (Some(program), None) if Some(program) == self.binary("kr-worker").to_str() => {
+                Program::Placed
+            }
+            (Some(_), None) => Program::Other,
+            _ => Program::Unclear,
+        }
     }
 
     /// Records the labels the command lines of this run's workers propose, now ([`Run::propose_jobs_from`]): each process whose
@@ -712,7 +718,7 @@ impl Run {
             .clone()
     }
 
-    /// The labels left alone, which the closing check says.
+    /// The targets (a domain and a label) left alone, which the closing check says.
     #[must_use]
     pub fn jobs_left_alone(&self) -> Vec<String> {
         self.jobs_left_alone
@@ -815,6 +821,16 @@ impl Run {
             reasons.push(why.to_owned());
         }
     }
+}
+
+/// What a job's print shows of the program it runs ([`Run::program_shown`]).
+enum Program {
+    /// Exactly one program line, and it is the worker the run placed.
+    Placed,
+    /// Exactly one program line, and it is another program.
+    Other,
+    /// No program line, or more than one: the print cannot be told from one that was made up.
+    Unclear,
 }
 
 /// What the service manager still holds of this run's workers.
@@ -1160,14 +1176,26 @@ pub fn socket_below(
 /// its device and inode, or nothing where the path is not there.
 type Walked = Option<(Option<std::os::fd::OwnedFd>, (i128, i128))>;
 
-/// The walk of [`open_file_below`] and [`socket_below`].
-fn walk_below(
+/// The directory a walk below the run's directory ended in, opened through handles, and the name of
+/// the last component in it.
+struct Parent {
+    directory: std::os::fd::OwnedFd,
+    last: std::ffi::CString,
+    device: rustix::fs::Dev,
+}
+
+/// The walk below the run's directory `root` that [`open_file_below`], [`socket_below`],
+/// [`entry_below`] and [`link_below`] share, as far as the directory of the last component: `root`
+/// must be the directory `pin` names, and each directory on the way is looked at with no link
+/// followed, on `root`'s file system, opened relative to its parent's handle with no link followed,
+/// then checked to be what was looked at and to lie beneath the pinned place. `Ok(None)` is a path
+/// whose directory is not there.
+fn parent_below(
     root: &Path,
     pin: &RootPin,
     relative: &Path,
     before_look: &mut dyn FnMut(&[u8]),
-    socket: bool,
-) -> Result<Walked, Refusal> {
+) -> Result<Option<Parent>, Refusal> {
     use rustix::fs::{FileType, Mode, OFlags};
     let mut directory = open_directory(root).map_err(|error| match error {
         rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => Refusal::RootChanged,
@@ -1221,6 +1249,76 @@ fn walk_below(
         }
         directory = child;
     }
+    Ok(Some(Parent {
+        directory,
+        last: last.clone(),
+        device,
+    }))
+}
+
+/// Whether anything is at `relative` below the run's directory `root`, found by the walk of
+/// [`parent_below`] and looked at with no link followed: a link at the end is an entry, and a link
+/// on the way, or anything else the walk refuses, is a [`Refusal`], so that nothing is looked at
+/// through it. Nothing is opened.
+///
+/// # Errors
+///
+/// Returns why the path could not be shown to be there or not.
+pub fn entry_below(root: &Path, pin: &RootPin, relative: &Path) -> Result<bool, Refusal> {
+    let Some(parent) = parent_below(root, pin, relative, &mut |_| {})? else {
+        return Ok(false);
+    };
+    Ok(look_below(&parent.directory, parent.last.as_c_str(), parent.device)?.is_some())
+}
+
+/// The target of the symbolic link at `relative` below the run's directory `root`, read with no link
+/// followed, by the walk of [`parent_below`]; `Ok(None)` is a path that is not there, and an entry
+/// that is no link is a [`Refusal`].
+///
+/// # Errors
+///
+/// Returns why the path is not a link of the run.
+pub fn link_below(root: &Path, pin: &RootPin, relative: &Path) -> Result<Option<PathBuf>, Refusal> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let Some(parent) = parent_below(root, pin, relative, &mut |_| {})? else {
+        return Ok(None);
+    };
+    let Some(looked) = look_below(&parent.directory, parent.last.as_c_str(), parent.device)? else {
+        return Ok(None);
+    };
+    if rustix::fs::FileType::from_raw_mode(looked.st_mode) != rustix::fs::FileType::Symlink {
+        return Err(Refusal::NotAFile);
+    }
+    let target = rustix::fs::readlinkat(&parent.directory, parent.last.as_c_str(), Vec::new())
+        .map_err(Refusal::Refused)?;
+    Ok(Some(PathBuf::from(std::ffi::OsString::from_vec(
+        target.into_bytes(),
+    ))))
+}
+
+/// The walk of [`open_file_below`] and [`socket_below`].
+fn walk_below(
+    root: &Path,
+    pin: &RootPin,
+    relative: &Path,
+    before_look: &mut dyn FnMut(&[u8]),
+    socket: bool,
+) -> Result<Walked, Refusal> {
+    use rustix::fs::{FileType, Mode, OFlags};
+    let Some(Parent {
+        directory,
+        last,
+        device,
+    }) = parent_below(root, pin, relative, before_look)?
+    else {
+        return Ok(None);
+    };
+    let replaced = |error: rustix::io::Errno| match error {
+        rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR | rustix::io::Errno::NOENT => {
+            Refusal::Replaced
+        }
+        other => Refusal::Refused(other),
+    };
     before_look(last.to_bytes());
     let Some(looked) = look_below(&directory, last.as_c_str(), device)? else {
         return Ok(None);
@@ -2210,8 +2308,8 @@ mod root_tests {
         assert_eq!(
             run.jobs_left_alone(),
             [
-                format!("kr-worker-{foreign}"),
-                format!("kr-worker-{lookalike}")
+                format!("gui/{uid}/kr-worker-{foreign}"),
+                format!("gui/{uid}/kr-worker-{lookalike}")
             ]
         );
         let mut asked_again: Vec<String> = Vec::new();
@@ -2225,11 +2323,107 @@ mod root_tests {
             .collect();
         assert_eq!(bootouts, [&format!("bootout gui/{uid}/kr-worker-{own}")]);
         assert!(
-            asked_again
-                .iter()
-                .all(|line| !line.contains(&foreign) && !line.contains(&lookalike)),
+            asked_again.iter().all(|line| !line
+                .contains(&format!("gui/{uid}/kr-worker-{foreign}"))
+                && !line.contains(&format!("gui/{uid}/kr-worker-{lookalike}"))),
             "a job left alone is not asked about again: {asked_again:?}"
         );
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// A print is trusted only where it holds exactly one line that starts with `program = ` and the
+    /// path that line gives is the worker the run placed, written as it was placed: a property list's
+    /// name that holds a line break and a false line makes two such lines and is listed, not
+    /// removed; a program path with `..` is another program and is left alone; and a decoy under
+    /// the label in one domain does not hide the run's own job under it in the other.
+    #[test]
+    fn a_print_is_trusted_only_for_one_program_line_that_is_the_placed_worker() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let root = scratch("jobs-program");
+        let run = Run::over(&root);
+        let uuid = |n: u8| format!("{n:08x}-0000-4000-8000-{n:012x}");
+        let worker = format!("{}/b/kr-worker", root.display());
+        let (injected, dotted, split) = (uuid(1), uuid(2), uuid(3));
+        let commands: Vec<String> = [&injected, &dotted, &split]
+            .iter()
+            .map(|id| format!("{worker} --reservation {id} --session s"))
+            .collect();
+        run.propose_jobs_from(commands.iter().map(String::as_str));
+        let uid = rustix::process::getuid().as_raw();
+        let answer = |code: i32, text: String| {
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: text.into_bytes(),
+                stderr: Vec::new(),
+            })
+        };
+        let print_of = |path: &str, program: &str| {
+            format!(
+                "{{\n\tactive count = 1\n\tpath = {path}\n\ttype = LaunchAgent\n\n\tprogram = {program}\n}}\n"
+            )
+        };
+        let mut asked: Vec<String> = Vec::new();
+        let mut ask = |arguments: &[&str]| {
+            asked.push(arguments.join(" "));
+            let [verb, target] = arguments else {
+                return Err("unexpected".to_owned());
+            };
+            if *verb == "bootout" {
+                return answer(0, String::new());
+            }
+            let gui = target.starts_with("gui/");
+            if target.ends_with(&injected) && gui {
+                // The service manager prints the plist's name as a path, whatever it holds.
+                answer(
+                    0,
+                    print_of(
+                        &format!("/x/jobs/a\n\tprogram = {worker}"),
+                        "/usr/bin/the-persons-own-program",
+                    ),
+                )
+            } else if target.ends_with(&dotted) && gui {
+                answer(
+                    0,
+                    print_of(
+                        "/x/jobs/b",
+                        &format!("{}/../other/b/kr-worker", root.display()),
+                    ),
+                )
+            } else if target.ends_with(&split) && gui {
+                answer(0, print_of("/x/jobs/c", "/usr/bin/the-persons-own-program"))
+            } else if target.ends_with(&split) {
+                answer(0, print_of("/x/jobs/c", &worker))
+            } else {
+                answer(113, String::new())
+            }
+        };
+        let held = run.held_jobs_asking(&mut ask);
+        assert_eq!(
+            held.verified,
+            [format!("user/{uid}/kr-worker-{split}")],
+            "only the run's own job, found under the label in the other domain, is trusted"
+        );
+        assert_eq!(held.unclear.len(), 1, "{:?}", held.unclear);
+        assert!(
+            held.unclear[0].contains(&injected),
+            "the print with two program lines is listed: {:?}",
+            held.unclear
+        );
+        assert_eq!(
+            run.jobs_left_alone(),
+            [
+                format!("gui/{uid}/kr-worker-{dotted}"),
+                format!("gui/{uid}/kr-worker-{split}")
+            ]
+        );
+        let mut bootouts: Vec<String> = Vec::new();
+        run.remove_jobs_asking(&mut |arguments| {
+            if arguments[0] == "bootout" {
+                bootouts.push(arguments.join(" "));
+            }
+            ask(arguments)
+        });
+        assert_eq!(bootouts, [format!("bootout user/{uid}/kr-worker-{split}")]);
         std::fs::remove_dir_all(&root).expect("clean up");
     }
 

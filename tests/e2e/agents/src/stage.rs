@@ -19,7 +19,9 @@ use kr_e2e_m1b::catalogue::{copy_tree, directory_url, enrol};
 use kr_e2e_m1b::ceremony;
 use kr_e2e_m1b::device::{Device, PairedHost, Remote};
 use kr_e2e_m1b::host::{Host, document};
-use kr_e2e_m1b::run::{Run, describe, ended_within, output_within, process_table, signal};
+use kr_e2e_m1b::run::{
+    RootPin, Run, describe, ended_within, link_below, output_within, process_table, signal,
+};
 use kr_e2e_m1b::shells::ManagedShell;
 use kr_e2e_m1b::window::{Window, answered};
 use kr_ipc::identity::{ProcessQuery, ProcessState, process_state, query_process};
@@ -443,13 +445,14 @@ pub fn installation_links(runtime: &[PathBuf]) -> Vec<String> {
 
 /// The rules for the scan of `run`'s directory: the directory the run made, the links the harness
 /// makes ([`installation_links`]) and the links the pinned build makes in its own home, which say
-/// the pinned executable `pinned` in the run's installation of the build at `prefix`, by the path
-/// the run starts it by and by its resolved path, and nothing else.
+/// the pinned executable `pinned` in the run's installation of the build, by the path the run starts
+/// it by and by its resolved path `resolved`, which is the system's answer from before the agent
+/// started, and nothing else.
 #[must_use]
 pub fn scan_rules(
     run: &Run,
-    prefix: &Path,
     pinned: &str,
+    resolved: Option<&Path>,
     runtime: &[PathBuf],
 ) -> crate::account::RunRules {
     let mut executables = vec![
@@ -458,7 +461,7 @@ pub fn scan_rules(
             .join(CURRENT_LINK)
             .join(pinned),
     ];
-    executables.extend(std::fs::canonicalize(prefix.join(pinned)));
+    executables.extend(resolved.map(Path::to_path_buf));
     crate::account::RunRules::new(run.pin(), installation_links(runtime))
         .with_agent_links(crate::held::CONFIG_DIRECTORY, executables)
 }
@@ -525,6 +528,190 @@ impl Installation {
         let next = self.current.with_file_name("current.next");
         std::os::unix::fs::symlink(prefix, &next).expect("links the newer build");
         std::fs::rename(&next, &self.current).expect("replaces the link");
+    }
+}
+
+/// The largest program [`PlacedProgram`] reads whole.
+const PROGRAM_AT_MOST: u64 = 1 << 30;
+
+/// What the system keeps of a program file, by which one that was written to, replaced or linked is
+/// told from the one that was placed: where it is, how long it is, when its bytes and its record
+/// changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProgramStamp {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl ProgramStamp {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.size(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
+/// The agent's program as the run placed it, recorded before the agent first starts: the installation
+/// the link `agent/current` names, the links in `agent/runtime`, the file the installed build's
+/// `bin/<command>` resolves to with each directory above it, and that file's stamp and digest. The
+/// agent runs in the same account and may leave another link, file or directory on the route its
+/// command is found by, so [`PlacedProgram::checked`] compares what is there now with this before
+/// each start, and the program is started by the absolute path of the file that was recorded, not by
+/// a name on a search path.
+#[derive(Clone, Debug)]
+pub struct PlacedProgram {
+    command: String,
+    prefix: PathBuf,
+    runtime: Vec<(String, PathBuf)>,
+    program: PathBuf,
+    /// The file the entry pins, as the system resolved it when the program was recorded.
+    pinned: Option<PathBuf>,
+    directories: Vec<(PathBuf, (u64, u64))>,
+    stamp: ProgramStamp,
+    digest: [u8; 32],
+}
+
+impl PlacedProgram {
+    /// Records the program the installed build at `prefix` gives for `command`, the file it pins
+    /// (`pinned`, relative to the prefix), and the links [`Installation::link`] makes for `runtime`.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the command is not a file of the installed build, or could not be read.
+    pub fn record(
+        prefix: &Path,
+        runtime: &[PathBuf],
+        command: &str,
+        pinned: &str,
+    ) -> Result<Self, String> {
+        let program = std::fs::canonicalize(prefix.join("bin").join(command)).map_err(|error| {
+            format!("`{command}` is not a command of the installed build: {error}")
+        })?;
+        let directories = program
+            .ancestors()
+            .skip(1)
+            .map(|directory| {
+                std::fs::metadata(directory)
+                    .map(|found| (directory.to_path_buf(), (found.dev(), found.ino())))
+                    .map_err(|error| format!("a directory the command is found in: {error}"))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let file = std::fs::File::open(&program)
+            .map_err(|error| format!("the installed build's `{command}`: {error}"))?;
+        let metadata = file.metadata().map_err(|error| error.to_string())?;
+        let digest = Self::digest_of(file, &metadata)?;
+        Ok(Self {
+            command: command.to_owned(),
+            prefix: prefix.to_path_buf(),
+            runtime: runtime
+                .iter()
+                .filter_map(|executable| {
+                    executable
+                        .file_name()
+                        .map(|name| (name.to_string_lossy().into_owned(), executable.clone()))
+                })
+                .collect(),
+            program,
+            pinned: std::fs::canonicalize(prefix.join(pinned)).ok(),
+            directories,
+            stamp: ProgramStamp::of(&metadata),
+            digest,
+        })
+    }
+
+    fn digest_of(file: std::fs::File, metadata: &std::fs::Metadata) -> Result<[u8; 32], String> {
+        if metadata.len() > PROGRAM_AT_MOST {
+            return Err("the agent's program is larger than the harness reads".to_owned());
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut &file, &mut bytes).map_err(|error| error.to_string())?;
+        Ok(kr_cbor::sha256(&bytes))
+    }
+
+    /// The file the installed build's command resolved to when it was recorded.
+    #[must_use]
+    pub fn resolved(&self) -> &Path {
+        &self.program
+    }
+
+    /// The file the entry pins, as the system resolved it when the program was recorded.
+    #[must_use]
+    pub fn pinned_resolved(&self) -> Option<&Path> {
+        self.pinned.as_deref()
+    }
+
+    /// Checks that the route the agent is started by is as it was placed, and returns the absolute
+    /// path of the program: the link `agent/current` below the run's directory `root`, which `pin`
+    /// names, read with no link followed, names the recorded installation; each link in
+    /// `agent/runtime` is as it was; the installed build's command resolves to the recorded file
+    /// through the recorded directories; and the file has the stamp it had, or else the bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns what is not as it was placed, as a class and no name outside the run.
+    pub fn checked(&self, root: &Path, pin: &RootPin) -> Result<&Path, String> {
+        let said = |what: &str| format!("the agent's program is not as the run placed it: {what}");
+        let link = |relative: String| {
+            link_below(root, pin, Path::new(&relative))
+                .map_err(|why| said(&format!("{relative}: {why}")))
+        };
+        if link(format!("{INSTALLATION_DIRECTORY}/{CURRENT_LINK}"))?.as_deref()
+            != Some(self.prefix.as_path())
+        {
+            return Err(said("the link agent/current names another installation"));
+        }
+        for (name, target) in &self.runtime {
+            if link(format!(
+                "{INSTALLATION_DIRECTORY}/{RUNTIME_DIRECTORY}/{name}"
+            ))?
+            .as_deref()
+                != Some(target.as_path())
+            {
+                return Err(said(&format!("the link agent/runtime/{name} is another")));
+            }
+        }
+        match std::fs::canonicalize(self.prefix.join("bin").join(&self.command)) {
+            Ok(now) if now == self.program => {}
+            _ => {
+                return Err(said(
+                    "the installed build's command resolves to another file",
+                ));
+            }
+        }
+        for (directory, identity) in &self.directories {
+            match std::fs::metadata(directory) {
+                Ok(found) if (found.dev(), found.ino()) == *identity => {}
+                _ => return Err(said("a directory on the route is not the one recorded")),
+            }
+        }
+        let file = std::fs::File::open(&self.program)
+            .map_err(|error| said(&format!("the program cannot be opened: {error}")))?;
+        let metadata = file.metadata().map_err(|error| said(&error.to_string()))?;
+        if ProgramStamp::of(&metadata) != self.stamp
+            && Self::digest_of(file, &metadata).map_err(|why| said(&why))? != self.digest
+        {
+            return Err(said("its bytes differ"));
+        }
+        Ok(&self.program)
+    }
+
+    /// A command that runs the program, with the name it is typed as as its first word, once the
+    /// route is checked ([`PlacedProgram::checked`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns why the route is not as it was placed.
+    pub fn command(&self, root: &Path, pin: &RootPin) -> Result<Command, String> {
+        let mut command = Command::new(self.checked(root, pin)?);
+        std::os::unix::process::CommandExt::arg0(&mut command, &self.command);
+        Ok(command)
     }
 }
 
@@ -1680,6 +1867,130 @@ impl std::fmt::Display for InputRefusal {
 mod tests {
     use super::*;
     use crate::provenance::exported_clear;
+
+    /// An installation whose `bin/codex` is a script that appends `name` to `mark`.
+    fn installation(base: &Path, name: &str, mark: &Path) -> PathBuf {
+        let prefix = base.join(name);
+        std::fs::create_dir_all(prefix.join("bin")).expect("an installation");
+        let program = prefix.join("bin/codex");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\necho {name} >> '{}'\n", mark.display()),
+        )
+        .expect("a program");
+        std::fs::set_permissions(
+            &program,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("executable");
+        prefix
+    }
+
+    /// The agent's program is started only by the route that was placed: a link at `agent/current`
+    /// to another installation, a link in `agent/runtime` that is another, a command of the
+    /// installed build that resolves to another file, and a program rewritten in place are each a
+    /// class, and the other installation's program, which leaves a mark when it runs, never runs;
+    /// the placed program, run first, does.
+    #[test]
+    fn a_route_that_is_not_the_one_placed_is_a_class_and_no_other_program_runs() {
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .expect("the temporary directory")
+            .join(format!("kr-route-{}", kr_ipc::new_uuid()));
+        let root = base.join("run");
+        std::fs::create_dir_all(root.join("agent/runtime")).expect("the run's installation");
+        let mark = base.join("mark");
+        let (one, two) = (
+            installation(&base, "one", &mark),
+            installation(&base, "two", &mark),
+        );
+        let runtime = base.join("node");
+        std::fs::write(&runtime, b"a runtime").expect("a runtime");
+        let current = root.join("agent/current");
+        std::os::unix::fs::symlink(&one, &current).expect("the link");
+        std::os::unix::fs::symlink(&runtime, root.join("agent/runtime/node")).expect("a runtime");
+        let pin = RootPin::of(&root).expect("a pin");
+        let placed =
+            PlacedProgram::record(&one, std::slice::from_ref(&runtime), "codex", "bin/codex")
+                .expect("recorded");
+        let marks = || std::fs::read_to_string(&mark).unwrap_or_default();
+        let ran = |placed: &PlacedProgram| -> Result<(), String> {
+            let mut command = placed.command(&root, &pin)?;
+            let status = command.status().map_err(|error| error.to_string())?;
+            assert!(status.success());
+            Ok(())
+        };
+        ran(&placed).expect("the placed route is started");
+        assert_eq!(marks(), "one\n");
+        // A link at agent/current to another installation, whose codex leaves a mark.
+        std::fs::remove_file(&current).expect("the link goes");
+        std::os::unix::fs::symlink(&two, &current).expect("another installation");
+        let said = ran(&placed).expect_err("another installation is not started");
+        assert!(said.contains("agent/current"), "{said}");
+        assert_eq!(marks(), "one\n", "the other installation's codex never ran");
+        std::fs::remove_file(&current).expect("the link goes");
+        std::os::unix::fs::symlink(&one, &current).expect("the placed link");
+        ran(&placed).expect("the placed link is as it was");
+        // A link in agent/runtime that is another.
+        std::fs::remove_file(root.join("agent/runtime/node")).expect("the link goes");
+        std::os::unix::fs::symlink(base.join("elsewhere"), root.join("agent/runtime/node"))
+            .expect("another runtime");
+        assert!(
+            ran(&placed)
+                .expect_err("another runtime")
+                .contains("agent/runtime/node")
+        );
+        std::fs::remove_file(root.join("agent/runtime/node")).expect("the link goes");
+        std::os::unix::fs::symlink(&runtime, root.join("agent/runtime/node")).expect("as it was");
+        // The installed build's command is now a link to the other installation's file.
+        let program = one.join("bin/codex");
+        let held = base.join("held");
+        std::fs::rename(&program, &held).expect("the program moves");
+        std::os::unix::fs::symlink(two.join("bin/codex"), &program).expect("a link");
+        assert!(
+            ran(&placed)
+                .expect_err("another file")
+                .contains("another file")
+        );
+        std::fs::remove_file(&program).expect("the link goes");
+        std::fs::rename(&held, &program).expect("the program is back");
+        ran(&placed).expect("the placed program is as it was");
+        // A directory on the route replaced by another that holds the same program.
+        let bin = one.join("bin");
+        let held_bin = base.join("held-bin");
+        std::fs::rename(&bin, &held_bin).expect("the directory moves");
+        std::fs::create_dir(&bin).expect("another directory");
+        std::fs::copy(held_bin.join("codex"), bin.join("codex")).expect("a copy of the program");
+        std::fs::set_permissions(
+            bin.join("codex"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("executable");
+        assert!(
+            ran(&placed)
+                .expect_err("another directory")
+                .contains("directory on the route")
+        );
+        std::fs::remove_dir_all(&bin).expect("the copy goes");
+        std::fs::rename(&held_bin, &bin).expect("the directory is back");
+        ran(&placed).expect("the placed directory is as it was");
+        // The program rewritten in place, to bytes of another length.
+        std::fs::write(
+            &program,
+            "#!/bin/sh\necho rewritten >> /dev/null\n# more bytes\n",
+        )
+        .expect("rewritten");
+        assert!(
+            ran(&placed)
+                .expect_err("rewritten")
+                .contains("bytes differ")
+        );
+        assert_eq!(
+            marks(),
+            "one\none\none\none\n",
+            "only the placed program ever ran"
+        );
+        std::fs::remove_dir_all(&base).expect("clean up");
+    }
 
     /// The startup file's hooks write the names a session's shell exports and never a value: at the
     /// prompt, and again just before a command line runs, so that what the agent's line started
