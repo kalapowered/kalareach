@@ -723,9 +723,29 @@ impl Idle {
         })
     }
 
+    /// Whether the sum of the resident sizes has risen past its alarm, which is watched only where
+    /// the requirement is held to the figure that counts each resident page once.
+    fn sum_alarm_fired(&self) -> bool {
+        self.combined.is_some() && self.sum > SUM_RECORDED_KIB + SUM_ALARM_STEP_KIB
+    }
+
     /// The lines that say what the figures came to against the target, and what stood in the way
-    /// of asserting it where something did.
+    /// of asserting it where something did, and a line that says so when the sum's alarm fired.
     fn verdict(&self) -> Vec<String> {
+        let mut lines = self.target_verdict();
+        if self.sum_alarm_fired() {
+            lines.push(format!(
+                "  alarm             the sum of the resident sizes, {} KiB, is more than \
+                 {SUM_ALARM_STEP_KIB} KiB above its recorded level of {SUM_RECORDED_KIB} KiB, so \
+                 the measurement fails and a ruling is needed; the alarm is not the requirement",
+                self.sum
+            ));
+        }
+        lines
+    }
+
+    /// The lines that say what the figures came to against the target.
+    fn target_verdict(&self) -> Vec<String> {
         let inside = |figure: bool| if figure { "inside" } else { "outside" };
         let processor = self.cores < IDLE_CORE_FRACTION;
         let memory = self.memory() < RESIDENT_BOUND_KIB;
@@ -786,7 +806,7 @@ impl Idle {
         // The sum counts the worker program once for each worker, so it shows twenty times what
         // the program grows by. Where the requirement is held to the figure that counts it once,
         // the sum is watched here and its rise is put to a ruling.
-        if self.combined.is_some() && self.sum > SUM_RECORDED_KIB + SUM_ALARM_STEP_KIB {
+        if self.sum_alarm_fired() {
             return Err(format!(
                 "the sum of the processes' resident sizes is {} KiB, more than {SUM_ALARM_STEP_KIB} \
                  KiB above its recorded level of {SUM_RECORDED_KIB} KiB: a ruling is needed on \
@@ -1030,6 +1050,14 @@ fn a_sum_that_rises_past_its_recorded_level_fails_with_the_words_that_a_ruling_i
         &reference,
     );
     assert_eq!(at_the_step.check(), Ok(()), "the step itself is allowed");
+    assert!(
+        at_the_step
+            .verdict()
+            .iter()
+            .all(|line| !line.starts_with("  alarm ")),
+        "and the record has no alarm line: {:?}",
+        at_the_step.verdict()
+    );
 
     let past = Idle::new(
         0.0075,
@@ -1041,6 +1069,13 @@ fn a_sum_that_rises_past_its_recorded_level_fails_with_the_words_that_a_ruling_i
     assert!(
         failure.contains("a ruling is needed") && failure.contains("not the requirement"),
         "the alarm says what it is: {failure}"
+    );
+    assert!(
+        past.verdict()
+            .iter()
+            .any(|line| line.starts_with("  alarm ") && line.contains("a ruling is needed")),
+        "and the record says that it fired: {:?}",
+        past.verdict()
     );
 
     // A low reading, which the kernel's reclaim of mapped pages gives (the sum read 440,048 KiB at one
