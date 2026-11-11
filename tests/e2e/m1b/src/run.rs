@@ -1589,6 +1589,9 @@ pub enum Left {
     MovedOut,
     /// The system refused a look, an opening or a removal.
     Refused,
+    /// The directories being emptied list more entries at once than the removal holds: the run
+    /// stays where it is, as past the removal's depth.
+    TooMany,
 }
 
 impl std::fmt::Display for Left {
@@ -1598,6 +1601,7 @@ impl std::fmt::Display for Left {
             Self::AnotherFileSystem => "an entry below it lies on another file system",
             Self::MovedOut => "a directory it held open is no longer beneath it",
             Self::Refused => "the system refused a look or a removal",
+            Self::TooMany => "its directories list more entries at once than the removal holds",
         })
     }
 }
@@ -1614,6 +1618,17 @@ pub enum Removal {
 /// The deepest the removal goes.
 const DEEPEST_REMOVAL: usize = 128;
 
+/// The most entry names the removal holds at once, in the listings of the directories it is in the
+/// middle of emptying, counted when each is listed: a run's directory lists a few thousand, and a
+/// tree that lists more than this, level after level, is left in place and said so.
+const REMOVAL_LISTED_AT_MOST: usize = 1_000_000;
+
+/// The names the removal holds now, and the most it holds.
+struct Listed {
+    held: usize,
+    at_most: usize,
+}
+
 /// Looks at every entry of `directory` and below, and with `remove` unlinks it, all through
 /// handles: each entry is looked at with no link followed and compared with `device`, each
 /// directory is opened with no link followed and checked to be the one that was looked at, and each
@@ -1626,6 +1641,7 @@ fn walk_for_removal(
     depth: usize,
     remove: bool,
     before_unlink: &mut dyn FnMut(&[u8]),
+    listed: &mut Listed,
 ) -> Result<(), Left> {
     use rustix::fs::{AtFlags, FileType};
     if depth > DEEPEST_REMOVAL {
@@ -1635,9 +1651,15 @@ fn walk_for_removal(
     for entry in rustix::fs::Dir::read_from(directory).map_err(|_| Left::Refused)? {
         let name = entry.map_err(|_| Left::Refused)?.file_name().to_owned();
         if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            // Counted when listed, with the names the levels above still hold.
+            listed.held += 1;
+            if listed.held > listed.at_most {
+                return Err(Left::TooMany);
+            }
             names.push(name);
         }
     }
+    let held_here = names.len();
     for name in names {
         let looked = match rustix::fs::statat(directory, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
         {
@@ -1667,7 +1689,15 @@ fn walk_for_removal(
             if !pin.contains(&child) {
                 return Err(Left::MovedOut);
             }
-            walk_for_removal(&child, device, pin, depth + 1, remove, before_unlink)?;
+            walk_for_removal(
+                &child,
+                device,
+                pin,
+                depth + 1,
+                remove,
+                before_unlink,
+                listed,
+            )?;
             if remove {
                 before_unlink(name.to_bytes());
                 if !pin.contains(directory) {
@@ -1687,6 +1717,7 @@ fn walk_for_removal(
                 .map_err(|_| Left::Refused)?;
         }
     }
+    listed.held -= held_here;
     Ok(())
 }
 
@@ -1699,7 +1730,7 @@ fn walk_for_removal(
 /// through that handle shows the name is still the pinned directory.
 #[must_use]
 pub fn remove_run_directory(root: &Path, pin: &RootPin) -> Removal {
-    remove_run_directory_by(root, pin, &mut |_| {})
+    remove_run_directory_by(root, pin, REMOVAL_LISTED_AT_MOST, &mut |_| {})
 }
 
 /// [`remove_run_directory`] with the moment before each unlink, told the name about to be unlinked
@@ -1707,6 +1738,7 @@ pub fn remove_run_directory(root: &Path, pin: &RootPin) -> Removal {
 fn remove_run_directory_by(
     root: &Path,
     pin: &RootPin,
+    listed_at_most: usize,
     before_unlink: &mut dyn FnMut(&[u8]),
 ) -> Removal {
     let handle = match open_directory(root) {
@@ -1724,7 +1756,19 @@ fn remove_run_directory_by(
         return Removal::Left(Left::Refused);
     };
     for remove in [false, true] {
-        if let Err(left) = walk_for_removal(&handle, stat.st_dev, pin, 1, remove, before_unlink) {
+        let mut listed = Listed {
+            held: 0,
+            at_most: listed_at_most,
+        };
+        if let Err(left) = walk_for_removal(
+            &handle,
+            stat.st_dev,
+            pin,
+            1,
+            remove,
+            before_unlink,
+            &mut listed,
+        ) {
             return Removal::Left(left);
         }
     }
@@ -2641,6 +2685,34 @@ mod root_tests {
     }
 
     #[test]
+    fn a_tree_that_lists_more_entries_at_once_than_the_removal_holds_is_left_where_it_is() {
+        let base = scratch("removal-held");
+        let root = base.join("run");
+        // Four levels that each list five entries, four files and the next level: twenty names
+        // held at once by the time the walk is at the bottom, though no level lists more than five.
+        let mut place = root.clone();
+        for _ in 0..4 {
+            std::fs::create_dir_all(&place).expect("a level");
+            for file in 0..4 {
+                std::fs::write(place.join(format!("f{file}")), "x").expect("a file");
+            }
+            place = place.join("next");
+        }
+        let pin = RootPin::of(&root).expect("a pin");
+        let removal = remove_run_directory_by(&root, &pin, 12, &mut |_| {});
+        assert_eq!(removal, Removal::Left(Left::TooMany));
+        assert!(
+            root.join("f0").exists() && root.join("next/next/next/f0").exists(),
+            "nothing was removed: the bound is met in the look before anything is unlinked"
+        );
+        // A bound that holds the tree removes it.
+        let removal = remove_run_directory_by(&root, &pin, 20, &mut |_| {});
+        assert_eq!(removal, Removal::Removed);
+        assert!(!root.exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn a_root_that_was_there_is_left_as_it_is_and_another_name_is_taken() {
         let base = scratch("root");
         // A directory of another run, owner-only, which a start that took it would remove.
@@ -3075,7 +3147,7 @@ mod root_tests {
         // The directory `inner` is moved out and a file of the person's is put under the name `x`.
         let pin = run(&root);
         let mut moved = false;
-        let removal = remove_run_directory_by(&root, &pin, &mut |name| {
+        let removal = remove_run_directory_by(&root, &pin, REMOVAL_LISTED_AT_MOST, &mut |name| {
             if name == b"x" && !moved {
                 moved = true;
                 std::fs::rename(root.join("a/inner"), elsewhere.join("inner")).expect("moved out");
@@ -3096,7 +3168,7 @@ mod root_tests {
         std::fs::remove_dir_all(elsewhere.join("inner")).expect("clean up");
         let pin = run(&root);
         let mut moved = false;
-        let removal = remove_run_directory_by(&root, &pin, &mut |name| {
+        let removal = remove_run_directory_by(&root, &pin, REMOVAL_LISTED_AT_MOST, &mut |name| {
             if name == b"inner" && !moved {
                 moved = true;
                 std::fs::rename(root.join("a"), elsewhere.join("a")).expect("moved out");
@@ -3114,7 +3186,7 @@ mod root_tests {
         // The root is renamed away after the walk, and an empty directory is put at its path.
         let pin = run(&root);
         let mut swapped = false;
-        let removal = remove_run_directory_by(&root, &pin, &mut |name| {
+        let removal = remove_run_directory_by(&root, &pin, REMOVAL_LISTED_AT_MOST, &mut |name| {
             if name.is_empty() && !swapped {
                 swapped = true;
                 std::fs::rename(&root, base.join("away")).expect("renamed away");
