@@ -66,9 +66,7 @@ use kr_crypto::connect::PairedPeer;
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::{SecretStore, StoreSelection};
 use kr_pairing::host::HostIdentity;
-use kr_protocol::ids::{
-    ActorId, AuthorityRevision, ConnectionId, DeviceId, DeviceKeyRevision, TransferId,
-};
+use kr_protocol::ids::{ActorId, AuthorityRevision, ConnectionId, DeviceId, DeviceKeyRevision};
 use kr_protocol::metrics::{MetricOutcome, Transport};
 use kr_protocol::pairing::NetworkConfig;
 use kr_protocol::scalars::EndpointKey;
@@ -493,7 +491,11 @@ impl Network {
     /// Resolves once no chunk of `transfer` is in the transfer service for `device`: the gate the
     /// blocking call that has a chunk holds is free.
     #[cfg(feature = "testing")]
-    pub async fn until_no_chunk_is_in_the_service(&self, device: DeviceId, transfer: TransferId) {
+    pub async fn until_no_chunk_is_in_the_service(
+        &self,
+        device: DeviceId,
+        transfer: kr_protocol::ids::TransferId,
+    ) {
         self.guard
             .host
             .chunks
