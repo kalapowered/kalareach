@@ -843,6 +843,15 @@ async fn every_write_the_method_table_admits_for_a_device_is_served_or_refused_b
         unlisted.is_empty(),
         "methods routed to a worker whose table does not list them: {unlisted:?}"
     );
+    // The worker's table lists raw input, as a request. Sent as a mutation it is this host's
+    // refusal by name, which is the one decision that keeps it from a worker that would take it.
+    assert!(
+        matches!(
+            DeviceWrite::of(Method::InputWrite),
+            Some(DeviceWrite::Refused(super::routes::Unserved::RawInput))
+        ),
+        "raw input sent as a mutation is not refused by name"
+    );
 
     let recorded: fake::Recorded = Arc::default();
     let world = fake::fake_worker(Some(Arc::clone(&recorded))).await;
@@ -876,8 +885,7 @@ async fn every_write_the_method_table_admits_for_a_device_is_served_or_refused_b
         else {
             continue;
         };
-        // Raw input is a request, and a worker's table lists it: whatever the decision says, sent
-        // as a mutation it is refused here with its name, which only the decision can do.
+        // Sent through the connection, raw input is answered with its name and the refusal's code.
         if *method == Method::InputWrite {
             raw_input_refused =
                 error.code == ErrorCode::InvalidArgument && error.message.starts_with(entry.name);
