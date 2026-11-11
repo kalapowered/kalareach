@@ -379,8 +379,10 @@ final class SealedPreviewTests: XCTestCase {
     /// opens the preview with them and shows it. Once the application has cleared the keys, as
     /// turning previews off or signing out does, an extension started afresh finds none, hands the
     /// library no seed and leaves the generic alert. Not shown here: the keychain itself, which a
-    /// bundle with no host application has no entitlement to reach; the device probes read it on a
-    /// phone.
+    /// bundle with no host application has no entitlement to reach (the device probes read it on a
+    /// phone); the application's own removal of the keys, which the store's `clear` stands for; and
+    /// the device's own authorisation key, which the Rust library reads from the application's
+    /// keychain group and never hands to Swift.
     func testTheExtensionReadsOnlyTheKeysThePreviewNamesUsesThemAndFindsNoneOnceTheyAreCleared() throws {
         let sealed = try golden()
         let earlier = NotificationService.parts
