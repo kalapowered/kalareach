@@ -416,9 +416,10 @@ impl KeyScan {
 /// returns where it was and what could not be read. Nothing of the value is returned or printed.
 /// The walk is made through directory handles with no link followed below `root` (a link, a socket
 /// or a pipe holds no bytes of its own to search and is read through by nothing; a name that became
-/// a link while the scan ran is told as not scanned). A place of the person's own may hold files
-/// with several names, and they are read; a run's own directory is searched by
-/// [`run_files_holding`].
+/// a link while the scan ran is told as not scanned). The walk stays on the file system of `root`:
+/// an entry on another one (a volume attached below it) is told as not scanned and nothing on it is
+/// opened. A place of the person's own may hold files with several names, and they are read; a
+/// run's own directory is searched by [`run_files_holding`].
 ///
 /// # Panics
 ///
@@ -467,13 +468,15 @@ fn not_scanned(why: &str) -> String {
 }
 
 /// One directory of the scan, through its handle: every entry is looked at with `fstatat` and no
-/// link followed, a directory is opened with the same handle and no link followed and checked to be
+/// link followed, an entry on another file system than `root`, the look at the scan's root, is not
+/// opened, a directory is opened with the same handle and no link followed and checked to be
 /// the one that was looked at, and a file is opened with no link followed, nonblocking, checked to
 /// be the regular file that was looked at (and, in a `strict` scan, to have one name, before and
 /// after it is opened), and only then read. What cannot be read is told in `scan.unread` and the
 /// walk goes on.
 fn scan_directory(
     directory: &std::os::fd::OwnedFd,
+    root: &rustix::fs::Stat,
     relative: &str,
     depth: usize,
     strict: bool,
@@ -528,9 +531,16 @@ fn scan_directory(
                 continue;
             }
         };
+        // A volume attached below the root is no link and its files have one name: only the
+        // device tells it from the root's own file system, and nothing on it is opened.
+        if looked.st_dev != root.st_dev {
+            scan.unread
+                .push(format!("{shown}: {}", not_scanned("another file system")));
+            continue;
+        }
         match FileType::from_raw_mode(looked.st_mode) {
             FileType::Directory => match opened_directory(directory, name.as_c_str(), &looked, 0) {
-                Ok(child) => scan_directory(&child, &shown, depth + 1, strict, holds, scan),
+                Ok(child) => scan_directory(&child, root, &shown, depth + 1, strict, holds, scan),
                 Err(unlooked) => scan
                     .unread
                     .push(format!("{shown}: {}", not_scanned(&unlooked.to_string()))),
@@ -646,7 +656,10 @@ fn scan_files(root: &Path, values: &[&[u8]], strict: bool) -> KeyScan {
         rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
         rustix::fs::Mode::empty(),
     ) {
-        Ok(directory) => scan_directory(&directory, "", 1, strict, &holds, &mut scan),
+        Ok(directory) => match rustix::fs::fstat(&directory) {
+            Ok(root) => scan_directory(&directory, &root, "", 1, strict, &holds, &mut scan),
+            Err(error) => scan.unread.push(format!(": {error}")),
+        },
         Err(error) => scan.unread.push(format!(": {error}")),
     }
     scan.held_by
@@ -1978,6 +1991,46 @@ mod tests {
         let scan = run_files_holding(&run, key);
         assert!(scan.complete(), "{:?}", scan.unread);
         assert_eq!(scan.held_by.len(), 1, "{:?}", scan.held_by);
+    }
+
+    /// A volume attached below the scan's root (a disk image, a network view) is another file
+    /// system, and the files on it have one name: it is told as not scanned and nothing on it is
+    /// read, in a run's scan and in the scan of a place of the person's own.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_scan_does_not_cross_into_a_file_system_mounted_below_its_root() {
+        use kr_ipc::testing::volumes::{Volume, not_attachable};
+        let scratch = Scratch::new("scan-mounted");
+        let run = scratch.0.join("run");
+        let images = scratch.0.join("images");
+        std::fs::create_dir_all(run.join("a/mounted")).expect("a run");
+        std::fs::create_dir_all(&images).expect("images");
+        let key = b"the-key-value-0123456789";
+        std::fs::write(run.join("a/own"), key).expect("a file of the run's own that holds the key");
+        let volume = Volume::attach(&run.join("a/mounted"), &images, "scan")
+            .unwrap_or_else(|| not_attachable());
+        std::fs::write(run.join("a/mounted/theirs"), key)
+            .expect("a file with one name, on the volume, that holds the key");
+        let scans = [run_files_holding(&run, key), files_holding(&run, key)];
+        volume.detach();
+        for scan in scans {
+            assert!(!scan.complete());
+            assert!(
+                scan.unread
+                    .iter()
+                    .any(|entry| entry.contains("not scanned: another file system")),
+                "{:?}",
+                scan.unread
+            );
+            assert_eq!(
+                scan.held_by
+                    .iter()
+                    .map(|holder| holder.path.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["a/own"],
+                "nothing on the volume was read"
+            );
+        }
     }
 
     #[test]
