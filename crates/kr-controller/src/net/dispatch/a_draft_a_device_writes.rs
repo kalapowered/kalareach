@@ -10,7 +10,10 @@
 
 use kr_protocol::envelope::{ActionTarget, ControlFrame, MutationRequest, Outcome, ParamsValue};
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{ActorId, DeviceId, DraftId, DraftRevision, SessionEpoch, SessionId};
+use kr_protocol::ids::{
+    ActorId, AgentBindingRevision, ApplicationInstanceId, DeviceId, DraftId, DraftRevision,
+    SessionEpoch, SessionId,
+};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Nullable, U64, Uuid};
@@ -53,6 +56,19 @@ fn write_naming(
     params: &impl serde::Serialize,
     session: Option<SessionId>,
 ) -> MutationRequest {
+    write_naming_application(world, connection, method, request_id, params, session, None)
+}
+
+/// A write of `method` on `connection` that names `session` and, inside it, `application`.
+fn write_naming_application(
+    world: &fake::Silent,
+    connection: &super::RemoteConnection,
+    method: Method,
+    request_id: u64,
+    params: &impl serde::Serialize,
+    session: Option<SessionId>,
+    application: Option<ApplicationInstanceId>,
+) -> MutationRequest {
     let mut mutation = mutation_of(
         world,
         connection,
@@ -65,11 +81,49 @@ fn write_naming(
             environment_id: world.environment_id,
             session_id: Nullable::some(session_id),
             session_epoch: Nullable::some(SessionEpoch::V1),
-            application_instance_id: Nullable::null(),
-            agent_binding_revision: Nullable::null(),
+            application_instance_id: Nullable(application),
+            agent_binding_revision: Nullable(application.map(|_| AgentBindingRevision::new(1))),
         };
     }
     mutation
+}
+
+fn an_application(byte: u8) -> ApplicationInstanceId {
+    ApplicationInstanceId::new(Uuid::from_bytes([byte; 16]))
+}
+
+/// Parameters of a create for `session` that names `application`, or none.
+fn create_params_for(
+    world: &fake::Silent,
+    session: SessionId,
+    application: Option<ApplicationInstanceId>,
+    text: &str,
+) -> DraftCreateParams {
+    DraftCreateParams {
+        application_instance_id: Nullable(application),
+        ..create_params(world, Some(session), None, text)
+    }
+}
+
+/// One draft for `actor` in `session` that targets `application`, made in the service directly.
+fn a_draft_of(
+    world: &fake::Silent,
+    actor: &ActorId,
+    session: SessionId,
+    application: Option<ApplicationInstanceId>,
+) -> kr_protocol::transfer::DraftRecord {
+    world
+        .controller
+        .transfer()
+        .service()
+        .draft_create(
+            actor,
+            &create_params_for(world, session, application, "an open draft"),
+            None,
+            None,
+        )
+        .expect("creates the draft")
+        .draft
 }
 
 /// The result an answer carries.
@@ -294,6 +348,278 @@ async fn a_draft_bound_to_a_session_is_written_only_by_a_request_that_names_that
             .await,
     );
     assert_eq!(named.draft.revision, DraftRevision::new(2));
+    world.serving.abort();
+}
+
+/// KR-REQ-23.41: a `draft.create` names in its target the application its parameters name, as it
+/// names the session: both absent, or the same. A create whose target and parameters differ in the
+/// application is refused and stores nothing; one that agrees is served, and the draft keeps the
+/// application. The control is a create that names none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_names_in_its_target_the_application_its_parameters_name() {
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    let session = world.session_id;
+    let (connection, _) = paired_connection(controller, 41, EVERY_RIGHT);
+    let device = connection.device.principal();
+    let (first, second) = (an_application(0x41), an_application(0x42));
+
+    let create = async |request_id: u64,
+                        carried: Option<ApplicationInstanceId>,
+                        named: Option<ApplicationInstanceId>| {
+        connection
+            .mutate(&write_naming_application(
+                &world,
+                &connection,
+                Method::DraftCreate,
+                request_id,
+                &create_params_for(&world, session, carried, "a draft"),
+                Some(session),
+                named,
+            ))
+            .await
+    };
+    for (request_id, (carried, named)) in [
+        (Some(first), None),
+        (None, Some(first)),
+        (Some(first), Some(second)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let refused = create(request_id as u64 + 1, carried, named).await;
+        assert_eq!(
+            super::tests::error_of(&refused).code,
+            ErrorCode::InvalidArgument,
+            "a create whose parameters name {carried:?} and whose target names {named:?}"
+        );
+    }
+    assert_eq!(
+        controller
+            .transfer()
+            .service()
+            .open_drafts(&device)
+            .expect("counts"),
+        0,
+        "a refused create stores nothing"
+    );
+
+    let made: DraftCreateResult = result_of(&create(10, Some(first), Some(first)).await);
+    assert_eq!(made.draft.application_instance_id.0, Some(first));
+    assert_eq!(made.draft.session_id.0, Some(session));
+    let plain: DraftCreateResult = result_of(&create(11, None, None).await);
+    assert_eq!(plain.draft.application_instance_id.0, None);
+    world.serving.abort();
+}
+
+/// KR-REQ-23.41: a draft made for an application is updated by a request whose target names that
+/// application, and by no other. An update that names another application, or none, is refused,
+/// and so is one that names an application for a draft that has none; each leaves the draft as it
+/// was. The control is the update that names the draft's own application, which is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_draft_for_an_application_is_updated_only_by_a_request_that_names_that_application() {
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    let session = world.session_id;
+    let (connection, _) = paired_connection(controller, 42, EVERY_RIGHT);
+    let device = connection.device.principal();
+    let (application, other) = (an_application(0x41), an_application(0x42));
+    let with = a_draft_of(&world, &device, session, Some(application));
+    let without = a_draft_of(&world, &device, session, None);
+
+    let update = async |request_id: u64,
+                        draft: &kr_protocol::transfer::DraftRecord,
+                        named: Option<ApplicationInstanceId>| {
+        connection
+            .mutate(&write_naming_application(
+                &world,
+                &connection,
+                Method::DraftUpdate,
+                request_id,
+                &update_of(draft.draft_id, draft.revision, "changed"),
+                Some(session),
+                named,
+            ))
+            .await
+    };
+    let unchanged = |draft: &kr_protocol::transfer::DraftRecord| {
+        let read = controller
+            .transfer()
+            .service()
+            .draft(&device, draft.draft_id)
+            .expect("the device's draft");
+        assert_eq!(
+            (read.revision, read.text.as_str()),
+            (draft.revision, "an open draft")
+        );
+    };
+
+    for (request_id, (draft, named)) in [
+        (&with, None),
+        (&with, Some(other)),
+        (&without, Some(application)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let refused = update(request_id as u64 + 1, draft, named).await;
+        assert_eq!(
+            super::tests::error_of(&refused).code,
+            ErrorCode::InvalidArgument,
+            "an update of a draft for {:?} whose target names {named:?}",
+            draft.application_instance_id.0
+        );
+        unchanged(draft);
+    }
+
+    let served: DraftUpdateResult = result_of(&update(10, &with, Some(application)).await);
+    assert_eq!(served.draft.revision, DraftRevision::new(2));
+    assert_eq!(served.draft.application_instance_id.0, Some(application));
+    let served: DraftUpdateResult = result_of(&update(11, &without, None).await);
+    assert_eq!(served.draft.revision, DraftRevision::new(2));
+    world.serving.abort();
+}
+
+/// KR-REQ-23.41 and KR-REQ-09.09: an exact repeat of an update of a draft for an application is
+/// answered from the service's record and changes nothing: the draft stays at the revision the
+/// first update made. The repeat is held as a kept answer, which a device that may read the
+/// session's receipts is given, and one that may not is told the outcome is unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeated_update_of_a_draft_for_an_application_is_answered_from_its_record() {
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    let session = world.session_id;
+    let application = an_application(0x41);
+    let (blind, recording) = paired_connection(controller, 43, &[ActionRight::AgentPrompt]);
+    let (sighted, _) = paired_connection(
+        controller,
+        44,
+        &[ActionRight::AgentPrompt, ActionRight::SessionView],
+    );
+
+    for (connection, may_not_read) in [(&blind, true), (&sighted, false)] {
+        let device = connection.device.principal();
+        let draft = a_draft_of(&world, &device, session, Some(application));
+        let update = write_naming_application(
+            &world,
+            connection,
+            Method::DraftUpdate,
+            1,
+            &update_of(draft.draft_id, draft.revision, "once"),
+            Some(session),
+            Some(application),
+        );
+        let first = connection
+            .answer_now(ControlFrame::Mutation(Box::new(update.clone())))
+            .await
+            .expect("the first is answered");
+        assert!(
+            first.asked.as_ref().is_some_and(|asked| !asked.is_kept()),
+            "the update that performed is a fresh answer"
+        );
+        let performed: DraftUpdateResult = result_of(first.frame());
+        assert_eq!(performed.draft.revision, DraftRevision::new(2));
+        assert!(
+            connection.write_answer(connection.output(), first).await,
+            "the connection stands"
+        );
+
+        let repeat = connection
+            .answer_now(ControlFrame::Mutation(Box::new(update)))
+            .await
+            .expect("the repeat is answered");
+        assert!(
+            repeat
+                .asked
+                .as_ref()
+                .is_some_and(super::decision::Asked::is_kept),
+            "the repeat is held as a kept answer"
+        );
+        if may_not_read {
+            let told = written(connection, &recording, repeat).await;
+            assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+        } else {
+            let repeated: DraftUpdateResult = result_of(repeat.frame());
+            assert_eq!(repeated, performed, "the repeat is given the record");
+        }
+        let read = controller
+            .transfer()
+            .service()
+            .draft(&device, draft.draft_id)
+            .expect("the device's draft");
+        assert_eq!(
+            (read.revision, read.text.as_str()),
+            (DraftRevision::new(2), "once"),
+            "the repeat changed nothing"
+        );
+    }
+    world.serving.abort();
+}
+
+/// KR-REQ-23.41: naming an application widens nothing. A connection that serves one session under
+/// one grant is refused a draft write for another session and one under another grant, and the
+/// application the target names changes neither refusal: each is told the same as the write that
+/// names none, and nothing is stored or changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_target_that_names_an_application_reaches_nothing_its_connection_does_not_serve() {
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    let session = world.session_id;
+    let elsewhere = SessionId::new(Uuid::from_bytes([0x77; 16]));
+    let application = an_application(0x41);
+    let (connection, _) = paired_connection(controller, 45, EVERY_RIGHT);
+    let device = connection.device.principal();
+    let held = a_draft_of(&world, &device, session, Some(application));
+    *connection.scope.lock().expect("the scope") = super::opening::Scope::Session {
+        session_id: session,
+        grant_id: kr_protocol::ids::GrantId::new(kr_ipc::new_uuid()),
+    };
+
+    let mut told = Vec::new();
+    for (request_id, named) in [(1, None), (2, Some(application))] {
+        let create = connection
+            .mutate(&write_naming_application(
+                &world,
+                &connection,
+                Method::DraftCreate,
+                request_id,
+                &create_params_for(&world, elsewhere, named, "elsewhere"),
+                Some(elsewhere),
+                named,
+            ))
+            .await;
+        let update = connection
+            .mutate(&write_naming_application(
+                &world,
+                &connection,
+                Method::DraftUpdate,
+                request_id + 10,
+                &update_of(held.draft_id, held.revision, "under another grant"),
+                Some(session),
+                named,
+            ))
+            .await;
+        told.push((
+            super::tests::error_of(&create).clone(),
+            super::tests::error_of(&update).clone(),
+        ));
+    }
+    assert_eq!(told[0].0.code, ErrorCode::InvalidArgument);
+    assert_eq!(told[0].1.code, ErrorCode::PermissionDenied);
+    for (without, with) in [(&told[0].0, &told[1].0), (&told[0].1, &told[1].1)] {
+        assert_eq!(
+            (with.code, &with.message),
+            (without.code, &without.message),
+            "naming an application changes no refusal"
+        );
+    }
+    let service = controller.transfer().service();
+    assert_eq!(service.open_drafts(&device).expect("counts"), 1);
+    let read = service.draft(&device, held.draft_id).expect("the draft");
+    assert_eq!(
+        (read.revision, read.text.as_str()),
+        (held.revision, "an open draft")
+    );
     world.serving.abort();
 }
 
