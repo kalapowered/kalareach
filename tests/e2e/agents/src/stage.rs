@@ -1935,12 +1935,18 @@ mod tests {
             said.contains("does not run the file the build pins"),
             "{said}"
         );
-        // The installed command resolves to another file than the one pinned, though both are named.
+        // The file the description pins has the stand-in's bytes, and the installed command is a link
+        // to another build: what the typed line runs is not what the digest was read from.
+        let pinned = base.join("pinned");
+        std::fs::write(&pinned, b"the stand-in").expect("a copy of the stand-in");
         std::fs::remove_file(&installed).expect("the installed build goes");
         std::os::unix::fs::symlink(&other, &installed).expect("a link to another build");
-        let said = closed_route(&expected(&digest, &installed), "codex", &stand_in)
+        let said = closed_route(&expected(&digest, &pinned), "codex", &stand_in)
             .expect_err("a command that resolves to another file is refused");
-        assert!(said.contains("live route is closed"), "{said}");
+        assert!(
+            said.contains("does not run the file the build pins"),
+            "{said}"
+        );
         // The pinned file is the one the command resolves to, and its bytes are not the stand-in's.
         let said = closed_route(&expected(&digest, &other), "codex", &stand_in)
             .expect_err("a file that is not the stand-in is refused");
