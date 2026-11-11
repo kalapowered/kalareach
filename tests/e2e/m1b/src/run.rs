@@ -274,9 +274,9 @@ impl Run {
     }
 
     /// Checks that the file at `relative` is still the file [`Run::note_placed`] recorded: a regular
-    /// file with one name, opened through the run's handles, with the identity, size and times it
-    /// had, or, where those differ, with the bytes it had. A file whose bytes were rewritten in
-    /// place, replaced, linked or given a second name is not the file that was placed.
+    /// file with one name, opened through the run's handles, with the bytes it had, read at every
+    /// check. A file whose bytes were rewritten in place, replaced, linked or given a second name
+    /// is not the file that was placed.
     ///
     /// # Errors
     ///
@@ -314,10 +314,9 @@ impl Run {
         Ok(())
     }
 
-    /// The file at `relative` as it stands: through the run's handles, then its stamp and digest.
-    /// The digest is read again only where the stamp differs from the one recorded, since a write
-    /// changes the time the system keeps of the last change to the file's own record, which no
-    /// process of the account can set back.
+    /// The file at `relative` as it stands: through the run's handles, then its stamp and the
+    /// digest of its bytes, read at every look. The stamp alone decides nothing: a write through a
+    /// shared mapping leaves it as it was while the mapping stays open.
     fn look_at_placed(&self, relative: &Path) -> Result<Placed, String> {
         let said = |why: &dyn std::fmt::Display| {
             format!(
@@ -336,18 +335,6 @@ impl Run {
             modified: (i128::from(stat.st_mtime), i128::from(stat.st_mtime_nsec)),
             changed: (i128::from(stat.st_ctime), i128::from(stat.st_ctime_nsec)),
         };
-        let known = self
-            .placed
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .find(|(path, _)| path == relative)
-            .map(|(_, placed)| placed.clone());
-        if let Some(known) = known
-            && known.stamp == stamp
-        {
-            return Ok(known);
-        }
         if stat.st_size > PLACED_AT_MOST {
             return Err(said(&"it is larger than a program the run places"));
         }
@@ -2366,6 +2353,46 @@ mod tests {
             None,
             "only a refusal is taken for another user"
         );
+    }
+
+    /// A file's bytes are read at each check, and the system's stamp of the file decides nothing:
+    /// a write through a shared mapping leaves the stamp as it was while the mapping stays open, so
+    /// a file whose bytes differ and whose stamp reads as it did when it was recorded is not the file
+    /// that was placed. (The workspace forbids unsafe code, which mapping a file needs, so the case
+    /// writes the other bytes and gives the record the stamp the file has now.)
+    #[test]
+    fn a_placed_file_whose_stamp_reads_as_recorded_is_still_read_for_its_bytes() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .expect("the temporary directory")
+            .join(format!("kr-stamp-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(root.join("b")).expect("a directory for the file");
+        let file = root.join("b/program");
+        std::fs::write(&file, b"the placed bytes").expect("the placed file");
+        let run = Run::over(&root);
+        let relative = Path::new("b/program");
+        run.note_placed(relative).expect("the file is recorded");
+        run.placed_as_it_was(relative)
+            .expect("the file as it was placed passes");
+        std::fs::write(&file, b"other bytes here").expect("the bytes of the same length");
+        let stat = rustix::fs::stat(&file).expect("the file's stat");
+        run.placed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter_mut()
+            .for_each(|(_, placed)| {
+                placed.stamp = Stamp {
+                    device: i128::from(stat.st_dev),
+                    inode: i128::from(stat.st_ino),
+                    size: i128::from(stat.st_size),
+                    modified: (i128::from(stat.st_mtime), i128::from(stat.st_mtime_nsec)),
+                    changed: (i128::from(stat.st_ctime), i128::from(stat.st_ctime_nsec)),
+                };
+            });
+        let why = run
+            .placed_as_it_was(relative)
+            .expect_err("other bytes under the recorded stamp are not the placed file");
+        assert!(why.contains("its bytes differ"), "{why}");
+        std::fs::remove_dir_all(&root).expect("clean up");
     }
 }
 
