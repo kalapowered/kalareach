@@ -4,7 +4,8 @@
 //! A runtime learns that a peer closed only when it next turns its reactor, so a reader polled in
 //! between says nothing. The writer asks the operating system instead, and these tests drive a real
 //! connection to show what it says whatever the peer has sent, and that a caller told how much is
-//! waiting can read exactly that.
+//! waiting can read exactly that. They also hold a write, a read and a shutdown that meet a peer
+//! that has closed to saying so, whichever of the system's failures answers them.
 
 use kr_ipc::endpoint::{Connection, Listener};
 use kr_ipc::framed::{FrameReader, FrameWriter, PeerState, split};

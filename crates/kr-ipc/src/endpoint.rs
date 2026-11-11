@@ -489,12 +489,7 @@ mod platform {
         pub(super) fn peer(&self) -> Result<PeerIdentity> {
             let credentials = self.0.peer_cred().map_err(|source| {
                 // A peer that closed before the kernel was asked is gone, not unidentifiable.
-                if matches!(
-                    source.kind(),
-                    std::io::ErrorKind::NotConnected
-                        | std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::BrokenPipe
-                ) {
+                if crate::error::peer_has_gone(&source) {
                     IpcError::PeerClosed
                 } else {
                     IpcError::PeerUnknown { source }
