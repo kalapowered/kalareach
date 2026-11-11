@@ -45,8 +45,8 @@ use kr_client::services::AccountTokenSource;
 use kr_client::services::account::{AccountStatus, SignedInAccount};
 use kr_client::services::voice::{VOICE_SCOPE, VoiceCommand, same_origin};
 use kr_client::services::voice_control::{
-    ControlEnd, ControlEvents, ControlNews, ControlTarget, OpeningContextSent, SendError,
-    VoiceControl,
+    AttemptFailure, ControlEnd, ControlEvents, ControlNews, ControlTarget, OpeningContextSent,
+    SendError, VoiceControl,
 };
 use kr_client::session::ComposedMutation;
 use kr_protocol::ids::{ActionId, VoiceSessionId};
@@ -571,6 +571,11 @@ async fn next_heard(events: &mut Option<CallEvents>) -> Option<Heard> {
 }
 
 /// Waits for the control's next news, or for ever when there is no control.
+/// Writes down one failed attempt to attach the control: its kind, and nothing else.
+fn write_failed_attempt(why: AttemptFailure) {
+    tracing::warn!(kind = why.words(), "a voice control attempt failed");
+}
+
 async fn next_news(events: &mut Option<ControlEvents>) -> Option<ControlNews> {
     match events {
         Some(events) => events.next().await,
@@ -1570,6 +1575,12 @@ impl Owner {
             Some(ControlNews::Ended(end)) => Some(Cause::Control(end)),
             Some(ControlNews::Detached) => {
                 self.view(|state| state.control = "unreachable".to_owned());
+                None
+            }
+            // One line for each failed attempt, by its kind alone: a recorded call can then say
+            // which of them stood between the phone and the voice service.
+            Some(ControlNews::AttemptFailed(why)) => {
+                write_failed_attempt(why);
                 None
             }
             Some(ControlNews::Attached { delegations, .. }) => {
@@ -2872,6 +2883,71 @@ async fn probe_host(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    /// The fields of each record written through `tracing` while it is in place.
+    #[derive(Clone, Default)]
+    struct Written(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+
+    struct Fields<'a>(&'a mut BTreeMap<String, String>);
+
+    impl tracing::field::Visit for Fields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    impl tracing::Subscriber for Written {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = BTreeMap::new();
+            event.record(&mut Fields(&mut fields));
+            self.0.lock().expect("the record").push(fields);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Each failed attempt to attach the control is written down once, as its kind and a fixed
+    /// sentence, whatever the kind: the line has two fields, so it can hold nothing of the exchange.
+    #[test]
+    fn a_failed_attempt_is_written_down_by_its_kind_and_nothing_else() {
+        let written = Written::default();
+        tracing::subscriber::with_default(written.clone(), || {
+            super::write_failed_attempt(AttemptFailure::TokenService);
+            super::write_failed_attempt(AttemptFailure::ServerError);
+        });
+        let lines = written.0.lock().expect("the record").clone();
+        let said = |kind: &str| {
+            BTreeMap::from([
+                ("kind".to_owned(), format!("{kind:?}")),
+                (
+                    "message".to_owned(),
+                    "a voice control attempt failed".to_owned(),
+                ),
+            ])
+        };
+        assert_eq!(
+            lines,
+            [said("token service unavailable"), said("status 5xx")],
+            "one line for each attempt, two fields in each"
+        );
+    }
+
     /// A request the host took and did not say it carried out is one the end cannot say nothing was
     /// done for, as one it asked about and was not answered, or has not yet written.
     #[test]
