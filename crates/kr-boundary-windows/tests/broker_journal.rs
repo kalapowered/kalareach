@@ -576,8 +576,8 @@ fn after_a_verification_no_grant_no_process_and_no_root_begins() {
             "{what} after a verification is refused"
         );
     }
-    // The reviewers' first sequence ends in a finished invocation with a granted key nobody
-    // releases; here it stops at the grant.
+    // A verification with no grant, then a grant after it, would end in a finished invocation
+    // with a granted key nobody releases; here it stops at the grant.
     let mut tracker = Tracker::new();
     for row in [begin(), verified(0)] {
         tracker.apply(&row).unwrap();
@@ -713,7 +713,7 @@ fn a_root_with_its_intent_alone_can_have_its_removal_recorded_and_no_end_leaves_
         verified(0),
         Row::End { root_leftovers: 0 },
     ]);
-    // The reviewer's sequence: the directory may exist, its removal failed, the invocation ended
+    // A sequence that can follow a crash after the directory was made: the directory may exist, its removal failed, the invocation ended
     // carrying the leftover, and a later sweep can still record the removal.
     let mut tracker = tracker_after(&[
         begin(),
@@ -740,8 +740,26 @@ fn a_root_with_its_intent_alone_can_have_its_removal_recorded_and_no_end_leaves_
 #[test]
 fn a_grant_that_would_take_the_journal_past_its_bound_is_refused_before_it_is_written() {
     use kr_boundary_windows::journal::replay::ROWS_APART_FROM_OBJECTS;
-    // For each bound, grant objects until one is refused, then release every granted object the
-    // way the release does, and the whole file is within the bound.
+    use kr_boundary_windows::journal::rows::{Label, Rule};
+    // What a release writes for a granted object under the group rule, and the worst way a failed
+    // release ends: a leftover that names the object by its path, with a long reason.
+    let group_intent = |n: u64| Row::ReleaseIntent {
+        key: key(n),
+        rule: Rule::Group,
+        new_owner: None,
+        new_dacl_bytes: vec![1, 2, 3, 4],
+        label: Label::Remove,
+        protected_target: true,
+    };
+    let failed = |n: u64| Row::Leftover {
+        object: grant_path(n),
+        reason: "x".repeat(256),
+        class: LeftoverClass::Tree,
+        snapshot: None,
+    };
+    // For each bound, grant objects until one is refused. The rows the file then holds, the grants
+    // and the worst release rows of every granted object, stay within what the bound leaves after
+    // the margin for the rows of no object.
     let mut stopped_at = Vec::new();
     for room in (0..60).map(|step| step * 2_000) {
         let limit = ROWS_APART_FROM_OBJECTS + room;
@@ -750,30 +768,34 @@ fn a_grant_that_would_take_the_journal_past_its_bound_is_refused_before_it_is_wr
         tracker.apply(&begin()).unwrap();
         let mut granted = 0;
         for n in 1..=50 {
-            match tracker.apply(&grant(n)) {
-                Ok(()) => {
-                    rows.push(grant(n));
-                    granted += 1;
-                }
-                Err(_) => break,
+            if tracker.apply(&grant(n)).is_err() {
+                break;
             }
+            rows.push(grant(n));
+            granted += 1;
         }
         stopped_at.push(granted);
-        rows.push(Row::GrantComplete { count: granted });
-        tracker.apply(rows.last().unwrap()).unwrap();
+        let complete = Row::GrantComplete { count: granted };
+        tracker.apply(&complete).unwrap();
+        rows.push(complete);
+        // The way through: every granted object released, verified and ended.
         for n in 1..=granted {
-            for row in [release_intent(n), released(n)] {
+            for row in [group_intent(n), released(n)] {
                 tracker.apply(&row).unwrap();
-                rows.push(row);
             }
         }
         for row in [verified(granted), Row::End { root_leftovers: 0 }] {
             tracker.apply(&row).unwrap();
-            rows.push(row);
+        }
+        // The worst way: each release fails with the longest leftover.
+        for n in 1..=granted {
+            rows.push(group_intent(n));
+            rows.push(failed(n));
         }
         assert!(
-            file_of(&rows).len() <= limit,
-            "{granted} objects with their release rows fit a bound of {limit} bytes"
+            file_of(&rows).len() <= room + 4096,
+            "{granted} objects with their worst release rows are {} bytes, over what a bound of {limit} leaves ({room})",
+            file_of(&rows).len()
         );
     }
     assert!(
