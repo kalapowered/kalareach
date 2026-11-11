@@ -447,6 +447,9 @@ mod a_copy_from_a_services_record;
 mod a_draft_a_device_writes;
 
 #[cfg(test)]
+mod a_draft_a_device_ends;
+
+#[cfg(test)]
 mod an_answer_that_cannot_be_recorded;
 
 #[cfg(test)]

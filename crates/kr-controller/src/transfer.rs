@@ -58,8 +58,9 @@ pub const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6
 
 /// How many open drafts one paired device may hold.
 ///
-/// A draft is open until a prompt sends it to a session or its target session ends, and the
-/// service counts it against the device's own principal. The page makes one draft for each session
+/// A draft is open until a prompt sends it to a session, its target session ends, the agent has
+/// taken every file bound to it or the device ends it, and the service counts it against the
+/// device's own principal. The page makes one draft for each session
 /// it attaches files in, and another for each eight files, so the bound is several times what a
 /// person works in at once; a device holds at most this many open drafts, each of up to
 /// [`kr_protocol::transfer::MAX_TRANSFER_RESULT_BYTES`] of text. The person at this machine has
@@ -620,6 +621,7 @@ impl TransferModule {
             | Method::UploadFinish
             | Method::UploadCancel
             | Method::DraftUpdate
+            | Method::DraftDiscard
             | Method::AgentDraftAddAttachment => (None, None),
             _ => {
                 return Err(ControllerError::InvalidArgument(format!(
@@ -948,7 +950,22 @@ impl TransferModule {
         };
         let service = Arc::clone(&self.service);
         let actor = actor_id.clone();
-        let stored = blocking(move || Ok(service.stored_subject(&actor, subject)?)).await?;
+        let stored = blocking(move || match service.stored_subject(&actor, subject) {
+            Ok(stored) => Ok(Some(stored)),
+            // A draft that is gone is not refused here when the call is the one that ends it: an
+            // action that ended it is answered from its record by the service, which refuses any
+            // other action as unknown in the words it uses for every draft the caller does not hold.
+            Err(kr_transfer::TransferError::UnknownDraft { .. })
+                if method == Method::DraftDiscard =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        })
+        .await?;
+        let Some(stored) = stored else {
+            return Ok(());
+        };
         if stored.environment_id != mutation.target.environment_id {
             return Err(ProtocolError::new(
                 ErrorCode::EnvironmentUnavailable,
@@ -1125,8 +1142,8 @@ impl TransferModule {
             admission.check()?;
             #[cfg(feature = "testing")]
             after_the_outer_check.wait();
-            // The action this mutation is performed under. The three methods whose idempotency is
-            // their own identifier commit it beside the state they change, which is what makes a
+            // The action this mutation is performed under. The draft methods, whose idempotency is
+            // their own identifier, commit it beside the state they change, which is what makes a
             // crash between the mutation and its record impossible.
             let performed = Action {
                 actor_id: actor.clone(),
@@ -1177,6 +1194,11 @@ impl TransferModule {
                             .draft_update(&actor, &typed(&params)?, Some(&performed))
                             .map_err(&told)?,
                     ),
+                    Method::DraftDiscard => encode(
+                        &service
+                            .draft_discard(&actor, &typed(&params)?, Some(&performed))
+                            .map_err(&told)?,
+                    ),
                     Method::AgentDraftAddAttachment => {
                         let params: kr_protocol::transfer::AgentDraftAddAttachmentParams =
                             typed(&params)?;
@@ -1204,7 +1226,7 @@ impl TransferModule {
                 return Err(refusal);
             }
             // The outcome is retained before it is returned, so the reply and the record cannot
-            // disagree about what happened. The three methods above recorded their own inside
+            // disagree about what happened. The draft methods above recorded their own inside
             // their transaction; this insert leaves an existing row alone and covers the rest.
             let record = match &outcome {
                 Ok(value) => {
@@ -1256,10 +1278,10 @@ impl TransferModule {
             };
             match recorded {
                 None => outcome,
-                // The record is the answer both callers get. The three draft writes record their
+                // The record is the answer both callers get. The draft writes record their
                 // own action in the transaction that performs it, and hold the journal's lock from
-                // the look that decides whether they begin (the record for a create, the draft's
-                // revision for the other two, which an earlier attempt's success has moved on) to
+                // the look that decides whether they begin (the record for a create and a discard, the
+                // draft's revision for the other two, which an earlier attempt's success has moved on) to
                 // that commit, so once the service has reached the place it begins an effect, a
                 // record that an attempt finds is its own. The upload writes let go of the lock
                 // while they verify a file, so another copy can record in between: any record read
@@ -1271,6 +1293,7 @@ impl TransferModule {
                             method,
                             Method::DraftCreate
                                 | Method::DraftUpdate
+                                | Method::DraftDiscard
                                 | Method::AgentDraftAddAttachment
                         );
                     if !performed_here {
@@ -1745,6 +1768,10 @@ fn subject_of(params: &ParamsValue, method: Method) -> Answer<Option<Subject>> {
             let params: kr_protocol::transfer::DraftUpdateParams = typed(params)?;
             Some(Subject::Draft(params.draft_id))
         }
+        Method::DraftDiscard => {
+            let params: kr_protocol::transfer::DraftDiscardParams = typed(params)?;
+            Some(Subject::Draft(params.draft_id))
+        }
         Method::AgentDraftAddAttachment => {
             let params: kr_protocol::transfer::AgentDraftAddAttachmentParams = typed(params)?;
             Some(Subject::Draft(params.draft_id))
@@ -1890,6 +1917,7 @@ mod tests {
             Method::DownloadChunk,
             Method::DraftCreate,
             Method::DraftUpdate,
+            Method::DraftDiscard,
             Method::AgentDraftAddAttachment,
         ] {
             assert!(
@@ -1920,6 +1948,7 @@ mod tests {
             Method::DownloadChunk,
             Method::DraftCreate,
             Method::DraftUpdate,
+            Method::DraftDiscard,
             Method::AgentDraftAddAttachment,
         ] {
             let decision = kr_protocol::method::decide(

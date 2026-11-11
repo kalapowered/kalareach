@@ -32,7 +32,7 @@ const WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
 /// and is stopped at the check its service asks with the record in hand, where the fence lands.
 /// The door's check comes next; the case lets it find the fence gone. A door that tells the service's
 /// refusal as the copy's answer then sends it to a device that has authority again.
-async fn two_copies_with_a_fence_between_the_checks(
+pub(super) async fn two_copies_with_a_fence_between_the_checks(
     controller: &Arc<Controller>,
     connection: &super::RemoteConnection,
     mutation: &MutationRequest,
