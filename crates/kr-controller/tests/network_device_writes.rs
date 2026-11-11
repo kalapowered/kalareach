@@ -61,14 +61,14 @@ async fn paired_with(
     (device, raw)
 }
 
-/// KR-REQ-23.41 and KR-REQ-23.21: the four upload writes, a palette change and raw input sent as a
-/// mutation are each refused by name, with a reason a device can act on, and nothing is recorded or
-/// staged for them: a repeat of the same action is refused as the first was, where an action the
-/// host had claimed would be told apart, and no byte is staged although the begin declared four
-/// thousand. A chunk's refusal names the stream it belongs on. The control is a device that does not
-/// hold the right: it is told so first, because the device's rights are asked before the refusal.
+/// KR-REQ-23.41 and KR-REQ-23.21: a chunk sent on the control stream, a palette change and raw input
+/// sent as a mutation are each refused by name, with a reason a device can act on, and nothing is
+/// recorded or staged for them: a repeat of the same action is refused as the first was, where an
+/// action the host had claimed would be told apart. A chunk's refusal names the stream it belongs
+/// on. The control is a device that does not hold the right to upload: it is told so first, because
+/// the device's rights are asked before the refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_upload_writes_a_palette_change_and_raw_input_are_refused_by_name_and_record_nothing() {
+async fn a_chunk_on_the_control_stream_a_palette_change_and_raw_input_are_refused_by_name_and_record_nothing() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let (session_id, _) = an_open_session(&host);
@@ -87,23 +87,15 @@ async fn the_upload_writes_a_palette_change_and_raw_input_are_refused_by_name_an
     let on_host = on_the_host(&host);
     let on_session = on_the_session(&host, session_id);
     let writes: Vec<(Method, ActionTarget)> = vec![
-        (Method::UploadBegin, on_host.clone()),
-        (Method::UploadChunk, on_host.clone()),
-        (Method::UploadFinish, on_host.clone()),
-        (Method::UploadCancel, on_host),
+        (Method::UploadChunk, on_host),
         (Method::TerminalPaletteSet, on_session.clone()),
         (Method::InputWrite, on_session),
     ];
     for (method, target) in writes {
         let action = ActionId::new(kr_ipc::new_uuid());
-        let params = begin_params(&host);
         let send = || async {
-            if method == Method::UploadBegin {
-                raw.mutate(method, action, target.clone(), &params).await
-            } else {
-                raw.mutate(method, action, target.clone(), &Anything {})
-                    .await
-            }
+            raw.mutate(method, action, target.clone(), &Anything {})
+                .await
         };
         let refused = send().await.expect_err("refused by name");
         let name = method.as_str();
@@ -136,7 +128,7 @@ async fn the_upload_writes_a_palette_change_and_raw_input_are_refused_by_name_an
             .staged_byte_len()
             .expect("the journal reads"),
         0,
-        "no byte was reserved for a begin that was refused"
+        "nothing was staged for a write that was refused"
     );
 
     // The control: a device without the right is told so, not that the method is unserved.

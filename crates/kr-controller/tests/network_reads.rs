@@ -1,12 +1,12 @@
 //! The reads a paired device makes that the daemon decides itself, over a real paired connection.
 //!
 //! What these demonstrate, for the paired-device ingress: `grant.list`, and the reads this host
-//! refuses a device. The method table admits a paired device to `grant.list`, `upload.status`,
-//! `download.begin` and `download.chunk`, among others.
+//! refuses a device. The method table admits a paired device to `grant.list`, `download.begin` and
+//! `download.chunk`, among others.
 //!
 //! A device lists the grants it issued and everything delegated from them, which is what the
 //! sharing service shows any issuer other than this host itself, and it needs `session.share` to
-//! ask. The other three are refused by name, each with the reason this host does not serve it to a
+//! ask. The downloads are refused by name, each with the reason this host does not serve them to a
 //! device: a refusal a device can act on rather than one that names no reason. Before either, a
 //! device whose grant does not reach what it asks about is refused as it always was, and so is a
 //! description of a session its grant does not reach.
@@ -30,7 +30,7 @@ use kr_protocol::scalars::{Nullable, U64};
 use kr_protocol::sharing::{GrantListParams, GrantListResult};
 use kr_protocol::transfer::{
     DownloadBeginParams, DownloadBeginResult, DownloadChunkParams, DownloadChunkResult,
-    DownloadSource, UploadStatusParams, UploadStatusResult,
+    DownloadSource,
 };
 use net_support::{Device, Host, connect, pair_with, proposal};
 
@@ -199,14 +199,14 @@ async fn a_device_lists_the_grants_it_issued_and_what_was_delegated_from_them() 
     host.stop().await;
 }
 
-/// The three reads the method table admits for a paired device that this host does not serve one
+/// The two reads the method table admits for a paired device that this host does not serve one
 /// are each refused by name, as `UNSUPPORTED_CAPABILITY` with the method and the reason in the
 /// message. A device whose grant does not reach the subject or carry the right is refused first,
 /// as it always was.
 ///
 /// KR-REQ-23.41, the part about file grants: a device without `files.read` is refused
 /// `download.begin` with a permission error. Not shown here: the draft methods, owner revision,
-/// environment handles and the upload methods' own rights; that the three media reads this host
+/// environment handles and the upload methods' own rights; that the two download reads this host
 /// does not serve a device are refused by name is not a clause of the row. The refused device's
 /// grant also sees only one other session, and the case does not read the refusal's message, so
 /// it does not tie the refusal to `files.read` alone.
@@ -241,12 +241,6 @@ async fn a_read_this_host_does_not_serve_a_device_is_refused_by_name() {
     };
 
     let refusals = [
-        refused::<_, UploadStatusResult>(
-            &session,
-            Method::UploadStatus,
-            &UploadStatusParams { transfer_id },
-        )
-        .await,
         refused::<_, DownloadBeginResult>(&session, Method::DownloadBegin, &begin).await,
         refused::<_, DownloadChunkResult>(
             &session,
@@ -258,13 +252,9 @@ async fn a_read_this_host_does_not_serve_a_device_is_refused_by_name() {
         )
         .await,
     ];
-    for (method, refusal) in [
-        Method::UploadStatus,
-        Method::DownloadBegin,
-        Method::DownloadChunk,
-    ]
-    .into_iter()
-    .zip(refusals)
+    for (method, refusal) in [Method::DownloadBegin, Method::DownloadChunk]
+        .into_iter()
+        .zip(refusals)
     {
         assert_eq!(
             refusal.code,
