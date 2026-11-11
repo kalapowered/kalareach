@@ -7,7 +7,8 @@
 //! part, inside that root. The root's own path is opened one part at a time from `/` with no link
 //! followed, and every directory below it, the folder's own parts and the record's, is opened the
 //! same way and must lie on the root's device. The record file is opened with no link followed,
-//! without blocking, and its kind is checked after: it must be a regular file with one name.
+//! without blocking, and checked after: it must be a regular file with one name on the root's
+//! device.
 //! Anything else writes nothing.
 
 use std::ffi::OsStr;
@@ -155,10 +156,22 @@ pub fn appends(
     {
         directory = opens_part(&directory, part, root_status.st_dev)?;
     }
-    // Without blocking: a pipe at the record's name must not hold the writer, and its kind is
-    // checked once it is open.
+    opens_record(&directory, file, root_status.st_dev)?
+        .write_all(bytes)
+        .map_err(|error| format!("the record file cannot be written: {error}"))
+}
+
+/// The record file `file` in `directory`, opened to be appended to: with no link followed and
+/// without blocking (a pipe at its name must not hold the writer), and then looked at through the
+/// handle, so that what was opened is what is checked. It must be a regular file with one name on
+/// the device `device`, the run's root's, as every directory above it is.
+fn opens_record(
+    directory: &std::os::fd::OwnedFd,
+    file: &str,
+    device: rustix::fs::Dev,
+) -> Result<std::fs::File, String> {
     let handle = rustix::fs::openat(
-        &directory,
+        directory,
         file,
         OFlags::WRONLY
             | OFlags::CREATE
@@ -176,9 +189,10 @@ pub fn appends(
     {
         return Err("the record file is not a regular file with one name".to_owned());
     }
-    std::fs::File::from(handle)
-        .write_all(bytes)
-        .map_err(|error| format!("the record file cannot be written: {error}"))
+    if status.st_dev != device {
+        return Err("the record file lies on another device than the run's root".to_owned());
+    }
+    Ok(std::fs::File::from(handle))
 }
 
 #[cfg(test)]
@@ -367,6 +381,15 @@ mod tests {
         assert!(
             opens_part(&directory, OsStr::new("agent-config"), status.st_dev + 1).is_err(),
             "another device is refused"
+        );
+        // The record file itself on another device than the root's: refused, and nothing written.
+        let (directory, status) = opens_root(&root).expect("the root");
+        let place =
+            opens_part(&directory, OsStr::new("agent-config"), status.st_dev).expect("a place");
+        assert!(opens_record(&place, "rollout-t.jsonl", status.st_dev).is_ok());
+        assert!(
+            opens_record(&place, "rollout-t.jsonl", status.st_dev + 1).is_err(),
+            "a file on another device is refused"
         );
         let _ = std::fs::remove_dir_all(base);
     }
