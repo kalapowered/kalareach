@@ -11,6 +11,7 @@
 //! The event log is read by the broker's proof, so the program that reads it starts through the
 //! broker's one launcher, under the broker's own token.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -180,17 +181,40 @@ impl Channel {
     /// Returns an error when the file cannot be written, PowerShell refuses the policy or the log,
     /// or its answer does not name a record.
     pub fn set(&self, xml: &str) -> Result<u64, Error> {
-        let file = self.scratch.join("policy.xml");
-        std::fs::write(&file, xml).map_err(|source| Error::Start {
-            what: "writing the policy file",
+        // PowerShell reads the policy by its path, so the file is one that did not exist: a random
+        // name, made in the directory the installation checked, owned by the administrators in the
+        // call that makes it. A file that another account owned or held open could be changed
+        // between this write and PowerShell's read.
+        let (mut made, file) = super::fresh::named_file(
+            &self.scratch,
+            "policy",
+            ".xml",
+            super::sd::SdKind::AdminFile,
+        )
+        .map_err(|source| Error::Start {
+            what: "making the policy file",
             source,
         })?;
+        let written = made
+            .write_all(xml.as_bytes())
+            .and_then(|()| made.sync_all());
+        drop(made);
+        if let Err(source) = written {
+            let _ = std::fs::remove_file(&file);
+            return Err(Error::Start {
+                what: "writing the policy file",
+                source,
+            });
+        }
         // An empty log answers with its own error, which is the answer zero; any other error stops
         // the script before the policy is written.
         let text = self.powershell(&format!(
             "$newest = 0; try {{ $newest = [int64](Get-WinEvent -LogName '{LOG}' -MaxEvents 1 -ErrorAction Stop).RecordId }} catch {{ if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') {{ throw }} }}; Set-AppLockerPolicy -XmlPolicy '{}'; Write-Output \"{RECORD_BEFORE_WRITE}$newest\"",
             file.display()
-        ))?;
+        ));
+        // The file served its read: it is removed whatever PowerShell said.
+        let _ = std::fs::remove_file(&file);
+        let text = text?;
         text.lines()
             .find_map(|line| line.trim().strip_prefix(RECORD_BEFORE_WRITE))
             .and_then(|number| number.trim().parse().ok())

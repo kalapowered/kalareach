@@ -56,8 +56,14 @@ pub enum SdKind {
     /// token names the system alone.
     ProcessThread,
     /// A folder only the system and administrators may change, which every account may read and
-    /// enter when the principals say so.
+    /// enter when the principals say so. The Administrators group owns it, named in the descriptor
+    /// that makes it, so that its owner is the same whoever makes it: the system, or an
+    /// administrator whose token's default owner is the account itself.
     AdminDir,
+    /// A file only the system and administrators may use, owned by the Administrators group for the
+    /// same reason as an [`SdKind::AdminDir`]: the installation's manifest, its earlier-state
+    /// record and the files it hands to another program by path.
+    AdminFile,
     /// The volatile registry key that holds the identifier of the current boot: the system and the
     /// administrators alone may do anything with it, and nobody else may even read it.
     BootMarker,
@@ -197,10 +203,11 @@ pub fn descriptor_text(kind: SdKind, principals: &Principals) -> Result<String> 
         SdKind::CapturePipe => Ok("O:SYD:P(A;;GA;;;SY)".to_owned()),
         SdKind::DataParent => Ok("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)".to_owned()),
         SdKind::AdminDir => Ok(if principals.users_may_read {
-            format!("D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;{READ_AND_ENTER};;;BU)")
+            format!("O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;{READ_AND_ENTER};;;BU)")
         } else {
-            "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)".to_owned()
+            "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)".to_owned()
         }),
+        SdKind::AdminFile => Ok("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)".to_owned()),
     }
 }
 
