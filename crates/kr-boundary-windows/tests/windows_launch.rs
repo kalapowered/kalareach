@@ -1045,7 +1045,13 @@ fn a_suspended_child_that_was_not_seen_to_end_is_reported_to_the_jobs_owner() {
     assert!(job.unproved_reasons().is_empty());
     // As if the platform refused the call to end it: the child stays, and the drop's wait runs out.
     testing::skip_next_termination();
+    let begun = Instant::now();
     drop(child);
+    let waited = begun.elapsed();
+    assert!(
+        waited >= Duration::from_secs(4) && waited < Duration::from_secs(8),
+        "the drop waits the five seconds the launcher states, not less and not ten: {waited:?}"
+    );
     // SAFETY: the copy is open.
     assert_ne!(
         unsafe { WaitForSingleObject(process.raw(), 0) },

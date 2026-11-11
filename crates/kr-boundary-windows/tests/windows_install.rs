@@ -437,13 +437,24 @@ fn installation_lays_down_and_removal_restores() {
         before,
         "the computer is as it was before the installation"
     );
+    // The service manager keeps the deleted service's key until the last handle to it closes. The
+    // handle this case held through the removal is closed first, and the case waits until the key is
+    // gone, so that what follows starts with no service key at all.
+    drop(broker);
+    let service_key = r"SYSTEM\CurrentControlSet\Services\KalaReachBoundary";
+    let key_gone = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while registry::open(service_key).unwrap().is_some() {
+        assert!(
+            std::time::Instant::now() < key_gone,
+            "the service's key is still there after its last handle closed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
     // Without the service there is no marker, and asking for one makes no key: a volatile service
     // key left behind would stop the next installation from storing the service's settings.
     assert!(boot::marker().is_err());
     assert!(
-        registry::open(r"SYSTEM\CurrentControlSet\Services\KalaReachBoundary")
-            .unwrap()
-            .is_none(),
+        registry::open(service_key).unwrap().is_none(),
         "no service key was made by asking for the marker"
     );
 }
@@ -743,6 +754,119 @@ fn a_folder_above_the_data_directory_that_others_own_may_write_in_or_have_replac
     let _ = std::fs::remove_dir_all(&target);
 }
 
+/// A handle on a folder, opened by the case as another program would: any sharing, and the rights
+/// named.
+fn open_folder(folder: &Path, access: u32) -> ffi::Handle {
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    let wide = ffi::wide_path(folder);
+    // SAFETY: the path is NUL-terminated; the call keeps nothing of it.
+    let raw = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    ffi::Handle::new(raw, "opening a folder").unwrap()
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_parent_folder_is_checked_on_one_handle_that_is_held_and_an_entry_of_an_unknown_type_is_refused()
+ {
+    use kr_boundary_windows::win::sd::{self, SdKind};
+    const DELETE: u32 = 0x0001_0000;
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const FILE_LIST_DIRECTORY: u32 = 1;
+    let folder = inherited_folder();
+    let protected = sd::descriptor(SdKind::DataParent, &sd::Principals::default()).unwrap();
+    acl::set_protected(&folder, &protected).unwrap();
+
+    // The folder the installation itself makes passes the check on a handle.
+    let own = open_folder(&folder, FILE_LIST_DIRECTORY | READ_CONTROL);
+    assert_eq!(acl::changeable_by_others_on(&own, false).unwrap(), None);
+    drop(own);
+
+    // A handle that another program already holds with the right to delete the folder makes the
+    // check refuse: it could rename the folder after the check.
+    let holder = open_folder(&folder, DELETE);
+    let refused = install::check_data_parent(&paths_under(&folder)).unwrap_err();
+    assert!(
+        refused.to_string().contains("holds it open"),
+        "the folder is refused while a handle that can delete it is open: {refused}"
+    );
+    drop(holder);
+
+    // The handle the check keeps blocks a rename or a delete of the folder while it is held, and
+    // the folder can be moved once it is closed.
+    let held = install::check_data_parent(&paths_under(&folder))
+        .unwrap()
+        .expect("the folder is there");
+    let moved = folder.with_extension("moved");
+    assert!(
+        std::fs::rename(&folder, &moved).is_err(),
+        "the held folder cannot be renamed"
+    );
+    assert!(
+        std::fs::remove_dir(&folder).is_err(),
+        "the held folder cannot be deleted"
+    );
+    drop(held);
+    std::fs::rename(&folder, &moved).expect("the closed folder moves");
+    std::fs::rename(&moved, &folder).unwrap();
+
+    // An entry that allows by a condition is a type the check does not read: refused, not skipped.
+    let conditional = sd::descriptor_from_text(
+        "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(XA;OICI;FA;;;WD;(@User.Title==\"x\"))",
+    )
+    .unwrap();
+    acl::set_protected(&folder, &conditional).unwrap();
+    let refused = install::check_data_parent(&paths_under(&folder)).unwrap_err();
+    assert!(
+        refused.to_string().contains("type"),
+        "a callback entry is refused: {refused}"
+    );
+    let handle = open_folder(&folder, FILE_LIST_DIRECTORY | READ_CONTROL);
+    assert!(
+        acl::changeable_by_others_on(&handle, false)
+            .unwrap()
+            .is_some_and(|finding| finding.contains("type")),
+        "the handle form refuses it too"
+    );
+    drop(handle);
+
+    // A plain user's allow entry is refused with the user named.
+    let users = sd::descriptor_from_text("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;BU)")
+        .unwrap();
+    acl::set_protected(&folder, &users).unwrap();
+    let handle = open_folder(&folder, FILE_LIST_DIRECTORY | READ_CONTROL);
+    let finding = acl::changeable_by_others_on(&handle, false)
+        .unwrap()
+        .unwrap();
+    assert!(finding.contains("S-1-5-32-545"), "{finding}");
+    // With replacement_only a right that only adds beside the folder does not count.
+    let adds = sd::descriptor_from_text("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x6;;;BU)")
+        .unwrap();
+    acl::set_protected(&folder, &adds).unwrap();
+    drop(handle);
+    let handle = open_folder(&folder, FILE_LIST_DIRECTORY | READ_CONTROL);
+    assert!(
+        acl::changeable_by_others_on(&handle, false)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(acl::changeable_by_others_on(&handle, true).unwrap(), None);
+    drop(handle);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_installation_stops_before_it_lays_anything_down_when_the_parent_folder_is_not_its_own() {
@@ -801,20 +925,51 @@ fn the_removal_reads_the_journal_and_the_private_roots_first_and_refuses_with_no
     assert_eq!(snapshot(), installed, "the removal changed nothing");
     assert!(paths.manifest.exists() && paths.journal.exists());
 
-    // A finished one is not work: only the unfinished one holds the removal.
-    // A private root that is still there holds it too.
+    // The same invocation, finished, but carrying a leftover of its private root that the sweep
+    // still holds: its slot is free and the removal is still held, because a leftover is work.
+    let (mut journal, _) = Journal::resume(&paths.journal, id, "boot").unwrap();
+    for row in [
+        Row::Leftover {
+            object: r"tmp\held".to_owned(),
+            reason: "in use".to_owned(),
+            class: kr_boundary_windows::journal::rows::LeftoverClass::Root,
+            snapshot: None,
+        },
+        Row::ReleaseVerified {
+            objects: 0,
+            leftovers: 0,
+        },
+        Row::End { root_leftovers: 1 },
+    ] {
+        journal.append(&row).unwrap();
+    }
+    let (code, output) = setup(&["remove"], "yes\n", &[]);
+    assert_ne!(code, 0, "{output}");
+    assert!(
+        output.contains("Finished") && output.contains(r"C:\work\project"),
+        "a finished invocation with a root leftover holds the removal: {output}"
+    );
+    assert_eq!(snapshot(), installed, "the removal changed nothing");
+    // Once the leftover is cleared the finished journal is no work. A private root that is still
+    // there holds the removal.
+    journal
+        .append(&Row::LeftoverCleared {
+            key: r"tmp\held".to_owned(),
+        })
+        .unwrap();
+    drop(journal);
     let root = paths.run.join("0123456789abcdef0123456789abcdef");
-    std::fs::remove_file(paths.journal.join(format!("{}.journal", hex::encode(id.0)))).unwrap();
     std::fs::create_dir(&root).unwrap();
     let (code, output) = setup(&["remove"], "yes\n", &[]);
     assert_ne!(code, 0, "{output}");
     assert!(
-        output.contains("a private root 0123456789abcdef0123456789abcdef"),
-        "{output}"
+        output.contains("a private root 0123456789abcdef0123456789abcdef")
+            && !output.contains("the invocation"),
+        "only the root holds it now: {output}"
     );
     assert_eq!(snapshot(), installed, "the removal changed nothing");
 
-    // With both gone the removal runs.
+    // With the root gone the removal runs and takes the finished journal with it.
     std::fs::remove_dir(&root).unwrap();
     let (code, output) = setup(&["remove"], "yes\n", &[]);
     assert_eq!(code, 0, "{output}");
