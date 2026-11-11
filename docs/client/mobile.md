@@ -393,13 +393,15 @@ cd apps/companion/src-tauri/gen/android && ./gradlew :app:compileUniversalDebugK
 # and when one ABI carries a library that another lacks. A class whose
 # natives a library exports in part and registers in part therefore fails, and nothing overrides
 # that. What the check cannot read in full is a failure and never "nothing found": an archive that
-# ends inside a member or gives it another size, a library whose header or symbol table is cut or
-# does not add up, and a dex file with an offset, number or count past its end. A minified build
-# removes or renames a class that only native code reaches, and the runtime then aborts the
-# application when the library asks for it, so only a minified package shows this. The classes of
-# the media library are kept whole by `src-tauri/gen/android/app/proguard-rules.pro`.
-# For a minified package under `app/build/outputs` (one checked from anywhere else has no known
-# variant, and this step is left out) the check also reads the merged rules the minifier wrote
+# ends inside a member, gives it another size or gives the CRC-32 of other bytes, a library whose
+# header or symbol table is cut or does not add up, and a dex file with an offset, number or count
+# past its end or outside its data section. A minified build removes or renames a class that only
+# native code reaches, and the runtime then aborts the application when the library asks for it, so
+# only a minified package shows this. The classes of the media library are kept whole by
+# `src-tauri/gen/android/app/proguard-rules.pro`.
+# For a minified package at `apk/<flavour>/<profile>/<file>` or `bundle/<variant>/<file>` under
+# `app/build/outputs` (a package anywhere else, at another depth under it too, has no known variant,
+# and this step is left out) the check also reads the merged rules the minifier wrote
 # (`app/build/outputs/mapping/<variant>/configuration.txt`) and fails when they do not name
 # `proguard-tauri.pro` and `proguard-wry.pro`. The Rust build writes those two files, and they keep
 # the classes the Rust library calls by names it builds as it runs, which the check of the libraries
