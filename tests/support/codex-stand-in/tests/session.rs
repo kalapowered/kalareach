@@ -532,6 +532,124 @@ async fn the_server_answers_the_sum_a_turn_asks_for_only_under_the_variant() {
     }
 }
 
+/// Every `.jsonl` file below `directory`, with its place relative to it.
+fn jsonl_files(directory: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
+    let mut found = Vec::new();
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.map(|entry| entry.expect("an entry")) {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+            {
+                let text = std::fs::read_to_string(&path).expect("the record is text");
+                found.push((
+                    path.strip_prefix(directory).expect("below").to_path_buf(),
+                    text,
+                ));
+            }
+        }
+    }
+    found
+}
+
+/// Under `write-the-record`, a turn whose input holds text is recorded as the agent's own record
+/// is: a file for the thread below `sessions/<year>/<month>/<day>` in the directory `CODEX_HOME`
+/// names, a line that marks the turn's start and a line that holds the prompt; a turn with no text
+/// (the terminal's own, with no prompt typed), a server where the variant is not named and one
+/// with no `CODEX_HOME` write nothing.
+#[tokio::test]
+async fn the_server_records_a_turn_with_a_prompt_in_the_agents_folder_only_under_the_variant() {
+    let question = "(mark) What is 612 plus 1034? Reply with only the number.";
+    let home = std::env::temp_dir().join(format!("kr-si-record-{}", std::process::id()));
+    for (variants, home_named, records) in [
+        ("write-the-record", true, true),
+        ("", true, false),
+        ("write-the-record", false, false),
+    ] {
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("a home");
+        let mut command = Command::new(PROGRAM);
+        command
+            .args(["app-server", "--listen", "stdio://"])
+            .env("STAND_IN", variants)
+            .env("STAND_IN_COMMAND", COMMAND)
+            .current_dir(&home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if home_named {
+            command.env("CODEX_HOME", home.join("agent"));
+        } else {
+            command.env_remove("CODEX_HOME");
+        }
+        let mut child = command.spawn().expect("the server starts");
+        let mut stdin = child.stdin.take().expect("stdin");
+        let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
+        write(&mut stdin, &initialize()).await;
+        assert_eq!(next(&mut lines).await["id"], "initialize");
+        assert_eq!(
+            next(&mut lines).await["method"],
+            "remoteControl/status/changed"
+        );
+        write(&mut stdin, &json!({"method":"initialized"})).await;
+        write(
+            &mut stdin,
+            &json!({"id":2,"method":"thread/start","params":{}}),
+        )
+        .await;
+        assert!(next(&mut lines).await["result"]["thread"]["id"].is_string());
+        assert_eq!(next(&mut lines).await["method"], "thread/started");
+        // The first turn has no prompt, as the terminal's has when none is typed; the second asks.
+        write(&mut stdin, &turn_asking(3, "thread-1", "")).await;
+        let _ = messages_of_the_turn(&mut stdin, &mut lines).await;
+        write(&mut stdin, &turn_asking(4, "thread-1", question)).await;
+        let _ = messages_of_the_turn(&mut stdin, &mut lines).await;
+        let files = jsonl_files(&home);
+        if !records {
+            assert!(files.is_empty(), "variants {variants:?}: {files:?}");
+            continue;
+        }
+        assert_eq!(files.len(), 1, "one file for the thread: {files:?}");
+        let (place, text) = &files[0];
+        let parts: Vec<String> = place
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(parts.len(), 6, "{parts:?}");
+        assert_eq!(&parts[..2], ["agent", "sessions"]);
+        assert!(
+            parts[2].len() == 4 && parts[3].len() == 2 && parts[4].len() == 2,
+            "the date directories: {parts:?}"
+        );
+        assert!(
+            parts[2..5]
+                .iter()
+                .all(|part| part.bytes().all(|byte| byte.is_ascii_digit())),
+            "{parts:?}"
+        );
+        assert_eq!(parts[5], "rollout-thread-1.jsonl");
+        let record: Vec<&str> = text.lines().collect();
+        assert_eq!(record.len(), 2, "one start and one prompt: {text}");
+        assert!(record[0].contains(r#""type":"task_started""#), "{text}");
+        assert!(record[0].contains(r#""turn_id":"turn-2""#), "{text}");
+        assert!(record[1].contains(r#""role":"user""#), "{text}");
+        assert!(record[1].contains("What is 612 plus 1034?"), "{text}");
+        assert!(
+            !text.contains("turn-1"),
+            "the turn with no prompt is not recorded: {text}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// The terminal writes the message of a turn as a row of its own under `answer-the-sum`, and no
 /// such row where the variant is not named.
 #[tokio::test]
