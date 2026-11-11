@@ -971,25 +971,25 @@ impl TransferModule {
     }
 
     /// Writes the end of each session the registry holds as closed among the sessions the drafts
-    /// `actor_id` holds open target and `target`, the one the create names, before the create is
-    /// counted against those drafts.
+    /// `actor_id` holds open target and `target`, the one the write names, before a create or a
+    /// binding is counted against those drafts.
     ///
     /// A session's closure queues the write that ends its drafts on a task of its own, so a create
-    /// that follows closely, or a write that failed and waits for the next sweep or start, would
-    /// count drafts of a session that has ended, or add one for it. Each create settles, before its
-    /// count, the closed sessions its principal's open drafts target and the one it names, whatever
-    /// the count is: a draft of a session recorded closed before then stops counting without a
-    /// second try, and a create that names one is refused as the service refuses any draft for an
-    /// ended session, unless the bound speaks first. A refusal at the bound is kept only after a
-    /// second settle and a second count ([`Self::write`]). What remains possible is a refusal for a
-    /// draft whose session another create's own registry read missed and then closed, at the first
-    /// settle and again at the second, or one after a settle that failed in both passes. The
-    /// registry is read once for each of those sessions in a pass, at most 65 key reads under its
-    /// lock (the principal's open drafts at the bound, and the create's own session); a create at
-    /// the bound makes two passes, so up to 130 key reads and two scans of the drafts, besides the
-    /// store's other reads and writes, which are as they are for any such write. A pass that
-    /// cannot be made leaves a line in the log and does not stop the create: the service counts
-    /// what it holds.
+    /// or a binding that follows closely, or a write that failed and waits for the next sweep or
+    /// start, would count drafts of a session that has ended, or add one for it. Each create and
+    /// each binding settles, before its count, the closed sessions its principal's open drafts
+    /// target and the one it names, whatever the count is: a draft of a session recorded closed
+    /// before then stops counting without a second try, and a create that names one is refused as
+    /// the service refuses any draft for an ended session, unless the bound speaks first. A create's
+    /// refusal at the bound is kept only after a second settle and a second count
+    /// ([`Self::write`]). What remains possible is a refusal for a draft whose session another
+    /// create's own registry read missed and then closed, at the first settle and again at the
+    /// second, or one after a settle that failed in both passes. The registry is read once for each
+    /// of those sessions in a pass, at most 65 key reads under its lock (the principal's open
+    /// drafts at the bound, and the write's own session); a create at the bound makes two passes,
+    /// so up to 130 key reads and two scans of the drafts, besides the store's other reads and
+    /// writes, which are as they are for any such write. A pass that cannot be made leaves a line
+    /// in the log and does not stop the write: the service counts what it holds.
     pub(crate) async fn settle_closures_of_open_drafts(
         &self,
         owner: &Arc<Controller>,

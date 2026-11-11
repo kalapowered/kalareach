@@ -3435,8 +3435,9 @@ at this machine may make a draft with no session and has no bound. A draft is op
 sends it to a session or the
 session it targets closes: the closure of a session queues, on a task of its own, the write that
 orphans its drafts, and each `draft.create` first writes the end of the sessions its device's open
-drafts target, and the session it names, that the registry holds closed. A draft of a session
-recorded closed before the create starts then stops counting. A create that names such a session
+drafts target, and the session it names, that the registry holds closed, and each
+`agent.draft.add_attachment` first writes the end of the sessions its device's open drafts target.
+A draft of a session recorded closed before the write starts then stops counting. A create that names such a session
 is refused `SESSION_CLOSED` when that settle succeeded, unless the device already holds its bound,
 where the count comes first and the refusal is `QUOTA_EXCEEDED`. A `draft.create` past the bound is
 refused `QUOTA_EXCEEDED` with the bound in the message only after the closed sessions are settled
@@ -3473,7 +3474,7 @@ refusal shows nothing of what exists. A draft that a prompt named, or one with a
 because those records show what the agent was offered or took: such a draft is kept.
 While this host cannot yet say that no earlier build's session was sent a draft, a draft that
 targets such a session, or holds an upload of one, is kept too. Attachments `recorded` or `failed`
-go with the draft, since nothing was offered from them. It never
+go with the draft: the agent was given nothing from them. It never
 changes an upload: the bytes, their quota charge, the session an upload was bound to and its expiry
 stay as they are, and only `upload.cancel` of an upload still receiving frees bytes. It is an
 ordinary action write. The same action asked again, on the same connection or a replacement, is

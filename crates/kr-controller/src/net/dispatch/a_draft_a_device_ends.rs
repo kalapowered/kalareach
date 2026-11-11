@@ -310,6 +310,38 @@ async fn a_create_is_served_once_the_agent_has_taken_the_files_of_a_draft() {
     world.serving.abort();
 }
 
+/// A `agent.draft.add_attachment` of `handle` to `draft_id`, at the revision the draft of `actor` has
+/// now, for the session of `world`.
+fn a_binding(
+    world: &fake::Silent,
+    connection: &super::RemoteConnection,
+    request_id: u64,
+    actor: &ActorId,
+    draft_id: DraftId,
+    handle: &kr_protocol::transfer::AttachmentHandle,
+) -> MutationRequest {
+    let revision = world
+        .controller
+        .transfer()
+        .service()
+        .draft(actor, draft_id)
+        .expect("the draft")
+        .revision;
+    write_naming(
+        world,
+        connection,
+        Method::AgentDraftAddAttachment,
+        request_id,
+        &AgentDraftAddAttachmentParams {
+            draft_id,
+            expected_revision: revision,
+            transfer_id: handle.transfer_id,
+            contribution: manual_contribution(handle),
+        },
+        Some(world.session_id),
+    )
+}
+
 /// KR-REQ-23.41: a file bound to a draft whose files the agent took makes the draft count again, so
 /// the binding is asked the bound as a create is. A device holding the bound is refused the binding
 /// with the quota code in words that name `draft.discard`, and nothing is bound; it ends one draft
@@ -346,20 +378,7 @@ async fn a_binding_that_makes_a_spent_draft_count_again_is_asked_the_bound() {
                 draft_id: DraftId,
                 actor: &ActorId,
                 handle: &kr_protocol::transfer::AttachmentHandle| {
-        let revision = service.draft(actor, draft_id).expect("the draft").revision;
-        write_naming(
-            &world,
-            connection,
-            Method::AgentDraftAddAttachment,
-            request_id,
-            &AgentDraftAddAttachmentParams {
-                draft_id,
-                expected_revision: revision,
-                transfer_id: handle.transfer_id,
-                contribution: manual_contribution(handle),
-            },
-            Some(session),
-        )
+        a_binding(&world, connection, request_id, actor, draft_id, handle)
     };
     let attachments = |actor: &ActorId, draft_id: DraftId| {
         service
@@ -418,6 +437,91 @@ async fn a_binding_that_makes_a_spent_draft_count_again_is_asked_the_bound() {
         service.open_drafts(&device).expect("counts"),
         DEVICE_OPEN_DRAFTS,
         "the draft counts again, and the device is at its bound"
+    );
+    world.serving.abort();
+}
+
+/// KR-REQ-23.41: a binding is counted against what the registry holds, as a create is. A device
+/// holds its bound, and one of its counting drafts targets a session that the registry will hold
+/// closed, the write that ends that draft not having been made. A binding that would bring a spent
+/// draft back is refused while the registry holds no closure. Once it holds the closure, the next
+/// binding settles it before it counts and is served, with no create between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_binding_at_the_bound_settles_the_closures_the_registry_holds_before_it_counts() {
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::closure_of;
+
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    let service = controller.transfer().service();
+    let (connection, _) = paired_connection(controller, 61, EVERY_RIGHT);
+    let device = connection.device.principal();
+    let (spent, transfer_id) = a_draft_with_a_file(&world, &device);
+    the_agent_takes(&world, &device, spent.draft_id, transfer_id);
+    let elsewhere = SessionId::new(kr_ipc::new_uuid());
+    a_draft_for(&world, &device, Some(elsewhere));
+    for _ in 1..DEVICE_OPEN_DRAFTS {
+        a_draft_for(&world, &device, None);
+    }
+    assert_eq!(
+        service.open_drafts(&device).expect("counts"),
+        DEVICE_OPEN_DRAFTS,
+        "the device holds its bound"
+    );
+    let second = super::tests::a_published_attachment_for(
+        controller,
+        world.environment_id,
+        &device,
+        "second.bin",
+        Some(world.session_id),
+    );
+
+    let refused = connection
+        .mutate(&a_binding(
+            &world,
+            &connection,
+            1,
+            &device,
+            spent.draft_id,
+            &second,
+        ))
+        .await;
+    assert_eq!(
+        super::tests::error_of(&refused).code,
+        ErrorCode::QuotaExceeded,
+        "no closure is recorded: the bound holds"
+    );
+
+    controller
+        .registry
+        .lock()
+        .await
+        .record_closure(&closure_of(elsewhere))
+        .expect("the registry records the closure");
+    let _: AgentDraftAddAttachmentResult = result_of(
+        &connection
+            .mutate(&a_binding(
+                &world,
+                &connection,
+                2,
+                &device,
+                spent.draft_id,
+                &second,
+            ))
+            .await,
+    );
+    assert_eq!(
+        service
+            .draft(&device, spent.draft_id)
+            .expect("the draft")
+            .attachments
+            .len(),
+        2,
+        "the binding was made"
+    );
+    assert_eq!(
+        service.open_drafts(&device).expect("counts"),
+        DEVICE_OPEN_DRAFTS,
+        "the draft of the closed session stopped counting and the spent draft took its place"
     );
     world.serving.abort();
 }
