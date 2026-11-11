@@ -21,6 +21,7 @@ use std::collections::BTreeSet;
 
 use crate::frame::invocation::{RefusedKind, printable};
 use crate::names::{BRANCH_PREFIX, is_branch_name};
+use crate::operation::grammar;
 use crate::refusal::Refusal;
 
 /// The bounds on a listing, each checked before anything of the listing is parsed or copied.
@@ -129,6 +130,50 @@ pub const RULE_URL_HELPER: &str = "config-url-helper";
 /// Returns a refusal of kind `configuration` naming the rule: a bound, the framing, a key or a
 /// value.
 pub fn classify_config(listing: &[u8], limits: &Limits) -> Result<ConfigFacts, Refusal> {
+    let Some(body) = frame(listing, limits)? else {
+        return Ok(ConfigFacts::default());
+    };
+    let records = || body.split(|byte| *byte == 0);
+    let mut facts = ConfigFacts::default();
+    let mut remotes = BTreeSet::new();
+    for record in records() {
+        admit(record, limits, &mut facts, &mut remotes)?;
+    }
+    facts.remotes = remotes.into_iter().collect();
+    Ok(facts)
+}
+
+/// Classifies the bytes of the NUL-framed listing of a `.gitmodules` file, which has the framing
+/// and the bounds of a configuration listing and a table of four keys of its own: for each
+/// submodule `path` (a path of the tree), `url` (text that names no transport helper), `branch` (a
+/// branch name) and `ignore` (`none`, `untracked`, `dirty` or `all`). Every other key refuses the
+/// repository, by name. An empty listing is valid.
+///
+/// # Errors
+///
+/// Returns a refusal of kind `configuration` naming the rule: a bound, the framing, a key that is
+/// not one of the four or a value outside its type.
+pub fn classify_gitmodules(listing: &[u8], limits: &Limits) -> Result<(), Refusal> {
+    let Some(body) = frame(listing, limits)? else {
+        return Ok(());
+    };
+    for record in body.split(|byte| *byte == 0) {
+        let (key, value) = split_record(record);
+        let key = Key::parse(key, limits)?;
+        let Some(entry) = SUBMODULE_TABLE.iter().find(|entry| entry.matches(&key)) else {
+            return Err(key.refusal(
+                RULE_UNLISTED,
+                "is not a setting of a submodule file that this release admits",
+            ));
+        };
+        check_value(entry, &key, value)?;
+    }
+    Ok(())
+}
+
+/// Checks a listing's size, framing, record count and record lengths, in that order, and returns
+/// its records without their last NUL: `None` for an empty listing, which has no records.
+fn frame<'a>(listing: &'a [u8], limits: &Limits) -> Result<Option<&'a [u8]>, Refusal> {
     if listing.len() > limits.listing_bytes {
         return Err(refusal(
             RULE_LISTING_TOO_LARGE,
@@ -136,7 +181,7 @@ pub fn classify_config(listing: &[u8], limits: &Limits) -> Result<ConfigFacts, R
         ));
     }
     let Some((&last, body)) = listing.split_last() else {
-        return Ok(ConfigFacts::default());
+        return Ok(None);
     };
     if last != 0 {
         return Err(refusal(
@@ -157,13 +202,32 @@ pub fn classify_config(listing: &[u8], limits: &Limits) -> Result<ConfigFacts, R
             "a record of the configuration listing is too long for this release",
         ));
     }
-    let mut facts = ConfigFacts::default();
-    let mut remotes = BTreeSet::new();
-    for record in records() {
-        admit(record, limits, &mut facts, &mut remotes)?;
+    Ok(Some(body))
+}
+
+/// Splits a record at its first newline into the key and the value; no newline means no value.
+fn split_record(record: &[u8]) -> (&[u8], Option<&[u8]>) {
+    match record.iter().position(|byte| *byte == b'\n') {
+        Some(at) => (&record[..at], Some(&record[at + 1..])),
+        None => (record, None),
     }
-    facts.remotes = remotes.into_iter().collect();
-    Ok(facts)
+}
+
+/// Checks the value of a key against the type of its row.
+fn check_value(entry: &Entry, key: &Key<'_>, value: Option<&[u8]>) -> Result<(), Refusal> {
+    let Err(rule) = entry.value.admit(value, entry.rule) else {
+        return Ok(());
+    };
+    let reason = match rule {
+        RULE_URL_HELPER => {
+            "names a helper program as the remote's address, which this release does not allow"
+        }
+        RULE_SYMLINKS => "must be false: this release does not create symbolic links",
+        RULE_BARE => "must be false: this release does not work in a bare repository",
+        RULE_EXTENSION => "is an extension, or a value of one, that this release does not support",
+        _ => "has a value this release does not admit",
+    };
+    Err(key.refusal(rule, reason))
 }
 
 /// Checks one record against the table and records what it says.
@@ -173,29 +237,13 @@ fn admit(
     facts: &mut ConfigFacts,
     remotes: &mut BTreeSet<String>,
 ) -> Result<(), Refusal> {
-    let (key, value) = match record.iter().position(|byte| *byte == b'\n') {
-        Some(at) => (&record[..at], Some(&record[at + 1..])),
-        None => (record, None),
-    };
+    let (key, value) = split_record(record);
     let key = Key::parse(key, limits)?;
     let Some(entry) = TABLE.iter().find(|entry| entry.matches(&key)) else {
         let (rule, reason) = family(&key);
         return Err(key.refusal(rule, reason));
     };
-    if let Err(rule) = entry.value.admit(value, entry.rule) {
-        let reason = match rule {
-            RULE_URL_HELPER => {
-                "names a helper program as the remote's address, which this release does not allow"
-            }
-            RULE_SYMLINKS => "must be false: this release does not create symbolic links",
-            RULE_BARE => "must be false: this release does not work in a bare repository",
-            RULE_EXTENSION => {
-                "is an extension, or a value of one, that this release does not support"
-            }
-            _ => "has a value this release does not admit",
-        };
-        return Err(key.refusal(rule, reason));
-    }
+    check_value(entry, &key, value)?;
     match entry.fact {
         Fact::None => {}
         Fact::Symlinks => facts.symlinks_local = Some(false),
@@ -400,6 +448,8 @@ enum Value {
     Text,
     /// One line of text that does not name a transport helper.
     Url,
+    /// A path of the tree, in the grammar of the argument tables.
+    Path,
     /// A refspec of the characters `A-Za-z0-9._/*-`: an optional `+`, then two patterns around one
     /// colon.
     Refspec,
@@ -433,6 +483,7 @@ impl Value {
                     true
                 }
             }
+            (Self::Path, Some(Ok(text))) => line(text) && grammar::path(text).is_ok(),
             (Self::Refspec, Some(Ok(text))) => refspec(text),
             (Self::RemoteName, Some(Ok(text))) => is_branch_name(text),
             (Self::BranchRef, Some(Ok(text))) => {
@@ -643,6 +694,19 @@ static TABLE: &[Entry] = &[
     named("submodule", "active", Value::Boolean, Fact::None),
     named("branch", "remote", Value::RemoteName, Fact::None),
     named("branch", "merge", Value::BranchRef, Fact::None),
+];
+
+/// Every key of a `.gitmodules` file the broker admits. A key in no row is refused.
+static SUBMODULE_TABLE: &[Entry] = &[
+    named("submodule", "path", Value::Path, Fact::None),
+    named("submodule", "url", Value::Url, Fact::None),
+    named("submodule", "branch", Value::RemoteName, Fact::None),
+    named(
+        "submodule",
+        "ignore",
+        Value::Words(&["none", "untracked", "dirty", "all"]),
+        Fact::None,
+    ),
 ];
 
 fn refusal(rule: &'static str, detail: &str) -> Refusal {
