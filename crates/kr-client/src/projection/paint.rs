@@ -703,12 +703,12 @@ impl<'a> Writer<'a> {
     /// keeps.
     ///
     /// A session holds the encoding as one state, so at most one of modes 1005 and 1006 is on in a
-    /// screen. A destination keeps one encoding too, the last one it was given, and a reset of any
-    /// mode of the family returns the default one, so writing the two in the screen's order would
-    /// leave 1006 in force for a screen that holds 1005, and the default for a screen that holds
-    /// 1006. All four modes xterm names are reset first, because the destination's own encoding is
-    /// not known here and xterm resets only the one that is in force, and the one that is on is set
-    /// last.
+    /// screen. Terminal.app and iTerm keep one encoding too, the last one they were given, and a
+    /// reset of any mode of the family returns the default one, so writing the two in the screen's
+    /// order would leave the default for a screen that holds 1005, because the reset of 1006 comes
+    /// after the set of 1005. All four modes xterm names are reset first, because the destination's
+    /// own encoding is not known here and xterm resets only the one that is in force, and the one
+    /// that is on is set last.
     ///
     /// A screen read from a worker of an earlier build can have both flags on, and the order they
     /// were set in is lost; a delta from such a worker carries only the mode that changed, so it can
@@ -3420,8 +3420,9 @@ mod safety {
         );
     }
 
-    /// The mouse encoding a stream leaves a terminal in, as a terminal keeps it: setting 1005, 1006,
-    /// 1015 or 1016 replaces the one in force, and resetting any of them returns the default.
+    /// The mouse encoding a stream leaves a terminal in, in a model of Terminal.app and iTerm:
+    /// setting 1005, 1006, 1015 or 1016 replaces the one in force, and resetting any of them
+    /// returns the default.
     fn mouse_encoding(stream: &[u8]) -> Option<u16> {
         // Every write replaces the state: a set makes its mode the one in force, a reset the default.
         mouse_encoding_writes(stream)
