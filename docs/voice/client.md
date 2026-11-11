@@ -124,8 +124,11 @@ Android's microphone foreground service:
   phone is unlocked. On Android 10 and 11 (the application's floor is API 29) the notification offers
   no Unmute while the phone is locked. On every release the service refuses an Unmute that arrives
   while the phone is locked, whoever sends it.
-  A muted call reports capture `muted_by_person` as on iOS, though the Android recorder stops with
+  A muted call reports capture `muted_by_person`, as on iOS, though the Android recorder stops with
   the muted track, so the call's own screen says the microphone is muted and offers to unmute it.
+  What the system did, such as another application taking the microphone, and a route change or a
+  route with no input are still said first. A recorder that fails during a mute shows as
+  unavailable only after the unmute; the call never reads as capturing in the meantime.
   From Android 14 the person can dismiss the notification on an unlocked phone, and the service posts
   it again.
   `scripts/e2e-voice-call-device.sh android lock-screen` runs a call on the Android 16 emulator,
@@ -169,7 +172,7 @@ plainly, with the statement that **unheard speech never authorises an action** (
 - `route_changing`: Switching between speaker, receiver, or Bluetooth.
 - `suspended_by_system`: The OS suspended capture.
 - `unavailable`: No microphone hardware or permission is available, the recorder has not
-  started or has failed, or (on Android) the system has not reported the call's own recording, so
+  started or has failed (while the person's mute holds, `muted_by_person` is said instead), or (on Android) the system has not reported the call's own recording, so
   the call cannot tell its own recording from another application's.
 - `idle`: No call has been permitted, the call has ended, or its deadline has passed.
 

@@ -281,6 +281,8 @@ class VoiceCaptureGate(private val keptIntervals: Int = 64) {
             // The recorder stops with the muted track and the system then lists no recording of the
             // call, so a muted call is said to be muted before the recorder is asked about: the
             // person's own choice is the reason it is not running, and the screen offers to undo it.
+            // A recorder that fails during the mute is shown only after the unmute, as unavailable;
+            // nothing in between reads as capturing, which is what the display is bound to.
             mutedByPerson -> VoiceCaptureState.MUTED_BY_PERSON
             !recorderRunning || recording == Recording.UNREPORTED -> VoiceCaptureState.UNAVAILABLE
             else -> VoiceCaptureState.CAPTURING
