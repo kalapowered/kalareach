@@ -3364,11 +3364,19 @@ A device holds at most 64 live connections: the host lets it use 32 at once, whi
 companion's own count of 30 to the host in use (its main link, a link and a terminal view for each
 of at most eight open sessions, up to four ambient links, and the connections of the owner's
 confirmations, the revocation readings, the push registration, the inbox, a voice call and the
-sharing desk), and each may linger once beside its replacement after a reconnection. At the first connection above the bound the host serves the new connection
-and withdraws the oldest as a revocation withdraws a device's connections: it is closed, a request in
-flight on it gets no answer, and the device presents the same action on a newer connection and
-settles it as it would after any lost connection. Another device's connections are not touched. An
-owner cannot change the bound.
+sharing desk), and the rest is room for the copies a lossy path leaves: a replaced link's connection
+stays with the host for the transport's idle time of 30 seconds, and a link replaced more than once
+in that time leaves a copy for each. At the first connection above the bound the host serves the new
+connection and withdraws the device's connection that it has heard from least recently, never the new
+one, and the older of two that were heard from at the same moment. A connection is heard from when the
+transport receives an authenticated packet from the device on it, keepalives included, and a live
+device sends one at least every 10 seconds, so the copies of a device that has gone are withdrawn
+before a connection it still answers on. A link the device has left, which still waits for replies,
+sends keepalives as a link in use does, and the host cannot tell the two apart: only the device's own
+count keeps it below the bound. The withdrawn connection is closed as a revocation withdraws a
+device's connections: a request in flight on it gets no answer, and the device presents the same
+action on a newer connection and settles it as it would after any lost connection. Another device's
+connections are not touched. An owner cannot change the bound.
 
 The transfer service performs a device's uploads under the device's own principal, which the host
 derives from the device's identity. A device sees and ends only its own uploads: another principal's
