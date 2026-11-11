@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use kr_protocol::hostinfo::configuration::{host_owns_variable, platform_variable_name};
 use serde::Deserialize;
 
 use crate::{BUILD_VARIABLE, GENERATION_VARIABLE, REQUIRE_VARIABLE, RESULT_VARIABLE};
@@ -1290,6 +1291,28 @@ impl Build {
             .collect()
     }
 
+    /// Whether every variable the entry sets in the agent's session ([`Build::names_it_sets`]) is one
+    /// the session's shell can have: the host's worker drops from a creator's environment the names it
+    /// owns (its own prefix, the terminal's identity, the desktop's), so a variable of that kind would
+    /// never reach the agent, in silence.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first such name, and never a value.
+    pub fn names_reach_the_session(&self) -> Result<(), String> {
+        match self
+            .names_it_sets()
+            .into_iter()
+            .find(|name| host_owns_variable(&platform_variable_name(name)))
+        {
+            Some(name) => Err(format!(
+                "the entry sets {name}, a variable the host owns and drops from every session, so the agent \
+                 would never have it"
+            )),
+            None => Ok(()),
+        }
+    }
+
     /// Whether every switch the account names for the agent's updates and installs is in what every
     /// launch gives the agent, probes included: the build's variables, the account's, its `switches`
     /// (not its `arguments`, which only the parts get), and the files of its configuration
@@ -1391,13 +1414,18 @@ impl Inputs {
 ///
 /// # Panics
 ///
-/// Panics when the file cannot be read or is not an entry.
+/// Panics when the file cannot be read or is not an entry, and when the entry sets a variable the
+/// host owns ([`Build::names_reach_the_session`]).
 #[must_use]
 pub fn read_build(path: &Path) -> Build {
     let bytes = std::fs::read(path)
         .unwrap_or_else(|error| panic!("the build file {}: {error}", path.display()));
-    serde_json::from_slice(&bytes)
-        .unwrap_or_else(|error| panic!("the build file {}: {error}", path.display()))
+    let build: Build = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("the build file {}: {error}", path.display()));
+    build
+        .names_reach_the_session()
+        .unwrap_or_else(|why| panic!("the build file {}: {why}", path.display()));
+    build
 }
 
 /// Quotes one word for a POSIX shell line.
@@ -1666,6 +1694,88 @@ mod tests {
             Ok(())
         );
         assert_eq!(claude.refusal(), "d");
+    }
+
+    /// The JSON of an entry that sets `environment` for the build and `variables` for the account.
+    fn entry_json(
+        environment: &serde_json::Value,
+        variables: &serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "package": "p", "application": "a", "version": "1", "prefix": "/p",
+            "pinned": "bin/a", "sha256": "00", "command": "a", "launch": "native",
+            "ready": "r", "harmless": { "input": "h", "shows": "h" }, "transcript": "t",
+            "environment": environment,
+            "account": {
+                "login": "l", "stored": "s", "home": "run", "budget": "b", "turns": 3,
+                "conversations": "sessions/{date}", "prompt_line": "p", "ready": "r",
+                "composer": "c", "submit": "\r", "clear": "x", "reply_line": "x",
+                "decision_line": "y", "busy": "b", "slash": { "input": "/p", "shows": "p" },
+                "interrupt": { "input": "e", "shows": "i" },
+                "approval": { "shows": "a", "allow": "y", "deny": "n" },
+                "resume": ["resume", "{conversation}"], "image": "paste",
+                "variables": variables
+            }
+        })
+    }
+
+    /// An entry that sets a variable the host's worker drops from every session (its own prefix,
+    /// the terminal's identity) is refused, naming the variable, whether the build or the account
+    /// sets it, and a variable outside those passes.
+    #[test]
+    fn an_entry_that_sets_a_variable_the_host_owns_is_refused_by_its_name() {
+        let entry = |environment: serde_json::Value, variables: serde_json::Value| -> Build {
+            serde_json::from_value(entry_json(&environment, &variables)).expect("an entry")
+        };
+        let none = serde_json::json!({});
+        assert_eq!(
+            entry(serde_json::json!({ "NO_UPDATE": "1" }), none.clone()).names_reach_the_session(),
+            Ok(())
+        );
+        let why = entry(
+            serde_json::json!({ "STAY_HERE": "1", "KR_VARIANTS": "stay" }),
+            none.clone(),
+        )
+        .names_reach_the_session()
+        .expect_err("a name with the host's prefix is refused");
+        assert!(why.contains("KR_VARIANTS"), "{why}");
+        let why = entry(none.clone(), serde_json::json!({ "TERM_PROGRAM": "x" }))
+            .names_reach_the_session()
+            .expect_err("a terminal identity of the account is refused");
+        assert!(
+            why.contains("TERM_PROGRAM") && !why.contains("\"x\""),
+            "{why}"
+        );
+    }
+
+    /// A build file that sets a variable the host owns is refused where it is read, naming the
+    /// variable: no part and no case is started from it.
+    #[test]
+    fn a_build_file_that_sets_a_variable_the_host_owns_is_refused_where_it_is_read() {
+        let file = std::env::temp_dir().join(format!("kr-entry-{}.json", kr_ipc::new_uuid()));
+        let write = |environment: serde_json::Value| {
+            std::fs::write(
+                &file,
+                serde_json::to_vec(&entry_json(&environment, &serde_json::json!({})))
+                    .expect("the entry's text"),
+            )
+            .expect("writes the entry");
+        };
+        write(serde_json::json!({ "NO_UPDATE": "1" }));
+        let _ = read_build(&file);
+        write(serde_json::json!({ "KR_VARIANTS": "stay" }));
+        let refused = std::panic::catch_unwind(|| read_build(&file));
+        std::fs::remove_file(&file).expect("removes the entry");
+        let panic = refused.expect_err("an entry that sets a name the host owns is refused");
+        let said = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+            .unwrap_or_default();
+        assert!(
+            said.contains("KR_VARIANTS") && !said.contains("stay"),
+            "{said}"
+        );
     }
 
     /// An entry that types options is not served by a command integration, so its words are the keys
