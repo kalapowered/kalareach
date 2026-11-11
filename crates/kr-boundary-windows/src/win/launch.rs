@@ -312,10 +312,16 @@ pub struct Child {
 /// Hooks for the cases.
 #[cfg(feature = "testing")]
 pub mod testing {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::win::ffi::Handle;
 
     static SKIP_NEXT_TERMINATION: AtomicBool = AtomicBool::new(false);
     static FAIL_NEXT_LAUNCH_AFTER_CREATION: AtomicBool = AtomicBool::new(false);
+    static HOLD_NEXT_PIPE_WRITER: AtomicBool = AtomicBool::new(false);
+    static FAIL_NEXT_EXIT_CODE_READ: AtomicBool = AtomicBool::new(false);
+    static HELD_WRITERS: Mutex<Vec<Handle>> = Mutex::new(Vec::new());
 
     /// Makes the next dropped suspended child skip its call to end the process, as if the platform
     /// had refused it: the child stays, and its drop must report that it was not seen to end.
@@ -335,6 +341,41 @@ pub mod testing {
 
     pub(super) fn take_fail_after_creation() -> bool {
         FAIL_NEXT_LAUNCH_AFTER_CREATION.swap(false, Ordering::SeqCst)
+    }
+
+    /// Makes the next capture pipe keep a writer outside the launcher: a copy of its write end is
+    /// held until [`release_held_pipe_writers`], as a process that is not in the job would hold it.
+    /// The pipe then does not reach its end when the job's processes have gone.
+    pub fn hold_next_pipe_writer() {
+        HOLD_NEXT_PIPE_WRITER.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn take_hold() -> bool {
+        HOLD_NEXT_PIPE_WRITER.swap(false, Ordering::SeqCst)
+    }
+
+    pub(super) fn keep(writer: Handle) {
+        HELD_WRITERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(writer);
+    }
+
+    /// Lets go of every writer that [`hold_next_pipe_writer`] kept.
+    pub fn release_held_pipe_writers() {
+        HELD_WRITERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    /// Makes the next read of a child's exit code fail, after the child has ended.
+    pub fn fail_next_exit_code_read() {
+        FAIL_NEXT_EXIT_CODE_READ.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn take_fail_exit_code() -> bool {
+        FAIL_NEXT_EXIT_CODE_READ.swap(false, Ordering::SeqCst)
     }
 }
 
@@ -456,6 +497,13 @@ impl Child {
             return Ok(None);
         }
         let mut code = 0_u32;
+        #[cfg(feature = "testing")]
+        if testing::take_fail_exit_code() {
+            return Err(ffi::error(
+                0,
+                "reading the exit code failed, as a case asked",
+            ));
+        }
         // SAFETY: the process has ended and the handle is open.
         if unsafe { GetExitCodeProcess(self.process.raw(), &raw mut code) } == 0 {
             return Err(last("reading the exit code"));
@@ -535,6 +583,24 @@ pub fn pipe() -> Result<(Handle, OwnedPipeEnd), ffi::Error> {
     }
     let read = Handle::new(read, "the pipe's read end")?;
     let write = Handle::new(write, "the pipe's write end")?;
+    #[cfg(feature = "testing")]
+    if testing::take_hold() {
+        let mut copy: HANDLE = null_mut();
+        // SAFETY: both handles are open; the copy is owned by the value made below and no child
+        // can inherit it.
+        unsafe {
+            windows_sys::Win32::Foundation::DuplicateHandle(
+                GetCurrentProcess(),
+                write.raw(),
+                GetCurrentProcess(),
+                &raw mut copy,
+                0,
+                0,
+                windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS,
+            );
+        }
+        testing::keep(Handle::new(copy, "a held copy of the pipe's write end")?);
+    }
     // SAFETY: the read end is open; the broker alone keeps it.
     if unsafe { SetHandleInformation(read.raw(), HANDLE_FLAG_INHERIT, 0) } == 0 {
         return Err(last("keeping the pipe's read end from children"));
