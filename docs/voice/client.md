@@ -115,6 +115,16 @@ Android's microphone foreground service:
   persistent user-visible notification while a call is active. When the screen locks, the foreground
   service preserves the microphone and speaker channels. Every action on the notification names the
   call it was shown for, so one that arrives late reaches that call or nothing.
+  The notification is in a channel of its own, `kr-voice-call-running`, at default importance with no
+  sound and no vibration, so a phone at its default settings shows it on the lock screen. The
+  earlier channel, `kr-voice-call`, had low importance, which the platform keeps off the lock screen,
+  and the service deletes it when it starts. The lock screen shows "Voice call running" and what the
+  microphone is doing, and names no session, host or account. Mute and Stop work there with no
+  unlock. Unmute asks for the unlock. From Android 12 (API 31) the platform holds the action until the
+  phone is unlocked. On Android 10 and 11 (the application's floor is API 29) the notification offers
+  no Unmute while the phone is locked, and the service refuses one that arrives.
+  `scripts/e2e-voice-call-device.sh android lock-screen` reads all of this from the emulator's lock
+  screen, with a lock credential of its own for the run.
 - **Unattended activation forbidden**: building a call makes its offer with the recorder and the
   microphone track off, and opens no audio session and no foreground service. Nothing records until
   the host's answer to a start permits the call. That answer names the voice session and the moment

@@ -233,6 +233,18 @@ unresolved until a receipt says otherwise. Queued, sent and applied are three di
 only a receipt produces the third. The banner after a recovery reports what was kept and what has
 no confirmed outcome, and ends by saying that nothing was sent again.
 
+## A running voice call on Android's lock screen
+
+A call the person started runs under a foreground service, and its notification is the only control within reach while the screen is locked. The notification sits in a channel of its own at default importance with no sound and no vibration, so a phone at its default notification settings shows it on the lock screen. A channel of low importance stays off the lock screen, and a channel's importance cannot be raised after it exists, so the service deletes the channel that earlier releases used when it starts.
+
+The lock screen shows the notification folded: "Voice call running" and what the microphone is doing, such as "Microphone on" or "Microphone muted". It names no session, host or account. Expand shows the controls, and expanding needs no unlock either.
+
+- **Mute** and **Stop** work with no unlock, because they only take something away from the call.
+- **Unmute** asks for the unlock, because it opens the microphone again. From Android 12 (API 31) the platform holds the action until the person unlocks the phone.
+- The application supports Android 10 (API 29) and later. On Android 10 and 11 the platform cannot hold a single action, so while the phone is locked the notification offers no Unmute and the service refuses one that arrives. The person unlocks the phone and uses the notification in the shade, or the call's own screen.
+
+The person's own notification settings for the application have the last word on whether it shows on the lock screen. `scripts/e2e-voice-call-device.sh android lock-screen` runs a call on the emulator, locks it, reads the notification from the system's records and presses these controls on the lock screen.
+
 ## Targets, type and motion
 
 - Every control is at least 44 points on iOS and 48 density-independent pixels on Android, in both
