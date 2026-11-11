@@ -485,15 +485,16 @@ impl Controller {
         self.before_a_connection_is_registered.arm()
     }
 
-    /// Arms the pause the withdrawal of the next network connection whose control stream is lost
-    /// stops at, once the loss is declared and before the registration goes. Returns the end that
-    /// says the withdrawal has arrived, and the end that lets it go. The pause fires once.
+    /// Holds the withdrawal of every network connection that ends from now on, whether its control
+    /// stream is lost or its handler is dropped, before its registration goes. Returns the end that
+    /// says the first withdrawal has arrived, and the end that lets them all go when it is set to
+    /// `true` or dropped.
     #[cfg(feature = "testing")]
     pub fn pause_connection_deregistration(
         &self,
     ) -> (
         tokio::sync::oneshot::Receiver<()>,
-        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::watch::Sender<bool>,
     ) {
         self.before_a_connection_is_deregistered.arm()
     }
