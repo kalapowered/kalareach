@@ -429,10 +429,15 @@ struct Scan {
     shortfall_kib: u64,
 }
 
+/// How the text of a file is read.
+type ReadText = Box<dyn Fn(&std::path::Path) -> std::io::Result<String>>;
+
 /// A `/proc` directory and the page size its page maps are indexed by.
 pub struct Proc {
     root: PathBuf,
     page_bytes: u64,
+    /// How the text of a file of the tree is read.
+    text: ReadText,
 }
 
 impl Proc {
@@ -440,9 +445,21 @@ impl Proc {
     /// The live tree is `/proc`; a check builds a stand-in from files it writes.
     #[must_use]
     pub fn at(root: impl Into<PathBuf>, page_bytes: u64) -> Self {
+        Self::reading_with(root, page_bytes, |path| std::fs::read_to_string(path))
+    }
+
+    /// As [`Proc::at`], with `read` as the way the text of each file but the page map is read, so
+    /// that a check can have a file say one thing at one read and another at the next.
+    #[must_use]
+    pub fn reading_with(
+        root: impl Into<PathBuf>,
+        page_bytes: u64,
+        read: impl Fn(&std::path::Path) -> std::io::Result<String> + 'static,
+    ) -> Self {
         Self {
             root: root.into(),
             page_bytes,
+            text: Box::new(read),
         }
     }
 
@@ -458,7 +475,7 @@ impl Proc {
     }
 
     fn read_text(&self, pid: u32, name: &str) -> Result<String, Failure> {
-        std::fs::read_to_string(self.file(pid, name)).map_err(|error| {
+        (self.text)(&self.file(pid, name)).map_err(|error| {
             Failure::Refused(format!("process {pid}: reading its {name}: {error}"))
         })
     }
@@ -495,9 +512,10 @@ impl Proc {
             .ok_or_else(|| Failure::Refused(format!("process {pid}: smaps_rollup has no Rss")))
     }
 
-    /// One pass over one process.
-    fn scan(&self, pid: u32) -> Result<Scan, Failure> {
-        let before = self.started(pid)?;
+    /// One pass over one process, which must still be the one that started at `started` when the
+    /// pass ends. The start time is read once before the first pass and given to every pass, so a
+    /// process that was replaced between two passes is not taken for the one that was being read.
+    fn scan(&self, pid: u32, started: &str) -> Result<Scan, Failure> {
         let listing = self.mappings(pid)?;
         let pagemap = File::open(self.file(pid, "pagemap")).map_err(|error| {
             Failure::Refused(format!("process {pid}: opening its page map: {error}"))
@@ -563,7 +581,7 @@ impl Proc {
                 done += count;
             }
         }
-        if self.started(pid)? != before {
+        if self.started(pid)? != started {
             return Err(Failure::Refused(format!(
                 "process {pid} is not the process the scan began with"
             )));
@@ -603,9 +621,13 @@ impl Proc {
             let mut class_swapped = 0;
             let mut class_own = 0;
             for &pid in &class.pids {
-                let scan = with_retries(|| self.scan(pid)).map_err(|reason| {
-                    format!("{reason} (a process of the {} class)", class.name)
-                })?;
+                let of_class =
+                    |reason: &str| format!("{reason} (a process of the {} class)", class.name);
+                let started = self
+                    .started(pid)
+                    .map_err(|failure| of_class(failure.reason()))?;
+                let scan = with_retries(|| self.scan(pid, &started))
+                    .map_err(|reason| of_class(&reason))?;
                 processes += 1;
                 class_resident += scan.resident;
                 class_swapped += scan.swapped;

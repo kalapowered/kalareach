@@ -88,17 +88,8 @@ impl Stand {
     fn write(&self, root: &Path) {
         let dir = root.join(self.pid.to_string());
         std::fs::create_dir_all(&dir).expect("a stand-in process directory");
-        // The command name holds a space and a parenthesis, as a real one can; the start time is the
-        // twentieth field after the last parenthesis.
-        let mut fields = vec!["0".to_owned(); 22];
-        fields[0] = "S".to_owned();
-        fields[19].clone_from(&self.start);
-        std::fs::write(
-            dir.join("stat"),
-            format!("{} (a (name) with space) {}\n", self.pid, fields.join(" ")),
-        )
-        .expect("stat");
-        std::fs::write(dir.join("maps"), self.maps.join("\n") + "\n").expect("maps");
+        std::fs::write(dir.join("stat"), stat_text(self.pid, &self.start)).expect("stat");
+        std::fs::write(dir.join("maps"), maps_text(self)).expect("maps");
         let present = self
             .entries
             .iter()
@@ -129,6 +120,20 @@ impl Stand {
     }
 }
 
+/// What a stand-in's `maps` says.
+fn maps_text(stand: &Stand) -> String {
+    stand.maps.join("\n") + "\n"
+}
+
+/// What a process's `stat` says. The command name holds a space and a parenthesis, as a real one can;
+/// the start time is the twentieth field after the last parenthesis.
+fn stat_text(pid: u32, start: &str) -> String {
+    let mut fields = vec!["0".to_owned(); 22];
+    fields[0] = "S".to_owned();
+    fields[19] = start.to_owned();
+    format!("{pid} (a (name) with space) {}\n", fields.join(" "))
+}
+
 /// A stand-in `/proc` of the processes given.
 fn tree(processes: &[Stand]) -> (tempfile::TempDir, Proc) {
     let dir = tempfile::tempdir().expect("a directory of its own");
@@ -136,6 +141,36 @@ fn tree(processes: &[Stand]) -> (tempfile::TempDir, Proc) {
         process.write(dir.path());
     }
     let proc = Proc::at(dir.path(), PAGE);
+    (dir, proc)
+}
+
+/// A stand-in `/proc` whose files can say one thing at a read and another at the next: `answer` is
+/// given the file (`<pid>/<name>`) and how many times it has been read, counting this read from one,
+/// and returns the text to say instead of the file's own, or none to say the file's own.
+fn tree_answering(
+    processes: &[Stand],
+    answer: impl Fn(&str, usize) -> Option<String> + 'static,
+) -> (tempfile::TempDir, Proc) {
+    let dir = tempfile::tempdir().expect("a directory of its own");
+    for process in processes {
+        process.write(dir.path());
+    }
+    let root = dir.path().to_path_buf();
+    let reads = std::cell::RefCell::new(std::collections::HashMap::new());
+    let proc = Proc::reading_with(dir.path(), PAGE, move |path| {
+        let file = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        let mut reads = reads.borrow_mut();
+        let count = reads.entry(file.clone()).or_insert(0_usize);
+        *count += 1;
+        match answer(&file, *count) {
+            Some(text) => Ok(text),
+            None => std::fs::read_to_string(path),
+        }
+    });
     (dir, proc)
 }
 
@@ -428,6 +463,78 @@ fn each_class_is_read_apart_and_a_file_page_two_classes_map_counts_once_in_each(
         "the whole group counts the file's pages once"
     );
     assert_eq!(reading.combined_kib, (1 + 2 + 4) * 4 + 8 * 4);
+}
+
+/// What a stand-in's `maps` says when its mappings have changed: one more than it had.
+const CHANGED_MAPPING: &str = "00500000-00501000 r--p 00000000 00:00 0 \n";
+
+/// KR-PERF-003: a process whose start time at the end of a scan is not the one the reading began with
+/// is another process, and the reading is refused.
+#[test]
+fn a_process_that_starts_at_another_time_by_the_end_of_its_scan_is_refused() {
+    let mut stand = Stand::new(70);
+    stand.map(16, 2, 0, "00:00", 0, "");
+    stand.resident(16, 2, Page::Own);
+    // The first read of its `stat` names the process; the second, at the end of the scan, names
+    // another.
+    let (_dir, proc) = tree_answering(&[stand], |file, read| {
+        (file == "70/stat" && read == 2).then(|| stat_text(70, "2000"))
+    });
+
+    let refused = proc.read(&group(&[70])).expect_err("another process");
+
+    assert!(
+        refused.contains("process 70") && refused.contains("not the process the scan began with"),
+        "the refusal names the process and says what is wrong: {refused}"
+    );
+}
+
+/// KR-PERF-003: a process's start time is read once, before the first scan, and holds for every
+/// scan after it: a process replaced between two scans is not taken for the one being read, whatever
+/// start time the later scan finds when it begins.
+#[test]
+fn a_start_time_read_once_holds_across_the_scans_of_a_process() {
+    let mut stand = Stand::new(71);
+    stand.map(16, 2, 0, "00:00", 0, "");
+    stand.resident(16, 2, Page::Own);
+    let changed = format!("{}{CHANGED_MAPPING}", maps_text(&stand));
+    // The first scan finds its mappings changed at its last read of them, so there is a second;
+    // from the third read of its `stat` on, the process has another start time.
+    let (_dir, proc) = tree_answering(&[stand], move |file, read| match (file, read) {
+        ("71/maps", 2) => Some(changed.clone()),
+        ("71/stat", 3..) => Some(stat_text(71, "2000")),
+        _ => None,
+    });
+
+    let refused = proc.read(&group(&[71])).expect_err("another process");
+
+    assert!(
+        refused.contains("not the process the scan began with"),
+        "the second scan is held to the first start time: {refused}"
+    );
+}
+
+/// KR-PERF-003: a scan whose mappings differ between its first and its last read is not returned as
+/// whole: the process is scanned again, and refused when every scan finds it changed.
+#[test]
+fn a_scan_whose_mappings_differ_at_its_second_read_is_never_returned() {
+    let mut stand = Stand::new(72);
+    stand.map(16, 2, 0, "00:00", 0, "");
+    stand.resident(16, 2, Page::Own);
+    let changed = format!("{}{CHANGED_MAPPING}", maps_text(&stand));
+    // Every scan reads its mappings twice, and the second read of each pair differs.
+    let (_dir, proc) = tree_answering(&[stand], move |file, read| {
+        (file == "72/maps" && read % 2 == 0).then(|| changed.clone())
+    });
+
+    let refused = proc
+        .read(&group(&[72]))
+        .expect_err("a process that keeps changing");
+
+    assert!(
+        refused.contains("mappings changed") && refused.contains("still after 3 scans"),
+        "every scan found it changed: {refused}"
+    );
 }
 
 /// A process is scanned again only while its mappings change, up to three times; any other failure
