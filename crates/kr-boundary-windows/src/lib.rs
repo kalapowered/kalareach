@@ -26,6 +26,7 @@
 //! | [`messages`] | The product's own messages whose exact words are fixed: the installer's wait for application control, and the broker's answer while its proof has not passed |
 //! | [`operation`] | The eight commands a request may name: their argument tables, the settings every command runs with, the one rule for line endings, and the checks of the repository's state |
 //! | [`state`] | What the doctor says in each state of the installation |
+//! | [`window`] | When the proof's search for a refusal is over: a run cut by the window's own end ends it, a run that failed does not |
 //!
 //! The calls that touch the machine live in `win`, which builds on Windows only. Everything above
 //! it builds and is tested everywhere, so the notice, the policy's two forms, the stores and the
@@ -62,6 +63,7 @@ pub mod quote;
 pub mod refusal;
 pub mod repository;
 pub mod state;
+pub mod window;
 
 #[cfg(windows)]
 pub mod win;

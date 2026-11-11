@@ -51,6 +51,12 @@ pub enum Error {
         /// What it wrote.
         output: String,
     },
+    /// A program did not end by its deadline.
+    #[error("{what} did not end by its deadline")]
+    TimedOut {
+        /// What was run.
+        what: &'static str,
+    },
     /// A program of the proof could not be started through the launcher.
     #[error("{what} could not be started: {source}")]
     Launch {
@@ -265,6 +271,7 @@ fn wevtutil(
     let text = String::from_utf8_lossy(&captured.stdout).into_owned();
     match captured.outcome {
         Outcome::Ran(0) => Ok(text),
+        Outcome::TimedOut => Err(Error::TimedOut { what }),
         other => Err(Error::Failed {
             what,
             status: format!("{other:?}"),
