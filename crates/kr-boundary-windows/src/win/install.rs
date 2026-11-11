@@ -74,8 +74,9 @@ pub const CONNECT: &str = "krb-connect";
 const DISPLAY: &str = "KalaReach repository boundary";
 const BROKER: &str = "kr-boundary-broker.exe";
 const CREDENTIAL: &str = "kr-boundary-credential.exe";
-/// The privileges the broker uses and no others.
-const BROKER_PRIVILEGES: [&str; 7] = [
+/// The privileges the broker uses and no others: the service manager gives the service's token
+/// these and takes away every other.
+pub const BROKER_PRIVILEGES: [&str; 7] = [
     "SeTcbPrivilege",
     "SeAssignPrimaryTokenPrivilege",
     "SeIncreaseQuotaPrivilege",
