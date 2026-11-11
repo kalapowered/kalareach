@@ -1212,7 +1212,6 @@ fn summary_of(path: &Path) -> kr_boundary_windows::win::sd::Summary {
 fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_before_any_step_uses_it()
  {
     use install::DataChild;
-    use kr_boundary_windows::win::sd;
     const SYSTEM: &str = "S-1-5-18";
     const ADMINISTRATORS: &str = "S-1-5-32-544";
     let folder = inherited_folder();
@@ -1222,7 +1221,12 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
         let refused = install::make_data_directory(&paths).expect_err("the directory is refused");
         let text = refused.to_string();
         assert!(text.contains(words), "{text}");
-        assert!(text.contains("Empty the directory, or remove it"), "{text}");
+        // Whatever is refused, what the person does leaves the manifest and the journal in place.
+        assert!(
+            text.to_lowercase()
+                .contains("the manifest and the journal stay where they are"),
+            "{text}"
+        );
     };
 
     // A directory that the installation made is accepted, with journal files of an earlier run in
@@ -1253,14 +1257,31 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
     drop(holds);
 
     // A directory that is there with a list that passes the check but is not protected is
-    // protected on its handle.
-    let loose = sd::descriptor_from_text("D:AI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)").unwrap();
-    acl::set_protected(&paths.staging, &loose).unwrap();
+    // protected on its handle, and what is in it keeps its own list: the call propagates to
+    // nothing. (`acl::set_protected` always sets the protected flag, so the tool turns inheritance
+    // back on.)
+    let inherited = Command::new("icacls")
+        .arg(&paths.staging)
+        .arg("/inheritance:e")
+        .output()
+        .unwrap();
+    assert!(inherited.status.success(), "{inherited:?}");
     assert!(!summary_of(&paths.staging).protected);
+    let child = paths
+        .staging
+        .join(format!("policy-{}.xml", "cd".repeat(16)));
+    std::fs::write(&child, b"policy").unwrap();
+    let child_before = summary_of(&child);
     let mut holds = install::make_data_directory(&paths).unwrap();
     holds.directory(DataChild::Staging).unwrap();
     drop(holds);
     assert!(summary_of(&paths.staging).protected);
+    assert_eq!(
+        summary_of(&child),
+        child_before,
+        "protecting the directory on its handle changes nothing in it"
+    );
+    std::fs::remove_file(&child).unwrap();
 
     // A child that another account owns is refused, and its list is as it was.
     let name = format!("krowner{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
@@ -1359,8 +1380,14 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
     no_staging.save(&paths.manifest).unwrap();
     install::make_data_directory(&paths).expect("an empty directory needs no record");
     std::fs::write(paths.staging.join("leftover"), b"x").unwrap();
-    refused_with("no manifest records");
+    refused_with("leftover");
     std::fs::remove_file(paths.staging.join("leftover")).unwrap();
+    let named = paths
+        .staging
+        .join(format!("policy-{}.xml", "ef".repeat(16)));
+    std::fs::write(&named, b"x").unwrap();
+    refused_with("no manifest records");
+    std::fs::remove_file(&named).unwrap();
     std::fs::remove_file(&paths.manifest).unwrap();
     refused_with("no manifest records");
     std::fs::remove_file(&journal_file).unwrap();
@@ -1369,6 +1396,208 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
     }
     let _ = std::fs::remove_file(paths.data.join("manifest.new"));
     install::make_data_directory(&paths).expect("an empty directory needs no manifest");
+
+    // An empty directory with the accepted list is one a new installation takes as it is: the
+    // refusal's own remedy can be done.
+    assert!(
+        matches!(install::entry(&paths), Ok(install::Entry::Fresh)),
+        "an empty data directory that passed its check is a fresh installation's"
+    );
+
+    // A directory that separates names that differ only by case is refused: the listing and the
+    // checks take such names for one.
+    let flagged = Command::new("fsutil")
+        .args(["file", "setCaseSensitiveInfo"])
+        .arg(&paths.data)
+        .arg("enable")
+        .output()
+        .unwrap();
+    assert!(
+        flagged.status.success(),
+        "the guest cannot make a directory case-sensitive: {flagged:?}"
+    );
+    refused_with("differ only by case");
+    let _ = Command::new("fsutil")
+        .args(["file", "setCaseSensitiveInfo"])
+        .arg(&paths.data)
+        .arg("disable")
+        .output();
+    install::make_data_directory(&paths).expect("the flag is off");
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// Gives a file or a directory to another account, as the tool does for a person.
+#[cfg(feature = "testing")]
+fn give_to(path: &Path, who: &str) {
+    let done = Command::new("icacls")
+        .arg(path)
+        .args(["/setowner", who])
+        .output()
+        .unwrap();
+    assert!(done.status.success(), "{done:?}");
+}
+
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreign_is_not_touched() {
+    use kr_boundary_windows::win::fresh;
+    use kr_boundary_windows::win::sd::{Principals, SdKind};
+    let folder = inherited_folder();
+    acl::set_protected(&folder, &data_parent_descriptor()).unwrap();
+    let paths = paths_in(&folder);
+    installed_data_directory(&paths);
+    let refused_with = |words: &str| {
+        let refused = install::make_data_directory(&paths).expect_err("the directory is refused");
+        let text = refused.to_string();
+        assert!(text.contains(words), "{text}");
+        assert!(text.contains("Remove "), "{text}");
+        assert!(text.contains("stay where they are"), "{text}");
+    };
+
+    // What an installation's own run leaves is accepted: a policy file made new, and a scratch
+    // directory (readable by every account) with a file in it.
+    let (mut made, policy) =
+        fresh::named_file(&paths.staging, "policy", ".xml", SdKind::AdminFile).unwrap();
+    made.write_all(b"policy").unwrap();
+    drop(made);
+    let scratch = fresh::directory(
+        &paths.staging,
+        "proof",
+        SdKind::AdminDir,
+        &Principals {
+            users_may_read: true,
+            ..Principals::default()
+        },
+    )
+    .unwrap();
+    let inner = scratch.join("unlisted.exe");
+    std::fs::write(&inner, b"x").unwrap();
+    install::make_data_directory(&paths).expect("the remnants of an installation's own run");
+
+    // A file in staging that another account owns is refused before anything is written, and it is
+    // as it was: not rewritten, not given to anybody.
+    let name = format!("krowner{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
+    let owner = account::create(&name).unwrap();
+    give_to(&policy, &name);
+    let before = summary_of(&policy);
+    let shown = policy.file_name().unwrap().to_string_lossy().into_owned();
+    refused_with(&shown);
+    let refused = install::make_data_directory(&paths).expect_err("a file that is owned");
+    assert!(refused.to_string().contains(&owner.to_text()), "{refused}");
+    assert_eq!(std::fs::read(&policy).unwrap(), b"policy");
+    assert_eq!(summary_of(&policy), before);
+    give_to(&policy, "Administrators");
+
+    // The name an earlier build gave the policy file is not one the installation gives now.
+    let legacy = paths.staging.join("policy.xml");
+    std::fs::write(&legacy, b"x").unwrap();
+    refused_with("policy.xml");
+    std::fs::remove_file(&legacy).unwrap();
+
+    // A file with a second name, and a file that another account owns inside a scratch directory.
+    let second = paths
+        .staging
+        .join(format!("policy-{}.xml", "ab".repeat(16)));
+    std::fs::hard_link(&policy, &second).unwrap();
+    refused_with("more than one name");
+    std::fs::remove_file(&second).unwrap();
+    give_to(&inner, &name);
+    refused_with("unlisted.exe");
+    give_to(&inner, "Administrators");
+
+    // A directory in run that another account owns is refused, and one that the administrators own
+    // is a private root.
+    let root = paths.run.join("ab".repeat(16));
+    std::fs::create_dir(&root).unwrap();
+    give_to(&root, &name);
+    refused_with(&"ab".repeat(16));
+    give_to(&root, "Administrators");
+    install::make_data_directory(&paths).expect("a private root the administrators own");
+    std::fs::remove_dir(&root).unwrap();
+
+    // A link at a scratch directory's name is refused, and the tree it leads to keeps its list.
+    let target = inherited_folder();
+    let targets_list = summary_of(&target);
+    let junction = paths.staging.join(format!("proof-{}", "cd".repeat(16)));
+    let linked = Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(&junction)
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(linked.status.success(), "{linked:?}");
+    refused_with("it is a link");
+    assert_eq!(summary_of(&target), targets_list);
+    std::fs::remove_dir(&junction).unwrap();
+    install::make_data_directory(&paths).expect("the link is gone");
+
+    let _ = account::delete(&name);
+    let _ = std::fs::remove_dir_all(&target);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_file_that_another_program_reads_by_path_is_made_new_and_owned_by_the_administrators() {
+    use kr_boundary_windows::win::fresh;
+    use kr_boundary_windows::win::sd::{Principals, SdKind};
+    const SYSTEM: &str = "S-1-5-18";
+    const ADMINISTRATORS: &str = "S-1-5-32-544";
+    const USERS: &str = "S-1-5-32-545";
+    let sids = |summary: &kr_boundary_windows::win::sd::Summary| -> Vec<String> {
+        summary
+            .entries
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.sid.clone())
+            .collect()
+    };
+    let folder = inherited_folder();
+
+    // The file's owner, its protected flag and its two entries are those of the creating call.
+    let (mut file, path) = fresh::named_file(&folder, "policy", ".xml", SdKind::AdminFile).unwrap();
+    file.write_all(b"policy").unwrap();
+    drop(file);
+    let made = summary_of(&path);
+    assert_eq!(made.owner, ADMINISTRATORS);
+    assert!(made.protected);
+    assert_eq!(sids(&made), [SYSTEM, ADMINISTRATORS]);
+
+    // Anything at the name stops the call, and what is there is as it was.
+    let again = fresh::file_at(&path, SdKind::AdminFile, true).expect_err("the name is taken");
+    assert_eq!(again.kind(), std::io::ErrorKind::AlreadyExists, "{again}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"policy");
+    let target = folder.join("target.txt");
+    std::fs::write(&target, b"x").unwrap();
+    let link = folder.join("linked.xml");
+    let linked = Command::new("cmd")
+        .args(["/c", "mklink"])
+        .arg(&link)
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(linked.status.success(), "{linked:?}");
+    fresh::file_at(&link, SdKind::AdminFile, true).expect_err("a link at the name is not followed");
+    assert_eq!(std::fs::read(&target).unwrap(), b"x");
+
+    // A directory is made with the same owner and its own list in the call.
+    let directory = fresh::directory(
+        &folder,
+        "proof",
+        SdKind::AdminDir,
+        &Principals {
+            users_may_read: true,
+            ..Principals::default()
+        },
+    )
+    .unwrap();
+    let scratch = summary_of(&directory);
+    assert_eq!(scratch.owner, ADMINISTRATORS);
+    assert!(scratch.protected);
+    assert_eq!(sids(&scratch), [SYSTEM, ADMINISTRATORS, USERS]);
     let _ = std::fs::remove_dir_all(&folder);
 }
 
@@ -1708,7 +1937,9 @@ fn an_answer_that_does_not_come_by_the_deadline_is_not_waited_for() {
     let text = refused.expect_err("nothing answered").to_string();
     assert!(text.contains("deadline"), "{text}");
     assert!(
-        elapsed >= bound && elapsed < bound + std::time::Duration::from_secs(5),
+        // The wait is in whole milliseconds, rounded down: a millisecond of slack at the bottom.
+        elapsed + std::time::Duration::from_millis(5) >= bound
+            && elapsed < bound + std::time::Duration::from_secs(5),
         "the wait ended at the deadline: {elapsed:?}"
     );
 }
