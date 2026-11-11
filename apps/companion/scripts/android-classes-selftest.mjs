@@ -25,6 +25,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, wr
 import { tmpdir } from 'node:os'
 import { deflateRawSync } from 'node:zlib'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 import { dex, elf, zip } from './archive-fixtures.mjs'
 import { libraryClassNames } from './android-native-names.mjs'
@@ -1657,26 +1658,21 @@ held(
   ]) {
     held(`\`pnpm ios ${argv.join(' ')}\` is refused, since it would open Xcode.app`, 'true', String(refused(argv)))
   }
-  // Started by a path that holds a symbolic link, the wrapper still runs, and so still refuses: the
-  // command line tool is never started by this case.
-  const link = join(work, 'scripts-link')
-  symlinkSync(import.meta.dirname, link)
-  const started = spawnSync(process.execPath, [join(link, 'ios.mjs'), 'dev'], { encoding: 'utf8' })
-  held(
-    'the wrapper started through a symbolic link still runs, and refuses a command that is not the build',
-    '2 true',
-    `${started.status} ${started.stderr.includes('pnpm ios runs')}`
-  )
 }
 
-// Every file that runs as a command takes the same path to its work whether it is started by its real
-// path or through a link (`/tmp` and `/var` are links on macOS): a start through a link that did
-// nothing and ended 0 would pass a store run that checked nothing. The inputs are ones each refuses.
+// Every file that runs as a command takes the same path to its work however it is started: by its real
+// path, through a link (`/tmp` and `/var` are links on macOS), and through a link under Node's
+// `--preserve-symlinks-main`, which keeps the link in the module's own name, given as the flag or by
+// `NODE_OPTIONS`. A start that did nothing and ended 0 would pass a store run that checked nothing.
+// The inputs are ones each refuses, and the wrapper refuses a command that is not the build.
+const COMMANDS = ['ios', 'sign-ios', 'store-ios-sign', 'android-classes', 'identifiers', 'privacy-manifest', 'store-bundle']
 {
   const link = join(work, 'entry-link')
   symlinkSync(import.meta.dirname, link)
   const missing = join(work, 'no-such-package')
+  const preserved = [process.env.NODE_OPTIONS, '--preserve-symlinks-main'].filter(Boolean).join(' ')
   for (const [file, args] of [
+    ['ios.mjs', ['dev']],
     ['sign-ios.mjs', ['--no-such-mode']],
     ['store-ios-sign.mjs', []],
     ['android-classes.mjs', [`${missing}.apk`]],
@@ -1684,15 +1680,49 @@ held(
     ['privacy-manifest.mjs', [`${missing}.app`]],
     ['store-bundle.mjs', ['--no-such-mode']]
   ]) {
-    const byReal = spawnSync(process.execPath, [join(import.meta.dirname, file), ...args], { encoding: 'utf8' })
-    const byLink = spawnSync(process.execPath, [join(link, file), ...args], { encoding: 'utf8' })
+    const start = (directory, { flags = [], env = process.env } = {}) => {
+      const run = spawnSync(process.execPath, [...flags, join(directory, file), ...args], { encoding: 'utf8', env })
+      return { status: run.status, answer: `${run.status}|${run.stderr}` }
+    }
+    const byReal = start(import.meta.dirname)
     held(`${file} refuses this input when started by its real path`, 'true', String(byReal.status !== 0))
-    held(
-      `${file} started through a link answers as it does by its real path`,
-      `${byReal.status}|${byReal.stderr}`,
-      `${byLink.status}|${byLink.stderr}`
-    )
+    for (const [how, started] of [
+      ['through a link', start(link)],
+      ['through a link under --preserve-symlinks-main', start(link, { flags: ['--preserve-symlinks-main'] })],
+      ['through a link under NODE_OPTIONS=--preserve-symlinks-main', start(link, { env: { ...process.env, NODE_OPTIONS: preserved } })]
+    ]) {
+      held(`${file} started ${how} answers as it does by its real path`, byReal.answer, started.answer)
+    }
   }
+}
+
+// A process whose program is no file (read from standard input, or given with `-e`) has no entry file:
+// no module is the command there, and importing the command files is no error. A path that names no
+// file stays an error, since a command started by it that did nothing would end 0 as though it ran.
+{
+  const program =
+    COMMANDS.map((name) => `await import(${JSON.stringify(pathToFileURL(join(import.meta.dirname, `${name}.mjs`)).href)})`).join(
+      '\n'
+    ) + '\nconsole.log("imported")'
+  const run = (args, input = undefined) =>
+    spawnSync(process.execPath, ['--input-type=module', ...args], { encoding: 'utf8', input })
+  const answer = (done) => `${done.status}|${done.stdout}|${done.stderr}`
+  held(
+    'every command file is imported without error by a program read from standard input',
+    '0|imported\n|',
+    answer(run(['-'], program))
+  )
+  held(
+    'every command file is imported without error by a program given with -e and no path',
+    '0|imported\n|',
+    answer(run(['-e', program]))
+  )
+  const none = run(['-e', program, join(work, 'no-such-file')])
+  held(
+    'a program started with a path that names no file fails, and names the path',
+    'true true',
+    `${none.status !== 0} ${none.stderr.includes(join(work, 'no-such-file'))}`
+  )
 }
 
 // -- the rule files the Rust build writes --------------------------------------------------------
