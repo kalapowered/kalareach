@@ -2139,12 +2139,15 @@ mod root_tests {
             format!("{program} --reservation {reservation} --session s")
         };
         let (own, foreign, unclear, gone) = (uuid(1), uuid(2), uuid(3), uuid(4));
+        // A job whose program has this run's worker's name and lies in another installation.
+        let lookalike = uuid(6);
         run.propose_jobs_from(
             [
                 line(&worker, &own),
                 line(&worker, &foreign),
                 line(&worker, &unclear),
                 line(&worker, &gone),
+                line(&worker, &lookalike),
                 line(&worker, "not-a-uuid"),
                 line(&worker, "ABCDEF01-0000-4000-8000-000000000001"),
                 line("/usr/bin/other", &uuid(5)),
@@ -2153,7 +2156,7 @@ mod root_tests {
             .iter()
             .map(String::as_str),
         );
-        let labels: Vec<String> = [&own, &foreign, &unclear, &gone]
+        let labels: Vec<String> = [&own, &foreign, &unclear, &gone, &lookalike]
             .iter()
             .map(|id| format!("kr-worker-{id}"))
             .collect();
@@ -2191,6 +2194,11 @@ mod root_tests {
                 answer(0, printed(target, &worker))
             } else if target.ends_with(&foreign) {
                 answer(0, printed(target, "/usr/bin/the-persons-own-program"))
+            } else if target.ends_with(&lookalike) {
+                answer(
+                    0,
+                    printed(target, "/private/tmp/another-installation/b/kr-worker"),
+                )
             } else {
                 answer(5, String::new())
             }
@@ -2199,7 +2207,13 @@ mod root_tests {
         assert_eq!(held.verified, [format!("gui/{uid}/kr-worker-{own}")]);
         assert_eq!(held.unclear.len(), 1, "{:?}", held.unclear);
         assert!(held.unclear[0].contains(&unclear), "{:?}", held.unclear);
-        assert_eq!(run.jobs_left_alone(), [format!("kr-worker-{foreign}")]);
+        assert_eq!(
+            run.jobs_left_alone(),
+            [
+                format!("kr-worker-{foreign}"),
+                format!("kr-worker-{lookalike}")
+            ]
+        );
         let mut asked_again: Vec<String> = Vec::new();
         run.remove_jobs_asking(&mut |arguments| {
             asked_again.push(arguments.join(" "));
@@ -2211,7 +2225,9 @@ mod root_tests {
             .collect();
         assert_eq!(bootouts, [&format!("bootout gui/{uid}/kr-worker-{own}")]);
         assert!(
-            asked_again.iter().all(|line| !line.contains(&foreign)),
+            asked_again
+                .iter()
+                .all(|line| !line.contains(&foreign) && !line.contains(&lookalike)),
             "a job left alone is not asked about again: {asked_again:?}"
         );
         std::fs::remove_dir_all(&root).expect("clean up");
