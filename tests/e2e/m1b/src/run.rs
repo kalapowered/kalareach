@@ -1156,15 +1156,18 @@ pub fn socket_below(
     Ok(walk_below(root, pin, relative, &mut |_| {}, true)?.map(|(_, identity)| identity))
 }
 
-/// The walk of [`open_file_below`] and [`socket_below`]: the file opened (a regular file with one
-/// name; none for a socket) and its device and inode.
+/// What [`walk_below`] found: the file opened (a regular file with one name; none for a socket) and
+/// its device and inode, or nothing where the path is not there.
+type Walked = Option<(Option<std::os::fd::OwnedFd>, (i128, i128))>;
+
+/// The walk of [`open_file_below`] and [`socket_below`].
 fn walk_below(
     root: &Path,
     pin: &RootPin,
     relative: &Path,
     before_look: &mut dyn FnMut(&[u8]),
     socket: bool,
-) -> Result<Option<(Option<std::os::fd::OwnedFd>, (i128, i128))>, Refusal> {
+) -> Result<Walked, Refusal> {
     use rustix::fs::{FileType, Mode, OFlags};
     let mut directory = open_directory(root).map_err(|error| match error {
         rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => Refusal::RootChanged,
