@@ -1211,31 +1211,65 @@ pub fn launch(
     }
 }
 
-/// The staged parts start only the test's own stand-in: the program a launch must run (`expected`)
-/// is checked to be this build's `agent-stand-in` by its digest, before anything is typed or
-/// started. A part's live route, with the pinned build and its login, is closed until the parts'
-/// own round, since the parts run `kr` after the agent has started, in a run's state that the agent
-/// can change.
+/// The staged parts start only the test's own stand-in: the program a part runs is checked to be
+/// this build's `agent-stand-in`, by the bytes of the file the typed command resolves to and not by
+/// the digest the build's description states. A part's live route, with the pinned build and its
+/// login, is closed until the parts' own round, since the parts run `kr` after the agent has
+/// started, in a run's state that the agent can change. Every part passes this check before it
+/// starts its first program ([`closed_for_all_but_the_stand_in`]).
+///
+/// The description's digest must name the stand-in, the launch must be a native one, `command` in
+/// the installed build's `bin` must resolve to the file the description pins, and that file's own
+/// digest, read now, must be the stand-in's.
 ///
 /// # Errors
 ///
 /// Returns the refusal, which says that nothing was started.
-pub fn closed_route(expected: &Expected, stand_in: &Path) -> Result<(), String> {
-    let digest = std::fs::read(stand_in).map(|bytes| {
-        kr_cbor::sha256(&bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    });
-    if digest.is_ok_and(|digest| digest == expected.sha256) {
-        Ok(())
-    } else {
-        Err(
-            "the staged parts' live route is closed until their own round: the program this launch \
-             must run is not the test's own stand-in, so nothing was started"
-                .to_owned(),
-        )
+pub fn closed_route(expected: &Expected, command: &str, stand_in: &Path) -> Result<(), String> {
+    let digest_of = |path: &Path| {
+        std::fs::read(path).map(|bytes| {
+            kr_cbor::sha256(&bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        })
+    };
+    let refused = |why: &str| {
+        Err(format!(
+            "the staged parts' live route is closed until their own round: {why}, so nothing was \
+             started"
+        ))
+    };
+    if !digest_of(stand_in).is_ok_and(|digest| digest == expected.sha256) {
+        return refused("the program this launch must run is not the test's own stand-in");
     }
+    if expected.launch != crate::build::Launch::Native
+        || std::fs::canonicalize(expected.prefix.join("bin").join(command))
+            .ok()
+            .as_deref()
+            != Some(expected.file.as_path())
+    {
+        return refused("the command this launch types does not run the file the build pins");
+    }
+    if !digest_of(&expected.file).is_ok_and(|digest| digest == expected.sha256) {
+        return refused("the file this launch runs is not the test's own stand-in");
+    }
+    Ok(())
+}
+
+/// The check every staged part passes before it starts its first program, a probe of the build, a
+/// session or the agent: the build the part is given must be this crate's own stand-in
+/// ([`closed_route`]).
+///
+/// # Errors
+///
+/// Returns the refusal, which says that nothing was started.
+pub fn closed_for_all_but_the_stand_in(build: &crate::build::Build) -> Result<(), String> {
+    closed_route(
+        &Expected::pinned(build),
+        &build.command,
+        &built_directory().join("agent-stand-in"),
+    )
 }
 
 /// An agent's start that reached no first screen because the agent refused to run.
@@ -1280,9 +1314,6 @@ pub fn launch_or_refusal(
     expected: &Expected,
     between: &dyn Fn(),
 ) -> std::result::Result<Vec<AgentProcess>, Refused> {
-    // The first statement: nothing is typed or started for a program that is not the stand-in.
-    closed_route(expected, &built_directory().join("agent-stand-in"))
-        .unwrap_or_else(|why| panic!("{why}"));
     assert!(
         !session
             .window
@@ -1899,32 +1930,62 @@ mod tests {
     use crate::provenance::exported_clear;
 
     /// A part asked for a program that is not the test's own stand-in is refused, with the closed
-    /// route named and nothing started; the stand-in itself is let through, and a stand-in file that
-    /// is not there refuses too.
+    /// route named and nothing started; the stand-in itself is let through, a stand-in file that is
+    /// not there refuses too, and so does a description that states the stand-in's digest over
+    /// another file, or whose command resolves to another file than the one it pins.
     #[test]
     fn a_part_asked_for_the_pinned_build_is_refused_before_anything_is_started() {
         let base = std::fs::canonicalize(std::env::temp_dir())
             .expect("the temporary directory")
             .join(format!("kr-closed-{}", kr_ipc::new_uuid()));
-        std::fs::create_dir_all(&base).expect("a scratch directory");
+        std::fs::create_dir_all(base.join("bin")).expect("a scratch directory");
         let stand_in = base.join("agent-stand-in");
         std::fs::write(&stand_in, b"the stand-in").expect("a stand-in");
+        let installed = base.join("bin/codex");
+        std::fs::write(&installed, b"the stand-in").expect("the installed build");
+        let other = base.join("other");
+        std::fs::write(&other, b"another build").expect("another build");
         let digest: String = kr_cbor::sha256(b"the stand-in")
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        let expected = |sha256: &str| Expected {
-            file: stand_in.clone(),
+        let expected = |sha256: &str, file: &Path| Expected {
+            file: file.to_path_buf(),
             sha256: sha256.to_owned(),
             launch: crate::build::Launch::Native,
             prefix: base.clone(),
         };
-        closed_route(&expected(&digest), &stand_in).expect("the stand-in is let through");
-        let said = closed_route(&expected(&"0".repeat(64)), &stand_in)
+        closed_route(&expected(&digest, &installed), "codex", &stand_in)
+            .expect("the stand-in is let through");
+        let said = closed_route(&expected(&"0".repeat(64), &installed), "codex", &stand_in)
             .expect_err("the pinned build is refused");
         assert!(said.contains("live route is closed"), "{said}");
         assert!(said.contains("nothing was started"), "{said}");
-        assert!(closed_route(&expected(&digest), &base.join("missing")).is_err());
+        assert!(
+            closed_route(
+                &expected(&digest, &installed),
+                "codex",
+                &base.join("missing")
+            )
+            .is_err()
+        );
+        // The description states the stand-in's digest, and the file it pins is another file.
+        let said = closed_route(&expected(&digest, &other), "codex", &stand_in)
+            .expect_err("a digest stated over another file is refused");
+        assert!(
+            said.contains("does not run the file the build pins"),
+            "{said}"
+        );
+        // The installed command resolves to another file than the one pinned, though both are named.
+        std::fs::remove_file(&installed).expect("the installed build goes");
+        std::os::unix::fs::symlink(&other, &installed).expect("a link to another build");
+        let said = closed_route(&expected(&digest, &installed), "codex", &stand_in)
+            .expect_err("a command that resolves to another file is refused");
+        assert!(said.contains("live route is closed"), "{said}");
+        // The pinned file is the one the command resolves to, and its bytes are not the stand-in's.
+        let said = closed_route(&expected(&digest, &other), "codex", &stand_in)
+            .expect_err("a file that is not the stand-in is refused");
+        assert!(said.contains("live route is closed"), "{said}");
         std::fs::remove_dir_all(&base).expect("clean up");
     }
 
