@@ -1555,7 +1555,16 @@ fn a_folder_above_the_program_directory_that_others_can_change_or_that_is_a_link
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_installation_takes_the_system_folders_from_the_system_and_not_from_the_environment() {
-    let names = ["ProgramFiles", "ProgramData", "SystemRoot", "windir"];
+    let names = [
+        "ProgramFiles",
+        "ProgramData",
+        "SystemRoot",
+        "windir",
+        // The system's folders may be stored as text that names these, and expanded from the
+        // environment of the process that asks.
+        "SystemDrive",
+        "ALLUSERSPROFILE",
+    ];
     let before = Paths::system();
     let saved: Vec<_> = names
         .iter()
@@ -1587,6 +1596,47 @@ fn the_installation_takes_the_system_folders_from_the_system_and_not_from_the_en
         !root.unwrap().starts_with(r"C:\Planted"),
         "the Windows directory is the platform's"
     );
+}
+
+/// Git is started by the elevated installer with an emptied environment: a trace variable of the
+/// session that started the installer, which names a file for Git to make or append to, makes no
+/// file. The control starts the same Git with the variable and shows that it does make the file.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn git_started_by_the_installer_sees_no_variable_of_the_session_that_started_it() {
+    let names = ["GIT_TRACE2_EVENT", "GIT_TRACE2", "GIT_TRACE"];
+    let trace = std::env::temp_dir().join(format!(
+        "krtrace-{}.txt",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ));
+    let git = Path::new(r"C:\Program Files\Git")
+        .join("mingw64")
+        .join("bin")
+        .join("git.exe");
+    let control = Command::new(&git)
+        .arg("--version")
+        .env("GIT_TRACE2_EVENT", &trace)
+        .output()
+        .unwrap();
+    assert!(control.status.success(), "{control:?}");
+    assert!(trace.exists(), "Git makes the file that the variable names");
+    std::fs::remove_file(&trace).unwrap();
+    for name in names {
+        // SAFETY: the guest's cases run on one test thread, and the variables are removed below.
+        unsafe { std::env::set_var(name, &trace) };
+    }
+    let qualified = install::qualify_git();
+    for name in names {
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(name) };
+    }
+    let made = trace.exists();
+    let _ = std::fs::remove_file(&trace);
+    assert!(
+        !made,
+        "the installer's Git made the file that the session named"
+    );
+    qualified.expect("Git is qualified");
 }
 
 /// With no manifest there is no installation whose records a leftover could be: a refusal of what

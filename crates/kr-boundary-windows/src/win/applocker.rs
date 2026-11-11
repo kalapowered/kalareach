@@ -80,6 +80,45 @@ fn system_root() -> PathBuf {
         .map_or_else(|_| PathBuf::from(r"C:\Windows"), PathBuf::from)
 }
 
+/// The drive the system's Windows directory is on, as the system gives it (`C:`), and not a fixed
+/// text.
+fn system_drive(root: &Path) -> std::ffi::OsString {
+    match root.components().next() {
+        Some(std::path::Component::Prefix(prefix)) => prefix.as_os_str().to_owned(),
+        _ => std::ffi::OsString::from("C:"),
+    }
+}
+
+/// A command for a program that the installer starts. Its environment is emptied and holds only
+/// values that the system gives (its Windows directory, the drive that directory is on, and the
+/// path to its own programs), so a variable of the session that started the installer reaches no
+/// program the installer runs elevated: a Git trace variable, for one, names a file that the
+/// program would make or append to with the installer's rights. Its working directory is the
+/// system's own program directory, which only the system and the administrators can change.
+pub(super) fn trusted_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let root = system_root();
+    let system32 = root.join("System32");
+    let mut command = Command::new(program);
+    command
+        .env_clear()
+        .env("SystemRoot", &root)
+        .env("windir", &root)
+        .env("SystemDrive", system_drive(&root))
+        .env("PATH", &system32)
+        .current_dir(&system32);
+    command
+}
+
+/// The directory of the modules that ship with Windows PowerShell, the only place it is told to load
+/// modules from.
+fn powershell_modules() -> PathBuf {
+    system_root()
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("Modules")
+}
+
 /// Runs PowerShell, the installation's channel, and returns what it wrote.
 fn run(
     program: &Path,
@@ -87,23 +126,13 @@ fn run(
     scratch: &Path,
     what: &'static str,
 ) -> Result<String, Error> {
-    let root = system_root();
-    let system32 = root.join("System32");
-    let powershell_modules = system32
-        .join("WindowsPowerShell")
-        .join("v1.0")
-        .join("Modules");
+    let powershell_modules = powershell_modules();
     // PowerShell's temporary directory and working directory are a new directory of its own, made
     // with its descriptor, and removed when the run ends: nothing it leaves is ever in the staging
     // directory itself.
     let shell = ShellDirectory::new(scratch).map_err(|source| Error::Start { what, source })?;
-    let output = Command::new(program)
+    let output = trusted_command(program)
         .args(arguments)
-        .env_clear()
-        .env("SystemRoot", &root)
-        .env("windir", &root)
-        .env("SystemDrive", "C:")
-        .env("PATH", &system32)
         .env("PSModulePath", &powershell_modules)
         .env("TEMP", &shell.0)
         .env("TMP", &shell.0)
@@ -169,15 +198,14 @@ impl Channel {
             .join("WindowsPowerShell")
             .join("v1.0")
             .join("powershell.exe");
-        let module = system_root()
-            .join("System32")
-            .join("WindowsPowerShell")
-            .join("v1.0")
-            .join("Modules")
-            .join("AppLocker")
-            .join("AppLocker.psd1");
+        let modules = powershell_modules();
+        let module = modules.join("AppLocker").join("AppLocker.psd1");
+        // PowerShell can add a module folder of the person's own to the module path when it
+        // starts; the path is set again to the system's own before any module is loaded, and the
+        // AppLocker module is loaded by its path.
         let script = format!(
-            "$ErrorActionPreference = 'Stop'; Import-Module -Name '{}'; {command}",
+            "$ErrorActionPreference = 'Stop'; $env:PSModulePath = '{}'; Import-Module -Name '{}'; {command}",
+            modules.display(),
             module.display()
         );
         run(

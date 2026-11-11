@@ -23,7 +23,7 @@ use std::io::{self, BufRead as _, Read as _, Write as _};
 use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest as _, Sha256};
@@ -1940,7 +1940,7 @@ fn refuse_smart_app_control() -> Result<(), Error> {
 fn refuse_code_integrity() -> Result<(), Error> {
     let root = ffi::system_windows_directory().unwrap_or_else(|_| r"C:\Windows".to_owned());
     let tool = Path::new(&root).join("System32").join("CiTool.exe");
-    let output = Command::new(&tool)
+    let output = applocker::trusted_command(&tool)
         .args(["--list-policies", "--json"])
         .stdin(Stdio::null())
         .output()
@@ -1980,8 +1980,14 @@ fn refuse_code_integrity() -> Result<(), Error> {
 }
 
 /// Finds Git where it installs for every account, refuses when anyone but the system's own class
-/// could change it, and records what the policy will name.
-fn qualify_git() -> Result<GitSet, Error> {
+/// could change it, and records what the policy will name. Git is started with an emptied
+/// environment and the system's own working directory.
+///
+/// # Errors
+///
+/// Returns [`Error::Refused`] when Git is not where the policy expects it, can be changed by
+/// others, or cannot be run.
+pub fn qualify_git() -> Result<GitSet, Error> {
     let dir = git_dir();
     let mut images = Vec::new();
     for relative in policy::git_images() {
@@ -2016,7 +2022,7 @@ fn qualify_git() -> Result<GitSet, Error> {
             sha256: hex::encode(Sha256::digest(&bytes)),
         });
     }
-    let output = Command::new(dir.join("mingw64").join("bin").join("git.exe"))
+    let output = applocker::trusted_command(dir.join("mingw64").join("bin").join("git.exe"))
         .arg("--version")
         .stdin(Stdio::null())
         .output()
