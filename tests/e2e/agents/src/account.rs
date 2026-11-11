@@ -2591,6 +2591,37 @@ mod tests {
         );
     }
 
+    /// A directory that lists more entries than the bound is refused when it is listed, before any
+    /// entry of it is looked at: none of its files is read, though each holds the key.
+    #[test]
+    fn a_directory_that_lists_more_entries_than_the_bound_is_refused_before_any_of_it_is_read() {
+        let scratch = Scratch::new("scan-wide");
+        let key = b"the-key-value-0123456789";
+        let run = scratch.0.join("run");
+        std::fs::create_dir_all(&run).expect("a run");
+        for file in 0..15 {
+            std::fs::write(run.join(format!("f{file}")), key).expect("a file that holds the key");
+        }
+        let limits = ScanLimits {
+            entries: 12,
+            ..ScanLimits::default()
+        };
+        let scan = scan_files_within(&run, &[key], Some(&rules_for(&run, &[])), limits);
+        assert!(!scan.complete());
+        assert!(
+            scan.unread
+                .iter()
+                .any(|entry| entry.contains("more entries than the scan reads")),
+            "{:?}",
+            scan.unread
+        );
+        assert!(
+            scan.held_by.is_empty(),
+            "no file was read: {:?}",
+            scan.held_by
+        );
+    }
+
     /// Two scans that share a budget of bytes read no more in all than it holds, and the entries of
     /// a scan are counted when they are listed, across all its levels.
     #[test]
