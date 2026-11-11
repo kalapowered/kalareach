@@ -43,7 +43,7 @@
 //! depend on that lease, because neither is remote dispatch.
 
 pub(crate) mod arrivals;
-mod chunks;
+pub(crate) mod chunks;
 pub mod clock_trust;
 pub mod config;
 mod device_errors;
@@ -66,7 +66,9 @@ use kr_crypto::connect::PairedPeer;
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::{SecretStore, StoreSelection};
 use kr_pairing::host::HostIdentity;
-use kr_protocol::ids::{ActorId, AuthorityRevision, ConnectionId, DeviceId, DeviceKeyRevision};
+use kr_protocol::ids::{
+    ActorId, AuthorityRevision, ConnectionId, DeviceId, DeviceKeyRevision, TransferId,
+};
 use kr_protocol::metrics::{MetricOutcome, Transport};
 use kr_protocol::pairing::NetworkConfig;
 use kr_protocol::scalars::EndpointKey;
@@ -443,6 +445,53 @@ impl Network {
         self.guard.host.revoke_device(device_id).await
     }
 
+    /// How many frames of a data stream have begun to wait for the gate of their transfer, as a
+    /// count a suite can wait on to know the one it is holding behind another has reached it.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn chunk_gate_waits(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.guard.host.chunks.gate_waits()
+    }
+
+    /// Holds the next frame of a data stream that has taken its transfer's gate, before it asks
+    /// whether its stream still stands. Returns the end that says the frame has arrived, and the end
+    /// that lets it go. The hold fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn hold_chunks_after_the_gate(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.guard.host.chunks.hold_after_the_gate()
+    }
+
+    /// Holds the next answer to a chunk, once the door has given it and before it is written to
+    /// the stream. Returns the end that says the answer has arrived, and the end that lets it go.
+    /// The hold fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn hold_chunks_after_they_are_answered(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.guard.host.chunks.hold_after_a_chunk_is_answered()
+    }
+
+    /// Resolves once no chunk of `transfer` is in the transfer service for `device`: the gate the
+    /// blocking call that has a chunk holds is free.
+    #[cfg(feature = "testing")]
+    pub async fn until_no_chunk_is_in_the_service(&self, device: DeviceId, transfer: TransferId) {
+        self.guard
+            .host
+            .chunks
+            .until_the_gate_is_free(&kr_transport::listener::device_principal(&device), transfer)
+            .await;
+    }
+
     /// Stops accepting connections and closes the endpoint.
     pub async fn shutdown(self) {
         self.guard.shutdown().await;
@@ -477,6 +526,9 @@ pub struct NetworkHost {
     endpoint_id: EndpointKey,
     /// How long each paired device is without a connection to this host.
     reconnects: reconnects::Reconnects,
+    /// The data streams devices send chunks on: which stream serves each transfer, the gate of
+    /// each, and the places of each device principal's lookups.
+    chunks: Arc<chunks::ChunkStreams>,
 }
 
 impl std::fmt::Debug for NetworkHost {
@@ -551,6 +603,8 @@ impl HostHandler for NetworkHost {
         // the lease is renewed meanwhile.
         if let Some(controller) = self.controller.upgrade() {
             tokio::spawn(async move {
+                #[cfg(feature = "testing")]
+                controller.before_a_connection_is_deregistered.wait().await;
                 controller.deregister(connection_id);
             });
         }
@@ -689,6 +743,7 @@ impl NetworkHost {
             clock,
             relay: None,
             watch: None,
+            chunks: None,
         };
         // The relay is its own task, because a subscription delivers whenever the session produces
         // output and the request loop below is usually waiting for the device rather than for the
@@ -713,6 +768,19 @@ impl NetworkHost {
         // The guard owns the relay's abort handle, so a handler the transport drops still stops it.
         // A detached relay would hold this connection and its controller for as long as it waited.
         guard.relay = Some(relay.abort_handle());
+        // The device's data streams are read from here, and not before: the connection has been
+        // admitted and its guard ends this task, so a stream the device opens earlier finds nobody
+        // reading it. They are read on a task of their own, never by this loop, which stays inside
+        // `serve_frame` for as long as a control request waits for its effect.
+        let door = Arc::new(chunks::ChunkDoor {
+            host: Arc::clone(&self),
+            remote: Arc::clone(&remote),
+            connection: session.connection.clone(),
+            device_id,
+            deadlines: Arc::clone(&session.deadlines),
+            clock: Arc::clone(&session.clock),
+        });
+        guard.chunks = Some(tokio::spawn(door.serve(session.data_streams)).abort_handle());
         // What the loop has read of the device's stream and not yet served, in the order sent: the
         // frames a key went ahead of that were read while a request was answered. `None` stands for
         // the end of the stream.
@@ -1434,6 +1502,8 @@ struct ConnectionGuard {
     relay: Option<tokio::task::AbortHandle>,
     /// Ends the connection when a grant it stands on ends ([`RemoteConnection::grant_ended`]).
     watch: Option<tokio::task::AbortHandle>,
+    /// Takes the connection's data streams. Ending it ends the task of every stream with it.
+    chunks: Option<tokio::task::AbortHandle>,
 }
 
 impl Drop for ConnectionGuard {
@@ -1443,6 +1513,9 @@ impl Drop for ConnectionGuard {
         }
         if let Some(watch) = self.watch.take() {
             watch.abort();
+        }
+        if let Some(chunks) = self.chunks.take() {
+            chunks.abort();
         }
         // The gap is recorded before the connection leaves the table of those being served, so a
         // reader that finds the table without it finds the gap begun.
@@ -1581,6 +1654,7 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         live: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         endpoint_id,
         reconnects: reconnects::Reconnects::new(Arc::clone(controller.metrics())),
+        chunks: Arc::default(),
     });
     // The record of the wall clock moves while this host runs, whether or not anything asks it a
     // question. A mark that only advanced when a device connected would stand still through a
@@ -1638,6 +1712,9 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
     config.accepted_kinds = chunks::ACCEPTED_STREAMS.to_vec();
     if let Some(validity) = setup.settings.action_window_validity {
         config.action_window_validity = validity.min(kr_transport::window::MAX_WINDOW_VALIDITY);
+    }
+    if let Some(deadlines) = setup.settings.data_stream_deadlines.clone() {
+        config.deadlines = deadlines;
     }
     let listener = kr_transport::listener::register_with_clock(
         config,
