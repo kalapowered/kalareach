@@ -2694,7 +2694,10 @@ fn shell_quoted(text: &str) -> String {
 /// `KR_HOLD_MOUSE_AGAIN=1` it turns them on again after every byte it reads, so that a click can be
 /// shown to pass through the attachment whatever the attachment did with the modes it was given.
 /// With `KR_HOLD_MOUSE=off` it never turns them on, so that a terminal's own handling of a link and
-/// of the mouse is what a person shows. Under the link line the application writes the plain text
+/// of the mouse is what a person shows. With `KR_HOLD_MODES` set to private modes with their final
+/// letter, such as `1006h 1005h`, it turns the mouse reporting on (`1000h`) and then writes those
+/// modes, in that order, instead of the default three, so that the encoding of a click can be shown
+/// for the sequence an application chose. Under the link line the application writes the plain text
 /// address `https://example.invalid/kr-plain`, which a terminal that detects addresses itself offers
 /// to open, so that the two ways a terminal can offer a link are shown beside each other.
 ///
@@ -2736,9 +2739,22 @@ async fn a_session_is_held_for_a_person_at_a_terminal() {
 
     let mouse_off = std::env::var("KR_HOLD_MOUSE").as_deref() == Ok("off");
     let modes = if mouse_off {
-        "true"
+        "true".to_owned()
+    } else if let Ok(sequence) = std::env::var("KR_HOLD_MODES") {
+        let mut written = String::from("\\033[?1000h");
+        for mode in sequence.split_whitespace() {
+            let (number, letter) = mode.split_at(mode.len() - 1);
+            assert!(
+                !number.is_empty()
+                    && number.bytes().all(|byte| byte.is_ascii_digit())
+                    && matches!(letter, "h" | "l"),
+                "KR_HOLD_MODES lists private modes with their final letter, such as `1006h 1005h`: {mode}"
+            );
+            written.push_str(&format!("\\033[?{mode}"));
+        }
+        format!("printf '{written}'")
     } else {
-        "printf '\\033[?1000h\\033[?1002h\\033[?1006h'"
+        "printf '\\033[?1000h\\033[?1002h\\033[?1006h'".to_owned()
     };
     let again = if std::env::var("KR_HOLD_MOUSE_AGAIN").as_deref() == Ok("1") {
         format!("{modes}; ")
