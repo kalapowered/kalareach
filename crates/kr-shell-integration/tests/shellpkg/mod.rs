@@ -117,6 +117,67 @@ fn wait_until_ready(stream: &impl AsFd, flags: PollFlags, within: Duration) {
     }
 }
 
+/// Whether `error` is what an operation on the endpoint answers once the shell has gone.
+///
+/// A shell that ends takes its side of the endpoint with it, and the system says so in more than
+/// one form. A write to the closed stream is refused as a broken pipe; a reset is the same state
+/// reported as one the shell ended with data of ours unread. macOS can also answer "not
+/// connected": a write that meets the close while it is being made gets it, and so does every
+/// shutdown of a stream whose peer has closed. This is the one place that lists the forms, for
+/// every read, write and shutdown on the endpoint, so that none of them takes a form the others
+/// know as a fault of the harness.
+fn peer_has_gone(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::NotConnected
+    )
+}
+
+/// Writes all of `bytes` to the endpoint, waiting for room in it until `deadline`.
+///
+/// Says [`Delivery::PeerGone`] when the shell's side has gone, in whatever form the system reports
+/// it ([`peer_has_gone`]), and [`Stalled`] when the endpoint took nothing more by `deadline`.
+///
+/// # Panics
+///
+/// Panics on an error that is not the peer's going: that is a fault of the harness or the system.
+fn send_to_bridge<S: Write + AsFd>(
+    stream: &mut S,
+    bytes: &[u8],
+    deadline: Instant,
+) -> Result<Delivery, Stalled> {
+    let mut written = 0;
+    while written < bytes.len() {
+        match stream.write(&bytes[written..]) {
+            Ok(0) => return Ok(Delivery::PeerGone),
+            Ok(count) => written += count,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(Stalled);
+                }
+                wait_until_ready(&*stream, PollFlags::OUT, left);
+            }
+            Err(error) if peer_has_gone(&error) => return Ok(Delivery::PeerGone),
+            Err(error) => panic!("writing to the bridge: {error}"),
+        }
+    }
+    Ok(Delivery::Delivered)
+}
+
+/// Ends both directions of the endpoint, as a worker that has gone does. An endpoint whose shell
+/// has already gone is ended already.
+///
+/// # Panics
+///
+/// Panics on an error that is not the peer's going.
+fn shut_the_endpoint(stream: &UnixStream) {
+    match stream.shutdown(std::net::Shutdown::Both) {
+        Err(error) if !peer_has_gone(&error) => panic!("the endpoint closes: {error}"),
+        Ok(()) | Err(_) => {}
+    }
+}
+
 /// How long the step given to an editor that only reaches its queue when the reader steps lasts.
 pub const STEP: Duration = Duration::from_millis(60);
 
@@ -1692,32 +1753,9 @@ impl Session {
             );
             bytes.extend_from_slice(&body);
         }
-        let mut written = 0;
-        while written < bytes.len() {
-            match self.stream.write(&bytes[written..]) {
-                Ok(0) => {
-                    self.peer_write_gone = true;
-                    return Ok(Delivery::PeerGone);
-                }
-                Ok(count) => written += count,
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    if left.is_zero() {
-                        return Err(Stalled);
-                    }
-                    wait_until_ready(&self.stream, PollFlags::OUT, left);
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
-                    ) =>
-                {
-                    self.peer_write_gone = true;
-                    return Ok(Delivery::PeerGone);
-                }
-                Err(error) => panic!("writing to the bridge: {error}"),
-            }
+        if send_to_bridge(&mut self.stream, &bytes, deadline)? == Delivery::PeerGone {
+            self.peer_write_gone = true;
+            return Ok(Delivery::PeerGone);
         }
         // An editor that reaches its own queue only when the reader steps is given that step here,
         // which is the one a person at the keyboard gives it by typing at all.
@@ -1771,14 +1809,7 @@ impl Session {
                     }
                     wait_until_ready(&self.stream, PollFlags::IN, left);
                 }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
-                    ) =>
-                {
-                    self.peer_read_gone = true;
-                }
+                Err(error) if peer_has_gone(&error) => self.peer_read_gone = true,
                 Err(error) => panic!("reading from the bridge: {error}"),
             }
         }
@@ -2903,9 +2934,7 @@ impl Session {
     /// Nothing is written or read afterwards: the worker is gone, and what the shell does from
     /// here is what it does on its own.
     pub fn close_endpoint(&mut self) {
-        self.stream
-            .shutdown(std::net::Shutdown::Both)
-            .expect("the endpoint closes");
+        shut_the_endpoint(&self.stream);
         self.shut = true;
     }
 }
@@ -3592,6 +3621,86 @@ fn a_terminal_that_stopped_reading_ends_a_write_at_its_deadline() {
     // The terminal takes input again, and the writer's thread ends with the session that started
     // it rather than outliving this test.
     drop(taking);
+}
+
+/// A stream whose every write fails with one error, for the forms of a gone peer that a real
+/// socket gives only while the peer is closing, or only on some platforms.
+struct FailsWith {
+    error: rustix::io::Errno,
+    /// What the harness waits on for room; a failing write is never waited on.
+    endpoint: UnixStream,
+}
+
+impl Write for FailsWith {
+    fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+        Err(self.error.into())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl AsFd for FailsWith {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.endpoint.as_fd()
+    }
+}
+
+/// A write to an endpoint whose shell has gone says so, whatever form the platform gives it.
+///
+/// A shell ends when a case sends it its own end of file, and the harness's next write to the
+/// endpoint then meets the close. Linux answers a broken pipe, or a reset when data of ours was
+/// unread. macOS answers a broken pipe too, and "not connected" in the instant the close is being
+/// made, which is the form a hosted macOS runner showed. Each is the shell's going, which the case
+/// that expected it takes as its result, and none is a fault of the harness.
+#[test]
+fn a_write_to_an_endpoint_whose_shell_has_gone_says_so_in_every_form_of_it() {
+    use rustix::io::Errno;
+
+    let (endpoint, _shell) = UnixStream::pair().expect("a pair of connected streams");
+    for error in [Errno::PIPE, Errno::CONNRESET, Errno::NOTCONN] {
+        let mut stream = FailsWith {
+            error,
+            endpoint: endpoint
+                .try_clone()
+                .expect("a second handle to the endpoint"),
+        };
+        let delivery = send_to_bridge(&mut stream, b"kr", Instant::now() + REPLY);
+        assert_eq!(
+            delivery,
+            Ok(Delivery::PeerGone),
+            "a write answered {error} was not taken as the shell having gone"
+        );
+    }
+}
+
+/// A write to a stream whose peer has really closed says so on the platform the case runs on, and
+/// so does ending the endpoint, which macOS refuses as "not connected" every time.
+#[test]
+fn an_endpoint_whose_peer_has_closed_takes_a_write_and_its_own_end_as_the_peers_going() {
+    let (mut endpoint, shell) = UnixStream::pair().expect("a pair of connected streams");
+    endpoint
+        .set_nonblocking(true)
+        .expect("a non-blocking endpoint");
+    drop(shell);
+    assert_eq!(
+        send_to_bridge(&mut endpoint, b"kr", Instant::now() + REPLY),
+        Ok(Delivery::PeerGone)
+    );
+    shut_the_endpoint(&endpoint);
+}
+
+/// An error that is not the peer's going stays a fault of the harness, whatever else is taken.
+#[test]
+#[should_panic(expected = "writing to the bridge")]
+fn a_write_that_fails_for_another_reason_is_not_taken_as_the_shell_having_gone() {
+    let (endpoint, _shell) = UnixStream::pair().expect("a pair of connected streams");
+    let mut stream = FailsWith {
+        error: rustix::io::Errno::INVAL,
+        endpoint,
+    };
+    let _ = send_to_bridge(&mut stream, b"kr", Instant::now() + REPLY);
 }
 
 /// An endpoint whose path is not text is refused by name, rather than told to the shell as a
