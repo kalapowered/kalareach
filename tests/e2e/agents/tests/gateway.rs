@@ -2285,6 +2285,15 @@ fn ends(
                          nothing, and no further case is to be started on it"
                     ),
                 )),
+                Audit::Incomplete(why) => stops.push((
+                    "turn_audit_incomplete",
+                    format!(
+                        "the turns in the agent's record were not counted, and the case's charge \
+                         cannot be checked against them: {why}. Nothing of the record was read \
+                         beyond the bound, and the end went on to the key scan, the removal and \
+                         the outcome"
+                    ),
+                )),
                 Audit::Uncountable(why) => stops.push((
                     "uncharged_turns",
                     format!("the turns in the agent's record could not be counted: {why}"),
