@@ -1961,6 +1961,17 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         },
     },
     IgnoredRun {
+        package: "kr-worker",
+        target: "--test desktop_hosted",
+        cases: &[
+            "a_desktop_bound_workers_checks_leave_the_other_application_the_terminal_and_the_files_as_they_were",
+        ],
+        runs: Runs::Command {
+            file: ".github/workflows/core-ci.yml",
+            line: "run: cargo test --locked -p kr-worker --test desktop_hosted -- --nocapture --ignored --exact a_desktop_bound_workers_checks_leave_the_other_application_the_terminal_and_the_files_as_they_were",
+        },
+    },
+    IgnoredRun {
         package: "kr-changeset",
         target: "--test capture",
         cases: &[],

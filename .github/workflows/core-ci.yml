@@ -2329,6 +2329,20 @@ jobs:
       - name: Build the worker the native backend's session case starts
         run: cargo build --locked -p kr-worker
 
+      # The three desktop checks, which a worker is asked for only when it is bound to a desktop:
+      # a screen image, the front application's accessibility tree through System Events, and an
+      # application started and ended again. Performed, they act on the desktop of the machine they
+      # run on, so the case that watches them is ignored in every ordinary run and refuses to run
+      # anywhere but on a GitHub-hosted runner, whose desktop belongs to the run. This step runs it
+      # here, on the macOS leg, with the grants the runner image holds for the programs the checks
+      # run. It shows what the checks do to an application of its own with a focused text field, to
+      # the session's terminal, to a file and its directory, and to the application the launch
+      # starts. It stands before the steps that open windows of this job's own.
+      - name: A desktop-bound worker's checks leave the runner's desktop as they found it
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        timeout-minutes: 30
+        run: cargo test --locked -p kr-worker --test desktop_hosted -- --nocapture --ignored --exact a_desktop_bound_workers_checks_leave_the_other_application_the_terminal_and_the_files_as_they_were
+
       # The backend, its boundary, and the shared client's upload sequence. Its `host_events` check
       # opens a real window, and on this runner's Linux leg that takes a display: the check starts
       # an `Xvfb` of its own, which the image carries. A runner without one would let the check
