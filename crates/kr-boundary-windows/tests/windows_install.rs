@@ -1304,6 +1304,141 @@ fn an_answer_that_does_not_come_by_the_deadline_is_not_waited_for() {
     );
 }
 
+#[test]
+fn the_proof_cycle_is_counted_from_before_the_service_starts() {
+    use std::time::{Duration, Instant};
+    let bound = Duration::from_secs(300);
+    let before = Instant::now();
+    let cycle = install::ProofCycle::begin(bound, Duration::from_secs(10), || {
+        std::thread::sleep(Duration::from_millis(700));
+        Ok(())
+    })
+    .unwrap();
+    // The broker takes its own instant after its service has started, so the installation's
+    // deadline must come before the broker's: it is counted from before the start, whatever the
+    // start took.
+    assert!(
+        cycle.deadline() < before + bound + Duration::from_millis(300),
+        "the deadline is counted from before the start"
+    );
+    // A start that fails is the error of the cycle.
+    assert!(
+        install::ProofCycle::begin(bound, Duration::from_secs(10), || {
+            Err(install::Error::Failed("no start".to_owned()))
+        })
+        .is_err()
+    );
+}
+
+/// A broker that answers each proof when the case says: it answers the proof for each class after a
+/// delay, and counts the proofs that were asked of it. It stands for a broker whose cycle ends
+/// before the installation's deadline would, and whose answer after the end belongs to a later cycle.
+#[cfg(feature = "testing")]
+fn stand_in_broker(
+    checkout_after: std::time::Duration,
+    connect_after: std::time::Duration,
+) -> (
+    std::thread::JoinHandle<()>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<kr_boundary_windows::win::pipe::Stop>,
+) {
+    use kr_boundary_windows::win::pipe::{Listener, Stop};
+    use std::sync::atomic::Ordering;
+    let stop = Stop::new().unwrap();
+    let system = Sid::parse("S-1-5-18").unwrap();
+    let mut listener = Listener::bind(&[system], std::sync::Arc::clone(&stop)).unwrap();
+    let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let thread = std::thread::spawn({
+        let stop = std::sync::Arc::clone(&stop);
+        let asked = std::sync::Arc::clone(&asked);
+        move || {
+            let Some(mut connection) = listener.accept().unwrap() else {
+                return;
+            };
+            while let Ok(request) = kr_boundary_windows::frame::read::<_, Request>(&mut connection)
+            {
+                let Request::Prove { class } = request else {
+                    continue;
+                };
+                asked.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(match class {
+                    Class::Checkout => checkout_after,
+                    Class::Connect => connect_after,
+                });
+                let answer = Response::Proof {
+                    ready: true,
+                    detail: format!("{class:?} is ready"),
+                };
+                if kr_boundary_windows::frame::write(&mut connection, &answer).is_err() {
+                    return;
+                }
+            }
+            while !stop.is_set() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    });
+    (thread, asked, stop)
+}
+
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn an_answer_of_a_later_cycle_is_never_accepted_and_no_proof_is_asked_near_the_end() {
+    use kr_boundary_windows::win::pipe;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    let bound = Duration::from_secs(4);
+    let margin = Duration::from_secs(1);
+
+    // The proof for the second class is answered after the installation's deadline, as a later cycle
+    // would answer it: the installation stops reading at the deadline and takes no answer after it.
+    let (server, asked, stop) = stand_in_broker(Duration::from_millis(500), Duration::from_secs(5));
+    let mut connection = pipe::connect(std::process::id()).unwrap();
+    let cycle = install::ProofCycle::begin(bound, margin, || Ok(())).unwrap();
+    let began = Instant::now();
+    let refused = cycle.prove(&mut connection).unwrap_err().to_string();
+    let elapsed = began.elapsed();
+    drop(connection);
+    stop.set();
+    server.join().unwrap();
+    assert!(refused.contains("deadline"), "{refused}");
+    assert!(
+        elapsed < bound,
+        "the wait ended at the installation's deadline, not at the late answer: {elapsed:?}"
+    );
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+
+    // The first answer comes inside the margin, so the second proof is not asked at all: a request
+    // that late could be answered only by a cycle of the broker's that the installation did not ask
+    // for.
+    let (server, asked, stop) = stand_in_broker(Duration::from_millis(3200), Duration::ZERO);
+    let mut connection = pipe::connect(std::process::id()).unwrap();
+    let cycle = install::ProofCycle::begin(bound, margin, || Ok(())).unwrap();
+    let refused = cycle.prove(&mut connection).unwrap_err().to_string();
+    drop(connection);
+    stop.set();
+    server.join().unwrap();
+    assert!(
+        refused.contains("left before the proof for Connect"),
+        "{refused}"
+    );
+    assert_eq!(asked.load(Ordering::SeqCst), 1, "only the first was asked");
+
+    // Both inside the cycle: accepted.
+    let (server, asked, stop) =
+        stand_in_broker(Duration::from_millis(200), Duration::from_millis(200));
+    let mut connection = pipe::connect(std::process::id()).unwrap();
+    install::ProofCycle::begin(bound, margin, || Ok(()))
+        .unwrap()
+        .prove(&mut connection)
+        .unwrap();
+    drop(connection);
+    stop.set();
+    server.join().unwrap();
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+}
+
 /// How long the process has existed.
 fn process_age(pid: u32) -> std::time::Duration {
     use windows_sys::Win32::Foundation::FILETIME;
