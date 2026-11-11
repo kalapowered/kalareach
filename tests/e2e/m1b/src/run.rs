@@ -13,8 +13,10 @@
 //! before it is reaped, while its number cannot pass to anyone else ([`Run::record_child`]). A
 //! number learned from a listing or a file is recorded only when, read while one start holds it,
 //! the process is beneath a process this run recorded ([`Run::record_descendants`]) or its command
-//! line names this run's directory, which is new for every run ([`Run::record_named`]). A worker is
-//! found by its command line in the process table, and no file of the host's is opened for it.
+//! line names this run's directory, which is new for every run, by its path components and not as a
+//! piece of text ([`Run::record_named`]). A worker is found by its command line in the process
+//! table, and it is this run's only when its program is exactly the worker the run placed
+//! ([`Run::record_worker`]); no file of the host's is opened for it.
 //!
 //! The closing check asks four questions, and a run that leaves anything behind fails on it:
 //! whether any recorded process still runs, whether any process at all still runs out of this
@@ -432,14 +434,63 @@ impl Run {
             return None;
         };
         let described = describe(&identity).ok()??;
-        let root = self.root.display().to_string();
-        if !described.command.contains(&root)
+        if !names_the_root(&described.command, &self.root)
             || !marks.iter().all(|mark| described.command.contains(mark))
         {
             return None;
         }
         self.record(identity.clone(), what);
         Some(identity)
+    }
+
+    /// Records the process that has the number `pid` now, when it is the worker of `session` that
+    /// this run placed: its program, the first word of its command line, is exactly the worker's
+    /// absolute path in this run's directory, and `--session` names `session`. The start identity
+    /// is read first and the command line after it, as for [`Run::record_named`]. A worker of
+    /// another host, whatever its directory is called, is not this run's.
+    pub fn record_worker(
+        &self,
+        pid: u32,
+        what: &str,
+        session: &str,
+    ) -> Option<ProcessStartIdentity> {
+        let ProcessQuery::Present(identity) = query_process(pid) else {
+            return None;
+        };
+        let described = describe(&identity).ok()??;
+        if worker_session(&described.command, &self.binary("kr-worker")) != Some(session) {
+            return None;
+        }
+        self.record(identity.clone(), what);
+        Some(identity)
+    }
+
+    /// The identity of the worker process that serves `session_id`: the process running this run's
+    /// copy of `kr-worker` for that session, recorded once its start holds the number the process
+    /// table gave.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no such process is in the process table within [`LIVENESS`].
+    #[must_use]
+    pub fn worker_of(&self, session_id: &str) -> ProcessStartIdentity {
+        let started = Instant::now();
+        let program = self.binary("kr-worker");
+        loop {
+            if let Some(identity) = processes_under(&self.root)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(_, command)| worker_session(command, &program) == Some(session_id))
+                .find_map(|(pid, _)| self.record_worker(pid, "the session's worker", session_id))
+            {
+                return identity;
+            }
+            assert!(
+                started.elapsed() < crate::LIVENESS,
+                "no worker for session {session_id} is in the process table"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     /// Every process this run recorded.
@@ -2032,7 +2083,32 @@ fn still_running(identity: &ProcessStartIdentity, what: &str) -> Result<bool, St
     }
 }
 
-/// Every process whose command line names `root`, other than this one.
+/// Whether the command line `command` names the directory `root`: one of its words, or the part of
+/// one after an `=`, is `root` or a path below it, compared by path components. A directory whose
+/// name merely begins with the text of `root`'s is not named, so another host's run directory
+/// `<root>-other` is not this run's.
+#[must_use]
+pub fn names_the_root(command: &str, root: &Path) -> bool {
+    command.split_whitespace().any(|word| {
+        Path::new(word).starts_with(root)
+            || word
+                .split_once('=')
+                .is_some_and(|(_, value)| Path::new(value).starts_with(root))
+    })
+}
+
+/// The session a command line is the worker of: its program, the first word, is exactly `program`,
+/// the worker the run placed, and `--session` names the session.
+#[must_use]
+pub fn worker_session<'a>(command: &'a str, program: &Path) -> Option<&'a str> {
+    let mut words = command.split_whitespace();
+    if words.next()? != program.to_str()? {
+        return None;
+    }
+    words.skip_while(|word| *word != "--session").nth(1)
+}
+
+/// Every process whose command line names `root` ([`names_the_root`]), other than this one.
 ///
 /// Every binary a leg launches is a copy inside its directory and every path it hands a process is
 /// inside it, so a process still running out of it is one the leg started, whoever its parent is.
@@ -2041,11 +2117,10 @@ fn still_running(identity: &ProcessStartIdentity, what: &str) -> Result<bool, St
 ///
 /// Returns why the process table could not be read.
 pub fn processes_under(root: &Path) -> Result<Vec<(u32, String)>, String> {
-    let needle = root.display().to_string();
     let own = std::process::id();
     Ok(process_table()?
         .into_iter()
-        .filter(|entry| entry.pid != own && entry.command.contains(&needle))
+        .filter(|entry| entry.pid != own && names_the_root(&entry.command, root))
         .map(|entry| (entry.pid, entry.command))
         .collect())
 }

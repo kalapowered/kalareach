@@ -462,31 +462,6 @@ fn check<'a>(document: &'a serde_json::Value, id: &str) -> Option<&'a serde_json
     }
 }
 
-/// The identity of the worker process that serves `session_id`: the process running this run's
-/// copy of `kr-worker` for that session, recorded only while its start holds the number the
-/// process table gave.
-fn worker_of(run: &Run, session_id: &str) -> kr_protocol::identity::ProcessStartIdentity {
-    let started = std::time::Instant::now();
-    let session = format!("--session {session_id}");
-    loop {
-        if let Some(identity) = kr_e2e_m1b::run::processes_under(run.root())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(_, command)| command.contains("kr-worker") && command.contains(&session))
-            .find_map(|(pid, _)| {
-                run.record_named(pid, "the session's worker", &["kr-worker", &session])
-            })
-        {
-            return identity;
-        }
-        assert!(
-            started.elapsed() < kr_e2e_m1b::LIVENESS,
-            "no worker for session {session_id} is in the process table"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
 /// Waits until `read` answers with a process identifier, and records that process once its
 /// command line names this run's directory and holds every one of `marks`.
 fn recorded(
@@ -690,7 +665,7 @@ fn a_device_uses_an_agent_in_a_managed_shell_and_reattaches_to_the_screen_kr_att
         status["shell_mode"], "managed",
         "a managed session: {status}"
     );
-    let worker = worker_of(&run, &session_id.to_string());
+    let worker = run.worker_of(&session_id.to_string());
     let doctor = host.kr_json(&["doctor"]);
     println!(
         "the workers run under: {}",
