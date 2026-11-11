@@ -3332,15 +3332,20 @@ A device holds at most 64 open drafts. A draft is open until a prompt sends it t
 session it targets closes: the closure of a session queues, on a task of its own, the write that
 orphans its drafts, and each `draft.create` first writes the end of the sessions its device's open
 drafts target, and the session it names, that the registry holds closed. A draft of a session
-recorded closed before the create starts then stops counting, and a create that names such a
-session is refused `SESSION_CLOSED`. A `draft.create` past the bound is
-refused `QUOTA_EXCEEDED` with the bound in the message, only after the closed sessions are settled
+recorded closed before the create starts then stops counting. A create that names such a session
+is refused `SESSION_CLOSED` when that settle succeeded, unless the device already holds its bound,
+where the count comes first and the refusal is `QUOTA_EXCEEDED`. A `draft.create` past the bound is
+refused `QUOTA_EXCEEDED` with the bound in the message only after the closed sessions are settled
 once more and the create is tried again, and only after the service has asked the admission again,
-so a device whose authority has gone learns no count. What remains possible is a refusal for a
-draft whose session closes between the registry's read and another create's insert, at the first
-settle and again at the second. The host keeps that refusal
-as the action's outcome, as it keeps every refusal of a service, so the same action asked again is
-given the same refusal even when a place is free, and a device that has freed a place takes a new
+so a device whose authority has gone learns no count. Two things remain possible. A settle that fails in both passes leaves the drafts of closed sessions
+counting, and the host writes a line to its log for each pass that fails. And a create can be
+refused for a draft that was not open when it began: another create of the device reads the
+registry, a session it names then closes, the create at the bound settles without a draft to point
+it at that session, and the other create inserts its draft; the second settle ends that session,
+and a third create, for a second session that closed in the same way, fills the place again. That
+takes three creates of one device on separate connections and two closures. The host keeps a refusal
+at the bound as the action's outcome, as it keeps every refusal of a service, so the same action asked
+again is given the same refusal even when a place is free, and a device that has freed a place takes a new
 action for its new attempt. The bound is one constant of this host, which an owner cannot change,
 and the person at this machine is held to none. A device cannot end a draft itself: this level has
 no method that discards one, so a prompt that sends it, or the end of its session, is how a place
