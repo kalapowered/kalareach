@@ -1252,6 +1252,33 @@ fn closed_for(build: &crate::build::Build, stand_in: &Path) -> Result<(), String
     Ok(())
 }
 
+/// The command that runs one of a staged part's login probes: the installed build's `bin/<command>`
+/// by its absolute path, the program [`closed_route`] resolved and checked, with the probe's
+/// `arguments` and the part's `switches`, in exactly `variables` and in `work`, with no input. The
+/// program is not looked up on a search path: the description's account variables can replace it.
+#[must_use]
+pub fn login_probe(
+    build: &crate::build::Build,
+    arguments: &[String],
+    switches: &[String],
+    variables: &[(String, String)],
+    work: &Path,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(build.prefix.join("bin").join(&build.command));
+    command
+        .args(arguments)
+        .args(switches)
+        .env_clear()
+        .envs(
+            variables
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        )
+        .current_dir(work)
+        .stdin(std::process::Stdio::null());
+    command
+}
+
 /// An agent's start that reached no first screen because the agent refused to run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refused {
@@ -1976,6 +2003,36 @@ mod tests {
         std::fs::remove_dir_all(&base).expect("clean up");
     }
 
+    /// A build description over the installation at `prefix`, whose `bin/codex` has the digest
+    /// `sha256`, with a newer build where one is given as its prefix and digest.
+    fn description(
+        prefix: &Path,
+        sha256: &str,
+        newer: Option<(&Path, &str)>,
+    ) -> crate::build::Build {
+        serde_json::from_value(serde_json::json!({
+            "package": "a package",
+            "application": "an application",
+            "version": "1",
+            "prefix": prefix,
+            "pinned": "bin/codex",
+            "sha256": sha256,
+            "command": "codex",
+            "launch": "native",
+            "ready": "ready",
+            "harmless": { "input": "x", "shows": "y" },
+            "transcript": "a transcript",
+            "newer": newer.map(|(prefix, sha256)| serde_json::json!({
+                "version": "2",
+                "prefix": prefix,
+                "pinned": "bin/codex",
+                "sha256": sha256,
+                "ready": "ready",
+            })),
+        }))
+        .expect("a description")
+    }
+
     /// A description whose main build is the stand-in and whose newer build is not is refused where
     /// the staged part is made: the upgrade part moves `agent/current` to the newer build and types
     /// launches, so every build a part can start passes the closed-route check.
@@ -2000,29 +2057,7 @@ mod tests {
             prefix
         };
         let main = install("main", b"the stand-in");
-        let build = |newer: Option<(&Path, &str)>| -> crate::build::Build {
-            serde_json::from_value(serde_json::json!({
-                "package": "a package",
-                "application": "an application",
-                "version": "1",
-                "prefix": main,
-                "pinned": "bin/codex",
-                "sha256": hex(b"the stand-in"),
-                "command": "codex",
-                "launch": "native",
-                "ready": "ready",
-                "harmless": { "input": "x", "shows": "y" },
-                "transcript": "a transcript",
-                "newer": newer.map(|(prefix, sha256)| serde_json::json!({
-                    "version": "2",
-                    "prefix": prefix,
-                    "pinned": "bin/codex",
-                    "sha256": sha256,
-                    "ready": "ready",
-                })),
-            }))
-            .expect("a description")
-        };
+        let build = |newer: Option<(&Path, &str)>| description(&main, &hex(b"the stand-in"), newer);
         closed_for(&build(None), &stand_in).expect("the stand-in alone is let through");
         let copy = install("newer-stand-in", b"the stand-in");
         closed_for(&build(Some((&copy, &hex(b"the stand-in")))), &stand_in)
@@ -2035,6 +2070,47 @@ mod tests {
         let said = closed_for(&build(Some((&other, &hex(b"the stand-in")))), &stand_in)
             .expect_err("the stand-in's digest stated over another newer build is refused");
         assert!(said.contains("the newer build"), "{said}");
+        std::fs::remove_dir_all(&base).expect("clean up");
+    }
+
+    /// A login probe starts the program the closed-route check resolved, by its absolute path, and
+    /// not whatever the search path of the environment it is given names: the description's account
+    /// variables can replace the search path.
+    #[test]
+    fn a_login_probe_starts_the_checked_program_whatever_the_search_path_names() {
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .expect("the temporary directory")
+            .join(format!("kr-probe-{}", kr_ipc::new_uuid()));
+        let installed = base.join("installed");
+        let elsewhere = base.join("elsewhere");
+        for (directory, name) in [(&installed, "checked"), (&elsewhere, "searched")] {
+            std::fs::create_dir_all(directory.join("bin")).expect("an installation");
+            let program = directory.join("bin/codex");
+            std::fs::write(
+                &program,
+                format!("#!/bin/sh\necho {name} >> '{}'\n", base.join("ran").display()),
+            )
+            .expect("a program");
+            std::fs::set_permissions(
+                &program,
+                std::os::unix::fs::PermissionsExt::from_mode(0o755),
+            )
+            .expect("executable");
+        }
+        let build = description(&installed, "unused", None);
+        let variables = vec![(
+            "PATH".to_owned(),
+            format!("{}:/usr/bin:/bin", elsewhere.join("bin").display()),
+        )];
+        let status = login_probe(&build, &[], &[], &variables, &base)
+            .status()
+            .expect("the probe starts");
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(base.join("ran")).expect("a probe ran"),
+            "checked\n",
+            "the probe started the program on the search path and not the checked one"
+        );
         std::fs::remove_dir_all(&base).expect("clean up");
     }
 
