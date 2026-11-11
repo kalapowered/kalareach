@@ -9,7 +9,7 @@ use kr_boundary_windows::frame::invocation::{
 use kr_boundary_windows::operation::grammar::{
     MAX_PATH_COMPONENTS, MAX_PATHS, MAX_REVISION_STEPS, RULE_MESSAGE_CONTROL, RULE_MESSAGE_LENGTH,
     RULE_MESSAGE_LINES, RULE_PATH, RULE_PATH_DEPTH, RULE_PATH_LENGTH, RULE_REVISION,
-    RULE_REVISION_LENGTH, message,
+    RULE_REVISION_LENGTH, message, revision,
 };
 use kr_boundary_windows::operation::tables::{self, Form, GLOBAL_REFUSED, INTROSPECTION, Row};
 use kr_boundary_windows::operation::{
@@ -2084,9 +2084,7 @@ fn a_path_is_relative_with_forward_slashes_and_ordinary_components() {
         "con1",
         "conx",
         "comx",
-        "com0",
         "com10",
-        "lpt0",
         "lptx",
         "conin",
         "conout",
@@ -2171,6 +2169,12 @@ fn a_path_is_relative_with_forward_slashes_and_ordinary_components() {
         "LPT1",
         "lpt9",
         "Lpt3.log",
+        "COM0",
+        "com0",
+        "LPT0",
+        "lpt0",
+        "Com0.txt",
+        "a/lpt0.log",
         "COM¹",
         "COM²",
         "COM³",
@@ -2353,8 +2357,17 @@ fn a_name_and_a_reference_are_bounded() {
     for bad in [
         "", "a b", "a..b", "a//b", "/a", "a/", "a.", "a.lock", "a/b.lock", ".a", "a/.b", "-a",
         "a@{1}", "a~1", "a^", "a:b", "a?b", "a*b", "a[b", "a\\b",
+        // A device name on Windows, as the path grammar reads it.
+        "nul", "con", "com1", "aux.x", "a/prn/b", "LPT9",
     ] {
         assert_eq!(refused(Command::Checkout, &[n(bad)]), RULE_NAME, "{bad:?}");
+    }
+    for bad in ["refs/heads/nul", "refs/heads/a/com1", "refs/heads/aux.x"] {
+        assert_eq!(
+            refused(Command::UpdateRef, &[rn(bad), o(OID), o(OID2)]),
+            RULE_REFNAME,
+            "{bad:?}"
+        );
     }
     for good in [
         "a",
@@ -2606,5 +2619,26 @@ fn the_message_grammar_refuses_a_control_character_by_itself() {
     }
     for fine in ["a\tb", "a\nb", "a\n\tb", "é"] {
         assert_eq!(message(fine, 100, false), Ok(()), "{fine:?}");
+    }
+}
+
+#[test]
+fn a_revision_names_the_branch_it_starts_at_from_its_own_parse() {
+    for (text, spec, branch) in [
+        ("main", "refs/heads/main", Some("refs/heads/main")),
+        ("a/b~2^", "refs/heads/a/b~2^", Some("refs/heads/a/b")),
+        (
+            "refs/heads/x",
+            "refs/heads/refs/heads/x",
+            Some("refs/heads/refs/heads/x"),
+        ),
+        ("HEAD", "HEAD", None),
+        ("HEAD^{commit}~3", "HEAD^{commit}~3", None),
+        (OID, OID, None),
+        (&format!("{OID}^"), &format!("{OID}^"), None),
+    ] {
+        let found = revision(text).unwrap_or_else(|rule| panic!("{text}: {rule}"));
+        assert_eq!(found.spec, spec, "{text}");
+        assert_eq!(found.branch.as_deref(), branch, "{text}");
     }
 }

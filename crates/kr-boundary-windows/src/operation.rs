@@ -19,7 +19,7 @@ pub mod settings;
 pub mod state;
 pub mod tables;
 
-use self::grammar::{MAX_PATHS, is_control};
+use self::grammar::{MAX_PATHS, Revision, is_control};
 use self::tables::{Form, GLOBAL_REFUSED, INTROSPECTION, NAMED_FORMATS, Row, Table, Typed, Values};
 use crate::frame::invocation::{
     Arg, Command, Dots, Format, MAX_ARGUMENTS, NamedFormat, Part, Placeholder, RefusedKind,
@@ -591,13 +591,14 @@ impl Parser<'_> {
                     let (left, right) = (self.qualify(left)?, self.qualify(right)?);
                     self.checks.push(Check::ResolveRange {
                         index: self.argv.len(),
-                        left: left.clone(),
+                        left: left.spec.clone(),
                         dots: *dots,
-                        right: right.clone(),
+                        right: right.spec.clone(),
                     });
                     self.symbolic_check(&left);
                     self.symbolic_check(&right);
-                    self.argv.push(format!("{left}{}{right}", dots_text(*dots)));
+                    self.argv
+                        .push(format!("{}{}{}", left.spec, dots_text(*dots), right.spec));
                     self.at += 1;
                 }
                 _ => break,
@@ -606,33 +607,31 @@ impl Parser<'_> {
         Ok(plain > 0 || range)
     }
 
-    fn qualify(&self, text: &str) -> Result<String, Refusal> {
+    fn qualify(&self, text: &str) -> Result<Revision, Refusal> {
         grammar::revision(text)
             .map_err(|rule| self.refusal(rule, "is a revision outside the grammar"))
     }
 
     /// A revision that starts at a branch has that reference checked: a symbolic reference could
     /// make another one, a tag among them, answer to the branch's name.
-    fn symbolic_check(&mut self, spec: &str) {
-        if let Ok((base, _)) = grammar::split_revision(spec)
-            && base.starts_with(BRANCH_PREFIX)
-        {
+    fn symbolic_check(&mut self, revision: &Revision) {
+        if let Some(refname) = &revision.branch {
             self.checks.push(Check::NotSymbolic {
-                refname: base.to_owned(),
+                refname: refname.clone(),
             });
         }
     }
 
     /// One revision, qualified, with its resolution recorded and its place noted.
     fn revision(&mut self, text: &str) -> Result<(), Refusal> {
-        let spec = self.qualify(text)?;
+        let revision = self.qualify(text)?;
         self.checks.push(Check::Resolve {
-            spec: spec.clone(),
+            spec: revision.spec.clone(),
             replaces: Some(self.argv.len()),
             tree_target: false,
         });
-        self.symbolic_check(&spec);
-        self.argv.push(spec);
+        self.symbolic_check(&revision);
+        self.argv.push(revision.spec);
         self.at += 1;
         Ok(())
     }
@@ -738,15 +737,15 @@ impl Parser<'_> {
                 self.at = 1;
                 match self.args.get(1) {
                     Some(Arg::Rev(text)) => {
-                        let spec = self.qualify(text)?;
+                        let revision = self.qualify(text)?;
                         self.checks.push(Check::Resolve {
-                            spec: spec.clone(),
+                            spec: revision.spec.clone(),
                             replaces: Some(self.argv.len() + 1),
                             tree_target: true,
                         });
-                        self.symbolic_check(&spec);
+                        self.symbolic_check(&revision);
                         self.argv.push("--detach".to_owned());
-                        self.argv.push(spec);
+                        self.argv.push(revision.spec);
                         self.argv.push("--".to_owned());
                         self.at = 2;
                         self.end()
@@ -758,14 +757,14 @@ impl Parser<'_> {
                 }
             }
             Some(Arg::Rev(text)) => {
-                let spec = self.qualify(text)?;
+                let revision = self.qualify(text)?;
                 self.checks.push(Check::Resolve {
-                    spec: spec.clone(),
+                    spec: revision.spec.clone(),
                     replaces: Some(self.argv.len()),
                     tree_target: true,
                 });
-                self.symbolic_check(&spec);
-                self.argv.push(spec);
+                self.symbolic_check(&revision);
+                self.argv.push(revision.spec);
                 self.at = 1;
                 self.paths(true)?;
                 self.end()

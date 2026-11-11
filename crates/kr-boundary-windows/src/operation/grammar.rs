@@ -5,7 +5,7 @@
 //! that converts to UTF-16 and back without loss; what remains is the characters and the shapes.
 
 use crate::frame::invocation::{MAX_MESSAGE_BYTES, MAX_PATH_BYTES, MAX_REV_BYTES};
-use crate::names::{BRANCH_PREFIX, TAG_PREFIX, is_branch_name, is_oid};
+use crate::names::{BRANCH_PREFIX, TAG_PREFIX, is_branch_name, is_device_name, is_oid};
 
 /// The most paths a command takes after `--`.
 pub const MAX_PATHS: usize = 256;
@@ -61,10 +61,6 @@ pub fn path(text: &str) -> Result<(), &'static str> {
     }
 }
 
-/// The names Windows reads as a device, with or without an extension, in any case. `CONIN$` and
-/// `CONOUT$` are the console's input and output.
-const DEVICES: &[&str] = &["con", "prn", "aux", "nul", "conin$", "conout$"];
-
 fn component(text: &str) -> bool {
     // `.` and `..` end in a dot and are refused with the names that do.
     if text.is_empty() {
@@ -79,30 +75,15 @@ fn component(text: &str) -> bool {
     if text.ends_with(['.', ' ']) {
         return false;
     }
-    let lower = text.to_ascii_lowercase();
-    let stem = lower.split('.').next().unwrap_or_default().trim_end();
-    if DEVICES.contains(&stem) || numbered_device(stem) {
+    if is_device_name(text) {
         return false;
     }
+    let lower = text.to_ascii_lowercase();
     // `.git` in any case, and the short name NTFS gives it.
     if lower == ".git" || short_git_name(&lower) {
         return false;
     }
     true
-}
-
-/// `COM` or `LPT` and one digit from 1 to 9, or one of the superscript digits 1, 2 and 3, which
-/// Windows reserves as well.
-fn numbered_device(stem: &str) -> bool {
-    ["com", "lpt"].iter().any(|prefix| {
-        stem.strip_prefix(prefix).is_some_and(|digit| {
-            let mut chars = digit.chars();
-            matches!(
-                (chars.next(), chars.next()),
-                (Some('1'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'), None)
-            )
-        })
-    })
 }
 
 fn short_git_name(lower: &str) -> bool {
@@ -161,20 +142,35 @@ pub fn count(text: &str, min: u32, max: u32) -> Option<u32> {
 /// # Errors
 ///
 /// Returns the rule that refused.
-pub fn revision(text: &str) -> Result<String, &'static str> {
+pub fn revision(text: &str) -> Result<Revision, &'static str> {
     if text.len() > MAX_REV_BYTES {
         return Err(RULE_REVISION_LENGTH);
     }
     let (base, steps) = split_at_steps(text);
-    let carried = if base == "HEAD" || is_oid(base) {
-        base.to_owned()
+    let (carried, branch) = if base == "HEAD" || is_oid(base) {
+        (base.to_owned(), None)
     } else if is_branch_name(base) {
-        format!("{BRANCH_PREFIX}{base}")
+        let reference = format!("{BRANCH_PREFIX}{base}");
+        (reference.clone(), Some(reference))
     } else {
         return Err(RULE_REVISION);
     };
     steps_of(steps)?;
-    Ok(format!("{carried}{steps}"))
+    Ok(Revision {
+        spec: format!("{carried}{steps}"),
+        branch,
+    })
+}
+
+/// A revision as [`revision`] qualified it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Revision {
+    /// The form the command line carries: the base, qualified, and the steps.
+    pub spec: String,
+    /// The reference `refs/heads/<name>` the revision starts at, when its base is a branch name. A
+    /// revision that starts at `HEAD` or an identifier has none. It comes from the grammar's own
+    /// parse of the base, so no check of a reference can be lost for want of parsing it again.
+    pub branch: Option<String>,
 }
 
 /// Takes a qualified revision, as [`revision`] returns it or as a reader is given it, apart into

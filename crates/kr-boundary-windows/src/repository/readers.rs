@@ -610,26 +610,75 @@ pub fn parse_r4(output: &Output<'_>) -> Result<Vec<Entry>, Refusal> {
         .collect()
 }
 
-/// Whether the last component of a path is one that Git reads attributes from on a Windows
-/// file system: `.gitattributes` in any case, with the trailing dots and spaces Windows drops,
-/// or a short name NTFS gives it: `gitatt~N`, or `gi7d29~N` once the first names are taken.
-/// Over-matching is safe: it only makes the scan read more.
+/// Whether the last component of a path is one that Git reads attributes from on a Windows file
+/// system: a name that NTFS reads as `.gitattributes`.
 fn names_attributes(path: &[u8]) -> bool {
     let name = path.rsplit(|b| *b == b'/').next().unwrap_or_default();
-    let lower = name.to_ascii_lowercase();
-    let trimmed: &[u8] = {
-        let end = lower
-            .iter()
-            .rposition(|b| !matches!(b, b'.' | b' '))
-            .map_or(0, |at| at + 1);
-        &lower[..end]
+    is_ntfs_dotgitattributes(name)
+}
+
+/// The name an NTFS dot file is spelled after, and the first six bytes of the fall-back short name
+/// NTFS gives it once the numbered short names are taken (Git's `gi7d29`).
+const DOT_NAME: &[u8] = b"gitattributes";
+const FALL_BACK_PREFIX: &[u8] = b"gi7d29";
+
+/// Git's rule for a name that NTFS reads as `.gitattributes`, as `is_ntfs_dot_generic` in `path.c`
+/// has it (read in the sources of Git 2.50.1 and 2.53.0, where the function is the same, and
+/// checked against the recording of `git fsck --strict` in both builds): `.gitattributes` in any
+/// case; or its first six letters, `~` and one digit from 1 to 4; or a fall-back short name, the
+/// first bytes of `gi7d29` followed by `~` and digits, eight bytes in all. Each may be followed by
+/// spaces and periods and then a `:` (an alternate stream) or the end.
+fn is_ntfs_dotgitattributes(name: &[u8]) -> bool {
+    // The end of the name is a NUL, as in the C string Git reads.
+    let at = |i: usize| name.get(i).copied().unwrap_or(0);
+    let only_spaces_and_periods = |start: usize| {
+        for c in (start..).map(at) {
+            if c == 0 || c == b':' {
+                return true;
+            }
+            if c != b' ' && c != b'.' {
+                return false;
+            }
+        }
+        unreachable!("the end of the name is a NUL")
     };
-    trimmed == b".gitattributes"
-        || [&b"gitatt~"[..], b"gi7d29~"].iter().any(|prefix| {
-            trimmed
-                .strip_prefix(*prefix)
-                .is_some_and(|digits| !digits.is_empty() && digits.iter().all(u8::is_ascii_digit))
-        })
+    if at(0) == b'.'
+        && name
+            .get(1..=DOT_NAME.len())
+            .is_some_and(|rest| rest.eq_ignore_ascii_case(DOT_NAME))
+    {
+        return only_spaces_and_periods(DOT_NAME.len() + 1);
+    }
+    if name
+        .get(..6)
+        .is_some_and(|head| head.eq_ignore_ascii_case(&DOT_NAME[..6]))
+        && at(6) == b'~'
+        && (b'1'..=b'4').contains(&at(7))
+    {
+        return only_spaces_and_periods(8);
+    }
+    let mut i = 0;
+    let mut saw_tilde = false;
+    while i < 8 {
+        let c = at(i);
+        if c == 0 {
+            return false;
+        } else if saw_tilde {
+            if !c.is_ascii_digit() {
+                return false;
+            }
+        } else if c == b'~' {
+            i += 1;
+            if !(b'1'..=b'9').contains(&at(i)) {
+                return false;
+            }
+            saw_tilde = true;
+        } else if i >= 6 || c >= 0x80 || c.to_ascii_lowercase() != FALL_BACK_PREFIX[i] {
+            return false;
+        }
+        i += 1;
+    }
+    only_spaces_and_periods(i)
 }
 
 /// The entries whose files Git reads attributes from. A gitlink is not a file and is left out.
