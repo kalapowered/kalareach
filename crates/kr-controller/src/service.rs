@@ -34,6 +34,8 @@ use crate::supervision::WorkerSupervisor;
 
 #[cfg(any(feature = "testing", test))]
 use tokio::sync::oneshot;
+#[cfg(feature = "testing")]
+use tokio::sync::watch;
 
 /// The daemon on the network.
 ///
@@ -218,6 +220,48 @@ impl ReadPause {
             let _ = arrived.send(());
             let _ = go.await;
         }
+    }
+}
+
+/// Where this host's own tests hold the withdrawal of network connections: every deregistration
+/// that reaches it once it is armed waits there, and the first says it has arrived. They go when the
+/// test sets the end it was given to `true` or drops it.
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+struct DeregistrationHold(
+    std::sync::Mutex<Option<(Option<oneshot::Sender<()>>, watch::Receiver<bool>)>>,
+);
+
+#[cfg(feature = "testing")]
+impl DeregistrationHold {
+    /// Arms the hold. Returns the end that says a deregistration has arrived, and the end that lets
+    /// them all go.
+    fn arm(&self) -> (oneshot::Receiver<()>, watch::Sender<bool>) {
+        let (arrived, arrival) = oneshot::channel();
+        let (open, opened) = watch::channel(false);
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((Some(arrived), opened));
+        (arrival, open)
+    }
+
+    /// Waits here when the hold is armed, until it is opened or its end is dropped.
+    async fn wait(&self) {
+        let mut opened = {
+            let mut armed = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some((arrived, opened)) = armed.as_mut() else {
+                return;
+            };
+            if let Some(arrived) = arrived.take() {
+                let _ = arrived.send(());
+            }
+            opened.clone()
+        };
+        let _ = opened.wait_for(|open| *open).await;
     }
 }
 
@@ -648,7 +692,7 @@ pub struct Controller {
     /// lost, so that the loss is declared while its registration still stands. Compiled away in
     /// every shipped build.
     #[cfg(feature = "testing")]
-    before_a_connection_is_deregistered: ReadPause,
+    before_a_connection_is_deregistered: DeregistrationHold,
     /// Where this host's own tests stop a read whose worker has stopped answering, once it has
     /// asked the kernel and before it looks at what this daemon holds of the session. Compiled
     /// away in every shipped build.
