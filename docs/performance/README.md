@@ -113,8 +113,10 @@ group holds from the kernel's page map, at the end of the five-minute window, an
 against 512,000 KiB:
 
 - A resident page that the kernel marks as a file page or as shared memory, of a mapping that has an
-  inode, is identified by its device, inode and place in the file, and counted once for the whole
-  group, whether or not a process outside the group maps it too.
+  inode, is identified by its device, path, inode and place in the file, and counted once for the
+  whole group, whether or not a process outside the group maps it too. The path is in the key
+  because a file system can give two files one inode number on one device; a file with two names
+  counts twice, which can only raise the figure.
 - Every other resident page (anonymous memory, a page of a private file mapping that a process has
   written, a shared page with no inode) is counted for each process that maps it. Pages shared
   through a fork, or merged by the kernel, are counted for each process, so the figure can only be

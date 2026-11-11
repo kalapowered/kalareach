@@ -248,6 +248,25 @@ fn file_pages_are_identified_by_their_place_in_the_file_and_not_by_their_address
     assert_eq!(reading.own_kib, 0);
 }
 
+/// A file system can give two files one inode number on one device (btrfs subvolumes, overlay
+/// layers), so the device and inode do not tell them apart: the path is part of a file's identity,
+/// and two paths count as two files, which can only raise the figure.
+#[test]
+fn two_paths_with_one_device_and_inode_are_two_files() {
+    let mut first = Stand::new(120);
+    first.map(16, 4, 0, "00:2a", 7, "/mnt/one/kr-worker");
+    first.resident(16, 4, Page::File);
+    let mut second = Stand::new(121);
+    second.map(16, 4, 0, "00:2a", 7, "/mnt/two/kr-worker");
+    second.resident(16, 4, Page::File);
+    let (_dir, proc) = tree(&[first, second]);
+
+    let reading = proc.read(&group(&[120, 121])).expect("a reading");
+
+    assert_eq!(reading.files_kib, 2 * 4 * 4, "each path's pages count");
+    assert_eq!(reading.files.len(), 2, "as two files");
+}
+
 /// Only a page the kernel marks as a file page, of a mapping that has an inode, is shared. A
 /// private file page that was written, and shared memory with no inode, belong to each process.
 #[test]

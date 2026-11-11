@@ -6,8 +6,9 @@
 //! process of the group and counts, page by page:
 //!
 //! * a resident page the kernel marks as a file page or as shared memory (bit 61 of the page map's
-//!   entry) of a mapping that has an inode is identified by its device, inode and page of the file,
-//!   and counted once for the whole group, whether or not a process outside the group maps it too;
+//!   entry) of a mapping that has an inode is identified by its device, path, inode and page of the
+//!   file, and counted once for the whole group, whether or not a process outside the group maps it
+//!   too;
 //!   the one exception is the kernel's own objects (an `anon_inode:` file), whose inode number does
 //!   not name a file whose pages are shared;
 //! * every other resident page (anonymous memory, a page of a private file mapping that has been
@@ -373,8 +374,11 @@ struct Mapping {
     end: u64,
     /// The offset into the file the mapping starts at, in bytes.
     offset: u64,
-    /// The device and inode of the file, as the kernel names them.
-    device: String,
+    /// The device and inode of the file, as the kernel names them, and the path it names the
+    /// mapping by. A file system can give two files one inode number on one device (btrfs
+    /// subvolumes, overlay layers), so the device alone does not tell them apart; with the path in
+    /// the key two names for one file count twice, and that can only raise the figure.
+    file: String,
     inode: u64,
     path: String,
 }
@@ -401,14 +405,14 @@ impl Mapping {
             start: u64::from_str_radix(start, 16).ok()?,
             end: u64::from_str_radix(end, 16).ok()?,
             offset: u64::from_str_radix(offset, 16).ok()?,
-            device: device.to_owned(),
+            file: format!("{device} {path}"),
             inode: inode.parse().ok()?,
             path,
         })
     }
 }
 
-/// A page of a file: its device, inode and page number in the file.
+/// A page of a file: its device and path, inode and page number in the file.
 type FilePage = (String, u64, u64);
 
 /// What one scan of one process found.
@@ -569,9 +573,9 @@ impl Proc {
                     if entry & FILE_OR_SHARED != 0 && mapping.pages_are_of_a_shared_file() {
                         let page = mapping.offset / self.page_bytes + done + index as u64;
                         scan.files
-                            .insert((mapping.device.clone(), mapping.inode, page));
+                            .insert((mapping.file.clone(), mapping.inode, page));
                         scan.by_file
-                            .entry((mapping.device.clone(), mapping.inode))
+                            .entry((mapping.file.clone(), mapping.inode))
                             .or_insert_with(|| (mapping.path.clone(), 0))
                             .1 += 1;
                     } else {
@@ -662,7 +666,7 @@ impl Proc {
             .filter_map(|(file, once)| {
                 let (path, each) = each_by_file.remove(&file)?;
                 let path = if path.is_empty() {
-                    format!("inode {} on {}", file.1, file.0)
+                    format!("inode {} on {}", file.1, file.0.trim_end())
                 } else {
                     path
                 };
