@@ -4,6 +4,7 @@ import java.io.File
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeFalse
@@ -343,6 +344,115 @@ class PushReceiverTest {
         val read = JSONObject(record.read(now)!!)
         assertEquals("refused", read.getString("state"))
         assertEquals("gateway_403", read.getString("reason"))
+    }
+
+    // A process the system ends and starts again.
+
+    /** What ends the receiver's process in the middle of its post. */
+    private class ProcessEnded : RuntimeException("the system ended the process")
+
+    /**
+     * The Rust half's decision for this case, made from the record it is given and from nothing
+     * else: with no record, a record that is no longer pending, or a challenge for another
+     * registration, it refuses; and only the device's own key signs.
+     */
+    private class RecordDecidingCrypto : ChallengeCrypto {
+        override fun classify(input: String): String {
+            val read = JSONObject(input)
+            val record =
+                read.optJSONObject("pending") ?: return """{"verdict":"refused","reason":"no_pending"}"""
+            return when {
+                record.getString("state") != "pending" -> """{"verdict":"refused","reason":"state"}"""
+                record.getString("registration_id") !=
+                    read.getJSONObject("data").getString("kr_registration_id") ->
+                    """{"verdict":"refused","reason":"registration"}"""
+                else ->
+                    """{"verdict":"answer","url":"https://reach.kala.to/api/push/installation/register","seed_item":"device/device-key/authorisation"}"""
+            }
+        }
+
+        override fun sign(input: String, seed: ByteArray): String =
+            if (seed.all { it == 5.toByte() }) {
+                """{"ok":true,"url":"https://reach.kala.to/api/push/installation/register","body":"{}"}"""
+            } else {
+                """{"ok":false,"reason":"key"}"""
+            }
+    }
+
+    /** The state the record file holds, read from the file itself and not through the record. */
+    private fun stateOnDisk(directory: File) =
+        JSONObject(File(directory, PushStores.PENDING_FILE).readText(Charsets.UTF_8)).getString("state")
+
+    /**
+     * KR-REQ-13.24: lifecycle recovery with no page running. The system ends the receiver's
+     * process in the middle of posting the answer to a registration challenge. The scheduler's
+     * worker, in a process started later that holds nothing of the first, answers the same
+     * challenge from the stored record and the secure store alone, and the application's next
+     * start reads that the answer was taken. Every process builds its record, its secure store
+     * and its answerer from the files again, as the product's stores do; no page exists in any of
+     * them. Not shown here: the scheduler itself, which the instrumented cases run on a device.
+     */
+    @Test
+    fun aChallengeAnswerTheSystemEndedMidPostIsFinishedAfterTheRestartFromTheStoredStateAlone() {
+        val noBackup = folder.newFolder("no-backup")
+        // The Keystore key that seals the secure store outlives every process.
+        val keystoreKey = SoftwareSealer()
+        val authorisation = ByteArray(32) { 5 }
+        val message = mapOf("kr_challenge" to "x", "kr_registration_id" to registration)
+
+        // The application's earlier run: the record of the registration it waits for, and its key.
+        PushStores.pending(noBackup).write(pendingText())
+        PushStores.secrets(noBackup, keystoreKey).write("device/device-key/authorisation", authorisation.copyOf())
+
+        fun answererOfANewProcess(gateway: GatewayPost, beforePosting: () -> Unit = {}): ChallengeAnswerer {
+            val secrets = PushStores.secrets(noBackup, keystoreKey)
+            return ChallengeAnswerer(
+                PushStores.pending(noBackup),
+                RecordDecidingCrypto(),
+                { item -> secrets.read(item) },
+                gateway,
+                beforePosting
+            ) { now }
+        }
+
+        // The receiver's process: the answer is signed, the scheduler is handed it, and the process
+        // is ended before the post comes back.
+        var handedToTheScheduler: Map<String, String>? = null
+        var ended: ProcessEnded? = null
+        try {
+            answererOfANewProcess({ _, _ -> throw ProcessEnded() }) { handedToTheScheduler = message }
+                .answer(message)
+        } catch (failure: ProcessEnded) {
+            ended = failure
+        }
+        assertNotNull("the process was ended in the middle of the post", ended)
+        assertEquals("the scheduler was handed the answer before the post", message, handedToTheScheduler)
+        assertEquals("nothing says the registration was answered", "pending", stateOnDisk(noBackup))
+
+        // The scheduler's worker, later, in a process of its own.
+        val posted = mutableListOf<Pair<String, String>>()
+        val taking = GatewayPost { url, body ->
+            posted.add(url to body.toString(Charsets.UTF_8))
+            PostResult.Status(200)
+        }
+        assertEquals(ChallengeOutcome.Answered, answererOfANewProcess(taking).answer(handedToTheScheduler!!))
+        assertEquals(listOf("https://reach.kala.to/api/push/installation/register" to "{}"), posted)
+        assertEquals("answered", stateOnDisk(noBackup))
+
+        // The application's next start reads what became of the registration, and the key it signed
+        // with is still in the store: only the copy the answer used was cleared.
+        assertEquals("answered", stateOf(PushStores.pending(noBackup)))
+        assertEquals(
+            authorisation.toList(),
+            PushStores.secrets(noBackup, keystoreKey).read("device/device-key/authorisation")!!.toList()
+        )
+
+        // The scheduler's net, or the same push delivered again, finds the registration settled.
+        assertEquals(
+            ChallengeOutcome.Ignored("state"),
+            answererOfANewProcess(taking).answer(handedToTheScheduler!!)
+        )
+        assertEquals("nothing was posted a second time", 1, posted.size)
     }
 
     // The limited preview keys.
