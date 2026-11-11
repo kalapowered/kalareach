@@ -898,9 +898,25 @@ impl RemoteConnection {
             }
             Err(RouteRefusal::Conflict(error)) => return Err(error),
         }
-        let accepted = match self.check_envelope(mutation, entry, received_at, &decided) {
-            Ok(accepted) => accepted,
-            Err(error) => return Err(error),
+        let accepted = {
+            let authority = self.check_envelope(mutation, entry, &decided)?;
+            match self.accept_in_window(mutation, received_at, authority) {
+                Ok(accepted) => accepted,
+                // A finish or a cancel is two commits: a claim, and what the claim leads to. An
+                // exact repeat of one that an earlier connection began is the original request,
+                // window included, and on this connection that window admits nothing; what it is
+                // owed is what its claim says.
+                Err(refusal)
+                    if matches!(entry.method, Method::UploadFinish | Method::UploadCancel) =>
+                {
+                    return self
+                        .settle_a_repeat(
+                            mutation, entry, refusal, validated, &decided, asked, own_claim,
+                        )
+                        .await;
+                }
+                Err(refusal) => return Err(refusal),
+            }
         };
         // The last check this connection's own turn makes before the effect is admitted. It
         // guarantees nothing about what happens next: it releases the connection table before it
@@ -1827,6 +1843,7 @@ impl RemoteConnection {
                     },
                     own_claim,
                     on_stream,
+                    false,
                 )
                 .await
                 .map(|given| noting(&mut origin, given))?,
@@ -1860,6 +1877,68 @@ impl RemoteConnection {
 }
 
 impl RemoteConnection {
+    /// Answers an exact repeat of an upload finish or cancel whose window this connection never
+    /// issued, from what its action's claim says.
+    ///
+    /// A claim that is open is finished, and nothing else is begun. A claim that was settled gives
+    /// back the answer it was settled with, under the check any recorded answer is owed. An action
+    /// with no claim is a first admission, which has no window: it is refused for the window, and
+    /// told as a repeat's refusal when a copy of the request has been carried out or is on its way
+    /// ([`Self::told_of_a_repeat`]).
+    async fn settle_a_repeat(
+        &self,
+        mutation: &MutationRequest,
+        entry: &'static MethodEntry,
+        refusal: ProtocolError,
+        validated: kr_protocol::ids::AuthorityRevision,
+        decided: &Asked,
+        asked: &mut Option<Asked>,
+        own_claim: &OwnClaim,
+    ) -> std::result::Result<ControlFrame, ProtocolError> {
+        use crate::transfer::Settling;
+
+        let actor_id = self.device.principal();
+        match self
+            .controller
+            .transfer
+            .settles(&actor_id, mutation, entry.method)
+            .await
+        {
+            Settling::No => Err(refusal),
+            Settling::Answered(answer) => {
+                self.kept_answer(answer, entry.method, mutation, validated, decided, asked)
+                    .await
+            }
+            Settling::Open => {
+                let mut origin = Origin::Fresh;
+                let answer = self
+                    .transfer_write(
+                        mutation,
+                        entry.method,
+                        actor_id,
+                        crate::authority::AdmittedMutation {
+                            connection_id: self.connection_id(),
+                            admitted_revision: validated,
+                            deadline: None,
+                        },
+                        own_claim,
+                        None,
+                        true,
+                    )
+                    .await
+                    .map(|given| noting(&mut origin, given))?;
+                match origin {
+                    Origin::Fresh => Ok(answer),
+                    Origin::Copied => {
+                        self.kept_answer(answer, entry.method, mutation, validated, decided, asked)
+                            .await
+                    }
+                    Origin::Withheld => Err(self.withheld_answer(decided, asked)),
+                }
+            }
+        }
+    }
+
     /// The session an `upload.status` is decided over: the one the stored upload is bound to, and
     /// none for an upload that is bound to none, which is asked under the pairing grant.
     ///

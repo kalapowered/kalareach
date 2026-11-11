@@ -9,17 +9,18 @@ mod net_support;
 use std::time::Duration;
 
 use kr_crypto::keys::DeviceKeys;
-use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue};
-use kr_protocol::error::ProtocolError;
+use kr_controller::service::net::devices::DeviceRecord;
+use kr_protocol::envelope::{ControlFrame, MutationRequest, Outcome, ParamsValue};
+use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::{StreamHeader, StreamKind, StreamResource};
-use kr_protocol::ids::{ActionId, TransferId};
+use kr_protocol::ids::{ActionId, ActorId, TransferId};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Bytes, Digest256, Nullable, U64};
 use kr_protocol::transfer::{
-    ChunkDescriptor, ChunkLayout, UploadBeginParams, UploadBeginResult, UploadChunkParams,
-    UploadChunkResult, UploadFinishParams, UploadFinishResult, UploadState, UploadStatusParams,
-    UploadStatusResult,
+    ChunkDescriptor, ChunkLayout, UploadBeginParams, UploadBeginResult, UploadCancelParams,
+    UploadCancelResult, UploadChunkParams, UploadChunkResult, UploadFinishParams,
+    UploadFinishResult, UploadState, UploadStatusParams, UploadStatusResult,
 };
 use kr_transport::streams::DataStream;
 use net_support::{Device, Host, RawDevice, on_the_host};
@@ -30,9 +31,23 @@ const WAIT: Duration = Duration::from_secs(60);
 
 /// A paired device, its record and its connection.
 struct Paired {
-    /// Held so that the device's endpoint stays up as long as its connection.
-    _device: Device,
+    device: Device,
+    record: DeviceRecord,
     raw: RawDevice,
+}
+
+impl Paired {
+    /// The principal the host acts for this device under.
+    fn actor(&self) -> ActorId {
+        kr_transport::listener::device_principal(&self.record.device_id)
+    }
+
+    /// Connects the device again, as a device does that lost a connection.
+    async fn again(&self, host: &Host) -> RawDevice {
+        let raw = RawDevice::connect(host, &self.device, &self.record).await;
+        raw.claim();
+        raw
+    }
 }
 
 async fn paired(host: &Host, owner: &DeviceKeys, rights: &[ActionRight]) -> Paired {
@@ -41,7 +56,8 @@ async fn paired(host: &Host, owner: &DeviceKeys, rights: &[ActionRight]) -> Pair
     let raw = RawDevice::connect(host, &device, &record).await;
     raw.claim();
     Paired {
-        _device: device,
+        device,
+        record,
         raw,
     }
 }
@@ -179,6 +195,19 @@ fn chunk_frame(
     .1
 }
 
+/// Sends every chunk of `bytes` as part of `transfer`, on a stream the device opens for it.
+async fn send_every_chunk(host: &Host, raw: &RawDevice, transfer: TransferId, bytes: &[u8]) {
+    let mut stream = raw.open_stream(header(host, raw, transfer)).await;
+    for index in 0..ChunkLayout::for_length(bytes.len() as u64).chunk_count.get() {
+        ask(
+            &mut stream,
+            &chunk_frame(host, raw, transfer, bytes, index),
+        )
+        .await
+        .expect("the chunk is staged");
+    }
+}
+
 /// Sends `frame` on `stream` and returns the host's answer to it.
 async fn ask(
     stream: &mut DataStream,
@@ -263,6 +292,289 @@ async fn a_device_uploads_a_file_in_three_chunks_on_a_data_stream_and_publishes_
         status_of(&device.raw, empty.transfer_id).await.state,
         UploadState::Published
     );
+    device.raw.close();
+    host.stop().await;
+}
+
+/// The mutation a device would send, composed on `raw` and not sent.
+#[cfg(unix)]
+fn composed<P: serde::Serialize>(
+    raw: &RawDevice,
+    host: &Host,
+    method: Method,
+    params: &P,
+) -> MutationRequest {
+    match raw
+        .mutation_frame_for(
+            method,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_host(host),
+            params,
+        )
+        .1
+    {
+        ControlFrame::Mutation(mutation) => *mutation,
+        other => panic!("a mutation was expected: {other:?}"),
+    }
+}
+
+/// The transfer journal, opened beside the host's own handle on it.
+#[cfg(unix)]
+fn journal(host: &Host) -> kr_transfer::Store {
+    kr_transfer::Store::open(
+        kr_transfer::StagingArea::store_path(host.controller().paths()),
+        host.environment_id,
+    )
+    .expect("opens the transfer journal")
+}
+
+/// The claim `request` leaves when it is interrupted before it settles: its action, and no result.
+#[cfg(unix)]
+fn claim_of(
+    request: &MutationRequest,
+    actor: &ActorId,
+    transfer: TransferId,
+) -> kr_transfer::store::RetainedAction {
+    kr_transfer::store::RetainedAction {
+        payload_digest: kr_protocol::digest::mutation_digest(request, actor)
+            .expect("digests the mutation"),
+        actor_id: actor.clone(),
+        action_id: request.action_id.get(),
+        method: request.method.as_str().to_owned(),
+        subject: Some(transfer),
+        result: None,
+        failure: None,
+        recorded_at_ms: kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
+    }
+}
+
+/// Commits the claim a finish makes with its publication intent and nothing after it, as an
+/// interrupted finish leaves it: the journal says the publication began, and no handle is recorded.
+#[cfg(unix)]
+fn leave_a_publication_unrecorded(
+    host: &Host,
+    transfer: TransferId,
+    bytes: &[u8],
+    name: &str,
+    actor: &ActorId,
+    finish: &MutationRequest,
+) {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let staged = host
+        .controller()
+        .transfer()
+        .service()
+        .staging()
+        .incomplete()
+        .display_path()
+        .join(
+            kr_transfer::StorageName::derive(transfer, name)
+                .incomplete()
+                .expect("the payload's staged name")
+                .as_str(),
+        );
+    let metadata = std::fs::metadata(&staged).expect("the staged payload is there");
+    let claim = claim_of(finish, actor, transfer);
+    journal(host)
+        .begin_publish(
+            transfer,
+            &kr_transfer::store::Publication {
+                content_digest: digest(bytes),
+                payload_identity: kr_transfer::ObjectIdentity {
+                    device: metadata.dev(),
+                    file_id: metadata.ino(),
+                },
+                preview: None,
+                preview_unavailable: None,
+            },
+            claim.recorded_at_ms,
+            Some(&claim),
+        )
+        .expect("records the publication and its claim");
+}
+
+/// Commits the claim a cancel makes with the close of its upload and nothing after it, as an
+/// interrupted cancel leaves it: the upload is closed, its payload and its bytes are still there.
+#[cfg(unix)]
+fn leave_a_cancellation_unrecorded(
+    host: &Host,
+    transfer: TransferId,
+    actor: &ActorId,
+    cancel: &MutationRequest,
+) {
+    let claim = claim_of(cancel, actor, transfer);
+    journal(host)
+        .close_upload(
+            transfer,
+            UploadState::Cancelled,
+            None,
+            claim.recorded_at_ms,
+            Some(&claim),
+        )
+        .expect("records the close and its claim");
+}
+
+/// KR-REQ-14.12: a device that lost the answer to `upload.finish` reads the upload's status and is
+/// told it is published, with the handle and one file; the finish asked again, on a replacement
+/// connection and under the window the first connection issued, is answered from its record. A
+/// finish or a cancel that was interrupted between its two commits is settled by an exact repeat on
+/// a replacement connection, whose window admits nothing. The control is a finish and a cancel the
+/// host never admitted, which are refused for the window as a first admission is.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_finish_answer_is_resolved_and_an_interrupted_finish_or_cancel_is_settled_on_a_replacement_connection()
+ {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = paired(&host, &owner, &[ActionRight::FilesUpload]).await;
+    let service = host.controller().transfer().service();
+    let bytes = pattern(4096);
+    let finish_of = |transfer_id| UploadFinishParams {
+        transfer_id,
+        declared_byte_len: U64::new(bytes.len() as u64),
+        declared_digest: digest(&bytes),
+    };
+
+    // The answer to a finish is lost: the device asks for the upload's status, and for the finish
+    // again, on a connection of its own that never issued the window the finish was sent under.
+    let lost = begin_at_the_door(&device.raw, &host, &bytes, "lost.bin")
+        .await
+        .transfer_id;
+    send_every_chunk(&host, &device.raw, lost, &bytes).await;
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let window = device.raw.action_window_id();
+    let finished: UploadFinishResult = typed(
+        &device
+            .raw
+            .mutate(
+                Method::UploadFinish,
+                action,
+                on_the_host(&host),
+                &finish_of(lost),
+            )
+            .await
+            .expect("the host publishes the upload"),
+    );
+    let again = device.again(&host).await;
+    let status = status_of(&again, lost).await;
+    assert_eq!(status.state, UploadState::Published);
+    assert_eq!(status.handle.0.as_ref(), Some(&finished.handle));
+    let repeated: UploadFinishResult = typed(
+        &again
+            .mutate_in(
+                window,
+                Method::UploadFinish,
+                action,
+                on_the_host(&host),
+                &finish_of(lost),
+            )
+            .await
+            .expect("the repeat is answered from the record"),
+    );
+    assert_eq!(repeated, finished);
+    assert_eq!(
+        service.staged_byte_len().expect("the staged bytes"),
+        bytes.len() as u64,
+        "one file"
+    );
+
+    // A finish whose publication began and was never recorded is settled by its exact repeat.
+    let claimed = begin_at_the_door(&device.raw, &host, &bytes, "claimed.bin")
+        .await
+        .transfer_id;
+    send_every_chunk(&host, &device.raw, claimed, &bytes).await;
+    let finish = composed(
+        &device.raw,
+        &host,
+        Method::UploadFinish,
+        &finish_of(claimed),
+    );
+    leave_a_publication_unrecorded(&host, claimed, &bytes, "claimed.bin", &device.actor(), &finish);
+    let settled: UploadFinishResult = typed(
+        &again
+            .mutate_in(
+                finish.action_window_id.clone(),
+                Method::UploadFinish,
+                finish.action_id,
+                on_the_host(&host),
+                &finish_of(claimed),
+            )
+            .await
+            .expect("the repeat settles the publication"),
+    );
+    assert_eq!(settled.handle.transfer_id, claimed);
+    assert_eq!(settled.handle.content_digest, digest(&bytes));
+    assert_eq!(status_of(&again, claimed).await.state, UploadState::Published);
+
+    // The control: a finish this host never admitted gets no such allowance.
+    let never = begin_at_the_door(&device.raw, &host, &bytes, "never.bin")
+        .await
+        .transfer_id;
+    send_every_chunk(&host, &device.raw, never, &bytes).await;
+    let unsent = composed(&device.raw, &host, Method::UploadFinish, &finish_of(never));
+    let refusal = again
+        .mutate_in(
+            unsent.action_window_id.clone(),
+            Method::UploadFinish,
+            unsent.action_id,
+            on_the_host(&host),
+            &finish_of(never),
+        )
+        .await
+        .expect_err("a finish this host never admitted");
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied, "{refusal:?}");
+    assert_eq!(status_of(&again, never).await.state, UploadState::Receiving);
+
+    // A cancel whose upload was closed and whose payload is still held is settled the same way,
+    // and releases the bytes the upload reserved.
+    let closed = begin_at_the_door(&device.raw, &host, &bytes, "closed.bin")
+        .await
+        .transfer_id;
+    let cancel_params = UploadCancelParams {
+        transfer_id: closed,
+    };
+    let cancel = composed(&device.raw, &host, Method::UploadCancel, &cancel_params);
+    leave_a_cancellation_unrecorded(&host, closed, &device.actor(), &cancel);
+    let charged = service.staged_byte_len().expect("the staged bytes");
+    let released: UploadCancelResult = typed(
+        &again
+            .mutate_in(
+                cancel.action_window_id.clone(),
+                Method::UploadCancel,
+                cancel.action_id,
+                on_the_host(&host),
+                &cancel_params,
+            )
+            .await
+            .expect("the repeat settles the cancellation"),
+    );
+    assert_eq!(released.state, UploadState::Cancelled);
+    assert_eq!(released.released_byte_len.get(), bytes.len() as u64);
+    assert_eq!(
+        service.staged_byte_len().expect("the staged bytes"),
+        charged - bytes.len() as u64,
+        "the cancelled upload's bytes are released"
+    );
+
+    let kept = begin_at_the_door(&device.raw, &host, &bytes, "kept.bin")
+        .await
+        .transfer_id;
+    let kept_params = UploadCancelParams { transfer_id: kept };
+    let unsent = composed(&device.raw, &host, Method::UploadCancel, &kept_params);
+    let refusal = again
+        .mutate_in(
+            unsent.action_window_id.clone(),
+            Method::UploadCancel,
+            unsent.action_id,
+            on_the_host(&host),
+            &kept_params,
+        )
+        .await
+        .expect_err("a cancel this host never admitted");
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied, "{refusal:?}");
+    assert_eq!(status_of(&again, kept).await.state, UploadState::Receiving);
+    again.close();
     device.raw.close();
     host.stop().await;
 }
