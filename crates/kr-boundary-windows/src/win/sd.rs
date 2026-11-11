@@ -12,13 +12,19 @@
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
+use std::mem::size_of;
 use std::ptr::null_mut;
 
 use windows_sys::Win32::Foundation::LocalFree;
-use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+};
+use windows_sys::Win32::Security::{
+    ACE_HEADER, ACL, GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+    GetSecurityDescriptorOwner, SECURITY_ATTRIBUTES,
+};
 
-use super::ffi::{Result, Sid, error, last, wide};
+use super::ffi::{Handle, Result, Sid, error, last, wide};
 
 const SDDL_REVISION_1: u32 = 1;
 const ERROR_INVALID_PARAMETER: u32 = 87;
@@ -52,6 +58,9 @@ pub enum SdKind {
     /// A folder only the system and administrators may change, which every account may read and
     /// enter when the principals say so.
     AdminDir,
+    /// The volatile registry key that holds the identifier of the current boot: the system and the
+    /// administrators alone may do anything with it, and nobody else may even read it.
+    BootMarker,
 }
 
 /// The identities a descriptor names. A kind uses the ones it needs and refuses a descriptor
@@ -174,6 +183,7 @@ pub fn descriptor_text(kind: SdKind, principals: &Principals) -> Result<String> 
             ),
             None => format!("O:SYD:P(A;;{ALL_ACCESS};;;SY)"),
         }),
+        SdKind::BootMarker => Ok("O:SYD:P(A;;KA;;;SY)(A;;KA;;;BA)".to_owned()),
         SdKind::AdminDir => Ok(if principals.users_may_read {
             format!("D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;{READ_AND_ENTER};;;BU)")
         } else {
@@ -200,4 +210,173 @@ pub fn descriptor_from_text(text: &str) -> Result<OwnedSd> {
 /// descriptor.
 pub fn descriptor(kind: SdKind, principals: &Principals) -> Result<OwnedSd> {
     OwnedSd::from_text(descriptor_text(kind, principals)?)
+}
+
+/// One entry of a permission list, as an access check reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entry {
+    /// The entry's type: 0 allows, 1 denies.
+    pub kind: u8,
+    /// The entry's inheritance flags.
+    pub flags: u8,
+    /// The rights it names.
+    pub mask: u32,
+    /// Who it names, as text.
+    pub sid: String,
+}
+
+/// What a descriptor says that an access check uses: its owner, whether its list is protected from
+/// inheritance, and every entry in order. It is how the broker compares the descriptor an object
+/// ended up with against the one it asked for, without depending on how either is written as text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Summary {
+    /// The owner, as text.
+    pub owner: String,
+    /// Whether the list does not take entries from the parent.
+    pub protected: bool,
+    /// The entries, or none when the descriptor has no list.
+    pub entries: Option<Vec<Entry>>,
+}
+
+const SE_DACL_PROTECTED: u16 = 0x1000;
+const SE_FILE_OBJECT: i32 = 1;
+const SE_REGISTRY_KEY: i32 = 4;
+const OWNER_AND_DACL: u32 = 0x1 | 0x4;
+
+/// Reads the summary of a descriptor the platform gave.
+///
+/// # Safety
+///
+/// `descriptor` must point at a valid absolute or self-relative descriptor.
+unsafe fn summarise(descriptor: *mut c_void) -> Result<Summary> {
+    let mut owner: *mut c_void = null_mut();
+    let mut defaulted = 0;
+    // SAFETY: the caller promises the descriptor is valid; the out-parameters are local.
+    if unsafe { GetSecurityDescriptorOwner(descriptor, &raw mut owner, &raw mut defaulted) } == 0 {
+        return Err(last("reading a descriptor's owner"));
+    }
+    if owner.is_null() {
+        return Err(error(
+            ERROR_INVALID_PARAMETER,
+            "the descriptor has no owner",
+        ));
+    }
+    // SAFETY: the owner pointer is inside the valid descriptor.
+    let owner = unsafe { Sid::from_ptr(owner) }.to_text();
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    // SAFETY: as above.
+    if unsafe { GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) } == 0
+    {
+        return Err(last("reading a descriptor's flags"));
+    }
+    let mut present = 0;
+    let mut list: *mut ACL = null_mut();
+    // SAFETY: as above.
+    if unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor,
+            &raw mut present,
+            &raw mut list,
+            &raw mut defaulted,
+        )
+    } == 0
+    {
+        return Err(last("reading a descriptor's list"));
+    }
+    let entries = if present == 0 || list.is_null() {
+        None
+    } else {
+        // SAFETY: the list pointer is inside the valid descriptor.
+        let count = unsafe { (*list).AceCount };
+        let mut entries = Vec::new();
+        for index in 0..u32::from(count) {
+            let mut ace: *mut c_void = null_mut();
+            // SAFETY: the index is below the entry count.
+            if unsafe { GetAce(list, index, &raw mut ace) } == 0 {
+                return Err(last("reading a list entry"));
+            }
+            // SAFETY: an access-allowed or access-denied entry is a header, a mask and a
+            // identifier; the platform returned a pointer to a whole entry.
+            let (kind, flags, mask, sid) = unsafe {
+                let header = &*ace.cast::<ACE_HEADER>();
+                let mask = *ace.cast::<u8>().add(size_of::<ACE_HEADER>()).cast::<u32>();
+                let sid = ace
+                    .cast::<u8>()
+                    .add(size_of::<ACE_HEADER>() + 4)
+                    .cast::<c_void>();
+                (header.AceType, header.AceFlags, mask, Sid::from_ptr(sid))
+            };
+            entries.push(Entry {
+                kind,
+                flags,
+                mask,
+                sid: sid.to_text(),
+            });
+        }
+        Some(entries)
+    };
+    Ok(Summary {
+        owner,
+        protected: control & SE_DACL_PROTECTED != 0,
+        entries,
+    })
+}
+
+impl OwnedSd {
+    /// What the descriptor says, for comparing with what an object has.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform cannot read the descriptor.
+    pub fn summary(&self) -> Result<Summary> {
+        // SAFETY: the descriptor was built by the platform and lives as long as `self`.
+        unsafe { summarise(self.raw) }
+    }
+}
+
+/// What the descriptor of an open object says.
+///
+/// # Errors
+///
+/// Returns an error when the platform cannot read the object's descriptor.
+pub fn summary_of_handle(handle: &Handle) -> Result<Summary> {
+    summary_of_object(handle.raw(), SE_FILE_OBJECT)
+}
+
+/// What the descriptor of an open registry key says.
+///
+/// # Errors
+///
+/// Returns an error when the platform cannot read the key's descriptor.
+pub fn summary_of_key(key: *mut c_void) -> Result<Summary> {
+    summary_of_object(key, SE_REGISTRY_KEY)
+}
+
+fn summary_of_object(object: *mut c_void, kind: i32) -> Result<Summary> {
+    let mut descriptor: *mut c_void = null_mut();
+    // SAFETY: the handle is open with the right to read the descriptor; the out-parameter is local
+    // and the block it receives is freed below.
+    let code = unsafe {
+        GetSecurityInfo(
+            object,
+            kind,
+            OWNER_AND_DACL,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if code != 0 {
+        return Err(error(code, "reading an object's descriptor"));
+    }
+    // SAFETY: the call returned a valid descriptor, which is freed once after it is read.
+    let summary = unsafe { summarise(descriptor) };
+    // SAFETY: the block came from the platform's allocator.
+    unsafe {
+        LocalFree(descriptor);
+    }
+    summary
 }

@@ -4,6 +4,7 @@
 //! | Module | What it owns |
 //! | --- | --- |
 //! | `ffi` | Wide strings, owned handles, errors and identifiers |
+//! | `boot` | The identifier of the current start of Windows, in a volatile registry key |
 //! | `acl` | Permissions on files and directories |
 //! | `registry` | Values in the machine's registry |
 //! | `account` | The two boundary accounts, their rights and their sign-in |
@@ -15,6 +16,9 @@
 //! | `switch` | What the guest's test build can take back from a launch |
 //! | `verify` | The check that the payload was signed by the publisher |
 //! | `applocker` | PowerShell's application-control cmdlets and the event log |
+//! | `privilege` | The backup and restore privileges, held by one thread for one privileged action |
+//! | `root` | An invocation's private root: its creation and its removal |
+//! | `walk` | The anchored walk: objects reached by identifier from a held directory |
 //! | `pipe` | The broker's local pipe |
 //! | `proof` | The proof that the boundary is in force, and that it was released |
 //! | `broker` | The broker service |
@@ -24,17 +28,21 @@
 pub mod account;
 pub mod acl;
 pub mod applocker;
+pub mod boot;
 pub mod broker;
 pub mod ffi;
 pub mod install;
 pub mod job;
 pub mod launch;
 pub mod pipe;
+pub mod privilege;
 pub mod proof;
 pub mod registry;
+pub mod root;
 pub mod sd;
 pub mod service;
 pub mod setup;
 pub mod switch;
 pub mod token;
 pub mod verify;
+pub mod walk;
