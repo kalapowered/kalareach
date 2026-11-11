@@ -3025,8 +3025,12 @@ jobs:
         timeout-minutes: 35
         run: cargo test --locked -p kr-shell-integration --test pwsh --no-run
 
+      # The cases that depend on how the editor draws run under a byte locale and a UTF-8 locale,
+      # and a runner that lists no UTF-8 locale fails them instead of running the first alone.
       - name: Drive the PowerShell package through the contract
         timeout-minutes: 65
+        env:
+          KR_REQUIRE_UTF8_LOCALE: "1"
         run: cargo test --locked -p kr-shell-integration --test pwsh -- --test-threads=1 --include-ignored
 
   # The Zsh, Bash and Fish packages' cases on the macOS runner, against packages built here from
@@ -3049,8 +3053,9 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # What this runner is, printed before anything asserts on it: the locale variables it
-      # carries and the UTF-8 locales it lists are what the cases below run under. The build here
-      # is given one job per processor, as the macos job's builds are.
+      # carries, which the harness replaces for each shell it starts, and whether it lists the
+      # UTF-8 locale the cases run under. The build here is given one job per processor, as the
+      # macos job's builds are.
       - name: What this runner is
         timeout-minutes: 2
         run: |
@@ -3060,7 +3065,7 @@ jobs:
           echo "memory: $(( $(sysctl -n hw.memsize) / 1073741824 )) GiB"
           df -h /System/Volumes/Data
           echo "locale variables: $(env | grep -E '^(LANG|LC_)' | tr '\n' ' ')"
-          echo "UTF-8 locales listed: $(locale -a | grep -i -E 'utf-?8$' | head -5 | tr '\n' ' ')"
+          echo "UTF-8 locales listed: $(locale -a | grep -c -i -E 'utf-?8$'), en_US.UTF-8 among them: $(locale -a | grep -c -x 'en_US.UTF-8')"
           echo "CARGO_BUILD_JOBS=$(sysctl -n hw.logicalcpu)" >> "$GITHUB_ENV"
 
       - name: Install the pinned toolchain
@@ -3111,7 +3116,8 @@ jobs:
         timeout-minutes: 30
         run: |
           cargo test --locked -p kr-shell-integration \
-            --test zsh --test bash --test fish --test fish_sources --test module_abi --no-run
+            --test zsh --test bash --test fish --test fish_sources --test module_abi \
+            --test qualification --no-run
 
       # The same suites the release tree runs against the packages it built. A package that is
       # missing, or is not the one this tree gives, fails the case that needed it. The cases that

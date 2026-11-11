@@ -130,14 +130,14 @@ either. The core workflow's `shell-packages` job runs, on x86-64 Linux, the patc
 three packages, the upstream suites of Zsh and Bash (`--require-upstream-tests`), the contract
 suites of the packages, the startup customisations, the second Zsh build and the PowerShell
 package against a pinned PowerShell. The core workflow's `macos-powershell` job runs the PowerShell
-package's cases once more, on the macOS runner, against the same pinned release. The core
-workflow's `macos-shell-packages` job builds the Zsh, Bash and Fish packages on the macOS runner
-and, at every landing, runs the contract suites of the three, the Fish source checks, the
-native-module proof of Zsh and the case that compares each package with its pin. The cases that depend on how the editor
+package's cases once more, on the macOS runner, against the same pinned release. The core workflow's
+`macos-shell-packages` job builds the Zsh, Bash and Fish packages on the macOS runner and, at every
+landing, runs the contract suites of the three, the Fish source checks, the native-module proof of
+Zsh and the case that compares each package with its pin. The cases that depend on how the editor
 draws run under a byte locale and under a UTF-8 locale. Where `KR_REQUIRE_UTF8_LOCALE=1` is set, as
-it is in the `shell-packages` job, the `macos-shell-packages` job and the release tree's
-requalification, a runner that lists no UTF-8 locale fails those cases; without it the UTF-8 run is
-skipped and the log says so. Before a macOS or
+it is in the `shell-packages`, `macos-shell-packages` and `macos-powershell` jobs and in the release
+tree's requalification, a runner that lists no UTF-8 locale fails those cases; without it the UTF-8
+run is skipped and the log says so. Before a macOS or
 Linux release tree is assembled, each of its four targets builds the Zsh, Bash and Fish packages natively and runs the contract suites of
 the three, the Fish source checks, the native-module proof of Zsh and the case that compares each
 package with its pin, against the packages it just built; a failing suite stops the tree before
