@@ -581,6 +581,10 @@ async fn a_chunk_in_the_service_keeps_the_gate_after_its_connection_is_dropped()
 
     let again = device.again(&host).await;
     let mut waits = host.network().chunk_gate_waits();
+    // The newer frame's pass of the gate is where the case reads whether it has one: the host
+    // reaches it in the same step as it takes the gate, so a gate that was let go with the aborted
+    // task shows as an arrival here before the held chunk is released.
+    let (mut past_the_gate, go) = host.network().hold_chunks_after_the_gate();
     let mut newer = again.open_stream(header(&host, &again, transfer)).await;
     newer
         .write_message(&chunk_frame(&host, &again, transfer, &CHUNK))
@@ -592,10 +596,19 @@ async fn a_chunk_in_the_service_keeps_the_gate_after_its_connection_is_dropped()
         .expect("the count stays open");
     let (entered, enter) = module.pause_after_the_outer_check();
     assert!(
+        past_the_gate.try_recv().is_err(),
+        "the newer frame does not take the gate while the dropped connection's chunk is in the service"
+    );
+    assert!(
         entered.try_recv().is_err(),
         "the newer frame does not enter the service while the dropped connection's chunk is in it"
     );
     release.send(()).expect("the held chunk goes on");
+    tokio::time::timeout(WAIT, past_the_gate)
+        .await
+        .expect("the newer frame takes the gate once the chunk has left the service")
+        .expect("the hold is armed");
+    go.send(()).expect("the newer frame goes on");
     arrived(entered).await;
     enter.send(()).expect("the newer chunk goes on");
     answered(&mut newer)
@@ -607,10 +620,11 @@ async fn a_chunk_in_the_service_keeps_the_gate_after_its_connection_is_dropped()
 }
 
 /// KR-REQ-23.21: an older stream's task that read its frame before the replacement and takes the
-/// gate after it ends with no call into the service. The case holds the older at the gate, replaces
-/// its stream, and lets it go; the newer stream's chunk, different bytes for the same position, is
-/// then the one that is staged, and the upload stands: had the older entered the service its bytes
-/// would be staged first and the newer's would contradict them and invalidate the upload.
+/// gate after it ends with no call into the service. The case holds the older after the gate,
+/// replaces its stream (the newer's first frame waiting at the gate says it has), and lets the older
+/// go; the newer's own pass of the gate is held, so that nothing of the newer can be in the service
+/// while the case reads that the older never reached the service's entry. The newer stream's chunk,
+/// different bytes for the same position, is then the one that is staged, and the upload stands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_older_task_that_takes_the_gate_after_its_stream_was_replaced_calls_nothing() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -632,18 +646,39 @@ async fn an_older_task_that_takes_the_gate_after_its_stream_was_replaced_calls_n
         .expect("the older frame reaches the gate")
         .expect("the hold is armed");
 
+    let mut waits = host.network().chunk_gate_waits();
+    let (newer_at_the_gate, newer_go) = host.network().hold_chunks_after_the_gate();
+    let (entered, enter) = host.controller().transfer().pause_after_the_outer_check();
     let mut newer = device
         .raw
         .open_stream(header(&host, &device.raw, transfer))
         .await;
+    newer
+        .write_message(&chunk_frame(&host, &device.raw, transfer, &[2; 96]))
+        .await
+        .expect("the frame is written");
+    // The newer's first frame waits at the gate, which its stream's replacement of the older's
+    // precedes.
+    tokio::time::timeout(WAIT, waits.wait_for(|waits| *waits >= 2))
+        .await
+        .expect("the newer frame reaches the gate")
+        .expect("the count stays open");
     go.send(()).expect("the older task goes on");
     reset(&mut older).await;
-    ask(
-        &mut newer,
-        &chunk_frame(&host, &device.raw, transfer, &[2; 96]),
-    )
-    .await
-    .expect("the newer stream's chunk is served");
+    assert!(
+        entered.try_recv().is_err(),
+        "the older task made no call into the service"
+    );
+    tokio::time::timeout(WAIT, newer_at_the_gate)
+        .await
+        .expect("the newer frame takes the gate once the older has gone")
+        .expect("the hold is armed");
+    newer_go.send(()).expect("the newer frame goes on");
+    arrived(entered).await;
+    enter.send(()).expect("the newer chunk goes on");
+    answered(&mut newer)
+        .await
+        .expect("the newer stream's chunk is served");
     let status = host
         .controller()
         .transfer()
@@ -943,7 +978,7 @@ async fn the_loss_of_the_control_stream_ends_the_chunks_that_have_not_begun_thei
         0,
         "the chunk was refused at the ask, with its registration still in place"
     );
-    deregister.send(()).expect("the withdrawal goes on");
+    deregister.send(true).expect("the withdrawals go on");
     assert!(
         !matches!(next(&mut stream).await, Ok(Some(_))),
         "nothing is written to the stream of a lost connection"

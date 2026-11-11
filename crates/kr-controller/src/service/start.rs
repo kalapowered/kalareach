@@ -29,6 +29,8 @@ use super::{Clocks, Controller, net};
 
 #[cfg(test)]
 use super::BlockingPause;
+#[cfg(feature = "testing")]
+use super::DeregistrationHold;
 #[cfg(any(feature = "testing", test))]
 use super::ReadPause;
 
@@ -1219,7 +1221,7 @@ impl Controller {
             #[cfg(feature = "testing")]
             before_a_connection_is_registered: ReadPause::default(),
             #[cfg(feature = "testing")]
-            before_a_connection_is_deregistered: ReadPause::default(),
+            before_a_connection_is_deregistered: DeregistrationHold::default(),
             #[cfg(feature = "testing")]
             before_the_lease: ReadPause::default(),
             #[cfg(feature = "testing")]

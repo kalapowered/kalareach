@@ -1652,6 +1652,8 @@ impl Drop for ConnectionGuard {
         // neither can run in a destructor, so they run on a task that outlives the connection.
         tokio::spawn(async move {
             remote.release().await;
+            #[cfg(feature = "testing")]
+            controller.before_a_connection_is_deregistered.wait().await;
             controller.deregister(connection_id);
         });
     }
