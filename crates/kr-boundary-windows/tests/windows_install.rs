@@ -1398,6 +1398,46 @@ fn a_folder_above_the_program_directory_that_others_can_change_or_that_is_a_link
     let _ = std::fs::remove_dir_all(&folder);
 }
 
+/// The installation's places are the system's own, not what the environment of the session that
+/// runs the setup program says: an unelevated session of the same account can set its own
+/// variables, and the elevated installation runs the PowerShell and lays the programs down there.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_installation_takes_the_system_folders_from_the_system_and_not_from_the_environment() {
+    let names = ["ProgramFiles", "ProgramData", "SystemRoot", "windir"];
+    let before = Paths::system();
+    let saved: Vec<_> = names
+        .iter()
+        .map(|name| (*name, std::env::var_os(name)))
+        .collect();
+    for name in names {
+        // SAFETY: the guest's cases run on one test thread, and the variables are put back below.
+        unsafe { std::env::set_var(name, r"C:\Planted") };
+    }
+    let after = Paths::system();
+    let root = ffi::system_windows_directory();
+    for (name, value) in saved {
+        match value {
+            // SAFETY: as above.
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            // SAFETY: as above.
+            None => unsafe { std::env::remove_var(name) },
+        }
+    }
+    assert_eq!(after.program, before.program);
+    assert_eq!(after.data, before.data);
+    assert!(
+        !after.program.starts_with(r"C:\Planted"),
+        "{:?}",
+        after.program
+    );
+    assert!(!after.data.starts_with(r"C:\Planted"), "{:?}", after.data);
+    assert!(
+        !root.unwrap().starts_with(r"C:\Planted"),
+        "the Windows directory is the platform's"
+    );
+}
+
 /// With no manifest there is no installation whose records a leftover could be: a refusal of what
 /// is left says to remove it, and does not say to correct what cannot be corrected away.
 #[cfg(feature = "testing")]

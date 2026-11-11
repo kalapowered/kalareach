@@ -72,8 +72,12 @@ pub enum Error {
     Unreadable(String),
 }
 
+/// The system's Windows directory from the platform's own call, never from the environment: an
+/// unelevated session of the same account can set its own variables, and this installation runs
+/// the PowerShell found there elevated.
 fn system_root() -> PathBuf {
-    PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()))
+    super::ffi::system_windows_directory()
+        .map_or_else(|_| PathBuf::from(r"C:\Windows"), PathBuf::from)
 }
 
 /// Runs PowerShell, the installation's channel, and returns what it wrote.
