@@ -17,8 +17,8 @@ use crate::refusal::Refusal;
 pub const MAX_ATTRIBUTES_BYTES: usize = 1024 * 1024;
 
 /// The names of Git's built-in diff drivers, which select a hunk-header pattern and start no
-/// program. Taken from Git's attribute manual; the installed Git's own list is the one to confirm
-/// them against.
+/// program. These are the 25 names of the built-in hunk-header patterns in the attribute manual of
+/// Git for Windows 2.55.0.windows.5, the Git that Windows hosts use, in the manual's order.
 pub const BUILT_IN_DIFF_DRIVERS: &[&str] = &[
     "ada", "bash", "bibtex", "cpp", "csharp", "css", "dts", "elixir", "fortran", "fountain",
     "golang", "html", "java", "kotlin", "markdown", "matlab", "objc", "pascal", "perl", "php",
