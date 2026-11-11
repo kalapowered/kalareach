@@ -3329,8 +3329,10 @@ no session end between. Only the draft's own principal may end it: another devic
 owner's draft and a draft that is gone are all refused `INVALID_ARGUMENT` in the same words, so the
 refusal shows nothing of what exists. A draft that a prompt named, or one with an attachment
 `inserting`, `accepted_by_agent` or `unknown`, is refused `DRAFT_CONFLICT` and nothing is deleted,
-because those records show what the agent was offered or took: such a draft ends with its session.
-Attachments `recorded` or `failed` go with the draft, since nothing was offered from them. It never
+because those records show what the agent was offered or took: such a draft is kept.
+While this host cannot yet say that no earlier build's session was sent a draft, a draft that
+targets such a session, or holds an upload of one, is kept too. Attachments `recorded` or `failed`
+go with the draft, since nothing was offered from them. It never
 changes an upload: the bytes, their quota charge, the session an upload was bound to and its expiry
 stay as they are, and only `upload.cancel` of an upload still receiving frees bytes. It is an
 ordinary action write. The same action asked again, on the same connection or a replacement, is

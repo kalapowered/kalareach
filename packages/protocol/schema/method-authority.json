@@ -3446,7 +3446,7 @@
       "resource_selectors": [
         "draft"
       ],
-      "summary": "End a draft of the caller's own and release the places it holds. A draft a prompt named, or one an attachment of which the agent was offered, is refused and kept until its session ends. Uploads the draft bound are not changed.",
+      "summary": "End a draft of the caller's own and release the places it holds. A draft a prompt named, or one an attachment of which the agent was offered, is refused and kept as the record of what the agent was sent. Uploads the draft bound are not changed.",
       "version": 1
     },
     {
