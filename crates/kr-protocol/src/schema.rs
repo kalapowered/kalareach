@@ -256,9 +256,9 @@ use crate::transfer::{
     AttachmentHandle, AttachmentReadGrant, DownloadBeginParams, DownloadBeginResult,
     DownloadChunkParams, DownloadChunkResult, DownloadPlacement, DraftCreateParams,
     DraftCreateResult, DraftDiscardParams, DraftDiscardResult, DraftRecord, DraftUpdateParams,
-    DraftUpdateResult, UploadBeginParams, UploadBeginResult, UploadCancelParams, UploadCancelResult,
-    UploadChunkParams, UploadChunkResult, UploadFinishParams, UploadFinishResult,
-    UploadStatusParams, UploadStatusResult,
+    DraftUpdateResult, UploadBeginParams, UploadBeginResult, UploadCancelParams,
+    UploadCancelResult, UploadChunkParams, UploadChunkResult, UploadFinishParams,
+    UploadFinishResult, UploadStatusParams, UploadStatusResult,
 };
 use crate::update::{HostUpdateHandoverParams, HostUpdateHandoverResult};
 use crate::voice::{
