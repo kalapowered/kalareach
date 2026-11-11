@@ -1618,6 +1618,9 @@ impl<'a> Session<'a> {
         not: Option<ApplicationInstanceId>,
         commands: &[Slash],
     ) -> ApplicationInstanceId {
+        // From here the harness runs no `kr` and ends the host's processes by the identities it
+        // recorded: the agent runs in the same account and may leave anything in the run's state.
+        self.host.agent_starts();
         match &self.ctx.route {
             Route::StandIn => {
                 let _ = self.person.types_until_it_shows(
