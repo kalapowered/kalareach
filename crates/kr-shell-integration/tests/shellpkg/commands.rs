@@ -1662,181 +1662,187 @@ pub(super) fn after_the_first_line(session: &mut Session, kind: ShellKind) {
 /// finished, with the shell's own status for it, its duration and the directory it ran in. An
 /// empty line and the input a running command reads report none.
 pub fn each_line_reports_its_block_with_status_duration_and_directory(kind: ShellKind) {
-    let package = Package::built(kind);
-    let probes = Probes::new();
-    let mut session = a_session_with_probes(&package, &probes);
-    after_the_first_line(&mut session, kind);
+    in_each_locale(
+        kind,
+        "each_line_reports_its_block_with_status_duration_and_directory",
+        || {
+            let package = Package::built(kind);
+            let probes = Probes::new();
+            let mut session = a_session_with_probes(&package, &probes);
+            after_the_first_line(&mut session, kind);
 
-    let reported = session.commands.blocks.len();
-    let command = "kr-probe block; sh -c 'exit 3'";
-    assert!(session.run(command, "probe-ran"));
-    let entry = session.commands.last_line_reader().clone();
-    session.until("the line's finished block", |commands| {
-        commands.blocks[reported..]
-            .iter()
-            .any(|block| block.exit_status.0.is_some())
-    });
-    let blocks = session.commands.blocks[reported..].to_vec();
-    assert_eq!(
-        blocks.len(),
-        2,
-        "one block when the line started and one when it finished: {blocks:?}"
-    );
-    let (started, finished) = (&blocks[0], &blocks[1]);
-    assert_eq!(started.session_id, session.session_id);
-    assert_eq!(started.command, command);
-    assert_eq!(started.prompt_generation, entry.prompt_generation);
-    assert_eq!(started.cwd, told(&session.home()));
-    assert_eq!(started.cwd_revision, entry.cwd_revision);
-    assert!(
-        started.exit_status.0.is_none() && started.duration_ms.0.is_none(),
-        "a block that has just started has no status and no duration: {started:?}"
-    );
-    assert_eq!(finished.command, started.command);
-    assert_eq!(finished.prompt_generation, started.prompt_generation);
-    assert_eq!(finished.started_at_ms, started.started_at_ms);
-    assert_eq!(
-        finished.exit_status.0.map(|status| status.get()),
-        Some(3),
-        "the status the shell itself holds for the line"
-    );
-    assert!(finished.duration_ms.0.is_some(), "{finished:?}");
-    assert!(finished.completed_nonzero());
+            let reported = session.commands.blocks.len();
+            let command = "kr-probe block; sh -c 'exit 3'";
+            assert!(session.run(command, "probe-ran"));
+            let entry = session.commands.last_line_reader().clone();
+            session.until("the line's finished block", |commands| {
+                commands.blocks[reported..]
+                    .iter()
+                    .any(|block| block.exit_status.0.is_some())
+            });
+            let blocks = session.commands.blocks[reported..].to_vec();
+            assert_eq!(
+                blocks.len(),
+                2,
+                "one block when the line started and one when it finished: {blocks:?}"
+            );
+            let (started, finished) = (&blocks[0], &blocks[1]);
+            assert_eq!(started.session_id, session.session_id);
+            assert_eq!(started.command, command);
+            assert_eq!(started.prompt_generation, entry.prompt_generation);
+            assert_eq!(started.cwd, told(&session.home()));
+            assert_eq!(started.cwd_revision, entry.cwd_revision);
+            assert!(
+                started.exit_status.0.is_none() && started.duration_ms.0.is_none(),
+                "a block that has just started has no status and no duration: {started:?}"
+            );
+            assert_eq!(finished.command, started.command);
+            assert_eq!(finished.prompt_generation, started.prompt_generation);
+            assert_eq!(finished.started_at_ms, started.started_at_ms);
+            assert_eq!(
+                finished.exit_status.0.map(|status| status.get()),
+                Some(3),
+                "the status the shell itself holds for the line"
+            );
+            assert!(finished.duration_ms.0.is_some(), "{finished:?}");
+            assert!(finished.completed_nonzero());
 
-    // A line that succeeds reports that it did.
-    let reported = session.commands.blocks.len();
-    assert!(session.run("kr-probe fine", "probe-ran"));
-    session.until("the line's finished block", |commands| {
-        commands.blocks[reported..]
-            .iter()
-            .any(|block| block.exit_status.0.is_some())
-    });
-    let blocks = session.commands.blocks[reported..].to_vec();
-    assert_eq!(blocks.len(), 2, "{blocks:?}");
-    assert_eq!(blocks[1].exit_status.0.map(|status| status.get()), Some(0));
+            // A line that succeeds reports that it did.
+            let reported = session.commands.blocks.len();
+            assert!(session.run("kr-probe fine", "probe-ran"));
+            session.until("the line's finished block", |commands| {
+                commands.blocks[reported..]
+                    .iter()
+                    .any(|block| block.exit_status.0.is_some())
+            });
+            let blocks = session.commands.blocks[reported..].to_vec();
+            assert_eq!(blocks.len(), 2, "{blocks:?}");
+            assert_eq!(blocks[1].exit_status.0.map(|status| status.get()), Some(0));
 
-    // A continuation line is part of the line it continues: one block holds both.
-    let continuation = if kind == ShellKind::PowerShell {
-        "`"
-    } else {
-        "\\"
-    };
-    let reported = session.commands.blocks.len();
-    let start = session.written();
-    session.type_line(&format!("kr-probe joined {continuation}"));
-    if kind == ShellKind::PowerShell {
-        // The editor draws its own continuation prompt, and what is typed there is typed to the
-        // editor, which has not drawn the prompt a case waits for.
-        assert!(
-            session.drew_after(start, ">> ", REPLY).was_drawn(),
-            "the editor drew no continuation prompt:\n{}",
-            session.terminal_output()
-        );
-        let start = session.written();
-        session.type_bytes(b"continued\r");
-        assert!(
-            session.wait_for_output_after(start, "probe-ran", REPLY),
-            "the joined line did not run:\n{}",
-            session.terminal_output()
-        );
-        // The next prompt is the first one drawn after what the line printed.
-        session.mark = session
-            .last_shown("probe-ran")
-            .map_or_else(|| session.written(), |at| at + "probe-ran".len());
-    } else {
-        assert!(session.run("continued", "probe-ran"));
-    }
-    session.until("the joined line's finished block", |commands| {
-        commands.blocks[reported..]
-            .iter()
-            .any(|block| block.exit_status.0.is_some())
-    });
-    let finished = session.commands.blocks[reported..]
-        .iter()
-        .rev()
-        .find(|block| block.exit_status.0.is_some())
-        .cloned()
-        .expect("a finished block");
-    assert_eq!(
-        finished.command,
-        format!("kr-probe joined {continuation}\ncontinued")
-    );
-    assert_eq!(last_run(&probes).arguments, ["joined", "continued"]);
+            // A continuation line is part of the line it continues: one block holds both.
+            let continuation = if kind == ShellKind::PowerShell {
+                "`"
+            } else {
+                "\\"
+            };
+            let reported = session.commands.blocks.len();
+            let start = session.written();
+            session.type_line(&format!("kr-probe joined {continuation}"));
+            if kind == ShellKind::PowerShell {
+                // The editor draws its own continuation prompt, and what is typed there is typed to the
+                // editor, which has not drawn the prompt a case waits for.
+                assert!(
+                    session.drew_after(start, ">> ", REPLY).was_drawn(),
+                    "the editor drew no continuation prompt:\n{}",
+                    session.terminal_output()
+                );
+                let start = session.written();
+                session.type_bytes(b"continued\r");
+                assert!(
+                    session.wait_for_output_after(start, "probe-ran", REPLY),
+                    "the joined line did not run:\n{}",
+                    session.terminal_output()
+                );
+                // The next prompt is the first one drawn after what the line printed.
+                session.mark = session
+                    .last_shown("probe-ran")
+                    .map_or_else(|| session.written(), |at| at + "probe-ran".len());
+            } else {
+                assert!(session.run("continued", "probe-ran"));
+            }
+            session.until("the joined line's finished block", |commands| {
+                commands.blocks[reported..]
+                    .iter()
+                    .any(|block| block.exit_status.0.is_some())
+            });
+            let finished = session.commands.blocks[reported..]
+                .iter()
+                .rev()
+                .find(|block| block.exit_status.0.is_some())
+                .cloned()
+                .expect("a finished block");
+            assert_eq!(
+                finished.command,
+                format!("kr-probe joined {continuation}\ncontinued")
+            );
+            assert_eq!(last_run(&probes).arguments, ["joined", "continued"]);
 
-    // An empty line runs nothing and reports nothing: the next block is the next command's.
-    let reported = session.commands.blocks.len();
-    if dialect(kind).types_at_the_prompt {
-        // A return typed before this editor reads the terminal arrives through the terminal's own
-        // line discipline as a line feed, and whether the editor takes that for the empty line
-        // depends on the shell and on what the person bound to it. The line before has finished,
-        // which says nothing of whether the editor is reading again, so this waits for that as
-        // every other line does.
-        assert!(
-            session.wait_for_prompt(),
-            "the shell drew no prompt to type the empty line at:\n{}",
-            session.terminal_output()
-        );
-        assert!(
-            session.wait_for_editor_reading(),
-            "the editor never read the terminal at the prompt of the empty line:\n{}",
-            session.terminal_output()
-        );
-    }
-    session.type_line("");
-    let marker_command = print_assembled(kind, "kr-after-empty");
-    assert!(session.run(&marker_command, "kr-after-empty"));
-    session.until("the next command's finished block", |commands| {
-        commands.blocks[reported..]
-            .iter()
-            .any(|block| block.exit_status.0.is_some())
-    });
-    let blocks = session.commands.blocks[reported..].to_vec();
-    assert!(
-        blocks.iter().all(|block| block.command == marker_command),
-        "an empty line reported a block: {blocks:?}"
-    );
+            // An empty line runs nothing and reports nothing: the next block is the next command's.
+            let reported = session.commands.blocks.len();
+            if dialect(kind).types_at_the_prompt {
+                // A return typed before this editor reads the terminal arrives through the terminal's own
+                // line discipline as a line feed, and whether the editor takes that for the empty line
+                // depends on the shell and on what the person bound to it. The line before has finished,
+                // which says nothing of whether the editor is reading again, so this waits for that as
+                // every other line does.
+                assert!(
+                    session.wait_for_prompt(),
+                    "the shell drew no prompt to type the empty line at:\n{}",
+                    session.terminal_output()
+                );
+                assert!(
+                    session.wait_for_editor_reading(),
+                    "the editor never read the terminal at the prompt of the empty line:\n{}",
+                    session.terminal_output()
+                );
+            }
+            session.type_line("");
+            let marker_command = print_assembled(kind, "kr-after-empty");
+            assert!(session.run(&marker_command, "kr-after-empty"));
+            session.until("the next command's finished block", |commands| {
+                commands.blocks[reported..]
+                    .iter()
+                    .any(|block| block.exit_status.0.is_some())
+            });
+            let blocks = session.commands.blocks[reported..].to_vec();
+            assert!(
+                blocks.iter().all(|block| block.command == marker_command),
+                "an empty line reported a block: {blocks:?}"
+            );
 
-    // Input a running command reads through the editor is that command's, not a line of its
-    // own: the line that asked for it is the one block. This editor has no reader of that kind: a
-    // prompt a running line opens is the nested one the cases of its own drive.
-    if kind == ShellKind::PowerShell {
-        return controls_for_what_a_shell_cannot_see(&mut session, kind, &probes);
-    }
-    let reported = session.commands.blocks.len();
-    let entries = session.commands.entries.len();
-    let reading = reading_through_the_editor(kind);
-    session.type_line(reading);
-    // What is typed goes in once the reader the line starts is reading. Before that it goes to a
-    // terminal that is not that reader's yet: a shell may throw away what it finds there when it
-    // takes the terminal for the reader, or leave it queued with the reader that was reading
-    // before.
-    session.until("the reader the line starts", |commands| {
-        commands.entries[entries..]
-            .iter()
-            .any(|entry| entry.reader_context == ReaderContext::ReadBuiltin)
-    });
-    session.type_line("kr-typed-input");
-    session.until("the reading line's finished block", |commands| {
-        commands.blocks[reported..]
-            .iter()
-            .any(|block| block.command == reading && block.exit_status.0.is_some())
-    });
-    let commands: Vec<String> = session.commands.blocks[reported..]
-        .iter()
-        .map(|block| block.command.clone())
-        .collect();
-    assert!(
-        commands
-            .iter()
-            .all(|command| !command.contains("kr-typed-input")),
-        "the input a command read was reported as a line: {commands:?}"
-    );
-    assert!(
-        commands.iter().all(|command| command == reading),
-        "only the line that read the input is reported: {commands:?}"
-    );
+            // Input a running command reads through the editor is that command's, not a line of its
+            // own: the line that asked for it is the one block. This editor has no reader of that kind: a
+            // prompt a running line opens is the nested one the cases of its own drive.
+            if kind == ShellKind::PowerShell {
+                return controls_for_what_a_shell_cannot_see(&mut session, kind, &probes);
+            }
+            let reported = session.commands.blocks.len();
+            let entries = session.commands.entries.len();
+            let reading = reading_through_the_editor(kind);
+            session.type_line(reading);
+            // What is typed goes in once the reader the line starts is reading. Before that it goes to a
+            // terminal that is not that reader's yet: a shell may throw away what it finds there when it
+            // takes the terminal for the reader, or leave it queued with the reader that was reading
+            // before.
+            session.until("the reader the line starts", |commands| {
+                commands.entries[entries..]
+                    .iter()
+                    .any(|entry| entry.reader_context == ReaderContext::ReadBuiltin)
+            });
+            session.type_line("kr-typed-input");
+            session.until("the reading line's finished block", |commands| {
+                commands.blocks[reported..]
+                    .iter()
+                    .any(|block| block.command == reading && block.exit_status.0.is_some())
+            });
+            let commands: Vec<String> = session.commands.blocks[reported..]
+                .iter()
+                .map(|block| block.command.clone())
+                .collect();
+            assert!(
+                commands
+                    .iter()
+                    .all(|command| !command.contains("kr-typed-input")),
+                "the input a command read was reported as a line: {commands:?}"
+            );
+            assert!(
+                commands.iter().all(|command| command == reading),
+                "only the line that read the input is reported: {commands:?}"
+            );
 
-    controls_for_what_a_shell_cannot_see(&mut session, kind, &probes);
+            controls_for_what_a_shell_cannot_see(&mut session, kind, &probes);
+        },
+    );
 }
 
 /// What the shell cannot see into is still part of its line: a function, a pipeline, an `eval` and

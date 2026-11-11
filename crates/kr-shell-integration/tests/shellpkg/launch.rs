@@ -97,21 +97,23 @@ fn launch_prints_what_was_named(
 /// leaves it out of the arguments of a native program. The words around it are ones a shell might
 /// also take for an option or a marker, which a launch has to pass on as they are.
 pub fn a_launch_passes_every_word_it_is_given(kind: ShellKind) {
-    let package = Package::built(kind);
-    let mut session = Session::start(&package);
-    session.first_prompt();
-    session.forget_events();
-    assert!(session.answered("kr-ready"));
+    in_each_locale(kind, "a_launch_passes_every_word_it_is_given", || {
+        let package = Package::built(kind);
+        let mut session = Session::start(&package);
+        session.first_prompt();
+        session.forget_events();
+        assert!(session.answered("kr-ready"));
 
-    let program = argument_printer(&session);
-    launch_prints_what_was_named(&mut session, &program, &["--%"], 40, 0x81);
-    launch_prints_what_was_named(
-        &mut session,
-        &program,
-        &["a", "--%", "b", "--", "-", "-x:y", "--%x"],
-        41,
-        0x82,
-    );
+        let program = argument_printer(&session);
+        launch_prints_what_was_named(&mut session, &program, &["--%"], 40, 0x81);
+        launch_prints_what_was_named(
+            &mut session,
+            &program,
+            &["a", "--%", "b", "--", "-", "-x:y", "--%x"],
+            41,
+            0x82,
+        );
+    });
 }
 
 /// Words that name a function and an alias of this shell's own, each shadowing a program the
@@ -139,55 +141,61 @@ fn define_shadows(session: &mut Session) {
 /// of the same name would run in the program's place. The line shows what runs: the application's
 /// own path.
 pub fn a_launch_runs_the_application_and_not_a_function_or_alias_of_its_name(kind: ShellKind) {
-    let package = Package::built(kind);
-    let mut session = Session::start(&package);
-    session.first_prompt();
-    session.forget_events();
-    define_shadows(&mut session);
+    in_each_locale(
+        kind,
+        "a_launch_runs_the_application_and_not_a_function_or_alias_of_its_name",
+        || {
+            let package = Package::built(kind);
+            let mut session = Session::start(&package);
+            session.first_prompt();
+            session.forget_events();
+            define_shadows(&mut session);
 
-    let uname = std::process::Command::new("uname")
-        .arg("-s")
-        .output()
-        .expect("the system's uname");
-    let system = String::from_utf8_lossy(&uname.stdout).trim().to_owned();
-    assert!(!system.is_empty(), "the system's uname printed nothing");
+            let uname = std::process::Command::new("uname")
+                .arg("-s")
+                .output()
+                .expect("the system's uname");
+            let system = String::from_utf8_lossy(&uname.stdout).trim().to_owned();
+            assert!(!system.is_empty(), "the system's uname printed nothing");
 
-    for (vector, expected, prompt_seed, transaction_seed) in [
-        (
-            vec!["printf", "%s|", "one", "two"],
-            "one|two|".to_owned(),
-            50,
-            0x91,
-        ),
-        (vec!["uname", "-s"], system, 51, 0x92),
-    ] {
-        let before_install = session.written();
-        let decision = launch_vector(
-            &mut session,
-            vector.iter().map(|word| (*word).to_owned()).collect(),
-            prompt_seed,
-            transaction_seed,
-        );
-        assert!(
-            matches!(decision, LaunchDecision::Accepted(_)),
-            "an empty fenced prompt refused a launch of {vector:?}: {decision:?}"
-        );
-        session.nudge();
-        session.expect_event("command_accepted", |event| {
-            matches!(event, BridgeEvent::CommandAccepted(_))
-        });
-        assert!(
-            session
-                .drew_after(before_install, &expected, REPLY)
-                .was_drawn(),
-            "{vector:?} did not run the application of that name; wanted {expected}:\n{}",
-            session.terminal_output()
-        );
-    }
-    assert!(
-        !session.terminal_output().contains("kr-shadow-ran"),
-        "a function or an alias ran in the place of the program:\n{}",
-        session.terminal_output()
+            for (vector, expected, prompt_seed, transaction_seed) in [
+                (
+                    vec!["printf", "%s|", "one", "two"],
+                    "one|two|".to_owned(),
+                    50,
+                    0x91,
+                ),
+                (vec!["uname", "-s"], system, 51, 0x92),
+            ] {
+                let before_install = session.written();
+                let decision = launch_vector(
+                    &mut session,
+                    vector.iter().map(|word| (*word).to_owned()).collect(),
+                    prompt_seed,
+                    transaction_seed,
+                );
+                assert!(
+                    matches!(decision, LaunchDecision::Accepted(_)),
+                    "an empty fenced prompt refused a launch of {vector:?}: {decision:?}"
+                );
+                session.nudge();
+                session.expect_event("command_accepted", |event| {
+                    matches!(event, BridgeEvent::CommandAccepted(_))
+                });
+                assert!(
+                    session
+                        .drew_after(before_install, &expected, REPLY)
+                        .was_drawn(),
+                    "{vector:?} did not run the application of that name; wanted {expected}:\n{}",
+                    session.terminal_output()
+                );
+            }
+            assert!(
+                !session.terminal_output().contains("kr-shadow-ran"),
+                "a function or an alias ran in the place of the program:\n{}",
+                session.terminal_output()
+            );
+        },
     );
 }
 
@@ -196,58 +204,66 @@ pub fn a_launch_runs_the_application_and_not_a_function_or_alias_of_its_name(kin
 /// The refusal is the reader's own for a vector it cannot build a line from. A name that is only a
 /// function of this shell's own is such a name: the launch asked for a program.
 pub fn a_launch_of_a_name_that_is_no_application_is_refused_and_installs_nothing(kind: ShellKind) {
-    let package = Package::built(kind);
-    let mut session = Session::start(&package);
-    session.first_prompt();
-    session.forget_events();
-    define_shadows(&mut session);
+    in_each_locale(
+        kind,
+        "a_launch_of_a_name_that_is_no_application_is_refused_and_installs_nothing",
+        || {
+            let package = Package::built(kind);
+            let mut session = Session::start(&package);
+            session.first_prompt();
+            session.forget_events();
+            define_shadows(&mut session);
 
-    let (enter, fence) = session.fenced_prompt(52);
-    for (name, transaction_seed) in [("kr-only-a-function", 0x93), ("kr-no-such-program", 0x94)] {
-        let decision = launch_vector_at(
-            &mut session,
-            &enter,
-            &fence,
-            vec![name.to_owned()],
-            transaction_seed,
-        );
-        assert_eq!(
-            decision.rejection(),
-            Some(LaunchRejectionReason::BufferNotEmpty),
-            "{name} is no application, so nothing should have been installed: {decision:?}"
-        );
-    }
+            let (enter, fence) = session.fenced_prompt(52);
+            for (name, transaction_seed) in
+                [("kr-only-a-function", 0x93), ("kr-no-such-program", 0x94)]
+            {
+                let decision = launch_vector_at(
+                    &mut session,
+                    &enter,
+                    &fence,
+                    vec![name.to_owned()],
+                    transaction_seed,
+                );
+                assert_eq!(
+                    decision.rejection(),
+                    Some(LaunchRejectionReason::BufferNotEmpty),
+                    "{name} is no application, so nothing should have been installed: {decision:?}"
+                );
+            }
 
-    // Nothing was installed, so the same prompt takes the next launch.
-    let before_install = session.written();
-    let decision = launch_vector_at(
-        &mut session,
-        &enter,
-        &fence,
-        ["printf", "%s|", "three", "four"]
-            .map(str::to_owned)
-            .to_vec(),
-        0x95,
-    );
-    assert!(
-        matches!(decision, LaunchDecision::Accepted(_)),
-        "the refusals left something behind: {decision:?}"
-    );
-    session.nudge();
-    session.expect_event("command_accepted", |event| {
-        matches!(event, BridgeEvent::CommandAccepted(_))
-    });
-    assert!(
-        session
-            .drew_after(before_install, "three|four|", REPLY)
-            .was_drawn(),
-        "the launch after the refusals did not run:\n{}",
-        session.terminal_output()
-    );
-    assert!(
-        !session.terminal_output().contains("kr-function-ran"),
-        "a function ran in the place of a program:\n{}",
-        session.terminal_output()
+            // Nothing was installed, so the same prompt takes the next launch.
+            let before_install = session.written();
+            let decision = launch_vector_at(
+                &mut session,
+                &enter,
+                &fence,
+                ["printf", "%s|", "three", "four"]
+                    .map(str::to_owned)
+                    .to_vec(),
+                0x95,
+            );
+            assert!(
+                matches!(decision, LaunchDecision::Accepted(_)),
+                "the refusals left something behind: {decision:?}"
+            );
+            session.nudge();
+            session.expect_event("command_accepted", |event| {
+                matches!(event, BridgeEvent::CommandAccepted(_))
+            });
+            assert!(
+                session
+                    .drew_after(before_install, "three|four|", REPLY)
+                    .was_drawn(),
+                "the launch after the refusals did not run:\n{}",
+                session.terminal_output()
+            );
+            assert!(
+                !session.terminal_output().contains("kr-function-ran"),
+                "a function ran in the place of a program:\n{}",
+                session.terminal_output()
+            );
+        },
     );
 }
 
@@ -262,7 +278,11 @@ pub fn a_launch_of_a_name_that_is_no_application_is_refused_and_installs_nothing
 /// it unasked too, and no answer of the hook's may be taken for something that stands in for the
 /// program.
 pub fn a_launch_of_a_command_the_lookup_handler_asks_about_is_asked_about(kind: ShellKind) {
-    const HOOK: &str = r#"
+    in_each_locale(
+        kind,
+        "a_launch_of_a_command_the_lookup_handler_asks_about_is_asked_about",
+        || {
+            const HOOK: &str = r#"
 $global:KrProbeCalls = 0
 $ExecutionContext.InvokeCommand.CommandNotFoundAction = {
     param($CommandName, $EventArgs)
@@ -273,58 +293,60 @@ $ExecutionContext.InvokeCommand.CommandNotFoundAction = {
     }
 }
 "#;
-    for (hook, seed) in [("", 60), (HOOK, 62)] {
-        let package = Package::built(kind);
-        let probes = Probes::new();
-        let mut session = a_session_with_probes_and(&package, &probes, hook);
+            for (hook, seed) in [("", 60), (HOOK, 62)] {
+                let package = Package::built(kind);
+                let probes = Probes::new();
+                let mut session = a_session_with_probes_and(&package, &probes, hook);
 
-        let before = session.written();
-        let decision = launch_vector(
-            &mut session,
-            ["kr-probe", "one", "two words"].map(str::to_owned).to_vec(),
-            seed,
-            0xa1,
-        );
-        assert!(
-            matches!(decision, LaunchDecision::Accepted(_)),
-            "an empty fenced prompt refused a launch: {decision:?}"
-        );
-        session.nudge();
-        session.expect_event("command_accepted", |event| {
-            matches!(event, BridgeEvent::CommandAccepted(_))
-        });
-        assert!(
-            session.drew_after(before, "probe-ran", REPLY).was_drawn(),
-            "the program did not run:\n{}",
-            session.terminal_output()
-        );
-        let asked = &session.commands.resolves;
-        assert_eq!(
-            asked.len(),
-            1,
-            "a launch of a command the handler answers for was asked about {} times with the hook \
+                let before = session.written();
+                let decision = launch_vector(
+                    &mut session,
+                    ["kr-probe", "one", "two words"].map(str::to_owned).to_vec(),
+                    seed,
+                    0xa1,
+                );
+                assert!(
+                    matches!(decision, LaunchDecision::Accepted(_)),
+                    "an empty fenced prompt refused a launch: {decision:?}"
+                );
+                session.nudge();
+                session.expect_event("command_accepted", |event| {
+                    matches!(event, BridgeEvent::CommandAccepted(_))
+                });
+                assert!(
+                    session.drew_after(before, "probe-ran", REPLY).was_drawn(),
+                    "the program did not run:\n{}",
+                    session.terminal_output()
+                );
+                let asked = &session.commands.resolves;
+                assert_eq!(
+                    asked.len(),
+                    1,
+                    "a launch of a command the handler answers for was asked about {} times with the hook \
              {hook:?}: {asked:?}",
-            asked.len()
-        );
-        assert_eq!(asked[0].argv, ["kr-probe", "one", "two words"]);
-        assert_eq!(asked[0].executable, told(&probes.probe()));
-        assert!(
-            !session.terminal_output().contains("kr-hook-ran"),
-            "the hook's answer ran in the program's place:\n{}",
-            session.terminal_output()
-        );
-        // A program that is found never reaches the hook, whatever line starts it.
-        if !hook.is_empty() {
-            assert!(
-                session.run(
-                    "Write-Output ('kr-probe-calls-' + $global:KrProbeCalls)",
-                    "kr-probe-calls-0"
-                ),
-                "the hook was called for a program that is found:\n{}",
-                session.terminal_output()
-            );
-        }
-    }
+                    asked.len()
+                );
+                assert_eq!(asked[0].argv, ["kr-probe", "one", "two words"]);
+                assert_eq!(asked[0].executable, told(&probes.probe()));
+                assert!(
+                    !session.terminal_output().contains("kr-hook-ran"),
+                    "the hook's answer ran in the program's place:\n{}",
+                    session.terminal_output()
+                );
+                // A program that is found never reaches the hook, whatever line starts it.
+                if !hook.is_empty() {
+                    assert!(
+                        session.run(
+                            "Write-Output ('kr-probe-calls-' + $global:KrProbeCalls)",
+                            "kr-probe-calls-0"
+                        ),
+                        "the hook was called for a program that is found:\n{}",
+                        session.terminal_output()
+                    );
+                }
+            }
+        },
+    );
 }
 
 /// A command-not-found hook of the person's own: a name it answers is run by a script block of its
@@ -346,52 +368,58 @@ $ExecutionContext.InvokeCommand.CommandNotFoundAction = {
 /// line to install. A reader that read a path off it would fail with no answer at all, and the
 /// caller would be told the outcome is unknown for a launch that installed nothing.
 pub fn a_launch_of_a_name_only_a_lookup_hook_answers_is_refused(kind: ShellKind) {
-    let package = Package::built(kind);
-    let mut session = Session::start_with_environment_and_profile(
-        &package,
-        &[],
-        Profile {
-            after_entry: NOT_FOUND_HOOK,
-            ..Profile::ORDINARY
-        },
-    );
-    session.first_prompt();
-    session.forget_events();
-    assert!(session.answered("kr-ready"));
+    in_each_locale(
+        kind,
+        "a_launch_of_a_name_only_a_lookup_hook_answers_is_refused",
+        || {
+            let package = Package::built(kind);
+            let mut session = Session::start_with_environment_and_profile(
+                &package,
+                &[],
+                Profile {
+                    after_entry: NOT_FOUND_HOOK,
+                    ..Profile::ORDINARY
+                },
+            );
+            session.first_prompt();
+            session.forget_events();
+            assert!(session.answered("kr-ready"));
 
-    let (enter, fence) = session.fenced_prompt(61);
-    let decision = launch_vector_at(
-        &mut session,
-        &enter,
-        &fence,
-        vec!["kr-hooked".to_owned()],
-        0xa2,
-    );
-    assert_eq!(
-        decision.rejection(),
-        Some(LaunchRejectionReason::BufferNotEmpty),
-        "a name only a lookup hook answers is no application: {decision:?}"
-    );
-    // The reader is still answering: the same fence takes a launch that runs.
-    let before = session.written();
-    let decision = launch_vector_at(
-        &mut session,
-        &enter,
-        &fence,
-        ["printf", "%s|", "five", "six"].map(str::to_owned).to_vec(),
-        0xa3,
-    );
-    assert!(
-        matches!(decision, LaunchDecision::Accepted(_)),
-        "the refusal left the reader unable to take a launch: {decision:?}"
-    );
-    session.nudge();
-    session.expect_event("command_accepted", |event| {
-        matches!(event, BridgeEvent::CommandAccepted(_))
-    });
-    assert!(
-        session.drew_after(before, "five|six|", REPLY).was_drawn(),
-        "the launch after the refusal did not run:\n{}",
-        session.terminal_output()
+            let (enter, fence) = session.fenced_prompt(61);
+            let decision = launch_vector_at(
+                &mut session,
+                &enter,
+                &fence,
+                vec!["kr-hooked".to_owned()],
+                0xa2,
+            );
+            assert_eq!(
+                decision.rejection(),
+                Some(LaunchRejectionReason::BufferNotEmpty),
+                "a name only a lookup hook answers is no application: {decision:?}"
+            );
+            // The reader is still answering: the same fence takes a launch that runs.
+            let before = session.written();
+            let decision = launch_vector_at(
+                &mut session,
+                &enter,
+                &fence,
+                ["printf", "%s|", "five", "six"].map(str::to_owned).to_vec(),
+                0xa3,
+            );
+            assert!(
+                matches!(decision, LaunchDecision::Accepted(_)),
+                "the refusal left the reader unable to take a launch: {decision:?}"
+            );
+            session.nudge();
+            session.expect_event("command_accepted", |event| {
+                matches!(event, BridgeEvent::CommandAccepted(_))
+            });
+            assert!(
+                session.drew_after(before, "five|six|", REPLY).was_drawn(),
+                "the launch after the refusal did not run:\n{}",
+                session.terminal_output()
+            );
+        },
     );
 }

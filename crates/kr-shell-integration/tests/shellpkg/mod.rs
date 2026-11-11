@@ -1278,9 +1278,11 @@ impl Session {
         command.env("XDG_DATA_HOME", home.join(".local").join("share"));
         command.env("TERM", "xterm-256color");
         // `LC_ALL` is set with `LANG`: a run that inherits `LC_ALL` or `LC_CTYPE` would otherwise
-        // run the shell in that locale, whatever `LANG` says.
-        command.env("LANG", "C");
-        command.env("LC_ALL", "C");
+        // run the shell in that locale, whatever `LANG` says. The locale is the byte locale
+        // unless the case runs inside `in_each_locale`, which names the locale of each run.
+        let locale = locale_in_force();
+        command.env("LANG", &locale);
+        command.env("LC_ALL", &locale);
         if managed {
             command.env("KR_SESSION", session_id.to_string());
             command.env("KR_SHELL_BRIDGE", &endpoint.path);
@@ -1299,7 +1301,9 @@ impl Session {
                 command.env("KR_SHELL_BRIDGE_TRACE", trace);
             }
         }
-        // What the case itself names goes last, so a case that sets one of these is the one heard.
+        // What the case itself names goes last, so a variable a case sets replaces the one set
+        // above. `LC_ALL` outranks `LANG` and `LC_CTYPE`, so a case that needs another locale
+        // goes through `in_each_locale` and does not set those two.
         for (name, value) in environment {
             command.env(name, value);
         }

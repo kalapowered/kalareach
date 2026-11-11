@@ -1198,19 +1198,25 @@ pub fn a_reply_shaped_run_inside_a_bracketed_paste_is_pasted_whole(kind: ShellKi
 /// Panics when the typed text is not drawn.
 #[cfg(unix)]
 pub fn a_hosts_answer_behind_typed_text_leaves_the_text_drawn(kind: ShellKind) {
-    let package = Package::built(kind);
-    let mut session = Session::start(&package);
-    session.first_prompt();
-    session.forget_events();
-    assert!(session.answered("kr-ready"));
-    let _ = session.next_prompt();
-    let start = session.written();
-    let keys = format!("echo ab{}", HOST_ANSWERS[0]);
-    session.type_bytes(keys.as_bytes());
-    assert!(
-        session.drew_after(start, "echo ab", REPLY).was_drawn(),
-        "the text typed in front of the host's answer was not drawn:\n{}",
-        session.terminal_output()
+    in_each_locale(
+        kind,
+        "a_hosts_answer_behind_typed_text_leaves_the_text_drawn",
+        || {
+            let package = Package::built(kind);
+            let mut session = Session::start(&package);
+            session.first_prompt();
+            session.forget_events();
+            assert!(session.answered("kr-ready"));
+            let _ = session.next_prompt();
+            let start = session.written();
+            let keys = format!("echo ab{}", HOST_ANSWERS[0]);
+            session.type_bytes(keys.as_bytes());
+            assert!(
+                session.drew_after(start, "echo ab", REPLY).was_drawn(),
+                "the text typed in front of the host's answer was not drawn:\n{}",
+                session.terminal_output()
+            );
+        },
     );
 }
 
@@ -1234,14 +1240,14 @@ pub fn an_escape_and_a_hosts_answer_in_one_delivery_leave_the_escape_a_key(kind:
     in_each_locale(
         kind,
         "an_escape_and_a_hosts_answer_in_one_delivery_leave_the_escape_a_key",
-        |locale| {
-            let mut session = Session::start_in_locale(&package, locale);
+        || {
+            let mut session = Session::start(&package);
             session.first_prompt();
             let line = format!("printf '%s%s\\n' kr-ans ered\x1b{}bw", HOST_ANSWERS[0]);
             assert!(
                 session.run(&line, "kr-answered"),
                 "the Escape in front of the host's answer was not the Escape of the key that \
-                 followed, under the {locale} locale:\n{}",
+                 followed:\n{}",
                 session.terminal_output()
             );
         },
@@ -1261,9 +1267,9 @@ pub fn an_escape_and_a_hosts_answer_in_one_delivery_leave_the_escape_a_key(kind:
 ///
 /// The wait is for the mode's name, `cmd`, and not for the whole indicator `(cmd)`. A byte locale
 /// redraws the indicator with its parentheses, and a UTF-8 locale moves the cursor over the
-/// parentheses that stay and writes only what changed, so the whole indicator is never on the
-/// screen in one piece there. The case runs under each locale, named, whatever locale the run
-/// inherited.
+/// parentheses that stay and writes only what changed, so the whole indicator is never in the
+/// terminal's output in one piece there. The case runs under each locale, named, whatever locale
+/// the run inherited.
 ///
 /// # Panics
 ///
@@ -1274,30 +1280,34 @@ pub fn an_escape_and_a_hosts_answer_in_one_delivery_leave_vi_insert_mode(kind: S
     in_each_locale(
         kind,
         "an_escape_and_a_hosts_answer_in_one_delivery_leave_vi_insert_mode",
-        |locale| {
-            let mut session = Session::start_in_locale(&package, locale);
+        || {
+            let mut session = Session::start(&package);
             session.first_prompt();
             assert!(
                 session.run(
                     "set -o vi; bind 'set show-mode-in-prompt on'; printf '%s%s\\n' kr-vi- on",
                     "kr-vi-on"
                 ),
-                "the editor did not switch to vi bindings under the {locale} locale:\n{}",
+                "the editor did not switch to vi bindings:\n{}",
                 session.terminal_output()
             );
             let _ = session.next_prompt();
             let start = session.written();
             let keys = format!("printf '%s%s\\n' kr-\x1b{}", HOST_ANSWERS[0]);
+            // What was typed cannot draw the mode's name, so only the editor's own drawing can.
+            assert!(
+                !the_echo_could_draw(&keys, "cmd"),
+                "the typed keys can draw the mode's name by being echoed"
+            );
             session.type_bytes(keys.as_bytes());
             assert!(
                 session.drew_after(start, "cmd", REPLY).was_drawn(),
-                "the editor stayed in insert mode after an Escape with an answer behind it, \
-                 under the {locale} locale:\n{}",
+                "the editor stayed in insert mode after an Escape with an answer behind it:\n{}",
                 session.terminal_output()
             );
             assert!(
                 session.finish_line(&keys, "A ab", "kr-ab"),
-                "the line appended in command mode did not run under the {locale} locale:\n{}",
+                "the line appended in command mode did not run:\n{}",
                 session.terminal_output()
             );
         },
@@ -2494,69 +2504,75 @@ pub fn keys_typed_ahead_of_a_read_in_the_windows_edit_mode_are_the_persons_own(k
 pub fn a_read_with_no_key_of_the_modules_own_reports_idle_only_once_its_editor_has_the_cursors_reply(
     kind: ShellKind,
 ) {
-    // Control characters, which no runtime splits or reads as the start of a sequence.
-    const PREVIOUS_HISTORY: &[u8] = b"\x10";
-    const ACCEPT_AND_GET_NEXT: &[u8] = b"\x0f";
-    const FORWARD_CHARACTER: &[u8] = b"\x06";
-    let package = Package::built(kind);
-    let mut session = Session::start(&package);
-    session.first_prompt();
-    session.stepping = false;
-    for entry in ["aaa1", "bbb2"] {
-        let marker = format!("kr-idle-{entry}");
-        assert!(
-            session.run(&print_assembled(kind, &marker), &marker),
-            "a line of the history did not run:\n{}",
-            session.terminal_output()
-        );
-    }
-    assert!(
-        session.wait_for_prompt() && session.wait_for_editor_reading(),
-        "the shell drew no prompt to recall a line at:\n{}",
-        session.terminal_output()
-    );
-    // Two steps back in the history recall the first line, and accepting it with accept-and-get-next
-    // loads the second at the next prompt.
-    let recalled = session.written();
-    session.type_bytes(PREVIOUS_HISTORY);
-    session.type_bytes(PREVIOUS_HISTORY);
-    // The editor draws a line in colours, so the recalled line is not one run of text: the end of
-    // its first entry is.
-    assert!(
-        session.drew_after(recalled, "aa1'", REPLY).was_drawn(),
-        "the history did not recall the first line:\n{}",
-        shown_since(&session, recalled)
-    );
-    session.forget_events();
-    session.mark = session.written();
-    session.type_bytes(ACCEPT_AND_GET_NEXT);
-    let enter = session.next_prompt();
-    assert!(
-        session.wait_for_prompt() && session.wait_for_editor_reading(),
-        "the editor asked the terminal nothing at the prompt after the recalled line:\n{}",
-        session.terminal_output()
-    );
-    // A report from the read's entry comes before the editor asks, so it is on the endpoint by now.
-    session.take_in_what_has_arrived();
-    assert!(
-        !session.events.waiting().contains(&"reader_idle"),
-        "the reader reported itself idle before any key had run in a read the module queued no key \
+    in_each_locale(
+        kind,
+        "a_read_with_no_key_of_the_modules_own_reports_idle_only_once_its_editor_has_the_cursors_reply",
+        || {
+            // Control characters, which no runtime splits or reads as the start of a sequence.
+            const PREVIOUS_HISTORY: &[u8] = b"\x10";
+            const ACCEPT_AND_GET_NEXT: &[u8] = b"\x0f";
+            const FORWARD_CHARACTER: &[u8] = b"\x06";
+            let package = Package::built(kind);
+            let mut session = Session::start(&package);
+            session.first_prompt();
+            session.stepping = false;
+            for entry in ["aaa1", "bbb2"] {
+                let marker = format!("kr-idle-{entry}");
+                assert!(
+                    session.run(&print_assembled(kind, &marker), &marker),
+                    "a line of the history did not run:\n{}",
+                    session.terminal_output()
+                );
+            }
+            assert!(
+                session.wait_for_prompt() && session.wait_for_editor_reading(),
+                "the shell drew no prompt to recall a line at:\n{}",
+                session.terminal_output()
+            );
+            // Two steps back in the history recall the first line, and accepting it with accept-and-get-next
+            // loads the second at the next prompt.
+            let recalled = session.written();
+            session.type_bytes(PREVIOUS_HISTORY);
+            session.type_bytes(PREVIOUS_HISTORY);
+            // The editor draws a line in colours, so the recalled line is not one run of text: the end of
+            // its first entry is.
+            assert!(
+                session.drew_after(recalled, "aa1'", REPLY).was_drawn(),
+                "the history did not recall the first line:\n{}",
+                shown_since(&session, recalled)
+            );
+            session.forget_events();
+            session.mark = session.written();
+            session.type_bytes(ACCEPT_AND_GET_NEXT);
+            let enter = session.next_prompt();
+            assert!(
+                session.wait_for_prompt() && session.wait_for_editor_reading(),
+                "the editor asked the terminal nothing at the prompt after the recalled line:\n{}",
+                session.terminal_output()
+            );
+            // A report from the read's entry comes before the editor asks, so it is on the endpoint by now.
+            session.take_in_what_has_arrived();
+            assert!(
+                !session.events.waiting().contains(&"reader_idle"),
+                "the reader reported itself idle before any key had run in a read the module queued no key \
          for, which is before its editor had the reply to its question about the cursor: \
          {:?}\n{}",
-        session.events.waiting(),
-        session.terminal_output()
-    );
+                session.events.waiting(),
+                session.terminal_output()
+            );
 
-    session.type_bytes(FORWARD_CHARACTER);
-    session.expect_event(
-        "an idle report from the key the person pressed once the editor has the reply",
-        |event| {
-            matches!(
-                event,
-                BridgeEvent::ReaderIdle(idle)
-                    if idle.prompt_generation == enter.prompt_generation
-                        && idle.reader_revision == enter.reader_revision
-            )
+            session.type_bytes(FORWARD_CHARACTER);
+            session.expect_event(
+                "an idle report from the key the person pressed once the editor has the reply",
+                |event| {
+                    matches!(
+                        event,
+                        BridgeEvent::ReaderIdle(idle)
+                            if idle.prompt_generation == enter.prompt_generation
+                                && idle.reader_revision == enter.reader_revision
+                    )
+                },
+            );
         },
     );
 }
@@ -2641,19 +2657,23 @@ pub fn a_dropped_answer_does_not_wait_for_the_rest_of_a_character_the_terminal_h
 /// older line.
 #[cfg(unix)]
 pub fn a_history_search_goes_on_across_a_line_accepted_with_accept_and_get_next(kind: ShellKind) {
-    // Control characters, which no runtime splits or reads as the start of a sequence.
-    const SEARCH_BACKWARD: &[u8] = b"\x0c";
-    const ACCEPT_AND_GET_NEXT: &[u8] = b"\x0f";
-    let package = Package::built(kind);
-    let mut session = Session::start(&package);
-    session.first_prompt();
-    // The case gives the reader no step. A step is a key, and any key the editor runs between the
-    // search and the acceptance, or ahead of the next search, ends the very thing the case looks
-    // at: the editor forgets the recalled line's place in the history after the first, and the
-    // search chain after the second.
-    session.stepping = false;
-    let bound = "kr-chain-bound";
-    assert!(
+    in_each_locale(
+        kind,
+        "a_history_search_goes_on_across_a_line_accepted_with_accept_and_get_next",
+        || {
+            // Control characters, which no runtime splits or reads as the start of a sequence.
+            const SEARCH_BACKWARD: &[u8] = b"\x0c";
+            const ACCEPT_AND_GET_NEXT: &[u8] = b"\x0f";
+            let package = Package::built(kind);
+            let mut session = Session::start(&package);
+            session.first_prompt();
+            // The case gives the reader no step. A step is a key, and any key the editor runs between the
+            // search and the acceptance, or ahead of the next search, ends the very thing the case looks
+            // at: the editor forgets the recalled line's place in the history after the first, and the
+            // search chain after the second.
+            session.stepping = false;
+            let bound = "kr-chain-bound";
+            assert!(
         session.run(
             &format!(
                 "Set-PSReadLineKeyHandler -Chord Ctrl+l -Function HistorySearchBackward; {}",
@@ -2664,68 +2684,70 @@ pub fn a_history_search_goes_on_across_a_line_accepted_with_accept_and_get_next(
         "the search key was not bound:\n{}",
         session.terminal_output()
     );
-    for entry in ["aaa1", "bbb2", "aaa3", "ccc4"] {
-        let marker = format!("kr-chain-{entry}");
-        assert!(
-            session.run(&print_assembled(kind, &marker), &marker),
-            "a line of the history did not run:\n{}",
-            session.terminal_output()
-        );
-    }
+            for entry in ["aaa1", "bbb2", "aaa3", "ccc4"] {
+                let marker = format!("kr-chain-{entry}");
+                assert!(
+                    session.run(&print_assembled(kind, &marker), &marker),
+                    "a line of the history did not run:\n{}",
+                    session.terminal_output()
+                );
+            }
 
-    // The first and the third entry begin with the prefix typed here, and the search recalls the
-    // later of them, the third.
-    assert!(
-        session.wait_for_prompt() && session.wait_for_editor_reading(),
-        "the shell drew no prompt to search at:\n{}",
-        session.terminal_output()
-    );
-    let searched = session.written();
-    session.type_bytes(b"Write-Output ('kr-chain-' + 'a");
-    session.type_bytes(SEARCH_BACKWARD);
-    // The editor draws the prefix a search started from in a colour of its own, so the recalled
-    // line is not one run of text: the end of its third entry is.
-    assert!(
-        session.drew_after(searched, "aa3'", REPLY).was_drawn(),
-        "the search did not recall the third entry:\n{}",
-        shown_since(&session, searched)
-    );
+            // The first and the third entry begin with the prefix typed here, and the search recalls the
+            // later of them, the third.
+            assert!(
+                session.wait_for_prompt() && session.wait_for_editor_reading(),
+                "the shell drew no prompt to search at:\n{}",
+                session.terminal_output()
+            );
+            let searched = session.written();
+            session.type_bytes(b"Write-Output ('kr-chain-' + 'a");
+            session.type_bytes(SEARCH_BACKWARD);
+            // The editor draws the prefix a search started from in a colour of its own, so the recalled
+            // line is not one run of text: the end of its third entry is.
+            assert!(
+                session.drew_after(searched, "aa3'", REPLY).was_drawn(),
+                "the search did not recall the third entry:\n{}",
+                shown_since(&session, searched)
+            );
 
-    // Accepting it loads the entry after it, the fourth, at the next prompt.
-    session.mark = session.written();
-    let accepted = session.written();
-    session.type_bytes(ACCEPT_AND_GET_NEXT);
-    let deadline = session.deadline_for(REPLY);
-    assert!(
-        session.wait_for_output_after_by(accepted, "kr-chain-aaa3", deadline),
-        "the recalled line did not run:\n{}",
-        session.terminal_output()
-    );
-    assert!(
-        session.wait_for_prompt() && session.wait_for_editor_reading(),
-        "the shell drew no prompt after the recalled line:\n{}",
-        session.terminal_output()
-    );
+            // Accepting it loads the entry after it, the fourth, at the next prompt.
+            session.mark = session.written();
+            let accepted = session.written();
+            session.type_bytes(ACCEPT_AND_GET_NEXT);
+            let deadline = session.deadline_for(REPLY);
+            assert!(
+                session.wait_for_output_after_by(accepted, "kr-chain-aaa3", deadline),
+                "the recalled line did not run:\n{}",
+                session.terminal_output()
+            );
+            assert!(
+                session.wait_for_prompt() && session.wait_for_editor_reading(),
+                "the shell drew no prompt after the recalled line:\n{}",
+                session.terminal_output()
+            );
 
-    assert!(
-        session.drew_after(accepted, "ccc4", REPLY).was_drawn(),
-        "the editor did not load the entry after the accepted line at the next prompt:\n{}",
-        shown_since(&session, accepted)
-    );
-    session.mark = session.written();
-    let continued = session.written();
-    session.type_bytes(SEARCH_BACKWARD);
-    session.type_bytes(b"\r");
-    assert!(
-        session.wait_for_prompt(),
-        "the line the search recalled did not run:\n{}",
-        session.terminal_output()
-    );
-    let shown = shown_since(&session, continued);
-    assert!(
-        shown.contains("kr-chain-aaa3") && !shown.contains("kr-chain-ccc4"),
-        "the search at the next prompt began again from the line the editor loaded, so something \
+            assert!(
+                session.drew_after(accepted, "ccc4", REPLY).was_drawn(),
+                "the editor did not load the entry after the accepted line at the next prompt:\n{}",
+                shown_since(&session, accepted)
+            );
+            session.mark = session.written();
+            let continued = session.written();
+            session.type_bytes(SEARCH_BACKWARD);
+            session.type_bytes(b"\r");
+            assert!(
+                session.wait_for_prompt(),
+                "the line the search recalled did not run:\n{}",
+                session.terminal_output()
+            );
+            let shown = shown_since(&session, continued);
+            assert!(
+                shown.contains("kr-chain-aaa3") && !shown.contains("kr-chain-ccc4"),
+                "the search at the next prompt began again from the line the editor loaded, so something \
          ended the chain the accepted line left:\n{shown}"
+            );
+        },
     );
 }
 
@@ -3015,118 +3037,126 @@ pub fn an_eligible_gesture_under_a_fence_is_an_attributable_detach(kind: ShellKi
 
 /// KR-REQ-07.71, KR-REQ-07.72, and `eof-missing-fence`, `eof-stale-fence`, `eof-repeated-after-detach`.
 pub fn an_unattributable_gesture_is_consumed_with_one_hint_per_prompt(kind: ShellKind) {
-    let package = Package::built(kind);
-    let mut session = Session::start(&package);
-    session.first_prompt();
-    session.forget_events();
-    assert!(session.answered("kr-ready"));
-    let enter = session.next_prompt();
+    in_each_locale(
+        kind,
+        "an_unattributable_gesture_is_consumed_with_one_hint_per_prompt",
+        || {
+            let package = Package::built(kind);
+            let mut session = Session::start(&package);
+            session.first_prompt();
+            session.forget_events();
+            assert!(session.answered("kr-ready"));
+            let enter = session.next_prompt();
 
-    // What the hint is, is what the screen shows, so this is a display observation and carries no
-    // claim that anything ran. The boundary is taken before the key, so a hint an earlier prompt
-    // printed is not this one's.
-    let before_first = session.written();
-    session.type_bytes(CTRL_D);
-    let (_, first) = session.expect_event("pre_eof_consumed", |event| {
-        matches!(event, BridgeEvent::PreEofConsumed(_))
-    });
-    let BridgeEvent::PreEofConsumed(first) = first else {
-        unreachable!()
-    };
-    assert_eq!(first.reason, ConsumeReason::FenceMissing);
-    assert!(first.hint_printed);
-    assert_eq!(first.prompt_generation, enter.prompt_generation);
-    assert!(
-        session
-            .drew_after(before_first, DETACH_HINT, REPLY)
-            .was_drawn(),
-        "the hint was not printed:\n{}",
-        session.terminal_output()
-    );
-    let after_first = session.terminal_output().matches(DETACH_HINT).count();
-    if kind == ShellKind::Fish {
-        // Counted in the terminal's own bytes, which is what the wait below counts in.
-        let hint_pos = session
-            .last_shown(DETACH_HINT)
-            .expect("the hint the check above saw drawn");
-        let prompt = session.prompt.clone();
-        assert!(
-            session.wait_for_output_after(hint_pos, &prompt, REPLY),
-            "the prompt was not redrawn after the hint:\n{}",
-            session.terminal_output()
-        );
-    }
+            // What the hint is, is what the screen shows, so this is a display observation and carries no
+            // claim that anything ran. The boundary is taken before the key, so a hint an earlier prompt
+            // printed is not this one's.
+            let before_first = session.written();
+            session.type_bytes(CTRL_D);
+            let (_, first) = session.expect_event("pre_eof_consumed", |event| {
+                matches!(event, BridgeEvent::PreEofConsumed(_))
+            });
+            let BridgeEvent::PreEofConsumed(first) = first else {
+                unreachable!()
+            };
+            assert_eq!(first.reason, ConsumeReason::FenceMissing);
+            assert!(first.hint_printed);
+            assert_eq!(first.prompt_generation, enter.prompt_generation);
+            assert!(
+                session
+                    .drew_after(before_first, DETACH_HINT, REPLY)
+                    .was_drawn(),
+                "the hint was not printed:\n{}",
+                session.terminal_output()
+            );
+            let after_first = session.terminal_output().matches(DETACH_HINT).count();
+            if kind == ShellKind::Fish {
+                // Counted in the terminal's own bytes, which is what the wait below counts in.
+                let hint_pos = session
+                    .last_shown(DETACH_HINT)
+                    .expect("the hint the check above saw drawn");
+                let prompt = session.prompt.clone();
+                assert!(
+                    session.wait_for_output_after(hint_pos, &prompt, REPLY),
+                    "the prompt was not redrawn after the hint:\n{}",
+                    session.terminal_output()
+                );
+            }
 
-    session.type_bytes(CTRL_D);
-    let (_, second) = session.expect_event("a second pre_eof_consumed", |event| {
-        matches!(event, BridgeEvent::PreEofConsumed(_))
-    });
-    let BridgeEvent::PreEofConsumed(second) = second else {
-        unreachable!()
-    };
-    assert!(
-        !second.hint_printed,
-        "the hint is printed at most once per prompt"
-    );
-    assert_eq!(
-        session.terminal_output().matches(DETACH_HINT).count(),
-        after_first,
-        "a second gesture at one prompt printed the hint again"
-    );
-    assert!(session.alive(), "an unattributable gesture ended the shell");
+            session.type_bytes(CTRL_D);
+            let (_, second) = session.expect_event("a second pre_eof_consumed", |event| {
+                matches!(event, BridgeEvent::PreEofConsumed(_))
+            });
+            let BridgeEvent::PreEofConsumed(second) = second else {
+                unreachable!()
+            };
+            assert!(
+                !second.hint_printed,
+                "the hint is printed at most once per prompt"
+            );
+            assert_eq!(
+                session.terminal_output().matches(DETACH_HINT).count(),
+                after_first,
+                "a second gesture at one prompt printed the hint again"
+            );
+            assert!(session.alive(), "an unattributable gesture ended the shell");
 
-    // A fence from an earlier prompt is as stale as none at all.
-    let stale = fence_for(&enter, fence_id(3), attachment_id(2), epoch(6));
-    session.publish(&stale);
-    assert!(session.answered("kr-next-prompt"));
-    let _ = session.next_prompt();
-    session.type_bytes(CTRL_D);
-    let (_, third) = session.expect_event("a stale-fence consume", |event| {
-        matches!(event, BridgeEvent::PreEofConsumed(_))
-    });
-    let BridgeEvent::PreEofConsumed(third) = third else {
-        unreachable!()
-    };
-    assert_eq!(third.reason, ConsumeReason::FenceStale);
-    assert!(third.hint_printed, "a new prompt prints the hint again");
+            // A fence from an earlier prompt is as stale as none at all.
+            let stale = fence_for(&enter, fence_id(3), attachment_id(2), epoch(6));
+            session.publish(&stale);
+            assert!(session.answered("kr-next-prompt"));
+            let _ = session.next_prompt();
+            session.type_bytes(CTRL_D);
+            let (_, third) = session.expect_event("a stale-fence consume", |event| {
+                matches!(event, BridgeEvent::PreEofConsumed(_))
+            });
+            let BridgeEvent::PreEofConsumed(third) = third else {
+                unreachable!()
+            };
+            assert_eq!(third.reason, ConsumeReason::FenceStale);
+            assert!(third.hint_printed, "a new prompt prints the hint again");
+        },
+    );
 }
 
 /// `eof-repeated-after-detach`: a detach the worker refuses is consumed with the hint.
 pub fn a_refused_detach_is_consumed_with_the_hint(kind: ShellKind) {
-    let package = Package::built(kind);
-    let mut session = Session::start(&package);
-    session.first_prompt();
-    session.forget_events();
-    assert!(session.answered("kr-ready"));
+    in_each_locale(kind, "a_refused_detach_is_consumed_with_the_hint", || {
+        let package = Package::built(kind);
+        let mut session = Session::start(&package);
+        session.first_prompt();
+        session.forget_events();
+        assert!(session.answered("kr-ready"));
 
-    let (_, fence) = session.fenced_prompt(4);
-    let before_key = session.written();
-    session.type_bytes(CTRL_D);
-    let (id, event) = session.expect_event("eof_detach", |event| {
-        matches!(event, BridgeEvent::EofDetach(_))
-    });
-    let BridgeEvent::EofDetach(detach) = event else {
-        unreachable!()
-    };
-    assert_eq!(detach.fence_id, fence.fence_id);
-    session.answer_event(id, detach_refusal());
+        let (_, fence) = session.fenced_prompt(4);
+        let before_key = session.written();
+        session.type_bytes(CTRL_D);
+        let (id, event) = session.expect_event("eof_detach", |event| {
+            matches!(event, BridgeEvent::EofDetach(_))
+        });
+        let BridgeEvent::EofDetach(detach) = event else {
+            unreachable!()
+        };
+        assert_eq!(detach.fence_id, fence.fence_id);
+        session.answer_event(id, detach_refusal());
 
-    let (_, consumed) = session.expect_event("pre_eof_consumed", |event| {
-        matches!(event, BridgeEvent::PreEofConsumed(_))
-    });
-    let BridgeEvent::PreEofConsumed(consumed) = consumed else {
-        unreachable!()
-    };
-    assert!(consumed.hint_printed);
-    assert!(
+        let (_, consumed) = session.expect_event("pre_eof_consumed", |event| {
+            matches!(event, BridgeEvent::PreEofConsumed(_))
+        });
+        let BridgeEvent::PreEofConsumed(consumed) = consumed else {
+            unreachable!()
+        };
+        assert!(consumed.hint_printed);
+        assert!(
+            session
+                .drew_after(before_key, DETACH_HINT, REPLY)
+                .was_drawn(),
+            "a refused detach printed no hint"
+        );
         session
-            .drew_after(before_key, DETACH_HINT, REPLY)
-            .was_drawn(),
-        "a refused detach printed no hint"
-    );
-    session
-        .still_serving("kr-hint-served")
-        .unwrap_or_else(|why| panic!("a refused detach left nothing working: {why}"));
+            .still_serving("kr-hint-served")
+            .unwrap_or_else(|why| panic!("a refused detach left nothing working: {why}"));
+    });
 }
 
 /// A cancellation is not the gesture again: a read that ends with no key resolved leaves the key
@@ -3247,45 +3277,51 @@ const LENGTH_FUNCTION: &str =
 /// operation for it. The module's decision is on that key all the same, and a key outside the
 /// detach condition (here a line with text in it) is what it passes on.
 pub fn an_unbound_gesture_key_does_what_the_editor_does_with_an_unbound_key(kind: ShellKind) {
-    let package = Package::built(kind);
-    let mut session = Session::start_with_profile(
-        &package,
-        Profile {
-            after_configuration: &format!(
-                "Remove-PSReadLineKeyHandler -Chord Ctrl+d\n{LENGTH_FUNCTION}"
-            ),
-            ..Profile::ORDINARY
+    in_each_locale(
+        kind,
+        "an_unbound_gesture_key_does_what_the_editor_does_with_an_unbound_key",
+        || {
+            let package = Package::built(kind);
+            let mut session = Session::start_with_profile(
+                &package,
+                Profile {
+                    after_configuration: &format!(
+                        "Remove-PSReadLineKeyHandler -Chord Ctrl+d\n{LENGTH_FUNCTION}"
+                    ),
+                    ..Profile::ORDINARY
+                },
+            );
+            session.first_prompt();
+            session.forget_events();
+            assert!(
+                session.answered("kr-ready"),
+                "the shell did not answer:\n{}",
+                session.terminal_output()
+            );
+
+            assert!(session.wait_for_prompt());
+            assert!(session.wait_for_editor_reading());
+            let start = session.written();
+            session.type_bytes(b"kr-length abc");
+            assert!(session.wait_for_editor(start));
+            // The cursor goes back one place, in front of the last character.
+            session.type_bytes(b"\x1b[D");
+            session.type_bytes(CTRL_D);
+            let before_return = session.written();
+            session.type_bytes(b"\r");
+            // What the editor does with an unbound key is to insert the character the key carries, so the
+            // line runs with four characters. The operation the module used to run in its place deleted
+            // the last one, which left two.
+            assert!(
+                session
+                    .drew_after(before_return, "kr-length-4", REPLY)
+                    .was_drawn(),
+                "the gesture key did not do what the editor does with an unbound key:\n{}",
+                session.terminal_output()
+            );
+            assert!(session.alive());
         },
     );
-    session.first_prompt();
-    session.forget_events();
-    assert!(
-        session.answered("kr-ready"),
-        "the shell did not answer:\n{}",
-        session.terminal_output()
-    );
-
-    assert!(session.wait_for_prompt());
-    assert!(session.wait_for_editor_reading());
-    let start = session.written();
-    session.type_bytes(b"kr-length abc");
-    assert!(session.wait_for_editor(start));
-    // The cursor goes back one place, in front of the last character.
-    session.type_bytes(b"\x1b[D");
-    session.type_bytes(CTRL_D);
-    let before_return = session.written();
-    session.type_bytes(b"\r");
-    // What the editor does with an unbound key is to insert the character the key carries, so the
-    // line runs with four characters. The operation the module used to run in its place deleted
-    // the last one, which left two.
-    assert!(
-        session
-            .drew_after(before_return, "kr-length-4", REPLY)
-            .was_drawn(),
-        "the gesture key did not do what the editor does with an unbound key:\n{}",
-        session.terminal_output()
-    );
-    assert!(session.alive());
 }
 
 /// KR-REQ-07.73: the key that moves the gesture still does what it was bound to.
@@ -3296,39 +3332,45 @@ pub fn an_unbound_gesture_key_does_what_the_editor_does_with_an_unbound_key(kind
 /// before the old key's press has run, and the press runs what stood on the old key, whatever
 /// stood on the new one.
 pub fn the_key_that_promotes_a_changed_gesture_runs_what_was_bound_to_it(kind: ShellKind) {
-    let package = Package::built(kind);
-    let mut session = Session::start_with_profile(
-        &package,
-        Profile {
-            after_configuration: LENGTH_FUNCTION,
-            terminal_eof: Some("^e"),
-            ..Profile::ORDINARY
+    in_each_locale(
+        kind,
+        "the_key_that_promotes_a_changed_gesture_runs_what_was_bound_to_it",
+        || {
+            let package = Package::built(kind);
+            let mut session = Session::start_with_profile(
+                &package,
+                Profile {
+                    after_configuration: LENGTH_FUNCTION,
+                    terminal_eof: Some("^e"),
+                    ..Profile::ORDINARY
+                },
+            );
+            session.first_prompt();
+
+            // No command runs before the key itself: the change takes effect at the first gesture key the
+            // prompt sees, and a command run first would have the next prompt take it on entry.
+            assert!(session.wait_for_prompt());
+            assert!(session.wait_for_editor_reading());
+            let start = session.written();
+            session.type_bytes(b"kr-length abc");
+            assert!(session.wait_for_editor(start));
+            session.type_bytes(b"\x1b[D");
+            // The old gesture key, which the editor binds to deleting the character under the cursor, so
+            // the line runs with two characters. The new one is bound to going to the end of the line,
+            // which would leave three.
+            session.type_bytes(CTRL_D);
+            let before_return = session.written();
+            session.type_bytes(b"\r");
+            assert!(
+                session
+                    .drew_after(before_return, "kr-length-2", REPLY)
+                    .was_drawn(),
+                "the key that moved the gesture did not run what stood on it:\n{}",
+                session.terminal_output()
+            );
+            assert!(session.alive());
         },
     );
-    session.first_prompt();
-
-    // No command runs before the key itself: the change takes effect at the first gesture key the
-    // prompt sees, and a command run first would have the next prompt take it on entry.
-    assert!(session.wait_for_prompt());
-    assert!(session.wait_for_editor_reading());
-    let start = session.written();
-    session.type_bytes(b"kr-length abc");
-    assert!(session.wait_for_editor(start));
-    session.type_bytes(b"\x1b[D");
-    // The old gesture key, which the editor binds to deleting the character under the cursor, so
-    // the line runs with two characters. The new one is bound to going to the end of the line,
-    // which would leave three.
-    session.type_bytes(CTRL_D);
-    let before_return = session.written();
-    session.type_bytes(b"\r");
-    assert!(
-        session
-            .drew_after(before_return, "kr-length-2", REPLY)
-            .was_drawn(),
-        "the key that moved the gesture did not run what stood on it:\n{}",
-        session.terminal_output()
-    );
-    assert!(session.alive());
 }
 
 /// `detach-condition-exclusions`: outside the condition the editor keeps the key.
@@ -3947,101 +3989,107 @@ pub const LAUNCH_BUDGET_NOT_UNDER_TEST: DurationMs = DurationMs::new(86_400_000)
 
 /// KR-REQ-07.34, KR-REQ-07.35, and `launch-installed`.
 pub fn a_launch_is_installed_and_accepted_on_the_reader_thread(kind: ShellKind) {
-    let package = Package::built(kind);
-    let mut session = Session::start(&package);
-    session.first_prompt();
-    session.forget_events();
-    assert!(session.answered("kr-ready"));
+    in_each_locale(
+        kind,
+        "a_launch_is_installed_and_accepted_on_the_reader_thread",
+        || {
+            let package = Package::built(kind);
+            let mut session = Session::start(&package);
+            session.first_prompt();
+            session.forget_events();
+            assert!(session.answered("kr-ready"));
 
-    let (enter, fence) = session.fenced_prompt(8);
-    let transaction = LaunchTransactionId::new(Uuid::from_bytes([0x71; 16]));
-    // An argument vector no interpolation could survive: a word with a space in it, which a split
-    // would break into two, and a word that is a command substitution, which an unquoted install
-    // would run. `printf` prints each argument followed by a bar, so the exact vector that ran is
-    // visible in the output.
-    let substitution = match kind {
-        // Each shell's own way of writing a command substitution, so an unquoted install would run
-        // something rather than print it.
-        ShellKind::Fish => "(echo substituted)".to_owned(),
-        _ => "$(echo substituted)".to_owned(),
-    };
-    let command = LaunchCommand::Arguments(vec![
-        "printf".to_owned(),
-        "%s|".to_owned(),
-        "kr launch ok".to_owned(),
-        substitution,
-    ]);
-    let before_install = session.written();
-    let decision = session.launched(LaunchMailboxRequest {
-        session_id: session.session_id,
-        transaction,
-        fence_id: fence.fence_id,
-        command: command.clone(),
-        expected_prompt_generation: enter.prompt_generation,
-        expected_buffer_revision: enter.editor.buffer_revision,
-        expected_cwd_revision: enter.cwd_revision,
-        deadline_ms: LAUNCH_BUDGET_NOT_UNDER_TEST,
-    });
-    let accepted = match decision {
-        LaunchDecision::Accepted(accepted) => accepted,
-        LaunchDecision::Rejected(rejected) => {
-            panic!(
-                "an empty fenced prompt refused a launch: {:?}",
-                rejected.reason
-            )
-        }
-    };
-    assert_eq!(accepted.fence_id, fence.fence_id);
-    assert_eq!(
-        accepted.installed, command,
-        "the caller's own arguments went in"
-    );
-    assert_eq!(
-        accepted.buffer_revision,
-        next_revision(enter.editor.buffer_revision),
-        "installing the command changes the buffer once"
-    );
-    assert_eq!(accepted.prompt_generation, enter.prompt_generation);
+            let (enter, fence) = session.fenced_prompt(8);
+            let transaction = LaunchTransactionId::new(Uuid::from_bytes([0x71; 16]));
+            // An argument vector no interpolation could survive: a word with a space in it, which a split
+            // would break into two, and a word that is a command substitution, which an unquoted install
+            // would run. `printf` prints each argument followed by a bar, so the exact vector that ran is
+            // visible in the output.
+            let substitution = match kind {
+                // Each shell's own way of writing a command substitution, so an unquoted install would run
+                // something rather than print it.
+                ShellKind::Fish => "(echo substituted)".to_owned(),
+                _ => "$(echo substituted)".to_owned(),
+            };
+            let command = LaunchCommand::Arguments(vec![
+                "printf".to_owned(),
+                "%s|".to_owned(),
+                "kr launch ok".to_owned(),
+                substitution,
+            ]);
+            let before_install = session.written();
+            let decision = session.launched(LaunchMailboxRequest {
+                session_id: session.session_id,
+                transaction,
+                fence_id: fence.fence_id,
+                command: command.clone(),
+                expected_prompt_generation: enter.prompt_generation,
+                expected_buffer_revision: enter.editor.buffer_revision,
+                expected_cwd_revision: enter.cwd_revision,
+                deadline_ms: LAUNCH_BUDGET_NOT_UNDER_TEST,
+            });
+            let accepted = match decision {
+                LaunchDecision::Accepted(accepted) => accepted,
+                LaunchDecision::Rejected(rejected) => {
+                    panic!(
+                        "an empty fenced prompt refused a launch: {:?}",
+                        rejected.reason
+                    )
+                }
+            };
+            assert_eq!(accepted.fence_id, fence.fence_id);
+            assert_eq!(
+                accepted.installed, command,
+                "the caller's own arguments went in"
+            );
+            assert_eq!(
+                accepted.buffer_revision,
+                next_revision(enter.editor.buffer_revision),
+                "installing the command changes the buffer once"
+            );
+            assert_eq!(accepted.prompt_generation, enter.prompt_generation);
 
-    // This editor completes an acceptance at its own next step, so the session gives it one. The
-    // acceptance is already in the editor's own queue, which is drained before anything the
-    // terminal has, so it is the installed line that runs.
-    session.nudge();
+            // This editor completes an acceptance at its own next step, so the session gives it one. The
+            // acceptance is already in the editor's own queue, which is drained before anything the
+            // terminal has, so it is the installed line that runs.
+            session.nudge();
 
-    // The accepted line is reported from the reader, inside the fence, before the leave.
-    let (_, recorded) = session.expect_event("command_accepted", |event| {
-        matches!(event, BridgeEvent::CommandAccepted(_))
-    });
-    let BridgeEvent::CommandAccepted(recorded) = recorded else {
-        unreachable!()
-    };
-    assert_eq!(recorded.fence_id.as_ref(), Some(&fence.fence_id));
-    assert_eq!(
-        recorded.origin,
-        AcceptedOrigin::Fenced {
-            attachment_id: fence.originating_attachment,
-            input_epoch: fence.input_epoch,
-        }
-    );
-    let (_, left) = session.expect_event("editor_leave", |event| {
-        matches!(event, BridgeEvent::EditorLeave(_))
-    });
-    let BridgeEvent::EditorLeave(left) = left else {
-        unreachable!()
-    };
-    assert_eq!(left.reason, EditorLeaveReason::CommandAccepted);
+            // The accepted line is reported from the reader, inside the fence, before the leave.
+            let (_, recorded) = session.expect_event("command_accepted", |event| {
+                matches!(event, BridgeEvent::CommandAccepted(_))
+            });
+            let BridgeEvent::CommandAccepted(recorded) = recorded else {
+                unreachable!()
+            };
+            assert_eq!(recorded.fence_id.as_ref(), Some(&fence.fence_id));
+            assert_eq!(
+                recorded.origin,
+                AcceptedOrigin::Fenced {
+                    attachment_id: fence.originating_attachment,
+                    input_epoch: fence.input_epoch,
+                }
+            );
+            let (_, left) = session.expect_event("editor_leave", |event| {
+                matches!(event, BridgeEvent::EditorLeave(_))
+            });
+            let BridgeEvent::EditorLeave(left) = left else {
+                unreachable!()
+            };
+            assert_eq!(left.reason, EditorLeaveReason::CommandAccepted);
 
-    assert!(
-        session
-            .drew_after(before_install, dialect(kind).launch_expectation, REPLY)
-            .was_drawn(),
-        "the arguments that ran are not the arguments the caller named:\n{}",
-        session.terminal_output()
-    );
-    assert!(
-        !session.terminal_output().contains("substituted|"),
-        "an argument was expanded rather than installed literally:\n{}",
-        session.terminal_output()
+            assert!(
+                session
+                    .drew_after(before_install, dialect(kind).launch_expectation, REPLY)
+                    .was_drawn(),
+                "the arguments that ran are not the arguments the caller named:\n{}",
+                session.terminal_output()
+            );
+            assert!(
+                !session.terminal_output().contains("substituted|"),
+                "an argument was expanded rather than installed literally:\n{}",
+                session.terminal_output()
+            );
+        },
     );
 }
 
@@ -4112,82 +4160,88 @@ fn launch_prints_what_was_named(
 /// the installed line, which carries quotes and no brackets, cannot produce it. The last launch is
 /// a pipeline the caller quoted for the shell itself, which runs as written.
 pub fn a_launch_is_quoted_for_its_own_shell_and_never_evaluated(kind: ShellKind) {
-    let package = Package::built(kind);
-    let mut session = Session::start(&package);
-    session.first_prompt();
-    session.forget_events();
-    assert!(session.answered("kr-ready"));
+    in_each_locale(
+        kind,
+        "a_launch_is_quoted_for_its_own_shell_and_never_evaluated",
+        || {
+            let package = Package::built(kind);
+            let mut session = Session::start(&package);
+            session.first_prompt();
+            session.forget_events();
+            assert!(session.answered("kr-ready"));
 
-    let directory = session.home().join("kr launch directory");
-    std::fs::create_dir_all(&directory).expect("a directory with a space in its name");
-    let program = directory.join("show arguments");
-    kr_ipc::testing::place_script(
-        &program,
-        "#!/bin/sh\nfor argument in \"$@\"; do printf '<%s>' \"$argument\"; done\nprintf '\\n'\n",
-    );
+            let directory = session.home().join("kr launch directory");
+            std::fs::create_dir_all(&directory).expect("a directory with a space in its name");
+            let program = directory.join("show arguments");
+            kr_ipc::testing::place_script(
+                &program,
+                "#!/bin/sh\nfor argument in \"$@\"; do printf '<%s>' \"$argument\"; done\nprintf '\\n'\n",
+            );
 
-    let substitution = match kind {
-        ShellKind::Fish => "(echo substituted)",
-        _ => "$(echo substituted)",
-    };
-    // PowerShell reads five characters as a single quote: the ASCII one and the four typographic
-    // ones, so a word holding any of them must keep it inside the string. The first launch is one
-    // word that ends its string early in a reader that doubles only the ASCII quote, and what
-    // follows the word then runs as a command of its own. The second holds every quote character,
-    // and every other character a shell treats as more than itself.
-    let injected = "x\u{2019}; Write-Output kr-injected; \u{2019}";
-    launch_prints_what_was_named(&mut session, &program, &[injected], 19, 0x74);
-    launch_prints_what_was_named(
-        &mut session,
-        &program,
-        &[
-            "it's",
-            "it\u{2019}s",
-            "\u{2018}",
-            "\u{2019}",
-            "\u{201A}",
-            "\u{201B}",
-            r"a\b",
-            "",
-            "*",
-            "~",
-            "$HOME",
-            "@payload",
-            "a;b",
-            "a|b",
-            substitution,
-        ],
-        20,
-        0x75,
-    );
+            let substitution = match kind {
+                ShellKind::Fish => "(echo substituted)",
+                _ => "$(echo substituted)",
+            };
+            // PowerShell reads five characters as a single quote: the ASCII one and the four typographic
+            // ones, so a word holding any of them must keep it inside the string. The first launch is one
+            // word that ends its string early in a reader that doubles only the ASCII quote, and what
+            // follows the word then runs as a command of its own. The second holds every quote character,
+            // and every other character a shell treats as more than itself.
+            let injected = "x\u{2019}; Write-Output kr-injected; \u{2019}";
+            launch_prints_what_was_named(&mut session, &program, &[injected], 19, 0x74);
+            launch_prints_what_was_named(
+                &mut session,
+                &program,
+                &[
+                    "it's",
+                    "it\u{2019}s",
+                    "\u{2018}",
+                    "\u{2019}",
+                    "\u{201A}",
+                    "\u{201B}",
+                    r"a\b",
+                    "",
+                    "*",
+                    "~",
+                    "$HOME",
+                    "@payload",
+                    "a;b",
+                    "a|b",
+                    substitution,
+                ],
+                20,
+                0x75,
+            );
 
-    let (pipeline, printed) = pipeline_for(kind);
-    let (enter, fence) = session.fenced_prompt(21);
-    let before_install = session.written();
-    let decision = session.launched(LaunchMailboxRequest {
-        session_id: session.session_id,
-        transaction: LaunchTransactionId::new(Uuid::from_bytes([0x76; 16])),
-        fence_id: fence.fence_id,
-        command: LaunchCommand::QuotedCommand(pipeline.to_owned()),
-        expected_prompt_generation: enter.prompt_generation,
-        expected_buffer_revision: enter.editor.buffer_revision,
-        expected_cwd_revision: enter.cwd_revision,
-        deadline_ms: LAUNCH_BUDGET_NOT_UNDER_TEST,
-    });
-    assert!(
-        matches!(decision, LaunchDecision::Accepted(_)),
-        "an empty fenced prompt refused a launch: {decision:?}"
-    );
-    session.nudge();
-    session.expect_event("command_accepted", |event| {
-        matches!(event, BridgeEvent::CommandAccepted(_))
-    });
-    assert!(
-        session
-            .drew_after(before_install, printed, REPLY)
-            .was_drawn(),
-        "a command the caller quoted was not run as written:\n{}",
-        session.terminal_output()
+            let (pipeline, printed) = pipeline_for(kind);
+            let (enter, fence) = session.fenced_prompt(21);
+            let before_install = session.written();
+            let decision = session.launched(LaunchMailboxRequest {
+                session_id: session.session_id,
+                transaction: LaunchTransactionId::new(Uuid::from_bytes([0x76; 16])),
+                fence_id: fence.fence_id,
+                command: LaunchCommand::QuotedCommand(pipeline.to_owned()),
+                expected_prompt_generation: enter.prompt_generation,
+                expected_buffer_revision: enter.editor.buffer_revision,
+                expected_cwd_revision: enter.cwd_revision,
+                deadline_ms: LAUNCH_BUDGET_NOT_UNDER_TEST,
+            });
+            assert!(
+                matches!(decision, LaunchDecision::Accepted(_)),
+                "an empty fenced prompt refused a launch: {decision:?}"
+            );
+            session.nudge();
+            session.expect_event("command_accepted", |event| {
+                matches!(event, BridgeEvent::CommandAccepted(_))
+            });
+            assert!(
+                session
+                    .drew_after(before_install, printed, REPLY)
+                    .was_drawn(),
+                "a command the caller quoted was not run as written:\n{}",
+                session.terminal_output()
+            );
+        },
     );
 }
 
@@ -4359,42 +4413,49 @@ fn launch_at(
 /// shell's own revision, at the same prompt, is then installed and runs, which a reader whose
 /// buffer the first had changed would have refused.
 pub fn a_launch_for_another_working_directory_is_a_conflict_and_installs_nothing(kind: ShellKind) {
-    let package = Package::built(kind);
-    let mut session = Session::start(&package);
-    session.first_prompt();
-    session.forget_events();
-    assert!(session.answered("kr-ready"));
+    in_each_locale(
+        kind,
+        "a_launch_for_another_working_directory_is_a_conflict_and_installs_nothing",
+        || {
+            let package = Package::built(kind);
+            let mut session = Session::start(&package);
+            session.first_prompt();
+            session.forget_events();
+            assert!(session.answered("kr-ready"));
 
-    let (enter, fence) = session.fenced_prompt(8);
-    let substitution = match kind {
-        ShellKind::Fish => "(echo substituted)",
-        _ => "$(echo substituted)",
-    };
-    let mut stale = launch_at(&session, 0x73, &enter, &fence, substitution);
-    stale.expected_cwd_revision = kr_protocol::root::CwdRevision::new(enter.cwd_revision.get() + 7);
-    let before = session.written();
-    let decision = session.launched(stale);
-    let refusal = decision
-        .rejection()
-        .expect("the reader refused a launch for another working directory");
-    assert_eq!(refusal, LaunchRejectionReason::CwdRevisionMismatch);
-    assert_eq!(refusal.code(), kr_protocol::error::ErrorCode::DraftConflict);
+            let (enter, fence) = session.fenced_prompt(8);
+            let substitution = match kind {
+                ShellKind::Fish => "(echo substituted)",
+                _ => "$(echo substituted)",
+            };
+            let mut stale = launch_at(&session, 0x73, &enter, &fence, substitution);
+            stale.expected_cwd_revision =
+                kr_protocol::root::CwdRevision::new(enter.cwd_revision.get() + 7);
+            let before = session.written();
+            let decision = session.launched(stale);
+            let refusal = decision
+                .rejection()
+                .expect("the reader refused a launch for another working directory");
+            assert_eq!(refusal, LaunchRejectionReason::CwdRevisionMismatch);
+            assert_eq!(refusal.code(), kr_protocol::error::ErrorCode::DraftConflict);
 
-    // At the shell's own revision the same launch installs and runs.
-    let request = launch_at(&session, 0x74, &enter, &fence, substitution);
-    let decision = session.launched(request);
-    assert!(
-        matches!(decision, LaunchDecision::Accepted(_)),
-        "the launch at the shell's own revision was refused: {:?}",
-        decision.rejection()
-    );
-    session.nudge();
-    assert!(
-        session
-            .drew_after(before, dialect(kind).launch_expectation, REPLY)
-            .was_drawn(),
-        "the launch the reader accepted did not run:\n{}",
-        session.terminal_output()
+            // At the shell's own revision the same launch installs and runs.
+            let request = launch_at(&session, 0x74, &enter, &fence, substitution);
+            let decision = session.launched(request);
+            assert!(
+                matches!(decision, LaunchDecision::Accepted(_)),
+                "the launch at the shell's own revision was refused: {:?}",
+                decision.rejection()
+            );
+            session.nudge();
+            assert!(
+                session
+                    .drew_after(before, dialect(kind).launch_expectation, REPLY)
+                    .was_drawn(),
+                "the launch the reader accepted did not run:\n{}",
+                session.terminal_output()
+            );
+        },
     );
 }
 
@@ -4568,93 +4629,99 @@ pub fn a_revoked_launch_installs_nothing(kind: ShellKind) {
 /// A revocation for this transaction in the frames the reader's step read binds the launch, so a
 /// worker that dispatched a launch and revoked it in the same breath has revoked it.
 pub fn a_revocation_in_the_same_read_binds_the_launch(kind: ShellKind) {
-    let package = Package::built(kind);
-    let mut session = Session::start(&package);
-    session.first_prompt();
-    session.forget_events();
-    assert!(session.answered("kr-ready"));
+    in_each_locale(
+        kind,
+        "a_revocation_in_the_same_read_binds_the_launch",
+        || {
+            let package = Package::built(kind);
+            let mut session = Session::start(&package);
+            session.first_prompt();
+            session.forget_events();
+            assert!(session.answered("kr-ready"));
 
-    let (enter, fence) = session.fenced_prompt(15);
-    let transaction = LaunchTransactionId::new(Uuid::from_bytes([0x74; 16]));
-    let id = RequestId::new(9001);
+            let (enter, fence) = session.fenced_prompt(15);
+            let transaction = LaunchTransactionId::new(Uuid::from_bytes([0x74; 16]));
+            let id = RequestId::new(9001);
 
-    // The launch first, its revocation second, in one write, which has to reach the bridge: a
-    // write that found it gone would leave this check asserting nothing at all.
-    let delivery = session.write_frames(&[
-        BridgeFrame::Request {
-            id,
-            request: WorkerRequest::Launch(LaunchMailboxRequest {
-                session_id: session.session_id,
+            // The launch first, its revocation second, in one write, which has to reach the bridge: a
+            // write that found it gone would leave this check asserting nothing at all.
+            let delivery = session.write_frames(&[
+                BridgeFrame::Request {
+                    id,
+                    request: WorkerRequest::Launch(LaunchMailboxRequest {
+                        session_id: session.session_id,
+                        transaction,
+                        fence_id: fence.fence_id,
+                        command: LaunchCommand::Arguments(vec![
+                            "echo".to_owned(),
+                            "kr-late-revoked".to_owned(),
+                        ]),
+                        expected_prompt_generation: enter.prompt_generation,
+                        expected_buffer_revision: enter.editor.buffer_revision,
+                        expected_cwd_revision: enter.cwd_revision,
+                        deadline_ms: LAUNCH_READER_BUDGET,
+                    }),
+                },
+                BridgeFrame::LaunchRevoked {
+                    transaction,
+                    reason: LaunchRejectionReason::Timeout,
+                },
+            ]);
+            assert_eq!(
+                delivery,
+                Delivery::Delivered,
+                "the bridge was gone before the launch and its revocation were sent"
+            );
+
+            let BridgeAnswer::Launch(decision) = session.answer(id) else {
+                panic!("the reader answered a launch with something else")
+            };
+            assert_eq!(
+                decision.rejection(),
+                Some(LaunchRejectionReason::Revoked),
+                "a revocation the reader had already read did not bind its launch"
+            );
+
+            let acknowledgement = session.fence_exchange(&enter, fence_id(16));
+            assert!(
+                acknowledgement.editor.buffer_empty,
+                "a revoked launch left its text in the editor"
+            );
+            assert!(
+                !session.terminal_output().contains("kr-late-revoked"),
+                "a revoked launch ran anyway:\n{}",
+                session.terminal_output()
+            );
+
+            // A revocation for a transaction that is long over touches nothing.
+            session.write_frame(&BridgeFrame::LaunchRevoked {
                 transaction,
-                fence_id: fence.fence_id,
-                command: LaunchCommand::Arguments(vec![
-                    "echo".to_owned(),
-                    "kr-late-revoked".to_owned(),
-                ]),
-                expected_prompt_generation: enter.prompt_generation,
-                expected_buffer_revision: enter.editor.buffer_revision,
-                expected_cwd_revision: enter.cwd_revision,
-                deadline_ms: LAUNCH_READER_BUDGET,
-            }),
+                reason: LaunchRejectionReason::Timeout,
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            let before_typing = session.written();
+            session.type_bytes(b"kr-typed");
+            std::thread::sleep(Duration::from_millis(200));
+            session.write_frame(&BridgeFrame::LaunchRevoked {
+                transaction,
+                reason: LaunchRejectionReason::Timeout,
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            session.type_line("");
+            // The editor drawing the person's text is what says it survived, which is a display
+            // observation: nothing here claims a command ran.
+            assert!(
+                session
+                    .drew_after(before_typing, "kr-typed", REPLY)
+                    .was_drawn(),
+                "a revocation for a finished transaction took the person's own text out:\n{}",
+                session.terminal_output()
+            );
+            session
+                .still_serving("kr-revocation-served")
+                .unwrap_or_else(|why| panic!("a stale revocation left nothing working: {why}"));
         },
-        BridgeFrame::LaunchRevoked {
-            transaction,
-            reason: LaunchRejectionReason::Timeout,
-        },
-    ]);
-    assert_eq!(
-        delivery,
-        Delivery::Delivered,
-        "the bridge was gone before the launch and its revocation were sent"
     );
-
-    let BridgeAnswer::Launch(decision) = session.answer(id) else {
-        panic!("the reader answered a launch with something else")
-    };
-    assert_eq!(
-        decision.rejection(),
-        Some(LaunchRejectionReason::Revoked),
-        "a revocation the reader had already read did not bind its launch"
-    );
-
-    let acknowledgement = session.fence_exchange(&enter, fence_id(16));
-    assert!(
-        acknowledgement.editor.buffer_empty,
-        "a revoked launch left its text in the editor"
-    );
-    assert!(
-        !session.terminal_output().contains("kr-late-revoked"),
-        "a revoked launch ran anyway:\n{}",
-        session.terminal_output()
-    );
-
-    // A revocation for a transaction that is long over touches nothing.
-    session.write_frame(&BridgeFrame::LaunchRevoked {
-        transaction,
-        reason: LaunchRejectionReason::Timeout,
-    });
-    std::thread::sleep(Duration::from_millis(200));
-    let before_typing = session.written();
-    session.type_bytes(b"kr-typed");
-    std::thread::sleep(Duration::from_millis(200));
-    session.write_frame(&BridgeFrame::LaunchRevoked {
-        transaction,
-        reason: LaunchRejectionReason::Timeout,
-    });
-    std::thread::sleep(Duration::from_millis(200));
-    session.type_line("");
-    // The editor drawing the person's text is what says it survived, which is a display
-    // observation: nothing here claims a command ran.
-    assert!(
-        session
-            .drew_after(before_typing, "kr-typed", REPLY)
-            .was_drawn(),
-        "a revocation for a finished transaction took the person's own text out:\n{}",
-        session.terminal_output()
-    );
-    session
-        .still_serving("kr-revocation-served")
-        .unwrap_or_else(|why| panic!("a stale revocation left nothing working: {why}"));
 }
 
 /// The reader reports itself idle, which is one of the three points a withheld fence is retried at.
@@ -4822,34 +4889,40 @@ pub fn a_reader_that_holds_input_does_not_report_idle_again_when_the_worker_with
 
 /// A session that loses its bridge keeps the fail-safe answer to an eligible gesture.
 pub fn a_lost_bridge_does_not_restore_a_native_empty_prompt_end_of_file(kind: ShellKind) {
-    let package = Package::built(kind);
-    let mut session = Session::start(&package);
-    session.first_prompt();
-    session.forget_events();
-    assert!(session.answered("kr-ready"));
-    let before = session.terminal_output().matches(DETACH_HINT).count();
+    in_each_locale(
+        kind,
+        "a_lost_bridge_does_not_restore_a_native_empty_prompt_end_of_file",
+        || {
+            let package = Package::built(kind);
+            let mut session = Session::start(&package);
+            session.first_prompt();
+            session.forget_events();
+            assert!(session.answered("kr-ready"));
+            let before = session.terminal_output().matches(DETACH_HINT).count();
 
-    // The worker goes. Nothing can attribute a gesture any more, which is exactly when turning one
-    // into a native end of file would close somebody's shell.
-    session.close_endpoint();
-    std::thread::sleep(Duration::from_millis(300));
+            // The worker goes. Nothing can attribute a gesture any more, which is exactly when turning one
+            // into a native end of file would close somebody's shell.
+            session.close_endpoint();
+            std::thread::sleep(Duration::from_millis(300));
 
-    let before_key = session.written();
-    session.type_bytes(CTRL_D);
-    assert!(
-        session
-            .drew_after(before_key, DETACH_HINT, REPLY)
-            .was_drawn(),
-        "a shell whose bridge has gone printed no hint:\n{}",
-        session.terminal_output()
-    );
-    assert!(
-        session.terminal_output().matches(DETACH_HINT).count() > before,
-        "the hint was the one from before the bridge went"
-    );
-    assert!(
-        session.alive(),
-        "an eligible gesture ended a shell whose bridge had gone"
+            let before_key = session.written();
+            session.type_bytes(CTRL_D);
+            assert!(
+                session
+                    .drew_after(before_key, DETACH_HINT, REPLY)
+                    .was_drawn(),
+                "a shell whose bridge has gone printed no hint:\n{}",
+                session.terminal_output()
+            );
+            assert!(
+                session.terminal_output().matches(DETACH_HINT).count() > before,
+                "the hint was the one from before the bridge went"
+            );
+            assert!(
+                session.alive(),
+                "an eligible gesture ended a shell whose bridge had gone"
+            );
+        },
     );
 }
 
@@ -4862,53 +4935,59 @@ pub fn a_lost_bridge_does_not_restore_a_native_empty_prompt_end_of_file(kind: Sh
 /// answer, and the key is typed once the editor has taken it, so the editor is waiting whatever
 /// the speed of the machine.
 pub fn a_gesture_typed_while_the_editor_waits_for_the_terminal_is_still_a_gesture(kind: ShellKind) {
-    let package = Package::built(kind);
-    let mut session = Session::start(&package);
-    session.first_prompt();
-    session.forget_events();
+    in_each_locale(
+        kind,
+        "a_gesture_typed_while_the_editor_waits_for_the_terminal_is_still_a_gesture",
+        || {
+            let package = Package::built(kind);
+            let mut session = Session::start(&package);
+            session.first_prompt();
+            session.forget_events();
 
-    session.hold_terminal_answers();
-    let before_command = session.written();
-    assert!(session.answered("kr-ready"));
-    let enter = session.next_prompt();
-    // The prompt after the command asks the terminal where the cursor is and what it is, and the
-    // editor waits for the answer to the last of those.
-    assert!(
-        session
-            .drew_after(before_command, "\x1b[0c", REPLY)
-            .was_drawn(),
-        "the editor asked the terminal nothing at its next prompt:\n{}",
-        session.terminal_output()
-    );
+            session.hold_terminal_answers();
+            let before_command = session.written();
+            assert!(session.answered("kr-ready"));
+            let enter = session.next_prompt();
+            // The prompt after the command asks the terminal where the cursor is and what it is, and the
+            // editor waits for the answer to the last of those.
+            assert!(
+                session
+                    .drew_after(before_command, "\x1b[0c", REPLY)
+                    .was_drawn(),
+                "the editor asked the terminal nothing at its next prompt:\n{}",
+                session.terminal_output()
+            );
 
-    let before_key = session.written();
-    session.type_bytes(CTRL_D);
-    // The editor's own report of its queue says when it has the key: asking is an exchange the
-    // editor answers while it waits for the terminal.
-    let deadline = session.deadline_for(REPLY);
-    loop {
-        let held = session.fence_exchange_before(&enter, fence_id(41), deadline.0);
-        if held.snapshot.queued_keys > U64::new(0) {
-            break;
-        }
-        assert!(
-            !deadline.passed(),
-            "the editor never took the key it was typed:\n{}",
-            session.terminal_output()
-        );
-    }
+            let before_key = session.written();
+            session.type_bytes(CTRL_D);
+            // The editor's own report of its queue says when it has the key: asking is an exchange the
+            // editor answers while it waits for the terminal.
+            let deadline = session.deadline_for(REPLY);
+            loop {
+                let held = session.fence_exchange_before(&enter, fence_id(41), deadline.0);
+                if held.snapshot.queued_keys > U64::new(0) {
+                    break;
+                }
+                assert!(
+                    !deadline.passed(),
+                    "the editor never took the key it was typed:\n{}",
+                    session.terminal_output()
+                );
+            }
 
-    session.release_terminal_answers();
-    assert!(
-        session
-            .drew_after(before_key, DETACH_HINT, REPLY)
-            .was_drawn(),
-        "a gesture typed while the editor waited for the terminal printed no hint:\n{}",
-        session.terminal_output()
-    );
-    assert!(
-        session.alive(),
-        "a gesture typed while the editor waited for the terminal ended the shell"
+            session.release_terminal_answers();
+            assert!(
+                session
+                    .drew_after(before_key, DETACH_HINT, REPLY)
+                    .was_drawn(),
+                "a gesture typed while the editor waited for the terminal printed no hint:\n{}",
+                session.terminal_output()
+            );
+            assert!(
+                session.alive(),
+                "a gesture typed while the editor waited for the terminal ended the shell"
+            );
+        },
     );
 }
 
@@ -4919,72 +4998,78 @@ pub fn a_gesture_typed_while_the_editor_waits_for_the_terminal_is_still_a_gestur
 /// `self-insert` bound to a sequence that ends in the gesture replays the whole sequence, and the
 /// terminal is made slow to answer so that both keys are set aside first.
 pub fn a_gesture_a_binding_hands_back_is_the_editors_own_input(kind: ShellKind) {
-    let package = Package::built(kind);
-    let mut session = Session::start_with_profile(
-        &package,
-        Profile {
-            after_configuration: "bind ctrl-x,ctrl-d self-insert\n",
-            ..Profile::ORDINARY
-        },
-    );
-    session.first_prompt();
-    session.forget_events();
+    in_each_locale(
+        kind,
+        "a_gesture_a_binding_hands_back_is_the_editors_own_input",
+        || {
+            let package = Package::built(kind);
+            let mut session = Session::start_with_profile(
+                &package,
+                Profile {
+                    after_configuration: "bind ctrl-x,ctrl-d self-insert\n",
+                    ..Profile::ORDINARY
+                },
+            );
+            session.first_prompt();
+            session.forget_events();
 
-    session.hold_terminal_answers();
-    let before_command = session.written();
-    assert!(session.answered("kr-ready"));
-    let enter = session.next_prompt();
-    assert!(
-        session
-            .drew_after(before_command, "\x1b[0c", REPLY)
-            .was_drawn(),
-        "the editor asked the terminal nothing at its next prompt:\n{}",
-        session.terminal_output()
-    );
-
-    let before_keys = session.written();
-    session.type_bytes(b"\x18\x04");
-    let deadline = session.deadline_for(REPLY);
-    loop {
-        let held = session.fence_exchange_before(&enter, fence_id(42), deadline.0);
-        if held.snapshot.queued_keys >= U64::new(2) {
-            break;
-        }
-        assert!(
-            !deadline.passed(),
-            "the editor never took both keys it was typed:\n{}",
-            session.terminal_output()
-        );
-    }
-
-    // From here the editor either consumes the replayed gesture and says so with its hint, or
-    // leaves it to its own handling, which at an empty prompt ends the shell: the first of the two
-    // to happen is the answer.
-    session.release_terminal_answers();
-    let deadline = session.deadline_for(REPLY);
-    let hinted = session.expecting_the_bridge_to_go(|session| {
-        loop {
-            if !session.alive() {
-                break false;
-            }
-            if session
-                .drew_after(before_keys, DETACH_HINT, Duration::ZERO)
-                .was_drawn()
-            {
-                break true;
-            }
+            session.hold_terminal_answers();
+            let before_command = session.written();
+            assert!(session.answered("kr-ready"));
+            let enter = session.next_prompt();
             assert!(
-                !deadline.passed(),
-                "the editor neither hinted nor ended:\n{}",
+                session
+                    .drew_after(before_command, "\x1b[0c", REPLY)
+                    .was_drawn(),
+                "the editor asked the terminal nothing at its next prompt:\n{}",
                 session.terminal_output()
             );
-            session.pump(Duration::from_millis(25));
-        }
-    });
-    assert!(
-        !hinted,
-        "a gesture a binding handed back was taken for one the person made:\n{}",
-        session.terminal_output()
+
+            let before_keys = session.written();
+            session.type_bytes(b"\x18\x04");
+            let deadline = session.deadline_for(REPLY);
+            loop {
+                let held = session.fence_exchange_before(&enter, fence_id(42), deadline.0);
+                if held.snapshot.queued_keys >= U64::new(2) {
+                    break;
+                }
+                assert!(
+                    !deadline.passed(),
+                    "the editor never took both keys it was typed:\n{}",
+                    session.terminal_output()
+                );
+            }
+
+            // From here the editor either consumes the replayed gesture and says so with its hint, or
+            // leaves it to its own handling, which at an empty prompt ends the shell: the first of the two
+            // to happen is the answer.
+            session.release_terminal_answers();
+            let deadline = session.deadline_for(REPLY);
+            let hinted = session.expecting_the_bridge_to_go(|session| {
+                loop {
+                    if !session.alive() {
+                        break false;
+                    }
+                    if session
+                        .drew_after(before_keys, DETACH_HINT, Duration::ZERO)
+                        .was_drawn()
+                    {
+                        break true;
+                    }
+                    assert!(
+                        !deadline.passed(),
+                        "the editor neither hinted nor ended:\n{}",
+                        session.terminal_output()
+                    );
+                    session.pump(Duration::from_millis(25));
+                }
+            });
+            assert!(
+                !hinted,
+                "a gesture a binding handed back was taken for one the person made:\n{}",
+                session.terminal_output()
+            );
+        },
     );
 }
 
@@ -5637,71 +5722,77 @@ fn startup_question(kind: ShellKind) -> &'static str {
 /// the answer reaches the prompt; and the entry's activation, which is the profile having
 /// finished, is what qualifies the session.
 pub fn a_startup_prompt_reads_its_answer_and_readiness_waits_for_the_profile(kind: ShellKind) {
-    let package = Package::built(kind);
-    let mut session = Session::start_with_profile(
-        &package,
-        Profile {
-            after_configuration: startup_question(kind),
-            ..Profile::ORDINARY
+    in_each_locale(
+        kind,
+        "a_startup_prompt_reads_its_answer_and_readiness_waits_for_the_profile",
+        || {
+            let package = Package::built(kind);
+            let mut session = Session::start_with_profile(
+                &package,
+                Profile {
+                    after_configuration: startup_question(kind),
+                    ..Profile::ORDINARY
+                },
+            );
+            // Authenticated and ABI-checked: the handshake this returns from is the worker's own decision
+            // over the hello, and the reader it declared is the one the package's record names.
+            assert_eq!(
+                session.hello.shell.editor_abi,
+                package.record["shell"]["editor_abi"]
+                    .as_str()
+                    .expect("the package records its editor ABI"),
+                "the bridge declared a reader other than the one the package was built as"
+            );
+            let mut phase = PhaseGate::unauthenticated();
+            assert!(
+                !phase.accepts_external_input(),
+                "input is refused before the bridge has authenticated"
+            );
+            assert!(phase.authenticated(kind));
+            assert!(phase.accepts_external_input());
+            assert!(!phase.reports_ready());
+            assert!(!phase.permits_launch());
+
+            // The prompt is on the terminal, waiting, and the profile that asked has not finished, so the
+            // activation that follows it cannot have come.
+            assert!(
+                session.drew_after(0, "ASK>", REPLY).was_drawn(),
+                "the startup prompt was not drawn:\n{}",
+                session.terminal_output()
+            );
+            assert!(
+                !session.saw_event(Duration::from_millis(500), |event| matches!(
+                    event,
+                    BridgeEvent::HooksActivated(_)
+                )),
+                "the hooks were reported live while the profile was still waiting for its answer"
+            );
+            assert!(!phase.reports_ready());
+
+            session.type_bytes(b"the-answer\r");
+            assert!(
+                session
+                    .drew_after(0, "kr-answer-<the-answer>", REPLY)
+                    .was_drawn(),
+                "the answer did not reach the startup prompt:\n{}",
+                session.terminal_output()
+            );
+
+            // The profile has finished, so the activation comes, and then the first reader of the shell.
+            let entry = session.first_prompt();
+            assert!(
+                phase.qualified(),
+                "the activation qualifies an authenticated session"
+            );
+            assert!(phase.reports_ready());
+            assert!(phase.permits_launch());
+            assert_eq!(
+                entry.reader_context,
+                kr_protocol::root::ReaderContext::Primary
+            );
+            assert!(session.alive());
         },
     );
-    // Authenticated and ABI-checked: the handshake this returns from is the worker's own decision
-    // over the hello, and the reader it declared is the one the package's record names.
-    assert_eq!(
-        session.hello.shell.editor_abi,
-        package.record["shell"]["editor_abi"]
-            .as_str()
-            .expect("the package records its editor ABI"),
-        "the bridge declared a reader other than the one the package was built as"
-    );
-    let mut phase = PhaseGate::unauthenticated();
-    assert!(
-        !phase.accepts_external_input(),
-        "input is refused before the bridge has authenticated"
-    );
-    assert!(phase.authenticated(kind));
-    assert!(phase.accepts_external_input());
-    assert!(!phase.reports_ready());
-    assert!(!phase.permits_launch());
-
-    // The prompt is on the terminal, waiting, and the profile that asked has not finished, so the
-    // activation that follows it cannot have come.
-    assert!(
-        session.drew_after(0, "ASK>", REPLY).was_drawn(),
-        "the startup prompt was not drawn:\n{}",
-        session.terminal_output()
-    );
-    assert!(
-        !session.saw_event(Duration::from_millis(500), |event| matches!(
-            event,
-            BridgeEvent::HooksActivated(_)
-        )),
-        "the hooks were reported live while the profile was still waiting for its answer"
-    );
-    assert!(!phase.reports_ready());
-
-    session.type_bytes(b"the-answer\r");
-    assert!(
-        session
-            .drew_after(0, "kr-answer-<the-answer>", REPLY)
-            .was_drawn(),
-        "the answer did not reach the startup prompt:\n{}",
-        session.terminal_output()
-    );
-
-    // The profile has finished, so the activation comes, and then the first reader of the shell.
-    let entry = session.first_prompt();
-    assert!(
-        phase.qualified(),
-        "the activation qualifies an authenticated session"
-    );
-    assert!(phase.reports_ready());
-    assert!(phase.permits_launch());
-    assert_eq!(
-        entry.reader_context,
-        kr_protocol::root::ReaderContext::Primary
-    );
-    assert!(session.alive());
 }
 
 /// KR-REQ-07.23: a profile that asks and is never answered leaves the session authenticated and
@@ -5713,41 +5804,47 @@ pub fn a_startup_prompt_reads_its_answer_and_readiness_waits_for_the_profile(kin
 pub fn a_startup_prompt_nobody_answers_holds_readiness_and_does_not_hang_the_shell(
     kind: ShellKind,
 ) {
-    let package = Package::built(kind);
-    let mut session = Session::start_with_profile(
-        &package,
-        Profile {
-            after_configuration: startup_question(kind),
-            ..Profile::ORDINARY
-        },
-    );
-    let mut phase = PhaseGate::unauthenticated();
-    assert!(phase.authenticated(kind));
-    assert!(session.drew_after(0, "ASK>", REPLY).was_drawn());
-    assert!(
-        !session.saw_event(Duration::from_millis(500), |event| matches!(
-            event,
-            BridgeEvent::HooksActivated(_)
-        )),
-        "a profile nobody answered went on to report the hooks live"
-    );
-    assert!(
-        !phase.reports_ready(),
-        "an unanswered profile reported ready"
-    );
-    assert!(!phase.permits_launch());
-    assert!(
-        phase.accepts_external_input(),
-        "and it still takes the answer"
-    );
-    assert!(session.alive());
+    in_each_locale(
+        kind,
+        "a_startup_prompt_nobody_answers_holds_readiness_and_does_not_hang_the_shell",
+        || {
+            let package = Package::built(kind);
+            let mut session = Session::start_with_profile(
+                &package,
+                Profile {
+                    after_configuration: startup_question(kind),
+                    ..Profile::ORDINARY
+                },
+            );
+            let mut phase = PhaseGate::unauthenticated();
+            assert!(phase.authenticated(kind));
+            assert!(session.drew_after(0, "ASK>", REPLY).was_drawn());
+            assert!(
+                !session.saw_event(Duration::from_millis(500), |event| matches!(
+                    event,
+                    BridgeEvent::HooksActivated(_)
+                )),
+                "a profile nobody answered went on to report the hooks live"
+            );
+            assert!(
+                !phase.reports_ready(),
+                "an unanswered profile reported ready"
+            );
+            assert!(!phase.permits_launch());
+            assert!(
+                phase.accepts_external_input(),
+                "and it still takes the answer"
+            );
+            assert!(session.alive());
 
-    // The shell ends when asked, inside the harness's own bound for a shell to stop.
-    let ending = Deadline::after(REPLY);
-    drop(session);
-    assert!(
-        !ending.passed(),
-        "the shell that was waiting for an answer did not stop within its bound"
+            // The shell ends when asked, inside the harness's own bound for a shell to stop.
+            let ending = Deadline::after(REPLY);
+            drop(session);
+            assert!(
+                !ending.passed(),
+                "the shell that was waiting for an answer did not stop within its bound"
+            );
+        },
     );
 }
 
@@ -5869,40 +5966,46 @@ pub fn an_editor_the_profile_replaced_is_diagnosed_when_the_hooks_activate(kind:
 pub fn a_question_in_the_profile_every_host_reads_takes_its_answer_through_the_worker(
     kind: ShellKind,
 ) {
-    let package = Package::built(kind);
-    let mut session = Session::start_with_profile(
-        &package,
-        Profile {
-            all_hosts: startup_question(kind),
-            ..Profile::ORDINARY
+    in_each_locale(
+        kind,
+        "a_question_in_the_profile_every_host_reads_takes_its_answer_through_the_worker",
+        || {
+            let package = Package::built(kind);
+            let mut session = Session::start_with_profile(
+                &package,
+                Profile {
+                    all_hosts: startup_question(kind),
+                    ..Profile::ORDINARY
+                },
+            );
+            let mut phase = PhaseGate::unauthenticated();
+            assert!(
+                phase.authenticated(kind),
+                "the bridge authenticated while the first profile was waiting for its answer"
+            );
+            assert!(
+                session.drew_after(0, "ASK>", REPLY).was_drawn(),
+                "the question was not drawn:\n{}",
+                session.terminal_output()
+            );
+            assert!(
+                !phase.reports_ready(),
+                "a session whose profile is waiting for an answer reported ready"
+            );
+            session.type_bytes(b"the-answer\r");
+            assert!(
+                session
+                    .drew_after(0, "kr-answer-<the-answer>", REPLY)
+                    .was_drawn(),
+                "the answer did not reach the question the first profile asked:\n{}",
+                session.terminal_output()
+            );
+            // Both profiles have finished, so the hooks activate and the reader is the first one.
+            session.first_prompt();
+            assert!(phase.qualified());
+            assert!(phase.reports_ready());
         },
     );
-    let mut phase = PhaseGate::unauthenticated();
-    assert!(
-        phase.authenticated(kind),
-        "the bridge authenticated while the first profile was waiting for its answer"
-    );
-    assert!(
-        session.drew_after(0, "ASK>", REPLY).was_drawn(),
-        "the question was not drawn:\n{}",
-        session.terminal_output()
-    );
-    assert!(
-        !phase.reports_ready(),
-        "a session whose profile is waiting for an answer reported ready"
-    );
-    session.type_bytes(b"the-answer\r");
-    assert!(
-        session
-            .drew_after(0, "kr-answer-<the-answer>", REPLY)
-            .was_drawn(),
-        "the answer did not reach the question the first profile asked:\n{}",
-        session.terminal_output()
-    );
-    // Both profiles have finished, so the hooks activate and the reader is the first one.
-    session.first_prompt();
-    assert!(phase.qualified());
-    assert!(phase.reports_ready());
 }
 
 /// The profile text that changes what the host calls to read a line, in each shape a person writes
