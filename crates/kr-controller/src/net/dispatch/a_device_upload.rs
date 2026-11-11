@@ -11,7 +11,7 @@ use kr_protocol::envelope::{
     ActionTarget, ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{ActorId, RequestId, SessionEpoch, SessionId, TransferId};
+use kr_protocol::ids::{ActorId, RequestId, SessionEpoch, TransferId};
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Bytes, Digest256, Nullable, U64};

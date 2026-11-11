@@ -123,6 +123,34 @@ impl DeviceWrite {
     }
 }
 
+/// How a transfer write reached the door.
+pub(super) enum Arrival<'a> {
+    /// On the control stream, under a window this connection issued.
+    Control,
+    /// On a data stream, whose standing the service asks about again.
+    Stream(&'a Arc<ChunkAdmission>),
+    /// An exact repeat that carries no usable window: it may finish what its action already
+    /// claimed and begins nothing.
+    Settling,
+}
+
+/// [`Arrival`] owned, for the task that outlives the connection.
+enum OwnedArrival {
+    Control,
+    Stream(Arc<ChunkAdmission>),
+    Settling,
+}
+
+impl Arrival<'_> {
+    fn owned(self) -> OwnedArrival {
+        match self {
+            Self::Control => OwnedArrival::Control,
+            Self::Stream(stream) => OwnedArrival::Stream(Arc::clone(stream)),
+            Self::Settling => OwnedArrival::Settling,
+        }
+    }
+}
+
 impl RemoteConnection {
     /// Performs one draft write, or one chunk that arrived on `on_stream`, under this device's own
     /// principal, in the transfer service.
@@ -138,8 +166,8 @@ impl RemoteConnection {
     /// cancellation and a durable commit cannot be left half done because a peer went away. The
     /// answer says whether the service read it from its record of an earlier submission.
     ///
-    /// `settling` is an exact repeat that carries no usable window: it may finish what its action
-    /// already claimed and begins nothing.
+    /// `arrival` says how the write reached the door: on the control stream, on a data stream that
+    /// the service asks about again, or as an exact repeat that carries no usable window.
     pub(super) async fn transfer_write(
         &self,
         mutation: &MutationRequest,
@@ -147,8 +175,7 @@ impl RemoteConnection {
         actor_id: ActorId,
         carried: crate::authority::AdmittedMutation,
         own_claim: &OwnClaim,
-        on_stream: Option<&Arc<ChunkAdmission>>,
-        settling: bool,
+        arrival: Arrival<'_>,
     ) -> std::result::Result<Given<ControlFrame>, ProtocolError> {
         self.controller
             .transfer
@@ -160,7 +187,7 @@ impl RemoteConnection {
         let controller = Arc::clone(&self.controller);
         let mutation = mutation.clone();
         let request_id = mutation.request_id;
-        let on_stream = on_stream.map(Arc::clone);
+        let arrival = arrival.owned();
         let effect = tokio::spawn(async move {
             if method == Method::DraftCreate {
                 controller
@@ -172,16 +199,16 @@ impl RemoteConnection {
                     )
                     .await;
             }
-            let admission = match (on_stream, settling) {
-                (Some(stream), _) => crate::transfer::TransferAdmission::on_a_stream(
+            let admission = match arrival {
+                OwnedArrival::Stream(stream) => crate::transfer::TransferAdmission::on_a_stream(
                     Arc::clone(&controller),
                     carried,
                     stream,
                 ),
-                (None, true) => {
+                OwnedArrival::Settling => {
                     crate::transfer::TransferAdmission::settling(Arc::clone(&controller), carried)
                 }
-                (None, false) => {
+                OwnedArrival::Control => {
                     crate::transfer::TransferAdmission::new(Arc::clone(&controller), carried)
                 }
             };

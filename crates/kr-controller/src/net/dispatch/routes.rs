@@ -19,7 +19,7 @@ use super::super::Retained;
 use super::super::chunks::ChunkAdmission;
 use super::decision::{Answered, Asked, unserved_change_set_method};
 use super::forwarding::{OwnClaim, RouteRefusal};
-use super::writes::DeviceWrite;
+use super::writes::{Arrival, DeviceWrite};
 use super::{RemoteConnection, failure, outcome_not_shown, outcome_unknown};
 
 /// How long a caller waits for an effect the daemon owns before it is told the outcome is unknown.
@@ -909,11 +909,20 @@ impl RemoteConnection {
                 Err(refusal)
                     if matches!(entry.method, Method::UploadFinish | Method::UploadCancel) =>
                 {
-                    return self
+                    return match self
                         .settle_a_repeat(
-                            mutation, entry, refusal, validated, &decided, asked, own_claim,
+                            mutation,
+                            entry.method,
+                            validated,
+                            &decided,
+                            asked,
+                            own_claim,
                         )
-                        .await;
+                        .await?
+                    {
+                        Some(frame) => Ok(frame),
+                        None => Err(refusal),
+                    };
                 }
                 Err(refusal) => return Err(refusal),
             }
@@ -1842,8 +1851,7 @@ impl RemoteConnection {
                         deadline: Some(accepted.deadline),
                     },
                     own_claim,
-                    on_stream,
-                    false,
+                    on_stream.map_or(Arrival::Control, Arrival::Stream),
                 )
                 .await
                 .map(|given| noting(&mut origin, given))?,
@@ -1882,39 +1890,38 @@ impl RemoteConnection {
     ///
     /// A claim that is open is finished, and nothing else is begun. A claim that was settled gives
     /// back the answer it was settled with, under the check any recorded answer is owed. An action
-    /// with no claim is a first admission, which has no window: it is refused for the window, and
-    /// told as a repeat's refusal when a copy of the request has been carried out or is on its way
-    /// ([`Self::told_of_a_repeat`]).
+    /// with no claim is a first admission, which has no window: the answer is `None`, and the caller
+    /// refuses it for the window, told as a repeat's refusal when a copy of the request has been
+    /// carried out or is on its way ([`Self::told_of_a_repeat`]).
     async fn settle_a_repeat(
         &self,
         mutation: &MutationRequest,
-        entry: &'static MethodEntry,
-        refusal: ProtocolError,
+        method: Method,
         validated: kr_protocol::ids::AuthorityRevision,
         decided: &Asked,
         asked: &mut Option<Asked>,
         own_claim: &OwnClaim,
-    ) -> std::result::Result<ControlFrame, ProtocolError> {
+    ) -> std::result::Result<Option<ControlFrame>, ProtocolError> {
         use crate::transfer::Settling;
 
         let actor_id = self.device.principal();
         match self
             .controller
             .transfer
-            .settles(&actor_id, mutation, entry.method)
+            .settles(&actor_id, mutation, method)
             .await
         {
-            Settling::No => Err(refusal),
-            Settling::Answered(answer) => {
-                self.kept_answer(answer, entry.method, mutation, validated, decided, asked)
-                    .await
-            }
+            Settling::No => Ok(None),
+            Settling::Answered(answer) => self
+                .kept_answer(answer, method, mutation, validated, decided, asked)
+                .await
+                .map(Some),
             Settling::Open => {
                 let mut origin = Origin::Fresh;
                 let answer = self
                     .transfer_write(
                         mutation,
-                        entry.method,
+                        method,
                         actor_id,
                         crate::authority::AdmittedMutation {
                             connection_id: self.connection_id(),
@@ -1922,17 +1929,16 @@ impl RemoteConnection {
                             deadline: None,
                         },
                         own_claim,
-                        None,
-                        true,
+                        Arrival::Settling,
                     )
                     .await
                     .map(|given| noting(&mut origin, given))?;
                 match origin {
-                    Origin::Fresh => Ok(answer),
-                    Origin::Copied => {
-                        self.kept_answer(answer, entry.method, mutation, validated, decided, asked)
-                            .await
-                    }
+                    Origin::Fresh => Ok(Some(answer)),
+                    Origin::Copied => self
+                        .kept_answer(answer, method, mutation, validated, decided, asked)
+                        .await
+                        .map(Some),
                     Origin::Withheld => Err(self.withheld_answer(decided, asked)),
                 }
             }
