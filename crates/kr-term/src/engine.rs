@@ -25,7 +25,7 @@ use crate::event::{DirectDisposition, Event, EventKind};
 use crate::grid::{CanonicalGrid, GridConfig, GridRow};
 use crate::lane::{LaneDegradation, LaneLimits, ResponseLane};
 use crate::lexer::{LexLimits, Lexer};
-use crate::modes::{MOUSE_TRACKING_MODES, ModeKind, ModeState};
+use crate::modes::{ModeKind, ModeState, mouse_state_group};
 use crate::palette::{DynamicColour, Palette, PaletteSource};
 use crate::policy::{Backend, Policy};
 use crate::profile::Profile;
@@ -1358,11 +1358,12 @@ impl Engine {
                         continue;
                     }
                     self.modes.set(ModeKind::Dec, mode, enabled);
-                    // A change of the mouse tracking can clear the other two, so a delta carries
-                    // all three and a client is not left holding a flag the session no longer has.
-                    if MOUSE_TRACKING_MODES.contains(&mode) {
-                        for tracking in MOUSE_TRACKING_MODES {
-                            self.mark_mode(ModeKind::Dec, *tracking);
+                    // A change of the mouse tracking can clear the other two, and a change of the
+                    // mouse encoding the other one, so a delta carries the whole group and a client
+                    // is not left holding a flag the session no longer has.
+                    if let Some(group) = mouse_state_group(mode) {
+                        for member in group {
+                            self.mark_mode(ModeKind::Dec, *member);
                         }
                     } else {
                         self.mark_mode(ModeKind::Dec, mode);
