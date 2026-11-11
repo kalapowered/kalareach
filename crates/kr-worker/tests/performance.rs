@@ -40,6 +40,15 @@ mod teardown;
 #[path = "../../../tests/perf/src/record.rs"]
 mod record;
 
+/// What the idle group holds, a page of a file counted once, which only Linux's page map gives.
+#[cfg(target_os = "linux")]
+#[path = "../../../tests/perf/src/memory.rs"]
+#[allow(
+    dead_code,
+    reason = "the harness's own checks use the parts of the reader that the idle measurement does not"
+)]
+mod memory;
+
 /// The record this suite's figures are kept in, under `KR_TEST_ARTIFACTS_DIR`.
 const RECORD: &str = "kr-worker-performance.md";
 
@@ -49,8 +58,25 @@ const IDLE_SESSIONS: usize = 20;
 /// How many attached views the memory requirement names.
 const ATTACHED_VIEWS: usize = 32;
 
-/// The whole-host resident bound the requirement names, in kibibytes.
+/// The whole-host resident bound the requirement names, in kibibytes. On Linux it is held by the
+/// memory the group holds, each resident page counted once for the group; elsewhere, where no
+/// reader of that figure is found without a privileged port, by the sum of the resident sizes, which
+/// is never below it.
 const RESIDENT_BOUND_KIB: u64 = 500 * 1024;
+
+/// Where the sum of the resident sizes stood when the memory the group holds was last read on a
+/// 64-processor Linux host, in kibibytes: the mean of four runs of one build (515,387 KiB, rounded
+/// down), which spread 2,560 KiB. The sum counts a page of the worker program once for each of the
+/// twenty workers, so it shows a growth of that program twenty times enlarged. It is recorded, and
+/// it is no reading of the requirement: see [`SUM_ALARM_STEP_KIB`].
+const SUM_RECORDED_KIB: u64 = 515_000;
+
+/// How far the sum of the resident sizes may rise above [`SUM_RECORDED_KIB`] before the idle
+/// measurement fails, so that a ruling is asked for. The failure is an alarm that what the workers
+/// map or hold has grown, and not a finding about the requirement, which the figure that counts each
+/// resident page once holds. A sum that reads low, as the kernel's reclaim of mapped pages makes it,
+/// is no alarm: only a rise is.
+const SUM_ALARM_STEP_KIB: u64 = 10 * 1024;
 
 /// The processor bound the requirement names: a fraction of one core, averaged.
 const IDLE_CORE_FRACTION: f64 = 0.01;
@@ -653,7 +679,12 @@ fn total<T: std::iter::Sum>(
 /// What the idle measurement established, and what its host was short of the reference host.
 struct Idle {
     cores: f64,
-    resident: u64,
+    /// The sum of the processes' resident sizes, in kibibytes: a page that several processes map
+    /// is counted for each of them.
+    sum: u64,
+    /// What the group holds with each resident page counted once, in kibibytes, where this host can
+    /// read it (Linux). Where it is read it is the figure the memory bound is held to.
+    combined: Option<u64>,
     /// Each condition of the reference host this host can be shown not to meet. The processor
     /// figure is a claim about a reference host, so it is asserted only while this is empty; the
     /// memory bound is a size and is asserted on every host.
@@ -661,12 +692,19 @@ struct Idle {
 }
 
 impl Idle {
-    fn new(cores: f64, resident: u64, conditions: &record::Conditions) -> Self {
+    fn new(cores: f64, sum: u64, combined: Option<u64>, conditions: &record::Conditions) -> Self {
         Self {
             cores,
-            resident,
+            sum,
+            combined,
             shortfalls: conditions.shortfalls(),
         }
+    }
+
+    /// The figure the memory bound is held to: what the group holds where that can be read, and
+    /// the sum of the resident sizes, which is never below it, where it cannot.
+    fn memory(&self) -> u64 {
+        self.combined.unwrap_or(self.sum)
     }
 
     /// The lines that say what the figures came to against the target, and what stood in the way
@@ -674,7 +712,7 @@ impl Idle {
     fn verdict(&self) -> Vec<String> {
         let inside = |figure: bool| if figure { "inside" } else { "outside" };
         let processor = self.cores < IDLE_CORE_FRACTION;
-        let memory = self.resident < RESIDENT_BOUND_KIB;
+        let memory = self.memory() < RESIDENT_BOUND_KIB;
         if self.shortfalls.is_empty() {
             return vec![format!(
                 "  verdict           {}",
@@ -705,7 +743,8 @@ impl Idle {
     }
 
     /// Holds the figures to the bounds that are asserted: the processor figure on a host with no
-    /// shortfall, and the resident memory on every host.
+    /// shortfall, and the resident memory on every host, as the memory the group holds where that
+    /// is read and as the sum of the resident sizes elsewhere.
     fn check(&self) -> Result<(), String> {
         if self.shortfalls.is_empty() && self.cores >= IDLE_CORE_FRACTION {
             return Err(format!(
@@ -713,10 +752,31 @@ impl Idle {
                 self.cores
             ));
         }
-        if self.resident >= RESIDENT_BOUND_KIB {
+        if self.memory() >= RESIDENT_BOUND_KIB {
             return Err(format!(
-                "idle resident memory is under {RESIDENT_BOUND_KIB} KiB: {} KiB",
-                self.resident
+                "idle resident memory is under {RESIDENT_BOUND_KIB} KiB{}: {} KiB",
+                if self.combined.is_some() {
+                    ", each resident page counted once for the group"
+                } else {
+                    ""
+                },
+                self.memory()
+            ));
+        }
+        // The sum counts the worker program once for each worker, so it shows twenty times what
+        // the program grows by. Where the requirement is held to the figure that counts it once,
+        // the sum is watched here and its rise is put to a ruling.
+        if self.combined.is_some() && self.sum > SUM_RECORDED_KIB + SUM_ALARM_STEP_KIB {
+            return Err(format!(
+                "the sum of the processes' resident sizes is {} KiB, more than {SUM_ALARM_STEP_KIB} \
+                 KiB above its recorded level of {SUM_RECORDED_KIB} KiB: a ruling is needed on \
+                 whether the memory the workers map or hold has grown or the recorded level moves \
+                 (the `by class`, `worker program` and `largest files` lines of the record say \
+                 where). This is an alarm and not the requirement, which is held to the memory the \
+                 group holds with each resident page counted once: {} KiB against \
+                 {RESIDENT_BOUND_KIB} KiB",
+                self.sum,
+                self.memory()
             ));
         }
         Ok(())
@@ -735,7 +795,12 @@ const UNDER_THE_MEMORY_BOUND_KIB: u64 = 360_000;
 #[test]
 fn a_host_short_of_the_reference_host_records_the_idle_processor_figure_without_asserting_it() {
     let short = record::Conditions::supplied(3, 7 * 1024, None);
-    let idle = Idle::new(OVER_THE_PROCESSOR_BOUND, UNDER_THE_MEMORY_BOUND_KIB, &short);
+    let idle = Idle::new(
+        OVER_THE_PROCESSOR_BOUND,
+        UNDER_THE_MEMORY_BOUND_KIB,
+        None,
+        &short,
+    );
 
     let lines = idle.verdict();
     assert!(
@@ -764,6 +829,7 @@ fn a_host_with_no_shortfall_fails_an_idle_processor_figure_over_the_bound() {
     let over = Idle::new(
         OVER_THE_PROCESSOR_BOUND,
         UNDER_THE_MEMORY_BOUND_KIB,
+        None,
         &reference,
     );
     assert!(
@@ -779,7 +845,7 @@ fn a_host_with_no_shortfall_fails_an_idle_processor_figure_over_the_bound() {
         over.check()
     );
 
-    let under = Idle::new(0.0075, UNDER_THE_MEMORY_BOUND_KIB, &reference);
+    let under = Idle::new(0.0075, UNDER_THE_MEMORY_BOUND_KIB, None, &reference);
     assert_eq!(under.check(), Ok(()), "a figure under the bound passes");
 }
 
@@ -787,12 +853,87 @@ fn a_host_with_no_shortfall_fails_an_idle_processor_figure_over_the_bound() {
 #[test]
 fn a_host_short_of_the_reference_host_still_fails_idle_memory_over_the_bound() {
     let short = record::Conditions::supplied(3, 7 * 1024, None);
-    let idle = Idle::new(0.0075, RESIDENT_BOUND_KIB, &short);
+    let idle = Idle::new(0.0075, RESIDENT_BOUND_KIB, None, &short);
     assert!(
         idle.check()
             .is_err_and(|failure| failure.contains("resident memory")),
         "resident memory at the bound fails on a short host too: {:?}",
         idle.check()
+    );
+}
+
+/// KR-PERF-003: where the memory the group holds is read, the bound is held to it, and not to the
+/// sum of the resident sizes, which counts the program the twenty workers map twenty times.
+#[test]
+fn memory_is_held_to_what_the_group_holds_where_that_is_read() {
+    let reference = record::Conditions::supplied(4, 8 * 1024, Some(0.0));
+    // A sum over the bound, beside about 151,000 KiB held.
+    let held = Idle::new(0.0075, 515_432, Some(151_496), &reference);
+    assert_eq!(
+        held.check(),
+        Ok(()),
+        "a sum over the bound is no failure while the group holds far less"
+    );
+    assert!(
+        held.verdict()
+            .iter()
+            .any(|line| line.contains("the target is met on this host")),
+        "and the verdict reads the held figure: {:?}",
+        held.verdict()
+    );
+
+    let at_the_bound = Idle::new(0.0075, 515_432, Some(RESIDENT_BOUND_KIB), &reference);
+    assert!(
+        at_the_bound
+            .check()
+            .is_err_and(|failure| failure.contains("each resident page counted once")),
+        "what the group holds, at the bound, fails: {:?}",
+        at_the_bound.check()
+    );
+}
+
+/// The sum is watched, not held to the requirement: a rise of it above its recorded level by more
+/// than the step stops the measurement with the words that a ruling is needed.
+#[test]
+fn a_sum_that_rises_past_its_recorded_level_fails_with_the_words_that_a_ruling_is_needed() {
+    let reference = record::Conditions::supplied(4, 8 * 1024, Some(0.0));
+    let at_the_step = Idle::new(
+        0.0075,
+        SUM_RECORDED_KIB + SUM_ALARM_STEP_KIB,
+        Some(151_496),
+        &reference,
+    );
+    assert_eq!(at_the_step.check(), Ok(()), "the step itself is allowed");
+
+    let past = Idle::new(
+        0.0075,
+        SUM_RECORDED_KIB + SUM_ALARM_STEP_KIB + 1,
+        Some(151_496),
+        &reference,
+    );
+    let failure = past.check().expect_err("a sum past its alarm");
+    assert!(
+        failure.contains("a ruling is needed") && failure.contains("not the requirement"),
+        "the alarm says what it is: {failure}"
+    );
+
+    // A low reading, which the kernel's reclaim of mapped pages gives (the sum read 440,048 KiB at one
+    // commit while it read 513,960 to 516,520 KiB at four other runs of it), is no alarm: the sum is
+    // watched for a rise only.
+    let low = Idle::new(0.0075, 440_048, Some(90_432), &reference);
+    assert_eq!(low.check(), Ok(()), "a low reading does not fail");
+
+    // Where the sum is the held figure, it has no alarm of its own: the bound decides.
+    let sum_only = Idle::new(
+        0.0075,
+        SUM_RECORDED_KIB + SUM_ALARM_STEP_KIB + 1,
+        None,
+        &reference,
+    );
+    let failure = sum_only.check().expect_err("a sum over the bound");
+    assert!(
+        failure.contains("idle resident memory") && !failure.contains("a ruling is needed"),
+        "it fails as the bound and not as the alarm: {failure}"
     );
 }
 
@@ -817,6 +958,187 @@ async fn idle_resources_for_twenty_sessions_and_thirty_two_views() {
         .unwrap_or_else(|failure| panic!("{failure}"));
     let _ = host.controller;
     let _ = host.worker;
+}
+
+/// The test the idle measurement starts a copy of this program to run as the memory reader.
+#[cfg(target_os = "linux")]
+const MEMORY_READER_TEST: &str =
+    "the_idle_measurement_reads_what_its_group_holds_from_a_child_of_this_program";
+
+/// What the group holds with each resident page counted once, as the figure and the lines that say
+/// it, read from outside the group by a copy of this program: the controller is the process being
+/// read, so a reader inside it would put its own pages into the figure.
+///
+/// A reading that cannot be taken is an error, which fails the measurement with its reason.
+#[cfg(target_os = "linux")]
+async fn held_memory(
+    workers: &[u32],
+    shells: &[u32],
+    daemon: u32,
+    sum: u64,
+) -> Result<(Option<u64>, Vec<String>), String> {
+    let hosts: Vec<u32> = workers
+        .iter()
+        .copied()
+        .filter(|pid| !shells.contains(pid))
+        .collect();
+    let program = hosts.first().and_then(|&pid| memory::program_of(pid));
+    let count = hosts.len();
+    let classes = vec![
+        memory::Class {
+            name: "daemon".to_owned(),
+            pids: vec![daemon],
+        },
+        memory::Class {
+            name: "session_workers".to_owned(),
+            pids: hosts,
+        },
+        memory::Class {
+            name: "root_shells".to_owned(),
+            pids: shells.to_vec(),
+        },
+    ];
+    let reading =
+        tokio::task::spawn_blocking(move || memory::read_in_child(MEMORY_READER_TEST, &classes))
+            .await
+            .map_err(|error| format!("the memory reading's thread: {error}"))?
+            .map_err(|reason| format!("the memory the group holds could not be read: {reason}"))?;
+    let class = |name: &str| {
+        reading
+            .class(name)
+            .map_or((0, 0), |class| (class.combined_kib, class.resident_kib))
+    };
+    let mut lines = vec![
+        format!(
+            "  resident set      {} KiB with each resident page counted once for the group, \
+             against {RESIDENT_BOUND_KIB} KiB: the asserted figure ({} KiB of it is counted for \
+             each process that holds it, and {} KiB is file pages counted once)",
+            reading.combined_kib, reading.own_kib, reading.files_kib
+        ),
+        format!(
+            "  by class          held, then the resident pages the scan counted for each process: the \
+             daemon {} of {} KiB, {count} session workers {} of {} KiB, {} root shells {} of {} KiB \
+             (each class's own figures; a file page that two classes map counts once in each, so \
+             the first figures do not add up to the whole)",
+            class("daemon").0,
+            class("daemon").1,
+            class("session_workers").0,
+            class("session_workers").1,
+            shells.len(),
+            class("root_shells").0,
+            class("root_shells").1
+        ),
+        format!(
+            "  scan              {} KiB counted for each process against the process table's \
+             {sum} KiB, {} KiB of it beyond the kernel's own resident sizes (zero pages and huge \
+             pages, which a resident size leaves out)",
+            reading.resident_kib, reading.beyond_kib
+        ),
+    ];
+    let program_line = program
+        .as_deref()
+        .and_then(|path| reading.file(path))
+        .map(|file| {
+            format!(
+                "  worker program    {} KiB resident in each of {count} workers ({} KiB of the sum \
+                 above), {} KiB once for the group: {}",
+                file.each_kib / count.max(1) as u64,
+                file.each_kib,
+                file.once_kib,
+                file.path
+            )
+        })
+        .unwrap_or_else(|| {
+            "  worker program    not named in the reading: its path or its pages are not in it"
+                .to_owned()
+        });
+    lines.push(program_line);
+    lines.push(format!(
+        "  largest files     {} (file pages resident in the group, counted once)",
+        reading
+            .files
+            .iter()
+            .take(4)
+            .map(|file| format!("{} {} KiB", file.path, file.once_kib))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    Ok((Some(reading.combined_kib), lines))
+}
+
+/// Where the memory the group holds cannot be read, the memory bound is held to the sum.
+#[cfg(not(target_os = "linux"))]
+#[allow(
+    clippy::unused_async,
+    reason = "the reader on Linux is asynchronous and this is its counterpart elsewhere"
+)]
+async fn held_memory(
+    _workers: &[u32],
+    _shells: &[u32],
+    _daemon: u32,
+    _sum: u64,
+) -> Result<(Option<u64>, Vec<String>), String> {
+    Ok((
+        None,
+        vec![
+            "  resident set      not read on this host: no reader of what the group holds, with each \
+             resident page counted once, exists here without a privileged port, so the bound is \
+             held to the sum above, which is never below it. The requirement's figure is the Linux \
+             reading"
+                .to_owned(),
+        ],
+    ))
+}
+
+/// The idle measurement reads what its group holds from a copy of this program. This starts such a
+/// reader on two copies of the program that hold memory, and the reading counts the program the two
+/// of them map once. The group is two other processes and not this one, because this process runs
+/// other cases on other threads while the reader is scanning it, which change its mappings, and a
+/// scan whose mappings change is read again and then refused.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_idle_measurement_reads_what_its_group_holds_from_a_child_of_this_program() {
+    if memory::serve_if_asked() || memory::hold_if_asked() {
+        return;
+    }
+    let first = memory::Holder::spawn(MEMORY_READER_TEST, 4, memory::Hold::Written)
+        .expect("a copy of this program that holds memory starts");
+    let second = memory::Holder::spawn(MEMORY_READER_TEST, 4, memory::Hold::Written)
+        .expect("a second copy of this program that holds memory starts");
+    let classes = vec![
+        memory::Class {
+            name: "daemon".to_owned(),
+            pids: vec![first.pid()],
+        },
+        memory::Class {
+            name: "session_workers".to_owned(),
+            pids: vec![second.pid()],
+        },
+    ];
+
+    let reading = memory::read_in_child(MEMORY_READER_TEST, &classes)
+        .expect("the group is read from outside");
+
+    assert_eq!(reading.processes, 2);
+    assert!(
+        reading.own_kib >= 2 * 4 * 1024,
+        "what the holders wrote is counted: {} KiB",
+        reading.own_kib
+    );
+    assert!(
+        reading.combined_kib < reading.resident_kib,
+        "the program both processes map is counted once: {} KiB held, {} KiB counted for each",
+        reading.combined_kib,
+        reading.resident_kib
+    );
+    let program = memory::program_of(first.pid()).expect("the holder's program");
+    assert!(
+        reading
+            .file(&program)
+            .is_some_and(|file| file.each_kib > file.once_kib),
+        "the program is named with its pages once and for each process: {:?}",
+        reading.file(&program)
+    );
 }
 
 /// Takes the idle measurement, reporting a failure rather than ending the process on one.
@@ -918,7 +1240,20 @@ async fn idle(host: &Host, owned: &mut Owned) -> Result<Idle, String> {
     let (roots, in_roots) = by_kind("a root shell");
     let mut largest: Vec<(u32, f64)> = spent.clone();
     largest.sort_by(|left, right| right.1.total_cmp(&left.1));
-    let resident = total(&workers, daemon, resident_kib)?;
+    // Both are read at the endpoint of the window, the sum first and what the group holds at once
+    // after it, so that they are two readings of the same moment.
+    let sum = total(&workers, daemon, resident_kib)?;
+    let held = held_memory(&workers, &shells, daemon, sum).await;
+    // A reading that cannot be taken fails the measurement, after the record has kept the rest of
+    // what this run found: the processor figure, the sum and the conditions.
+    let (combined, held_lines, refusal) = match held {
+        Ok((combined, lines)) => (combined, lines, None),
+        Err(reason) => (
+            None,
+            vec![format!("  resident set      not read: {reason}")],
+            Some(reason),
+        ),
+    };
 
     let grid = kr_protocol::session::INVISIBLE_DEFAULT_DIMENSIONS;
     let mut lines = conditions.lines();
@@ -949,16 +1284,37 @@ async fn idle(host: &Host, owned: &mut Owned) -> Result<Idle, String> {
             .join(", ")
     ));
     lines.push(format!(
-        "  resident          {resident} KiB across {} processes (each session's worker and its \
-         root shell) and the daemon, against {RESIDENT_BOUND_KIB} KiB",
-        workers.len()
+        "  resident          {sum} KiB across {} processes (each session's worker and its root \
+         shell) and the daemon{}",
+        workers.len(),
+        if cfg!(target_os = "linux") {
+            format!(
+                ", the sum of their resident sizes, which counts a page that several of them map \
+                 for each: recorded on this host, with an alarm {} KiB above its recorded level \
+                 of {SUM_RECORDED_KIB} KiB, and not the requirement",
+                SUM_ALARM_STEP_KIB
+            )
+        } else {
+            format!(", against {RESIDENT_BOUND_KIB} KiB")
+        }
     ));
+    lines.extend(held_lines);
     lines.push(
         "  not measured      the whole product's memory with adapters and a description model \
          active"
             .to_owned(),
     );
-    let idle = Idle::new(cores, resident, &conditions);
+    if let Some(reason) = refusal {
+        lines.push(
+            "  verdict           the memory the group holds could not be read, so the measurement \
+             fails with the reason on the `resident set` line"
+                .to_owned(),
+        );
+        record::report(RECORD, "KR-PERF-003 idle local terminal resources", &lines);
+        drop(views);
+        return Err(reason);
+    }
+    let idle = Idle::new(cores, sum, combined, &conditions);
     lines.extend(idle.verdict());
     // Before anything is asserted, so a run whose target failed keeps the figure.
     record::report(RECORD, "KR-PERF-003 idle local terminal resources", &lines);

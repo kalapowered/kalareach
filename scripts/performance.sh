@@ -4,6 +4,14 @@
 # KR-PERF-003 is a five-minute average, so this script takes five minutes. KR-PERF-004 is measured
 # from the connection to a screen a terminal can draw, not to the first byte on the wire.
 #
+# KR-PERF-003's memory bound is held, on Linux, to the memory the daemon and the twenty idle
+# sessions hold: each resident page counted once for the group, read from the kernel's page map at
+# the end of the window. The sum of the processes' resident sizes, which counts the worker program
+# once for each worker, is printed beside it with an alarm that asks for a ruling when it rises; it
+# is not the requirement. On Linux a reading that cannot be taken fails the measurement, with the
+# process and the reason named. macOS has no page map that a process of the same user can read, so
+# there the bound is held to the sum, which is never below what the group holds.
+#
 # Every step is checked. A build that fails, a measurement that produces no samples, or a
 # measurement that misses its bound all end this script with a non-zero status, because a
 # performance script that exits zero without measuring anything is worse than no script. A bound
@@ -182,7 +190,7 @@ measurement_in() {
     "$target_flag" "$target" -- --ignored --exact --nocapture "$name" 2>&1)"; then
     echo "$output"
     echo "  load average leaving this measurement: $(load_average)"
-    echo "FAILED: $name did not meet its bound"
+    echo "FAILED: $name failed: its own message above says why"
     return 1
   fi
   echo "$output"

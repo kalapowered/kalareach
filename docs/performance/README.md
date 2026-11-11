@@ -92,7 +92,8 @@ in any five seconds.
 ## The two configurations
 
 Section 27 measures an idle host and a host under stress. KR-PERF-001 and KR-PERF-003 are taken in
-the idle configuration, and the stress run reports the same readings under stress and checks
+the idle configuration, and the stress run reports the same readings under stress, with the sum of
+resident sizes as its memory figure, and checks
 KR-PERF-007's slow observer. The other targets are taken on a host in its own state, as the table
 below says.
 
@@ -102,6 +103,56 @@ Twenty sessions, each a worker with its root shell in a pseudo-terminal, and thi
 attached across them, each subscribed to output. No application runs. KR-PERF-003 is measured in
 this configuration. KR-PERF-001 puts the same load on the host while it measures: nineteen live
 shells and thirty-two views beside the session the keystrokes go to.
+
+### The idle memory figure
+
+KR-PERF-003's 500 MiB is the memory the daemon and the twenty idle sessions hold. A page that all
+twenty workers map, the worker program's code above all, is one page of memory held once, and the
+sum of the processes' resident sizes counts it twenty times. So on Linux the test reads what the
+group holds from the kernel's page map, at the end of the five-minute window, and asserts that
+against 512,000 KiB:
+
+- A resident page that the kernel marks as a file page or as shared memory, of a mapping that has an
+  inode, is identified by its device, inode and place in the file, and counted once for the whole
+  group, whether or not a process outside the group maps it too.
+- Every other resident page (anonymous memory, a page of a private file mapping that a process has
+  written, a shared page with no inode) is counted for each process that maps it. Pages shared
+  through a fork, or merged by the kernel, are counted for each process, so the figure can only be
+  above the physical set there.
+- A swapped page is not resident and not counted. A page the page map shows as present counts,
+  including the zero page that a read of untouched memory maps, which the kernel's own resident size
+  leaves out; the excess over the kernel's sizes is recorded on the `scan` line. A scan that finds
+  fewer pages than a process's kernel resident size, by more than the larger of 64 KiB and one per
+  cent, has lost pages: the reading is refused and the measurement fails with the process named.
+  A scan inside that tolerance is accepted, so the reading can fall short of what a process holds
+  by up to that much. The pages of an `anon_inode:` mapping, which belong to a kernel object and
+  not to a file other processes share, are counted for each process.
+- The root shell of each session is counted with the workers and the daemon.
+
+The reader runs in a child copy of the test's own program, because the daemon runs in the test
+process and a reader inside it would put its own pages into the figure. It needs each process of
+the group to stay dumpable by its own user, since the kernel shows a page map only to a reader that
+may trace the process it describes; a process that cannot be read, has ended, or whose mappings keep
+changing refuses the reading, and a refusal fails the measurement and names the process and what
+failed.
+
+The record keeps these lines: `resident` (the sum of the resident sizes, counting a shared page for
+each process), `resident set` (the figure asserted; when the reading is refused, the reason, after
+which the measurement fails), `by class` (the daemon, the session workers and the root shells, each
+class's own figure beside the resident pages the scan counted for each of its processes, so a file
+page two classes map counts once in each), `scan`, `worker program` (how much of the worker program
+one worker holds resident, which the sum counts twenty times) and `largest files`.
+
+The sum stays recorded because it shows a growth of the worker program twenty times enlarged. It
+carries an alarm: `SUM_RECORDED_KIB` is where it stood when the figure was last read on a 64-processor
+Linux host, and a sum more than `SUM_ALARM_STEP_KIB` above that fails the measurement with the
+words that a ruling is needed. The alarm is not the requirement, and a low sum, which the kernel's
+reclaim of mapped pages gives, does not fire it.
+
+Where no reader of the held figure is available, which is macOS (it has no page map a process of
+the same user can read, and the memory-object counts of `proc_pidinfo` describe the object and not
+the process), the bound is asserted against the sum of the resident sizes. The sum is never below
+what the group holds, so asserting it is stricter and not weaker.
 
 ### Stress: 50 sessions with sustained output
 
@@ -127,7 +178,7 @@ load is waited out, not a host condition.
 | --- | --- | --- | --- |
 | KR-PERF-001 | p95 below 5 ms, p99 below 15 ms | `crates/kr-worker/benches/input_latency.rs` (`added_input_forwarding_latency`), and again in the stress run | 1,000 single-byte writes on the session's own local socket, each timed to the byte arriving back after the application echoed it. That includes the application's read and echo and the host's whole output path, which section 27 leaves out, so the figure is an upper bound on the added latency. A second reading, `remote_input_forwarding_latency` in `crates/kr-controller/tests/network_input.rs`, sends 1,000 single-byte writes from a paired device through the control daemon, once idle and once with each write sent right behind a viewport report on the device's own connection, and times each from the write to the application having the byte and to the application's echo reaching the device as output. Both include the device's link to the daemon, so both are recorded beside the local figure and assert nothing: section 27 states this bound for the local path. |
 | KR-PERF-002 | recogniser deadline at most 25 ms | `input_latency.rs` (`paste_prefix_recogniser_deadline`) | Every proper prefix of both paste delimiters and a lone Escape, each alone and timed to the byte reaching the application, and a delimiter split across two writes, recognised once. The deadline the host is built with is checked against section 27's directly. Each hold's upper bound, the deadline and 15 ms for the path around it, and the split delimiter's time are asserted on every host that reads no shortfall against the reference host and is not a GitHub-hosted runner, a virtual machine on shared hardware that the run cannot see into; no run reads whether the process kept its processor for the whole of a hold. On any other host the holds are recorded, each measurement says in its verdict whether its figures were inside the target, which `scripts/bench-all.sh` counts as a missed target when they were not, and the missing condition is named; a hosted runner also waits up to five seconds for a held byte, not 200 ms, so that a hold the machine stretched is recorded with its figure. The deadline itself, each hold's lower bound and the recognition of a split delimiter with its payload kept are asserted on every host. A split delimiter's second write is sent after the answer to the first, so it can reach the recogniser after the first part's deadline, and the recogniser says whether it did. An offer that came late is recorded with how long the first part was held and is made again, up to twenty offers in all. A measurement none of whose offers came in time fails, and so does a first part forwarded before its deadline, or one that ran out of time and still completed the delimiter. A byte that does not arrive within the wait for a held byte fails the measurement on every host. Four more rounds follow, recorded and not asserted, with the instants of each acquisition of the session on a hold's path, each observation of its processes, the timer's wake, the steps of the output ingest and its write to the spool, the processor time and a sleeping thread's wakes. The holds are taken again, to the same bounds, while an attach and a detach loop on a second connection, each a journalled mutation, and again with each write sent right behind a viewport report on its own connection, with the order of the two answers recorded, and where the worker took the write against the report's hold of the session. Each of those two takes one more hold, a lone Escape written once a mutation (the loop's, or the report) is known to be stopped in its dispatch marker's commit with the session held; the mutation is let go once the byte has reached the application, and the answer to the write is read after that, so the only wait on the way is the wait for a held byte. The other holds meet a mutation, or are answered before their report, as the machine schedules them, and are recorded apart from that one, so that the figure always includes a keystroke that met a mutation holding the session, and one that did not wait for the report of its own connection. A paired device's lone Escape behind a stalled mutation or read on its own connection also reaches the application through the daemon without waiting for it (`network_input.rs`) |
-| KR-PERF-003 | below 500 MiB and 1% of one core | `crates/kr-worker/tests/performance.rs` (`idle_resources_for_twenty_sessions_and_thirty_two_views`) | The idle configuration's daemon, workers and root shells: processor time over five minutes and resident memory at the end. The processor bound is asserted where the host meets the reference host's conditions, and elsewhere recorded with the shortfall named; the memory bound is asserted on every host. The stress run reports the same readings under stress, which section 27 sets no bound on, and the whole product's memory with the plugin host serving, beside the host's own account of the compiled components it holds (their number, the artefact bytes they were made from, the live bindings) and the size of its compiled-code cache on disk, which the run asserts it read from the host while the host served |
+| KR-PERF-003 | below 500 MiB and 1% of one core | `crates/kr-worker/tests/performance.rs` (`idle_resources_for_twenty_sessions_and_thirty_two_views`) | The idle configuration's daemon, workers and root shells: processor time over five minutes and memory at the end. The processor bound is asserted where the host meets the reference host's conditions, and elsewhere recorded with the shortfall named; the memory bound is asserted on every host, on Linux against what the group holds with each resident page counted once and elsewhere against the sum of the resident sizes (see "The idle memory figure"). The stress run reports the same readings under stress, which section 27 sets no bound on, and the whole product's memory with the plugin host serving, beside the host's own account of the compiled components it holds (their number, the artefact bytes they were made from, the live bindings) and the size of its compiled-code cache on disk, which the run asserts it read from the host while the host served |
 | KR-PERF-004 | a usable 120x40 screen within 500 ms | `performance.rs` (`attach_to_a_usable_screen`) | Five attachments of each presentation, from the connection to a screen a person could look at. The worker makes three journal records durable before it answers an attach, so the 500 ms is asserted unless the disk's durable writes took longer than the reference host admits at either edge, which the record names as a missing condition |
 | KR-PERF-005 | under 25 ms p95 above the path's round trip | `crates/kr-transport/tests/perf.rs` | Remote input over a real connection while a bulk transfer runs, less the path's own round trip. The target is asserted where the host meets the reference host's conditions, and elsewhere recorded with the shortfall named |
 | KR-PERF-006 | usable state within two seconds | `crates/kr-transport/tests/perf.rs`, `crates/kr-client/tests/session.rs` and `crates/kr-controller/tests/network_reconnect_time.rs` | The transport's share is timed: reconnecting, the handshake, a stream and a 120x40 snapshot. The client's share is asserted inside the budget: the subscription through the client library and a painted 120x40 screen, plainly and after one refused read. A reconnect to a real daemon and worker is timed as well: a paired device that has been attached and has gone dials again and resumes the cursors the ended session carried, and the clock runs from the dial through the connection, the attach, the subscription from the carried position and the host's projection to a painted 120x40 screen. The budget is asserted where no condition of the reference host that a run can read is shown to fall short (an optimised build, four processors, 8 GiB, durable writes on the host's disk within the bound above, and at most 1% of the time taken by a hypervisor), and elsewhere the figure is recorded with the shortfall named; a debug build always lacks one, so the landing workflow's debug runs record the figure and cannot fail the case on the target (the case's own waits for the host, pairing included, are each bounded as a whole at 120 seconds, and the harness's dial has a limit of its own) |

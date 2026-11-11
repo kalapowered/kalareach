@@ -21,8 +21,10 @@ name = "kr-perf-watch"
 path = "src/bin/kr-perf-watch.rs"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# Linux keeps a process's processor time in clock ticks, and this is where their rate is read.
-rustix = { workspace = true, features = ["param"] }
+# Linux keeps a process's processor time in clock ticks, and this is where their rate is read. The
+# memory reader's checks make a process refuse its page map to every reader, which is a process
+# setting, and the reader waits for the processes it starts by their process descriptors.
+rustix = { workspace = true, features = ["event", "param", "process"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # macOS gives each processor's idle time only through the kernel's host interface, and each

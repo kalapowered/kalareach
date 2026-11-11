@@ -6,9 +6,13 @@
 //! under `KR_TEST_ARTIFACTS_DIR`, headed by the identifier it measures. [`process`] reads what the
 //! measured processes use. `scripts/bench-all.sh` runs every measurement, section 27's stress run in
 //! this crate's `tests/stress.rs` among them, and reads those sections back. Through each one it
-//! runs `kr-perf-watch`, which reads the whole [`machine`] and bounds the [`other_work`] it did.
+//! runs `kr-perf-watch`, which reads the whole [`machine`] and bounds the [`other_work`] it did. On
+//! Linux, `memory` reads what a group of processes holds, a page of a file counted once, which is
+//! the figure KR-PERF-003's bound is about.
 
 pub mod machine;
+#[cfg(unix)]
+pub mod memory;
 pub mod other_work;
 pub mod process;
 #[cfg(any(target_os = "linux", test))]
