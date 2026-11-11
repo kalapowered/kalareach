@@ -52,9 +52,9 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_TAG_INFO, FILE_CASE_SENSITIVE_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_128,
-    FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileAttributeTagInfo, FileCaseSensitiveInfo, FileIdInfo, GetFileInformationByHandleEx,
-    OPEN_EXISTING,
+    FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FileAttributeTagInfo, FileCaseSensitiveInfo, FileIdInfo,
+    GetFileInformationByHandleEx, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -208,6 +208,9 @@ fn io_error(what: impl Into<String>) -> impl FnOnce(io::Error) -> Error {
 pub struct Paths {
     /// The program directory: the broker and the credential helper.
     pub program: PathBuf,
+    /// The highest folder above the program directory that is read before anything in it is used:
+    /// `Program Files`. Every folder from it down to the program directory's parent is checked.
+    pub program_top: PathBuf,
     /// The data directory: the manifest, the earlier-state record, the journal and the staging
     /// directories.
     pub data: PathBuf,
@@ -246,11 +249,12 @@ impl Paths {
         let data = PathBuf::from(program_data)
             .join("KalaReach")
             .join("Boundary");
-        let program = PathBuf::from(program_files)
+        let program = PathBuf::from(&program_files)
             .join("KalaReach")
             .join("Boundary");
         Paths {
             git: program.join("git"),
+            program_top: PathBuf::from(program_files),
             program,
             staging: data.join("staging"),
             journal: data.join("journal"),
@@ -1344,10 +1348,116 @@ fn within_refusal(
     }
 }
 
+/// Reads every existing folder from [`Paths::program_top`] down to the program directory's parent,
+/// part by part: each opened on its own handle with no link followed, a plain folder at the place
+/// that was asked for (its final path is the expected one), owned by the system, the Administrators
+/// group or the installer service, with no entry that lets another account add to it, rename or
+/// delete in it, write its list or take it. The paths that the service control manager runs the
+/// broker by rest on these lists. A folder that is not there is the installation's to make.
+fn check_program_parents(paths: &Paths) -> Result<(), Error> {
+    let Some(parent) = paths.program.parent() else {
+        return Ok(());
+    };
+    let mut chain: Vec<&Path> = parent
+        .ancestors()
+        .take_while(|folder| folder.starts_with(&paths.program_top))
+        .collect();
+    chain.reverse();
+    for folder in chain {
+        let wide = ffi::wide_path(folder);
+        // SAFETY: the path is NUL-terminated; the call keeps nothing of it.
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        let handle = match ffi::Handle::new(raw, "opening a folder above the program directory") {
+            Ok(handle) => handle,
+            Err(failure)
+                if failure.code == ERROR_FILE_NOT_FOUND || failure.code == ERROR_PATH_NOT_FOUND =>
+            {
+                return Ok(());
+            }
+            Err(failure) => return Err(failure.into()),
+        };
+        let mut tag = FILE_ATTRIBUTE_TAG_INFO {
+            FileAttributes: 0,
+            ReparseTag: 0,
+        };
+        // SAFETY: the handle is open and the record is the size the class takes.
+        if unsafe {
+            GetFileInformationByHandleEx(
+                handle.raw(),
+                FileAttributeTagInfo,
+                (&raw mut tag).cast(),
+                size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(ffi::last("reading a folder above the program directory").into());
+        }
+        let why = if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        {
+            Some("it is a link or not a folder".to_owned())
+        } else {
+            let found = final_dos_path(&handle)?;
+            if found.eq_ignore_ascii_case(&folder.display().to_string()) {
+                acl::changeable_by_others_on(&handle, false)?
+            } else {
+                Some(format!("it is really {found}: a link leads there"))
+            }
+        };
+        if let Some(why) = why {
+            return Err(Error::Refused(format!(
+                "{} is a folder above the boundary's program directory (the program that the service runs as the system). It is refused because {why}. Whoever owns it, or can add to it, rename or delete in it or change its list, could replace that program. Make the Administrators group, the system or the installer service its owner, leave only them able to change it, and if it is a link remove the link, then run the setup program again. Do not remove the program directory: the manifest records it and stays where it is.",
+                folder.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A folder's final path as the system gives it, without the `\\?\` prefix of its extended form.
+fn final_dos_path(handle: &ffi::Handle) -> Result<String, Error> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    };
+    let mut buffer = vec![0_u16; 512];
+    loop {
+        // SAFETY: the handle is open and the buffer length is passed.
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                handle.raw(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        };
+        if length == 0 {
+            return Err(ffi::last("reading a folder's final path").into());
+        }
+        if (length as usize) < buffer.len() {
+            buffer.truncate(length as usize);
+            break;
+        }
+        buffer.resize(length as usize + 1, 0);
+    }
+    let text = String::from_utf16_lossy(&buffer);
+    Ok(text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned())
+}
+
 /// Reads the program directory on a handle that is held, and everything in it on its own handle:
 /// no link, one name for a file, the installation's own owner, and no right for another account to
 /// change it. Nothing is done to the directory before this has passed.
 fn check_program_directory(paths: &Paths) -> Result<(), Error> {
+    check_program_parents(paths)?;
     if !paths.program.exists() {
         return Ok(());
     }
@@ -2131,6 +2241,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         users_may_read: true,
         ..Principals::default()
     };
+    check_program_parents(&paths)?;
     fresh::directory_all(&paths.program, SdKind::AdminDir, &readable)
         .map_err(io_error("making the program directory"))?;
     // What the broker points Git's global file, hooks path and template directory at: empty, and

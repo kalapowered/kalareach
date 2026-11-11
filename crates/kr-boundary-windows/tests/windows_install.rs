@@ -1188,6 +1188,7 @@ fn paths_in(folder: &Path) -> Paths {
     let program = folder.join("Program");
     Paths {
         git: program.join("git"),
+        program_top: folder.to_owned(),
         program,
         staging: data.join("staging"),
         journal: data.join("journal"),
@@ -1333,6 +1334,67 @@ fn a_program_directory_refusal_names_the_remedy_for_its_reason_in_a_repair_and_i
     give_to(&paths.program, "Administrators");
     let _ = account::delete(&name);
     let _ = std::fs::remove_dir_all(&target);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// Every folder above the program directory that the installation did not make is read part by part
+/// before the program directory is used: one that another account can add to, rename or delete in,
+/// or whose list it can change, and one that is a link, is refused in a repair and in a removal
+/// alike, with the folder named, and a plain protected folder is accepted.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_folder_above_the_program_directory_that_others_can_change_or_that_is_a_link_is_refused() {
+    let folder = inherited_folder();
+    acl::set_protected(&folder, &data_parent_descriptor()).unwrap();
+    let mut paths = paths_in(&folder);
+    installed_data_directory(&paths);
+    let above = inherited_folder();
+    paths.program = above.join("Program");
+    paths.program_top = above.clone();
+    paths.git = paths.program.join("git");
+    let refused = |paths: &Paths, what: &str| -> [String; 2] {
+        [
+            install::entry(paths).err().expect(what).to_string(),
+            install::remove(paths, true).expect_err(what).to_string(),
+        ]
+    };
+
+    // The folder keeps the list it inherited, which lets ordinary accounts add to it.
+    for text in refused(&paths, "a folder that others can change") {
+        assert!(
+            text.contains("is a folder above the boundary's program directory"),
+            "{text}"
+        );
+        assert!(text.contains(&above.display().to_string()), "{text}");
+        assert!(
+            text.contains("Do not remove the program directory"),
+            "{text}"
+        );
+    }
+
+    // With the installation's own protected list it is accepted, in a repair and in a removal.
+    acl::set_protected(&above, &data_parent_descriptor()).unwrap();
+    install::entry(&paths).expect("a protected folder is accepted");
+
+    // A link at the folder is refused whatever its target's list says, and the target is not read.
+    let link = folder.join("linked-above");
+    let linked = Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(&link)
+        .arg(&above)
+        .output()
+        .unwrap();
+    assert!(linked.status.success(), "{linked:?}");
+    paths.program = link.join("Program");
+    paths.program_top = link.clone();
+    paths.git = paths.program.join("git");
+    for text in refused(&paths, "a link above the program directory") {
+        assert!(text.contains("it is a link or not a folder"), "{text}");
+        assert!(text.contains(&link.display().to_string()), "{text}");
+    }
+    std::fs::remove_dir(&link).unwrap();
+    let _ = std::fs::remove_dir_all(&above);
     let _ = std::fs::remove_dir_all(&folder);
 }
 
