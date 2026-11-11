@@ -793,6 +793,14 @@ fn transport_config(incoming_bidi_streams: u32) -> QuicTransportConfig {
         .max_idle_timeout(Some(idle_timeout))
         .max_concurrent_uni_streams(VarInt::from_u32(0))
         .max_concurrent_bidi_streams(VarInt::from_u32(incoming_bidi_streams))
+        // The product sends and reads no QUIC datagram, and neither does iroh 1.4.1 on a
+        // connection: its own datagrams are relay packets, which are not QUIC datagrams, and the
+        // library's datagram frames are only sent by a caller of `send_datagram`. Left on, the
+        // library keeps the datagrams a peer sends, up to a stream's receive window, for as long as
+        // the connection stands, and nothing reads them. With no buffer the endpoint does not
+        // tell its peer that it takes datagrams, so a peer finds no size one may have, and a
+        // datagram it sends anyway ends the connection.
+        .datagram_receive_buffer_size(None)
         // Section 9's 8 MiB bounded send queue per peer, enforced by the connection itself rather
         // than only by the application's own accounting: past this, a write waits instead of
         // handing more bytes to a queue nothing can drain.

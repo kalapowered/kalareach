@@ -1313,6 +1313,28 @@ async fn a_stream_revoked_while_queued_is_reset_and_not_handed_over() {
     harness.finish().await;
 }
 
+/// A connection takes no datagram from either side. The product reads none, and the library keeps
+/// the unread ones of every connection up to a stream's window, the connections that are not
+/// authorised yet among them. A side that takes none leaves the datagram parameter out of what it
+/// tells its peer, so the peer finds no size a datagram may have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_takes_no_datagram_from_either_side() {
+    let harness = Harness::start(&[], Taking::Forward).await;
+
+    assert_eq!(
+        harness.connection.max_datagram_size(),
+        None,
+        "the host takes datagrams from a device"
+    );
+    assert_eq!(
+        harness.host_connection.max_datagram_size(),
+        None,
+        "a device takes datagrams from the host"
+    );
+
+    harness.finish().await;
+}
+
 /// KR-PERF-005 and KR-REQ-23.21: a stream the listener hands over is scheduled as a transfer is, on
 /// the host's side and on the device's, so its answers go behind control and receipts. Frames pass
 /// both ways, and the stream stays counted against its connection until both halves are dropped.
