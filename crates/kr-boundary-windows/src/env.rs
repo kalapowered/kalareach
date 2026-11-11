@@ -21,6 +21,9 @@ pub enum Kind {
     /// A configuration or attribute reader: it finds the repository from its directory, so the
     /// block names no repository, and it still carries the ceiling above the tree.
     ConfigRead,
+    /// One of the broker's own readers of the repository's objects (`ls-tree`, `cat-file`): the
+    /// block names the repository as it does for an operation.
+    Reader,
     /// A program of the proof, which runs in no repository.
     Proof,
 }
@@ -98,7 +101,7 @@ enum Scope {
     All,
     /// Children that work in or beside a repository.
     Tree,
-    /// Git in an operation only.
+    /// Git in an operation, and the readers of the repository's objects.
     OperationTree,
 }
 
@@ -198,8 +201,7 @@ fn usable(what: &'static str, path: &str) -> Result<(), EnvError> {
 
 /// Builds the block for a child.
 ///
-/// `tree` is required for [`Kind::Operation`] and [`Kind::ConfigRead`] and is ignored for
-/// [`Kind::Proof`].
+/// `tree` is required for every kind but [`Kind::Proof`], which ignores it.
 ///
 /// # Errors
 ///
@@ -212,7 +214,9 @@ pub fn build_env(
     git: &QualifiedGit,
 ) -> Result<EnvBlock, EnvError> {
     let tree = match kind {
-        Kind::Operation | Kind::ConfigRead => Some(tree.ok_or(EnvError::NoTree(kind))?),
+        Kind::Operation | Kind::ConfigRead | Kind::Reader => {
+            Some(tree.ok_or(EnvError::NoTree(kind))?)
+        }
         Kind::Proof => None,
     };
     usable("system", &root.system)?;
@@ -228,7 +232,7 @@ pub fn build_env(
         let wanted = match scope {
             Scope::All => true,
             Scope::Tree => tree.is_some(),
-            Scope::OperationTree => kind == Kind::Operation,
+            Scope::OperationTree => matches!(kind, Kind::Operation | Kind::Reader),
         };
         if !wanted {
             continue;

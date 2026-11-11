@@ -109,6 +109,17 @@ fn an_operations_block_holds_every_variable_of_the_table_and_nothing_else() {
 }
 
 #[test]
+fn a_reader_of_the_objects_gets_the_operations_block() {
+    let reader = build_env(Kind::Reader, &roots(), Some(&tree()), &git()).unwrap();
+    let operation = build_env(Kind::Operation, &roots(), Some(&tree()), &git()).unwrap();
+    assert_eq!(reader, operation);
+    assert_eq!(
+        build_env(Kind::Reader, &roots(), None, &git()),
+        Err(EnvError::NoTree(Kind::Reader))
+    );
+}
+
+#[test]
 fn a_configuration_reader_names_no_repository_but_keeps_the_ceiling() {
     let block = build_env(Kind::ConfigRead, &roots(), Some(&tree()), &git()).unwrap();
     assert_eq!(
