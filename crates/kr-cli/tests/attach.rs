@@ -878,13 +878,15 @@ fn mouse_tracking(stream: &[u8]) -> Option<u16> {
     tracking
 }
 
-/// The mouse encoding a stream leaves a terminal in, as the terminals this product runs in keep it.
+/// The mouse encoding a stream leaves a terminal in, in a model of Terminal.app and iTerm.
 ///
 /// One state again: `CSI ? 1005 h`, `1006 h`, `1015 h` and `1016 h` each *replace* whichever
 /// encoding was in force, and a reset of any of the four returns the default, also when it names a
 /// mode that was not the one in force. So the last write of the four decides, and a check that read
 /// 1005 and 1006 as independent booleans, or that took the last one that was set, would not notice
-/// a replay in the wrong order.
+/// a replay in the wrong order. xterm differs (a reset of a mode that is not in force changes
+/// nothing there), and Terminal.app ignores 1016, so this is a model of the two terminals the
+/// replay was shown in and not of every terminal.
 fn mouse_encoding(stream: &[u8]) -> Option<u16> {
     let mut encoding = None;
     let mut index = 0;
@@ -2812,11 +2814,10 @@ async fn a_session_is_held_for_a_person_at_a_terminal() {
     } else if let Ok(sequence) = std::env::var("KR_HOLD_MODES") {
         let mut written = String::from("\\033[?1000h");
         for mode in sequence.split_whitespace() {
-            let (number, letter) = mode.split_at(mode.len() - 1);
             assert!(
-                !number.is_empty()
-                    && number.bytes().all(|byte| byte.is_ascii_digit())
-                    && matches!(letter, "h" | "l"),
+                mode.strip_suffix(['h', 'l']).is_some_and(|number| {
+                    !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+                }),
                 "KR_HOLD_MODES lists private modes with their final letter, such as `1006h 1005h`: {mode}"
             );
             written.push_str(&format!("\\033[?{mode}"));

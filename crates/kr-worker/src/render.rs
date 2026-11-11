@@ -1924,9 +1924,9 @@ mod tests {
     ///
     /// Read as Terminal.app and iTerm keep it, the encoding is one state: a set of 1005 or 1006
     /// replaces it and a reset of either returns the default. The two entries of a screen are carried
-    /// in numeric order, so writing them one by one would leave 1006 in force for a screen that holds
-    /// 1005, and the default for a screen that holds 1006. The four modes xterm names are all reset
-    /// first, then the one that is on is set.
+    /// in numeric order, so writing them one by one would leave the default for a screen that holds
+    /// 1005, because the reset of 1006 comes after the set of 1005. The four modes xterm names are
+    /// all reset first, then the one that is on is set.
     #[test]
     fn a_restoration_leaves_the_terminal_in_the_mouse_encoding_the_screen_holds() {
         let written_after = |flags: [bool; 2]| {
