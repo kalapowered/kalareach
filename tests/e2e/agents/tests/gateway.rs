@@ -1434,8 +1434,9 @@ impl Person {
     /// # Errors
     ///
     /// Returns why the shell's environment is not as given, naming each variable and never a
-    /// value, or why the answer could not be read whole.
-    fn reads_the_environment(&self, expected: &Expected) -> Result<(), String> {
+    /// value, or why the answer could not be read whole. A pass returns the line that says what
+    /// was compared ([`Expected::passed_line`]).
+    fn reads_the_environment(&self, expected: &Expected) -> Result<String, String> {
         let mut tag = 0;
         let mut readings = Vec::new();
         for part in 0..expected.value_parts() {
@@ -1468,7 +1469,8 @@ impl Person {
             }
         }
         self.clears_the_screen_of(session_environment::ROW);
-        expected.judge(&readings, &exported)
+        expected.judge(&readings, &exported)?;
+        Ok(expected.passed_line(exported.len()))
     }
 
     /// Types one line of the environment's check on a cleared screen, and returns the screen once
@@ -2028,9 +2030,10 @@ impl<'a> Session<'a> {
         // environment is read at its prompt: the first start only, since an agent's start can change
         // what a later read would show.
         if !self.environment_read.replace(true) {
-            self.person
-                .reads_the_environment(&self.person.expected)
-                .unwrap_or_else(|why| panic!("{why}"));
+            match self.person.reads_the_environment(&self.person.expected) {
+                Ok(compared) => eprintln!("{compared}"),
+                Err(why) => panic!("{why}"),
+            }
         }
         // From here the harness runs no `kr` and ends the host's processes by the identities it
         // recorded: the agent runs in the same account and may leave anything in the run's state.
@@ -3490,10 +3493,23 @@ fn gateway_the_session_environment_is_read_at_the_prompt_before_the_first_typing
             .expect("a variable of the list")
     };
     // The control: the shell as given.
-    session
+    let compared = session
         .person
         .reads_the_environment(&session.person.expected)
         .unwrap_or_else(|why| panic!("the shell holds what it was given: {why}"));
+    assert!(
+        compared.starts_with(session_environment::PASSED)
+            && compared.contains(": ok: ")
+            && compared.contains("STAND_IN_RELEASE")
+            && !compared.contains('\n'),
+        "a pass says what it compared: {compared}"
+    );
+    assert!(
+        list.iter()
+            .filter(|(_, value)| value.len() >= session_environment::SHORTEST_VALUE_CHECKED)
+            .all(|(_, value)| !compared.contains(value.as_str())),
+        "a pass holds no value: {compared}"
+    );
     let refused = |expected: &Expected| {
         session
             .person
