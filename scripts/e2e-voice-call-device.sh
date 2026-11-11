@@ -391,6 +391,7 @@ set_required_checks() {
                 "the call waits for the lock screen"
                 "the screen is locked"
                 "the call's notification is on the lock screen with Mute and Stop"
+                "the call's notification makes no sound and no vibration"
                 "Mute from the lock screen mutes the call with no unlock"
                 "Unmute from the lock screen asks for the unlock and leaves the call muted"
                 "Unmute goes through once the screen is unlocked"

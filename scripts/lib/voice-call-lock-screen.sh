@@ -26,6 +26,8 @@
 lock_pin=2468
 # The call's notification: its identifier in the application (VoiceCallService.NOTIFICATION_ID).
 lock_notification_id=19286
+# The channel it belongs to (VoiceCallService.CHANNEL_ID).
+lock_channel_id=kr-voice-call-running
 
 lock_device() { "$emulator_adb" -s "$emulator_serial" "$@"; }
 
@@ -57,8 +59,15 @@ lock_showing() {
 lock_record() {
     lock_device shell dumpsys notification --noredact 2>/dev/null | tr -d '\r' \
         | awk -v id="$lock_notification_id" -v app="$app_id" '
-            /NotificationRecord\(/ { on = (index($0, "pkg=" app " ") > 0 && index($0, " id=" id " ") > 0) }
-            on { print }'
+            /NotificationRecord\(/ { on = (index($0, "pkg=" app " ") > 0 && index($0, " id=" id " ") > 0); if (on) print; next }
+            on && /^      / { print; next }
+            { on = 0 }'
+}
+
+# The system's record of the call's channel: its importance, sound and vibration.
+lock_channel() {
+    lock_device shell dumpsys notification --noredact 2>/dev/null | tr -d '\r' \
+        | grep -F "NotificationChannel{mId='$lock_channel_id'" | head -1
 }
 
 lock_record_has() { # <text>
@@ -154,6 +163,18 @@ lock_screen_leg() {
         tries=$((tries + 1))
     done
     lock_still 2-locked-after-read
+    # What the platform holds of the notification's channel: of default importance (what puts a
+    # notification on the lock screen of a phone at its default settings), with no sound and no
+    # vibration, and the notification itself carrying none.
+    lock_channel >"$artefacts/lock-screen/channel.txt"
+    if grep -q 'mImportance=3' "$artefacts/lock-screen/channel.txt" \
+        && grep -q 'mSound=null' "$artefacts/lock-screen/channel.txt" \
+        && ! grep -q 'mVibrationEnabled=true' "$artefacts/lock-screen/channel.txt" \
+        && lock_record_has 'sound=null' && lock_record_has 'vibrate=null'; then
+        lock_check "the call's notification makes no sound and no vibration" 1 "$(sed 's/mDescription=[^,]*, //' "$artefacts/lock-screen/channel.txt" | cut -c1-300)"
+    else
+        lock_check "the call's notification makes no sound and no vibration" 0 "channel: $(cut -c1-300 "$artefacts/lock-screen/channel.txt")"
+    fi
     if [ "$shown" = 1 ] && lock_record_has "Mute" && lock_record_has "Stop"; then
         lock_check "the call's notification is on the lock screen with Mute and Stop" 1 "the notification manager holds it and the lock screen shows it"
     else
@@ -219,7 +240,8 @@ lock_screen_leg() {
 lock_judge_trail() { # <result file>
     local line at verdict
     line="$(grep '^check=the microphone followed the taps on the lock screen ok=' "$1" | head -1)"
-    at="$(tr -d '\r\n' <"$harness/unlock-at.txt" 2>/dev/null)"
+    at=""
+    [ ! -s "$harness/unlock-at.txt" ] || at="$(tr -d '\r\n' <"$harness/unlock-at.txt")"
     verdict="$(python3 -I - "$line" "$at" <<'PY'
 import re
 import sys

@@ -1,18 +1,23 @@
 package to.kala.reach.companion.voice
 
+import android.app.KeyguardManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import to.kala.reach.companion.mobile.VoiceCaptureState
+import to.kala.reach.companion.mobile.VoiceNotificationControls
 import to.kala.reach.companion.mobile.VoiceServiceActions
 
 /**
@@ -26,7 +31,10 @@ import to.kala.reach.companion.mobile.VoiceServiceActions
  * Its notification is not decoration either. Section 15 paragraph 22 wants user-visible native
  * playback, mute and stop to stay available, and while the screen is locked the notification is
  * the only surface there is. It says a call is running, it says what the microphone is doing, and
- * it carries mute and stop.
+ * it carries mute and stop. It is on the lock screen of a phone at its default settings, which
+ * needs a channel of default importance (the platform keeps lower ones off the lock screen); the
+ * channel is silent, so a running call makes no sound and no vibration. Mute and stop work there
+ * with no unlock; unmute asks for the unlock (see [VoiceNotificationControls]).
  *
  * What it deliberately does not do is start itself. The service is started by the person starting
  * a call and by nothing else, because a service that could start itself would be the unattended
@@ -35,7 +43,18 @@ import to.kala.reach.companion.mobile.VoiceServiceActions
 class VoiceCallService : android.app.Service() {
     companion object {
         /** The channel a running call's notification belongs to. */
-        const val CHANNEL_ID = "kr-voice-call"
+        const val CHANNEL_ID = "kr-voice-call-running"
+
+        /**
+         * The channel earlier releases put the notification in, with low importance, which keeps a
+         * call's notification off the lock screen of a phone at its default settings. A channel's
+         * importance cannot be raised once it exists, so the notification moved to a channel of
+         * its own and this one is deleted when the service starts.
+         *
+         * Remove this and its deletion in [ensureChannel] once no installed application can still
+         * hold it: when the oldest release the stores still serve already has [CHANNEL_ID].
+         */
+        private const val LOW_IMPORTANCE_CHANNEL_ID = "kr-voice-call"
 
         /** Start the service for a call the host permitted. */
         const val ACTION_START = VoiceServiceActions.START
@@ -117,6 +136,17 @@ class VoiceCallService : android.app.Service() {
 
     private var running = false
 
+    /**
+     * Republishes the notification when the phone locks or unlocks, on a platform that cannot ask
+     * for the unlock before one action runs: what the notification offers there depends on it.
+     */
+    private val lockChanges = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (running) publish()
+        }
+    }
+    private var watchingLock = false
+
     /** The call this service was started for. Nothing else is its to stop or mute. */
     private var call: Long = 0
 
@@ -169,7 +199,13 @@ class VoiceCallService : android.app.Service() {
             VoiceServiceActions.Act.TOGGLE_MUTE -> {
                 val held = VoiceCallHolder.current(call)
                 if (held != null) {
-                    held.setMutedByPerson(!held.isMutedByPerson)
+                    // Where the platform did not ask for the unlock, a muted microphone is not
+                    // reopened from a locked phone.
+                    if (!held.isMutedByPerson ||
+                        VoiceNotificationControls.mayUnmute(locked, Build.VERSION.SDK_INT)
+                    ) {
+                        held.setMutedByPerson(!held.isMutedByPerson)
+                    }
                 } else {
                     // No call owns this notification any more, so the microphone is not this
                     // service's to change and the notification should not suggest it is.
@@ -202,6 +238,7 @@ class VoiceCallService : android.app.Service() {
 
     override fun onDestroy() {
         running = false
+        unwatchLock()
         // The service going away takes the microphone with it, so the call goes too. A call whose
         // service has been destroyed would be a call with no foreground service holding its
         // capture open, which is the state section 15 paragraph 22 asks to be shown rather than
@@ -212,6 +249,7 @@ class VoiceCallService : android.app.Service() {
 
     private fun startInForeground() {
         ensureChannel()
+        watchLock()
         ServiceCompat.startForeground(
             this,
             NOTIFICATION_ID,
@@ -226,9 +264,34 @@ class VoiceCallService : android.app.Service() {
 
     private fun stopCall() {
         running = false
+        unwatchLock()
         capture = VoiceCaptureState.IDLE
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    private val locked: Boolean
+        get() = getSystemService(KeyguardManager::class.java)?.isKeyguardLocked == true
+
+    private fun watchLock() {
+        if (watchingLock || Build.VERSION.SDK_INT >= VoiceNotificationControls.UNLOCK_PER_ACTION_SDK) return
+        ContextCompat.registerReceiver(
+            this,
+            lockChanges,
+            IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_USER_PRESENT)
+            },
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+        watchingLock = true
+    }
+
+    private fun unwatchLock() {
+        if (!watchingLock) return
+        watchingLock = false
+        unregisterReceiver(lockChanges)
     }
 
     private fun publish() {
@@ -239,36 +302,59 @@ class VoiceCallService : android.app.Service() {
     private fun ensureChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val manager = getSystemService(NotificationManager::class.java) ?: return
+        try {
+            manager.deleteNotificationChannel(LOW_IMPORTANCE_CHANNEL_ID)
+        } catch (held: SecurityException) {
+            // A running service's notification still sits in it: it goes at the next start.
+        }
         if (manager.getNotificationChannel(CHANNEL_ID) != null) return
         manager.createNotificationChannel(
             NotificationChannel(
                 CHANNEL_ID,
                 "Voice calls",
-                NotificationManager.IMPORTANCE_LOW,
+                // Default importance is what puts a notification on the lock screen of a phone at
+                // its default settings; the sound and the vibration are taken away below.
+                NotificationManager.IMPORTANCE_DEFAULT,
             ).apply {
                 description = "Shown while a voice call you started is running."
                 setShowBadge(false)
+                setSound(null, null)
+                enableVibration(false)
+                enableLights(false)
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             },
         )
     }
 
-    private fun notification(): Notification =
-        NotificationCompat.Builder(this, CHANNEL_ID)
+    private fun notification(): Notification {
+        val controls = VoiceNotificationControls.controls(muted, locked, Build.VERSION.SDK_INT)
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Voice call running")
             // What the microphone is doing, in the person's own words, on the one surface that
             // exists while the screen is locked.
             .setContentText(capture.display)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)
+            .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .addAction(
-                0,
-                if (muted) "Unmute" else "Mute",
-                pending(ACTION_TOGGLE_MUTE, 1),
-            )
-            .addAction(0, "Stop", pending(ACTION_STOP, 2))
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+        when (controls.toggle) {
+            VoiceNotificationControls.Toggle.MUTE ->
+                builder.addAction(action("Mute", ACTION_TOGGLE_MUTE, 1, controls.needsUnlock))
+            VoiceNotificationControls.Toggle.UNMUTE ->
+                builder.addAction(action("Unmute", ACTION_TOGGLE_MUTE, 1, controls.needsUnlock))
+            VoiceNotificationControls.Toggle.NONE -> Unit
+        }
+        return builder
+            .addAction(action("Stop", ACTION_STOP, 2, needsUnlock = false))
+            .build()
+    }
+
+    /** An action of the notification; one that needs the unlock waits for it on a locked phone. */
+    private fun action(title: String, action: String, code: Int, needsUnlock: Boolean) =
+        NotificationCompat.Action.Builder(0, title, pending(action, code))
+            .setAuthenticationRequired(needsUnlock)
             .build()
 
     private fun pending(action: String, code: Int): PendingIntent =
