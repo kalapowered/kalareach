@@ -79,8 +79,9 @@ pub const AMBIENT_LIMIT: usize = 4;
 /// Not held to this count either: an opened link that was left keeps its connection for up to 60
 /// seconds while its requests finish, and an open that was superseded keeps its connection until
 /// its dial returns. Each of them is a connection to the host beside the ones above, so a person
-/// who leaves and opens sessions faster than the requests finish holds more than this number, and
-/// the host's bound is what ends the surplus.
+/// who leaves and opens sessions faster than the requests finish holds more than this number.
+/// Above the host's bound the host withdraws one of the device's connections for each new one and
+/// cannot tell these from the ones in use, so only a limit here keeps them below it.
 pub const HOST_CONNECTIONS: usize =
     1 + OPENED_LIMIT + OPENED_LIMIT + AMBIENT_LIMIT + 2 + 2 + 1 + 1 + 1 + 2;
 
