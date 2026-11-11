@@ -498,6 +498,62 @@ impl Network {
     }
 }
 
+/// How many live connections one paired device may hold on this host at once.
+///
+/// A device that loses its link opens a new connection while the host still holds the old one, for
+/// as long as the transport's idle timeout, so a device holds more than one for a while. A device
+/// that opened them without end would hold the host's memory, the streams of each connection and
+/// its lookups. At a fifth the host serves the new connection and withdraws the device's oldest, so
+/// a phone that reconnects while an old connection lingers is never refused. An owner cannot change
+/// the bound.
+pub const DEVICE_LIVE_CONNECTIONS: usize = 4;
+
+/// The connections this host serves for each device, oldest first.
+#[derive(Default)]
+struct DeviceConnections(
+    std::sync::Mutex<std::collections::BTreeMap<DeviceId, Vec<HeldConnection>>>,
+);
+
+/// One connection of a device, and whether the device has opened more connections than the bound
+/// allows beside it.
+struct HeldConnection {
+    connection_id: ConnectionId,
+    withdrawn_for_the_bound: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A connection counted among its device's from its admission until it ends.
+struct Counted {
+    table: Arc<DeviceConnections>,
+    device_id: DeviceId,
+    connection_id: ConnectionId,
+    withdrawn_for_the_bound: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Counted {
+    /// Whether the device opened more connections than the bound allows beside this one, so that
+    /// this one, the oldest, is to end.
+    fn is_withdrawn_for_the_bound(&self) -> bool {
+        self.withdrawn_for_the_bound
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        let mut table = self
+            .table
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(connections) = table.get_mut(&self.device_id) {
+            connections.retain(|held| held.connection_id != self.connection_id);
+            if connections.is_empty() {
+                table.remove(&self.device_id);
+            }
+        }
+    }
+}
+
 /// What the transport calls back into.
 pub struct NetworkHost {
     /// The daemon this host belongs to.
@@ -529,6 +585,8 @@ pub struct NetworkHost {
     /// The data streams devices send chunks on: which stream serves each transfer, the gate of
     /// each, and the places of each device principal's lookups.
     chunks: Arc<chunks::ChunkStreams>,
+    /// The connections each device holds, oldest first, which [`DEVICE_LIVE_CONNECTIONS`] bounds.
+    device_connections: Arc<DeviceConnections>,
 }
 
 impl std::fmt::Debug for NetworkHost {
@@ -618,7 +676,10 @@ impl NetworkHost {
     /// which authority can be withdrawn, and a connection registered in that gap would pass every
     /// later check. The registry lock is taken first and the connection table second, which is the
     /// order a revocation uses, so neither can interleave with the other.
-    async fn admit(&self, session: &AuthorisedSession) -> Result<(DeviceRecord, Arc<Controller>)> {
+    async fn admit(
+        &self,
+        session: &AuthorisedSession,
+    ) -> Result<(DeviceRecord, Arc<Controller>, Counted)> {
         let controller = self.daemon()?;
         #[cfg(feature = "testing")]
         controller.before_a_connection_is_registered.wait().await;
@@ -661,8 +722,57 @@ impl NetworkHost {
                 .under(record.grant.clone()),
         );
         drop(admitted);
+        // Counted here, under the registry's lock, where a revocation also acts: a device cannot
+        // open connections faster than the host withdraws its oldest.
+        let counted = self.count_connection(record.device_id, session.connection_id);
         drop(registry);
-        Ok((record, controller))
+        Ok((record, controller, counted))
+    }
+
+    /// Counts a connection among its device's, and withdraws the device's oldest when it now holds
+    /// more than [`DEVICE_LIVE_CONNECTIONS`]. The oldest is withdrawn as a revocation withdraws a
+    /// device's connections, and it leaves the count at once, so the next connection is not counted
+    /// against it. An oldest that has not yet reached the table of connections being served is
+    /// withdrawn when it gets there ([`Counted::is_withdrawn_for_the_bound`]).
+    fn count_connection(&self, device_id: DeviceId, connection_id: ConnectionId) -> Counted {
+        let withdrawn_for_the_bound = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let oldest = {
+            let mut table = self
+                .device_connections
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let connections = table.entry(device_id).or_default();
+            connections.push(HeldConnection {
+                connection_id,
+                withdrawn_for_the_bound: Arc::clone(&withdrawn_for_the_bound),
+            });
+            (connections.len() > DEVICE_LIVE_CONNECTIONS).then(|| connections.remove(0))
+        };
+        if let Some(oldest) = oldest {
+            oldest
+                .withdrawn_for_the_bound
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let live = self
+                .live
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&oldest.connection_id)
+                .and_then(Weak::upgrade);
+            if let Some(remote) = live {
+                remote.output().withdraw();
+                // Releasing the worker link waits for a socket, so it belongs to a task of its own.
+                tokio::spawn(async move {
+                    remote.release().await;
+                });
+            }
+        }
+        Counted {
+            table: Arc::clone(&self.device_connections),
+            device_id,
+            connection_id,
+            withdrawn_for_the_bound,
+        }
     }
 
     /// Serves one authorised connection until it ends.
@@ -679,7 +789,7 @@ impl NetworkHost {
             self.reconnects
                 .arrived(device_id, arrived_at, transport, MetricOutcome::Refused)
         };
-        let (device, controller) = match self.admit(&session).await {
+        let (device, controller, counted) = match self.admit(&session).await {
             Ok(admitted) => admitted,
             Err(error) => {
                 refused();
@@ -745,6 +855,14 @@ impl NetworkHost {
             watch: None,
             chunks: None,
         };
+        // A device that opened more connections than the bound allows had this one, its oldest,
+        // withdrawn while it was on its way to the table above, where the withdrawal did not find
+        // it: it ends as any withdrawn connection does. Asked after the table holds it, so that
+        // one of the two sees the other.
+        if counted.is_withdrawn_for_the_bound() {
+            remote.output().withdraw();
+            return;
+        }
         // The relay is its own task, because a subscription delivers whenever the session produces
         // output and the request loop below is usually waiting for the device rather than for the
         // worker. It checks the registration and the grant before each batch it writes, which is
@@ -1655,6 +1773,7 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         endpoint_id,
         reconnects: reconnects::Reconnects::new(Arc::clone(controller.metrics())),
         chunks: Arc::default(),
+        device_connections: Arc::default(),
     });
     // The record of the wall clock moves while this host runs, whether or not anything asks it a
     // question. A mark that only advanced when a device connected would stand still through a
