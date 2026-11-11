@@ -934,6 +934,56 @@ mod native {
     }
 
     #[test]
+    fn the_path_of_an_uncertain_end_then_the_proof_then_the_release_is_written_in_that_order() {
+        let dir = Dir::new();
+        let mut journal = Journal::create(&dir.0, id()).unwrap();
+        journal.append(&begin()).unwrap();
+        journal
+            .append(&Row::ProcessStarted {
+                pid: 12,
+                creation_time: 34,
+            })
+            .unwrap();
+        journal
+            .append(&Row::EndUncertain {
+                reason: "the session is still there".to_owned(),
+            })
+            .unwrap();
+        // No release, no verification, no removal of the root and no end while the end is not
+        // proved, and none of the refusals reaches the file.
+        let before = std::fs::metadata(journal.path()).unwrap().len();
+        for row in [
+            super::release_intent(1),
+            Row::ReleaseVerified {
+                objects: 0,
+                leftovers: 0,
+            },
+            Row::End { root_leftovers: 0 },
+        ] {
+            assert!(
+                matches!(journal.append(&row), Err(JournalError::Order(_))),
+                "{row:?} is refused"
+            );
+        }
+        assert_eq!(std::fs::metadata(journal.path()).unwrap().len(), before);
+        let held = replay_dir(&dir.0, BOOT).unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].standing, Standing::Uncertain);
+        // A later try finds the session gone and writes the proof; the release then goes on.
+        journal.append(&Row::JobEnded).unwrap();
+        journal.append(&super::release_intent(1)).unwrap();
+        journal.append(&super::released(1)).unwrap();
+        journal
+            .append(&Row::ReleaseVerified {
+                objects: 1,
+                leftovers: 0,
+            })
+            .unwrap();
+        journal.append(&Row::End { root_leftovers: 0 }).unwrap();
+        assert!(replay_dir(&dir.0, BOOT).unwrap().is_empty());
+    }
+
+    #[test]
     fn a_file_longer_than_the_bound_is_read_up_to_it_and_is_unreadable() {
         let dir = Dir::new();
         {

@@ -815,14 +815,30 @@ fn a_child_that_asks_to_break_away_from_the_job_is_refused_or_stays_in() {
     println!("breakaway: {text}");
     assert_eq!(child.wait(Duration::from_secs(30)).unwrap(), Some(0));
     if text.contains("breakaway-refused") {
-        // The platform refused the flag: nothing left the job.
-    } else {
-        assert!(text.contains("breakaway-started"));
+        // The platform refused the flag, with the access error it gives a job that allows no
+        // breakaway, and nothing left the job: it holds no process but the child.
         assert!(
-            text.lines()
-                .filter(|line| line.starts_with("report"))
-                .all(|line| line.contains("in-job=true")),
-            "a grandchild that was started with the flag is still in a job"
+            text.contains("breakaway-refused Some(5)"),
+            "the refusal is the access error: {text}"
+        );
+        assert_eq!(
+            job.active_processes().unwrap(),
+            0,
+            "nothing else is in the job"
+        );
+    } else {
+        assert!(text.contains("breakaway-started"), "{text}");
+        let reports: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("report"))
+            .collect();
+        assert!(
+            !reports.is_empty(),
+            "the grandchild that was started with the flag reported: {text}"
+        );
+        assert!(
+            reports.iter().all(|line| line.contains("in-job=true")),
+            "a grandchild that was started with the flag is still in a job: {text}"
         );
     }
     job.end(&[&child], Duration::from_secs(10));
