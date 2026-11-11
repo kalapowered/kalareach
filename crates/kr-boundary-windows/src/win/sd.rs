@@ -62,7 +62,8 @@ pub enum SdKind {
     AdminDir,
     /// A file only the system and administrators may use, owned by the Administrators group for the
     /// same reason as an [`SdKind::AdminDir`]: the installation's manifest, its earlier-state
-    /// record and the files it hands to another program by path.
+    /// record and the files it hands to another program by path. When the principals say that every
+    /// account may read, every account may also read and run it (the proof's unlisted program).
     AdminFile,
     /// The volatile registry key that holds the identifier of the current boot: the system and the
     /// administrators alone may do anything with it, and nobody else may even read it.
@@ -209,7 +210,11 @@ pub fn descriptor_text(kind: SdKind, principals: &Principals) -> Result<String> 
         } else {
             "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)".to_owned()
         }),
-        SdKind::AdminFile => Ok("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)".to_owned()),
+        SdKind::AdminFile => Ok(if principals.users_may_read {
+            format!("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;{READ_AND_ENTER};;;BU)")
+        } else {
+            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)".to_owned()
+        }),
     }
 }
 

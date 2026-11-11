@@ -87,6 +87,10 @@ fn run(
         .join("WindowsPowerShell")
         .join("v1.0")
         .join("Modules");
+    // PowerShell's temporary directory and working directory are a new directory of its own, made
+    // with its descriptor, and removed when the run ends: nothing it leaves is ever in the staging
+    // directory itself.
+    let shell = ShellDirectory::new(scratch).map_err(|source| Error::Start { what, source })?;
     let output = Command::new(program)
         .args(arguments)
         .env_clear()
@@ -95,9 +99,9 @@ fn run(
         .env("SystemDrive", "C:")
         .env("PATH", &system32)
         .env("PSModulePath", &powershell_modules)
-        .env("TEMP", scratch)
-        .env("TMP", scratch)
-        .current_dir(scratch)
+        .env("TEMP", &shell.0)
+        .env("TMP", &shell.0)
+        .current_dir(&shell.0)
         .stdin(Stdio::null())
         .output()
         .map_err(|source| Error::Start { what, source })?;
@@ -114,6 +118,28 @@ fn run(
                 String::from_utf8_lossy(&output.stderr).trim()
             ),
         })
+    }
+}
+
+/// The directory a PowerShell run uses for its temporary files: new, random, owned by the
+/// administrators and removed when the run is over.
+struct ShellDirectory(PathBuf);
+
+impl ShellDirectory {
+    fn new(under: &Path) -> std::io::Result<ShellDirectory> {
+        super::fresh::directory(
+            under,
+            "shell",
+            super::sd::SdKind::AdminDir,
+            &super::sd::Principals::default(),
+        )
+        .map(ShellDirectory)
+    }
+}
+
+impl Drop for ShellDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

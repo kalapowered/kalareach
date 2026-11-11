@@ -1426,6 +1426,35 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
     let _ = std::fs::remove_dir_all(&folder);
 }
 
+/// Writes a journal file in the directory that names the private root as unfinished work: a begin
+/// row and the root's intent, which is all the installation reads of it.
+#[cfg(feature = "testing")]
+fn journal_naming(journals: &Path, root: &str) {
+    use kr_boundary_windows::filekey::FileKey;
+    use kr_boundary_windows::journal::rows::{RootName, Row};
+    use kr_boundary_windows::win::journal::Journal;
+    use kr_boundary_windows::win::launch::InvocationId;
+    let mut journal = Journal::create(journals, InvocationId([7; 16])).unwrap();
+    journal
+        .append(&Row::Begin {
+            invocation: "07".repeat(16),
+            boot_marker: "11111111-1111-1111-1111-111111111111".to_owned(),
+            session_luid: 7,
+            group_sid: "S-1-9-1-2-3-4".to_owned(),
+            client_sid: "S-1-5-21-1-2-3-1000".to_owned(),
+            client_pid: 4242,
+            client_creation_time: 99,
+            chain: vec![FileKey::ntfs(0xabcd, 5)],
+            tree_path: r"C:\work\tree".to_owned(),
+        })
+        .unwrap();
+    journal
+        .append(&Row::RootIntent {
+            name: RootName::parse(root).unwrap(),
+        })
+        .unwrap();
+}
+
 /// Gives a file or a directory to another account, as the tool does for a person.
 #[cfg(feature = "testing")]
 fn give_to(path: &Path, who: &str) {
@@ -1506,15 +1535,53 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
     refused_with("unlisted.exe");
     give_to(&inner, "Administrators");
 
-    // A directory in run that another account owns is refused, and one that the administrators own
-    // is a private root.
+    // A directory in run that no journal names is refused, with the entry to remove. One that a
+    // journal names as unfinished work and another account owns is refused with the owner to
+    // correct, and one that the administrators own is a private root; nothing is looked at inside
+    // it, whatever it holds.
     let root = paths.run.join("ab".repeat(16));
     std::fs::create_dir(&root).unwrap();
+    refused_with("no journal names it");
+    journal_naming(&paths.journal, &"ab".repeat(16));
     give_to(&root, &name);
-    refused_with(&"ab".repeat(16));
+    let text = install::make_data_directory(&paths)
+        .expect_err("a root that another account owns")
+        .to_string();
+    assert!(text.contains(&"ab".repeat(16)), "{text}");
+    assert!(text.contains("Do not remove"), "{text}");
     give_to(&root, "Administrators");
+    std::fs::write(root.join("anything"), b"x").unwrap();
     install::make_data_directory(&paths).expect("a private root the administrators own");
+    std::fs::remove_file(root.join("anything")).unwrap();
     std::fs::remove_dir(&root).unwrap();
+    std::fs::remove_file(paths.journal.join(format!("{}.journal", "07".repeat(16)))).unwrap();
+
+    // A proof directory holds the unlisted program and nothing else: another name, even a file
+    // that is as protected as the program, is refused.
+    let stray = scratch.join("notes.txt");
+    std::fs::write(&stray, b"x").unwrap();
+    refused_with("notes.txt");
+    std::fs::remove_file(&stray).unwrap();
+    install::make_data_directory(&paths).expect("the proof directory holds only its program");
+
+    // A record the layout gives is refused with the owner and the list to correct, never with its
+    // removal: the manifest and the journal directory.
+    give_to(&paths.journal, &name);
+    let text = install::make_data_directory(&paths)
+        .expect_err("a journal directory that is owned")
+        .to_string();
+    assert!(text.contains("journal"), "{text}");
+    assert!(!text.contains("Remove "), "{text}");
+    assert!(text.contains("stay where they are"), "{text}");
+    give_to(&paths.journal, "Administrators");
+    give_to(&paths.manifest, &name);
+    let text = install::make_data_directory(&paths)
+        .expect_err("a manifest that is owned")
+        .to_string();
+    assert!(text.contains("manifest.json"), "{text}");
+    assert!(!text.contains("Remove "), "{text}");
+    give_to(&paths.manifest, "Administrators");
+    install::make_data_directory(&paths).expect("the records are the administrators' again");
 
     // A link at a scratch directory's name is refused, and the tree it leads to keeps its list.
     let target = inherited_folder();
