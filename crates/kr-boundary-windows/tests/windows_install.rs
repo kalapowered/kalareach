@@ -1711,6 +1711,98 @@ fn a_folder_above_the_program_directory_that_others_can_change_or_that_is_a_link
     let _ = std::fs::remove_dir_all(&folder);
 }
 
+/// Two refusals of the program directory that a change of owner or list cannot cure get a remedy of
+/// their own, in a repair and in a removal alike. A program directory on a volume that is not NTFS
+/// is refused for its volume, and the text says that nothing in it can be corrected. A folder above
+/// the program directory that cannot be opened to be checked (another program holds it open) is
+/// refused with the words for that, and not with the owner and the list to correct.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_volume_that_is_not_used_and_a_parent_that_cannot_be_opened_have_remedies_of_their_own() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let folder = inherited_folder();
+    acl::set_protected(&folder, &data_parent_descriptor()).unwrap();
+    let mut paths = paths_in(&folder);
+    installed_data_directory(&paths);
+    let both = |paths: &Paths, what: &str| -> [String; 2] {
+        [
+            install::entry(paths).err().expect(what).to_string(),
+            install::remove(paths, true).expect_err(what).to_string(),
+        ]
+    };
+
+    // A parent that another program holds open and shares with nobody cannot be opened.
+    let above = inherited_folder();
+    paths.program = above.join("Program");
+    paths.program_top = above.clone();
+    paths.git = paths.program.join("git");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .custom_flags(0x0200_0000)
+        .open(&above)
+        .unwrap();
+    let refused = both(&paths, "a parent that cannot be opened");
+    drop(held);
+    for text in refused {
+        assert!(text.contains("could not be opened to be checked"), "{text}");
+        assert!(text.contains("close that program"), "{text}");
+        assert!(text.contains(&above.display().to_string()), "{text}");
+        assert!(!text.contains("Make the Administrators group"), "{text}");
+    }
+    let _ = std::fs::remove_dir_all(&above);
+
+    // A program directory on a volume that is not NTFS: a small FAT volume in a virtual disk.
+    let disk = folder.join("fat.vhd");
+    let diskpart = |lines: &[String]| {
+        let script = folder.join("diskpart.txt");
+        std::fs::write(&script, lines.join("\r\n")).unwrap();
+        let done = Command::new("diskpart")
+            .arg("/s")
+            .arg(&script)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&script);
+        assert!(done.status.success(), "{done:?}");
+    };
+    diskpart(&[
+        format!(
+            "create vdisk file=\"{}\" maximum=128 type=expandable",
+            disk.display()
+        ),
+        "attach vdisk".to_owned(),
+        "create partition primary".to_owned(),
+        "format fs=fat32 quick label=krfat".to_owned(),
+        "assign letter=Y".to_owned(),
+    ]);
+    let program = PathBuf::from(r"Y:\Program");
+    std::fs::create_dir(&program).unwrap();
+    paths.program = program.clone();
+    // No folder above the program directory is read: the volume is what is refused.
+    paths.program_top = program.clone();
+    paths.git = program.join("git");
+    let refused = both(&paths, "a volume that is not used");
+    diskpart(&[
+        format!("select vdisk file=\"{}\"", disk.display()),
+        "detach vdisk".to_owned(),
+    ]);
+    for text in refused {
+        assert!(
+            text.contains("is on a volume that the installation does not use"),
+            "{text}"
+        );
+        assert!(text.contains("NTFS"), "{text}");
+        assert!(!text.contains("Make the Administrators group"), "{text}");
+        assert!(!text.contains("Close the program"), "{text}");
+        assert!(
+            text.contains("Do not remove the program directory"),
+            "{text}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
 /// The installation's places are the system's own, not what the environment of the session that
 /// runs the setup program says: an unelevated session of the same account can set its own
 /// variables, and the elevated installation runs the PowerShell and lays the programs down there.
