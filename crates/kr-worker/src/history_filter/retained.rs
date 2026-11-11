@@ -218,6 +218,7 @@ pub const fn result_content(method: Method) -> ResultContent {
         | Method::AgentToolsRemove
         | Method::DraftCreate
         | Method::DraftUpdate
+        | Method::DraftDiscard
         | Method::AgentDraftAddAttachment
         | Method::UploadBegin
         | Method::UploadChunk

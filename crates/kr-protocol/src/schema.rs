@@ -255,10 +255,10 @@ use crate::transfer::{
     AgentDraftAddAttachmentParams, AgentDraftAddAttachmentResult, AttachmentContribution,
     AttachmentHandle, AttachmentReadGrant, DownloadBeginParams, DownloadBeginResult,
     DownloadChunkParams, DownloadChunkResult, DownloadPlacement, DraftCreateParams,
-    DraftCreateResult, DraftRecord, DraftUpdateParams, DraftUpdateResult, UploadBeginParams,
-    UploadBeginResult, UploadCancelParams, UploadCancelResult, UploadChunkParams,
-    UploadChunkResult, UploadFinishParams, UploadFinishResult, UploadStatusParams,
-    UploadStatusResult,
+    DraftCreateResult, DraftDiscardParams, DraftDiscardResult, DraftRecord, DraftUpdateParams,
+    DraftUpdateResult, UploadBeginParams, UploadBeginResult, UploadCancelParams, UploadCancelResult,
+    UploadChunkParams, UploadChunkResult, UploadFinishParams, UploadFinishResult,
+    UploadStatusParams, UploadStatusResult,
 };
 use crate::update::{HostUpdateHandoverParams, HostUpdateHandoverResult};
 use crate::voice::{
@@ -670,6 +670,8 @@ pub fn protocol_schema() -> Value {
         "download_placement" => DownloadPlacement,
         "draft_create_params" => DraftCreateParams,
         "draft_create_result" => DraftCreateResult,
+        "draft_discard_params" => DraftDiscardParams,
+        "draft_discard_result" => DraftDiscardResult,
         "draft_record" => DraftRecord,
         "draft_update_params" => DraftUpdateParams,
         "draft_update_result" => DraftUpdateResult,

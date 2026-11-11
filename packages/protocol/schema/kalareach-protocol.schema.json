@@ -14821,6 +14821,34 @@
       ],
       "type": "object"
     },
+    "DraftDiscardParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `draft.discard`.\n\nNo revision is expected: the caller that most needs to end a draft is one that has lost the\nrevision it last saw.",
+      "properties": {
+        "draft_id": {
+          "$ref": "#/$defs/DraftId",
+          "description": "The draft to end."
+        }
+      },
+      "required": [
+        "draft_id"
+      ],
+      "type": "object"
+    },
+    "DraftDiscardResult": {
+      "additionalProperties": false,
+      "description": "The result of `draft.discard`.\n\nIt names the draft that was ended. A repeat of the same action is answered with it again.",
+      "properties": {
+        "draft_id": {
+          "$ref": "#/$defs/DraftId",
+          "description": "The draft that was ended."
+        }
+      },
+      "required": [
+        "draft_id"
+      ],
+      "type": "object"
+    },
     "DraftFacts": {
       "additionalProperties": false,
       "description": "What a draft holds, without its text.",
@@ -23036,6 +23064,11 @@
         {
           "const": "draft.update",
           "description": "Update a draft at its exact revision. A draft is never submitted automatically.",
+          "type": "string"
+        },
+        {
+          "const": "draft.discard",
+          "description": "End a draft of the caller's own and release the places it holds. A draft a prompt named, or one an attachment of which the agent was offered, is refused and kept until its session ends. Uploads the draft bound are not changed.",
           "type": "string"
         },
         {
@@ -44668,6 +44701,12 @@
     },
     "draft_create_result": {
       "$ref": "#/$defs/DraftCreateResult"
+    },
+    "draft_discard_params": {
+      "$ref": "#/$defs/DraftDiscardParams"
+    },
+    "draft_discard_result": {
+      "$ref": "#/$defs/DraftDiscardResult"
     },
     "draft_record": {
       "$ref": "#/$defs/DraftRecord"

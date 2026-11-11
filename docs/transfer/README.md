@@ -638,6 +638,18 @@ A draft (`draft.create`) is durable and device-owned, with its own revision. Eve
 revision it expects, and a mismatch is `DRAFT_CONFLICT` that changes nothing. Losing a connection
 removes an attachment's association, not the draft.
 
+A draft that nothing has used is ended with `draft.discard`. It names the draft and no revision, so
+a caller that has lost the revision it last saw can still end it. One transaction deletes the draft,
+its attachment records and its prompt record, and revokes the read grants of its attachments. Only
+the draft's own principal may end it: another principal's draft and a draft that is gone are refused
+alike, `INVALID_ARGUMENT`. A draft that a prompt named, or that holds an attachment `inserting`,
+`accepted_by_agent` or `unknown`, is refused `DRAFT_CONFLICT` and nothing is deleted, because those
+records show what the agent was offered or took: such a draft ends with its session. Attachments
+`recorded` or `failed` go with the draft. The call changes no upload: the bytes, their quota charge,
+the session an upload was bound to and its expiry stay as they are, and only `upload.cancel` of an
+upload still receiving releases bytes. The same action asked again is answered from its record, and a
+new action for a draft that is gone is refused as unknown, which a caller reads as already ended.
+
 A draft's reply carries the draft: its text, every attachment bound to it and every preview. That
 reply has to fit the frame that carries it, so its encoded size is checked *before* the mutation
 commits and the refusal is `QUOTA_EXCEEDED` with what to remove. Checking afterwards would leave a

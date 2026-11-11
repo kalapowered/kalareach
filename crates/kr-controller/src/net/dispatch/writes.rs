@@ -96,9 +96,10 @@ impl DeviceWrite {
             Method::DevicePreviewKeyUpdate => Self::PreviewKey,
             Method::DevicePushRegister => Self::PushRegistration,
             Method::DeviceKeysComplete => Self::KeysComplete,
-            Method::DraftCreate | Method::DraftUpdate | Method::AgentDraftAddAttachment => {
-                Self::Transfer
-            }
+            Method::DraftCreate
+            | Method::DraftUpdate
+            | Method::DraftDiscard
+            | Method::AgentDraftAddAttachment => Self::Transfer,
             Method::UploadBegin | Method::UploadFinish | Method::UploadCancel => {
                 Self::Refused(Unserved::Upload)
             }
