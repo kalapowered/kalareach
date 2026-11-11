@@ -990,7 +990,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         let first_deadline = within(FIRST_APPLIED_BOUND);
         inject("appid")?;
         say(messages::APPLICATION_CONTROL_STARTING);
-        let waited = wait_for_applied(
+        let (waited, _) = wait_for_applied(
             before_start,
             first_deadline,
             "the Application Identity service's first \"policy applied\" event",
@@ -1012,11 +1012,13 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     ] {
         run.record(ObjectKind::PolicyRule, id, None)?;
     }
-    let before_write = applocker::newest_record(&paths.staging, &log_env, within(QUERY_BOUND))?;
-    channel.set(&wanted.render())?;
+    // The log's newest record is read by the process that writes the policy, right before it writes,
+    // and comes back with the write's answer: an event after that number came after the write began.
+    let before_write = channel.set(&wanted.render())?;
+    note_call(&format!("policy written after record {before_write}"));
     say("the policy is written");
     inject("policy")?;
-    wait_for_applied(
+    let (_, applied_record) = wait_for_applied(
         before_write,
         within(if was_running {
             FIRST_APPLIED_BOUND
@@ -1027,6 +1029,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         &paths.staging,
         &log_env,
     )?;
+    note_call(&format!("policy applied by record {applied_record}"));
     say("the platform has applied the policy");
     let (after_xml, after) = channel.effective()?;
     let _ = after_xml;
@@ -1038,17 +1041,26 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         )));
     }
 
-    // The broker, and the proof through it. The broker's proofs share one deadline that ends
-    // `PROOF_BOUND` after its start; an answer that comes after it, with a little time for the
-    // answer to travel, is not taken as a success.
-    let broker_started = Instant::now();
+    // The broker, and the proof through it. The proofs of the start-up cycle share one deadline that
+    // ends `PROOF_BOUND` after the broker's start. The broker takes its start before it reports that
+    // it runs, so counting from here ends the cycle no earlier than the broker's own count does, and
+    // nothing is added to it: the installation asks only while the cycle is open, reads each answer
+    // only until its deadline and takes none after it. A proof asked after it belongs to a later
+    // cycle, which the installation never asks for.
     broker_service.start()?;
     broker_service.wait_for(false, Duration::from_secs(60))?;
+    let proof_deadline = Instant::now() + PROOF_BOUND;
     say("the broker is running");
     inject("broker")?;
     let mut session = open_session()?;
-    let proof_deadline = broker_started + PROOF_BOUND + PROOF_ANSWER_SLACK;
     for class in [Class::Checkout, Class::Connect] {
+        if Instant::now() >= proof_deadline {
+            return Err(Error::Failed(format!(
+                "the start-up proof's cycle of {} seconds ended before the proof for {class:?} was asked",
+                PROOF_BOUND.as_secs()
+            )));
+        }
+        session.set_deadline(Some(proof_deadline));
         let response = ask(&mut session, &Request::Prove { class })?;
         if Instant::now() > proof_deadline {
             return Err(Error::Failed(format!(
@@ -1091,9 +1103,8 @@ const NEXT_APPLIED_BOUND: Duration = Duration::from_secs(60);
 
 /// The most one query of the application-control log may take.
 const QUERY_BOUND: Duration = Duration::from_secs(60);
-/// How much later than its own deadline the broker's answer to a proof may arrive, for the time the
-/// answer takes to reach the installation.
-const PROOF_ANSWER_SLACK: Duration = Duration::from_secs(10);
+/// How long the broker may take to answer a hello.
+const HELLO_BOUND: Duration = Duration::from_secs(30);
 
 /// The time `bound` from now.
 fn within(bound: Duration) -> Instant {
@@ -1101,15 +1112,15 @@ fn within(bound: Duration) -> Instant {
 }
 
 /// Waits for the platform's "policy applied" event after a record number, and returns how long it
-/// took. Every query of the log stays within the deadline, and an event that was in hand only after
-/// the deadline is not taken as a success.
+/// took and the event's record number. Every query of the log stays within the deadline, and an
+/// event that was in hand only after the deadline is not taken as a success.
 fn wait_for_applied(
     after: u64,
     deadline: Instant,
     what: &str,
     scratch: &Path,
     env: &crate::env::EnvBlock,
-) -> Result<Duration, Error> {
+) -> Result<(Duration, u64), Error> {
     let begun = Instant::now();
     let too_late = || {
         Error::Failed(format!(
@@ -1122,8 +1133,8 @@ fn wait_for_applied(
         if Instant::now() > deadline {
             return Err(too_late());
         }
-        if seen {
-            return Ok(begun.elapsed());
+        if let Some(record) = seen {
+            return Ok((begun.elapsed(), record));
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -1151,24 +1162,30 @@ pub fn open_session() -> Result<pipe::Connection, Error> {
         ));
     }
     let mut connection = pipe::connect(status.pid)?;
-    match ask(
+    connection.set_deadline(Some(Instant::now() + HELLO_BOUND));
+    let said = ask(
         &mut connection,
         &Request::Hello {
             version: frame::VERSION,
         },
-    )? {
-        Response::Hello { .. } => Ok(connection),
+    )?;
+    match said {
+        Response::Hello { .. } => {
+            // The caller sets the deadline of what it asks next.
+            connection.set_deadline(None);
+            Ok(connection)
+        }
         other => Err(Error::Failed(format!(
             "the broker answered hello with {other:?}"
         ))),
     }
 }
 
-/// Sends one request and reads the answer.
+/// Sends one request and reads the answer, within the connection's deadline when it has one.
 ///
 /// # Errors
 ///
-/// Returns an error when the connection fails.
+/// Returns an error when the connection fails or the deadline passes before the answer.
 pub fn ask(connection: &mut pipe::Connection, request: &Request) -> Result<Response, Error> {
     frame::write(connection, request).map_err(|error| Error::Failed(error.to_string()))?;
     frame::read(connection).map_err(|error| Error::Failed(error.to_string()))

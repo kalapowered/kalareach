@@ -26,6 +26,9 @@ use super::proof::{Run, run_captured};
 /// The application-control log that holds the executable collection's events.
 const LOG: &str = "Microsoft-Windows-AppLocker/EXE and DLL";
 
+/// What the script that writes the policy prints before the number of the log's newest record.
+const RECORD_BEFORE_WRITE: &str = "newest-record-before-write=";
+
 /// A failure to read or write the policy or the log.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -165,22 +168,38 @@ impl Channel {
         Ok((xml, policy))
     }
 
-    /// Replaces the local policy with the XML given.
+    /// Replaces the local policy with the XML given, and returns the number of the newest record of
+    /// the application-control log as the same PowerShell process read it right before it wrote the
+    /// policy (zero for an empty log). An event with a larger number came after the write began, so
+    /// the number is the one a wait for the platform's report of the policy starts from: no other
+    /// process reads it, and nothing happens between the read and the write but PowerShell's own
+    /// next statement.
     ///
     /// # Errors
     ///
-    /// Returns an error when the file cannot be written or PowerShell refuses the policy.
-    pub fn set(&self, xml: &str) -> Result<(), Error> {
+    /// Returns an error when the file cannot be written, PowerShell refuses the policy or the log,
+    /// or its answer does not name a record.
+    pub fn set(&self, xml: &str) -> Result<u64, Error> {
         let file = self.scratch.join("policy.xml");
         std::fs::write(&file, xml).map_err(|source| Error::Start {
             what: "writing the policy file",
             source,
         })?;
-        self.powershell(&format!(
-            "Set-AppLockerPolicy -XmlPolicy '{}'",
+        // An empty log answers with its own error, which is the answer zero; any other error stops
+        // the script before the policy is written.
+        let text = self.powershell(&format!(
+            "$newest = 0; try {{ $newest = [int64](Get-WinEvent -LogName '{LOG}' -MaxEvents 1 -ErrorAction Stop).RecordId }} catch {{ if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') {{ throw }} }}; Set-AppLockerPolicy -XmlPolicy '{}'; Write-Output \"{RECORD_BEFORE_WRITE}$newest\"",
             file.display()
         ))?;
-        Ok(())
+        text.lines()
+            .find_map(|line| line.trim().strip_prefix(RECORD_BEFORE_WRITE))
+            .and_then(|number| number.trim().parse().ok())
+            .ok_or_else(|| {
+                Error::Unreadable(format!(
+                    "PowerShell did not say which record the log ended at before the policy was written: {}",
+                    text.trim()
+                ))
+            })
     }
 }
 
@@ -196,8 +215,7 @@ fn wevtutil(
     deadline: Instant,
 ) -> Result<String, Error> {
     let what = "the event log query";
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
+    if Instant::now() >= deadline {
         return Err(Error::Unreadable(
             "the deadline passed before the event log was asked".to_owned(),
         ));
@@ -217,7 +235,7 @@ fn wevtutil(
             cwd: scratch,
             env,
         },
-        remaining.min(QUERY_BOUND),
+        deadline.min(Instant::now() + QUERY_BOUND),
     )
     .map_err(launch_error)?;
     let text = String::from_utf8_lossy(&captured.stdout).into_owned();
@@ -279,7 +297,8 @@ pub fn newest_record(scratch: &Path, env: &EnvBlock, deadline: Instant) -> Resul
     Ok(events.iter().map(|event| event.record).max().unwrap_or(0))
 }
 
-/// Whether the log holds the platform's "policy applied" event after a record number.
+/// The record number of the platform's first "policy applied" event after a record number, when the
+/// log holds one.
 ///
 /// # Errors
 ///
@@ -289,12 +308,14 @@ pub fn policy_applied_after(
     scratch: &Path,
     env: &EnvBlock,
     deadline: Instant,
-) -> Result<bool, Error> {
+) -> Result<Option<u64>, Error> {
     let filter = format!(
         "/q:*[System[(EventID={}) and (EventRecordID>{record})]]",
         events::APPLIED
     );
-    Ok(!query(&[&filter, "/c:1"], scratch, env, deadline)?.is_empty())
+    Ok(query(&[&filter, "/c:1"], scratch, env, deadline)?
+        .first()
+        .map(|event| event.record))
 }
 
 /// The refusals the log has recorded after a record number.

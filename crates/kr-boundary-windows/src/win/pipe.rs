@@ -16,10 +16,11 @@ use std::ffi::c_void;
 use std::io::{self, Read, Write};
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
+use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{
     ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, LocalFree,
-    WAIT_OBJECT_0,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::{
@@ -100,12 +101,25 @@ pub struct Identity {
 pub struct Connection {
     pipe: Handle,
     stop: Arc<Stop>,
+    /// The time after which no transfer on this connection waits, or none.
+    deadline: Option<Instant>,
 }
 
-fn wait(pipe: HANDLE, overlapped: &mut OVERLAPPED, event: &Handle, stop: &Stop) -> io::Result<u32> {
+fn wait(
+    pipe: HANDLE,
+    overlapped: &mut OVERLAPPED,
+    event: &Handle,
+    stop: &Stop,
+    deadline: Option<Instant>,
+) -> io::Result<u32> {
     let handles = [event.raw(), stop.0.raw()];
+    let milliseconds = deadline.map_or(INFINITE, |deadline| {
+        let left = deadline.saturating_duration_since(Instant::now());
+        // One less than the longest wait, which means "forever".
+        u32::try_from(left.as_millis()).map_or(INFINITE - 1, |left| left.min(INFINITE - 1))
+    });
     // SAFETY: both handles are open for the length of the wait.
-    let signalled = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
+    let signalled = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, milliseconds) };
     if signalled != WAIT_OBJECT_0 {
         // SAFETY: the transfer belongs to this connection and is cancelled and waited for.
         unsafe {
@@ -113,10 +127,14 @@ fn wait(pipe: HANDLE, overlapped: &mut OVERLAPPED, event: &Handle, stop: &Stop) 
             let mut ignored = 0_u32;
             GetOverlappedResult(pipe, overlapped, &raw mut ignored, 1);
         }
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "the service is stopping",
-        ));
+        return Err(if signalled == WAIT_TIMEOUT {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the other end did not answer before the deadline",
+            )
+        } else {
+            io::Error::new(io::ErrorKind::Interrupted, "the service is stopping")
+        });
     }
     let mut transferred = 0_u32;
     // SAFETY: the transfer has completed, so the result can be read without waiting.
@@ -167,7 +185,13 @@ impl Read for Connection {
                 };
             }
         }
-        match wait(self.pipe.raw(), &mut overlapped, &event, &self.stop) {
+        match wait(
+            self.pipe.raw(),
+            &mut overlapped,
+            &event,
+            &self.stop,
+            self.deadline,
+        ) {
             Ok(count) => Ok(count as usize),
             Err(failure) if failure.raw_os_error() == Some(109) => Ok(0),
             Err(failure) => Err(failure),
@@ -204,7 +228,14 @@ impl Write for Connection {
                 return Err(failure);
             }
         }
-        wait(self.pipe.raw(), &mut overlapped, &event, &self.stop).map(|count| count as usize)
+        wait(
+            self.pipe.raw(),
+            &mut overlapped,
+            &event,
+            &self.stop,
+            self.deadline,
+        )
+        .map(|count| count as usize)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -213,6 +244,13 @@ impl Write for Connection {
 }
 
 impl Connection {
+    /// Sets the time after which a read or a write on this connection stops waiting and fails with
+    /// [`io::ErrorKind::TimedOut`]; none waits for as long as the other end takes. It is how a client
+    /// holds one absolute deadline over a request and its answer.
+    pub fn set_deadline(&mut self, deadline: Option<Instant>) {
+        self.deadline = deadline;
+    }
+
     /// The process on the other end of a connection a client made to this server, and the account
     /// and standing of its token.
     ///
@@ -389,7 +427,7 @@ impl Listener {
             // SAFETY: reads the calling thread's last error.
             let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
             if code == ERROR_IO_PENDING {
-                match wait(pipe.raw(), &mut overlapped, &event, &self.stop) {
+                match wait(pipe.raw(), &mut overlapped, &event, &self.stop, None) {
                     Ok(_) => {}
                     Err(failure) if failure.kind() == io::ErrorKind::Interrupted => {
                         return Ok(None);
@@ -408,6 +446,7 @@ impl Listener {
         Ok(Some(Connection {
             pipe,
             stop: Arc::clone(&self.stop),
+            deadline: None,
         }))
     }
 }
@@ -451,5 +490,6 @@ pub fn connect(expected_server: u32) -> Result<Connection> {
     Ok(Connection {
         pipe,
         stop: Stop::new()?,
+        deadline: None,
     })
 }
