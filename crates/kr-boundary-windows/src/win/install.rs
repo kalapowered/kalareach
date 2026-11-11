@@ -3,7 +3,8 @@
 //! The installation lays down, in this order and recording each object in the manifest before the
 //! step that makes it: the data directory and the earlier-state record, the program directory and
 //! the broker and credential helper in it, the two accounts with their rights, the service, the
-//! application-control policy with the Application Identity service, and then the proof that the
+//! Application Identity service, started and awaited until the platform reports its first policy
+//! applied, the application-control policy, awaited the same way, and then the proof that the
 //! policy refuses what it must. A failure at any step undoes what was done by the removal
 //! sequence and then checks the machine against the earlier-state record.
 //!
@@ -20,7 +21,7 @@ use std::io::{self, BufRead as _, Read as _, Write as _};
 use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest as _, Sha256};
 
@@ -28,12 +29,14 @@ use crate::frame::{self, Class, Request, Response};
 use crate::manifest::{
     GitSet, Image, InstallState, Manifest, ObjectKind, Prior, STORE_VERSION, StoreError,
 };
+use crate::messages;
 use crate::notice::NOTICE;
 use crate::policy::{self, Policy};
 
 use super::acl;
 use super::applocker::{self, Channel};
 use super::ffi::{self, Sid};
+use super::proof;
 use super::registry;
 use super::sd::{self, Principals, SdKind};
 use super::service;
@@ -100,8 +103,8 @@ pub const STEPS: [&str; 7] = [
     "payload",
     "accounts",
     "service",
-    "policy",
     "appid",
+    "policy",
     "broker",
 ];
 
@@ -807,18 +810,8 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
 
     inject("service")?;
 
-    // The policy and the Application Identity service.
-    let wanted = Policy::installed(&sids[0].to_text(), &sids[1].to_text());
-    for id in [
-        policy::RULE_ALLOW_ALL,
-        policy::RULE_CHECKOUT,
-        policy::RULE_CONNECT,
-    ] {
-        run.record(ObjectKind::PolicyRule, id, None)?;
-    }
-    channel.set(&wanted.render())?;
-    say("the policy is written");
-    inject("policy")?;
+    // The Application Identity service first. A policy written before the service has applied one is
+    // not enforced, and the service applies its first about two minutes after it starts.
     run.record(
         ObjectKind::AppIdentity,
         APPID,
@@ -827,11 +820,57 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     if appid_start != AUTOMATIC {
         appid.set_automatic()?;
     }
-    if !appid.status()?.running() {
+    let git = run
+        .manifest
+        .git
+        .clone()
+        .ok_or_else(|| Error::Failed("no Git installation is recorded".to_owned()))?;
+    let log_env = proof::proof_environment(&git, &paths.staging).map_err(Error::Failed)?;
+    let before_start = applocker::newest_record(&paths.staging, &log_env)?;
+    let was_running = appid.status()?.running();
+    if !was_running {
         appid.start()?;
         appid.wait_for(false, Duration::from_secs(60))?;
     }
     inject("appid")?;
+    say(messages::APPLICATION_CONTROL_STARTING);
+    let waited = wait_for_applied(
+        if was_running {
+            Applied::ThisStart
+        } else {
+            Applied::After(before_start)
+        },
+        FIRST_APPLIED_BOUND,
+        "the Application Identity service's first \"policy applied\" event",
+        &paths.staging,
+        &log_env,
+    )?;
+    say(&format!(
+        "application control has started, {:.0} s after the service",
+        waited.as_secs_f32()
+    ));
+
+    // The policy, and the platform's next event that says it applied it.
+    let wanted = Policy::installed(&sids[0].to_text(), &sids[1].to_text());
+    for id in [
+        policy::RULE_ALLOW_ALL,
+        policy::RULE_CHECKOUT,
+        policy::RULE_CONNECT,
+    ] {
+        run.record(ObjectKind::PolicyRule, id, None)?;
+    }
+    let before_write = applocker::newest_record(&paths.staging, &log_env)?;
+    channel.set(&wanted.render())?;
+    say("the policy is written");
+    inject("policy")?;
+    wait_for_applied(
+        Applied::After(before_write),
+        NEXT_APPLIED_BOUND,
+        "the \"policy applied\" event after the policy was written",
+        &paths.staging,
+        &log_env,
+    )?;
+    say("the platform has applied the policy");
     let (after_xml, after) = channel.effective()?;
     let _ = after_xml;
     let differences = after.differences(&wanted);
@@ -871,6 +910,52 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     run.manifest.save(&paths.manifest)?;
     say("the boundary is installed and in force");
     Ok(())
+}
+
+/// How long the installation waits for the platform's first "policy applied" event after it starts
+/// the Application Identity service: the service applies its first policy about two minutes after
+/// it starts.
+const FIRST_APPLIED_BOUND: Duration = Duration::from_secs(300);
+/// How long it waits for the next such event after it has written the policy: the platform applied
+/// the policy within a second of the write in every run of the guest.
+const NEXT_APPLIED_BOUND: Duration = Duration::from_secs(60);
+
+/// What a "policy applied" event has to come after.
+enum Applied {
+    /// A record number in the application-control log: the log's newest before the step.
+    After(u64),
+    /// The start of Windows: the service was already running, so it applied its first policy
+    /// before this installation began, or has not yet since the machine started.
+    ThisStart,
+}
+
+/// Waits for the platform's "policy applied" event, and returns how long it took.
+fn wait_for_applied(
+    since: Applied,
+    bound: Duration,
+    what: &str,
+    scratch: &Path,
+    env: &crate::env::EnvBlock,
+) -> Result<Duration, Error> {
+    let begun = Instant::now();
+    loop {
+        let seen = match since {
+            Applied::After(record) => applocker::policy_applied_after(record, scratch, env)?,
+            Applied::ThisStart => {
+                applocker::policy_applied_within(ffi::uptime_millis(), scratch, env)?
+            }
+        };
+        if seen {
+            return Ok(begun.elapsed());
+        }
+        if begun.elapsed() >= bound {
+            return Err(Error::Failed(format!(
+                "Windows did not report {what} within {} seconds",
+                bound.as_secs()
+            )));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 /// Connects to the broker's pipe, checking that the process serving it is the service's.
