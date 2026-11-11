@@ -309,6 +309,10 @@ const LEFT_RIGHT_MARGINS: u16 = 69;
 /// ANSI mode 4, insert mode, which would push the cells beside a drawn one along the row.
 const INSERT_MODE: u16 = 4;
 
+/// The DEC private modes that choose which mouse events a destination reports, narrowest first:
+/// presses and releases (1000), those and a move with a button held (1002), and every move (1003).
+const MOUSE_TRACKING_MODES: &[u16] = &[1000, 1002, 1003];
+
 /// The modes that are the buffer selection under another spelling.
 ///
 /// Setting one of them here would clear the buffer this frame is about to paint. Which buffer is
@@ -542,10 +546,23 @@ impl<'a> Writer<'a> {
     fn state(&mut self) {
         self.palette();
         self.title();
+        // Whether the screen tracks the mouse at all, and the widest tracking it has on.
+        let mut tracked = false;
+        let mut tracking = None;
         for ((spelling, mode), enabled) in self.screen.modes.clone() {
             let Ok(number) = u16::try_from(mode) else {
                 continue;
             };
+            if spelling == super::ProjectedModeSpelling::Dec
+                && MOUSE_TRACKING_MODES.contains(&number)
+            {
+                // Written once, below, as the one setting a terminal keeps.
+                tracked = true;
+                if enabled {
+                    tracking = tracking.max(Some(number));
+                }
+                continue;
+            }
             let geometry = matches!(spelling, super::ProjectedModeSpelling::Dec)
                 && (number == ORIGIN_MODE || number == LEFT_RIGHT_MARGINS)
                 || matches!(spelling, super::ProjectedModeSpelling::Ansi) && number == INSERT_MODE;
@@ -564,6 +581,9 @@ impl<'a> Writer<'a> {
                 continue;
             }
             self.mode_of(spelling, number, enabled);
+        }
+        if tracked {
+            self.mouse_tracking(tracking);
         }
         // The keypad's own mode is carried twice by a screen; this is the spelling a terminal
         // takes, and it is written whichever way the modes above spelled it.
@@ -624,6 +644,23 @@ impl<'a> Writer<'a> {
         let flags = buffer.flags.0.map_or(0, |flags| flags.get());
         self.csi(format!("={flags};1u").as_bytes());
         self.comparison.keyboard_stack += buffer.stack.len();
+    }
+
+    /// Installs which mouse events the destination reports, as the one setting a terminal keeps.
+    ///
+    /// The screen holds modes 1000, 1002 and 1003 as three settings and the widest one that is on
+    /// is what the application asked for. A terminal holds one tracking state: setting any of them
+    /// replaces the one in force, and resetting any of them turns tracking off whichever was on.
+    /// Written one by one in the screen's order, with the ones that are off among them, the last
+    /// reset would leave the destination reporting nothing, so all three are reset first and the
+    /// widest one that is on is set last.
+    fn mouse_tracking(&mut self, tracking: Option<u16>) {
+        for mode in MOUSE_TRACKING_MODES {
+            self.mode_of(super::ProjectedModeSpelling::Dec, *mode, false);
+        }
+        if let Some(mode) = tracking {
+            self.mode_of(super::ProjectedModeSpelling::Dec, mode, true);
+        }
     }
 
     /// Writes one tracked mode.
@@ -3214,6 +3251,63 @@ mod safety {
             contains(&withheld.bytes, b"\x1b[?1006h"),
             "the mouse modes still are, because those are not the keyboard's"
         );
+    }
+
+    /// KR-REQ-01.11: the mouse tracking is installed as the one setting a terminal keeps.
+    #[test]
+    fn a_frame_leaves_the_destination_reporting_the_mouse_the_application_asked_for() {
+        let tracking_after = |modes: [(u64, bool); 3]| {
+            let mut screen = screen("plain", "text", None);
+            for (mode, enabled) in modes {
+                screen
+                    .modes
+                    .insert((super::super::ProjectedModeSpelling::Dec, mode), enabled);
+            }
+            let painted = install(&screen, Window::of(&screen), Keyboard::EVERYTHING);
+            mouse_tracking(&painted.bytes)
+        };
+        // The screen holds three settings; a terminal holds one, and any reset of the three turns
+        // it off, so which of them is written last decides what a click reaches the application as.
+        assert_eq!(
+            tracking_after([(1000, true), (1002, true), (1003, false)]),
+            Some(1002)
+        );
+        assert_eq!(
+            tracking_after([(1000, true), (1002, false), (1003, false)]),
+            Some(1000)
+        );
+        assert_eq!(
+            tracking_after([(1000, true), (1002, false), (1003, true)]),
+            Some(1003)
+        );
+        assert_eq!(
+            tracking_after([(1000, false), (1002, false), (1003, false)]),
+            None
+        );
+    }
+
+    /// The mouse tracking a stream leaves a terminal in, as a terminal keeps it: setting any of the
+    /// three tracking modes replaces the one in force, and resetting any of them turns it off.
+    fn mouse_tracking(stream: &[u8]) -> Option<u16> {
+        let mut tracking = None;
+        let mut rest = stream;
+        while let Some(at) = rest.windows(3).position(|window| window == b"\x1b[?") {
+            rest = &rest[at + 3..];
+            let digits = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
+            let mode = std::str::from_utf8(&rest[..digits])
+                .ok()
+                .and_then(|text| text.parse::<u16>().ok());
+            if let (Some(mode), Some(last)) = (mode, rest.get(digits)) {
+                if matches!(mode, 1000 | 1002 | 1003) {
+                    match last {
+                        b'h' => tracking = Some(mode),
+                        b'l' => tracking = None,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        tracking
     }
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {

@@ -93,7 +93,7 @@
 
 use kr_term::grid::Link;
 use kr_term::grid::{Blink, Colour, GridRow, Rendition, Run, UnderlineStyle, VerticalPosition};
-use kr_term::modes::ALTERNATE_BUFFER_MODES;
+use kr_term::modes::{ALTERNATE_BUFFER_MODES, MOUSE_TRACKING_MODES};
 use kr_term::palette::Rgb;
 use kr_term::sideeffect::{
     ClipboardSelection, NotificationDisplay, NotificationUrgency, Progress, SideEffectKind,
@@ -277,6 +277,30 @@ pub fn render(
             *held = enabled;
         }
     }
+    // The three mouse tracking modes are carried as three settings and a terminal keeps one, so
+    // what is written is the widest of them that is on, found here and written where the first of
+    // them is reached.
+    let tracking_entries: Vec<_> = operations
+        .iter()
+        .filter_map(|operation| match operation {
+            RestoreOp::SetMode { entry }
+                if entry.kind == kr_term::modes::ModeKind::Dec
+                    && MOUSE_TRACKING_MODES.contains(&entry.mode) =>
+            {
+                Some(entry)
+            }
+            _ => None,
+        })
+        .collect();
+    if !tracking_entries.is_empty() {
+        writer.mouse_tracking = Some(
+            tracking_entries
+                .iter()
+                .filter(|entry| entry.enabled)
+                .map(|entry| entry.mode)
+                .max(),
+        );
+    }
     for operation in operations {
         writer.apply(operation);
     }
@@ -344,6 +368,10 @@ struct Writer {
     autowrap: bool,
     /// Whether the session has reverse video on, which the plain state writes before every save.
     reverse_video: bool,
+    /// The mouse tracking to install, held until the first of the three tracking modes is reached:
+    /// `Some(None)` is tracking off, and `None` is nothing to write (no tracking mode is carried,
+    /// or it has been written).
+    mouse_tracking: Option<Option<u16>>,
     carried: Carried,
 }
 
@@ -365,6 +393,7 @@ impl Writer {
             origin_mode: false,
             autowrap: true,
             reverse_video: false,
+            mouse_tracking: None,
             keyboard,
             carried: Carried::default(),
         }
@@ -445,6 +474,21 @@ impl Writer {
                     // Whether the cursor shows is the cursor's own operation, which comes last,
                     // so that nobody watches it travel across the repaint.
                     if entry.mode == CURSOR_VISIBLE_MODE {
+                        return;
+                    }
+                    // The three mouse tracking modes are one setting on a terminal, so they are
+                    // written together, where the first of them is reached: all three reset, then
+                    // the widest one that is on set. Written one by one in the order they are
+                    // carried, the reset of one that is off would turn off the one that is on.
+                    if MOUSE_TRACKING_MODES.contains(&entry.mode) {
+                        if let Some(tracking) = self.mouse_tracking.take() {
+                            for mode in MOUSE_TRACKING_MODES {
+                                self.csi(format!("?{mode}l").as_bytes());
+                            }
+                            if let Some(mode) = tracking {
+                                self.csi(format!("?{mode}h").as_bytes());
+                            }
+                        }
                         return;
                     }
                 }
