@@ -100,6 +100,9 @@ pub enum VolumeRefusal {
     /// The volume is on another computer.
     #[error("the volume is on another computer, and only local volumes are supported")]
     Remote,
+    /// The path is a device path (`\\.\`), which this release does not open.
+    #[error("the path is a device path, and only drive paths are supported")]
+    DevicePath,
     /// The volume is on removable media.
     #[error("the volume is on removable media, and only fixed volumes are supported")]
     Removable,
@@ -366,6 +369,19 @@ pub mod testing {
         }
     }
 
+    static ANCHOR_OPENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// How many times an anchor was opened in this process, whatever the result: a path refused
+    /// before any open leaves the count as it was.
+    #[must_use]
+    pub fn anchor_opens() -> usize {
+        ANCHOR_OPENS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(super) fn note_anchor_open() {
+        ANCHOR_OPENS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub(super) fn note_open(directory: &[u16], name: &[u16]) {
         let directory = String::from_utf16_lossy(directory);
         let name = String::from_utf16_lossy(name);
@@ -599,9 +615,10 @@ fn open_by_key(hint: &Handle, key: &FileKey, access: u32, share: u32) -> Result<
 }
 
 /// An absolute path as the NT name that opens it, which is the one form a call that is not
-/// `CreateFileW` takes. A path on another computer has none: the answer is `None`, and the anchor
-/// is refused as a remote volume.
-fn nt_path(path: &Path) -> Result<Option<Vec<u16>>> {
+/// `CreateFileW` takes. Two kinds of path have none, and the answer says which: a path on another
+/// computer (`\\server\share`, `\\?\UNC\...`, `\\.\UNC\...`), and a device path (`\\.\C:\...`),
+/// which only a `\\?\` prefix may stand in for.
+fn nt_path(path: &Path) -> Result<std::result::Result<Vec<u16>, VolumeRefusal>> {
     let wide = wide_path(path);
     let mut full = vec![0_u16; 512];
     loop {
@@ -625,32 +642,36 @@ fn nt_path(path: &Path) -> Result<Option<Vec<u16>>> {
     }
     let slash = u16::from(b'\\');
     let question = u16::from(b'?');
+    let dot = u16::from(b'.');
     if full.len() > 4
         && full[0] == slash
         && full[1] == slash
-        && full[2] == question
+        && (full[2] == question || full[2] == dot)
         && full[3] == slash
     {
         // `\\?\C:\x` is `\??\C:\x` in the NT space; the one that names a share,
-        // `\\?\UNC\server\share`, is a path on another computer. Other `\\?\` forms
-        // (`\\?\GLOBALROOT\Device\...`, `\\?\pipe\...`) reach the open, and `check_volume` refuses
-        // what is not a local NTFS directory; anchors come from the administrator's configuration.
-        // A `\\.\` path is not taken as an NT form: it falls to the refusal below with the other
-        // paths that begin with two backslashes.
+        // `\\?\UNC\server\share`, is a path on another computer, in either prefix. Other `\\?\`
+        // forms (`\\?\GLOBALROOT\Device\...`, `\\?\pipe\...`) reach the open, and `check_volume`
+        // refuses what is not a local NTFS directory; anchors come from the administrator's
+        // configuration. A `\\.\` path to anything but a share is a device path and is refused
+        // here, before any open.
         let rest = String::from_utf16_lossy(&full[4..]).to_ascii_uppercase();
         if rest.starts_with("UNC\\") {
-            return Ok(None);
+            return Ok(Err(VolumeRefusal::Remote));
+        }
+        if full[2] == dot {
+            return Ok(Err(VolumeRefusal::DevicePath));
         }
         full[1] = question;
         full[2] = question;
-        return Ok(Some(full));
+        return Ok(Ok(full));
     }
     if full.len() > 2 && full[0] == slash && full[1] == slash {
-        return Ok(None);
+        return Ok(Err(VolumeRefusal::Remote));
     }
     let mut nt = vec![slash, question, question, slash];
     nt.extend(full);
-    Ok(Some(nt))
+    Ok(Ok(nt))
 }
 
 /// Checks an open directory the way every anchor and every recorded directory is checked: the
@@ -708,9 +729,12 @@ impl DirHandle {
         access: u32,
     ) -> Result<std::result::Result<DirHandle, AnchorRefusal>> {
         require_holding(access)?;
-        let Some(nt) = nt_path(path)? else {
-            return Ok(Err(AnchorRefusal::Volume(VolumeRefusal::Remote)));
+        let nt = match nt_path(path)? {
+            Ok(nt) => nt,
+            Err(refusal) => return Ok(Err(AnchorRefusal::Volume(refusal))),
         };
+        #[cfg(feature = "testing")]
+        testing::note_anchor_open();
         let handle = nt_create(
             std::ptr::null_mut(),
             &nt,

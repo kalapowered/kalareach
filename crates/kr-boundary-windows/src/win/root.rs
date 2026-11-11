@@ -158,9 +158,11 @@ pub enum RootError {
 }
 
 /// An object the removal could not remove, or the root itself when the removal stopped or did not
-/// start. The removal changes nothing on it, with one exception: when the reason says that a delete
-/// call did not end, that call may still complete later, and whether the object is gone is not
-/// known.
+/// start. The removal changes nothing on it, with two exceptions. When the reason says that a
+/// delete call did not end, or that a delete call of an earlier removal has not ended, that call
+/// may still complete later, and whether the object, the root included, is gone is not known. When
+/// the reason says that another removal of the root is running, that removal may remove the root:
+/// the leftover does not say that the root stays.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Leftover {
     /// Where it is, below the root, with the root's name left out.
@@ -312,8 +314,8 @@ fn make_root(
 ///
 /// Returns what could not be removed. When nothing is left over the root itself is gone (its name
 /// goes when the caller's handle closes) and the `removed` row is written; otherwise the root
-/// stays, and so does everything the removal could not take. Three outcomes are not an object that
-/// refused, and each has its leftover:
+/// stays, and so does everything the removal could not take, except where the third outcome below
+/// says otherwise. Three outcomes are not an object that refused, and each has its leftover:
 ///
 /// - The waits for objects in use are spent. The removal makes no further delete call and returns
 ///   one leftover for the root; the objects it did not reach stay. The call that spent the waits
@@ -321,12 +323,14 @@ fn make_root(
 ///   nothing comes after it.
 /// - A delete call did not end. The removal gives it up and makes no further call; the object's
 ///   leftover says so, the call may still complete, and whether the object is gone is not known.
-/// - The root is reserved by another removal, or by a given-up delete call that has not ended. The
-///   removal lists nothing, deletes nothing and returns one leftover for the root that says why.
+/// - The root is reserved by another removal that is running, or by a delete call of an earlier
+///   removal that has not ended. The removal lists nothing, deletes nothing and returns one
+///   leftover for the root that says which. Neither says that the root stays: the running removal
+///   may remove it, and the earlier call may still complete.
 ///
 /// `PrivateRoot` is shared, so two removals of one root can overlap by type; the reservation, made
-/// before anything is listed and kept until the removal returns (or, after a give-up, until the
-/// abandoned call's thread has ended), lets only one of them work.
+/// before anything is listed and kept until the removal returns (or, while a delete call is
+/// outstanding, until the thread that makes it has ended), lets only one of them work.
 ///
 /// # Errors
 ///
@@ -440,8 +444,11 @@ struct Claim {
     root: String,
     /// The removal has not returned.
     running: AtomicBool,
-    /// The removal gave up a delete call that may not have returned.
-    abandoned: AtomicBool,
+    /// A delete call was sent whose answer the removal has not taken, so the thread may be inside
+    /// it. Set before the job is sent and cleared when the answer is taken: a removal that gives
+    /// the call up, or unwinds while it waits, leaves it set, and the root stays claimed until the
+    /// thread has ended.
+    outstanding: AtomicBool,
     /// The thread that makes the delete calls has ended, which it does after its call returned.
     ended: AtomicBool,
 }
@@ -469,27 +476,28 @@ impl Claim {
         let claim = Arc::new(Claim {
             root: root.to_owned(),
             running: AtomicBool::new(true),
-            abandoned: AtomicBool::new(false),
+            outstanding: AtomicBool::new(false),
             ended: AtomicBool::new(false),
         });
         claims.push(claim.clone());
         Ok(claim)
     }
 
-    /// Whether the root is still reserved: its removal is running, or it gave up a call whose
-    /// thread has not ended.
+    /// Whether the root is still reserved: its removal is running, or a delete call it sent is
+    /// outstanding and its thread has not ended.
     fn held(&self) -> bool {
         self.running.load(Ordering::Acquire) || self.pending()
     }
 
-    /// Whether a given-up delete call may still be in the system.
+    /// Whether a delete call that the removal did not take the answer of may still be in the
+    /// system.
     fn pending(&self) -> bool {
-        self.abandoned.load(Ordering::Acquire) && !self.ended.load(Ordering::Acquire)
+        self.outstanding.load(Ordering::Acquire) && !self.ended.load(Ordering::Acquire)
     }
 }
 
-/// Ends the removal's reservation when it is dropped, early returns and panics included. A given-up
-/// call keeps the root reserved until its thread has ended.
+/// Ends the removal's reservation when it is dropped, early returns and panics included. A delete
+/// call that is still outstanding keeps the root reserved until its thread has ended.
 struct Reservation(Arc<Claim>);
 
 impl Drop for Reservation {
@@ -548,11 +556,17 @@ impl Deleter {
             #[cfg(feature = "testing")]
             root: self.claim.root.clone(),
         };
+        // Outstanding from before the job is sent, so that no unwind between the send and the
+        // answer can free the root while the thread is in its call.
+        self.claim.outstanding.store(true, Ordering::Release);
         if self.jobs.send(job).is_err() {
             return Call::DidNotEnd;
         }
         match self.answers.recv_timeout(limit) {
-            Ok(result) => return Call::Ended(result),
+            Ok(result) => {
+                self.claim.outstanding.store(false, Ordering::Release);
+                return Call::Ended(result);
+            }
             Err(RecvTimeoutError::Disconnected) => return Call::DidNotEnd,
             Err(RecvTimeoutError::Timeout) => {}
         }
@@ -562,11 +576,12 @@ impl Deleter {
         // the system to cancel the synchronous request that thread has pending, if it has one.
         unsafe { CancelSynchronousIo(self.thread.as_raw_handle()) };
         match self.answers.recv_timeout(CANCEL_GRACE) {
-            Ok(result) => Call::Cancelled(result),
-            Err(_) => {
-                self.claim.abandoned.store(true, Ordering::Release);
-                Call::DidNotEnd
+            Ok(result) => {
+                self.claim.outstanding.store(false, Ordering::Release);
+                Call::Cancelled(result)
             }
+            // The call stays outstanding: the thread keeps the root claimed until it ends.
+            Err(_) => Call::DidNotEnd,
         }
     }
 }
@@ -720,8 +735,32 @@ pub mod testing {
         }
     }
 
-    /// Whether a delete call that an earlier removal of the root named `root` gave up is still in
-    /// the system.
+    static PLAIN_DELETE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Makes every delete call of the process leave out the POSIX semantics until the guard is
+    /// dropped: the name then stays until the last handle to the object closes, as on a volume
+    /// that takes the call and does not act on it.
+    #[must_use]
+    pub fn delete_without_posix_semantics() -> PlainDelete {
+        PLAIN_DELETE.store(true, std::sync::atomic::Ordering::SeqCst);
+        PlainDelete
+    }
+
+    /// The switch of [`delete_without_posix_semantics`], put back when it is dropped.
+    pub struct PlainDelete;
+
+    impl Drop for PlainDelete {
+        fn drop(&mut self) {
+            PLAIN_DELETE.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    pub(super) fn plain_delete() -> bool {
+        PLAIN_DELETE.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether a delete call that an earlier removal of the root named `root` did not take the
+    /// answer of is still in the system.
     #[must_use]
     pub fn call_pending(root: &RootName) -> bool {
         super::CLAIMS
@@ -940,7 +979,9 @@ impl Removal {
     /// call that takes longer than [`DELETE_GRACE`] is counted against the total whatever its
     /// result. A call that does not end, or one that takes longer than the grace once the total is
     /// spent, stops the removal's delete calls for this root: what is left stays, under one
-    /// leftover for the root.
+    /// leftover for the root. The root's own call has no stop, since nothing comes after it: a root
+    /// delete that succeeds ends the removal clean whatever its time, and one that does not end is
+    /// the root's own leftover.
     fn remove(&mut self, handle: Handle, path: &str) {
         if self.stopped {
             return;
@@ -1002,6 +1043,20 @@ impl Removal {
     }
 }
 
+#[cfg(feature = "testing")]
+fn posix_semantics() -> u32 {
+    if testing::plain_delete() {
+        0
+    } else {
+        FILE_DISPOSITION_POSIX_SEMANTICS
+    }
+}
+
+#[cfg(not(feature = "testing"))]
+const fn posix_semantics() -> u32 {
+    FILE_DISPOSITION_POSIX_SEMANTICS
+}
+
 /// Deletes the object behind the handle with POSIX semantics: the name goes when the handle's file
 /// object is cleaned up (the last handle to it closed), whatever else has the object open through
 /// other handles, and the read-only attribute does not stop it. The handle must be
@@ -1009,7 +1064,7 @@ impl Removal {
 fn delete(handle: &Handle) -> Result<(), super::ffi::Error> {
     let information = FILE_DISPOSITION_INFORMATION_EX {
         Flags: FILE_DISPOSITION_DELETE
-            | FILE_DISPOSITION_POSIX_SEMANTICS
+            | posix_semantics()
             | FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE,
     };
     let mut status_block = IO_STATUS_BLOCK::default();

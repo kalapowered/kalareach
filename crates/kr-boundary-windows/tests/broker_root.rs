@@ -667,6 +667,29 @@ fn the_disposition_call_is_checked_on_a_scratch_file_and_leaves_nothing() {
     );
 }
 
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_disposition_check_refuses_a_delete_that_leaves_the_name_while_another_handle_is_open() {
+    let scratch = Scratch::new();
+    let run = run_dir(&scratch);
+    // A delete without POSIX semantics leaves the name until the last handle closes, which is what
+    // a volume that takes the call and does not act on it looks like to the check; only the
+    // check's independent handle keeps the file open when the deleting handle closes.
+    let plain = removal::delete_without_posix_semantics();
+    let refused = check_disposition(&run.dir);
+    drop(plain);
+    println!("the check on a delete that leaves the name: {refused:?}");
+    assert!(
+        refused.is_err(),
+        "the check accepted a delete that left the name"
+    );
+    assert_eq!(
+        std::fs::read_dir(&run.path).unwrap().count(),
+        0,
+        "the independent handle closed, so the delete completed: no scratch file stays"
+    );
+}
+
 /// Watches a directory and everything under it for the changes to what it holds, security changes
 /// among them, from before a case acts until the case asks for what was seen.
 struct Watch {
@@ -1648,17 +1671,37 @@ fn names_in(directory: &Path) -> Vec<String> {
     names
 }
 
+/// What a lock of one kind does to the removal of the file it holds, as a guest showed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    /// The lock owes no break: the delete goes through at once.
+    Removed,
+    /// The open is granted, the delete call waits for the lock's break, and the cancel ends it.
+    DeleteWaitsAndTheCancelEndsIt,
+    /// The open owes the lock a break and is refused, so no delete call is made.
+    OpenRefused,
+}
+
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
-fn a_file_held_by_a_lock_that_is_not_given_up_is_removed_or_in_use_within_the_waits_for_every_kind()
-{
-    for (levels, kind) in [
-        (LOCK_READ, "read"),
-        (LOCK_READ | LOCK_HANDLE, "read and handle"),
-        (LOCK_READ | LOCK_WRITE, "read and write"),
+fn a_file_held_by_a_lock_that_is_not_given_up_waits_at_the_delete_or_is_refused_at_the_open_for_each_kind()
+ {
+    for (levels, kind, outcome) in [
+        (LOCK_READ, "read", Outcome::Removed),
+        (
+            LOCK_READ | LOCK_HANDLE,
+            "read and handle",
+            Outcome::DeleteWaitsAndTheCancelEndsIt,
+        ),
+        (
+            LOCK_READ | LOCK_WRITE,
+            "read and write",
+            Outcome::OpenRefused,
+        ),
         (
             LOCK_READ | LOCK_WRITE | LOCK_HANDLE,
             "read, write and handle",
+            Outcome::OpenRefused,
         ),
     ] {
         let scratch = Scratch::new();
@@ -1674,26 +1717,22 @@ fn a_file_held_by_a_lock_that_is_not_given_up_is_removed_or_in_use_within_the_wa
             "lock of {kind}: break asked for {asked}, cancels {cancels}, {:?}, {:?}",
             done.leftovers, done.spent
         );
-        assert!(
-            done.spent <= AT_MOST,
-            "{kind}: no call of the removal waited for the lock's break: {:?}",
-            done.spent
-        );
-        assert!(
-            cancels <= 1,
-            "{kind}: one delete call at most was cancelled"
-        );
-        match done.leftovers.as_slice() {
-            [] => assert!(!held.exists(), "{kind}: removed means gone"),
-            [one] => {
+        match outcome {
+            Outcome::Removed => {
+                assert!(!asked, "{kind}: nothing was owed a break");
+                assert_eq!(cancels, 0, "{kind}: no call waited");
+                assert!(done.leftovers.is_empty(), "{kind}: {:?}", done.leftovers);
+                assert!(!held.exists(), "{kind}: removed means gone");
+            }
+            Outcome::DeleteWaitsAndTheCancelEndsIt | Outcome::OpenRefused => {
+                assert!(asked, "{kind}: the lock was asked to give up");
                 assert_eq!(
-                    (one.path.as_str(), one.reason.as_str()),
-                    ("tmp\\locked.txt", "in use"),
+                    done.leftovers,
+                    [Leftover {
+                        path: "tmp\\locked.txt".to_owned(),
+                        reason: "in use".to_owned()
+                    }],
                     "{kind}: a lock that is not given up makes the object one in use"
-                );
-                assert!(
-                    asked,
-                    "{kind}: the lock was asked to give up, or nothing held the object"
                 );
                 assert!(
                     done.spent >= LIMITS.wait_each,
@@ -1701,14 +1740,20 @@ fn a_file_held_by_a_lock_that_is_not_given_up_is_removed_or_in_use_within_the_wa
                     done.spent
                 );
                 assert!(held.exists(), "{kind}: the object is as it was");
+                if outcome == Outcome::DeleteWaitsAndTheCancelEndsIt {
+                    assert_eq!(
+                        cancels, 1,
+                        "{kind}: the delete call waited for the break and the one cancel ended it"
+                    );
+                    assert!(
+                        done.spent < LIMITS.wait_each + GRACE / 2,
+                        "{kind}: the cancel ended the call; it did not wait out the grace: {:?}",
+                        done.spent
+                    );
+                } else {
+                    assert_eq!(cancels, 0, "{kind}: the open refused the object");
+                }
             }
-            more => panic!("{kind}: {more:?}"),
-        }
-        if levels == LOCK_READ | LOCK_WRITE | LOCK_HANDLE {
-            // Shown in a guest: the open of an object with a lock of every level owes it a break,
-            // so the open is refused and no delete call is made.
-            assert_eq!(cancels, 0, "{kind}: the open refused the object");
-            assert_eq!(done.leftovers.len(), 1, "{kind}: and it is a leftover");
         }
         drop(lock);
         let (rest, _) = remove_with_the_walks_privileges(&done.root);
@@ -1719,7 +1764,8 @@ fn a_file_held_by_a_lock_that_is_not_given_up_is_removed_or_in_use_within_the_wa
 
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
-fn the_roots_own_delete_under_a_lock_on_the_root_directory_is_removed_or_in_use_within_the_waits() {
+fn the_roots_own_delete_under_a_lock_on_the_root_directory_waits_for_the_break_and_the_cancel_ends_it()
+ {
     let scratch = Scratch::new();
     let (_run, root, _owner) = made_root(&scratch);
     let lock = Lock::take(root.path(), LOCK_READ | LOCK_HANDLE);
@@ -1732,28 +1778,25 @@ fn the_roots_own_delete_under_a_lock_on_the_root_directory_is_removed_or_in_use_
         "lock on the root directory: break asked for {asked}, cancels {cancels}, {:?}, {:?}",
         done.leftovers, done.spent
     );
-    assert!(done.spent <= AT_MOST, "{:?}", done.spent);
-    let removed = done.leftovers.is_empty();
-    match done.leftovers.as_slice() {
-        [] => assert_eq!(done.log, ["removed"]),
-        [one] => {
-            assert_eq!(
-                (one.path.as_str(), one.reason.as_str()),
-                ("", "in use"),
-                "the leftover is the root's"
-            );
-            assert!(asked, "the lock was asked to give up");
-            assert_eq!(cancels, 1, "the one delete call that waited was cancelled");
-            assert!(done.spent >= LIMITS.wait_each, "{:?}", done.spent);
-            assert!(path.exists() && done.log.is_empty());
-        }
-        more => panic!("{more:?}"),
-    }
+    assert!(asked, "the lock was asked to give up");
+    assert_eq!(
+        done.leftovers,
+        [Leftover {
+            path: String::new(),
+            reason: "in use".to_owned()
+        }],
+        "the leftover is the root's"
+    );
+    assert_eq!(cancels, 1, "the one delete call that waited was cancelled");
+    assert!(
+        done.spent >= LIMITS.wait_each && done.spent < LIMITS.wait_each + GRACE / 2,
+        "the call waited for its limit and the cancel ended it, not the grace: {:?}",
+        done.spent
+    );
+    assert!(path.exists() && done.log.is_empty());
     drop(lock);
-    if !removed {
-        let (rest, _) = remove_with_the_walks_privileges(&done.root);
-        assert!(rest.is_empty(), "once the lock is gone: {rest:?}");
-    }
+    let (rest, _) = remove_with_the_walks_privileges(&done.root);
+    assert!(rest.is_empty(), "once the lock is gone: {rest:?}");
     // The name goes when the root's own handle closes: the delete was made through a copy of it,
     // and the two share one file object.
     assert!(common::is_gone(done.root), "the root is gone");
@@ -1939,7 +1982,10 @@ fn a_delete_call_far_over_the_grace_is_charged_whole_against_the_total() {
     // The total is 1.18 seconds, a little under three calls: charged whole, the third call spends
     // it and exactly three of the six files go. If only what is over the 50 were charged, a call
     // would cost 350 and a fourth would be needed; if nothing were charged, all six would go. A
-    // run that makes each call up to 90 milliseconds slower still ends after the third.
+    // charge of only what is over the 50 would also stop after the third call once each call
+    // takes 443 milliseconds or more, so the case bounds the time too: three calls that take
+    // 440 milliseconds spend 1.32 seconds, and a slower run fails the case rather than pass it
+    // for the wrong reason.
     let delay = removal::delay_deletes(&name, Duration::from_millis(400));
     let limits = Limits {
         wait_each: Duration::from_secs(2),
@@ -1953,6 +1999,11 @@ fn a_delete_call_far_over_the_grace_is_charged_whole_against_the_total() {
             path: String::new(),
             reason: "the waits for objects in use are spent".to_owned()
         }]
+    );
+    assert!(
+        done.spent < Duration::from_millis(1320),
+        "the calls ran slower than the case can read: {:?}",
+        done.spent
     );
     assert_eq!(
         6 - names_in(&tmp).len(),
@@ -2008,6 +2059,9 @@ fn two_removals_of_one_root_at_the_same_time_leave_the_work_to_one() {
     std::fs::write(tmp.join("b.txt"), b"x").unwrap();
     let name = root.name().clone();
     let recording = walking::record(name.as_str());
+    // A root of another run, which the claim of the first must not hold.
+    let other_scratch = Scratch::new();
+    let (_other_run, other_root, _other_owner) = made_root(&other_scratch);
     // The first removal waits in its first listing, before it opens or deletes anything, until the
     // second removal has returned. The second starts while the first is inside its work.
     let (reached, reached_wait) = std::sync::mpsc::channel::<()>();
@@ -2039,6 +2093,12 @@ fn two_removals_of_one_root_at_the_same_time_leave_the_work_to_one() {
             .recv_timeout(Duration::from_secs(30))
             .expect("the first removal listed the root");
         let before = (recording.listing_calls(""), recording.opens().len());
+        let (other_left, other_log) = remove_with_the_walks_privileges(&other_root);
+        assert!(
+            other_left.is_empty(),
+            "another root is free: {other_left:?}"
+        );
+        assert_eq!(other_log, ["removed"]);
         let second = scope.spawn(|| run_one(&root)).join().unwrap();
         let after = (recording.listing_calls(""), recording.opens().len());
         go.send(()).unwrap();
@@ -2065,6 +2125,81 @@ fn two_removals_of_one_root_at_the_same_time_leave_the_work_to_one() {
     );
     assert_eq!(first.1, ["removed"]);
     assert!(common::is_gone(root), "the root is gone");
+    assert!(common::is_gone(other_root), "the other root is gone");
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_removal_that_unwinds_in_a_hook_frees_the_root_for_the_next_one() {
+    let scratch = Scratch::new();
+    let (_run, root, _owner) = made_root(&scratch);
+    let tmp = root.tmp();
+    std::fs::write(tmp.join("a.txt"), b"x").unwrap();
+    let name = root.name().clone();
+    let fired = std::sync::atomic::AtomicBool::new(false);
+    // The hook fails once, in the first listing, so the first removal unwinds from inside its work.
+    removal::set(&name, move |event| {
+        if let Event::Listed { directory, .. } = event
+            && directory.is_empty()
+            && !fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            panic!("the hook fails once");
+        }
+    });
+    let unwound = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let guard = privilege::enter().unwrap();
+                let mut rows = Rows::default();
+                remove_root_within(&root, &guard, LIMITS, &mut rows)
+            })
+            .join()
+    });
+    assert!(unwound.is_err(), "the hook's panic ended the first removal");
+    assert_eq!(names_in(&tmp), ["a.txt"], "it removed nothing");
+    let (rest, log) = remove_with_the_walks_privileges(&root);
+    removal::clear(&name);
+    assert!(rest.is_empty(), "the next removal works: {rest:?}");
+    assert_eq!(log, ["removed"]);
+    assert!(common::is_gone(root), "the root is gone");
+}
+
+/// Rows whose `removed` row cannot be written.
+struct NoRemovedRow;
+
+impl RootRows for NoRemovedRow {
+    fn intent(&mut self, _name: &RootName) -> Result<(), RootError> {
+        Ok(())
+    }
+
+    fn made(&mut self, _name: &RootName, _key: &FileKey) -> Result<(), RootError> {
+        Ok(())
+    }
+
+    fn removed(&mut self) -> Result<(), RootError> {
+        Err(RootError::Journal("no room".to_owned()))
+    }
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_removal_that_returns_an_error_frees_the_root_for_the_next_one() {
+    let scratch = Scratch::new();
+    let (_run, root, _owner) = made_root(&scratch);
+    let guard = privilege::enter().unwrap();
+    let failed = remove_root_within(&root, &guard, LIMITS, &mut NoRemovedRow);
+    assert!(matches!(failed, Err(RootError::Journal(_))), "{failed:?}");
+    // The root is gone as far as the removal could take it; what the next removal says is not the
+    // reservation's: it is not turned away.
+    let mut rows = Rows::default();
+    let again = remove_root_within(&root, &guard, LIMITS, &mut rows);
+    drop(guard);
+    if let Ok(leftovers) = &again {
+        assert!(
+            leftovers.iter().all(|l| !l.reason.contains("of this root")),
+            "the root was still reserved: {leftovers:?}"
+        );
+    }
 }
 
 #[test]
