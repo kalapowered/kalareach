@@ -459,7 +459,7 @@ async fn a_draft_create_read_from_the_record_is_held_as_kept() {
 /// Serves `mutation` twice at once, the first copy stopped inside the transfer service, once it
 /// has passed the door's check and before it takes the service's lock, and returns what each copy
 /// was answered with.
-async fn two_copies_stopped_in_the_service(
+pub(super) async fn two_copies_stopped_in_the_service(
     controller: &std::sync::Arc<crate::service::Controller>,
     connection: &super::RemoteConnection,
     mutation: &MutationRequest,

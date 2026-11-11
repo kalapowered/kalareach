@@ -15,12 +15,14 @@ use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, U64, Uuid};
 use kr_protocol::transfer::{
     AgentDraftAddAttachmentParams, AgentDraftAddAttachmentResult, AttachmentContribution,
-    DraftCreateResult, DraftDiscardParams, DraftDiscardResult, InsertionMethod,
+    DraftCreateResult, DraftDiscardParams, DraftDiscardResult, DraftUpdateParams,
+    DraftUpdateResult, InsertionMethod,
 };
 
 use super::a_copy_from_a_services_record::{EVERY_RIGHT, mutation_of, two_copies};
 use super::a_draft_a_device_writes::{
-    a_draft_for, create_params, manual_contribution, result_of, the_owner, write_naming,
+    a_draft_for, create_params, manual_contribution, result_of, the_owner,
+    two_copies_stopped_in_the_service, write_naming,
 };
 use super::write_boundary::paired_connection;
 use crate::service::a_close_a_worker_never_answers as fake;
@@ -454,6 +456,184 @@ async fn a_copy_of_a_discard_that_reaches_the_service_after_the_draft_is_gone_is
     world.serving.abort();
 }
 
+/// KR-REQ-23.41 and KR-REQ-09.09: a copy of a discard that is stopped inside the service, after the
+/// door's check and before the service takes its lock, is answered from the record the other copy
+/// made, and is told as the copy it is. The copy that performed is a fresh answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_discard_copied_inside_the_service_is_answered_from_the_record_and_told_as_a_copy() {
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    let (connection, _) = paired_connection(controller, 59, EVERY_RIGHT);
+    let device = connection.device.principal();
+    let own = a_draft_for(&world, &device, None);
+    let mutation = discard(&world, &connection, 92, own.draft_id);
+
+    let (copied, fresh) =
+        two_copies_stopped_in_the_service(controller, &connection, &mutation).await;
+    for answered in [&copied, &fresh] {
+        let ended: DraftDiscardResult = result_of(answered.frame());
+        assert_eq!(ended.draft_id, own.draft_id);
+    }
+    assert!(
+        copied
+            .asked
+            .as_ref()
+            .is_some_and(super::decision::Asked::is_kept),
+        "the copy that read the record is held as a kept answer"
+    );
+    assert!(
+        fresh.asked.as_ref().is_some_and(|asked| !asked.is_kept()),
+        "the copy that performed is a fresh answer"
+    );
+    world.serving.abort();
+}
+
+/// Serves `action` twice, the first copy stopped before its effect, and between the two copies' ends
+/// serves `then`: the second copy performs the action, `then` follows it, and the first copy goes on
+/// to meet what both did to the draft. Returns the first copy's answer and the second's.
+async fn a_copy_that_meets_a_draft_ended_meanwhile(
+    controller: &std::sync::Arc<crate::service::Controller>,
+    connection: &super::RemoteConnection,
+    action: &MutationRequest,
+    then: &MutationRequest,
+) -> (super::Answered, super::Answered) {
+    let (arrived, go) = controller.before_the_effect.arm();
+    let first = connection.answer_now(ControlFrame::Mutation(Box::new(action.clone())));
+    tokio::pin!(first);
+    tokio::select! {
+        arrived = tokio::time::timeout(std::time::Duration::from_secs(30), arrived) => {
+            arrived
+                .expect("the first copy reaches the place it is stopped at")
+                .expect("the pause is armed");
+        }
+        early = &mut first => panic!("the first copy was answered before its effect: {early:?}"),
+    }
+    let performed = connection
+        .answer_now(ControlFrame::Mutation(Box::new(action.clone())))
+        .await
+        .expect("the second copy is answered");
+    let ended = connection
+        .answer_now(ControlFrame::Mutation(Box::new(then.clone())))
+        .await
+        .expect("the discard is answered");
+    let _: DraftDiscardResult = result_of(ended.frame());
+    go.send(()).expect("the first copy goes on");
+    (first.await.expect("the first copy is answered"), performed)
+}
+
+/// KR-REQ-23.41 and KR-REQ-09.09: a copy of an update, or of a binding, whose draft another copy
+/// changed and a discard then ended while it was on its way is answered from the record the other
+/// copy made, as a copy: the door does not refuse it as a draft it does not know. The control is a
+/// new update of the same gone draft, which is refused as unknown and does nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_copy_of_an_update_or_a_binding_whose_draft_was_ended_meanwhile_is_answered_from_the_record()
+ {
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    let session = world.session_id;
+    let (connection, _) = paired_connection(controller, 60, EVERY_RIGHT);
+    let device = connection.device.principal();
+
+    let updated = a_draft_for(&world, &device, None);
+    let update = write_naming(
+        &world,
+        &connection,
+        Method::DraftUpdate,
+        93,
+        &DraftUpdateParams {
+            draft_id: updated.draft_id,
+            expected_revision: updated.revision,
+            text: "the second words".to_owned(),
+        },
+        None,
+    );
+    // The second copy performs the update; the discard that follows ends the draft before the first
+    // copy, stopped at the door, goes on.
+    let (copied, performed) = a_copy_that_meets_a_draft_ended_meanwhile(
+        controller,
+        &connection,
+        &update,
+        &discard(&world, &connection, 94, updated.draft_id),
+    )
+    .await;
+    let _: DraftUpdateResult = result_of(performed.frame());
+    let _: DraftUpdateResult = result_of(copied.frame());
+    assert!(
+        copied
+            .asked
+            .as_ref()
+            .is_some_and(super::decision::Asked::is_kept),
+        "the update the draft's end followed is told as the copy it is"
+    );
+    let stale = connection
+        .mutate(&write_naming(
+            &world,
+            &connection,
+            Method::DraftUpdate,
+            95,
+            &DraftUpdateParams {
+                draft_id: updated.draft_id,
+                expected_revision: updated.revision,
+                text: "a new action".to_owned(),
+            },
+            None,
+        ))
+        .await;
+    assert_eq!(
+        super::tests::error_of(&stale).code,
+        ErrorCode::InvalidArgument,
+        "a new action for the gone draft is refused as unknown"
+    );
+
+    let bound = a_draft_for(&world, &device, Some(session));
+    let handle = super::tests::a_published_attachment_for(
+        controller,
+        world.environment_id,
+        &device,
+        "meanwhile.bin",
+        Some(session),
+    );
+    let bind = write_naming(
+        &world,
+        &connection,
+        Method::AgentDraftAddAttachment,
+        96,
+        &AgentDraftAddAttachmentParams {
+            draft_id: bound.draft_id,
+            expected_revision: bound.revision,
+            transfer_id: handle.transfer_id,
+            contribution: manual_contribution(&handle),
+        },
+        Some(session),
+    );
+    let (copied, performed) = a_copy_that_meets_a_draft_ended_meanwhile(
+        controller,
+        &connection,
+        &bind,
+        &write_naming(
+            &world,
+            &connection,
+            Method::DraftDiscard,
+            97,
+            &DraftDiscardParams {
+                draft_id: bound.draft_id,
+            },
+            Some(session),
+        ),
+    )
+    .await;
+    let _: AgentDraftAddAttachmentResult = result_of(performed.frame());
+    let _: AgentDraftAddAttachmentResult = result_of(copied.frame());
+    assert!(
+        copied
+            .asked
+            .as_ref()
+            .is_some_and(super::decision::Asked::is_kept),
+        "the binding the draft's end followed is told as the copy it is"
+    );
+    world.serving.abort();
+}
+
 /// KR-REQ-09.09: a first discard is withheld while this host owes a fence it could not raise, as
 /// every write is: it is refused at the ask and the draft stands. The control is the same discard
 /// once the fence is gone, which ends it.
@@ -486,10 +666,10 @@ async fn a_first_discard_is_refused_while_a_fence_is_owed_and_the_draft_stands()
     );
 }
 
-/// KR-REQ-09.09 and 26.16: the record of a performed discard is not given back to a repeat that
-/// reaches the service while this host owes a fence it could not raise: the service withholds it,
-/// whatever the fence is by the time the door asks its own check. The control is the same repeat with
-/// nothing owed, which is given the record.
+/// KR-REQ-09.09 and 26.16: the record of a performed discard is not given back to a repeat while
+/// this host owes a fence it could not raise: the record is withheld and the repeat is told the
+/// fence's refusal. The control is the same repeat with nothing owed, which is given the record, and
+/// again once the fence is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_copy_of_a_performed_discard_is_withheld_while_a_fence_is_owed() {
     use crate::service::the_fence_at_every_effect::{
