@@ -361,12 +361,26 @@ impl DirHandle {
     /// Returns an error when the platform refuses a step. The inner error says why the anchor is
     /// not accepted when it is a volume or an object of the wrong kind.
     pub fn open_anchor(path: &Path) -> Result<std::result::Result<DirHandle, AnchorRefusal>> {
+        DirHandle::open_anchor_with(path, LIST)
+    }
+
+    /// As [`DirHandle::open_anchor`], with the access the caller needs. The access must include a
+    /// data right, such as [`LIST`], so that the held directory is not renamed or removed while it
+    /// is used.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform refuses a step.
+    pub fn open_anchor_with(
+        path: &Path,
+        access: u32,
+    ) -> Result<std::result::Result<DirHandle, AnchorRefusal>> {
         let wide = wide_path(path);
         // SAFETY: the path is NUL-terminated; the call keeps nothing of it.
         let raw = unsafe {
             CreateFileW(
                 wide.as_ptr(),
-                LIST,
+                access,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 null(),
                 OPEN_EXISTING,
