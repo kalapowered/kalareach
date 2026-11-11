@@ -1129,8 +1129,47 @@ fn a_pipe_that_a_writer_outside_the_job_holds_open_after_a_proved_end_is_an_unce
         "{held:?}"
     );
     assert!(
+        matches!(&held, LaunchError::EndUncertain(text) if text.contains("asked for by a case")),
+        "the failure of the case's own is the one that is said: {held:?}"
+    );
+    assert!(
         took < Duration::from_millis(4_500),
         "the readers of a failed launch stop at the deadline: {took:?}"
+    );
+
+    // A writer on the error pipe alone: the output pipe ends, the error pipe does not, and the
+    // uncertain end says which, after a normal end and after a failed launch.
+    testing::hold_second_pipe_writer();
+    let begun = Instant::now();
+    let held = run_captured(
+        proof_run(&fixture, "report"),
+        Instant::now() + Duration::from_secs(4),
+    )
+    .expect_err("the error pipe did not end");
+    let took = begun.elapsed();
+    testing::release_held_pipe_writers();
+    assert!(
+        uncertain(
+            &held,
+            "standard output ended true, standard error ended false"
+        ),
+        "{held:?}"
+    );
+    assert!(took < Duration::from_millis(4_500), "{took:?}");
+    testing::hold_second_pipe_writer();
+    testing::fail_next_launch_after_creation();
+    let held = run_captured(
+        proof_run(&fixture, "sleep"),
+        Instant::now() + Duration::from_secs(4),
+    )
+    .expect_err("the launch failed");
+    testing::release_held_pipe_writers();
+    assert!(
+        uncertain(
+            &held,
+            "standard output ended true, standard error ended false"
+        ) && uncertain(&held, "asked for by a case"),
+        "{held:?}"
     );
 
     // The control: the same failure with no writer outside is the platform's error, as it was.

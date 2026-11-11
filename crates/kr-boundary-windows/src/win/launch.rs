@@ -318,7 +318,8 @@ pub mod testing {
 
     static SKIP_NEXT_TERMINATION: AtomicBool = AtomicBool::new(false);
     static FAIL_NEXT_LAUNCH_AFTER_CREATION: AtomicBool = AtomicBool::new(false);
-    static HOLD_NEXT_PIPE_WRITER: AtomicBool = AtomicBool::new(false);
+    /// How many pipes are made before the one that keeps a writer, when a case asked for one.
+    static HOLD_PIPE_AFTER: Mutex<Option<usize>> = Mutex::new(None);
     static FAIL_NEXT_EXIT_CODE_READ: AtomicBool = AtomicBool::new(false);
     static HELD_WRITERS: Mutex<Vec<Handle>> = Mutex::new(Vec::new());
 
@@ -346,11 +347,35 @@ pub mod testing {
     /// held until [`release_held_pipe_writers`], as a process that is not in the job would hold it.
     /// The pipe then does not reach its end when the job's processes have gone.
     pub fn hold_next_pipe_writer() {
-        HOLD_NEXT_PIPE_WRITER.store(true, Ordering::SeqCst);
+        *HOLD_PIPE_AFTER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(0);
+    }
+
+    /// As [`hold_next_pipe_writer`], for the pipe made after the next one: a capture makes its
+    /// standard output pipe first and its standard error pipe second, so this holds the writer of
+    /// the error pipe alone.
+    pub fn hold_second_pipe_writer() {
+        *HOLD_PIPE_AFTER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(1);
     }
 
     pub(super) fn take_hold() -> bool {
-        HOLD_NEXT_PIPE_WRITER.swap(false, Ordering::SeqCst)
+        let mut after = HOLD_PIPE_AFTER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *after {
+            Some(0) => {
+                *after = None;
+                true
+            }
+            Some(left) => {
+                *after = Some(left - 1);
+                false
+            }
+            None => false,
+        }
     }
 
     pub(super) fn keep(writer: Handle) {
