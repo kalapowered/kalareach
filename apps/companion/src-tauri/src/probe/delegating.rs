@@ -491,9 +491,6 @@ impl<R: Runtime> Play<'_, R> {
         })
     }
 
-    /// Waits until native code holds the person's mute and capture no longer shows as capturing. What
-    /// capture reads then is the display's own word (muted by the person, whether or not the
-    /// recorder stopped with the mute); the mute is read as a fact of its own. Returns the word.
     /// Waits until the call has been told the recorder stopped more times than `before`.
     async fn recorder_has_stopped_since(&self, before: u64) -> bool {
         let driver = self.driver;
@@ -504,6 +501,9 @@ impl<R: Runtime> Play<'_, R> {
         .is_some()
     }
 
+    /// Waits until native code holds the person's mute and capture no longer shows as capturing. What
+    /// capture reads then is the display's own word (muted by the person, whether or not the
+    /// recorder stopped with the mute); the mute is read as a fact of its own. Returns the word.
     async fn mute_is_held(&self) -> Option<String> {
         let (app, platform) = (self.app, self.platform);
         until(SIGN_WITHIN, || async move {

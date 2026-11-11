@@ -172,8 +172,9 @@ plainly, with the statement that **unheard speech never authorises an action** (
 - `route_changing`: Switching between speaker, receiver, or Bluetooth.
 - `suspended_by_system`: The OS suspended capture.
 - `unavailable`: No microphone hardware or permission is available, the recorder has not
-  started or has failed (while the person's mute holds, `muted_by_person` is said instead), or (on Android) the system has not reported the call's own recording, so
-  the call cannot tell its own recording from another application's.
+  started or has failed, or (on Android) the system has not reported the call's own recording, so
+  the call cannot tell its own recording from another application's. On Android, while the
+  person's mute holds, `muted_by_person` is said instead of the last two.
 - `idle`: No call has been permitted, the call has ended, or its deadline has passed.
 
 On the phones, what a call displays and whether its microphone carries speech come from the same
