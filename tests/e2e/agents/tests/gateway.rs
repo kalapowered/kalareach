@@ -100,7 +100,7 @@ use kr_e2e_agents::build::{self, Account, Build, InstallSwitch, Probe};
 use kr_e2e_agents::held::{
     Absent, Audit, CONFIG_DIRECTORY, HeldKeys, ISOLATION_UNPROVEN, MetaGuard, Recorded, RunScan,
     Stop, absent_paths, audit_turns, conversations_root, grouped_output, kept_panic_text,
-    panic_text, person_home, turns_recorded,
+    other_agent_processes, other_agents_refusal, panic_text, person_home, turns_recorded,
 };
 use kr_e2e_agents::outcome::Outcome;
 use kr_e2e_agents::stage::{Installation, closed_port, session_variables};
@@ -200,7 +200,8 @@ fn mark() -> String {
 }
 
 /// A question whose answer, a number of at least 1000, is in none of `avoid`, the texts a case
-/// types or its screen shows, and not in the question.
+/// types or its screen shows, and not in the question, in the plain form or the one with a
+/// thousands separator.
 fn fresh_question(avoid: &[&str]) -> (String, String) {
     loop {
         let bytes = *kr_ipc::new_uuid().as_bytes();
@@ -208,7 +209,8 @@ fn fresh_question(avoid: &[&str]) -> (String, String) {
         let second = 500 + u64::from(bytes[2]) + u64::from(bytes[3]);
         let sum = (first + second).to_string();
         let question = format!("What is {first} plus {second}? Reply with only the number.");
-        if !question.contains(&sum) && avoid.iter().all(|text| !text.contains(&sum)) {
+        let holds = |text: &str| text.contains(&sum) || text.contains(&with_thousands(&sum));
+        if !holds(&question) && avoid.iter().all(|text| !holds(text)) {
             return (question, sum);
         }
     }
@@ -239,6 +241,15 @@ enum Slash {
 
 /// The commands the thread case sends, in the order it sends them.
 const THREAD_CASE_COMMANDS: [Slash; 4] = [Slash::Shown, Slash::Fork, Slash::New, Slash::Quit];
+
+/// The name of the file a typed agent command runs: `codex` for `codex`, and for a command typed
+/// with a path the file name at its end.
+fn executable_name(command: &str) -> String {
+    Path::new(command).file_name().map_or_else(
+        || command.to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
 
 /// The agent a run is given.
 enum Route {
@@ -288,6 +299,15 @@ impl Route {
         // another `HOME` would guard a tree that is not theirs and pass.
         let home =
             person_home(std::env::var_os("HOME").as_deref()).unwrap_or_else(|why| panic!("{why}"));
+        // The guard over the person's directory compares the whole of it at the end, and cannot
+        // tell a write of another agent process of theirs from the run's: none runs at the start.
+        let others = other_agent_processes(&executable_name(&build.command), None)
+            .unwrap_or_else(|why| panic!("{why}"));
+        assert!(
+            others.is_empty(),
+            "{}",
+            other_agents_refusal(&others, "before the run starts")
+        );
         let held = HeldKeys::read(&format!("gateway case {case}"), &account);
         let ledger = Ledger::from_environment(&account.budget, account.turns);
         let person = MetaGuard::take(&home, &PERSON_TREES);
@@ -530,8 +550,17 @@ impl Real {
         )
     }
 
-    /// Charges one turn to the entry's budget before a prompt the model answers is sent.
-    fn charge(&self, case: &str, what: &str) {
+    /// Charges one turn to the entry's budget before a prompt the model answers is sent, once no
+    /// other process of this user runs the agent's executable outside `run`: one that started
+    /// since the run began stops the case here, with no turn charged or spent.
+    fn charge(&self, run: &Run, case: &str, what: &str) {
+        let others = other_agent_processes(&executable_name(&self.build.command), Some(run.root()))
+            .unwrap_or_else(|why| panic!("no turn is charged: {why}"));
+        assert!(
+            others.is_empty(),
+            "{}",
+            other_agents_refusal(&others, "right before the charge, so no turn was charged")
+        );
         let _ = self
             .ledger
             .charge(case, what)
@@ -1149,11 +1178,13 @@ impl Person {
         self.window.type_text(b"\r");
     }
 
-    /// Types the slash command `command` and waits until a row that the screen did not show before
-    /// it was typed, and that is a row of the agent's own list of commands, names it. Returns the
-    /// rows the screen showed before, which the caller compares the screen with once the composer
-    /// is cleared. A row that was on the screen already (a history row, a help screen, the tip a
-    /// terminal prints at its start) is not the list, and neither is the composer's own row.
+    /// Types the slash command `command` and waits until a row of the agent's own list of commands
+    /// names it: a row below the composer's own row ([`list_region`]) that the screen did not show
+    /// before the command was typed. Returns the rows the screen showed before, which the caller
+    /// compares the screen with once the composer is cleared. A row that was on the screen already
+    /// (a history row, a help screen, the tip a terminal prints at its start), a row above the
+    /// composer, whatever it says or becomes when the screen is drawn again, and the composer's own
+    /// row are not the list.
     ///
     /// # Panics
     ///
@@ -1165,7 +1196,7 @@ impl Person {
         let started = Instant::now();
         loop {
             let rows = self.window.screen();
-            if new_rows(&before, &rows)
+            if list_region(&before, &rows, command)
                 .iter()
                 .any(|row| lists_command(row, command))
             {
@@ -1173,7 +1204,9 @@ impl Person {
             }
             assert!(
                 started.elapsed() < LIVENESS,
-                "the agent's own list of commands does not name {command:?} in a row that was not                  on the screen before it was typed, after {LIVENESS:?}, so it was not sent; the                  screen is:\n{}",
+                "the agent's own list of commands does not name {command:?} in a row below the \
+                 composer's own that was not on the screen before it was typed, after \
+                 {LIVENESS:?}, so it was not sent; the screen is:\n{}",
                 rows.join("\n")
             );
             std::thread::sleep(Duration::from_millis(100));
@@ -1220,30 +1253,33 @@ impl Person {
         }
     }
 
-    /// Waits until a row of the screen shows `sum` as a number of its own ([`shows_sum`]).
-    fn sees_the_sum(&self, sum: &str, why: &str) -> Vec<String> {
+    /// Waits until a row that the screen did not show in `before`, the rows it showed when the
+    /// prompt was sent, shows `sum` as a number of its own ([`shows_sum`]): the answer is output
+    /// drawn after the prompt, and not text that was on the screen already.
+    fn sees_the_sum(&self, sum: &str, before: &[String], why: &str) -> Vec<String> {
         let started = Instant::now();
         loop {
             let rows = self.window.screen();
-            if rows.iter().any(|row| shows_sum(row, sum)) {
+            if answered_since(before, &rows, sum) {
                 return rows;
             }
             assert!(
                 started.elapsed() < LIVENESS,
-                "{why}: no row of the screen shows {sum} as a number of its own after {LIVENESS:?}; \
-                 the screen is:\n{}",
+                "{why}: no row drawn since the prompt shows {sum} as a number of its own after \
+                 {LIVENESS:?}; the screen is:\n{}",
                 rows.join("\n")
             );
             std::thread::sleep(Duration::from_millis(100));
         }
     }
 
-    /// A question whose answer, a number of at least 1000, is not on the screen now and is in none
-    /// of `avoid`, so that the answer's appearing is the agent's.
+    /// A question whose answer, a number of at least 1000, is not on the screen now (by the matcher
+    /// the answer is checked with) and is in none of `avoid`, so that the answer's appearing is the
+    /// agent's.
     fn asks(&self, avoid: &[&str]) -> (String, String) {
         loop {
             let (question, sum) = fresh_question(avoid);
-            if !self.window.screen().iter().any(|row| row.contains(&sum)) {
+            if !on_screen(&self.window.screen(), &sum) {
                 return (question, sum);
             }
         }
@@ -1300,22 +1336,66 @@ fn lists_command(row: &str, command: &str) -> bool {
         .is_some_and(|rest| rest.starts_with(char::is_whitespace) && !rest.trim().is_empty())
 }
 
-/// The rows of `after` that `before` did not show: every row of `after` that is not matched by a row
-/// of `before`, each row of `before` matching one. A row shown twice where it was shown once is new
-/// once.
-fn new_rows<'a>(before: &[String], after: &'a [String]) -> Vec<&'a str> {
+/// The rows of `after`, each with its place on the screen, that `before` did not show: every row of
+/// `after` that is not matched by a row of `before`, each row of `before` matching one. A row shown
+/// twice where it was shown once is new once.
+fn new_row_places<'a>(before: &[String], after: &'a [String]) -> Vec<(usize, &'a str)> {
     let mut shown: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for row in before {
         *shown.entry(row.trim()).or_default() += 1;
     }
     let mut fresh = Vec::new();
-    for row in after {
+    for (place, row) in after.iter().enumerate() {
         match shown.get_mut(row.trim()) {
             Some(count) if *count > 0 => *count -= 1,
-            _ => fresh.push(row.as_str()),
+            _ => fresh.push((place, row.as_str())),
         }
     }
     fresh
+}
+
+/// The rows of `after` that `before` did not show ([`new_row_places`]).
+fn new_rows<'a>(before: &[String], after: &'a [String]) -> Vec<&'a str> {
+    new_row_places(before, after)
+        .into_iter()
+        .map(|(_, row)| row)
+        .collect()
+}
+
+/// Whether `row` is the composer's own row holding the typed `command`: the command with
+/// something of the composer's before it, its mark, once the frame and the spaces beside the row
+/// are taken off. A row of the list begins with the command.
+fn is_composer_row(row: &str, command: &str) -> bool {
+    let bare = |text: &str| {
+        text.trim_matches(|character: char| {
+            character.is_whitespace() || matches!(character, '│' | '┃' | '║')
+        })
+        .to_owned()
+    };
+    let row = bare(row);
+    row.find(command)
+        .is_some_and(|at| !bare(&row[..at]).is_empty())
+}
+
+/// The rows that make up the agent's list of commands after `command` was typed: the rows the
+/// screen did not show before, below the new row that is the composer's own holding the typed
+/// command. The agent draws its list under the composer, so a row above it, a history row that is
+/// drawn again with other words, and a help row that appears elsewhere are not the list; where no
+/// new row is the composer's own, there is no region.
+fn list_region<'a>(before: &[String], after: &'a [String], command: &str) -> Vec<&'a str> {
+    let fresh = new_row_places(before, after);
+    let Some(composer) = fresh
+        .iter()
+        .find(|(_, row)| is_composer_row(row, command))
+        .map(|(place, _)| *place)
+    else {
+        return Vec::new();
+    };
+    fresh
+        .into_iter()
+        .filter(|(place, _)| *place > composer)
+        .map(|(_, row)| row)
+        .collect()
 }
 
 /// `digits` with a comma before each group of three from the right: `1557` as `1,557`.
@@ -1357,6 +1437,20 @@ fn whole_word(row: &str, form: &str) -> bool {
 /// digits alone or with a comma as the thousands separator.
 fn shows_sum(row: &str, sum: &str) -> bool {
     whole_word(row, sum) || whole_word(row, &with_thousands(sum))
+}
+
+/// Whether a row of `rows` shows `sum` ([`shows_sum`]): what a question's answer must not already
+/// be on the screen as, by the matcher the answer is checked with.
+fn on_screen(rows: &[String], sum: &str) -> bool {
+    rows.iter().any(|row| shows_sum(row, sum))
+}
+
+/// Whether `after` has a row that shows `sum` ([`shows_sum`]) and that `before`, the screen when
+/// the prompt was sent, did not show: the answer is output drawn since the prompt.
+fn answered_since(before: &[String], after: &[String], sum: &str) -> bool {
+    new_rows(before, after)
+        .iter()
+        .any(|row| shows_sum(row, sum))
 }
 
 /// A named pipe in the run's own directory: a command that writes to it waits there until the case
@@ -1974,7 +2068,7 @@ fn gateway_a_device_answers_an_approval_and_the_terminal_closes_its_prompt() {
                          agent's dialog",
                         command.len()
                     );
-                    real.charge("gateway-1", "an approval-gated command");
+                    real.charge(&ctx.run, "gateway-1", "an approval-gated command");
                     session.person.composes(
                         &format!(
                             "({mark}) Use your shell tool to run exactly this command and nothing \
@@ -2109,7 +2203,8 @@ fn gateway_the_terminal_shows_a_turn_the_host_started() {
                     let marked = mark();
                     let root = ctx.run.root().display().to_string();
                     let (question, sum) = session.person.asks(&[&marked, &root]);
-                    real.charge("gateway-2", "a prompt from a device");
+                    real.charge(&ctx.run, "gateway-2", "a prompt from a device");
+                    let before = session.person.window.screen();
                     let started = ctx
                         .prompts(
                             &session.remote,
@@ -2120,9 +2215,11 @@ fn gateway_the_terminal_shows_a_turn_the_host_started() {
                         )
                         .expect("the device's prompt is carried");
                     assert!(started.turn_id.0.is_some(), "the host started a turn");
-                    let _ = session
-                        .person
-                        .sees_the_sum(&sum, "the terminal shows the turn the host started");
+                    let _ = session.person.sees_the_sum(
+                        &sum,
+                        &before,
+                        "the terminal shows the turn the host started",
+                    );
                     serde_json::json!({ "turn_started_by_the_host": true })
                 }
             }
@@ -2181,11 +2278,14 @@ fn gateway_the_binding_changes_its_thread_only_where_the_terminal_starts_resumes
                     let marked = mark();
                     let root = ctx.run.root().display().to_string();
                     let (question, sum) = session.person.asks(&[&marked, &root]);
-                    real.charge("gateway-3", "a turn in the first thread");
+                    real.charge(&ctx.run, "gateway-3", "a turn in the first thread");
+                    let rows_before = session.person.window.screen();
                     session
                         .person
                         .composes(&format!("({marked}) {question}"), &marked);
-                    let _ = session.person.sees_the_sum(&sum, "the agent answers");
+                    let _ = session
+                        .person
+                        .sees_the_sum(&sum, &rows_before, "the agent answers");
                     let first = session.binding_until(instance, "the turn ends", |binding| {
                         binding.thread_id.0.is_some()
                             && binding.turn_id.0.is_none()
@@ -2330,11 +2430,14 @@ fn gateway_a_whole_session_names_no_method_the_table_does_not_list() {
                     let marked = mark();
                     let root = ctx.run.root().display().to_string();
                     let (question, sum) = session.person.asks(&[&marked, &root]);
-                    real.charge("gateway-4", "a turn");
+                    real.charge(&ctx.run, "gateway-4", "a turn");
+                    let rows_before = session.person.window.screen();
                     session
                         .person
                         .composes(&format!("({marked}) {question}"), &marked);
-                    let _ = session.person.sees_the_sum(&sum, "the agent answers");
+                    let _ = session
+                        .person
+                        .sees_the_sum(&sum, &rows_before, "the agent answers");
                     let _ =
                         session.binding_unsuspended_until(instance, "the turn ends", |binding| {
                             binding.thread_id.0.is_some() && binding.turn_id.0.is_none()
@@ -2413,7 +2516,7 @@ fn gateway_a_device_prompt_over_a_running_turn_is_refused_and_reaches_nothing() 
                     let mark = mark();
                     let log = ctx.run.work().join("a");
                     let command = format!("echo {mark} >> {}", log.display());
-                    real.charge("gateway-5", "a turn that waits on an approval");
+                    real.charge(&ctx.run, "gateway-5", "a turn that waits on an approval");
                     session.person.composes(
                         &format!(
                             "({mark}) Use your shell tool to run exactly this command and nothing \
@@ -2437,7 +2540,7 @@ fn gateway_a_device_prompt_over_a_running_turn_is_refused_and_reaches_nothing() 
                     let held = session.interpreted_approval();
                     // Charged before it is sent: where the host did not refuse it, the agent would
                     // take it as a prompt of its own.
-                    real.charge("gateway-5", "a device prompt over a running turn");
+                    real.charge(&ctx.run, "gateway-5", "a device prompt over a running turn");
                     let device = format!("{} the device's own prompt", crate::mark());
                     let refused = ctx
                         .prompts(
@@ -2572,6 +2675,91 @@ fn a_row_the_screen_showed_before_is_not_the_agents_list_of_commands() {
         Vec::<&str>::new(),
         "nothing is new on a screen that did not change"
     );
+}
+
+/// The agent's list is the new rows under the composer's own row: a history row that is drawn
+/// again with other words above the composer, or a screen with no composer row that holds the
+/// typed command, is not a list.
+#[test]
+fn the_list_of_commands_is_the_new_rows_below_the_composers_row() {
+    let rows = |lines: &[&str]| {
+        lines
+            .iter()
+            .map(|line| (*line).to_owned())
+            .collect::<Vec<_>>()
+    };
+    let before = rows(&["history", "  /fork      fork the current chat", "", "› "]);
+    // The typing draws the composer's row, and the list under it.
+    let drawn = rows(&[
+        "history",
+        "  /fork      fork the current chat",
+        "",
+        "› /fork",
+        "  /fork      copy this conversation",
+        "  /forks     another command",
+    ]);
+    assert_eq!(
+        list_region(&before, &drawn, "/fork"),
+        vec![
+            "  /fork      copy this conversation",
+            "  /forks     another command"
+        ]
+    );
+    // A history row drawn again with other words, above the composer, is not the list.
+    let redrawn = rows(&[
+        "history",
+        "  /fork      fork the chat, as edited",
+        "",
+        "› /fork",
+    ]);
+    assert!(
+        list_region(&before, &redrawn, "/fork")
+            .iter()
+            .all(|row| !lists_command(row, "/fork"))
+    );
+    // A help row that is new but is drawn above the composer's row is not the list either.
+    let help_above = rows(&["  /fork      shown by a help screen", "history", "› /fork"]);
+    assert!(list_region(&before, &help_above, "/fork").is_empty());
+    // No new row holds the typed command with a mark before it: nothing shows that it was typed
+    // at the composer, so there is no region.
+    let no_composer = rows(&["history", "  /fork      a new description", "", "› "]);
+    assert!(list_region(&before, &no_composer, "/fork").is_empty());
+}
+
+/// The question's choice and the answer's check use one matcher, and the answer must be drawn after
+/// the prompt: a screen that already holds the sum in its comma form, or in a row such as a count of
+/// tokens, cannot pass for the answer.
+#[test]
+fn the_answer_is_checked_with_the_matcher_the_question_was_chosen_by_and_only_in_new_rows() {
+    let rows = |lines: &[&str]| {
+        lines
+            .iter()
+            .map(|line| (*line).to_owned())
+            .collect::<Vec<_>>()
+    };
+    // What a question's sum must not be on the screen as: the plain digits or the comma form, as a
+    // number of its own.
+    assert!(on_screen(&rows(&["total 1,557 tokens"]), "1557"));
+    assert!(on_screen(&rows(&["x", "= 1557."]), "1557"));
+    assert!(!on_screen(&rows(&["thread 019a2b3c-1557-7abc"]), "1557"));
+    // The answer is in a row that the screen did not show when the prompt was sent.
+    let before = rows(&["tokens used: 1,557", "› "]);
+    let typed = rows(&["tokens used: 1,557", "› (kr0123) What is 700 plus 857?"]);
+    assert!(
+        !answered_since(&before, &typed, "1557"),
+        "a count shown before the prompt is not the answer"
+    );
+    let answered = rows(&[
+        "tokens used: 1,557",
+        "› (kr0123) What is 700 plus 857?",
+        "1557",
+    ]);
+    assert!(answered_since(&before, &answered, "1557"));
+    // A row drawn again, with the sum in it where it was not, is new.
+    let redrawn = rows(&["tokens used: 2,100", "› "]);
+    assert!(!answered_since(&before, &redrawn, "1557"));
+    let again = rows(&["tokens used: 1,557 of 9,000", "› "]);
+    assert!(answered_since(&before, &again, "1557"));
 }
 
 /// The sum is a number of its own: the plain digits and the form with a thousands separator pass,
