@@ -154,6 +154,16 @@ frames that connection at the attachment bound. The handshake, the peer-credenti
 authentication and the action windows are the control connection's, unchanged. The frame bound is
 the only difference, and it is why the endpoint exists at all.
 
+A host takes a paired device's chunks on that stream for the device's own uploads only, keeps one
+live stream for each transfer, and answers each chunk on the stream it came on. A header the host
+refuses (an environment that is not its own, an upload the device does not hold or that is no
+longer receiving, a device that may not send to the upload, a connection whose authority has gone)
+resets the stream, and the device sees a reset and no answer. A frame the stream may not carry is
+answered with its refusal, and the stream ends after the answer. A newer stream for a transfer
+replaces the older, which is reset, so a device sends a transfer's chunks on one stream at a time.
+A device holds at most four connections to a host, and a fifth closes its oldest. The host's
+document gives the order of the checks.
+
 | Endpoint | Unix | Windows | Carries |
 | --- | --- | --- | --- |
 | clients | `<runtime>/<prefix>/c.sock` | `kalareach-<uid>-<prefix>-c` | every method whose frames fit 1 MiB |
