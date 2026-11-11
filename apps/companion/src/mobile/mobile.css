@@ -22,6 +22,8 @@
 
 :root[data-surface='ios'],
 :root[data-surface='android'] {
+  /* How far a link in a message is pressable beyond its words, on each side of the line. */
+  --reach-inline: calc(var(--target) / 4);
   --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --safe-left: env(safe-area-inset-left, 0px);
@@ -607,6 +609,13 @@
   overflow-y: auto;
   overscroll-behavior-y: contain;
   min-block-size: 0;
+  /*
+   * A link's press area reaches past its words, so the area the pane scrolls holds that reach: it
+   * does not scroll sideways for a link as wide as the line, and does not cut the area of a link at
+   * the line's edge. The margin takes the room back, so the messages stay where they were.
+   */
+  padding-inline: var(--reach-inline);
+  margin-inline: calc(-1 * var(--reach-inline));
 }
 
 /*
@@ -687,12 +696,58 @@
   border-block-end: 0;
 }
 
+/* The last line of the conversation can be a link, whose press area reaches below its words. */
+@supports (height: 1lh) {
+  .m-node:last-child {
+    padding-block-end: max(var(--gap-2), calc(var(--target) / 2 - 0.5lh));
+  }
+}
+
 .m-node-role {
   font-size: 0.6875rem;
   font-weight: 700;
   letter-spacing: 0.04em;
   text-transform: uppercase;
   color: var(--faint);
+}
+
+/*
+ * A link inside a message is as tall as its line, which is less than a finger needs. The button's
+ * box grows by a reach on each side and its margin takes the same amount back, so the line, the
+ * paragraph and the words around the link stay where they were, while the box that a finger, TalkBack
+ * and VoiceOver find is `--target` in both directions. The block reach is what the line lacks; the
+ * inline reach is a quarter of `--target` on each side, and a link of a character or two is widened
+ * to `--target`.
+ *
+ * Where two links are closer than the reach, the words of each stay that link's own: they are a
+ * layer above every button's area. A press on a link's words is that link's whichever neighbour's
+ * area lies under it, and the area nobody's words are on goes to the link it belongs to.
+ */
+.m-node .md-link {
+  --reach-block: 16px;
+  padding: var(--reach-block) var(--reach-inline);
+  margin: calc(-1 * var(--reach-block)) calc(-1 * var(--reach-inline));
+  min-inline-size: var(--target);
+}
+
+@supports (height: 1lh) {
+  .m-node .md-link {
+    --reach-block: max(0px, calc((var(--target) - 1lh) / 2));
+  }
+}
+
+.m-node .md-link-label {
+  position: relative;
+}
+
+/* The ring follows the words, not the larger box a finger has. */
+.m-node .md-link:focus-visible {
+  outline: none;
+}
+
+.m-node .md-link:focus-visible .md-link-label {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
 }
 
 .m-terminal {

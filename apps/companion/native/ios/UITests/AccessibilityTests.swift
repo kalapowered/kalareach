@@ -47,11 +47,6 @@ final class AccessibilityTests: HarnessTestCase {
         Thread.sleep(forTimeInterval: 1.5)
     }
 
-    /// A link that sits inside a sentence of the conversation is text, and a size the person sets
-    /// for the text is the size of the link: it is not counted as a control that needs its own
-    /// forty-four points. Each such link is named here, and is said when it is skipped.
-    private static let linksInsideText: Set<String> = ["the reconnect notes"]
-
     /// Whether an element belongs to the product and not to the harness or the debug build.
     private func isThePage(_ element: XCUIElement?) -> Bool {
         guard let element else { return true }
@@ -90,10 +85,6 @@ final class AccessibilityTests: HarnessTestCase {
                 // A one-point button is an input the page hides behind its own label, which a
                 // finger cannot reach: the label beside it is the control, and is measured.
                 guard frame.width > 4, frame.height > 4 else { continue }
-                if Self.linksInsideText.contains(control.label) {
-                    say("A11Y \(screen.rawValue): \(control.label) is a link inside a sentence, \(Int(frame.width)) by \(Int(frame.height)), and is not counted")
-                    continue
-                }
                 if frame.width < 44 || frame.height < 44 {
                     say("A11Y \(screen.rawValue): \(control.label) is \(Int(frame.width)) by \(Int(frame.height))")
                     XCTFail("\(control.label) on \(screen.rawValue) is \(Int(frame.width)) by \(Int(frame.height)) points")
