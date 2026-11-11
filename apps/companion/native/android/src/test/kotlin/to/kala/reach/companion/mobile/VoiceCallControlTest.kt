@@ -434,7 +434,9 @@ class VoiceCallControlTest {
      * KR-REQ-13.24: a call's audio is started, held and ended by the native control alone, with no
      * page in the case: the microphone carries speech once the service and the recorder say so,
      * and the control's own timer ends the call at its deadline, with the microphone, focus and
-     * service all given back.
+     * service all given back. Not shown here: the platform's recorder, focus and foreground
+     * service, which are replaced by a record of what was asked of them; the device capture proof
+     * runs them.
      *
      * KR-REQ-15.34: the call's end is scheduled at the deadline itself, and ends everything.
      */

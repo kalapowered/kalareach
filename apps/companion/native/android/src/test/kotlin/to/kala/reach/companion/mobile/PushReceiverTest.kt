@@ -4,7 +4,6 @@ import java.io.File
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeFalse
@@ -354,7 +353,7 @@ class PushReceiverTest {
     /**
      * The Rust half's decision for this case, made from the record it is given and from nothing
      * else: with no record, a record that is no longer pending, or a challenge for another
-     * registration, it refuses; and only the device's own key signs.
+     * registration, it refuses; and only the device's own whole key signs.
      */
     private class RecordDecidingCrypto : ChallengeCrypto {
         override fun classify(input: String): String {
@@ -372,7 +371,7 @@ class PushReceiverTest {
         }
 
         override fun sign(input: String, seed: ByteArray): String =
-            if (seed.all { it == 5.toByte() }) {
+            if (seed.size == 32 && seed.all { it == 5.toByte() }) {
                 """{"ok":true,"url":"https://reach.kala.to/api/push/installation/register","body":"{}"}"""
             } else {
                 """{"ok":false,"reason":"key"}"""
@@ -390,7 +389,9 @@ class PushReceiverTest {
      * challenge from the stored record and the secure store alone, and the application's next
      * start reads that the answer was taken. Every process builds its record, its secure store
      * and its answerer from the files again, as the product's stores do; no page exists in any of
-     * them. Not shown here: the scheduler itself, which the instrumented cases run on a device.
+     * them. Stood in for here, and run on a device by the instrumented cases only: the service's
+     * hand-off to the scheduler, the scheduler's own dispatch, the Keystore key (a software key
+     * that outlives every process) and the Rust half's decision.
      */
     @Test
     fun aChallengeAnswerTheSystemEndedMidPostIsFinishedAfterTheRestartFromTheStoredStateAlone() {
@@ -418,14 +419,17 @@ class PushReceiverTest {
         // The receiver's process: the answer is signed, the scheduler is handed it, and the process
         // is ended before the post comes back.
         var handedToTheScheduler: Map<String, String>? = null
-        var ended: ProcessEnded? = null
+        var postStarted = false
         try {
-            answererOfANewProcess({ _, _ -> throw ProcessEnded() }) { handedToTheScheduler = message }
+            answererOfANewProcess({ _, _ ->
+                postStarted = true
+                throw ProcessEnded()
+            }) { handedToTheScheduler = message }
                 .answer(message)
         } catch (failure: ProcessEnded) {
-            ended = failure
+            // The process is gone: nothing after the post runs.
         }
-        assertNotNull("the process was ended in the middle of the post", ended)
+        assertTrue("the process was ended in the middle of the post", postStarted)
         assertEquals("the scheduler was handed the answer before the post", message, handedToTheScheduler)
         assertEquals("nothing says the registration was answered", "pending", stateOnDisk(noBackup))
 
@@ -440,7 +444,7 @@ class PushReceiverTest {
         assertEquals("answered", stateOnDisk(noBackup))
 
         // The application's next start reads what became of the registration, and the key it signed
-        // with is still in the store: only the copy the answer used was cleared.
+        // with is still in the store for a later process.
         assertEquals("answered", stateOf(PushStores.pending(noBackup)))
         assertEquals(
             authorisation.toList(),
