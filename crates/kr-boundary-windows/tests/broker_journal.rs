@@ -656,6 +656,104 @@ fn a_verification_is_refused_while_a_granted_key_has_neither_its_release_nor_a_t
     assert!(refused_after(&rows, &verified(0)));
 }
 
+#[test]
+fn a_grant_after_a_release_of_the_same_key_needs_its_own_release_and_is_refused_while_a_release_is_pending()
+ {
+    let granted_twice = [
+        begin(),
+        grant(1),
+        release_intent(1),
+        released(1),
+        grant(1),
+        Row::GrantComplete { count: 2 },
+        started(),
+        Row::JobEnded,
+    ];
+    // The release that came before the second grant undid the first, so the verification does not
+    // cover the key until a release follows the second grant.
+    assert!(
+        refused_after(&granted_twice, &verified(1)),
+        "the second grant of the key was never released"
+    );
+    let mut rows = granted_twice.to_vec();
+    rows.extend([release_intent(1), released(1)]);
+    let mut tracker = tracker_after(&rows);
+    tracker.apply(&verified(1)).unwrap();
+    tracker.apply(&Row::End { root_leftovers: 0 }).unwrap();
+
+    // A grant of a key whose release is begun and not written is refused.
+    assert!(refused_after(
+        &[begin(), grant(1), release_intent(1)],
+        &grant(1)
+    ));
+    // Once written, the grant is accepted.
+    tracker_after(&[begin(), grant(1), release_intent(1), released(1), grant(1)]);
+}
+
+#[test]
+fn an_invocation_whose_root_still_stands_stays_in_the_recovery_after_its_last_leftover_is_cleared()
+{
+    let root_leftover = Row::Leftover {
+        object: "tmp/held".to_owned(),
+        reason: "in use".to_owned(),
+        class: LeftoverClass::Root,
+        snapshot: None,
+    };
+    let cleared = Row::LeftoverCleared {
+        key: "tmp/held".to_owned(),
+    };
+    for (what, root) in [
+        (
+            "made",
+            vec![
+                Row::RootIntent { name: root_name(1) },
+                Row::RootMade {
+                    name: root_name(1),
+                    key: key(9),
+                },
+            ],
+        ),
+        ("intended", vec![Row::RootIntent { name: root_name(1) }]),
+    ] {
+        let mut rows = vec![begin()];
+        rows.extend(root);
+        rows.extend([
+            root_leftover.clone(),
+            verified(0),
+            Row::End { root_leftovers: 1 },
+        ]);
+        assert!(invocation(&file_of(&rows), BOOT).needs_recovery());
+        // The crash prefix: the leftover was cleared and the row that records the removal of the
+        // root did not reach the file.
+        rows.push(cleared.clone());
+        let found = invocation(&file_of(&rows), BOOT);
+        assert_eq!(found.standing, Standing::Finished);
+        assert!(found.tracker.leftovers().is_empty());
+        assert!(
+            found.needs_recovery(),
+            "the root is still {what}, so the sweep has work to do"
+        );
+        // The removal is recorded: nothing is left.
+        rows.push(Row::RootRemoved);
+        assert!(!invocation(&file_of(&rows), BOOT).needs_recovery());
+    }
+}
+
+#[test]
+fn an_uncertain_end_after_a_verification_voids_it_and_it_is_written_again_after_the_end_is_proved()
+{
+    let rows = [begin(), grant_done(), started(), Row::JobEnded, verified(0)];
+    let mut tracker = tracker_after(&rows);
+    tracker.apply(&uncertain()).unwrap();
+    tracker.apply(&Row::JobEnded).unwrap();
+    assert!(
+        tracker.apply(&Row::End { root_leftovers: 0 }).is_err(),
+        "the end was in doubt after the verification, which no longer holds"
+    );
+    tracker.apply(&verified(0)).unwrap();
+    tracker.apply(&Row::End { root_leftovers: 0 }).unwrap();
+}
+
 fn grant_path(n: u64) -> String {
     match grant(n) {
         Row::Grant { path, .. } => path,
@@ -1328,6 +1426,31 @@ mod native {
             "the rows before the bound are kept"
         );
         assert!(Journal::resume(&dir.0, id(), BOOT).is_err());
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_failed_write_closes_the_journal_to_readers_of_its_tracker() {
+        use kr_boundary_windows::win::journal::testing;
+        let dir = Dir::new();
+        let mut journal = Journal::create(&dir.0, id()).unwrap();
+        journal.append(&begin()).unwrap();
+        assert!(journal.tracker().is_ok());
+        // The write fails after the tracker took the row: the tracker may be ahead of the file, so
+        // it is not given out, and no more rows are taken.
+        testing::fail_next_write();
+        let failed = journal
+            .append(&snapshot(1, SnapshotKind::Initial))
+            .unwrap_err();
+        assert!(matches!(failed, JournalError::Io(_)), "{failed}");
+        assert!(matches!(journal.tracker(), Err(JournalError::Closed)));
+        assert!(matches!(
+            journal.append(&snapshot(2, SnapshotKind::Changed)),
+            Err(JournalError::Closed)
+        ));
+        // The file says what is on the disk: the row that was not written is not there.
+        let bytes = std::fs::read(journal.path()).unwrap();
+        assert_eq!(framing::read_all(&bytes).records.len(), 1);
     }
 
     #[test]

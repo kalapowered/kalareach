@@ -228,6 +228,9 @@ impl Tracker {
                 if self.grant_complete {
                     return wrong("an object is granted after the grant was complete");
                 }
+                if self.pending_releases.contains_key(key) {
+                    return wrong("an object is granted while its release is not written");
+                }
                 let reserve = release_reserve(row);
                 if self.bytes + self.reserved + framed + reserve + ROWS_APART_FROM_OBJECTS
                     > self.limit
@@ -238,6 +241,9 @@ impl Tracker {
                 }
                 self.grants += 1;
                 self.granted.insert(*key, path.clone());
+                // A release that came before this grant undid an earlier grant of the key, not
+                // this one: the key is released again only by a release that follows.
+                self.released_keys.remove(key);
                 self.reserved += reserve;
                 Ok(())
             }
@@ -282,6 +288,9 @@ impl Tracker {
                 self.unproved = true;
                 self.uncertain = true;
                 self.job_ended = false;
+                // A verification rests on the end being proved; once that is in doubt it is void
+                // and is written again after the end is proved.
+                self.release_verified = false;
                 Ok(())
             }
             Row::ReleaseIntent { key, .. } => {
@@ -496,10 +505,17 @@ pub struct Invocation {
 
 impl Invocation {
     /// Whether recovery has something to do with it: the invocation did not finish, or it finished
-    /// with a leftover of its private root that the sweep still carries (its tree's slot is free).
+    /// with a leftover of its private root that the sweep still carries (its tree's slot is free),
+    /// or its private root still stands as made or intended whatever its leftovers say: the last
+    /// leftover can be cleared before the row that records the root's removal reaches the file.
     #[must_use]
     pub fn needs_recovery(&self) -> bool {
-        self.standing != Standing::Finished || !self.tracker.leftovers().is_empty()
+        self.standing != Standing::Finished
+            || !self.tracker.leftovers().is_empty()
+            || matches!(
+                self.tracker.root(),
+                RootState::IntentOnly(_) | RootState::Made(..)
+            )
     }
 }
 
