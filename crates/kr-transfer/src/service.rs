@@ -1943,8 +1943,10 @@ impl TransferService {
         actor: &ActorId,
         transfer_id: TransferId,
     ) -> Result<StoredSubject> {
-        let now = self.clock.now_ms();
+        // The time is read once the store is held, so that an upload that expired while the lookup
+        // waited for the store is refused.
         let store = self.locked()?;
+        let now = self.clock.now_ms();
         let row = upload_of(&store, transfer_id, actor)?;
         if !row.state.accepts_chunks() || row.expires_at_ms.get() <= now.get() {
             return Err(unknown(transfer_id));
