@@ -498,6 +498,13 @@ fn the_system_volume_is_accepted_and_every_other_kind_of_volume_is_refused_with_
             other => panic!("{share} is a share of this computer, a remote volume: {other:?}"),
         }
     }
+    // A device path to a local directory is refused too, with no open: `\\?\` is the one prefix
+    // taken as an NT form. A handle here would mean the path was opened.
+    let device = format!(r"\\.\{}", scratch.dir.display());
+    match DirHandle::open_anchor(Path::new(&device)).expect("the platform answers") {
+        Err(AnchorRefusal::Volume(VolumeRefusal::Remote)) => {}
+        other => panic!("{device} is refused and not opened: {other:?}"),
+    }
     let fat =
         Disk::new(&scratch, "fat32", 100, 'R').expect("a FAT32 disk can be made on the guest");
     match DirHandle::open_anchor(Path::new("R:\\")).expect("the platform answers") {

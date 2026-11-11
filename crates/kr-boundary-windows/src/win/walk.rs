@@ -625,15 +625,18 @@ fn nt_path(path: &Path) -> Result<Option<Vec<u16>>> {
     }
     let slash = u16::from(b'\\');
     let question = u16::from(b'?');
-    let dot = u16::from(b'.');
     if full.len() > 4
         && full[0] == slash
         && full[1] == slash
-        && (full[2] == question || full[2] == dot)
+        && full[2] == question
         && full[3] == slash
     {
-        // `\\?\C:\x` and `\\.\C:\x` are `\??\C:\x` in the NT space; the one that names a share,
-        // `\\?\UNC\server\share`, is a path on another computer.
+        // `\\?\C:\x` is `\??\C:\x` in the NT space; the one that names a share,
+        // `\\?\UNC\server\share`, is a path on another computer. Other `\\?\` forms
+        // (`\\?\GLOBALROOT\Device\...`, `\\?\pipe\...`) reach the open, and `check_volume` refuses
+        // what is not a local NTFS directory; anchors come from the administrator's configuration.
+        // A `\\.\` path is not taken as an NT form: it falls to the refusal below with the other
+        // paths that begin with two backslashes.
         let rest = String::from_utf16_lossy(&full[4..]).to_ascii_uppercase();
         if rest.starts_with("UNC\\") {
             return Ok(None);
