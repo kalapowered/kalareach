@@ -1120,10 +1120,11 @@ async fn a_stalled_chunk_stream_holds_nothing_on_the_control_stream() {
     let length = 4 * 1024 * 1024;
     let transfer = begin_of(&host, &device.actor(), None, length);
     let big = vec![5_u8; 1024 * 1024];
+    let (session_id, _) = an_open_session(&host);
     let draft = |text: &str| kr_protocol::transfer::DraftCreateParams {
         environment_id: host.environment_id,
         device_id: Nullable::null(),
-        session_id: Nullable::null(),
+        session_id: Nullable::some(session_id),
         application_instance_id: Nullable::null(),
         text: text.to_owned(),
     };
@@ -1152,7 +1153,7 @@ async fn a_stalled_chunk_stream_holds_nothing_on_the_control_stream() {
                 .mutate(
                     Method::DraftCreate,
                     ActionId::new(kr_ipc::new_uuid()),
-                    on_the_host(host),
+                    on_the_session(host, session_id),
                     &params,
                 )
                 .await
@@ -1242,10 +1243,11 @@ async fn a_fifth_connection_of_a_device_withdraws_its_oldest() {
 
     // The oldest has a mutation in flight, held before the service's ask.
     let action = ActionId::new(kr_ipc::new_uuid());
+    let (session_id, _) = an_open_session(&host);
     let create = kr_protocol::transfer::DraftCreateParams {
         environment_id: host.environment_id,
         device_id: Nullable::null(),
-        session_id: Nullable::null(),
+        session_id: Nullable::some(session_id),
         application_instance_id: Nullable::null(),
         text: "made once".to_owned(),
     };
@@ -1253,7 +1255,12 @@ async fn a_fifth_connection_of_a_device_withdraws_its_oldest() {
     let (held, release) = host.controller().transfer().pause_after_the_outer_check();
     let request = device
         .raw
-        .submit(Method::DraftCreate, action, on_the_host(&host), &create)
+        .submit(
+            Method::DraftCreate,
+            action,
+            on_the_session(&host, session_id),
+            &create,
+        )
         .await;
     arrived(held).await;
 
@@ -1278,7 +1285,7 @@ async fn a_fifth_connection_of_a_device_withdraws_its_oldest() {
             window,
             Method::DraftCreate,
             action,
-            on_the_host(&host),
+            on_the_session(&host, session_id),
             &create,
         )
         .await;
