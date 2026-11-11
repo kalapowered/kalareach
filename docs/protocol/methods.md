@@ -217,6 +217,7 @@ document.
 | `upload.cancel` | write | `local_ipc`, `paired_device`, `workflow` | Cancel an unfinished upload and release its reservation. | [Transfer: The seven methods](../transfer/README.md) |
 | `download.begin` | read | `local_ipc`, `paired_device`, `workflow` | Open an immutable source revision or bounded staging snapshot and describe its chunks. | [Transfer: The seven methods](../transfer/README.md) |
 | `download.chunk` | read | `local_ipc`, `paired_device`, `workflow` | Read one chunk of the same snapshot. Read authority is checked on every request. | [Transfer: The seven methods](../transfer/README.md) |
+| `transfer.streams` | read | `paired_device` | The stream kinds this host takes from a paired device. A device asks it before it begins an upload, because a host that takes no attachment-chunk stream could never receive the upload's chunks. | [Transfer: Asking a host which streams it takes](../transfer/README.md) |
 
 ## Project repositories
 

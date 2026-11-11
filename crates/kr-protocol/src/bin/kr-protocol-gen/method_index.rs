@@ -250,6 +250,7 @@ pub(crate) const fn described_in(method: Method) -> Section {
         | Method::UploadCancel
         | Method::DownloadBegin
         | Method::DownloadChunk => at(TRANSFER, "The seven methods"),
+        Method::TransferStreams => at(TRANSFER, "Asking a host which streams it takes"),
 
         Method::ProjectList
         | Method::ProjectRead

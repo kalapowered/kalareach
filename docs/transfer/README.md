@@ -175,6 +175,16 @@ be released before the next daemon binds the same address, and only the owner of
 can release it at a known moment: an in-process restart releases both and binds them again, which
 is what the restart test does.
 
+### Asking a host which streams it takes
+
+`transfer.streams` is a read that only a host serving the form lists. A paired device asks it before
+it begins an upload, with no parameters and no right, and the host answers with the stream kinds it
+takes from a device: `attachment_chunks`. A host that does not list the method answers
+`PERMISSION_DENIED` with `METHOD_NOT_AVAILABLE`, and a device that reads that does not begin an
+upload there, since no reservation could be filled. The answer says which streams a connection may
+open, not what the device may do on one: the host decides the device's rights when the stream is
+opened.
+
 ## Storage layout
 
 ```text

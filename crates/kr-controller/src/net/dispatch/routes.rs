@@ -111,6 +111,9 @@ pub(super) enum DeviceRead {
     /// this device. Generated text is answered only when the grant's history reaches back to the
     /// session's start, because a description can summarise anything the session did.
     Description,
+    /// `transfer.streams`: the stream kinds this host takes from a paired device. The answer is
+    /// the list the listener is configured with, and reads nothing from the store.
+    Transfer,
     /// Refused by name, for the reason [`Unserved::refusal`] gives.
     Refused(Unserved),
 }
@@ -163,6 +166,7 @@ impl DeviceRead {
             Method::GrantHeld => Self::Held,
             Method::SessionDescribe => Self::Description,
             Method::SessionOpen => Self::Opening,
+            Method::TransferStreams => Self::Transfer,
             Method::UploadStatus | Method::DownloadBegin | Method::DownloadChunk => {
                 Self::Refused(Unserved::Transfer)
             }
@@ -565,6 +569,13 @@ impl RemoteConnection {
                     Err(error) => failure(request.request_id, error.to_protocol_error()),
                 }
             }
+            DeviceRead::Transfer => framed(
+                request.request_id,
+                ParamsValue::from_typed(&kr_protocol::transfer::TransferStreamsResult {
+                    accepted_streams: super::super::chunks::ACCEPTED_STREAMS.to_vec(),
+                })
+                .map_err(|error| crate::error::ControllerError::InvalidArgument(error.to_string())),
+            ),
             // Answered before the routes are read, so a request cannot arrive here.
             DeviceRead::Opening => {
                 return failure(

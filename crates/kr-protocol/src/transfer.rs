@@ -18,6 +18,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::frame::StreamKind;
 use crate::ids::{
     ApplicationInstanceId, DeviceId, DraftId, DraftRevision, EnvironmentId, GrantId, SessionId,
     TransferId,
@@ -1027,6 +1028,25 @@ pub struct DownloadChunkResult {
     pub chunk: ChunkDescriptor,
     /// The chunk bytes.
     pub bytes: Bytes,
+}
+
+/// Parameters of `transfer.streams`, which take none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TransferStreamsParams {}
+
+/// The result of `transfer.streams`: the stream kinds this host takes from a paired device.
+///
+/// A device that sends an upload's chunks on a stream of their own asks this first, so that no
+/// reservation is made on a host that could not receive them. A host that lists
+/// `attachment_chunks` takes that stream from every paired device that holds the
+/// right to upload; the host decides the right when the stream is opened, not here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TransferStreamsResult {
+    /// The stream kinds a paired device may open on a connection to this host, besides the control
+    /// stream it already holds.
+    pub accepted_streams: Vec<StreamKind>,
 }
 
 /// How a client publishes a verified download to its own destination.
