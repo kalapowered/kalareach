@@ -17,7 +17,7 @@
 //! | [`events`] | What the platform's application-control log says about a program it refused |
 //! | [`filekey`] | The identity of an object on a volume, which the walk, the private root and the journal name instead of a path |
 //! | [`frame`] | The broker's pipe protocol: framed messages with limits, and the requests and answers |
-//! | [`env`] | The environment of every child, built from a fixed table and nothing of the caller's |
+//! | [`mod@env`] | The environment of every child, built from a fixed table and nothing of the caller's |
 //! | [`quote`] | A child's command line, quoted so that the platform's own splitting gives back its parts |
 //! | [`journal`] | The journal's records: their framing (a length, the bytes and a checksum, with a torn tail dropped), their rows and the order the rows may come in |
 //! | [`repository`] | What the broker reads of a repository before it starts Git, from bytes alone: its `HEAD`, its attributes, its configuration listing and the output of the five readers it runs |

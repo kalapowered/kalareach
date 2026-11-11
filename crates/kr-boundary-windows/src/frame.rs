@@ -4,8 +4,8 @@
 //! A frame is a four-byte little-endian length and that many bytes of JSON. The length is checked
 //! against [`MAX_FRAME`] before any byte of the body is read or allocated, so a client cannot make
 //! the broker hold more than one frame's limit. The one request that carries a list of paths and a
-//! message, [`OperateRequest`], has a limit of its own, [`MAX_OPERATE_FRAME`], which
-//! [`read_request`] applies to it and to no other request. The first frame of every connection says
+//! message, [`invocation::OperateRequest`], has a limit of its own, [`invocation::MAX_OPERATE_FRAME`], which
+//! [`invocation::read_request`] applies to it and to no other request. The first frame of every connection says
 //! which version of this protocol the client speaks; a broker and a host update apart, so a version
 //! the broker does not speak is refused with the instruction to repair.
 //!
@@ -13,7 +13,7 @@
 //! field the protocol does not name is a parse error. The broker takes the caller's identity from
 //! the pipe, never from the message.
 //!
-//! The frames of an invocation ([`InvocationRequest`] and [`InvocationReply`]) are bounded field by
+//! The frames of an invocation ([`invocation::InvocationRequest`] and [`invocation::InvocationReply`]) are bounded field by
 //! field as well: each has a `check` that the readers call, and the writers refuse to send what it
 //! refuses.
 

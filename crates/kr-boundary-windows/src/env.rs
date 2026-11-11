@@ -4,7 +4,7 @@
 //! Git reads a great many variables, and every one of them that a caller can set is a way to point
 //! Git at a program, a configuration file, a repository, a proxy or a log. A list of variables to
 //! remove would miss the next one, so this module goes the other way: the block holds the
-//! variables of [`TABLE`] and no others. No function here reads the process's own environment, and
+//! variables of its fixed table and no others. No function here reads the process's own environment, and
 //! nothing in a request can add a variable.
 //!
 //! The module is pure: the system's own paths, the installation's folders, the invocation's private
