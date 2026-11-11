@@ -1463,6 +1463,14 @@ mod shutdown_tests {
             if let Some(accepting) = self.accepting.take() {
                 accepting.join().expect("the accepting thread");
             }
+            // Before the worker is waited for: it must have been ended by the host, not have run out.
+            let alive: Vec<String> = run
+                .owned()
+                .iter()
+                .filter(|owned| running(&owned.identity))
+                .map(|owned| owned.what.clone())
+                .collect();
+            assert!(alive.is_empty(), "still running: {alive:?}");
             let _ = self.worker.wait();
             assert_eq!(
                 self.connections.load(Ordering::SeqCst),
@@ -1477,13 +1485,6 @@ mod shutdown_tests {
                     .is_empty(),
                 "a kr was asked for after the agent started"
             );
-            let alive: Vec<String> = run
-                .owned()
-                .iter()
-                .filter(|owned| running(&owned.identity))
-                .map(|owned| owned.what.clone())
-                .collect();
-            assert!(alive.is_empty(), "still running: {alive:?}");
             assert!(
                 run.owned()
                     .iter()
