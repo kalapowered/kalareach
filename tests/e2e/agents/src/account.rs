@@ -393,15 +393,125 @@ pub struct KeyHolder {
     pub modified_ms: Option<u64>,
 }
 
+/// The most lines that one list of a key scan keeps; the rest are counted.
+const TOLD_LINES_AT_MOST: usize = 10_000;
+
+/// The most bytes that one list of a key scan keeps, over all its lines: a line holds a path that
+/// can be 16 kilobytes long in a deep tree, and a tree of a million links leaves a line for each,
+/// which no bound on the bytes read or the entries listed holds back.
+const TOLD_BYTES_AT_MOST: usize = 4 << 20;
+
+/// What one line of a [`Told`] list holds in memory, at least.
+pub trait Weighs {
+    /// The bytes the line keeps.
+    fn weight(&self) -> usize;
+}
+
+impl Weighs for String {
+    fn weight(&self) -> usize {
+        self.len()
+    }
+}
+
+impl Weighs for KeyHolder {
+    fn weight(&self) -> usize {
+        self.path.len() + 64
+    }
+}
+
+/// One list of what a key scan tells: it keeps the first lines up to a number of lines and of bytes
+/// in all, and counts every line past either, so the run's end can always write what it holds. A
+/// list that has counted a line is not empty.
+#[derive(Clone, Debug)]
+pub struct Told<T> {
+    kept: Vec<T>,
+    bytes: usize,
+    more: u64,
+    lines_at_most: usize,
+    bytes_at_most: usize,
+}
+
+impl<T> Default for Told<T> {
+    fn default() -> Self {
+        Self::within(TOLD_LINES_AT_MOST, TOLD_BYTES_AT_MOST)
+    }
+}
+
+impl<T> Told<T> {
+    /// An empty list that keeps at most `lines` lines and `bytes` bytes.
+    #[must_use]
+    pub const fn within(lines: usize, bytes: usize) -> Self {
+        Self {
+            kept: Vec::new(),
+            bytes: 0,
+            more: 0,
+            lines_at_most: lines,
+            bytes_at_most: bytes,
+        }
+    }
+}
+
+impl<T: Weighs> Told<T> {
+    /// Keeps `line` where the list has room for it, and counts it otherwise.
+    pub fn push(&mut self, line: T) {
+        let weight = line.weight();
+        if self.kept.len() < self.lines_at_most
+            && self.bytes.saturating_add(weight) <= self.bytes_at_most
+        {
+            self.bytes += weight;
+            self.kept.push(line);
+        } else {
+            self.more += 1;
+        }
+    }
+
+    /// The lines kept, in the order they were told.
+    pub fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.kept.iter()
+    }
+
+    /// How many lines were told, those counted and not kept included.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.kept
+            .len()
+            .saturating_add(usize::try_from(self.more).unwrap_or(usize::MAX))
+    }
+
+    /// Whether no line was told.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.kept.is_empty() && self.more == 0
+    }
+
+    /// How many lines were counted and not kept.
+    #[must_use]
+    pub const fn not_listed(&self) -> u64 {
+        self.more
+    }
+
+    /// Orders the lines kept.
+    pub fn sort_by(&mut self, order: impl FnMut(&T, &T) -> std::cmp::Ordering) {
+        self.kept.sort_by(order);
+    }
+}
+
+impl<T: Serialize> Serialize for Told<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.kept.serialize(serializer)
+    }
+}
+
 /// What a search of a run's directory for a key's bytes found: every regular file that held them,
 /// by path relative to the directory, and every entry the search could not read, which leaves the
-/// search incomplete. Nothing of the value is kept.
+/// search incomplete. Nothing of the value is kept. Each list keeps a set number of lines and of
+/// bytes and counts the rest ([`Told::not_listed`]).
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct KeyScan {
     /// The files that held the value.
-    pub held_by: Vec<KeyHolder>,
+    pub held_by: Told<KeyHolder>,
     /// The entries that could not be read, with why.
-    pub unread: Vec<String>,
+    pub unread: Told<String>,
     /// The scan met an entry on another file system than its root's, as a mounted volume is: the
     /// run's directory is then left where it is.
     #[serde(skip)]
@@ -475,6 +585,8 @@ struct ScanLimits {
     entries: usize,
     /// The most bytes read in all by the scans that share a budget.
     bytes: u64,
+    /// The most lines, and the most bytes of lines, that each of a scan's two lists keeps.
+    told: (usize, usize),
 }
 
 impl Default for ScanLimits {
@@ -483,6 +595,7 @@ impl Default for ScanLimits {
             file: SCAN_FILE_AT_MOST,
             entries: SCAN_ENTRIES_AT_MOST,
             bytes: SCAN_BYTES_AT_MOST,
+            told: (TOLD_LINES_AT_MOST, TOLD_BYTES_AT_MOST),
         }
     }
 }
@@ -1044,6 +1157,8 @@ fn scan_files_sharing(
     let mut scan = KeyScan {
         limits,
         bytes,
+        held_by: Told::within(limits.told.0, limits.told.1),
+        unread: Told::within(limits.told.0, limits.told.1),
         ..KeyScan::default()
     };
     scan_root(root, rules, &holds, &mut scan);
@@ -1070,7 +1185,9 @@ pub fn record_key_scan(part: &str, variable: &str, scan: &KeyScan, removed_ms: u
         "part": part,
         "variable": variable,
         "held_by": scan.held_by,
+        "held_by_not_listed": scan.held_by.not_listed(),
         "unread": scan.unread,
+        "unread_not_listed": scan.unread.not_listed(),
         "complete": scan.complete(),
         "run_removed_ms": removed_ms,
         "run_gone": gone,
@@ -2390,6 +2507,88 @@ mod tests {
         // Within the bounds the same tree is searched whole.
         let whole = scan_files_within(&run, &[key], Some(&rules_for(&run, &[])), limits);
         assert!(whole.complete(), "{:?}", whole.unread);
+    }
+
+    /// A deep tree that holds many links, and many copies of the key, leaves each of the scan's two
+    /// lists within its bound of lines and of bytes: the lines past it are counted and not kept, the
+    /// scan is not complete, and what the scan file would hold stays within the bound.
+    #[test]
+    fn a_tree_of_many_links_and_copies_leaves_the_scans_lists_within_their_bounds() {
+        let scratch = Scratch::new("scan-lists");
+        let key = b"the-key-value-0123456789";
+        let mut deep = scratch.0.join("run");
+        for level in 0..20 {
+            deep = deep.join(format!("{level:0>40}"));
+        }
+        std::fs::create_dir_all(&deep).expect("a deep run");
+        let run = scratch.0.join("run");
+        for index in 0..60 {
+            std::os::unix::fs::symlink("/nowhere", deep.join(format!("link-{index:0>60}")))
+                .expect("a link");
+            std::fs::write(deep.join(format!("copy-{index:0>60}")), key)
+                .expect("a copy of the key");
+        }
+        let limits = ScanLimits {
+            told: (7, 3000),
+            ..ScanLimits::default()
+        };
+        let scan = scan_files_within(&run, &[key], Some(&rules_for(&run, &[])), limits);
+        assert!(!scan.complete());
+        for (kept, bytes, told, more, what) in [
+            (
+                scan.unread.iter().count(),
+                scan.unread.iter().map(String::len).sum::<usize>(),
+                scan.unread.len(),
+                scan.unread.not_listed(),
+                "unread",
+            ),
+            (
+                scan.held_by.iter().count(),
+                scan.held_by
+                    .iter()
+                    .map(|holder| holder.path.len())
+                    .sum::<usize>(),
+                scan.held_by.len(),
+                scan.held_by.not_listed(),
+                "held_by",
+            ),
+        ] {
+            assert!(kept <= 7, "{what} kept {kept} lines");
+            assert!(bytes <= 3000, "{what} kept {bytes} bytes");
+            assert!(kept > 0, "{what} kept none of its lines");
+            assert_eq!(told, 60, "{what} counts every line it was told");
+            assert_eq!(
+                more,
+                u64::try_from(60 - kept).expect("a count"),
+                "{what} counts each line it did not keep"
+            );
+        }
+        // Where the bytes allow more than the lines do, the lines bound the list.
+        let few = ScanLimits {
+            told: (4, 1 << 20),
+            ..ScanLimits::default()
+        };
+        let four = scan_files_within(&run, &[key], Some(&rules_for(&run, &[])), few);
+        assert_eq!(four.unread.iter().count(), 4);
+        assert_eq!(four.unread.not_listed(), 56);
+        assert_eq!(four.held_by.iter().count(), 4);
+        // Where no line fits the bytes, none is kept and the scan is still not complete.
+        let narrow = ScanLimits {
+            told: (7, 10),
+            ..ScanLimits::default()
+        };
+        let none = scan_files_within(&run, &[key], Some(&rules_for(&run, &[])), narrow);
+        assert!(!none.complete());
+        assert_eq!(none.unread.iter().count(), 0);
+        assert_eq!(none.unread.len(), 60);
+        assert_eq!(none.held_by.iter().count(), 0);
+        assert_eq!(none.held_by.not_listed(), 60);
+        let written = serde_json::to_vec(&scan).expect("a scan is JSON");
+        assert!(
+            written.len() < 2 * 3000 + 2000,
+            "{} bytes written",
+            written.len()
+        );
     }
 
     /// Two scans that share a budget of bytes read no more in all than it holds, and the entries of
