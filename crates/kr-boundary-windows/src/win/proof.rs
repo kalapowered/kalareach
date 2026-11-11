@@ -17,17 +17,23 @@
 //! a proof that did not succeed, not a pass.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::env::{self, EnvBlock, Kind, QualifiedGit, RootPaths};
 use crate::frame::Class;
-use crate::manifest::{Manifest, ObjectKind};
+use crate::manifest::{GitSet, Manifest, ObjectKind};
 use crate::policy::{RULE_CHECKOUT, RULE_CONNECT};
+use crate::quote::quote_command_line;
 
 use super::acl;
 use super::applocker;
-use super::launch::{Outcome, REFUSED_BY_POLICY, run_as};
+use super::ffi::{self, Sid};
+use super::install::Paths;
+use super::launch::{
+    Captured, LaunchError, Outcome, REFUSED_BY_POLICY, Run, TokenSpec, VerifiedPath, run_captured,
+};
 use super::pipe::Stop;
+use super::sd::{Principals, SdKind, descriptor};
 use super::token::{boundary_token, new_invocation_group};
 
 /// The result of a proof.
@@ -55,25 +61,54 @@ fn account_of(manifest: &Manifest, class: Class) -> Option<(String, String)> {
     Some((name.to_owned(), object.detail.clone()?))
 }
 
-fn git_dir() -> PathBuf {
-    PathBuf::from(std::env::var_os("ProgramFiles").unwrap_or_else(|| "C:\\Program Files".into()))
-        .join("Git")
+/// The system's own Windows directory, from the platform and not from any environment.
+fn system_windows_directory() -> Result<String, String> {
+    ffi::system_windows_directory().map_err(|error| error.to_string())
 }
 
-fn environment() -> Vec<(&'static str, String)> {
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_owned());
-    vec![
-        ("SystemRoot", root.clone()),
-        ("windir", root.clone()),
-        ("SystemDrive", "C:".to_owned()),
-        (
-            "PATH",
-            format!(
-                "{};{root}\\System32",
-                git_dir().join("mingw64").join("bin").display()
-            ),
-        ),
-    ]
+/// The environment of a program of the proof, which runs in no repository. The proof's scratch
+/// directory stands for the private root.
+fn proof_environment(git: &GitSet, scratch: &Path) -> Result<EnvBlock, String> {
+    let roots = RootPaths {
+        system: system_windows_directory()?,
+        boundary: Paths::system().program.display().to_string(),
+        private_root: scratch.display().to_string(),
+    };
+    env::build_env(
+        Kind::Proof,
+        &roots,
+        None,
+        &QualifiedGit {
+            dir: git.dir.clone(),
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Starts one program of the proof through the launcher and waits for it.
+fn run_program(
+    token: TokenSpec<'_>,
+    group: Option<&Sid>,
+    program: &Path,
+    arguments: &[&str],
+    cwd: &Path,
+    env: &EnvBlock,
+    bound: Duration,
+) -> Result<Captured, LaunchError> {
+    let name = program.display().to_string();
+    let mut parts = vec![name.as_str()];
+    parts.extend_from_slice(arguments);
+    run_captured(
+        Run {
+            token,
+            group,
+            program: VerifiedPath::new(program)?,
+            command_line: quote_command_line(&parts),
+            cwd,
+            env,
+        },
+        bound,
+    )
 }
 
 fn same_path(left: &str, right: &Path) -> bool {
@@ -89,7 +124,15 @@ impl Scratch {
         let dir = under.join(format!("proof-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir)
             .map_err(|error| format!("making {}: {error}", dir.display()))?;
-        acl::set_protected(&dir, acl::READABLE_PROTECTED).map_err(|error| error.to_string())?;
+        let readable = descriptor(
+            SdKind::AdminDir,
+            &Principals {
+                users_may_read: true,
+                ..Principals::default()
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        acl::set_protected(&dir, &readable).map_err(|error| error.to_string())?;
         Ok(Scratch(dir))
     }
 }
@@ -112,6 +155,9 @@ pub fn prove(
     let Some((account, sid)) = account_of(manifest, class) else {
         return fail("the manifest records no account for this class");
     };
+    let Some(git) = manifest.git.as_ref() else {
+        return fail("the manifest records no Git installation");
+    };
     let rule = match class {
         Class::Checkout => RULE_CHECKOUT,
         Class::Connect => RULE_CONNECT,
@@ -120,24 +166,29 @@ pub fn prove(
         Ok(scratch) => scratch,
         Err(reason) => return fail(reason),
     };
-    let system32 =
-        PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()))
-            .join("System32");
+    let system = match system_windows_directory() {
+        Ok(system) => PathBuf::from(system),
+        Err(reason) => return fail(reason),
+    };
     let unlisted = scratch.0.join("unlisted.exe");
-    if let Err(error) = std::fs::copy(system32.join("hostname.exe"), &unlisted) {
+    if let Err(error) = std::fs::copy(system.join("System32").join("hostname.exe"), &unlisted) {
         return fail(format!(
             "copying a system program into the scratch directory: {error}"
         ));
     }
-    let token = match boundary_token(&account, &new_invocation_group()) {
+    let group = new_invocation_group();
+    let token = match boundary_token(&account, &group) {
         Ok(token) => token,
         Err(error) => return fail(format!("making the token for {account}: {error}")),
     };
-    let record = match applocker::newest_record(&scratch.0) {
+    let environment = match proof_environment(git, &scratch.0) {
+        Ok(environment) => environment,
+        Err(reason) => return fail(reason),
+    };
+    let record = match applocker::newest_record(&scratch.0, &environment) {
         Ok(record) => record,
         Err(error) => return fail(error.to_string()),
     };
-    let environment = environment();
     let started = Instant::now();
     let mut attempts = 0_u32;
     loop {
@@ -145,22 +196,29 @@ pub fn prove(
             return fail("the service is stopping");
         }
         attempts += 1;
-        match run_as(
-            &token,
+        match run_program(
+            TokenSpec::Boundary(&token),
+            Some(&group),
             &unlisted,
-            "unlisted.exe",
+            &[],
             &scratch.0,
             &environment,
             Duration::from_secs(30),
         ) {
-            Ok(Outcome::NotStarted(code)) if code == REFUSED_BY_POLICY => break,
-            Ok(Outcome::NotStarted(code)) => {
+            Err(LaunchError::NotStarted(code)) if code == REFUSED_BY_POLICY => break,
+            Err(LaunchError::NotStarted(code)) => {
                 return fail(format!(
                     "the unlisted program could not be started for {account}, with error {code} and not the policy's {REFUSED_BY_POLICY}"
                 ));
             }
-            Ok(Outcome::Ran(_)) => {}
-            Ok(Outcome::TimedOut) => return fail("the unlisted program ran for 30 seconds"),
+            Ok(Captured {
+                outcome: Outcome::Ran(_),
+                ..
+            }) => {}
+            Ok(Captured {
+                outcome: Outcome::TimedOut,
+                ..
+            }) => return fail("the unlisted program ran for 30 seconds"),
             Err(error) => return fail(error.to_string()),
         }
         if started.elapsed() >= bound {
@@ -173,7 +231,7 @@ pub fn prove(
     }
     // The refusal is the policy's only if the log says which rule made it.
     let named = loop {
-        match applocker::blocked_after(record, &scratch.0) {
+        match applocker::blocked_after(record, &scratch.0, &environment) {
             Ok(events) => {
                 if events.iter().any(|event| {
                     event.rule_id == rule
@@ -195,29 +253,48 @@ pub fn prove(
             "the unlisted program was refused to {account} but the log does not name the rule {rule}"
         ));
     }
-    let git = git_dir().join("mingw64").join("bin").join("git.exe");
-    match run_as(
-        &token,
-        &git,
-        "git.exe --version",
+    let git_exe = Path::new(&git.dir)
+        .join("mingw64")
+        .join("bin")
+        .join("git.exe");
+    match run_program(
+        TokenSpec::Boundary(&token),
+        Some(&group),
+        &git_exe,
+        &["--version"],
         &scratch.0,
         &environment,
         Duration::from_secs(30),
     ) {
-        Ok(Outcome::Ran(0)) => {}
-        Ok(other) => return fail(format!("Git did not run for {account}: {other:?}")),
+        Ok(Captured {
+            outcome: Outcome::Ran(0),
+            ..
+        }) => {}
+        Ok(other) => {
+            return fail(format!(
+                "Git did not run for {account}: {:?}",
+                other.outcome
+            ));
+        }
         Err(error) => return fail(error.to_string()),
     }
-    let control = Command::new(&unlisted)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    match control {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
+    match run_program(
+        TokenSpec::Own,
+        None,
+        &unlisted,
+        &[],
+        &scratch.0,
+        &environment,
+        Duration::from_secs(30),
+    ) {
+        Ok(Captured {
+            outcome: Outcome::Ran(0),
+            ..
+        }) => {}
+        Ok(other) => {
             return fail(format!(
-                "the unlisted program did not run under the broker's own token: {status}"
+                "the unlisted program did not run under the broker's own token: {:?}",
+                other.outcome
             ));
         }
         Err(error) => {
@@ -247,14 +324,22 @@ pub fn release(
     let Some((account, _)) = account_of(manifest, class) else {
         return fail("the manifest records no account for this class");
     };
-    let token = match boundary_token(&account, &new_invocation_group()) {
+    let Some(git) = manifest.git.as_ref() else {
+        return fail("the manifest records no Git installation");
+    };
+    let group = new_invocation_group();
+    let token = match boundary_token(&account, &group) {
         Ok(token) => token,
         Err(error) => return fail(format!("making the token for {account}: {error}")),
     };
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_owned());
-    let cmd_dir = Path::new(&root).join("System32");
-    let cmd = cmd_dir.join("cmd.exe");
-    let environment = environment();
+    let environment = match proof_environment(git, staging) {
+        Ok(environment) => environment,
+        Err(reason) => return fail(reason),
+    };
+    let cmd = match system_windows_directory() {
+        Ok(system) => Path::new(&system).join("System32").join("cmd.exe"),
+        Err(reason) => return fail(reason),
+    };
     let started = Instant::now();
     let mut attempts = 0_u32;
     loop {
@@ -262,15 +347,19 @@ pub fn release(
             return fail("the service is stopping");
         }
         attempts += 1;
-        match run_as(
-            &token,
+        match run_program(
+            TokenSpec::Boundary(&token),
+            Some(&group),
             &cmd,
-            "cmd.exe /c exit 0",
+            &["/c", "exit", "0"],
             staging,
             &environment,
             Duration::from_secs(30),
         ) {
-            Ok(Outcome::Ran(0)) => {
+            Ok(Captured {
+                outcome: Outcome::Ran(0),
+                ..
+            }) => {
                 return Proof {
                     ready: true,
                     detail: format!(
@@ -279,8 +368,8 @@ pub fn release(
                     ),
                 };
             }
-            Ok(Outcome::NotStarted(code)) if code == REFUSED_BY_POLICY => {}
-            Ok(other) => return fail(format!("cmd.exe for {account}: {other:?}")),
+            Err(LaunchError::NotStarted(code)) if code == REFUSED_BY_POLICY => {}
+            Ok(other) => return fail(format!("cmd.exe for {account}: {:?}", other.outcome)),
             Err(error) => return fail(error.to_string()),
         }
         if started.elapsed() >= bound {

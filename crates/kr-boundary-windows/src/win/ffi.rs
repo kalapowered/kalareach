@@ -76,6 +76,27 @@ pub unsafe fn from_wide(text: *const u16) -> String {
     }
 }
 
+/// The system's own Windows directory, as the platform reports it: never read from an environment
+/// variable, which a caller could have set.
+///
+/// # Errors
+///
+/// Returns the platform's error when the directory cannot be read.
+pub fn system_windows_directory() -> Result<String> {
+    let mut buffer = vec![0_u16; 260];
+    // SAFETY: the buffer is as long as the length given.
+    let length = unsafe {
+        windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW(
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+        )
+    } as usize;
+    if length == 0 || length >= buffer.len() {
+        return Err(last("reading the system's Windows directory"));
+    }
+    Ok(String::from_utf16_lossy(&buffer[..length]))
+}
+
 /// A handle that closes when dropped.
 #[derive(Debug)]
 pub struct Handle(HANDLE);

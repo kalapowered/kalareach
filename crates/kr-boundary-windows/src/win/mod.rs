@@ -9,7 +9,9 @@
 //! | `account` | The two boundary accounts, their rights and their sign-in |
 //! | `service` | The service manager: the broker's service and the Application Identity service |
 //! | `token` | The logon token Git runs under |
-//! | `launch` | Starting a program under a token |
+//! | `job` | The job every child of an invocation is made in |
+//! | `launch` | Starting a program: the broker's one process creation |
+//! | `sd` | The security descriptors the broker makes |
 //! | `verify` | The check that the payload was signed by the publisher |
 //! | `applocker` | PowerShell's application-control cmdlets and the event log |
 //! | `pipe` | The broker's local pipe |
@@ -24,10 +26,12 @@ pub mod applocker;
 pub mod broker;
 pub mod ffi;
 pub mod install;
+pub mod job;
 pub mod launch;
 pub mod pipe;
 pub mod proof;
 pub mod registry;
+pub mod sd;
 pub mod service;
 pub mod setup;
 pub mod token;

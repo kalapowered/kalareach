@@ -5,13 +5,22 @@
 //! PowerShell runs by its absolute path with nothing from the caller's environment: its module
 //! path is the system's alone, and its temporary directory and working directory are a directory
 //! only administrators can write. The AppLocker module is imported by its system path. Only
-//! inline commands run, never a script file.
+//! inline commands run, never a script file. PowerShell is the installation's own channel and runs
+//! in the setup program's process; the broker never reaches it.
+//!
+//! The event log is read by the broker's proof, so the program that reads it starts through the
+//! broker's one launcher, under the broker's own token.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
+use crate::env::EnvBlock;
 use crate::events::{self, LogEvent};
 use crate::policy::Policy;
+use crate::quote::quote_command_line;
+
+use super::launch::{self, LaunchError, Outcome, Run, TokenSpec, VerifiedPath};
 
 /// The application-control log that holds the executable collection's events.
 const LOG: &str = "Microsoft-Windows-AppLocker/EXE and DLL";
@@ -37,6 +46,14 @@ pub enum Error {
         /// What it wrote.
         output: String,
     },
+    /// A program of the proof could not be started through the launcher.
+    #[error("{what} could not be started: {source}")]
+    Launch {
+        /// What was being started.
+        what: &'static str,
+        /// The reason.
+        source: LaunchError,
+    },
     /// The answer could not be read.
     #[error("{0}")]
     Unreadable(String),
@@ -46,6 +63,7 @@ fn system_root() -> PathBuf {
     PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()))
 }
 
+/// Runs PowerShell, the installation's channel, and returns what it wrote.
 fn run(
     program: &Path,
     arguments: &[&str],
@@ -165,12 +183,41 @@ impl Channel {
     }
 }
 
-fn query(extra: &[&str], scratch: &Path) -> Result<Vec<LogEvent>, Error> {
+fn query(extra: &[&str], scratch: &Path, env: &EnvBlock) -> Result<Vec<LogEvent>, Error> {
+    let what = "the event log query";
     let program = system_root().join("System32").join("wevtutil.exe");
-    let mut arguments = vec!["qe", LOG, "/f:xml", "/e:Events"];
-    arguments.extend_from_slice(extra);
-    let text = run(&program, &arguments, scratch, "the event log query")?;
-    events::parse(&text).map_err(|error| Error::Unreadable(error.to_string()))
+    let name = program.display().to_string();
+    let mut parts = vec![name.as_str(), "qe", LOG, "/f:xml", "/e:Events"];
+    parts.extend_from_slice(extra);
+    let launch_error = |source| Error::Launch { what, source };
+    let program = VerifiedPath::new(&program).map_err(launch_error)?;
+    let captured = launch::run_captured(
+        Run {
+            token: TokenSpec::Own,
+            group: None,
+            program,
+            command_line: quote_command_line(&parts),
+            cwd: scratch,
+            env,
+        },
+        Duration::from_secs(60),
+    )
+    .map_err(launch_error)?;
+    let text = String::from_utf8_lossy(&captured.stdout).into_owned();
+    match captured.outcome {
+        Outcome::Ran(0) => {
+            events::parse(&text).map_err(|error| Error::Unreadable(error.to_string()))
+        }
+        other => Err(Error::Failed {
+            what,
+            status: format!("{other:?}"),
+            output: format!(
+                "{} {}",
+                text.trim(),
+                String::from_utf8_lossy(&captured.stderr).trim()
+            ),
+        }),
+    }
 }
 
 /// The newest record number in the log, or zero when it is empty. A failed query is an error: an
@@ -179,8 +226,8 @@ fn query(extra: &[&str], scratch: &Path) -> Result<Vec<LogEvent>, Error> {
 /// # Errors
 ///
 /// Returns an error when the query fails or its answer cannot be read.
-pub fn newest_record(scratch: &Path) -> Result<u64, Error> {
-    let events = query(&["/c:1", "/rd:true"], scratch)?;
+pub fn newest_record(scratch: &Path, env: &EnvBlock) -> Result<u64, Error> {
+    let events = query(&["/c:1", "/rd:true"], scratch, env)?;
     Ok(events.iter().map(|event| event.record).max().unwrap_or(0))
 }
 
@@ -189,10 +236,10 @@ pub fn newest_record(scratch: &Path) -> Result<u64, Error> {
 /// # Errors
 ///
 /// Returns an error when the query fails or its answer cannot be read.
-pub fn blocked_after(record: u64, scratch: &Path) -> Result<Vec<LogEvent>, Error> {
+pub fn blocked_after(record: u64, scratch: &Path, env: &EnvBlock) -> Result<Vec<LogEvent>, Error> {
     let filter = format!(
         "/q:*[System[(EventID={}) and (EventRecordID>{record})]]",
         events::BLOCKED
     );
-    query(&[&filter], scratch)
+    query(&[&filter], scratch, env)
 }

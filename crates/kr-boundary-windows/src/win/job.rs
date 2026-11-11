@@ -1,0 +1,318 @@
+//! The job every child of an invocation is made in.
+//!
+//! The job is unnamed, so nothing opens it by name, and only the broker holds a handle to it. It
+//! kills every process in it when its last handle closes, ends a process that dies of an
+//! unhandled exception, and caps the number of processes and the memory the job may use. A
+//! completion port is attached to it, but the port's messages are only a reason to look again: what
+//! decides that a job has ended is the job's own count of active processes and the retained
+//! process objects, read after the wake-up.
+
+#![allow(unsafe_code)]
+
+use std::ffi::c_void;
+use std::ptr::{null, null_mut};
+use std::time::{Duration, Instant};
+
+use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
+use windows_sys::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus};
+use windows_sys::Win32::System::JobObjects::{
+    CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_JOB_MEMORY,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_ASSOCIATE_COMPLETION_PORT,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectAssociateCompletionPortInformation,
+    JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+    TerminateJobObject,
+};
+use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+use super::ffi::{Handle, Result, error, last};
+use super::launch::Child;
+
+/// What the job holds a process tree to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// The most processes the job may hold at once.
+    pub active_processes: u32,
+    /// The most memory the whole job may commit, in bytes.
+    pub memory_bytes: usize,
+}
+
+impl Limits {
+    /// The caps of an invocation's job: sixteen processes and one gibibyte.
+    pub const INVOCATION: Limits = Limits {
+        active_processes: 16,
+        memory_bytes: 1 << 30,
+    };
+}
+
+/// The limit flags every job carries: kill on close, die on an unhandled exception, an
+/// active-process cap and a job memory cap.
+pub const LIMIT_FLAGS: u32 = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
+    | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+    | JOB_OBJECT_LIMIT_JOB_MEMORY;
+
+/// What the platform reports a job's limits to be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadBack {
+    /// The limit flags in force.
+    pub flags: u32,
+    /// The cap on active processes.
+    pub active_processes: u32,
+    /// The cap on the job's memory, in bytes.
+    pub memory_bytes: usize,
+}
+
+/// Where a job is in its life.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    /// No end has been asked of it.
+    Fresh,
+    /// [`Job::end`] has run: every process was ended.
+    Ended,
+}
+
+/// How an end went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ended {
+    /// Every retained process object is signalled: each process has exited.
+    pub all_exited: bool,
+    /// The job's own count of active processes is zero.
+    pub active_zero: bool,
+}
+
+/// A job object with a completion port.
+#[derive(Debug)]
+pub struct Job {
+    handle: Handle,
+    port: Handle,
+    state: State,
+}
+
+impl Job {
+    /// Makes an unnamed job with the limits, reads the limits back from the platform and refuses a
+    /// job whose limits are not the ones asked for.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error when the job, its limits or its port cannot be made, or an
+    /// error when the limits read back differ from the limits set.
+    pub fn new(limits: Limits) -> Result<Job> {
+        // SAFETY: no attributes and no name: the job is unnamed and its handle is not inheritable.
+        let raw = unsafe { CreateJobObjectW(null(), null()) };
+        let handle = Handle::new(raw, "making the job")?;
+        // SAFETY: a zeroed record is the documented starting point.
+        let mut extended: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        extended.BasicLimitInformation.LimitFlags = LIMIT_FLAGS;
+        extended.BasicLimitInformation.ActiveProcessLimit = limits.active_processes;
+        extended.JobMemoryLimit = limits.memory_bytes;
+        // SAFETY: the handle is open and the record is the size the class takes.
+        let set = unsafe {
+            SetInformationJobObject(
+                handle.raw(),
+                JobObjectExtendedLimitInformation,
+                (&raw const extended).cast::<c_void>(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if set == 0 {
+            return Err(last("setting the job's limits"));
+        }
+        // SAFETY: a completion port made with no file is the documented way to make a new one.
+        let port_raw = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, null_mut(), 0, 1) };
+        let port = Handle::new(port_raw, "making the job's completion port")?;
+        let association = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
+            CompletionKey: null_mut(),
+            CompletionPort: port.raw(),
+        };
+        // SAFETY: the job and the port are open and the record is the size the class takes.
+        let associated = unsafe {
+            SetInformationJobObject(
+                handle.raw(),
+                JobObjectAssociateCompletionPortInformation,
+                (&raw const association).cast::<c_void>(),
+                size_of::<JOBOBJECT_ASSOCIATE_COMPLETION_PORT>() as u32,
+            )
+        };
+        if associated == 0 {
+            return Err(last("attaching the completion port to the job"));
+        }
+        let job = Job {
+            handle,
+            port,
+            state: State::Fresh,
+        };
+        let read = job.read_back()?;
+        if read.flags != LIMIT_FLAGS
+            || read.active_processes != limits.active_processes
+            || read.memory_bytes != limits.memory_bytes
+        {
+            return Err(error(
+                0,
+                format!("the job's limits read back as {read:?}, not as set ({limits:?})"),
+            ));
+        }
+        Ok(job)
+    }
+
+    /// The raw handle, still owned by the job.
+    pub(super) fn raw(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.handle.raw()
+    }
+
+    /// Where the job is in its life.
+    #[must_use]
+    pub fn state(&self) -> State {
+        self.state
+    }
+
+    /// The limits the platform reports for the job.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error when the job cannot be queried.
+    pub fn read_back(&self) -> Result<ReadBack> {
+        // SAFETY: a zeroed record is what the platform fills in.
+        let mut extended: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: the handle is open and the record is the size the class takes.
+        let queried = unsafe {
+            QueryInformationJobObject(
+                self.handle.raw(),
+                JobObjectExtendedLimitInformation,
+                (&raw mut extended).cast::<c_void>(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                null_mut(),
+            )
+        };
+        if queried == 0 {
+            return Err(last("reading the job's limits"));
+        }
+        Ok(ReadBack {
+            flags: extended.BasicLimitInformation.LimitFlags,
+            active_processes: extended.BasicLimitInformation.ActiveProcessLimit,
+            memory_bytes: extended.JobMemoryLimit,
+        })
+    }
+
+    /// The job's own count of active processes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error when the job cannot be queried. A caller that cannot tell must
+    /// not take the count for zero.
+    pub fn active_processes(&self) -> Result<u32> {
+        // SAFETY: a zeroed record is what the platform fills in.
+        let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: the handle is open and the record is the size the class takes.
+        let queried = unsafe {
+            QueryInformationJobObject(
+                self.handle.raw(),
+                JobObjectBasicAccountingInformation,
+                (&raw mut accounting).cast::<c_void>(),
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                null_mut(),
+            )
+        };
+        if queried == 0 {
+            return Err(last("reading the job's active process count"));
+        }
+        Ok(accounting.ActiveProcesses)
+    }
+
+    /// The identifiers of the processes in the job now.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error when the job cannot be queried or holds more processes than
+    /// its cap allows the list to name.
+    pub fn process_ids(&self) -> Result<Vec<u32>> {
+        const CAPACITY: usize = 256;
+        // The record is a count pair followed by an array of identifiers.
+        let mut storage = vec![0_usize; 2 + CAPACITY];
+        // SAFETY: the buffer is aligned for the record and large enough for `CAPACITY` entries.
+        let queried = unsafe {
+            QueryInformationJobObject(
+                self.handle.raw(),
+                JobObjectBasicProcessIdList,
+                storage.as_mut_ptr().cast::<c_void>(),
+                (storage.len() * size_of::<usize>()) as u32,
+                null_mut(),
+            )
+        };
+        if queried == 0 {
+            return Err(last("listing the job's processes"));
+        }
+        // SAFETY: the buffer holds a record the platform filled in.
+        let list = unsafe { &*storage.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
+        let listed = list.NumberOfProcessIdsInList as usize;
+        if listed < list.NumberOfAssignedProcesses as usize {
+            return Err(error(
+                0,
+                "the job holds more processes than the list can name",
+            ));
+        }
+        Ok(storage[2..2 + listed].iter().map(|id| *id as u32).collect())
+    }
+
+    /// Whether a process is in this job.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error when the question cannot be asked.
+    pub fn contains(&self, process: &Handle) -> Result<bool> {
+        let mut inside = 0;
+        // SAFETY: both handles are open.
+        let asked = unsafe { IsProcessInJob(process.raw(), self.handle.raw(), &raw mut inside) };
+        if asked == 0 {
+            return Err(last("asking whether a process is in the job"));
+        }
+        Ok(inside != 0)
+    }
+
+    /// Ends every process in the job and waits, up to a bound, until each has gone.
+    ///
+    /// The completion port wakes the wait; the answer is the job's own active count and the
+    /// retained process objects, read after each wake-up. A message that never comes changes
+    /// nothing but how soon the next read happens.
+    pub fn end(&mut self, retained: &[&Child], bound: Duration) -> Ended {
+        self.state = State::Ended;
+        // SAFETY: the handle is open.
+        unsafe {
+            TerminateJobObject(self.handle.raw(), 1);
+        }
+        let deadline = Instant::now() + bound;
+        loop {
+            let all_exited = retained.iter().all(|child| {
+                // SAFETY: the retained process handle is open.
+                unsafe { WaitForSingleObject(child.process.raw(), 0) == WAIT_OBJECT_0 }
+            });
+            let active_zero = self.active_processes().is_ok_and(|count| count == 0);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if (all_exited && active_zero) || remaining.is_zero() {
+                return Ended {
+                    all_exited,
+                    active_zero,
+                };
+            }
+            self.wait_for_message(remaining.min(Duration::from_millis(100)));
+        }
+    }
+
+    fn wait_for_message(&self, up_to: Duration) {
+        let mut bytes = 0_u32;
+        let mut key = 0_usize;
+        let mut overlapped = null_mut();
+        // SAFETY: the port is open and the out-parameters are this function's own.
+        unsafe {
+            GetQueuedCompletionStatus(
+                self.port.raw(),
+                &raw mut bytes,
+                &raw mut key,
+                &raw mut overlapped,
+                u32::try_from(up_to.as_millis()).unwrap_or(u32::MAX),
+            );
+        }
+    }
+}

@@ -9,8 +9,7 @@ use std::ptr::null_mut;
 
 use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSecurityDescriptorToStringSecurityDescriptorW,
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
     SetNamedSecurityInfoW,
 };
 use windows_sys::Win32::Security::{
@@ -19,66 +18,53 @@ use windows_sys::Win32::Security::{
     PROTECTED_DACL_SECURITY_INFORMATION,
 };
 
-use super::ffi::{Result, Sid, error, from_wide, last, wide, wide_path};
+use super::ffi::{Result, Sid, error, from_wide, last, wide_path};
+use super::sd::OwnedSd;
 
 const SDDL_REVISION_1: u32 = 1;
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const INHERIT_ONLY_ACE: u8 = 0x08;
 
-/// A directory only the system and administrators may change, which anyone may read and enter.
-pub const READABLE_PROTECTED: &str = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
-/// A directory only the system and administrators may use at all.
-pub const ADMIN_ONLY: &str = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
-
-/// Replaces a path's permissions with the list an SDDL string describes and stops it inheriting.
+/// Replaces a path's permissions with a descriptor's list and stops it inheriting.
 ///
 /// # Errors
 ///
-/// Returns the platform's error when the text is not a list or the path cannot be changed.
-pub fn set_protected(path: &Path, sddl: &str) -> Result<()> {
-    let text = wide(sddl);
-    let mut descriptor: *mut c_void = null_mut();
-    // SAFETY: the text is NUL-terminated and the descriptor is an out-parameter freed below.
-    unsafe {
-        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            text.as_ptr(),
-            SDDL_REVISION_1,
-            &raw mut descriptor,
-            null_mut(),
-        ) == 0
-        {
-            return Err(last(format!("reading the permission list {sddl}")));
-        }
-        let mut present = 0;
-        let mut defaulted = 0;
-        let mut dacl: *mut ACL = null_mut();
-        let got = GetSecurityDescriptorDacl(
-            descriptor,
+/// Returns the platform's error when the descriptor has no list or the path cannot be changed.
+pub fn set_protected(path: &Path, descriptor: &OwnedSd) -> Result<()> {
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut dacl: *mut ACL = null_mut();
+    // SAFETY: the descriptor is valid and the out-parameters are local.
+    let got = unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor.as_ptr(),
             &raw mut present,
             &raw mut dacl,
             &raw mut defaulted,
-        );
-        let path_text = wide_path(path);
-        let status = if got == 0 || present == 0 {
-            1_u32
-        } else {
-            SetNamedSecurityInfoW(
-                path_text.as_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                null_mut(),
-                null_mut(),
-                dacl,
-                null_mut(),
-            )
-        };
-        LocalFree(descriptor);
-        if status != 0 {
-            return Err(error(
-                status,
-                format!("setting the permissions of {}", path.display()),
-            ));
-        }
+        )
+    };
+    if got == 0 || present == 0 {
+        return Err(error(1, "the descriptor has no permission list"));
+    }
+    let path_text = wide_path(path);
+    // SAFETY: the path is NUL-terminated and the list belongs to the descriptor, which outlives the
+    // call.
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            path_text.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            dacl,
+            null_mut(),
+        )
+    };
+    if status != 0 {
+        return Err(error(
+            status,
+            format!("setting the permissions of {}", path.display()),
+        ));
     }
     Ok(())
 }
