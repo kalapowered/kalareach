@@ -660,10 +660,10 @@ fn is_ntfs_dotgitattributes(name: &[u8]) -> bool {
     let mut i = 0;
     let mut saw_tilde = false;
     while i < 8 {
+        // Git tests for the end of the name and for a byte over 0x7f before it lowercases; here a
+        // NUL and such a byte are no digit, no tilde and no prefix byte, so they fail below.
         let c = at(i);
-        if c == 0 {
-            return false;
-        } else if saw_tilde {
+        if saw_tilde {
             if !c.is_ascii_digit() {
                 return false;
             }
@@ -673,7 +673,7 @@ fn is_ntfs_dotgitattributes(name: &[u8]) -> bool {
                 return false;
             }
             saw_tilde = true;
-        } else if i >= 6 || c >= 0x80 || c.to_ascii_lowercase() != FALL_BACK_PREFIX[i] {
+        } else if i >= 6 || c.to_ascii_lowercase() != FALL_BACK_PREFIX[i] {
             return false;
         }
         i += 1;
