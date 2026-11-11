@@ -20,7 +20,7 @@
 //! | [`repository`] | What the broker reads of a repository before it starts Git, from bytes alone: its `HEAD`, its attributes, its configuration listing and the output of the five readers it runs |
 //! | [`refusal`] | The refusal those readers give: a kind, the rule's name and a short text |
 //! | [`names`] | The grammar of the branch names and object identifiers the broker admits |
-//! | [`operation`] | The eight commands a request may name: their argument tables, the settings every command runs with and the one rule for line endings |
+//! | [`operation`] | The eight commands a request may name: their argument tables, the settings every command runs with, the one rule for line endings, and the checks of the repository's state |
 //! | [`state`] | What the doctor says in each state of the installation |
 //!
 //! The calls that touch the machine live in `win`, which builds on Windows only. Everything above
