@@ -18,8 +18,7 @@ use kr_protocol::transfer::{
     DraftDiscardResult, InsertionMethod,
 };
 
-use super::a_copy_a_service_withheld::two_copies_with_a_fence_between_the_checks;
-use super::a_copy_from_a_services_record::{EVERY_RIGHT, mutation_of, refusal_of, two_copies};
+use super::a_copy_from_a_services_record::{EVERY_RIGHT, mutation_of, two_copies};
 use super::a_draft_a_device_writes::{
     a_draft_for, create_params, result_of, the_owner, write_naming,
 };
@@ -342,21 +341,18 @@ async fn a_copy_of_a_discard_that_reaches_the_service_after_the_draft_is_gone_is
     world.serving.abort();
 }
 
-/// KR-REQ-09.09: a discard is withheld while this host owes a fence it could not raise, as every
-/// write is. A first discard is refused at the ask and the draft stands; the control is the same
-/// discard once the fence is gone, which ends it. A copy that read the record another copy left, and
-/// whose service asked its check with the fence owed, is told the outcome is not shown when the
-/// fence is gone by the time the door asks its own, and not the record; with no fence owed both
-/// copies are given the record.
+/// KR-REQ-09.09: a first discard is withheld while this host owes a fence it could not raise, as
+/// every write is: it is refused at the ask and the draft stands. The control is the same discard
+/// once the fence is gone, which ends it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_discard_is_withheld_while_a_fence_is_owed() {
+async fn a_first_discard_is_refused_while_a_fence_is_owed_and_the_draft_stands() {
     let world = fake::fake_worker(None).await;
     let controller = &world.controller;
     let service = controller.transfer().service();
     let (connection, _) = paired_connection(controller, 57, EVERY_RIGHT);
     let device = connection.device.principal();
-
     let own = a_draft_for(&world, &device, None);
+
     controller.hold_fence(true);
     let refused = connection
         .mutate(&discard(&world, &connection, 1, own.draft_id))
@@ -375,22 +371,77 @@ async fn a_discard_is_withheld_while_a_fence_is_owed() {
             .mutate(&discard(&world, &connection, 2, own.draft_id))
             .await,
     );
+}
 
-    for (fence, rid) in [(false, 91), (true, 92)] {
-        let draft = a_draft_for(&world, &device, None);
-        let mutation = discard(&world, &connection, rid, draft.draft_id);
-        let (copied, fresh) =
-            two_copies_with_a_fence_between_the_checks(controller, &connection, &mutation, fence)
-                .await;
-        let _: DraftDiscardResult = result_of(fresh.frame());
-        if fence {
-            let told = refusal_of(&copied);
-            assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
-        } else {
-            let _: DraftDiscardResult = result_of(copied.frame());
-        }
-    }
-    world.serving.abort();
+/// KR-REQ-09.09 and 26.16: the record of a performed discard is not given back to a repeat that
+/// reaches the service while this host owes a fence it could not raise: the service withholds it,
+/// whatever the fence is by the time the door asks its own check. The control is the same repeat with
+/// nothing owed, which is given the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_copy_of_a_performed_discard_is_withheld_while_a_fence_is_owed() {
+    use crate::service::the_fence_at_every_effect::{
+        admitted, carried, daemon, mutation_of as local_mutation, refused_for_a_fence,
+    };
+
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let draft = controller
+        .transfer()
+        .service()
+        .draft_create(
+            &actor_id,
+            &kr_protocol::transfer::DraftCreateParams {
+                environment_id: temp.environment_id(),
+                device_id: Nullable::null(),
+                session_id: Nullable::null(),
+                application_instance_id: Nullable::null(),
+                text: "to be ended".to_owned(),
+            },
+            None,
+            None,
+        )
+        .expect("the owner's draft")
+        .draft;
+    let mutation = local_mutation(
+        &temp,
+        Method::DraftDiscard,
+        ParamsValue::from_typed(&DraftDiscardParams {
+            draft_id: draft.draft_id,
+        })
+        .expect("encodes"),
+    );
+    let attempt = || {
+        controller.transfer().write(
+            &actor_id,
+            &mutation,
+            Method::DraftDiscard,
+            crate::transfer::TransferAdmission::new(
+                std::sync::Arc::clone(&controller),
+                carried(&controller, connection_id),
+            ),
+            None,
+        )
+    };
+
+    let first = attempt().await;
+    assert!(!first.is_copied(), "the first attempt performs");
+    first.into_answer().expect("the draft is ended");
+    let copy = attempt().await;
+    assert!(copy.is_copied(), "the repeat is given the record");
+    copy.into_answer()
+        .expect("with nothing owed the repeat is answered from the record");
+
+    controller.hold_fence(true);
+    let refused = attempt()
+        .await
+        .into_withheld()
+        .expect_err("a fence this host owes stops the record");
+    refused_for_a_fence(&refused);
+    controller.hold_fence(false);
+    attempt()
+        .await
+        .into_answer()
+        .expect("once the fence is gone it is answered again");
 }
 
 /// KR-REQ-23.41: the person at this machine ends the owner's own drafts at the local door, and
