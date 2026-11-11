@@ -27,7 +27,7 @@ use windows_sys::Wdk::Storage::FileSystem::{
 };
 use windows_sys::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, GetLastError, HANDLE,
-    OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
+    RtlNtStatusToDosError, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ExtendedFileIdType, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -720,7 +720,9 @@ impl DirHandle {
             Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
             RootDirectory: self.handle.raw(),
             ObjectName: &raw const text,
-            Attributes: OBJ_CASE_INSENSITIVE,
+            // Names come from a listing and are matched exactly, so a directory that tells names apart
+            // by case never opens the wrong one.
+            Attributes: 0,
             SecurityDescriptor: null(),
             SecurityQualityOfService: null(),
         };
