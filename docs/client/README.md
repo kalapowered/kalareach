@@ -403,13 +403,16 @@ request identifier comes from the session's counter, so none repeats one the con
 The route remembers a window the host refused as not permitted, and the lane that replaces the
 failed one waits for a window with another identifier; if none arrives before the refused one would
 have expired, the lane has none (`NoActionWindow`) and the driver goes on as for any failed lane.
-The lane opens its stream for its first call, after it has that window, and not when the caller
-asks for the lane: a wait for a window can last as long as a window's validity, and a host resets
-a stream that stands idle for less, so a stream opened before the wait would be dead when the
-chunk went on it. A lane that waits holds no stream and none of the connection's four transfer
-slots, and the failures of the open come back from its first call.
-Before each chunk the lane asks the transport whether this device ended the connection, as a
-sign-out does, and stops with the reason the transport recorded.
+The lane opens its stream for a call after it has that window, and not when the caller asks for
+the lane: a wait for a window can last as long as a window's validity, and a host resets a stream
+that stands idle for less, so a stream held through the wait would be dead when the chunk went on
+it. A lane that waits holds no stream and none of the connection's four transfer slots: one that
+has carried a chunk finishes its stream before the wait, between two calls, so the host reads a
+clean end, and opens another for the call once it has its window. The failures of an open come
+back from the call that makes it.
+The lane asks the transport whether this device ended the connection, as a sign-out does, before
+each chunk and on every way out of a call or a wait, and stops with the reason the transport
+recorded.
 
 The client bounds every wait on the host, because its stream registry holds no deadlines. The open
 of the stream, which waits for the host's stream credit while it holds one of the connection's four

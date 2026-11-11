@@ -21,10 +21,11 @@
 //! and windows, so a chunk carries the window the control connection's reader last received, and
 //! its request identifier comes from the same counter as the session's.
 //!
-//! A network lane opens its stream for its first call, once it has the window that call carries. A
-//! wait for a window can last as long as a window's validity, which is longer than the host lets
-//! a stream stand idle, so the lane holds no stream, and no one of the connection's bulk slots,
-//! until it has a window to carry.
+//! A network lane opens its stream for a call once it has the window that call carries. A wait for
+//! a window can last as long as a window's validity, which is longer than the host lets a stream
+//! stand idle, so a lane that has to wait gives up the stream it holds before it waits, and opens
+//! another for the call: while it waits it holds no stream, and none of the connection's bulk
+//! slots.
 //!
 //! The client owns the bound on every wait for a paired host in a lane: the open of the stream
 //! (thirty seconds), which waits for the host's credit and writes the header, and a chunk's write
@@ -399,8 +400,9 @@ impl ChunkLane {
     /// received the chunk; the host's own refusal under its code; and a refusal when the answer
     /// names another transfer or chunk.
     ///
-    /// The first call of a lane on a paired host's connection also opens the lane's stream, once it
-    /// has its window, and returns what the open fails with: a transport failure (a deadline of
+    /// A call of a lane on a paired host's connection that has no stream (the first call, and a call
+    /// that followed a wait for a window) also opens the lane's stream, once it has its window, and
+    /// returns what the open fails with: a transport failure (a deadline of
     /// the header kind) when the host gave no credit for the stream or did not take its header
     /// within thirty seconds, and the bulk-limit refusal when the connection already holds as many
     /// transfer streams as it allows. The lane has ended then, as it has when any call fails on
@@ -852,6 +854,44 @@ enum Unavailable {
     RanOut,
 }
 
+/// What the lane holds, judged at this moment.
+enum Held {
+    /// The newest window, received less than half its validity ago and not turned down.
+    Carry(ActionWindow),
+    /// The renewal is due or the window was turned down: the call waits for the next one, until the
+    /// window it holds would have expired.
+    Renewal { expiry: tokio::time::Instant },
+}
+
+/// Judges the window the lane holds, without waiting.
+fn held_window(
+    issued: &mut watch::Receiver<Issued>,
+    clock: &LaneClock,
+    source: Option<&WindowSource>,
+) -> std::result::Result<Held, Unavailable> {
+    let held = issued.borrow_and_update().clone();
+    if held.window.valid_for_ms.get() == 0 {
+        return Err(Unavailable::Nothing);
+    }
+    // A paired host's window is held to the protocol's longest, so that a host that states a
+    // longer one cannot keep a lane waiting on a refused window past that.
+    let validity = if source.is_some() {
+        held.validity().min(Duration::from_millis(
+            kr_protocol::limits::MAX_ACTION_WINDOW.get(),
+        ))
+    } else {
+        held.validity()
+    };
+    let turned_down =
+        source.is_some_and(|source| source.turned_down(&held.window.action_window_id));
+    if !turned_down && clock.now().saturating_duration_since(held.received_at) < validity / 2 {
+        return Ok(Held::Carry(held.window));
+    }
+    Ok(Held::Renewal {
+        expiry: held.received_at + validity,
+    })
+}
+
 /// The window a call carries: the newest the host issued, once the lane has received it less than
 /// half its validity ago.
 ///
@@ -865,27 +905,11 @@ async fn newest_window(
     source: Option<&WindowSource>,
 ) -> std::result::Result<ActionWindow, Unavailable> {
     loop {
-        let held = issued.borrow_and_update().clone();
-        if held.window.valid_for_ms.get() == 0 {
-            return Err(Unavailable::Nothing);
-        }
-        // A paired host's window is held to the protocol's longest, so that a host that states a
-        // longer one cannot keep a lane waiting on a refused window past that.
-        let validity = if source.is_some() {
-            held.validity().min(Duration::from_millis(
-                kr_protocol::limits::MAX_ACTION_WINDOW.get(),
-            ))
-        } else {
-            held.validity()
+        let expiry = match held_window(issued, clock, source)? {
+            Held::Carry(window) => return Ok(window),
+            // The reader delivers the next window as soon as it arrives.
+            Held::Renewal { expiry } => expiry,
         };
-        let turned_down =
-            source.is_some_and(|source| source.turned_down(&held.window.action_window_id));
-        if !turned_down && clock.now().saturating_duration_since(held.received_at) < validity / 2 {
-            return Ok(held.window);
-        }
-        // The renewal is due, or the host turned this window down. The reader delivers the next
-        // one as soon as it arrives.
-        let expiry = held.received_at + validity;
         match tokio::time::timeout_at(clock.timer_deadline(expiry), issued.changed()).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => return Err(Unavailable::SourceEnded),
@@ -977,10 +1001,11 @@ fn lane_bounds() -> TimerDeadlines {
 ///
 /// One stream carries the transfer's chunks in turn: a frame, then its answer on the same stream.
 /// The window a chunk carries is the control connection's newest, taken as a local lane takes its
-/// own, and its request identifier comes from the session's counter. The stream is opened for the
-/// first call, after the lane has the window that call carries: a wait for a window can outlast
-/// what the host lets an open stream stand idle, and the stream the lane would hold through it
-/// would be reset when the chunk went on it.
+/// own, and its request identifier comes from the session's counter. The stream is opened for a
+/// call after the lane has the window that call carries. A wait for a window can outlast what the
+/// host lets an open stream stand idle, and a stream held through it would be reset when the chunk
+/// went on it, so a lane that has carried a chunk and has to wait for its next window finishes its
+/// stream first; the lane is between calls then, and the host reads a clean end.
 ///
 /// Every wait on the host is under a bound of the lane's own: the open and the write of the header,
 /// and a chunk's write with the wait for its answer. A bound that passes ends the lane, which
@@ -1007,7 +1032,8 @@ struct NetworkCarrier {
 
 /// Where a network lane's stream stands.
 enum LaneStream {
-    /// Not opened: the header the open will write, for the lane's first call.
+    /// Not opened, because the lane has not carried a call yet or gave its stream up before a wait
+    /// for a window: the header the next open writes.
     Unopened(StreamHeader),
     Open(DataStream),
     /// Reset and dropped when the lane ended.
@@ -1099,6 +1125,18 @@ impl NetworkCarrier {
     async fn window(&mut self) -> Result<ActionWindow> {
         if matches!(self.stream, LaneStream::Ended) {
             return Err(ClientError::ConnectionEnded);
+        }
+        // A lane that has carried a chunk holds a stream, and the host resets one that stands idle
+        // for far less than a renewal can take. The lane is between calls, so the stream gives way
+        // before the wait and finishes cleanly, and the call opens another once it has its window.
+        if let LaneStream::Open(stream) = &self.stream {
+            let header = stream.header().clone();
+            if matches!(
+                held_window(&mut self.issued, &self.clock, Some(&self.source)),
+                Ok(Held::Renewal { .. })
+            ) {
+                self.stream = LaneStream::Unopened(header);
+            }
         }
         // The wait for a renewal ends with the connection: the session keeps its windows after its
         // reader stops, so what says the connection is gone is the revocation of the connection's

@@ -207,6 +207,9 @@ struct SeenChunk {
 struct Seen {
     /// Streams whose header the host read, and each header.
     headers: Vec<StreamHeader>,
+    /// Streams of those whose host side has ended, however it ended: the client finished it or
+    /// reset it, or the host's idle bound reset it.
+    ended_streams: u64,
     chunks: Vec<SeenChunk>,
     stored: BTreeSet<u64>,
     begins: u64,
@@ -283,6 +286,16 @@ impl Script {
         })
         .await
         .unwrap_or_else(|_| panic!("the host never saw {what}"));
+    }
+
+    /// Waits until the host side of every stream whose header it read has ended. After the idle
+    /// bound has passed, that is the host's acknowledgement that it reset each stream that stood
+    /// idle, so a case that renews a window next knows the reset came first.
+    async fn until_every_stream_has_ended(&self) {
+        self.until("the end of every stream the host read", |seen| {
+            seen.ended_streams == seen.headers.len() as u64
+        })
+        .await;
     }
 
     /// The host's idle bound passes: every stream that waits for a frame at this moment is reset, as
@@ -531,6 +544,15 @@ fn control_reply(script: &Arc<Script>, frame: ControlFrame) -> Option<ControlFra
 }
 
 /// Takes one data stream: its header, and then a chunk at a time.
+/// Records that the host's side of a stream whose header it read has ended, however it ended.
+struct Ends(Arc<Script>);
+
+impl Drop for Ends {
+    fn drop(&mut self) {
+        self.0.record(|seen| seen.ended_streams += 1);
+    }
+}
+
 async fn serve_stream(
     script: Arc<Script>,
     pending: kr_transport::streams::PendingStream,
@@ -543,6 +565,7 @@ async fn serve_stream(
     // the idle bound pass is never missed.
     let mut idle = script.idle.subscribe();
     script.record(|seen| seen.headers.push(stream.header().clone()));
+    let _ends = Ends(Arc::clone(&script));
     if script.refuses_streams.load(Ordering::Acquire) {
         stream.reset();
         return;
@@ -1070,6 +1093,86 @@ async fn a_lane_that_waits_for_a_window_holds_no_stream_for_the_host_to_reset() 
             .collect();
         assert_eq!(windows, vec![refused.as_str(), "replacement"]);
         assert_eq!(seen.stored, BTreeSet::from([0]));
+    });
+    session.close();
+    serving.abort();
+}
+
+/// KR-REQ-23.21: a lane that has carried a chunk gives up its stream before it waits for its next
+/// window. Two uploads share one route and so one window: the first lane carries a chunk and holds
+/// its stream; the second lane is refused the shared window; the first lane's next call then waits
+/// for a window the host has not issued. The host's idle bound passes during the wait, and the
+/// case goes on once the host has ended every stream it read, so a stream the lane still held
+/// would be dead. The chunk goes on a new stream, under the new window, with nothing retried.
+#[tokio::test]
+async fn a_lane_that_carried_a_chunk_gives_up_its_stream_before_it_waits_for_a_window() {
+    let script = Script::new(true);
+    script.reserved(64);
+    let opened = Arc::new(AtomicU64::new(0));
+    let count = Arc::clone(&opened);
+    let (session, _host, _client, serving) = pair_over(Arc::clone(&script), move |transport| {
+        Ok(Arc::new(Counted {
+            inner: Arc::new(transport),
+            opened: count,
+        }) as Arc<dyn ControlTransport>)
+    })
+    .await;
+    let shared = session.action_window().await.action_window_id;
+    let route = ChunkRoute::network(&session, environment())
+        .await
+        .expect("a route");
+    let first_transfer = TransferId::new(Uuid::from_bytes([10; 16]));
+    let second_transfer = TransferId::new(Uuid::from_bytes([11; 16]));
+    let at = target();
+
+    let mut first = within(route.open(first_transfer)).await.expect("a lane");
+    within(first.send_chunk(&at, &some_chunk(first_transfer), TTL))
+        .await
+        .expect("the first lane carries a chunk and holds its stream");
+    *script.ended_window.lock().expect("the script") = Some(shared.clone());
+    let mut second = within(route.open(second_transfer)).await.expect("a lane");
+    let turned_down = within(second.send_chunk(&at, &some_chunk(second_transfer), TTL))
+        .await
+        .expect_err("the host refuses the shared window");
+    assert_eq!(turned_down.code(), ErrorCode::PermissionDenied);
+    drop(second);
+
+    let chunk = some_chunk(first_transfer);
+    let mut next = std::pin::pin!(first.send_chunk(&at, &chunk, TTL));
+    assert!(
+        waits(&mut next).await,
+        "the first lane waits for a window the host has not issued"
+    );
+    script
+        .until("the header of every stream the client opened", |seen| {
+            seen.headers.len() as u64 == opened.load(Ordering::Acquire)
+        })
+        .await;
+    script.idle_bound_passes();
+    script.until_every_stream_has_ended().await;
+    script.renew_to("replacement", session.transport().connection_id());
+    within(next)
+        .await
+        .expect("the chunk goes under the new window, on a stream the bound did not reach");
+    assert_eq!(
+        opened.load(Ordering::Acquire),
+        3,
+        "the first lane opened a second stream for its second chunk"
+    );
+    script.seen(|seen| {
+        let windows: Vec<&str> = seen
+            .chunks
+            .iter()
+            .map(|chunk| chunk.window.as_str())
+            .collect();
+        assert_eq!(
+            windows,
+            vec![shared.as_str(), shared.as_str(), "replacement"]
+        );
+        assert_ne!(
+            seen.chunks[0].stream, seen.chunks[2].stream,
+            "the second chunk of the first lane is on a new stream"
+        );
     });
     session.close();
     serving.abort();
