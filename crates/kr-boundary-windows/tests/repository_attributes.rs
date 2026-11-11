@@ -250,6 +250,83 @@ fn a_quoted_pattern_unquotes_exactly_the_escapes_git_knows() {
 }
 
 #[test]
+fn a_byte_order_mark_is_read_both_ways_because_git_drops_it_from_a_file_on_disk_only() {
+    // Git removes EF BB BF from the start of line 1 of a file it reads from disk (the working tree
+    // and `info/attributes`) and keeps it in a copy from the index or a tree. With the mark taken
+    // as a pattern's first bytes, these lines show nothing; without it they select a driver, and
+    // Git applies it. The scan reports what either reading shows.
+    let mark = "\u{feff}";
+    assert_eq!(rule(&format!("{mark}\"x\"filter=lfs\n")), RULE_FILTER);
+    assert_eq!(rule(&format!("{mark} \"x\"filter=lfs\n")), RULE_FILTER);
+    assert_eq!(rule(&format!("{mark}\"x\"merge=ours\n")), RULE_MERGE);
+    assert_eq!(rule(&format!("{mark}\"x\"diff=custom\n")), RULE_DIFF);
+    assert_eq!(
+        rule(&format!("{mark}\"[attr]m\"filter=lfs\n* m\n")),
+        RULE_MACRO
+    );
+    assert_eq!(rule(&format!("{mark}x filter=lfs\n")), RULE_FILTER);
+    // The mark is read at the start of the file and nowhere else, and only whole.
+    allowed(&format!("\n{mark}\"x\"filter=lfs\n"));
+    allowed(&format!("* text\n{mark}\"x\"filter=lfs\n"));
+    allowed("\u{feff}");
+    // With the mark kept, line 1 is a pattern that starts with it, not a comment.
+    assert_eq!(rule(&format!("{mark}# filter=lfs\n")), RULE_FILTER);
+    allowed(&format!("{mark}# text\n"));
+    allowed(&format!("{mark}* text\n"));
+    assert!(scan_attributes(b"\xef\xbb\"x\"filter=lfs\n").is_ok());
+    assert!(scan_attributes(b"\xef\"x\"filter=lfs\n").is_ok());
+    // A refusal still names the line, and the later lines are scanned in both readings.
+    let refusal =
+        scan_attributes(format!("{mark}* text\n*.x\n\"y\"filter=lfs\n").as_bytes()).unwrap_err();
+    assert_eq!(refusal.rule, RULE_FILTER);
+    assert!(refusal.detail().contains("line 3"), "{refusal}");
+    let refusal = scan_attributes(format!("{mark}\"x\"filter=lfs\n").as_bytes()).unwrap_err();
+    assert!(refusal.detail().contains("line 1"), "{refusal}");
+}
+
+#[test]
+fn a_line_is_read_as_git_reads_it_and_whole_because_git_ends_it_at_a_nul() {
+    // Git reads a line as a C string, so it stops at the first NUL: the quotation mark that closes
+    // this pattern is never read, the unquoting fails, and the pattern is `"q`. The scan reads the
+    // line cut at the NUL and whole, and reports what either shows.
+    assert_eq!(
+        scan_attributes(b"\"q filter=lfs\0\"\n").unwrap_err().rule,
+        RULE_FILTER
+    );
+    assert_eq!(
+        scan_attributes(b"\"q diff=custom\0\"\n").unwrap_err().rule,
+        RULE_DIFF
+    );
+    assert_eq!(
+        scan_attributes(b"\"q merge=ours\0\"\n").unwrap_err().rule,
+        RULE_MERGE
+    );
+    assert_eq!(
+        scan_attributes(b"\"[attr]m\0\"\n").unwrap_err().rule,
+        RULE_MACRO
+    );
+    // What follows a NUL on a line is invisible to Git and is still scanned.
+    assert_eq!(
+        scan_attributes(b"x\0 filter=lfs\n").unwrap_err().rule,
+        RULE_FILTER
+    );
+    assert_eq!(
+        scan_attributes(b"x filter=lfs\0 text\n").unwrap_err().rule,
+        RULE_FILTER
+    );
+    // A NUL in a value ends it for Git and does not for the whole reading: the name differs.
+    assert_eq!(
+        scan_attributes(b"x diff=cpp\0\n").unwrap_err().rule,
+        RULE_DIFF
+    );
+    // Each reading is of one line: a NUL ends nothing of the next line.
+    let refusal = scan_attributes(b"* text\0\n*.x filter=lfs\n").unwrap_err();
+    assert!(refusal.detail().contains("line 2"), "{refusal}");
+    assert!(scan_attributes(b"* text\0 more\n*.x text\n").is_ok());
+    assert!(scan_attributes(b"\"a b\0\" text\n").is_ok());
+}
+
+#[test]
 fn a_refusal_names_the_rule_and_the_line_and_never_what_the_file_held() {
     let text = "# first\n* text=auto\nsecret/path/name.dat -text filter=secretdriver\nlater\n";
     let refusal = scan_attributes(text.as_bytes()).unwrap_err();
