@@ -86,6 +86,31 @@ pub const ALTERNATE_BUFFER_MODES: &[u16] = &[47, 1047, 1049];
 /// one of the three is set at any time, in the session's state as in the terminal.
 pub const MOUSE_TRACKING_MODES: &[u16] = &[1000, 1002, 1003];
 
+/// The DEC modes that choose how a mouse report spells a position, and that the session tracks:
+/// UTF-8 coordinates (1005) and SGR coordinates (1006).
+///
+/// They are one state, as Terminal.app and iTerm keep it: setting one makes it the encoding in
+/// force and replaces the other, and resetting either returns the default encoding, also when it
+/// names the one that is not in force. So at most one of the two is set at any time, in the
+/// session's state as in the terminal. xterm differs in one case: there a reset changes the
+/// encoding only when it names the one in force.
+pub const MOUSE_ENCODING_MODES: &[u16] = &[1005, 1006];
+
+/// The four modes xterm names for the encoding of a mouse position: the two the session tracks, and
+/// URXVT coordinates (1015) and SGR coordinates in pixels (1016), which it consumes without
+/// tracking them. A reset of all four returns any terminal to the default encoding, whichever of
+/// them it had been set to.
+pub const MOUSE_ENCODING_FAMILY: &[u16] = &[1005, 1006, 1015, 1016];
+
+/// The modes a terminal keeps as one state with the given mode, when it is one of the mouse's: the
+/// tracking modes, or the encoding modes.
+#[must_use]
+pub fn mouse_state_group(mode: u16) -> Option<&'static [u16]> {
+    [MOUSE_TRACKING_MODES, MOUSE_ENCODING_MODES]
+        .into_iter()
+        .find(|group| group.contains(&mode))
+}
+
 /// Every mode the engine tracks, and the keyboard state that goes with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModeState {
@@ -169,11 +194,13 @@ impl ModeState {
                 }
                 // The mouse tracking is one state, as xterm and Terminal.app keep it: a set of one
                 // of the three replaces the one in force, and a reset of any of them turns tracking
-                // off, whichever of them had set it.
-                if MOUSE_TRACKING_MODES.contains(&mode) {
-                    for tracking in MOUSE_TRACKING_MODES {
-                        if let Some(slot) = self.dec.get_mut(tracking) {
-                            *slot = enabled && *tracking == mode;
+                // off, whichever of them had set it. The mouse encoding is one state in the same
+                // way: a set of 1005 or 1006 replaces the encoding in force, and a reset of either
+                // returns the default encoding.
+                if let Some(group) = mouse_state_group(mode) {
+                    for member in group {
+                        if let Some(slot) = self.dec.get_mut(member) {
+                            *slot = enabled && *member == mode;
                         }
                     }
                     return true;

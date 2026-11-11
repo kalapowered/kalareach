@@ -878,6 +878,47 @@ fn mouse_tracking(stream: &[u8]) -> Option<u16> {
     tracking
 }
 
+/// The mouse encoding a stream leaves a terminal in, as the terminals this product runs in keep it.
+///
+/// One state again: `CSI ? 1005 h`, `1006 h`, `1015 h` and `1016 h` each *replace* whichever
+/// encoding was in force, and a reset of any of the four returns the default, also when it names a
+/// mode that was not the one in force. So the last write of the four decides, and a check that read
+/// 1005 and 1006 as independent booleans, or that took the last one that was set, would not notice
+/// a replay in the wrong order.
+fn mouse_encoding(stream: &[u8]) -> Option<u16> {
+    let mut encoding = None;
+    let mut index = 0;
+    while index + 3 < stream.len() {
+        if &stream[index..index + 3] != b"\x1b[?" {
+            index += 1;
+            continue;
+        }
+        let mut at = index + 3;
+        let mut number = String::new();
+        while let Some(byte) = stream.get(at).copied() {
+            if byte.is_ascii_digit() {
+                number.push(char::from(byte));
+                at += 1;
+            } else {
+                break;
+            }
+        }
+        let Ok(mode) = number.parse::<u16>() else {
+            index += 3;
+            continue;
+        };
+        if matches!(mode, 1005 | 1006 | 1015 | 1016) {
+            match stream.get(at) {
+                Some(b'h') => encoding = Some(mode),
+                Some(b'l') => encoding = None,
+                _ => {}
+            }
+        }
+        index += 3;
+    }
+    encoding
+}
+
 /// The last position a sequence appears at in a stream.
 fn last_index(stream: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || stream.len() < needle.len() {
@@ -1274,6 +1315,34 @@ async fn an_application_that_turned_the_mouse_on_before_the_attachment_is_sent_i
             final_modes(&drawn).get("?1006").copied(),
             Some(true),
             "and in the encoding it asked for after {history}"
+        );
+    }
+}
+
+/// KR-REQ-01.11: an application that chose a mouse encoding before the attachment has it in the
+/// outer terminal once the attachment has drawn the session, as its own terminal would have it.
+///
+/// Terminal.app and iTerm keep one encoding: the last of `1005` and `1006` that was set is in force,
+/// and a reset of either returns the default. The session holds the two as one state, and the
+/// attachment writes the one that is set after a reset of the four modes xterm names, so a terminal
+/// that keeps the last encoding it was given reports in the encoding the application asked for and
+/// not in the one of the higher number.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_application_that_chose_a_mouse_encoding_before_the_attachment_is_sent_it_after() {
+    // The application's own history, and the one state its terminal would hold after it.
+    for (history, expected) in [
+        ("\\033[?1006h\\033[?1005h", Some(1005)),
+        ("\\033[?1005h\\033[?1006h", Some(1006)),
+        ("\\033[?1005h\\033[?1006l", None),
+        ("\\033[?1006h\\033[?1005l", None),
+        ("\\033[?1006h\\033[?1006l", None),
+    ] {
+        let drawn = drawn_after(&format!("\\033[?1000h{history}")).await;
+        assert_eq!(
+            mouse_encoding(&drawn),
+            expected,
+            "the terminal reports a click in the encoding the application's own terminal would after {history}, once the screen is drawn: {}",
+            String::from_utf8_lossy(&drawn).escape_debug()
         );
     }
 }
