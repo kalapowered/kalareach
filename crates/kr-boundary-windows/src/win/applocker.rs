@@ -184,12 +184,13 @@ impl Channel {
     }
 }
 
-fn query(extra: &[&str], scratch: &Path, env: &EnvBlock) -> Result<Vec<LogEvent>, Error> {
+/// Runs the event log tool with the arguments and returns what it wrote.
+fn wevtutil(arguments: &[&str], scratch: &Path, env: &EnvBlock) -> Result<String, Error> {
     let what = "the event log query";
     let program = system_root().join("System32").join("wevtutil.exe");
     let name = program.display().to_string();
-    let mut parts = vec![name.as_str(), "qe", LOG, "/f:xml", "/e:Events"];
-    parts.extend_from_slice(extra);
+    let mut parts = vec![name.as_str()];
+    parts.extend_from_slice(arguments);
     let launch_error = |source| Error::Launch { what, source };
     let program = VerifiedPath::new(&program).map_err(launch_error)?;
     let captured = run_captured(
@@ -206,9 +207,7 @@ fn query(extra: &[&str], scratch: &Path, env: &EnvBlock) -> Result<Vec<LogEvent>
     .map_err(launch_error)?;
     let text = String::from_utf8_lossy(&captured.stdout).into_owned();
     match captured.outcome {
-        Outcome::Ran(0) => {
-            events::parse(&text).map_err(|error| Error::Unreadable(error.to_string()))
-        }
+        Outcome::Ran(0) => Ok(text),
         other => Err(Error::Failed {
             what,
             status: format!("{other:?}"),
@@ -219,6 +218,29 @@ fn query(extra: &[&str], scratch: &Path, env: &EnvBlock) -> Result<Vec<LogEvent>
             ),
         }),
     }
+}
+
+fn query(extra: &[&str], scratch: &Path, env: &EnvBlock) -> Result<Vec<LogEvent>, Error> {
+    let mut arguments = vec!["qe", LOG, "/f:xml", "/e:Events"];
+    arguments.extend_from_slice(extra);
+    let text = wevtutil(&arguments, scratch, env)?;
+    events::parse(&text).map_err(|error| Error::Unreadable(error.to_string()))
+}
+
+/// What the log last said, in a few words, for the text of a proof that did not succeed.
+///
+/// # Errors
+///
+/// Returns an error when the query fails.
+pub fn latest(scratch: &Path, env: &EnvBlock) -> Result<String, Error> {
+    let text = wevtutil(&["qe", LOG, "/c:3", "/rd:true", "/f:text"], scratch, env)?;
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let flat = words.join(" ");
+    Ok(if flat.is_empty() {
+        "nothing".to_owned()
+    } else {
+        flat.chars().take(700).collect()
+    })
 }
 
 /// The newest record number in the log, or zero when it is empty. A failed query is an error: an

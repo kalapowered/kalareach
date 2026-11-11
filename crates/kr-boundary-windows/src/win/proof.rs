@@ -164,6 +164,21 @@ fn system_windows_directory() -> Result<String, String> {
 /// The environment of a program of the proof, which runs in no repository. The proof's scratch
 /// directory stands for the private root.
 fn proof_environment(git: &GitSet, scratch: &Path) -> Result<EnvBlock, String> {
+    if super::switch::taken().old_environment {
+        let system = system_windows_directory()?;
+        return Ok(EnvBlock::from_pairs(vec![
+            ("SystemRoot", system.clone()),
+            ("windir", system.clone()),
+            ("SystemDrive", "C:".to_owned()),
+            (
+                "PATH",
+                format!(
+                    "{};{system}\\System32",
+                    Path::new(&git.dir).join("mingw64").join("bin").display()
+                ),
+            ),
+        ]));
+    }
     let roots = RootPaths {
         system: system_windows_directory()?,
         boundary: Paths::system().program.display().to_string(),
@@ -286,6 +301,7 @@ pub fn prove(
     };
     let started = Instant::now();
     let mut attempts = 0_u32;
+    let mut last: String;
     loop {
         if stop.is_set() {
             return fail("the service is stopping");
@@ -307,9 +323,16 @@ pub fn prove(
                 ));
             }
             Ok(Captured {
-                outcome: Outcome::Ran(_),
-                ..
-            }) => {}
+                outcome: Outcome::Ran(code),
+                stdout,
+                stderr,
+            }) => {
+                last = format!(
+                    "it ended with {code} after writing {} and {} bytes",
+                    stdout.len(),
+                    stderr.len()
+                );
+            }
             Ok(Captured {
                 outcome: Outcome::TimedOut,
                 ..
@@ -317,8 +340,10 @@ pub fn prove(
             Err(error) => return fail(error.to_string()),
         }
         if started.elapsed() >= bound {
+            let log = applocker::latest(&scratch.0, &environment)
+                .unwrap_or_else(|error| format!("unreadable: {error}"));
             return fail(format!(
-                "the policy did not refuse the unlisted program to {account} in {} seconds ({attempts} launches)",
+                "the policy did not refuse the unlisted program to {account} in {} seconds ({attempts} launches; the last: {last}; the application-control log last said: {log})",
                 bound.as_secs()
             ));
         }

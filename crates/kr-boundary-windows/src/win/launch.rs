@@ -46,7 +46,7 @@ use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, GetProcessTimes, InitializeProcThreadAttributeList,
     LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    STARTUPINFOEXW, STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 use crate::env::EnvBlock;
@@ -54,6 +54,7 @@ use crate::env::EnvBlock;
 use super::ffi::{self, Handle, last, wide, wide_path};
 use super::job::{Job, State};
 use super::sd::OwnedSd;
+use super::switch::Taken;
 
 /// How a program that was started ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -258,6 +259,8 @@ pub struct SuspendedChild {
     /// Whether the launcher asked the platform, before returning, whether the process is in the
     /// job and was told it is. A child that is not in the job is never returned.
     pub in_job_checked: bool,
+    /// Whether the child was made suspended: always, but when a case took that back.
+    suspended: bool,
 }
 
 /// A child that has been resumed.
@@ -297,7 +300,11 @@ impl SuspendedChild {
             return Err(LaunchError::PermitForAnotherChild);
         }
         // SAFETY: the thread handle is open.
-        let previous = unsafe { ResumeThread(self.thread.raw()) };
+        let previous = if self.suspended {
+            unsafe { ResumeThread(self.thread.raw()) }
+        } else {
+            1
+        };
         if previous != 1 {
             // Dropping `self` ends the child.
             return Err(if previous == u32::MAX {
@@ -470,12 +477,21 @@ impl Drop for Attributes {
     }
 }
 
-/// Builds the list that holds the handle list and the job list.
-fn attributes(handles: &[HANDLE; 3], job: &HANDLE) -> Result<Attributes, LaunchError> {
+/// Builds the list that holds the handle list and the job list, less what a case has taken back;
+/// none when both were.
+fn attributes(
+    handles: &[HANDLE; 3],
+    job: &HANDLE,
+    taken: &Taken,
+) -> Result<Option<Attributes>, LaunchError> {
+    let count = u32::from(!taken.no_handle_list) + u32::from(!taken.no_job);
+    if count == 0 {
+        return Ok(None);
+    }
     let mut size = 0_usize;
     // SAFETY: the first call only asks for the size it needs, and is expected to fail.
     unsafe {
-        InitializeProcThreadAttributeList(null_mut(), 2, 0, &raw mut size);
+        InitializeProcThreadAttributeList(null_mut(), count, 0, &raw mut size);
     }
     if size == 0 {
         return Err(LaunchError::Platform(last("sizing the attribute list")));
@@ -484,41 +500,43 @@ fn attributes(handles: &[HANDLE; 3], job: &HANDLE) -> Result<Attributes, LaunchE
         storage: vec![0_usize; size.div_ceil(size_of::<usize>())],
     };
     // SAFETY: the buffer is the size the first call asked for and is aligned for the list.
-    if unsafe { InitializeProcThreadAttributeList(list.list(), 2, 0, &raw mut size) } == 0 {
+    if unsafe { InitializeProcThreadAttributeList(list.list(), count, 0, &raw mut size) } == 0 {
         return Err(LaunchError::Platform(last("making the attribute list")));
     }
     // SAFETY: the list is initialised; the values outlive the call that uses the list because the
     // caller holds them.
-    let handle_list = unsafe {
-        UpdateProcThreadAttribute(
-            list.list(),
-            0,
-            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-            handles.as_ptr().cast(),
-            size_of::<[HANDLE; 3]>(),
-            null_mut(),
-            null(),
-        )
-    };
-    if handle_list == 0 {
+    let handle_list = taken.no_handle_list
+        || unsafe {
+            UpdateProcThreadAttribute(
+                list.list(),
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                handles.as_ptr().cast(),
+                size_of::<[HANDLE; 3]>(),
+                null_mut(),
+                null(),
+            )
+        } != 0;
+    if !handle_list {
         return Err(LaunchError::Platform(last("listing the inherited handles")));
     }
     // SAFETY: as above.
-    let job_list = unsafe {
-        UpdateProcThreadAttribute(
-            list.list(),
-            0,
-            PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
-            std::ptr::from_ref(job).cast(),
-            size_of::<HANDLE>(),
-            null_mut(),
-            null(),
-        )
-    };
-    if job_list == 0 {
+    let job_list = taken.no_job
+        || unsafe {
+            UpdateProcThreadAttribute(
+                list.list(),
+                0,
+                PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                std::ptr::from_ref(job).cast(),
+                size_of::<HANDLE>(),
+                null_mut(),
+                null(),
+            )
+        } != 0;
+    if !job_list {
         return Err(LaunchError::Job(last("naming the job at creation")));
     }
-    Ok(list)
+    Ok(Some(list))
 }
 
 fn time_of(process: &Handle) -> Result<u64, ffi::Error> {
@@ -573,7 +591,8 @@ pub fn launch(spec: ChildSpec<'_>) -> Result<SuspendedChild, LaunchError> {
     };
     let handles = [input.raw(), output.raw(), errors.raw()];
     let job = spec.job.raw();
-    let mut list = attributes(&handles, &job)?;
+    let taken = super::switch::taken();
+    let mut list = attributes(&handles, &job, &taken)?;
     let program = wide_path(spec.program.path());
     let mut command = wide(&spec.command_line);
     let cwd = wide_path(spec.cwd);
@@ -581,12 +600,36 @@ pub fn launch(spec: ChildSpec<'_>) -> Result<SuspendedChild, LaunchError> {
     let mut thread_attributes = spec.thread_descriptor.attributes();
     // SAFETY: a zeroed record is the documented starting point.
     let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
-    startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+    startup.StartupInfo.cb = if list.is_some() {
+        size_of::<STARTUPINFOEXW>() as u32
+    } else {
+        size_of::<STARTUPINFOW>() as u32
+    };
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     startup.StartupInfo.hStdInput = handles[0];
     startup.StartupInfo.hStdOutput = handles[1];
     startup.StartupInfo.hStdError = handles[2];
-    startup.lpAttributeList = list.list();
+    startup.lpAttributeList = list.as_mut().map_or(null_mut(), Attributes::list);
+    let process_attributes: *mut SECURITY_ATTRIBUTES = if taken.default_descriptors {
+        null_mut()
+    } else {
+        &raw mut process_attributes
+    };
+    let thread_attributes: *mut SECURITY_ATTRIBUTES = if taken.default_descriptors {
+        null_mut()
+    } else {
+        &raw mut thread_attributes
+    };
+    let flags = (if taken.not_suspended {
+        0
+    } else {
+        CREATE_SUSPENDED
+    }) | (if list.is_some() {
+        EXTENDED_STARTUPINFO_PRESENT
+    } else {
+        0
+    }) | CREATE_UNICODE_ENVIRONMENT
+        | DETACHED_PROCESS;
     // SAFETY: a zeroed record is what the platform fills in.
     let mut created: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: the token is open, every string is NUL-terminated and outlives the call, the
@@ -598,13 +641,10 @@ pub fn launch(spec: ChildSpec<'_>) -> Result<SuspendedChild, LaunchError> {
             token,
             program.as_ptr(),
             command.as_mut_ptr(),
-            &raw mut process_attributes,
-            &raw mut thread_attributes,
+            process_attributes,
+            thread_attributes,
             1,
-            CREATE_SUSPENDED
-                | EXTENDED_STARTUPINFO_PRESENT
-                | CREATE_UNICODE_ENVIRONMENT
-                | DETACHED_PROCESS,
+            flags,
             spec.env.units().as_ptr().cast(),
             cwd.as_ptr(),
             &raw const startup.StartupInfo,
@@ -635,13 +675,16 @@ pub fn launch(spec: ChildSpec<'_>) -> Result<SuspendedChild, LaunchError> {
         pid: created.dwProcessId,
         creation_time: 0,
         in_job_checked: false,
+        suspended: !taken.not_suspended,
     };
     // From here a failure drops `child`, which ends it.
     child.creation_time = time_of(&child.process)?;
-    match spec.job.contains(&child.process) {
-        Ok(true) => child.in_job_checked = true,
-        Ok(false) => return Err(LaunchError::NotInJob),
-        Err(error) => return Err(LaunchError::Platform(error)),
+    if !taken.no_job {
+        match spec.job.contains(&child.process) {
+            Ok(true) => child.in_job_checked = true,
+            Ok(false) => return Err(LaunchError::NotInJob),
+            Err(error) => return Err(LaunchError::Platform(error)),
+        }
     }
     Ok(child)
 }

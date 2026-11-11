@@ -175,7 +175,7 @@ impl EnvBlock {
             .collect()
     }
 
-    fn from_pairs(mut pairs: Vec<(&'static str, String)>) -> EnvBlock {
+    pub(crate) fn from_pairs(mut pairs: Vec<(&'static str, String)>) -> EnvBlock {
         pairs.sort_by_key(|pair| pair.0.to_uppercase());
         let mut block = Vec::new();
         for (name, value) in pairs {
