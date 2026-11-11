@@ -563,30 +563,52 @@ fn jsonl_files(directory: &std::path::Path) -> Vec<(std::path::PathBuf, String)>
 /// is: a file for the thread below `sessions/<year>/<month>/<day>` in the directory `CODEX_HOME`
 /// names, a line that marks the turn's start and a line that holds the prompt; a turn with no text
 /// (the terminal's own, with no prompt typed), a server where the variant is not named and one
-/// with no `CODEX_HOME` write nothing.
+/// with no `CODEX_HOME` write nothing, and neither does a server whose `CODEX_HOME` is relative,
+/// has a `..` part or lies outside the run (the directory its `TMPDIR` lies in), or whose `TMPDIR`
+/// is not set.
 #[tokio::test]
 async fn the_server_records_a_turn_with_a_prompt_in_the_agents_folder_only_under_the_variant() {
     let question = "(mark) What is 612 plus 1034? Reply with only the number.";
+    // The run's root: its temporary directory and its agent folder lie in it. What lies outside it
+    // is a directory beside it.
     let home = std::env::temp_dir().join(format!("kr-si-record-{}", std::process::id()));
-    for (variants, home_named, records) in [
-        ("write-the-record", true, true),
-        ("", true, false),
-        ("write-the-record", false, false),
+    let outside = std::env::temp_dir().join(format!("kr-si-outside-{}", std::process::id()));
+    let sideways = home
+        .join("agent/..")
+        .join("..")
+        .join(outside.file_name().expect("a name"))
+        .join("agent");
+    for (variants, folder, records) in [
+        ("write-the-record", Some(home.join("agent")), true),
+        ("", Some(home.join("agent")), false),
+        ("write-the-record", None, false),
+        // Relative: it would resolve from the directory the server runs in.
+        (
+            "write-the-record",
+            Some(std::path::PathBuf::from("agent")),
+            false,
+        ),
+        ("write-the-record", Some(std::path::PathBuf::new()), false),
+        ("write-the-record", Some(sideways), false),
+        ("write-the-record", Some(outside.join("agent")), false),
     ] {
         let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).expect("a home");
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(home.join("tmp")).expect("a run");
+        std::fs::create_dir_all(&outside).expect("a directory outside it");
         let mut command = Command::new(PROGRAM);
         command
             .args(["app-server", "--listen", "stdio://"])
             .env("STAND_IN", variants)
             .env("STAND_IN_COMMAND", COMMAND)
+            .env("TMPDIR", home.join("tmp"))
             .current_dir(&home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        if home_named {
-            command.env("CODEX_HOME", home.join("agent"));
+        if let Some(folder) = &folder {
+            command.env("CODEX_HOME", folder);
         } else {
             command.env_remove("CODEX_HOME");
         }
@@ -614,7 +636,14 @@ async fn the_server_records_a_turn_with_a_prompt_in_the_agents_folder_only_under
         let _ = messages_of_the_turn(&mut stdin, &mut lines).await;
         let files = jsonl_files(&home);
         if !records {
-            assert!(files.is_empty(), "variants {variants:?}: {files:?}");
+            assert!(
+                files.is_empty(),
+                "variants {variants:?}, folder {folder:?}: {files:?}"
+            );
+            assert!(
+                jsonl_files(&outside).is_empty(),
+                "nothing is written outside the run: folder {folder:?}"
+            );
             continue;
         }
         assert_eq!(files.len(), 1, "one file for the thread: {files:?}");
@@ -648,6 +677,7 @@ async fn the_server_records_a_turn_with_a_prompt_in_the_agents_folder_only_under
         );
     }
     let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&outside);
 }
 
 /// The terminal writes the message of a turn as a row of its own under `answer-the-sum`, and no

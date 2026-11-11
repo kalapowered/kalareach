@@ -20,7 +20,7 @@ http.workspace = true
 # either end.
 jsonschema.workspace = true
 # The server starts its commands in a session of its own, and ends all of one's processes at once.
-rustix = { workspace = true, features = ["process"] }
+rustix = { workspace = true, features = ["fs", "process"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "net", "process", "signal"] }
 tokio-websockets.workspace = true
