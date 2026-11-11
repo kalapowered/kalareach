@@ -3093,29 +3093,37 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
     }
 }
 
-/// Removes the installation's own records, last of all: `staging`, the manifest, the earlier-state
-/// record, any replacement of the manifest that a crash or a failed write left, the data directory
-/// and, when it is empty, the folder above it. Returns each thing that could not be removed, with
+/// Removes the installation's own records, last of all: the manifest, the earlier-state record, any
+/// replacement of the manifest that a crash or a failed write left, then `staging` (only when each
+/// of those is gone), the data directory and, when it is empty, the folder above it. Returns each thing that could not be removed, with
 /// the reason; nothing is returned when everything is gone.
 pub fn remove_records(paths: &Paths) -> Vec<String> {
     let mut stayed = Vec::new();
-    let mut leave = |path: &Path, result: io::Result<()>| {
+    // Whether the thing is gone: it stayed when the call failed for any reason but its absence.
+    let mut leave = |path: &Path, result: io::Result<()>| -> bool {
         if let Err(error) = result
             && error.kind() != io::ErrorKind::NotFound
         {
             stayed.push(format!("{} ({error})", path.display()));
+            return false;
         }
+        true
     };
-    leave(&paths.staging, fs::remove_dir_all(&paths.staging));
-    leave(&paths.manifest, fs::remove_file(&paths.manifest));
-    leave(&paths.prior, fs::remove_file(&paths.prior));
+    let mut records_gone = leave(&paths.manifest, fs::remove_file(&paths.manifest));
+    records_gone &= leave(&paths.prior, fs::remove_file(&paths.prior));
     // A replacement of the manifest that a crash, or a failed write, left has no use.
     if let Ok(entries) = fs::read_dir(&paths.data) {
         for entry in entries.flatten() {
             if is_manifest_replacement(&entry.file_name().to_string_lossy()) {
-                leave(&entry.path(), fs::remove_file(entry.path()));
+                records_gone &= leave(&entry.path(), fs::remove_file(entry.path()));
             }
         }
+    }
+    // The staging directory goes last, and only when every record before it is gone: a removal run
+    // again reads the manifest's policy records through the channel, which makes its temporary
+    // directory in staging, so a record that stayed must find staging where it was.
+    if records_gone {
+        leave(&paths.staging, fs::remove_dir_all(&paths.staging));
     }
     leave(&paths.data, fs::remove_dir(&paths.data));
     if let Some(parent) = paths.data.parent() {
