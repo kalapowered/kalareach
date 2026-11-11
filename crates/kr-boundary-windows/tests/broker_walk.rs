@@ -1,0 +1,494 @@
+//! The anchored walk, shown on a Windows guest.
+//!
+//! These cases run only in a disposable guest, as SYSTEM, under a Hyper-V checkpoint that is
+//! restored afterwards. Each walks a tree with a visitor that makes one small change, a mark in an
+//! object's attributes, through the handle the walk gave it, and then looks at everything the walk
+//! should not have reached: an object renamed out of the tree while the walk ran, a name given
+//! another hard link, a name swapped for another object, a junction. None of those may carry the
+//! mark, and the walk must say that it could not show where they were.
+
+#![cfg(all(windows, feature = "testing"))]
+#![allow(unsafe_code)]
+
+mod common;
+
+use std::cell::RefCell;
+use std::os::windows::fs::MetadataExt as _;
+use std::path::Path;
+
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_BASIC_INFO, FILE_WRITE_ATTRIBUTES, FileBasicInfo, GetFileInformationByHandleEx,
+    SetFileInformationByHandle,
+};
+
+use kr_boundary_windows::win::ffi::Handle;
+use kr_boundary_windows::win::privilege;
+use kr_boundary_windows::win::walk::{
+    AnchorRefusal, Bounds, DirHandle, Entry, Kind, Lost, Verdict, VolumeRefusal, WalkError, walk,
+};
+
+use common::{Scratch, look_at, run};
+
+const NOT_CONTENT_INDEXED: u32 = 0x2000;
+const BIG: Bounds = Bounds {
+    objects: 10_000,
+    depth: 64,
+};
+
+fn mark(handle: &Handle) {
+    let mut info = FILE_BASIC_INFO::default();
+    // SAFETY: the handle is open and the buffer is the structure the class fills.
+    let read = unsafe {
+        GetFileInformationByHandleEx(
+            handle.raw(),
+            FileBasicInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    };
+    assert_ne!(read, 0, "the attributes read");
+    info.FileAttributes |= NOT_CONTENT_INDEXED;
+    // SAFETY: the handle is open with the right to write attributes.
+    let set = unsafe {
+        SetFileInformationByHandle(
+            handle.raw(),
+            FileBasicInfo,
+            (&raw const info).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    };
+    assert_ne!(set, 0, "the mark is written");
+}
+
+fn marked(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).unwrap().file_attributes() & NOT_CONTENT_INDEXED != 0
+}
+
+/// What a visitor saw of each child: its name, and either what kind it was or why it was lost.
+type Seen = RefCell<Vec<(String, Result<Kind, String>)>>;
+
+/// Opens the child for the one small change and makes it unless it is a reparse point or has more
+/// than one name, the rule the release will use for a write that is not keyed by a group.
+fn mark_visitor<'a>(
+    seen: &'a Seen,
+) -> impl FnMut(&Entry<'_>) -> kr_boundary_windows::win::ffi::Result<Verdict> + 'a {
+    move |entry| {
+        let name = entry.child.display();
+        match entry.open(FILE_WRITE_ATTRIBUTES)? {
+            Ok(opened) => {
+                let kind = opened.kind;
+                if kind != Kind::ReparsePoint && opened.links == 1 {
+                    mark(&opened.handle);
+                    seen.borrow_mut().push((name, Ok(kind)));
+                } else {
+                    seen.borrow_mut().push((
+                        name,
+                        Err(format!("not acted on: {kind:?}, {} link(s)", opened.links)),
+                    ));
+                }
+            }
+            Err(lost) => seen.borrow_mut().push((name, Err(lost.to_string()))),
+        }
+        Ok(Verdict::Descend)
+    }
+}
+
+fn anchor(path: &Path) -> DirHandle {
+    DirHandle::open_anchor(path)
+        .expect("the platform answers")
+        .expect("the anchor is accepted")
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_walk_goes_through_every_object_and_never_enters_a_junction_or_a_symbolic_link() {
+    let scratch = Scratch::new();
+    let tree = scratch.path("tree");
+    std::fs::create_dir_all(tree.join("sub").join("deeper")).unwrap();
+    std::fs::write(tree.join("one.txt"), b"1").unwrap();
+    std::fs::write(tree.join("sub").join("two.txt"), b"2").unwrap();
+    std::fs::write(tree.join("sub").join("deeper").join("three.txt"), b"3").unwrap();
+    let outside = scratch.path("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("victim.txt"), b"keep").unwrap();
+    run(
+        "cmd.exe",
+        &[
+            "/c",
+            "mklink",
+            "/J",
+            &tree.join("junction").display().to_string(),
+            &outside.display().to_string(),
+        ],
+    );
+    run(
+        "cmd.exe",
+        &[
+            "/c",
+            "mklink",
+            "/D",
+            &tree.join("symlink").display().to_string(),
+            &outside.display().to_string(),
+        ],
+    );
+    let before = look_at(&outside.join("victim.txt"));
+    let start = anchor(&tree);
+    let seen = Seen::default();
+    let guard = privilege::enter().unwrap();
+    let report = walk(&start, BIG, &mut mark_visitor(&seen)).expect("the walk runs");
+    drop(guard);
+    let seen = seen.take();
+    let names: Vec<&str> = seen.iter().map(|(name, _)| name.as_str()).collect();
+    for expected in [
+        "one.txt",
+        "sub",
+        "two.txt",
+        "deeper",
+        "three.txt",
+        "junction",
+        "symlink",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "{expected} was visited: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"victim.txt"),
+        "nothing behind a link was visited: {names:?}"
+    );
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+    assert!(
+        marked(&tree.join("sub").join("deeper").join("three.txt")),
+        "a file three levels down is marked"
+    );
+    assert_eq!(
+        look_at(&outside.join("victim.txt")),
+        before,
+        "the target of both links is as it was"
+    );
+    assert!(!marked(&outside), "and so is the directory they point at");
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_descendant_renamed_out_of_the_tree_during_the_walk_is_reported_and_never_changed() {
+    let scratch = Scratch::new();
+    let tree = scratch.path("tree");
+    let outside = scratch.path("outside");
+    std::fs::create_dir_all(tree.join("c_dir")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(tree.join("a_trigger.txt"), b"t").unwrap();
+    std::fs::write(tree.join("b_victim.txt"), b"v").unwrap();
+    std::fs::write(tree.join("c_dir").join("inside.txt"), b"i").unwrap();
+    let start = anchor(&tree);
+    let seen = Seen::default();
+    let mut inner = mark_visitor(&seen);
+    let mut visitor = |entry: &Entry<'_>| {
+        if entry.child.display() == "a_trigger.txt" {
+            // After the listing and before the walk opens either, both go out of the tree.
+            std::fs::rename(tree.join("b_victim.txt"), outside.join("b_victim.txt")).unwrap();
+            std::fs::rename(tree.join("c_dir"), outside.join("c_dir")).unwrap();
+        }
+        inner(entry)
+    };
+    let guard = privilege::enter().unwrap();
+    let report = walk(&start, BIG, &mut visitor).expect("the walk runs");
+    drop(guard);
+    let seen = seen.take();
+    assert!(
+        !marked(&outside.join("b_victim.txt")),
+        "the file that left the tree was not changed"
+    );
+    assert!(
+        !marked(&outside.join("c_dir")),
+        "the directory that left the tree was not changed"
+    );
+    assert!(
+        !marked(&outside.join("c_dir").join("inside.txt")),
+        "nothing inside the directory that left was visited"
+    );
+    let victim = seen
+        .iter()
+        .find(|(name, _)| name == "b_victim.txt")
+        .unwrap();
+    assert!(
+        victim.1.is_err(),
+        "the walk says it lost the file: {victim:?}"
+    );
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|problem| problem.name == "c_dir" && problem.lost == Lost::MovedOut)
+            || seen
+                .iter()
+                .any(|(name, result)| name == "c_dir" && result.is_err()),
+        "the walk says it lost the directory: {:?} {seen:?}",
+        report.problems
+    );
+    assert!(
+        marked(&tree.join("a_trigger.txt")),
+        "what stayed was visited"
+    );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_hard_link_made_during_the_walk_is_seen_in_the_link_count_and_the_file_is_not_changed() {
+    let scratch = Scratch::new();
+    let tree = scratch.path("tree");
+    let outside = scratch.path("outside");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(tree.join("a_trigger.txt"), b"t").unwrap();
+    std::fs::write(tree.join("b_file.txt"), b"f").unwrap();
+    let start = anchor(&tree);
+    let seen = Seen::default();
+    let mut inner = mark_visitor(&seen);
+    let mut visitor = |entry: &Entry<'_>| {
+        if entry.child.display() == "a_trigger.txt" {
+            std::fs::hard_link(tree.join("b_file.txt"), outside.join("link.txt")).unwrap();
+        }
+        inner(entry)
+    };
+    let guard = privilege::enter().unwrap();
+    walk(&start, BIG, &mut visitor).expect("the walk runs");
+    drop(guard);
+    let seen = seen.take();
+    let file = seen.iter().find(|(name, _)| name == "b_file.txt").unwrap();
+    assert!(
+        matches!(&file.1, Err(reason) if reason.contains("2 link(s)")),
+        "the visitor saw two names and did not act: {file:?}"
+    );
+    assert!(
+        !marked(&outside.join("link.txt")),
+        "the object under the outside name is not changed"
+    );
+    assert!(
+        !marked(&tree.join("b_file.txt")),
+        "and neither is the name inside"
+    );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_name_swapped_for_another_object_during_the_walk_is_not_acted_on_by_the_old_identifier() {
+    let scratch = Scratch::new();
+    let tree = scratch.path("tree");
+    let outside = scratch.path("outside");
+    std::fs::create_dir_all(tree.join("c_dir")).unwrap();
+    std::fs::create_dir_all(outside.join("target")).unwrap();
+    std::fs::write(outside.join("target").join("t.txt"), b"keep").unwrap();
+    std::fs::write(tree.join("a_trigger.txt"), b"t").unwrap();
+    std::fs::write(tree.join("b_file.txt"), b"old").unwrap();
+    std::fs::write(tree.join("c_dir").join("x.txt"), b"x").unwrap();
+    let start = anchor(&tree);
+    let seen = Seen::default();
+    let mut inner = mark_visitor(&seen);
+    let mut visitor = |entry: &Entry<'_>| {
+        if entry.child.display() == "a_trigger.txt" {
+            // The file's name now belongs to a new file; the directory's name to a junction.
+            std::fs::remove_file(tree.join("b_file.txt")).unwrap();
+            std::fs::write(tree.join("b_file.txt"), b"new").unwrap();
+            std::fs::rename(tree.join("c_dir"), tree.join("c_dir_aside")).unwrap();
+            run(
+                "cmd.exe",
+                &[
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &tree.join("c_dir").display().to_string(),
+                    &outside.join("target").display().to_string(),
+                ],
+            );
+        }
+        inner(entry)
+    };
+    let guard = privilege::enter().unwrap();
+    walk(&start, BIG, &mut visitor).expect("the walk runs");
+    drop(guard);
+    let seen = seen.take();
+    assert!(
+        !marked(&tree.join("b_file.txt")),
+        "the new file was not changed through the old identifier"
+    );
+    assert!(
+        !marked(&outside.join("target").join("t.txt")),
+        "nothing behind the junction was reached"
+    );
+    assert!(
+        !marked(&tree.join("c_dir_aside").join("x.txt")),
+        "the directory that moved aside was not entered"
+    );
+    let lost_file = seen.iter().find(|(name, _)| name == "b_file.txt");
+    assert!(
+        lost_file.is_none_or(|(_, result)| result.is_err()),
+        "the old file is reported as lost, not acted on: {lost_file:?}"
+    );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn every_directory_from_the_start_to_the_current_one_is_held_against_a_rename() {
+    let scratch = Scratch::new();
+    let tree = scratch.path("tree");
+    std::fs::create_dir_all(tree.join("top").join("middle")).unwrap();
+    std::fs::write(tree.join("top").join("middle").join("leaf.txt"), b"l").unwrap();
+    let start = anchor(&tree);
+    let refused = RefCell::new(Vec::new());
+    let mut visitor = |entry: &Entry<'_>| {
+        if entry.child.display() == "leaf.txt" {
+            for (from, to) in [
+                (tree.join("top").join("middle"), tree.join("top").join("m2")),
+                (tree.join("top"), tree.join("t2")),
+                (tree.clone(), scratch.path("tree2")),
+            ] {
+                refused
+                    .borrow_mut()
+                    .push((from.clone(), std::fs::rename(&from, &to).is_err()));
+            }
+        }
+        Ok(Verdict::Descend)
+    };
+    let guard = privilege::enter().unwrap();
+    walk(&start, BIG, &mut visitor).expect("the walk runs");
+    drop(guard);
+    for (from, was_refused) in refused.into_inner() {
+        assert!(
+            was_refused,
+            "{} could not be renamed while a descendant was acted on",
+            from.display()
+        );
+    }
+    std::fs::rename(tree.join("top"), tree.join("t2")).expect("after the walk a rename works");
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_tree_past_the_bounds_is_refused_not_walked_without_end() {
+    let scratch = Scratch::new();
+    let tree = scratch.path("tree");
+    std::fs::create_dir_all(tree.join("a").join("b").join("c")).unwrap();
+    for index in 0..8 {
+        std::fs::write(tree.join(format!("f{index}.txt")), b"x").unwrap();
+    }
+    let start = anchor(&tree);
+    let guard = privilege::enter().unwrap();
+    let wide = walk(
+        &start,
+        Bounds {
+            objects: 5,
+            depth: 64,
+        },
+        &mut |_| Ok(Verdict::Descend),
+    );
+    assert!(matches!(wide, Err(WalkError::TooLarge(5))), "{wide:?}");
+    let deep = walk(
+        &start,
+        Bounds {
+            objects: 1000,
+            depth: 2,
+        },
+        &mut |_| Ok(Verdict::Descend),
+    );
+    assert!(matches!(deep, Err(WalkError::TooDeep(2))), "{deep:?}");
+    drop(guard);
+}
+
+/// Makes a small virtual disk with the file system given, mounted on a letter, and removes it
+/// when dropped.
+struct Disk {
+    file: std::path::PathBuf,
+}
+
+impl Disk {
+    fn new(
+        scratch: &Scratch,
+        file_system: &str,
+        megabytes: u32,
+        letter: char,
+    ) -> Result<Disk, String> {
+        let file = scratch.path(&format!("{file_system}.vhd"));
+        let script = scratch.path(&format!("{file_system}.txt"));
+        std::fs::write(
+            &script,
+            format!(
+                "create vdisk file=\"{}\" maximum={megabytes} type=expandable\nselect vdisk file=\"{}\"\nattach vdisk\ncreate partition primary\nformat fs={file_system} quick\nassign letter={letter}\n",
+                file.display(),
+                file.display()
+            ),
+        )
+        .unwrap();
+        let out = std::process::Command::new("diskpart.exe")
+            .arg("/s")
+            .arg(&script)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let disk = Disk { file };
+        if Path::new(&format!("{letter}:\\")).exists() {
+            Ok(disk)
+        } else {
+            Err(text)
+        }
+    }
+}
+
+impl Drop for Disk {
+    fn drop(&mut self) {
+        let script = self.file.with_extension("detach.txt");
+        let _ = std::fs::write(
+            &script,
+            format!(
+                "select vdisk file=\"{}\"\ndetach vdisk\n",
+                self.file.display()
+            ),
+        );
+        let _ = std::process::Command::new("diskpart.exe")
+            .arg("/s")
+            .arg(&script)
+            .output();
+    }
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_system_volume_is_accepted_and_every_other_kind_of_volume_is_refused_with_its_reason() {
+    let scratch = Scratch::new();
+    assert!(
+        DirHandle::open_anchor(&scratch.dir).unwrap().is_ok(),
+        "an NTFS fixed volume is accepted"
+    );
+    let share = format!(
+        r"\\localhost\C$\Users\Public\{}",
+        scratch.dir.file_name().unwrap().to_string_lossy()
+    );
+    match DirHandle::open_anchor(Path::new(&share)).expect("the platform answers") {
+        Err(AnchorRefusal::Volume(VolumeRefusal::Remote)) => {}
+        other => panic!("a share of this computer is a remote volume: {other:?}"),
+    }
+    let fat =
+        Disk::new(&scratch, "fat32", 100, 'R').expect("a FAT32 disk can be made on the guest");
+    match DirHandle::open_anchor(Path::new("R:\\")).expect("the platform answers") {
+        Err(AnchorRefusal::Volume(VolumeRefusal::NotNtfs(name))) => {
+            assert_eq!(name, "FAT32");
+        }
+        other => panic!("a FAT32 volume is refused with its file system: {other:?}"),
+    }
+    drop(fat);
+    match Disk::new(&scratch, "refs", 2048, 'S') {
+        Ok(refs) => {
+            match DirHandle::open_anchor(Path::new("S:\\")).expect("the platform answers") {
+                Err(AnchorRefusal::Volume(VolumeRefusal::NotNtfs(name))) => {
+                    assert_eq!(name, "ReFS")
+                }
+                other => panic!("a ReFS volume is refused with its file system: {other:?}"),
+            }
+            drop(refs);
+        }
+        Err(reason) => println!(
+            "a ReFS volume could not be made on this guest, so that refusal was not shown: {reason}"
+        ),
+    }
+}
