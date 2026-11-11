@@ -2460,6 +2460,53 @@ impl RawDevice {
         }
     }
 
+    /// Sends one read under a method name the registry may not list, and returns what the host
+    /// answered: the way a device meets a host older than the method it asks for.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the name is not one a method may have, or the host ends the control stream
+    /// instead of answering.
+    pub async fn read_named<P: serde::Serialize + ?Sized>(
+        &self,
+        name: &str,
+        params: &P,
+    ) -> std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError> {
+        use kr_client::transport::ControlTransport as _;
+        use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Request};
+        use kr_protocol::method::{MethodName, MethodVersion};
+
+        let request_id = kr_protocol::ids::RequestId::new(
+            self.next_request
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+        let frame = ControlFrame::Request(Request {
+            request_id,
+            method: MethodName::new(name).expect("a method name"),
+            method_version: MethodVersion::V1,
+            params: ParamsValue::from_typed(params).expect("the parameters encode"),
+        });
+        self.transport
+            .send(&frame)
+            .await
+            .expect("the frame is sent");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let frame = tokio::time::timeout_at(deadline, self.heard_next())
+                .await
+                .expect("the host answers in time")
+                .expect("the control stream is open");
+            if let ControlFrame::Response(response) = frame
+                && response.request_id == request_id
+            {
+                return match response.outcome {
+                    Outcome::Ok(value) => Ok(value),
+                    Outcome::Error(error) => Err(error),
+                };
+            }
+        }
+    }
+
     /// Claims the receive side, which exactly one reader may hold.
     pub fn claim(&self) {
         use kr_client::transport::ControlTransport as _;
