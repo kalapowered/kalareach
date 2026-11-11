@@ -1566,6 +1566,11 @@ fn a_file_that_another_program_reads_by_path_is_made_new_and_owned_by_the_admini
     assert!(made.protected);
     assert_eq!(sids(&made), [SYSTEM, ADMINISTRATORS]);
 
+    // The name is random: another file made the same way has another.
+    let (_other, other_path) =
+        fresh::named_file(&folder, "policy", ".xml", SdKind::AdminFile).unwrap();
+    assert_ne!(other_path, path);
+
     // Anything at the name stops the call, and what is there is as it was.
     let again = fresh::file_at(&path, SdKind::AdminFile, true).expect_err("the name is taken");
     assert_eq!(again.kind(), std::io::ErrorKind::AlreadyExists, "{again}");
