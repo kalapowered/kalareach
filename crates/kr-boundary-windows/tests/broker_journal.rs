@@ -1920,6 +1920,35 @@ fn the_ceiling_follows_each_row_by_what_it_took_and_what_it_still_owes() {
     );
 }
 
+/// The ceiling counts each of a root's three rows at the largest size until the row is written, so
+/// each written row moves it by the row's real size less one reserve. The sizes come from the rows
+/// and the limits, not from the ceiling, so a reserve that is missing or short for one of the three
+/// moves the ceiling by the wrong amount whatever the file's size.
+#[test]
+fn a_private_roots_three_rows_are_each_reserved_at_their_largest_size_until_they_are_written() {
+    let framed = |row: &Row| (row.to_bytes().len() + framing::FRAME_BYTES) as i64;
+    let reserve = (limits::ROOT_MAX + framing::FRAME_BYTES) as i64;
+    let mut tracker = writer_after(limits::WRITER_LIMIT, &[begin()]);
+    let mut ceiling = tracker.ceiling() as i64;
+    for row in [
+        Row::RootIntent { name: root_name(1) },
+        Row::RootMade {
+            name: root_name(1),
+            key: key(9),
+        },
+        Row::RootRemoved,
+    ] {
+        tracker.apply(&row).unwrap();
+        let after = tracker.ceiling() as i64;
+        assert_eq!(
+            after - ceiling,
+            framed(&row) - reserve,
+            "{row:?} gives back its reserve and takes its own size"
+        );
+        ceiling = after;
+    }
+}
+
 #[test]
 fn a_leftover_never_gives_away_the_room_of_a_result_that_is_still_admissible() {
     // After a release intent and a leftover of the same key, the key's release is still pending: a
