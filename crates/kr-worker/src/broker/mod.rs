@@ -1825,21 +1825,23 @@ impl Broker {
             .bindings
             .values()
             .filter_map(|binding| {
-                binding
-                    .release
-                    .as_ref()
-                    .map(|release| kr_protocol::admission::LiveBinding {
+                binding.release.as_ref().map(|release| {
+                    let component = component::report_of(
+                        binding,
+                        state.component_states.get(&binding.binding_id),
+                        state.component_notes.get(&binding.binding_id),
+                        self.observation.is_private(),
+                    );
+                    #[cfg(feature = "testing")]
+                    let component = crate::plugin_link_trace::with_tail(component);
+                    kr_protocol::admission::LiveBinding {
                         binding_id: binding.binding_id,
                         application_instance_id: binding.application_instance_id,
                         release: release.clone(),
                         ending: binding.ending,
-                        component: Nullable(component::report_of(
-                            binding,
-                            state.component_states.get(&binding.binding_id),
-                            state.component_notes.get(&binding.binding_id),
-                            self.observation.is_private(),
-                        )),
-                    })
+                        component: Nullable(component),
+                    }
+                })
             })
             .collect()
     }

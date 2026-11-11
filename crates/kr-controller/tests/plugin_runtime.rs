@@ -367,7 +367,14 @@ impl Recording {
 
 impl WorkerSupervisor for Recording {
     fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
-        let outcome = self.inner.start(launch);
+        // The worker adds its link's account to the reports it sends only where it is asked to,
+        // and only the cases of this file ask.
+        let mut told = launch.clone();
+        told.desktop_environment.push((
+            kr_worker::plugin_link_trace::SWITCH.to_owned(),
+            "1".to_owned(),
+        ));
+        let outcome = self.inner.start(&told);
         self.note(Requested::Worker(launch.session_id), &outcome);
         outcome
     }
@@ -586,6 +593,22 @@ fn counting_in_words(counted: bool) -> &'static str {
     }
 }
 
+/// A component report's reason as the worker sends it without its link's account.
+fn plain_reason(report: &kr_protocol::admission::ComponentReport) -> Option<&str> {
+    report
+        .reason
+        .0
+        .as_deref()
+        .map(kr_worker::plugin_link_trace::plain)
+        .filter(|reason| !reason.is_empty())
+}
+
+/// Whether a report says the binding's registration is being sent to the runtime.
+fn registering(report: &kr_protocol::admission::ComponentReport) -> bool {
+    report.state == ComponentState::Pending
+        && plain_reason(report) == Some("registering with the plugin runtime")
+}
+
 /// What the workers' reports of components say, one binding to a phrase, for a wait that ran out:
 /// whether the binding is `first` (otherwise it is named by the end of its identifier), its state
 /// and its reason, and what `counting` says of how current they are.
@@ -615,7 +638,7 @@ fn reports_in_words(
                     )
                 },
                 report.state,
-                report.reason.0.as_deref().unwrap_or("no reason")
+                plain_reason(report).unwrap_or("no reason")
             )
         })
         .collect::<Vec<_>>()
@@ -1168,14 +1191,20 @@ impl World {
     /// whose descriptor that connection verified, so a runtime that ended and was replaced
     /// meanwhile is not taken for the one that answered. No binding needs to be registered for it.
     async fn running_published_host(&self) -> ProcessStartIdentity {
-        until(
+        until_found(
+            PATIENCE,
             "the daemon to publish a plugin runtime that answers",
             || async {
-                let client = PluginClient::connect(&self.environment()).await.ok()?;
-                client.health().await.ok()?;
+                let client = PluginClient::connect(&self.environment())
+                    .await
+                    .map_err(|_| String::new())?;
+                client.health().await.map_err(|_| String::new())?;
                 let host = client.descriptor().process_start_identity.clone();
-                (kr_ipc::identity::process_state(&host) == ProcessState::Running).then_some(host)
+                (kr_ipc::identity::process_state(&host) == ProcessState::Running)
+                    .then_some(host)
+                    .ok_or_else(String::new)
             },
+            || async { self.link_traces_in_words() },
         )
         .await
     }
@@ -1201,14 +1230,16 @@ impl World {
     }
 
     async fn holding_within(&self, patience: Duration, bindings: u64) -> HostHealth {
-        until_within(
+        until_found(
             patience,
             "the plugin runtime to hold the bindings",
             || async {
                 self.health()
                     .await
                     .filter(|health| health.live_bindings == bindings)
+                    .ok_or_else(String::new)
             },
+            || async { self.link_traces_in_words() },
         )
         .await
     }
@@ -1219,7 +1250,7 @@ impl World {
         self.reported()
             .await
             .into_iter()
-            .map(|(_, report)| (report.state, report.reason.0))
+            .map(|(_, report)| (report.state, plain_reason(&report).map(str::to_owned)))
             .collect()
     }
 
@@ -1283,14 +1314,53 @@ impl World {
         let notes = controller.catalogue_warnings().await;
         format!(
             "; when the wait ran out, {out} of {} workers had a round that had not ended; the \
-             catalogue's notes: {}",
+             catalogue's notes: {}{}",
             workers.len(),
             if notes.is_empty() {
                 "none".to_owned()
             } else {
                 notes.join(" | ")
-            }
+            },
+            self.link_traces_in_words()
         )
+    }
+
+    /// What each worker's link to the plugin runtime says it did, newest last, from the last
+    /// reports the daemon holds: the tail a worker sends after its reports' reasons when its
+    /// environment asks for it. Each time is in seconds on that worker's own clock.
+    fn link_traces_in_words(&self) -> String {
+        let Some(controller) = self.controller.as_ref() else {
+            return "; no link trace (the daemon of this case is a process of its own)".to_owned();
+        };
+        let mut seen: Vec<SessionId> = Vec::new();
+        let mut words = Vec::new();
+        for (session_id, _, report) in controller.reported_components() {
+            if seen.contains(&session_id) {
+                continue;
+            }
+            let Some(tail) = report
+                .reason
+                .0
+                .as_deref()
+                .and_then(kr_worker::plugin_link_trace::tail_of)
+            else {
+                continue;
+            };
+            seen.push(session_id);
+            let identifier = session_id.to_string();
+            words.push(format!(
+                "the worker of the session ending {}: {tail}",
+                &identifier[identifier.len().saturating_sub(6)..]
+            ));
+        }
+        if words.is_empty() {
+            "; no link trace (no worker of this case sent one)".to_owned()
+        } else {
+            format!(
+                "; the workers' link traces, oldest first: {}",
+                words.join(" | ")
+            )
+        }
     }
 
     /// The worker of a session, as the daemon's registry records it, for a daemon this test does
@@ -1734,10 +1804,6 @@ async fn a_plugin_runtime_that_ends_with_a_registration_unanswered_takes_no_work
     let second_agent = world.start_agent(&mut typing, "").await;
 
     // The worker has bound it and sent the registration, and nothing answers it.
-    let registering = |report: &kr_protocol::admission::ComponentReport| {
-        report.state == ComponentState::Pending
-            && report.reason.0.as_deref() == Some("registering with the plugin runtime")
-    };
     let second_binding = until_found(
         PATIENCE,
         "the second binding's registration to be sent and left unanswered",
@@ -1816,6 +1882,68 @@ async fn a_plugin_runtime_that_ends_with_a_registration_unanswered_takes_no_work
         Some(traffic.count()).filter(|count| *count > after_the_end + 20)
     })
     .await;
+}
+
+/// KR-REQ-05.07: a registration the plugin runtime holds unanswered is named in the worker's own
+/// account of what its link is doing, with the call and the limit the link gives it.
+///
+/// The worker adds that account to the reports it sends when its environment asks for it, and the
+/// cases of this file ask. A worker is running a program the package recognises, and its binding
+/// is registered. The runtime is stopped, a second program is run, and the worker sends the
+/// registration of its binding to a runtime that answers nothing. The account then names the
+/// registration of that binding with the limit its call is given, and does not say it ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_registration_the_runtime_holds_is_named_in_the_workers_account_with_its_limit() {
+    let Some(component) = well_behaved() else {
+        return;
+    };
+    let world = World::start(&component).await;
+    let created = world.session().await;
+    let (mut typing, _first_agent) = world.run_agent(&created).await;
+    world.registering(1).await;
+    world.components_are(1, ComponentState::Registered).await;
+    let first_binding = world.reported().await[0].0;
+    let host = world.published_host().expect("the runtime is published");
+
+    stop(&host);
+    let _second_agent = world.start_agent(&mut typing, "").await;
+
+    let limit = kr_plugin_service::client::REGISTER_DEADLINE.as_millis();
+    until_found(
+        PATIENCE,
+        "the worker's account to name the registration the runtime holds",
+        || async {
+            let look = world.looked().await;
+            let named = look.reports.iter().any(|(binding, report)| {
+                let identifier = binding.to_string();
+                let ending = &identifier[identifier.len().saturating_sub(6)..];
+                let tail = report
+                    .reason
+                    .0
+                    .as_deref()
+                    .and_then(kr_worker::plugin_link_trace::tail_of)
+                    .unwrap_or_default();
+                *binding != first_binding
+                    && registering(report)
+                    && tail.contains(&format!("began register {ending} limit {limit}"))
+                    && !tail.contains(&format!("ended register {ending}"))
+            });
+            if named {
+                Ok(())
+            } else {
+                Err(reports_in_words(
+                    &look.reports,
+                    first_binding,
+                    counting_in_words(look.counted),
+                ))
+            }
+        },
+        || world.rounds_in_words(),
+    )
+    .await;
+
+    kill(&host);
+    ended(&host).await;
 }
 
 /// KR-REQ-05.07: a plugin runtime that keeps ending is not started without end, and the workers

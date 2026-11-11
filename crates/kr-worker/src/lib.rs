@@ -85,6 +85,8 @@ pub mod owned_writer;
 pub mod ownership;
 pub mod persistence;
 pub mod plugin_decoding;
+#[cfg(feature = "testing")]
+pub mod plugin_link_trace;
 pub mod plugin_observation;
 pub mod plugin_runtime;
 pub mod privacy;

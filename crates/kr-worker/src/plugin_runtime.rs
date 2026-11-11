@@ -74,6 +74,8 @@ use kr_protocol::ids::{BrokerBindingId, SessionId};
 use crate::broker::Broker;
 use crate::broker::component::{ComponentNote, ComponentWant, Execution, FaultNote};
 use crate::broker::observation::{Held, ObservationLane};
+#[cfg(feature = "testing")]
+use crate::plugin_link_trace as link_trace;
 use crate::plugin_observation::{CALL_WAIT, service_id};
 
 /// How long a request to the control daemon is given.
@@ -138,6 +140,8 @@ pub async fn link(request: RuntimeRequest, broker: Weak<Broker>) {
     let _decoder = AbortOnDrop(tokio::spawn(crate::plugin_decoding::decoder(Weak::clone(
         &broker,
     ))));
+    #[cfg(feature = "testing")]
+    link_trace::start_from_environment();
     let mut link = Link {
         request,
         client: None,
@@ -154,6 +158,8 @@ pub async fn link(request: RuntimeRequest, broker: Weak<Broker>) {
         let Some(wants) = broker.upgrade().map(|broker| broker.component_wants()) else {
             return;
         };
+        #[cfg(feature = "testing")]
+        link_trace::pass(wants.len());
         let delay = link.settle(&broker, wants).await;
         link.wait(&broker, &changes, delay).await;
     }
@@ -395,7 +401,16 @@ impl Link {
                 self.registered.clear();
                 break;
             };
-            match client.unbind(service_id(binding_id)).await {
+            #[cfg(feature = "testing")]
+            let began = link_trace::began(
+                link_trace::Call::Unbind,
+                Some(binding_id),
+                kr_plugin_service::client::DEFAULT_DEADLINE,
+            );
+            let unbound = client.unbind(service_id(binding_id)).await;
+            #[cfg(feature = "testing")]
+            link_trace::ended(began, link_trace::Outcome::of(&unbound));
+            match unbound {
                 Ok(_) | Err(ServiceError::Protocol { .. } | ServiceError::Disabled { .. }) => {
                     self.registered.remove(&binding_id);
                     self.told_facts.remove(&binding_id);
@@ -405,6 +420,8 @@ impl Link {
                     }
                 }
                 Err(error) => {
+                    #[cfg(feature = "testing")]
+                    link_trace::lost(link_trace::Why::of(&error));
                     self.lose(broker, &error.to_string());
                     break;
                 }
@@ -460,7 +477,16 @@ impl Link {
             // Told before the connection is published and before anything is registered on it, so
             // that what the first binding's `bind` draws is judged by privacy mode as it stands. A
             // runtime that cannot be told is a runtime that cannot be reached.
-            if let Err(error) = client.privacy(self.lane.is_private()).await {
+            #[cfg(feature = "testing")]
+            let began = link_trace::began(
+                link_trace::Call::Privacy,
+                None,
+                kr_plugin_service::client::DEFAULT_DEADLINE,
+            );
+            let told = client.privacy(self.lane.is_private()).await;
+            #[cfg(feature = "testing")]
+            link_trace::ended(began, link_trace::Outcome::of(&told));
+            if let Err(error) = told {
                 self.stopped(
                     broker,
                     wants,
@@ -498,6 +524,12 @@ impl Link {
             // Before the component exists, on the connection it is registered on: whatever it is
             // handed on this connection marks it, and the mark outlasts its becoming ready.
             let connection = self.lane.connection();
+            #[cfg(feature = "testing")]
+            let began = link_trace::began(
+                link_trace::Call::Register,
+                Some(want.binding_id),
+                kr_plugin_service::client::REGISTER_DEADLINE,
+            );
             let registered = client
                 .register(
                     service_id(want.binding_id),
@@ -511,6 +543,8 @@ impl Link {
                     },
                 )
                 .await;
+            #[cfg(feature = "testing")]
+            link_trace::ended(began, link_trace::Outcome::of(&registered));
             match registered {
                 Ok(registration) => {
                     self.registered.insert(want.binding_id, want.generation);
@@ -533,6 +567,8 @@ impl Link {
                     report(broker, want.binding_id, ComponentState::Registered, None);
                     if let Err(error) = self.make_ready(broker, want, connection).await {
                         let reason = error.to_string();
+                        #[cfg(feature = "testing")]
+                        link_trace::lost(link_trace::Why::of(&error));
                         self.lose(broker, &reason);
                         for want in wants {
                             report(
@@ -554,6 +590,8 @@ impl Link {
                 }
                 Err(error) => {
                     let reason = error.to_string();
+                    #[cfg(feature = "testing")]
+                    link_trace::lost(link_trace::Why::of(&error));
                     self.lose(broker, &reason);
                     // The binding being registered and those behind it were told a step of the
                     // way; every one that wants a component is told what stopped it.
@@ -620,7 +658,19 @@ impl Link {
                 Some(ASKING),
             );
         }
-        let told = match self.ask().await {
+        #[cfg(feature = "testing")]
+        let began = link_trace::began(link_trace::Call::Ask, None, ASK_DEADLINE);
+        let asked = self.ask().await;
+        #[cfg(feature = "testing")]
+        link_trace::ended(
+            began,
+            if asked.is_ok() {
+                link_trace::Outcome::Answered
+            } else {
+                link_trace::Outcome::Unavailable
+            },
+        );
+        let told = match asked {
             Ok(PluginRuntimeState::Running) => None,
             Ok(PluginRuntimeState::Unavailable(PluginRuntimeUnavailable {
                 reason,
@@ -642,7 +692,16 @@ impl Link {
                     Some(CONNECTING),
                 );
             }
-            match PluginClient::connect(&self.request.environment).await {
+            #[cfg(feature = "testing")]
+            let began = link_trace::began(
+                link_trace::Call::Connect,
+                None,
+                kr_plugin_service::client::DEFAULT_DEADLINE,
+            );
+            let connected = PluginClient::connect(&self.request.environment).await;
+            #[cfg(feature = "testing")]
+            link_trace::ended(began, link_trace::Outcome::of(&connected));
+            match connected {
                 Ok(client) => return Some(client),
                 Err(error) => {
                     self.stopped(
@@ -681,6 +740,8 @@ impl Link {
         }
         self.last_reason = Some(reason.to_owned());
         self.pace.failed(tokio::time::Instant::now(), asked);
+        #[cfg(feature = "testing")]
+        link_trace::retry(self.pace.remaining(tokio::time::Instant::now()));
     }
 
     /// Waits until something may have changed: the broker's set, a notice from the runtime, the
@@ -732,7 +793,11 @@ impl Link {
         };
         match event {
             Event::Changed | Event::Timer => {}
-            Event::Notice(None) => self.lose(broker, "the plugin runtime ended its connection"),
+            Event::Notice(None) => {
+                #[cfg(feature = "testing")]
+                link_trace::lost(link_trace::Why::Ended);
+                self.lose(broker, "the plugin runtime ended its connection");
+            }
             Event::Notice(Some(Notice::Disabled { binding_id, reason })) => {
                 // The runtime has stopped running this component for good. The broker holds that
                 // for the binding's life; the next pass sees it no longer wanted and unbinds it.
@@ -831,9 +896,17 @@ impl Link {
         if let Some(held) = held {
             // The component is given state that belongs to this generation.
             self.registered.insert(binding, generation);
+            #[cfg(feature = "testing")]
+            let began = link_trace::began(
+                link_trace::Call::Restore,
+                Some(binding),
+                CALL_WAIT + kr_plugin_service::client::ROUND_TRIP_ALLOWANCE,
+            );
             let restored = client
                 .restore(service_id(binding), held.state, CALL_WAIT)
                 .await;
+            #[cfg(feature = "testing")]
+            link_trace::ended(began, link_trace::Outcome::of(&restored));
             let note = match restored {
                 Ok(called) if called.answered() => {
                     "the component's state was restored from a checkpoint, and the observations \
@@ -876,18 +949,28 @@ impl Link {
             {
                 continue;
             }
-            match client
+            #[cfg(feature = "testing")]
+            let began = link_trace::began(
+                link_trace::Call::ReviseFacts,
+                Some(want.binding_id),
+                kr_plugin_service::client::DEFAULT_DEADLINE,
+            );
+            let revised = client
                 .revise_facts(
                     service_id(want.binding_id),
                     &facts_of(want, kr_ipc::now_ms().get()),
                 )
-                .await
-            {
+                .await;
+            #[cfg(feature = "testing")]
+            link_trace::ended(began, link_trace::Outcome::of(&revised));
+            match revised {
                 Ok(()) => {
                     self.told_facts
                         .insert(want.binding_id, want.execution.clone());
                 }
                 Err(ServiceError::Unavailable { detail }) => {
+                    #[cfg(feature = "testing")]
+                    link_trace::lost(link_trace::Why::Unavailable);
                     self.lose(broker, &detail);
                     return;
                 }
@@ -915,15 +998,28 @@ impl Link {
         let due = *self.health_due.get_or_insert(now + HEALTH_EVERY);
         if now >= due {
             self.health_due = Some(now + HEALTH_EVERY);
-            match client.health().await {
+            #[cfg(feature = "testing")]
+            let began = link_trace::began(
+                link_trace::Call::Health,
+                None,
+                kr_plugin_service::client::DEFAULT_DEADLINE,
+            );
+            let health = client.health().await;
+            #[cfg(feature = "testing")]
+            link_trace::ended(began, link_trace::Outcome::of(&health));
+            match health {
                 Ok(_) => self.health_failures = 0,
                 Err(ServiceError::Unavailable { detail }) => {
+                    #[cfg(feature = "testing")]
+                    link_trace::lost(link_trace::Why::Unavailable);
                     self.lose(broker, &detail);
                     return Some(self.pace.remaining(tokio::time::Instant::now()));
                 }
                 Err(_) => {
                     self.health_failures = self.health_failures.saturating_add(1);
                     if self.health_failures >= HEALTH_FAILURES {
+                        #[cfg(feature = "testing")]
+                        link_trace::lost(link_trace::Why::StoppedAnswering);
                         self.lose(broker, "the plugin runtime stopped answering");
                         return Some(self.pace.remaining(tokio::time::Instant::now()));
                     }
@@ -941,7 +1037,16 @@ impl Link {
             self.lane.checkpoint_attempted(binding, now);
             let want = wants.iter().find(|want| want.binding_id == binding);
             let generation = self.registered.get(&binding).copied();
-            match client.checkpoint(service_id(binding), CALL_WAIT).await {
+            #[cfg(feature = "testing")]
+            let began = link_trace::began(
+                link_trace::Call::Checkpoint,
+                Some(binding),
+                CALL_WAIT + kr_plugin_service::client::ROUND_TRIP_ALLOWANCE,
+            );
+            let checkpointed = client.checkpoint(service_id(binding), CALL_WAIT).await;
+            #[cfg(feature = "testing")]
+            link_trace::ended(began, link_trace::Outcome::of(&checkpointed));
+            match checkpointed {
                 Ok(called) => {
                     if let (Some(state), Some(want), Some(generation)) =
                         (called.state, want, generation)
@@ -958,6 +1063,8 @@ impl Link {
                     }
                 }
                 Err(ServiceError::Unavailable { detail }) => {
+                    #[cfg(feature = "testing")]
+                    link_trace::lost(link_trace::Why::Unavailable);
                     self.lose(broker, &detail);
                     return Some(self.pace.remaining(tokio::time::Instant::now()));
                 }
@@ -998,6 +1105,8 @@ impl Link {
         self.hold(broker, None);
         self.last_reason = Some(reason.to_owned());
         self.pace.lost(tokio::time::Instant::now());
+        #[cfg(feature = "testing")]
+        link_trace::retry(self.pace.remaining(tokio::time::Instant::now()));
     }
 
     /// Keeps the connection to the runtime, or lets it go, and tells the broker, which asks
@@ -1038,6 +1147,8 @@ fn report(
     state: ComponentState,
     reason: Option<&str>,
 ) {
+    #[cfg(feature = "testing")]
+    link_trace::reported(binding_id, state, reason);
     if let Some(broker) = broker.upgrade() {
         broker.set_component_state(binding_id, state, reason);
     }
