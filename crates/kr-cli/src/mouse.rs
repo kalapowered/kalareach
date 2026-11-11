@@ -243,12 +243,34 @@ impl MouseReporting {
         let set = last == b'h';
         for &mode in &control.parameters {
             match mode {
-                // One tracking state: a set replaces the one in force, and a reset of any of the
-                // three turns it off, whichever of them had set it.
+                // One tracking state: a set of one of the three replaces the one in force, and a reset
+                // of the one in force turns tracking off. A reset of a tracking mode that is not the
+                // one in force is left alone: a terminal would turn tracking off, but a worker of an
+                // earlier build draws a screen with every tracking mode it holds, one by one, the
+                // ones that are off among them (`?1000h ?1002l ?1003l`), and that frame has to be
+                // read as what its application asked for, the widest that is on. The bytes carry no
+                // sign of which build wrote them, so every frame is read this way, and a reset of a
+                // tracking mode that is not on, written by an application itself, is read as a
+                // frame's would be.
+                // Remove the exception when no worker of an earlier build can still be running: when
+                // the lowest package version `check_build` accepts in `attach.rs` is at or above the
+                // first release that holds the one-state tracking in `kr-term`'s `ModeState`. A reset
+                // of any of the three then turns tracking off, as on a terminal.
                 1000 | 1002 | 1003 => {
-                    self.clicks = set && mode == 1000;
-                    self.drag = set && mode == 1002;
-                    self.motion = set && mode == 1003;
+                    let in_force = if self.motion {
+                        Some(1003)
+                    } else if self.drag {
+                        Some(1002)
+                    } else if self.clicks {
+                        Some(1000)
+                    } else {
+                        None
+                    };
+                    if set || in_force == Some(mode) {
+                        self.clicks = set && mode == 1000;
+                        self.drag = set && mode == 1002;
+                        self.motion = set && mode == 1003;
+                    }
                 }
                 1006 => self.sgr = set,
                 _ => {}
@@ -574,9 +596,9 @@ mod tests {
             (&b"\x1b[?1002h"[..], Tracking::Drag),
             (b"\x1b[?1003h", Tracking::Motion),
             (b"\x1b[?1000h", Tracking::Clicks),
-            (b"\x1b[?1003l", Tracking::Off),
+            (b"\x1b[?1003l", Tracking::Clicks),
             (b"\x1b[?1002h", Tracking::Drag),
-            (b"\x1b[?1000l", Tracking::Off),
+            (b"\x1b[?1002l", Tracking::Off),
         ] {
             reporting.observe(output);
             assert_eq!(reporting.tracking(), tracking, "{output:?}");
@@ -587,21 +609,46 @@ mod tests {
         assert_eq!(reporting.encoding(), kr_keys::MouseEncoding::X10);
     }
 
-    /// The tracking is one state, as a terminal keeps it: a reset of any of the three modes after a
-    /// set turns it off, and a frame drawn from the session's screen resets the three before it
-    /// sets the one that is on.
+    /// The tracking is one state: a set of one of the three replaces the one in force, a reset of
+    /// the one in force turns it off, and a frame drawn from the session's screen resets the three
+    /// before it sets the one that is on, so a console that was reporting stops when the session's
+    /// application has tracking off.
     #[test]
-    fn a_reset_of_any_tracking_mode_after_a_set_turns_the_tracking_off() {
+    fn a_frame_that_resets_the_three_and_sets_one_leaves_that_one_and_nothing_when_none_is_on() {
         let mut reporting = MouseReporting::default();
-        reporting.observe(b"\x1b[?1000h\x1b[?1002l\x1b[?1003l\x1b[?1006h\x1b[?2004l");
-        assert_eq!(reporting.tracking(), Tracking::Off);
+        reporting.observe(b"\x1b[?1003h");
+        assert_eq!(reporting.tracking(), Tracking::Motion);
+        reporting.observe(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1002h\x1b[?1006h");
+        assert_eq!(reporting.tracking(), Tracking::Drag);
         assert_eq!(reporting.encoding(), kr_keys::MouseEncoding::Sgr);
-        reporting.observe(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1002h");
-        assert_eq!(reporting.tracking(), Tracking::Drag);
-        reporting.observe(b"\x1b[?1000h\x1b[?1002h");
-        assert_eq!(reporting.tracking(), Tracking::Drag);
-        reporting.observe(b"\x1b[?1002h\x1b[?1000l");
-        assert_eq!(reporting.tracking(), Tracking::Off);
+        reporting.observe(b"\x1b[?1003h\x1b[?1000h");
+        assert_eq!(reporting.tracking(), Tracking::Clicks);
+        for on in [&b"\x1b[?1000h"[..], b"\x1b[?1002h", b"\x1b[?1003h"] {
+            let mut reporting = MouseReporting::default();
+            reporting.observe(on);
+            reporting.observe(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l");
+            assert_eq!(reporting.tracking(), Tracking::Off, "{on:?}");
+        }
+    }
+
+    /// A worker of an earlier build draws a screen with each tracking mode it holds, one by one and
+    /// the ones that are off among them, and that frame is read as what the application asked for.
+    #[test]
+    fn a_frame_of_an_earlier_worker_is_read_as_the_widest_tracking_that_is_on() {
+        for (frame, tracking) in [
+            (
+                &b"\x1b[?1000h\x1b[?1002l\x1b[?1003l\x1b[?1006h"[..],
+                Tracking::Clicks,
+            ),
+            (b"\x1b[?1000l\x1b[?1002h\x1b[?1003l", Tracking::Drag),
+            (b"\x1b[?1000h\x1b[?1002h\x1b[?1003l", Tracking::Drag),
+            (b"\x1b[?1000h\x1b[?1002l\x1b[?1003h", Tracking::Motion),
+            (b"\x1b[?1000l\x1b[?1002l\x1b[?1003l", Tracking::Off),
+        ] {
+            let mut reporting = MouseReporting::default();
+            reporting.observe(frame);
+            assert_eq!(reporting.tracking(), tracking, "{frame:?}");
+        }
     }
 
     /// A full reset of the terminal turns the mouse's modes off, however the write is cut, and what

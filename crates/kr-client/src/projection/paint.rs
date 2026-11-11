@@ -656,8 +656,15 @@ impl<'a> Writer<'a> {
     /// not known here.
     ///
     /// A screen read from a worker of an earlier build can have more than one on, and the order they
-    /// were set in is lost. The widest is taken: the history that leaves two on is an application
-    /// asking for a narrower tracking and then a wider one.
+    /// were set in is lost; a delta from such a worker carries only the mode that changed, so it can
+    /// leave two on as well. The widest is taken: the usual history that leaves two on is an
+    /// application asking for a narrower tracking and then a wider one (`?1000h ?1002h`). It is
+    /// wrong for `?1003h ?1000h` (a terminal has 1000) and for `?1000h ?1002h ?1003h ?1003l` (a
+    /// terminal has none), which an earlier worker cannot tell from it.
+    /// Remove the choice when no worker of an earlier build can still be running: when the lowest
+    /// package version `check_build` accepts in `kr-cli`'s `attach.rs` is at or above the first
+    /// release that holds the one-state tracking in `kr-term`'s `ModeState`; a screen then holds at
+    /// most one of the three.
     fn mouse_tracking(&mut self, tracking: Option<u16>) {
         for mode in MOUSE_TRACKING_MODES {
             self.mode_of(super::ProjectedModeSpelling::Dec, *mode, false);
@@ -3268,7 +3275,8 @@ mod safety {
                     .insert((super::super::ProjectedModeSpelling::Dec, mode), enabled);
             }
             let painted = install(&screen, Window::of(&screen), Keyboard::EVERYTHING);
-            mouse_tracking(&painted.bytes)
+            // The destination was reporting before the frame: an all-off screen must turn it off.
+            mouse_tracking(&[b"\x1b[?1003h".as_slice(), &painted.bytes].concat())
         };
         // A session holds one tracking, and a terminal holds one, so which of the three is written
         // last decides what a click reaches the application as. A screen from a worker of an
