@@ -9,8 +9,8 @@
 //! References resolve to checked object identifiers before the launch. A revision comes out of the
 //! parser in its qualified form (a branch name as `refs/heads/<name>`, so that a tag never answers
 //! to it) and the line carries, in [`OperationLine::checks`], what the readers must establish:
-//! each revision to resolve, each reference that must not be symbolic, the state the repository
-//! must be in. [`OperationLine::resolved`] puts the identifiers they return into the line. A refusal
+//! each revision to resolve, each reference that must not be symbolic (the branch every revision
+//! starts at, and the one a command writes), the state the repository must be in. [`OperationLine::resolved`] puts the identifiers they return into the line. A refusal
 //! names the rule that refused and the command and position of the element; it never repeats the
 //! element.
 
@@ -587,6 +587,8 @@ impl Parser<'_> {
                         dots: *dots,
                         right: right.clone(),
                     });
+                    self.symbolic_check(&left);
+                    self.symbolic_check(&right);
                     self.argv.push(format!("{left}{}{right}", dots_text(*dots)));
                     self.at += 1;
                 }
@@ -601,6 +603,18 @@ impl Parser<'_> {
             .map_err(|rule| self.refusal(rule, "is a revision outside the grammar"))
     }
 
+    /// A revision that starts at a branch has that reference checked: a symbolic reference could
+    /// make another one, a tag among them, answer to the branch's name.
+    fn symbolic_check(&mut self, spec: &str) {
+        if let Ok((base, _)) = grammar::split_revision(spec)
+            && base.starts_with(BRANCH_PREFIX)
+        {
+            self.checks.push(Check::NotSymbolic {
+                refname: base.to_owned(),
+            });
+        }
+    }
+
     /// One revision, qualified, with its resolution recorded and its place noted.
     fn revision(&mut self, text: &str) -> Result<(), Refusal> {
         let spec = self.qualify(text)?;
@@ -609,6 +623,7 @@ impl Parser<'_> {
             replaces: Some(self.argv.len()),
             tree_target: false,
         });
+        self.symbolic_check(&spec);
         self.argv.push(spec);
         self.at += 1;
         Ok(())
@@ -721,6 +736,7 @@ impl Parser<'_> {
                             replaces: Some(self.argv.len() + 1),
                             tree_target: true,
                         });
+                        self.symbolic_check(&spec);
                         self.argv.push("--detach".to_owned());
                         self.argv.push(spec);
                         self.argv.push("--".to_owned());
@@ -740,6 +756,7 @@ impl Parser<'_> {
                     replaces: Some(self.argv.len()),
                     tree_target: true,
                 });
+                self.symbolic_check(&spec);
                 self.argv.push(spec);
                 self.at = 1;
                 self.paths(true)?;

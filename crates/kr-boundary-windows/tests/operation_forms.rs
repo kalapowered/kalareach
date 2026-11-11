@@ -133,6 +133,12 @@ fn resolve(spec: &str, at: usize) -> Check {
     }
 }
 
+fn not_symbolic(refname: &str) -> Check {
+    Check::NotSymbolic {
+        refname: refname.to_owned(),
+    }
+}
+
 #[test]
 fn the_tables_say_which_commands_write_and_which_stop_on_a_state() {
     for (command, writes, state, head) in [
@@ -207,8 +213,19 @@ fn rev_parse_revision_form_qualifies_each_revision_and_notes_its_resolution() {
         line.checks,
         vec![
             resolve("refs/heads/main", 1),
+            not_symbolic("refs/heads/main"),
             resolve(OID, 2),
-            resolve("refs/heads/feature/x~2^", 3)
+            resolve("refs/heads/feature/x~2^", 3),
+            not_symbolic("refs/heads/feature/x"),
+        ]
+    );
+    // A name that spells a full reference is a branch name, and its reference is the longer one.
+    let line = accepted(Command::RevParse, &[r("refs/heads/x")]);
+    assert_eq!(
+        line.checks,
+        vec![
+            resolve("refs/heads/refs/heads/x", 1),
+            not_symbolic("refs/heads/refs/heads/x")
         ]
     );
 }
@@ -512,7 +529,13 @@ fn diff_takes_each_option_each_revision_form_and_paths() {
 
     let one = accepted(Command::Diff, &[r("main")]);
     assert_eq!(one.argv, with(DIFF, &["refs/heads/main"]));
-    assert_eq!(one.checks, vec![resolve("refs/heads/main", 5)]);
+    assert_eq!(
+        one.checks,
+        vec![
+            resolve("refs/heads/main", 5),
+            not_symbolic("refs/heads/main")
+        ]
+    );
     let two = accepted(Command::Diff, &[w("--cached"), r("HEAD~1"), r(OID)]);
     assert_eq!(two.argv, with(DIFF, &["--cached", "HEAD~1", OID]));
     assert_eq!(two.checks, vec![resolve("HEAD~1", 6), resolve(OID, 7)]);
@@ -525,14 +548,35 @@ fn diff_takes_each_option_each_revision_form_and_paths() {
         );
         assert_eq!(
             line.checks,
-            vec![Check::ResolveRange {
-                index: 5,
-                left: "refs/heads/main".to_owned(),
-                dots,
-                right: "HEAD^".to_owned()
-            }]
+            vec![
+                Check::ResolveRange {
+                    index: 5,
+                    left: "refs/heads/main".to_owned(),
+                    dots,
+                    right: "HEAD^".to_owned()
+                },
+                not_symbolic("refs/heads/main"),
+            ]
         );
     }
+    // Each side that starts at a branch is checked, the left one first.
+    let line = accepted(Command::Diff, &[range("a", Dots::Two, "b~1")]);
+    assert_eq!(
+        line.checks,
+        vec![
+            Check::ResolveRange {
+                index: 5,
+                left: "refs/heads/a".to_owned(),
+                dots: Dots::Two,
+                right: "refs/heads/b~1".to_owned()
+            },
+            not_symbolic("refs/heads/a"),
+            not_symbolic("refs/heads/b"),
+        ]
+    );
+    let line = accepted(Command::Diff, &[range("HEAD", Dots::Three, "b")]);
+    assert_eq!(line.checks.len(), 2, "{:?}", line.checks);
+    assert_eq!(line.checks[1], not_symbolic("refs/heads/b"));
 
     let line = accepted(Command::Diff, &[r("HEAD"), w("--"), p("a/b.txt"), p("c")]);
     assert_eq!(line.argv, with(DIFF, &["HEAD", "--", "a/b.txt", "c"]));
@@ -691,7 +735,11 @@ fn log_takes_each_option_each_revision_form_and_paths() {
     assert_eq!(line.argv, with(LOG, &["refs/heads/main", "HEAD"]));
     assert_eq!(
         line.checks,
-        vec![resolve("refs/heads/main", 9), resolve("HEAD", 10)]
+        vec![
+            resolve("refs/heads/main", 9),
+            not_symbolic("refs/heads/main"),
+            resolve("HEAD", 10)
+        ]
     );
     let line = accepted(Command::Log, &[range("a", Dots::Two, "b"), w("--"), p("x")]);
     assert_eq!(
@@ -901,7 +949,8 @@ fn checkout_detach_restore_from_a_revision_and_restore_from_the_index() {
                 spec: "refs/heads/main~2".to_owned(),
                 replaces: Some(5),
                 tree_target: true
-            }
+            },
+            not_symbolic("refs/heads/main"),
         ]
     );
 
@@ -922,6 +971,40 @@ fn checkout_detach_restore_from_a_revision_and_restore_from_the_index() {
     let line = accepted(Command::Checkout, &[w("--"), p("a"), p(".")]);
     assert_eq!(line.argv, with(CHECKOUT, &["--", "a", "."]));
     assert_eq!(line.checks, vec![Check::OperationState]);
+}
+
+#[test]
+fn every_checkout_revision_that_starts_at_a_branch_is_checked_for_a_symbolic_reference() {
+    // A branch that is a symbolic reference to a tag would make the tag answer to the branch's
+    // name: the restore form and the detach form check it as the switch does.
+    let line = accepted(Command::Checkout, &[r("alias"), w("--"), p("file")]);
+    assert_eq!(
+        line.argv,
+        with(CHECKOUT, &["refs/heads/alias", "--", "file"])
+    );
+    assert_eq!(
+        line.checks,
+        vec![
+            Check::OperationState,
+            Check::Resolve {
+                spec: "refs/heads/alias".to_owned(),
+                replaces: Some(4),
+                tree_target: true
+            },
+            not_symbolic("refs/heads/alias"),
+        ]
+    );
+    let line = accepted(Command::Checkout, &[r("alias^2"), w("--"), p("file")]);
+    assert_eq!(line.checks[2], not_symbolic("refs/heads/alias"));
+    let line = accepted(Command::Checkout, &[w("--detach"), r("alias~1")]);
+    assert_eq!(line.checks[2], not_symbolic("refs/heads/alias"));
+    // `HEAD` and an identifier start at no branch.
+    for revision in ["HEAD", "HEAD~3", OID] {
+        let line = accepted(Command::Checkout, &[r(revision), w("--"), p("file")]);
+        assert_eq!(line.checks.len(), 2, "{revision}: {:?}", line.checks);
+        let line = accepted(Command::Checkout, &[w("--detach"), r(revision)]);
+        assert_eq!(line.checks.len(), 2, "{revision}: {:?}", line.checks);
+    }
 }
 
 #[test]
