@@ -638,8 +638,9 @@ fn the_pages_of_a_kernel_object_are_counted_for_each_process() {
 #[cfg(target_os = "linux")]
 mod linux {
     use kr_perf::memory::{
-        Hold, Holder, Watched, hold_if_asked, program_of, read_in_child, serve_if_asked,
+        Hold, Holder, Watched, hold_if_asked, poll_until, program_of, read_in_child, serve_if_asked,
     };
+    use std::time::{Duration, Instant};
 
     use super::{Class, group};
 
@@ -653,9 +654,21 @@ mod linux {
         group(pids)
     }
 
+    /// What the kernel counts as a process's resident pages, in kibibytes: the second field of its
+    /// `statm`, which is the figure `ps` reports.
+    fn kernel_resident_kib(pid: u32) -> u64 {
+        let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).expect("its statm");
+        let pages: u64 = statm
+            .split_whitespace()
+            .nth(1)
+            .and_then(|field| field.parse().ok())
+            .expect("the resident field");
+        pages * rustix::param::page_size() as u64 / 1024
+    }
+
     /// Four copies of this program, each holding eight mebibytes of its own, are read from a child
     /// reader: the program they all map is counted once for the group, what each wrote is counted
-    /// for each, and the pages found agree with `ps`.
+    /// for each, and the pages found agree with the kernel's own count of each process's pages.
     #[test]
     fn processes_that_run_one_program_are_read_by_a_child_with_the_program_counted_once() {
         if serve_if_asked() || hold_if_asked() {
@@ -685,11 +698,10 @@ mod linux {
             file.once_kib,
             file.each_kib
         );
-        let table = kr_perf::process::resident_kib(&pids).expect("ps reads the holders");
-        let sum: u64 = table.values().sum();
+        let sum: u64 = pids.iter().map(|&pid| kernel_resident_kib(pid)).sum();
         assert!(
             reading.resident_kib.abs_diff(sum) <= sum / 100 + 64 * HOLDERS as u64,
-            "the scan found {} KiB and the process table sums to {sum} KiB",
+            "the scan found {} KiB and the kernel's own counts sum to {sum} KiB",
             reading.resident_kib
         );
     }
@@ -760,6 +772,87 @@ mod linux {
             "and is a zombie, not yet reaped"
         );
         assert!(leaving.reap().contains("exit status: 0"), "until it is");
+    }
+
+    /// A wait that signals keep interrupting is made again for the time that is left, and ends at
+    /// its deadline: repeated signals cannot keep it going past it, and one that is ready at the
+    /// deadline is still seen.
+    #[test]
+    fn a_wait_that_signals_keep_interrupting_ends_at_its_deadline() {
+        let end = Instant::now() + Duration::from_millis(20);
+        let mut calls = 0;
+        let ready = poll_until(end, |_| {
+            calls += 1;
+            // A call that takes a while and is then interrupted, until a hundred have been made.
+            std::thread::sleep(Duration::from_millis(5));
+            if calls < 100 {
+                Err(rustix::io::Errno::INTR)
+            } else {
+                Ok(true)
+            }
+        });
+        assert!(!ready, "no exit is accepted after the deadline");
+        assert!(
+            calls < 100,
+            "and the wait stops asking once it has passed: {calls}"
+        );
+
+        let mut calls = 0;
+        let ready = poll_until(Instant::now() + Duration::from_secs(30), |_| {
+            calls += 1;
+            if calls < 3 {
+                Err(rustix::io::Errno::INTR)
+            } else {
+                Ok(true)
+            }
+        });
+        assert!(
+            ready,
+            "before the deadline an interrupted wait is made again"
+        );
+        assert!(
+            poll_until(Instant::now(), |_| Ok(true)),
+            "and a zero wait that is ready says so"
+        );
+    }
+
+    /// A child that gets no process descriptor is an error that names the cause, and the child is
+    /// killed before the error returns.
+    #[test]
+    fn a_child_that_gets_no_process_descriptor_is_killed_and_the_error_names_the_cause() {
+        let mut started = None;
+        let failure = Watched::spawn_with(std::process::Command::new("sleep").arg("600"), |pid| {
+            started = Some(pid);
+            Err(rustix::io::Errno::MFILE)
+        })
+        .err()
+        .expect("no descriptor, no watched child")
+        .to_string();
+
+        assert!(
+            failure.contains("no process descriptor") && failure.contains("pidfd_open"),
+            "the error names the cause: {failure}"
+        );
+        // The child is a zombie that nothing reaped, so a descriptor for it can still be opened; it
+        // is readable once the child has exited.
+        let pidfd = rustix::process::pidfd_open(
+            started.expect("the open was asked for"),
+            rustix::process::PidfdFlags::empty(),
+        )
+        .expect("the killed child is still there to be reaped");
+        let mut fds = [rustix::event::PollFd::new(
+            &pidfd,
+            rustix::event::PollFlags::IN,
+        )];
+        let timeout = rustix::event::Timespec {
+            tv_sec: 30,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            rustix::event::poll(&mut fds, Some(&timeout)),
+            Ok(1),
+            "and it has exited"
+        );
     }
 
     /// Memory a process has read and never written is the kernel's shared zero page, which the page

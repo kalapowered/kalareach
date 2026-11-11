@@ -766,10 +766,15 @@ pub fn serve_if_asked() -> bool {
 /// process that was given the identifier after the child went; and the child is reaped
 /// (`std::process::Child::wait`) only after the pidfd has said it exited, so that call returns at
 /// once. A child that is still there after a kill and its grace is left, not waited for.
+///
+/// The pidfd names the child only while no other code in the process reaps it: the descriptor is
+/// opened after the child has started, and a child that something else had reaped by then would
+/// leave its identifier free for another process. Nothing in these test programs sets `SIGCHLD` to
+/// be ignored or waits for any child but the ones it started, which is what keeps this true.
 #[cfg(target_os = "linux")]
 pub struct Watched {
     child: std::process::Child,
-    pidfd: Option<std::os::fd::OwnedFd>,
+    pidfd: std::os::fd::OwnedFd,
 }
 
 #[cfg(target_os = "linux")]
@@ -777,21 +782,48 @@ impl Watched {
     /// How long a child that has been killed has to exit.
     const GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
-    /// Starts the command and opens a pidfd for the child. A kernel that gives none leaves the child
-    /// unwatched: [`Watched::exited_within`] then says it has not exited, and nothing waits for it.
+    /// Starts the command and opens a pidfd for the child.
     ///
     /// # Errors
     ///
-    /// The command does not start.
+    /// The command does not start, or the kernel gives no pidfd (it needs Linux 5.3 or later and a
+    /// free descriptor); the child is killed before the error returns.
     pub fn spawn(command: &mut std::process::Command) -> std::io::Result<Self> {
-        let child = command.spawn()?;
+        Self::spawn_with(command, |pid| {
+            rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
+        })
+    }
+
+    /// As [`Watched::spawn`], with `open` as the call that gives the pidfd, so that a check can give
+    /// a kernel that fails it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Watched::spawn`].
+    pub fn spawn_with(
+        command: &mut std::process::Command,
+        open: impl FnOnce(rustix::process::Pid) -> rustix::io::Result<std::os::fd::OwnedFd>,
+    ) -> std::io::Result<Self> {
+        let mut child = command.spawn()?;
         let pidfd = i32::try_from(child.id())
             .ok()
             .and_then(rustix::process::Pid::from_raw)
-            .and_then(|pid| {
-                rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).ok()
-            });
-        Ok(Self { child, pidfd })
+            .ok_or(rustix::io::Errno::INVAL)
+            .and_then(open);
+        match pidfd {
+            Ok(pidfd) => Ok(Self { child, pidfd }),
+            Err(error) => {
+                // Nothing has reaped the child, so its identifier still names it. It is not waited
+                // for: no wait has a bound without a descriptor, so it stays a zombie until this
+                // program ends.
+                let _ = child.kill();
+                Err(std::io::Error::other(format!(
+                    "no process descriptor for child {} ({error}): pidfd_open needs Linux 5.3 or \
+                     later and a free file descriptor",
+                    child.id()
+                )))
+            }
+        }
     }
 
     /// The child, for its pipes.
@@ -809,41 +841,24 @@ impl Watched {
     /// zombie until [`Watched::reap`].
     #[must_use]
     pub fn exited_within(&self, limit: std::time::Duration) -> bool {
-        let Some(pidfd) = &self.pidfd else {
-            return false;
-        };
         let end = std::time::Instant::now() + limit;
-        loop {
-            let left = end.saturating_duration_since(std::time::Instant::now());
+        poll_until(end, |left| {
             let timeout = rustix::event::Timespec {
                 tv_sec: i64::try_from(left.as_secs()).unwrap_or(i64::MAX),
                 tv_nsec: i64::from(left.subsec_nanos()),
             };
             let mut fds = [rustix::event::PollFd::new(
-                pidfd,
+                &self.pidfd,
                 rustix::event::PollFlags::IN,
             )];
-            match rustix::event::poll(&mut fds, Some(&timeout)) {
-                // The pidfd is readable once the process has exited.
-                Ok(ready) if ready > 0 => return true,
-                Ok(_) => return false,
-                // A signal interrupted the wait: wait again for the time that is left.
-                Err(rustix::io::Errno::INTR) => {}
-                Err(_) => return false,
-            }
-        }
+            // The pidfd is readable once the process has exited.
+            rustix::event::poll(&mut fds, Some(&timeout)).map(|ready| ready > 0)
+        })
     }
 
-    /// Sends the child SIGKILL by its pidfd, or by its identifier where no pidfd was given.
+    /// Sends the child SIGKILL by its pidfd.
     pub fn kill(&mut self) {
-        match &self.pidfd {
-            Some(pidfd) => {
-                let _ = rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::KILL);
-            }
-            None => {
-                let _ = self.child.kill();
-            }
-        }
+        let _ = rustix::process::pidfd_send_signal(&self.pidfd, rustix::process::Signal::KILL);
     }
 
     /// Kills the child and waits for its exit for at most the grace, without reaping it; says
@@ -862,6 +877,23 @@ impl Watched {
         self.child
             .wait()
             .map_or_else(|error| error.to_string(), |status| status.to_string())
+    }
+}
+
+/// Calls `poll` with the time left until `end` and returns what it says. A call that a signal
+/// interrupts is made again for the time that is left, and not after `end`: repeated signals cannot
+/// keep this going past its deadline, and an error is no result.
+#[cfg(target_os = "linux")]
+pub fn poll_until(
+    end: std::time::Instant,
+    mut poll: impl FnMut(std::time::Duration) -> rustix::io::Result<bool>,
+) -> bool {
+    loop {
+        match poll(end.saturating_duration_since(std::time::Instant::now())) {
+            Ok(ready) => return ready,
+            Err(rustix::io::Errno::INTR) if std::time::Instant::now() < end => {}
+            Err(_) => return false,
+        }
     }
 }
 
