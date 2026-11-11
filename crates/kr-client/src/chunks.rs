@@ -21,6 +21,11 @@
 //! and windows, so a chunk carries the window the control connection's reader last received, and
 //! its request identifier comes from the same counter as the session's.
 //!
+//! A network lane opens its stream for its first call, once it has the window that call carries. A
+//! wait for a window can last as long as a window's validity, which is longer than the host lets
+//! a stream stand idle, so the lane holds no stream, and no one of the connection's bulk slots,
+//! until it has a window to carry.
+//!
 //! The client owns the bound on every wait for a paired host in a lane: the open of the stream
 //! (thirty seconds), which waits for the host's credit and writes the header, and a chunk's write
 //! with the wait for its answer (two minutes together). A host that gives no credit, or holds a
@@ -217,12 +222,8 @@ impl ChunkRoute {
     /// host refuses the caller, the host's refusal of the hello, and a refusal when the host that
     /// answered belongs to another environment or shares no protocol major with this client.
     ///
-    /// On a network route, returns [`ClientError::ConnectionEnded`] when the sign-in the connection
-    /// was opened under has ended, a transport failure when the connection or the stream is gone,
-    /// a transport failure (a deadline of the header kind)
-    /// when the host gave no credit for the stream or did not take its header within thirty
-    /// seconds, and the bulk-limit refusal when the connection already holds as many transfer
-    /// streams as it allows.
+    /// A network route opens nothing here: the lane opens its stream for its first call, which is
+    /// where the failures of the open are returned ([`ChunkLane::send_chunk`]).
     pub async fn open(&self, transfer_id: TransferId) -> Result<ChunkLane> {
         match &self.form {
             Form::Local {
@@ -247,16 +248,9 @@ impl ChunkRoute {
                         transfer_id: Nullable::some(transfer_id),
                     },
                 };
-                // The open waits for the host's credit while it holds one of the connection's four
-                // bulk slots, and the header is written to a host that has to take it: both under
-                // the one bound, and a bound that passes gives the slot back.
-                let stream = bounded(network.bounds.as_ref(), DeadlineKind::Header, async {
-                    network.opener.open(header).await
-                })
-                .await?;
                 Ok(ChunkLane {
                     transfer_id,
-                    carrier: Carrier::Network(Box::new(NetworkCarrier::new(network, stream))),
+                    carrier: Carrier::Network(Box::new(NetworkCarrier::new(network, header))),
                 })
             }
         }
@@ -404,6 +398,13 @@ impl ChunkLane {
     /// [`ClientError::ConnectionEnded`] when the connection failed, whether or not the host
     /// received the chunk; the host's own refusal under its code; and a refusal when the answer
     /// names another transfer or chunk.
+    ///
+    /// The first call of a lane on a paired host's connection also opens the lane's stream, once it
+    /// has its window, and returns what the open fails with: a transport failure (a deadline of
+    /// the header kind) when the host gave no credit for the stream or did not take its header
+    /// within thirty seconds, and the bulk-limit refusal when the connection already holds as many
+    /// transfer streams as it allows. The lane has ended then, as it has when any call fails on
+    /// the connection.
     pub async fn send_chunk(
         &mut self,
         target: &ActionTarget,
@@ -456,7 +457,9 @@ impl ChunkLane {
     /// # Errors
     ///
     /// Returns [`ClientError::ConnectionEnded`] when the connection failed, the host's own refusal
-    /// under its code, and `ATTACHMENT_INTEGRITY` when the answer is not the chunk described.
+    /// under its code, and `ATTACHMENT_INTEGRITY` when the answer is not the chunk described. On a
+    /// paired host's connection the first call opens the lane's stream, and returns the failures of
+    /// the open that [`ChunkLane::send_chunk`] names.
     pub async fn read_chunk(&mut self, expected: &ChunkDescriptor) -> Result<Bytes> {
         let carrier = &mut self.carrier;
         carrier.usable()?;
@@ -959,15 +962,18 @@ fn lane_bounds() -> TimerDeadlines {
 ///
 /// One stream carries the transfer's chunks in turn: a frame, then its answer on the same stream.
 /// The window a chunk carries is the control connection's newest, taken as a local lane takes its
-/// own, and its request identifier comes from the session's counter.
+/// own, and its request identifier comes from the session's counter. The stream is opened for the
+/// first call, after the lane has the window that call carries: a wait for a window can outlast
+/// what the host lets an open stream stand idle, and the stream the lane would hold through it
+/// would be reset when the chunk went on it.
 ///
 /// Every wait on the host is under a bound of the lane's own: the open and the write of the header,
 /// and a chunk's write with the wait for its answer. A bound that passes ends the lane, which
 /// resets and drops its stream at once, so the host stops waiting for a frame and the bulk slot is
 /// free for the next whether or not the caller still holds the lane.
 struct NetworkCarrier {
-    /// The lane's stream, until the lane ends.
-    stream: Option<DataStream>,
+    stream: LaneStream,
+    opener: Arc<dyn StreamOpener>,
     issued: watch::Receiver<Issued>,
     source: Arc<WindowSource>,
     clock: LaneClock,
@@ -984,13 +990,22 @@ struct NetworkCarrier {
     carried: u64,
 }
 
+/// Where a network lane's stream stands.
+enum LaneStream {
+    /// Not opened: the header the open will write, for the lane's first call.
+    Unopened(StreamHeader),
+    Open(DataStream),
+    /// Reset and dropped when the lane ended.
+    Ended,
+}
+
 impl Drop for NetworkCarrier {
     fn drop(&mut self) {
         // A call dropped before its answer was read whole leaves a stream the host may be part way
         // through reading, which is reset so that it stops. One dropped between calls is finished
         // and the host reads a clean end.
         if self.ended
-            && let Some(stream) = &self.stream
+            && let LaneStream::Open(stream) = &self.stream
         {
             stream.handle().revoke();
         }
@@ -998,7 +1013,7 @@ impl Drop for NetworkCarrier {
 }
 
 impl NetworkCarrier {
-    fn new(network: &Network, stream: DataStream) -> Self {
+    fn new(network: &Network, header: StreamHeader) -> Self {
         #[cfg(feature = "testing")]
         let reset_after = network.seam.reset_first_lane_after.filter(|_| {
             !network
@@ -1007,7 +1022,8 @@ impl NetworkCarrier {
                 .swap(true, std::sync::atomic::Ordering::AcqRel)
         });
         Self {
-            stream: Some(stream),
+            stream: LaneStream::Unopened(header),
+            opener: Arc::clone(&network.opener),
             issued: network.windows.issued.clone(),
             source: Arc::clone(&network.windows),
             clock: LaneClock::new(tokio::time::Instant::now()),
@@ -1031,7 +1047,11 @@ impl NetworkCarrier {
         // its streams, and the reason it recorded is what the caller is told.
         if self.transport.ended_by_this_device().is_some()
             || self.ended
-            || self.stream.as_ref().is_none_or(DataStream::is_revoked)
+            || match &self.stream {
+                LaneStream::Unopened(_) => false,
+                LaneStream::Open(stream) => stream.is_revoked(),
+                LaneStream::Ended => true,
+            }
         {
             return Err(self.end(ClientError::ConnectionEnded));
         }
@@ -1046,7 +1066,7 @@ impl NetworkCarrier {
     /// waiting on one sees the revocation and not the sign-out.
     fn end(&mut self, error: ClientError) -> ClientError {
         self.ended = true;
-        if let Some(stream) = self.stream.take() {
+        if let LaneStream::Open(stream) = std::mem::replace(&mut self.stream, LaneStream::Ended) {
             stream.reset();
         }
         self.transport
@@ -1062,15 +1082,24 @@ impl NetworkCarrier {
     /// or the one this lane holds would have expired, or was turned down, before another came, and
     /// [`ClientError::ConnectionEnded`] when the session's reader stopped while this waited.
     async fn window(&mut self) -> Result<ActionWindow> {
-        let Some(stream) = &self.stream else {
+        if matches!(self.stream, LaneStream::Ended) {
             return Err(ClientError::ConnectionEnded);
-        };
+        }
         // The wait for a renewal ends with the connection: the session keeps its windows after its
-        // reader stops, so what says the connection is gone is the revocation of this lane's stream.
-        let revoked = stream.handle();
+        // reader stops, so what says the connection is gone is the revocation of the connection's
+        // streams, which a stream of this lane's own sees as its own, and a lane that has opened no
+        // stream sees through the opener.
+        let stream = &self.stream;
+        let opener = &self.opener;
+        let lost = async {
+            match stream {
+                LaneStream::Open(stream) => stream.handle().revoked().await,
+                LaneStream::Unopened(_) | LaneStream::Ended => opener.revoked().await,
+            }
+        };
         let waited = tokio::select! {
             window = newest_window(&mut self.issued, &self.clock, Some(&self.source)) => Some(window),
-            () = revoked.revoked() => None,
+            () = lost => None,
         };
         match waited {
             Some(Ok(window)) => Ok(window),
@@ -1086,8 +1115,24 @@ impl NetworkCarrier {
         RequestId::new(self.requests.fetch_add(1, Ordering::AcqRel))
     }
 
-    /// Writes one frame, reads the one answer that comes back on the same stream, and checks it
-    /// answers this call.
+    /// Opens the lane's stream when the lane has none yet. The open waits for the host's credit
+    /// while it holds one of the connection's four bulk slots, and the header is written to a host
+    /// that has to take it: both under the one bound, and a bound that passes gives the slot back.
+    async fn open_stream(&mut self) -> Result<()> {
+        if let LaneStream::Unopened(header) = &self.stream {
+            let opened = bounded(
+                self.bounds.as_ref(),
+                DeadlineKind::Header,
+                self.opener.open(header.clone()),
+            )
+            .await?;
+            self.stream = LaneStream::Open(opened);
+        }
+        Ok(())
+    }
+
+    /// Opens the stream the first call needs, writes one frame, reads the one answer that comes
+    /// back on the same stream, and checks it answers this call.
     async fn exchange(
         &mut self,
         frame: &ControlFrame,
@@ -1096,10 +1141,13 @@ impl NetworkCarrier {
         if self.ended {
             return Err(self.end(ClientError::ConnectionEnded));
         }
-        let Some(stream) = self.stream.as_mut() else {
-            return Err(ClientError::ConnectionEnded);
-        };
         self.ended = true;
+        if let Err(error) = self.open_stream().await {
+            return Err(self.end(error));
+        }
+        let LaneStream::Open(stream) = &mut self.stream else {
+            return Err(self.end(ClientError::ConnectionEnded));
+        };
         let bounds = Arc::clone(&self.bounds);
         // The write and the wait for the answer are one bound: the write ends when the connection
         // has buffered the frame, and the frame goes to the host while the answer is awaited.
@@ -1162,7 +1210,7 @@ impl NetworkCarrier {
     fn carried_one(&mut self) {
         self.carried += 1;
         if self.reset_after == Some(self.carried)
-            && let Some(stream) = &self.stream
+            && let LaneStream::Open(stream) = &self.stream
         {
             stream.handle().revoke();
         }

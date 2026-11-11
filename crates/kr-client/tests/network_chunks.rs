@@ -10,7 +10,7 @@
 //! own bound is replaced after a read of `upload.status`, which alone decides what is sent next.
 
 use std::collections::{BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -49,7 +49,7 @@ use kr_transport::config::EndpointConfig;
 use kr_transport::deadlines::{DeadlineKind, ManualDeadlines};
 use kr_transport::handshake::{self, Admitted, HostEpochs, LocalIdentity, PairedDirectory};
 use kr_transport::scheduler::{SendLimits, StreamBudget};
-use kr_transport::streams::StreamRegistry;
+use kr_transport::streams::{DataStream, StreamRegistry};
 use kr_transport::window::{ActionWindowIssuer, MAX_WINDOW_VALIDITY};
 
 /// How long a case waits for the host to see something that must happen: it fails a wait that
@@ -84,6 +84,14 @@ async fn within<T>(future: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(LIVENESS, future)
         .await
         .expect("the call ended in time")
+}
+
+/// Polls a call once and says whether it is still waiting. A lane's call chooses its window before
+/// it does anything else on the network, so one poll takes it to the wait for a window when the
+/// host has issued none it can carry, and the case then knows where the lane stands without waiting
+/// for it.
+async fn waits<F: std::future::Future>(call: &mut std::pin::Pin<&mut F>) -> bool {
+    std::future::poll_fn(|cx| std::task::Poll::Ready(call.as_mut().poll(cx).is_pending())).await
 }
 
 /// A progress channel nobody watches.
@@ -228,6 +236,8 @@ struct Script {
     ended_window: Mutex<Option<ActionWindowId>>,
     seen: Mutex<Seen>,
     changed: tokio::sync::Notify,
+    /// Counts the times the host's idle bound has passed: a stream that stands idle at one is reset.
+    idle: tokio::sync::watch::Sender<u64>,
     renewals: tokio::sync::mpsc::UnboundedSender<ActionWindow>,
     pending_renewals: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ActionWindow>>>,
 }
@@ -244,6 +254,7 @@ impl Script {
             ended_window: Mutex::new(None),
             seen: Mutex::new(Seen::default()),
             changed: tokio::sync::Notify::new(),
+            idle: tokio::sync::watch::channel(0).0,
             renewals,
             pending_renewals: Mutex::new(Some(pending)),
         })
@@ -274,6 +285,18 @@ impl Script {
         })
         .await
         .unwrap_or_else(|_| panic!("the host never saw {what}"));
+    }
+
+    /// The host's idle bound passes: every stream that waits for a frame at this moment is reset, as
+    /// the host resets a stream that has stood idle for too long. The case says when it passes, by
+    /// what the host has done and never by how long, so that no case waits for a time.
+    fn idle_bound_passes(&self) {
+        self.idle.send_modify(|passes| *passes += 1);
+    }
+
+    /// Makes the host take chunks of a file of `len` bytes, as it does once it has reserved one.
+    fn reserved(&self, len: usize) {
+        self.record(|seen| seen.layout = Some(ChunkLayout::for_length(len as u64)));
     }
 
     fn will(&self, next: Chunk) {
@@ -527,15 +550,23 @@ async fn serve_stream(
     let Ok(mut stream) = pending.open(&[StreamKind::AttachmentChunks]).await else {
         return;
     };
+    // Watched before the header is recorded, so that a case that has seen the header and then lets
+    // the idle bound pass is never missed.
+    let mut idle = script.idle.subscribe();
     script.record(|seen| seen.headers.push(stream.header().clone()));
     if script.refuses_streams.load(Ordering::Acquire) {
         stream.reset();
         return;
     }
     loop {
-        let Ok(Some(ControlFrame::Mutation(mutation))) =
-            stream.read_message::<ControlFrame>().await
-        else {
+        let read = tokio::select! {
+            read = stream.read_message::<ControlFrame>() => read,
+            Ok(()) = idle.changed() => {
+                stream.reset();
+                return;
+            }
+        };
+        let Ok(Some(ControlFrame::Mutation(mutation))) = read else {
             return;
         };
         let Ok(chunk) = mutation.params.to_typed::<UploadChunkParams>() else {
@@ -605,6 +636,9 @@ async fn serve_stream(
         {
             return;
         }
+        // A pass of the idle bound counts only while the stream waits for a frame: one that came
+        // while the host was busy with this chunk is not one.
+        idle.borrow_and_update();
     }
 }
 
@@ -949,28 +983,36 @@ async fn a_window_the_host_refused_is_replaced_by_one_it_issued_since() {
 #[tokio::test]
 async fn the_refused_windows_marker_survives_the_lanes_replacement() {
     let script = Script::new(true);
+    script.reserved(64);
     let pair = pair(Arc::clone(&script)).await;
     let refused = pair.session.action_window().await.action_window_id;
     *script.ended_window.lock().expect("the script") = Some(refused.clone());
     let route = ChunkRoute::network(&pair.session, environment())
         .await
         .expect("a route");
-    let mut upload = plan(UPLOAD_CHUNK_LEN);
+    let transfer = TransferId::new(Uuid::from_bytes([8; 16]));
+    let chunk = some_chunk(transfer);
     let at = target();
-    let progress = unwatched();
-    let sending = uploads::send(&pair.session, &route, &at, &mut upload, TTL, &progress);
-    let renewing = async {
-        // The replacement lane has opened its stream: it has the refused window newest and has
-        // been told the host turned it down. Only now is the host's next window let go.
-        script
-            .until("the replacement lane's stream", |seen| {
-                seen.headers.len() == 2
-            })
-            .await;
-        script.renew_to("replacement", pair.connection_id());
-    };
-    let (sent, ()) = tokio::join!(within(sending), renewing);
-    sent.expect("the replacement window is carried and the upload reaches a handle");
+    let mut first = within(route.open(transfer)).await.expect("a lane");
+    let turned_down = within(first.send_chunk(&at, &chunk, TTL))
+        .await
+        .expect_err("the host refuses the window");
+    assert_eq!(turned_down.code(), ErrorCode::PermissionDenied);
+    drop(first);
+
+    // The replacement lane has the refused window newest and has been told the host turned it
+    // down. One poll takes its call as far as it goes: if the lane did not wait for another
+    // window it would have chosen the refused one by now.
+    let mut second = within(route.open(transfer)).await.expect("a lane");
+    let mut sending = std::pin::pin!(second.send_chunk(&at, &chunk, TTL));
+    assert!(
+        waits(&mut sending).await,
+        "the replacement lane waits for a window the host has not issued"
+    );
+    script.renew_to("replacement", pair.connection_id());
+    within(sending)
+        .await
+        .expect("the replacement window is carried");
     script.seen(|seen| {
         let windows: Vec<&str> = seen
             .chunks
@@ -979,6 +1021,69 @@ async fn the_refused_windows_marker_survives_the_lanes_replacement() {
             .collect();
         assert_eq!(windows, vec![refused.as_str(), "replacement"]);
     });
+}
+
+/// KR-REQ-23.21: a lane that waits for a window holds no stream. The wait can last as long as a
+/// window's validity, and the host resets a stream that stands idle for a much shorter time, so a
+/// stream opened before the wait is dead when the chunk goes on it and the chunk costs a retry. The
+/// lane has its window first and opens its stream for the chunk. The case lets the host's idle
+/// bound pass during the wait, once the host has read the header of every stream the client has
+/// opened, and the chunk then goes on a stream the bound did not reach.
+#[tokio::test]
+async fn a_lane_that_waits_for_a_window_holds_no_stream_for_the_host_to_reset() {
+    let script = Script::new(true);
+    script.reserved(64);
+    let opened = Arc::new(AtomicU64::new(0));
+    let count = Arc::clone(&opened);
+    let (session, _host, _client, serving) = pair_over(Arc::clone(&script), move |transport| {
+        Ok(Arc::new(Counted {
+            inner: Arc::new(transport),
+            opened: count,
+        }) as Arc<dyn ControlTransport>)
+    })
+    .await;
+    let refused = session.action_window().await.action_window_id;
+    *script.ended_window.lock().expect("the script") = Some(refused.clone());
+    let route = ChunkRoute::network(&session, environment())
+        .await
+        .expect("a route");
+    let transfer = TransferId::new(Uuid::from_bytes([9; 16]));
+    let chunk = some_chunk(transfer);
+    let at = target();
+    let mut first = within(route.open(transfer)).await.expect("a lane");
+    let turned_down = within(first.send_chunk(&at, &chunk, TTL))
+        .await
+        .expect_err("the host refuses the window");
+    assert_eq!(turned_down.code(), ErrorCode::PermissionDenied);
+    drop(first);
+
+    let mut second = within(route.open(transfer)).await.expect("a lane");
+    let mut sending = std::pin::pin!(second.send_chunk(&at, &chunk, TTL));
+    assert!(
+        waits(&mut sending).await,
+        "the replacement lane waits for a window the host has not issued"
+    );
+    script
+        .until("the header of every stream the client opened", |seen| {
+            seen.headers.len() as u64 == opened.load(Ordering::Acquire)
+        })
+        .await;
+    script.idle_bound_passes();
+    script.renew_to("replacement", session.transport().connection_id());
+    within(sending)
+        .await
+        .expect("the chunk goes under the new window, on a stream the bound did not reach");
+    script.seen(|seen| {
+        let windows: Vec<&str> = seen
+            .chunks
+            .iter()
+            .map(|chunk| chunk.window.as_str())
+            .collect();
+        assert_eq!(windows, vec![refused.as_str(), "replacement"]);
+        assert_eq!(seen.stored, BTreeSet::from([0]));
+    });
+    session.close();
+    serving.abort();
 }
 
 /// The host takes a chunk and never answers: the lane ends at the client's own bound, which the
@@ -1021,9 +1126,9 @@ async fn a_host_that_holds_a_chunk_ends_the_lane_at_the_clients_bound() {
     assert!(pair.script.seen(|seen| seen.status_reads) >= 1);
 }
 
-/// A host that gives no stream credit ends the open at the client's own bound, and the bulk slot
-/// the open held comes back: the fifth open, past the connection's four slots, is cut by its bound
-/// too and is not refused for want of a slot.
+/// A host that gives no stream credit ends the open, which is a lane's first call, at the client's
+/// own bound, and the bulk slot the open held comes back: the fifth open, past the connection's four
+/// slots, is cut by its bound too and is not refused for want of a slot.
 #[tokio::test]
 async fn a_host_that_gives_no_stream_credit_ends_the_open_and_returns_its_slot() {
     let pair = pair(Script::new(false)).await;
@@ -1033,8 +1138,11 @@ async fn a_host_that_gives_no_stream_credit_ends_the_open_and_returns_its_slot()
         .expect("a route")
         .bounded_by(bounds.clone());
     let transfer = TransferId::new(Uuid::from_bytes([3; 16]));
+    let chunk = some_chunk(transfer);
+    let at = target();
     for attempt in 1..=5 {
-        let opening = route.open(transfer);
+        let mut lane = within(route.open(transfer)).await.expect("a lane");
+        let opening = lane.send_chunk(&at, &chunk, TTL);
         let cutting = bounds.fire_when_armed(DeadlineKind::Header);
         let (opened, ()) = within(async { tokio::join!(opening, cutting) }).await;
         let error = opened.expect_err("the open is cut");
@@ -1137,6 +1245,45 @@ async fn a_lost_connection_ends_the_wait_for_a_window() {
     );
 }
 
+/// A connection lost while a lane that has not opened its stream waits for a window ends the wait
+/// as well: the lane has no stream to see revoked, and it learns of the loss from the connection.
+#[tokio::test]
+async fn a_lost_connection_ends_the_wait_of_a_lane_that_has_no_stream_yet() {
+    let script = Script::new(true);
+    let pair = pair(Arc::clone(&script)).await;
+    let refused = pair.session.action_window().await.action_window_id;
+    *script.ended_window.lock().expect("the script") = Some(refused);
+    let route = ChunkRoute::network(&pair.session, environment())
+        .await
+        .expect("a route");
+    let transfer = TransferId::new(Uuid::from_bytes([10; 16]));
+    let chunk = some_chunk(transfer);
+    let at = target();
+    let mut first = within(route.open(transfer)).await.expect("a lane");
+    let turned_down = within(first.send_chunk(&at, &chunk, TTL))
+        .await
+        .expect_err("the host refuses the window");
+    assert_eq!(turned_down.code(), ErrorCode::PermissionDenied);
+    drop(first);
+
+    let mut second = within(route.open(transfer)).await.expect("a lane");
+    let mut waiting = std::pin::pin!(second.send_chunk(&at, &chunk, TTL));
+    assert!(
+        waits(&mut waiting).await,
+        "the replacement lane waits for a window the host has not issued"
+    );
+    pair.session.close();
+    let ended = within(waiting)
+        .await
+        .expect_err("the wait ends with the connection");
+    assert_eq!(ended.code(), ErrorCode::ResourceUnavailable, "{ended}");
+    assert_eq!(
+        script.seen(|seen| seen.chunks.len()),
+        1,
+        "the refused window was not carried again"
+    );
+}
+
 /// A host that ended the upload while its lookup waited refuses the stream after its header. The
 /// client reads that as a lane that failed: it reads `upload.status`, which says the upload expired,
 /// and the upload ends with that, with no second stream opened.
@@ -1201,6 +1348,69 @@ async fn a_chunk_with_an_unknown_outcome_is_decided_by_the_status_alone() {
         };
         assert_eq!(sent, expected, "stored by the host: {stored}");
         assert_eq!(pair.script.seen(|seen| seen.status_reads), 1);
+    }
+}
+
+/// A transport that counts the data streams opened through it, each once its header is written.
+#[derive(Debug)]
+struct Counted {
+    inner: Arc<dyn ControlTransport>,
+    opened: Arc<AtomicU64>,
+}
+
+#[derive(Debug)]
+struct CountingOpener {
+    inner: Arc<dyn StreamOpener>,
+    opened: Arc<AtomicU64>,
+}
+
+impl StreamOpener for CountingOpener {
+    fn open(&self, header: StreamHeader) -> TransportFuture<'_, DataStream> {
+        Box::pin(async move {
+            let stream = self.inner.open(header).await?;
+            self.opened.fetch_add(1, Ordering::AcqRel);
+            Ok(stream)
+        })
+    }
+
+    fn revoked(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        self.inner.revoked()
+    }
+}
+
+impl ControlTransport for Counted {
+    fn connection_id(&self) -> ConnectionId {
+        self.inner.connection_id()
+    }
+    fn limits(&self) -> ReceiveLimits {
+        self.inner.limits()
+    }
+    fn initial_action_window(&self) -> ActionWindow {
+        self.inner.initial_action_window()
+    }
+    fn ended_by_this_device(&self) -> Option<ProtocolError> {
+        self.inner.ended_by_this_device()
+    }
+    fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
+        self.inner.send(frame)
+    }
+    fn claim_receiver(&self) -> kr_client::Result<()> {
+        self.inner.claim_receiver()
+    }
+    fn stream_opener(&self) -> Option<Arc<dyn StreamOpener>> {
+        Some(Arc::new(CountingOpener {
+            inner: self.inner.stream_opener()?,
+            opened: Arc::clone(&self.opened),
+        }))
+    }
+    fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>> {
+        self.inner.recv()
+    }
+    fn revoke_streams(&self) {
+        self.inner.revoke_streams();
+    }
+    fn close(&self) {
+        self.inner.close();
     }
 }
 

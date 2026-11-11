@@ -71,6 +71,12 @@ pub trait StreamOpener: Send + Sync + std::fmt::Debug {
     /// has ended, and otherwise the bulk-limit refusal, a failure of the connection that says its
     /// control stream is lost, or a stream failure.
     fn open(&self, header: StreamHeader) -> TransportFuture<'_, DataStream>;
+
+    /// Resolves once the connection's streams have been revoked, which is when its control stream
+    /// has ended or the sign-in it was opened under has: at once when that is already so. A caller
+    /// that holds no stream of its own, and so cannot see its stream revoked, waits on this to
+    /// learn that the connection is gone.
+    fn revoked(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 /// What a client needs from whichever transport it connected over.
@@ -257,6 +263,10 @@ crate::debug_as_name!(NetworkStreams);
 impl StreamOpener for NetworkStreams {
     fn open(&self, header: StreamHeader) -> TransportFuture<'_, DataStream> {
         Box::pin(async move { Ok(self.streams.open(&self.connection, header).await?) })
+    }
+
+    fn revoked(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.streams.revoked())
     }
 }
 

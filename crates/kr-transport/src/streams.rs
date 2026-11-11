@@ -1051,6 +1051,20 @@ impl StreamRegistry {
         self.state.is_revoked()
     }
 
+    /// Resolves once the control stream has ended, or at once when it already has: the moment every
+    /// stream of the connection is revoked, and the moment an open that is yet to begin is refused.
+    /// A caller that holds no stream of its own waits on this to learn that the connection is gone.
+    pub async fn revoked(&self) {
+        // Asked for before the state is read, so that a revocation between the two is not missed.
+        let ended = self.state.ended.notified();
+        tokio::pin!(ended);
+        ended.as_mut().enable();
+        if self.state.is_revoked() {
+            return;
+        }
+        ended.await;
+    }
+
     /// Returns how many data streams are open.
     #[must_use]
     pub fn len(&self) -> usize {

@@ -306,6 +306,10 @@ impl StreamOpener for BoundOpener {
             self.inner.open(header).await
         })
     }
+
+    fn revoked(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        self.inner.revoked()
+    }
 }
 
 #[cfg(test)]
@@ -396,6 +400,10 @@ mod tests {
         fn open(&self, _: StreamHeader) -> TransportFuture<'_, kr_transport::streams::DataStream> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Err(ClientError::ConnectionEnded) })
+        }
+
+        fn revoked(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::pending())
         }
     }
 
