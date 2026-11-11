@@ -439,9 +439,14 @@ pub fn tail_of(reason: &str) -> Option<&str> {
 /// This worker's record, once the link has found [`SWITCH`] set.
 static ON: OnceLock<LinkTrace> = OnceLock::new();
 
+/// Whether an environment's value for [`SWITCH`] asks for the record.
+fn asked(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == "1")
+}
+
 /// Starts this worker's record where its environment holds [`SWITCH`].
 pub fn start_from_environment() {
-    if std::env::var_os(SWITCH).is_some_and(|value| value == "1") {
+    if asked(std::env::var_os(SWITCH).as_deref()) {
         let _ = ON.set(LinkTrace::new());
     }
 }
@@ -604,6 +609,31 @@ mod tests {
             let before = report(ComponentState::Unavailable, original);
             assert_eq!(trace.with_tail(before.clone()), before);
         }
+    }
+
+    #[test]
+    fn only_a_value_of_one_asks_for_the_record() {
+        use std::ffi::OsStr;
+        assert!(!asked(None));
+        assert!(!asked(Some(OsStr::new(""))));
+        assert!(!asked(Some(OsStr::new("0"))));
+        assert!(!asked(Some(OsStr::new("true"))));
+        assert!(asked(Some(OsStr::new("1"))));
+    }
+
+    #[test]
+    fn a_worker_whose_environment_does_not_ask_sends_its_reports_as_they_are() {
+        // This process's environment does not hold the switch, and nothing here sets it.
+        start_from_environment();
+        assert!(ON.get().is_none());
+        for original in [None, Some("registering with the plugin runtime")] {
+            let sent = report(ComponentState::Pending, original);
+            assert_eq!(with_tail(Some(sent.clone())), Some(sent));
+        }
+        assert_eq!(with_tail(None), None);
+        pass(3);
+        lost(Why::Limit);
+        assert!(ON.get().is_none());
     }
 
     #[test]
