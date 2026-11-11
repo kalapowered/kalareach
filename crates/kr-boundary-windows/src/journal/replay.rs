@@ -151,7 +151,8 @@ struct Account {
 
 impl Account {
     fn granted(path: &str, list_bytes: usize) -> Account {
-        let object = limits::json_bytes(path);
+        // A leftover names the object by its path or by its key as text, whichever is longer.
+        let object = limits::json_bytes(path).max(limits::KEY_TEXT_BYTES);
         Account {
             granted: true,
             released: false,

@@ -1112,8 +1112,12 @@ fn a_writer_driven_to_its_limit_with_the_worst_rows_of_every_kind_makes_a_file_t
         driver.put_ok(Row::JobEnded);
 
         // Each granted object is released in one of four ways, all at their worst.
+        // The objects whose release records a leftover that names them by their longest path go
+        // first, so that what they take is not hidden by the room that the other ways give back.
+        let mut order = granted.clone();
+        order.sort_by_key(|&(n, _)| (n % 4 != 2, n));
         let mut refused_list = 0;
-        for &(n, list) in &granted {
+        for &(n, list) in &order {
             match n % 4 {
                 // A full list released: the intent at the cap, and the longest result.
                 1 => {
@@ -1292,6 +1296,106 @@ fn a_tree_over_the_most_objects_the_journal_records_is_refused_with_words() {
         .apply(&small(limits::OBJECTS_PER_TREE as u64 + 1))
         .unwrap_err();
     assert!(matches!(&refusal, OrderError::NoRoom(words) if words.contains("100000 objects")));
+}
+
+#[test]
+fn the_room_kept_for_an_object_is_exact_and_given_back_as_its_work_ends() {
+    let framed = |row: &Row| row.to_bytes().len() + framing::FRAME_BYTES;
+    // A leftover names the object by its path or its key as text: room is kept for the longer.
+    let object = limits::json_bytes(&grant_path(1)).max(limits::KEY_TEXT_BYTES);
+    let released_room = limits::released_room();
+    let after_intent =
+        released_room.max(limits::leftover_room(object) + limits::cleared_room(object));
+    let intent_room = limits::intent_room(4 + limits::LIST_GROWTH);
+    assert!(framed(&release_intent(1)) <= intent_room);
+
+    // Granted: the intent, and then the result or a leftover with its clearance, are kept.
+    let mut tracker = writer_after(limits::WRITER_LIMIT, &[begin(), grant(1)]);
+    assert_eq!(
+        tracker.budget(),
+        (framed(&grant(1)), intent_room + after_intent)
+    );
+    // The intent is written: its room is spent and what the result may take stays kept.
+    tracker.apply(&release_intent(1)).unwrap();
+    assert_eq!(
+        tracker.budget(),
+        (framed(&grant(1)) + framed(&release_intent(1)), after_intent)
+    );
+    // The result is written: nothing is kept.
+    tracker.apply(&released(1)).unwrap();
+    assert_eq!(
+        tracker.budget(),
+        (
+            framed(&grant(1)) + framed(&release_intent(1)) + framed(&released(1)),
+            0
+        )
+    );
+
+    // A leftover that names the granted object by its path settles it: the room for the intent and
+    // the result is given back, and the clearance stays kept until it is written.
+    let path = grant_path(1);
+    let mut tracker = writer_after(
+        limits::WRITER_LIMIT,
+        &[begin(), grant(1), tree_leftover(&path)],
+    );
+    assert_eq!(
+        tracker.budget(),
+        (
+            framed(&grant(1)) + framed(&tree_leftover(&path)),
+            limits::cleared_room(object)
+        )
+    );
+    let cleared = Row::LeftoverCleared { key: path };
+    tracker.apply(&cleared).unwrap();
+    assert_eq!(tracker.budget().1, 0);
+    // By its key as text, the same.
+    let text = key(1).to_string();
+    let tracker = writer_after(
+        limits::WRITER_LIMIT,
+        &[begin(), grant(1), tree_leftover(&text)],
+    );
+    assert_eq!(
+        tracker.budget().1,
+        limits::cleared_room(limits::KEY_TEXT_BYTES)
+    );
+
+    // An object the invocation made has no room kept before its intent; the intent keeps what its
+    // result or its leftover may take.
+    let made = limits::leftover_room(limits::KEY_TEXT_BYTES)
+        + limits::cleared_room(limits::KEY_TEXT_BYTES);
+    let tracker = writer_after(limits::WRITER_LIMIT, &[begin(), release_intent(99)]);
+    assert_eq!(tracker.budget().1, released_room.max(made));
+}
+
+#[test]
+fn a_leftover_longer_than_the_room_kept_for_its_object_is_not_paid_from_it() {
+    // A journal of an earlier form can hold a leftover with a reason far over the cap. The reader
+    // takes it and does not charge the object's room for it, since the room was not kept for that.
+    let mut tracker = Tracker::reading();
+    for row in [begin(), grant(1)] {
+        tracker.apply(&row).unwrap();
+    }
+    let before = tracker.budget();
+    tracker
+        .apply(&Row::Leftover {
+            object: grant_path(1),
+            reason: "r".repeat(5_000),
+            class: LeftoverClass::Tree,
+            snapshot: None,
+        })
+        .unwrap();
+    assert_eq!(tracker.budget(), before);
+}
+
+#[test]
+fn a_row_over_its_kinds_largest_size_is_refused_whatever_field_made_it_long() {
+    // The digest of a hook has no cap of its own; the row's largest size is what stops it.
+    let mut snapshot = worst_snapshot(1);
+    if let Row::RepositorySnapshot { hooks, .. } = &mut snapshot {
+        hooks[0].sha256 = "f".repeat(200_000);
+    }
+    let text = snapshot.check_caps().unwrap_err();
+    assert!(text.contains("bytes the journal allows"), "{text}");
 }
 
 #[test]

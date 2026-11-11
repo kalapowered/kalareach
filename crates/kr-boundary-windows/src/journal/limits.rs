@@ -207,8 +207,7 @@ pub fn json_bytes(text: &str) -> usize {
 ///
 /// # Errors
 ///
-/// Returns the reason: more than [`PATH_UNITS`] characters, a control character, or a form that
-/// takes more than [`PATH_JSON_BYTES`] bytes in a row.
+/// Returns the reason: more than [`PATH_UNITS`] characters, or a control character.
 pub fn check_path(text: &str) -> Result<(), String> {
     let units = text.encode_utf16().count();
     if units > PATH_UNITS {
@@ -220,12 +219,9 @@ pub fn check_path(text: &str) -> Result<(), String> {
     if text.chars().any(char::is_control) {
         return Err("a path has a control character, which the journal does not record".to_owned());
     }
-    if json_bytes(text) > PATH_JSON_BYTES {
-        return Err(format!(
-            "a path takes more than {PATH_JSON_BYTES} bytes in the journal: {}",
-            cut(text, 80)
-        ));
-    }
+    // A unit takes at most three bytes in a row (a backslash or a quote, two; a control character,
+    // the only one that takes six, was refused above), so a path of at most `PATH_UNITS` units
+    // takes at most `PATH_JSON_BYTES`.
     Ok(())
 }
 
