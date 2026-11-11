@@ -18,6 +18,11 @@ fn main() -> std::process::ExitCode {
 
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
+    /// Where this program was started from, as its command line names it.
+    fn own_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(std::env::args_os().next().unwrap_or_default())
+    }
+
     fn in_any_job() -> bool {
         let mut inside = 0;
         // SAFETY: the current process pseudo-handle is valid; no job handle asks about any job.
@@ -77,9 +82,7 @@ fn main() -> std::process::ExitCode {
         "environment",
     ];
     if arguments.len() >= 7 && !known.contains(&mode) {
-        let beside = std::env::current_exe()
-            .unwrap()
-            .with_file_name("diff-mode.txt");
+        let beside = own_path().with_file_name("diff-mode.txt");
         from_file = std::fs::read_to_string(beside).unwrap_or_else(|_| "diff".to_owned());
         mode = from_file.trim();
     }
@@ -108,9 +111,7 @@ fn main() -> std::process::ExitCode {
         "spawn" => {
             // A grandchild that reports what it inherited, and reports the way it was started.
             report("child");
-            let output = Command::new(std::env::current_exe().unwrap())
-                .arg("report")
-                .output();
+            let output = Command::new(own_path()).arg("report").output();
             match output {
                 Ok(output) => print!("{}", String::from_utf8_lossy(&output.stdout)),
                 Err(error) => println!("spawn-failed {error}"),
@@ -119,7 +120,7 @@ fn main() -> std::process::ExitCode {
         "breakaway" => {
             // Asks to leave the job.
             report("child");
-            let started = Command::new(std::env::current_exe().unwrap())
+            let started = Command::new(own_path())
                 .arg("report")
                 .creation_flags(CREATE_BREAKAWAY_FROM_JOB)
                 .output();
@@ -146,7 +147,7 @@ fn main() -> std::process::ExitCode {
         "spawn-crash" => {
             report("child");
             let kind = arguments.get(1).map_or("fail-fast", String::as_str);
-            let output = Command::new(std::env::current_exe().unwrap())
+            let output = Command::new(own_path())
                 .arg(format!("crash-{kind}"))
                 .output();
             match output {
@@ -156,7 +157,7 @@ fn main() -> std::process::ExitCode {
         }
         // A grandchild that stays, so that the job holds a tree.
         "spawn-hold" => {
-            let grandchild = Command::new(std::env::current_exe().unwrap())
+            let grandchild = Command::new(own_path())
                 .args(["sleep", "120000"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
