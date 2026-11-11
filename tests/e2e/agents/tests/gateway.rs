@@ -98,8 +98,8 @@ use kr_e2e_agents::RESULT_VARIABLE;
 use kr_e2e_agents::account::{KEY_SCAN_VARIABLE, Ledger};
 use kr_e2e_agents::build::{self, Account, Build, InstallSwitch, Probe};
 use kr_e2e_agents::held::{
-    Absent, Audit, CONFIG_DIRECTORY, HeldKeys, ISOLATION_UNPROVEN, MetaGuard, Recorded, RunScan,
-    Stop, absent_paths, audit_turns, conversations_relative, grouped_output, kept_panic_text,
+    Absent, Audit, CONFIG_DIRECTORY, HeldKeys, ISOLATION_UNPROVEN, MetaGuard, RunScan, Stop,
+    absent_paths, audit_turns, conversations_relative, grouped_output, kept_panic_text,
     other_agent_processes, other_agents_refusal, panic_text, person_home, read_record,
     turns_recorded, unchanged_before_the_charge,
 };
@@ -1806,18 +1806,15 @@ fn ends(
                             |why| format!("the ledger could not be written: {why}"),
                             |total| format!("the ledger now says {total} spent"),
                         );
-                    let found = recorded.as_ref().ok().copied().unwrap_or(Recorded {
-                        turns: 0,
-                        unnamed: 0,
-                        files: 0,
-                    });
+                    let found = recorded.as_ref().ok().cloned().unwrap_or_default();
                     stops.push((
                         "uncharged_turns",
                         format!(
                             "the agent's record holds {} turn(s), {} of them counted by each \
                              occurrence of their line, against {charged} charged; {surplus} \
                              charged now ({said}). A conversation written again counts its turns \
-                             twice, so the count can be too high and never too low",
+                             twice, so the count can be too high; it is too low where a line of \
+                             the record was lost or two turns share a name",
                             found.turns, found.unnamed
                         ),
                     ));
@@ -1841,6 +1838,9 @@ fn ends(
                 "in_the_agents_record": recorded.as_ref().ok().map(|found| found.turns),
                 "counted_by_occurrence_of_their_line": recorded.as_ref().ok().map(|found| found.unnamed),
                 "record_files_read": recorded.as_ref().ok().map(|found| found.files),
+                "named_by_uuid": recorded.as_ref().ok().map(|found| found.by_uuid),
+                "named_by_a_name_that_is_no_uuid": recorded.as_ref().ok().map(|found| found.by_other_name),
+                "forms_of_the_names_that_are_no_uuid": recorded.as_ref().ok().map(|found| found.forms.clone()),
             });
         }
         if let Some(root) = &root {
