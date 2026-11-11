@@ -20,7 +20,8 @@ use crate::events::{self, LogEvent};
 use crate::policy::Policy;
 use crate::quote::quote_command_line;
 
-use super::launch::{self, LaunchError, Outcome, Run, TokenSpec, VerifiedPath};
+use super::launch::{LaunchError, Outcome, TokenSpec, VerifiedPath};
+use super::proof::{Run, run_captured};
 
 /// The application-control log that holds the executable collection's events.
 const LOG: &str = "Microsoft-Windows-AppLocker/EXE and DLL";
@@ -191,7 +192,7 @@ fn query(extra: &[&str], scratch: &Path, env: &EnvBlock) -> Result<Vec<LogEvent>
     parts.extend_from_slice(extra);
     let launch_error = |source| Error::Launch { what, source };
     let program = VerifiedPath::new(&program).map_err(launch_error)?;
-    let captured = launch::run_captured(
+    let captured = run_captured(
         Run {
             token: TokenSpec::Own,
             group: None,

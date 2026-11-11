@@ -46,10 +46,10 @@ use kr_boundary_windows::quote::quote_command_line;
 use kr_boundary_windows::win::ffi::{Handle, Sid, system_windows_directory};
 use kr_boundary_windows::win::job::{Job, LIMIT_FLAGS, Limits, ReadBack, State};
 use kr_boundary_windows::win::launch::{
-    ChildSpec, DurableProcessRow, LaunchError, Std, SuspendedChild, TokenSpec, VerifiedPath,
-    launch, pipe,
+    ChildSpec, InvocationId, LaunchError, ResumePermit, Std, SuspendedChild, TokenSpec,
+    VerifiedPath, launch, pipe,
 };
-use kr_boundary_windows::win::sd::{OwnedSd, Principals, SdKind, descriptor};
+use kr_boundary_windows::win::sd::{OwnedSd, Principals, SdKind, descriptor, descriptor_from_text};
 use kr_boundary_windows::win::{account, acl, broker, token};
 
 const STILL_ACTIVE: u32 = 259;
@@ -80,6 +80,9 @@ struct Fixture {
     stand_in: PathBuf,
     env: EnvBlock,
     descriptor: OwnedSd,
+    /// A list that gives the group every right on the process, for the controls that show what the
+    /// system would do with a crash if nothing else stood in the way.
+    full_descriptor: OwnedSd,
 }
 
 impl Fixture {
@@ -150,6 +153,11 @@ impl Fixture {
             },
         )
         .unwrap();
+        let full_descriptor = descriptor_from_text(&format!(
+            "O:SYD:P(A;;0x1fffff;;;{})(A;;0x1fffff;;;SY)",
+            group.to_text()
+        ))
+        .unwrap();
         Fixture {
             account,
             sid,
@@ -160,6 +168,7 @@ impl Fixture {
             stand_in,
             env,
             descriptor,
+            full_descriptor,
         }
     }
 
@@ -170,6 +179,18 @@ impl Fixture {
         arguments: &[&str],
         stdout: Std,
         stderr: Std,
+    ) -> ChildSpec<'a> {
+        self.spec_with(job, program, arguments, stdout, stderr, &self.descriptor)
+    }
+
+    fn spec_with<'a>(
+        &'a self,
+        job: &'a Job,
+        program: &Path,
+        arguments: &[&str],
+        stdout: Std,
+        stderr: Std,
+        descriptor: &'a OwnedSd,
     ) -> ChildSpec<'a> {
         let name = program.display().to_string();
         let mut parts = vec![name.as_str()];
@@ -184,8 +205,8 @@ impl Fixture {
             stdin: Std::Nul,
             stdout,
             stderr,
-            process_descriptor: &self.descriptor,
-            thread_descriptor: &self.descriptor,
+            process_descriptor: descriptor,
+            thread_descriptor: descriptor,
         }
     }
 
@@ -206,10 +227,11 @@ impl Drop for Fixture {
     }
 }
 
+const INVOCATION: InvocationId = InvocationId([7; 16]);
+
 fn resume(child: SuspendedChild) -> kr_boundary_windows::win::launch::Child {
-    child
-        .resume(DurableProcessRow::for_cases())
-        .expect("the child is resumed")
+    let permit = ResumePermit::for_cases(INVOCATION, &child);
+    child.resume(permit).expect("the child is resumed")
 }
 
 /// Everything the pipe holds until every writer has closed it.
@@ -754,7 +776,16 @@ fn the_job_holds_the_whole_tree_with_the_limits_asked_for_and_ends_every_process
         "the job's process list is the child's tree read by parent"
     );
     assert!(listed.contains(&grandchild));
-    assert_eq!(job.active_processes().unwrap(), 2);
+    // The job's own count is the list's length. A console program that a detached child starts
+    // without the detached flag gets a console host of its own, which is in the job too: the names
+    // are printed so that the census of a real operation can be told what to expect.
+    let names: Vec<String> = processes()
+        .into_iter()
+        .filter(|(pid, _, _)| listed.contains(pid))
+        .map(|(pid, parent, name)| format!("{name} (pid {pid}, parent {parent})"))
+        .collect();
+    println!("the job holds: {}", names.join(", "));
+    assert_eq!(job.active_processes().unwrap() as usize, listed.len());
     let ended = job.end(&[&child], Duration::from_secs(10));
     assert!(
         ended.all_exited,
@@ -827,6 +858,48 @@ fn a_suspended_child_that_is_dropped_is_ended_and_leaves_no_process() {
         !pids_named("kr-launch-stand-in").contains(&pid),
         "no process is left"
     );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_child_runs_only_with_the_permit_made_for_it() {
+    let fixture = Fixture::new();
+    let job = Job::new(Limits::INVOCATION).unwrap();
+    let marker = fixture.scratch.join("permit.txt");
+    let marker_text = marker.display().to_string();
+    let (first, _) = fixture.start(&job, &["marker", &marker_text]);
+    let (second, second_output) = fixture.start(&job, &["report"]);
+    assert_ne!(first.pid, second.pid);
+    let mut copy: HANDLE = std::ptr::null_mut();
+    // SAFETY: both handles are open; the copy is owned by the value made below.
+    unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            first.process.raw(),
+            GetCurrentProcess(),
+            &raw mut copy,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        );
+    }
+    let first_process = Handle::new(copy, "a copy of the first process").unwrap();
+    // The second child's permit does not let the first run: the first is refused and ended.
+    let other = ResumePermit::for_cases(INVOCATION, &second);
+    let refused = first.resume(other);
+    assert!(matches!(refused, Err(LaunchError::PermitForAnotherChild)));
+    // SAFETY: the copy is open.
+    assert_eq!(
+        unsafe { WaitForSingleObject(first_process.raw(), 30_000) },
+        WAIT_OBJECT_0,
+        "the refused child was ended"
+    );
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(!marker.exists(), "the refused child never ran");
+    // The second child runs with its own.
+    let runs = resume(second);
+    assert_eq!(runs.wait(Duration::from_secs(30)).unwrap(), Some(0));
+    assert!(read_to_end(&second_output).contains("report pid="));
 }
 
 #[test]
@@ -1141,22 +1214,39 @@ fn logged_a_crash_of(pid: u32) -> bool {
         .contains(&format!("faulting process id: {:#x}", pid))
 }
 
+/// How a crash case starts the stand-in.
+#[derive(Clone, Copy)]
+struct Start {
+    /// The error mode of the process that starts the child, which the child inherits: none leaves
+    /// the broker's own.
+    mode: Option<u32>,
+    /// Whether the child's process gives its group every right, as a control.
+    full: bool,
+}
+
+const AS_THE_BROKER_DOES: Start = Start {
+    mode: None,
+    full: false,
+};
+
 /// Runs the stand-in and returns what it wrote, the process that crashed and how it ended.
-fn crash_run(
-    fixture: &Fixture,
-    arguments: &[&str],
-    mode_when_started: Option<u32>,
-) -> (String, Vec<u32>, Option<u32>) {
+fn crash_run(fixture: &Fixture, arguments: &[&str], how: Start) -> (String, Vec<u32>, Option<u32>) {
     let mut job = Job::new(Limits::INVOCATION).unwrap();
     let (read, write) = pipe().unwrap();
     // A child inherits the mode its parent has when the child is made.
-    let kept = mode_when_started.map(set_own_error_mode);
-    let made = launch(fixture.spec(
+    let kept = how.mode.map(set_own_error_mode);
+    let descriptor = if how.full {
+        &fixture.full_descriptor
+    } else {
+        &fixture.descriptor
+    };
+    let made = launch(fixture.spec_with(
         &job,
         &fixture.stand_in,
         arguments,
         Std::Pipe(write),
         Std::Nul,
+        descriptor,
     ));
     if let Some(kept) = kept {
         set_own_error_mode(kept);
@@ -1248,46 +1338,91 @@ fn a_child_a_grandchild_and_a_child_of_git_inherit_the_brokers_error_mode() {
     job.end(&[&child], Duration::from_secs(10));
 }
 
+/// Whether a crash that the system reports has its dump after a bound, and how soon.
+fn dump_within(dumps: &Dumps, pid: u32, bound: Duration) -> Option<Duration> {
+    let started = Instant::now();
+    loop {
+        if dumps.has_dump_of(pid) && pids_named("werfault").is_empty() {
+            return Some(started.elapsed());
+        }
+        if started.elapsed() >= bound {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_crash_of_a_child_a_grandchild_or_git_s_child_leaves_no_dump_where_the_default_mode_does() {
     let fixture = Fixture::new();
     let dumps = Dumps::new(&["kr-launch-stand-in.exe"], &fixture.dir.join("dumps"));
-    // The controls first. A child that is started by a process whose own mode is the default, and
-    // one that asks for the default mode itself, are the cases the broker's mode does not cover:
-    // the system reports their crashes. They show that dumps are on for this program under this
-    // token, and how long the system takes to write one.
-    let (text, started_default, code) = crash_run(&fixture, &["crash-fail-fast"], Some(0));
-    println!("control, started from the default mode: {text} ended {code:?}");
-    let (text, asked_default, code) =
-        crash_run(&fixture, &["crash-default-mode", "fail-fast"], None);
-    println!("control, asks for the default mode: {text} ended {code:?}");
-    let latency = wait_for_dump(&dumps, started_default[0], Duration::from_secs(90));
-    println!(
-        "the control dump of a child started from the default mode was there {latency:?} after its end"
+    let default_mode = Start {
+        mode: Some(0),
+        full: false,
+    };
+    let default_and_open = Start {
+        mode: Some(0),
+        full: true,
+    };
+    // What the system does with these crashes when the broker's mode is not in the way, and what
+    // each stands in the way of. The first is the control that must dump: a child started from the
+    // default mode, its process open to its group. The others say why a crash may leave no dump
+    // even then.
+    let (text, open, code) = crash_run(&fixture, &["crash-fail-fast"], default_and_open);
+    println!("control, default mode, process open to its group: {text} ended {code:?}");
+    let (text, restricted, code) = crash_run(&fixture, &["crash-fail-fast"], default_mode);
+    println!("observation, default mode, the broker's descriptor: {text} ended {code:?}");
+    let (text, grandchild, code) = crash_run(&fixture, &["spawn-crash", "fail-fast"], default_mode);
+    println!("control, default mode, a grandchild: {text} ended {code:?}");
+    let (text, asked, code) = crash_run(
+        &fixture,
+        &["crash-default-mode", "fail-fast"],
+        AS_THE_BROKER_DOES,
     );
-    let latency = latency.max(wait_for_dump(
-        &dumps,
-        asked_default[0],
-        Duration::from_secs(90),
-    ));
-    println!(
-        "the control crashes were logged by the system: {} and {}",
-        logged_a_crash_of(started_default[0]),
-        logged_a_crash_of(asked_default[0])
+    println!("observation, the child asks for the default mode: {text} ended {code:?}");
+    let seen = |what: &str, pid: u32| {
+        let found = dump_within(&dumps, pid, Duration::from_secs(25));
+        println!(
+            "{what}: dump {found:?}; logged by the system: {}",
+            logged_a_crash_of(pid)
+        );
+        found
+    };
+    let control = seen("default mode, process open to its group", open[0]);
+    seen("default mode, the broker's descriptor", restricted[0]);
+    let grandchild_control = seen(
+        "default mode, a grandchild",
+        grandchild[1.min(grandchild.len() - 1)],
     );
+    seen("the child asks for the default mode itself", asked[0]);
+    println!(
+        "WER Temp now holds [{}]",
+        names_in(r"C:\ProgramData\Microsoft\Windows\WER\Temp")
+    );
+    let latency = control
+        .or(grandchild_control)
+        .expect("a crash that nothing stands in the way of is reported: otherwise a case that sees no dump shows nothing");
     let settle = (latency * 3).max(Duration::from_secs(20));
     let before = dumps.dumps();
     let mut crashed = Vec::new();
-    for arguments in [
-        &["crash-fail-fast"][..],
-        &["crash-access-violation"][..],
-        &["spawn-crash", "fail-fast"][..],
-        &["spawn-crash", "access-violation"][..],
+    // The claims: the broker's mode, set in the process that starts the child.
+    for (arguments, how) in [
+        (
+            &["crash-fail-fast"][..],
+            Start {
+                mode: None,
+                full: true,
+            },
+        ),
+        (&["crash-fail-fast"][..], AS_THE_BROKER_DOES),
+        (&["crash-access-violation"][..], AS_THE_BROKER_DOES),
+        (&["spawn-crash", "fail-fast"][..], AS_THE_BROKER_DOES),
+        (&["spawn-crash", "access-violation"][..], AS_THE_BROKER_DOES),
     ] {
-        let (text, pids, code) = crash_run(&fixture, arguments, None);
+        let (text, pids, code) = crash_run(&fixture, arguments, how);
         println!("{arguments:?}: {text} ended {code:?}");
-        assert_eq!(pids.len(), 1, "{arguments:?} crashed one process");
+        assert!(!pids.is_empty(), "{arguments:?} crashed a process");
         crashed.extend(pids);
     }
     // A child of the pinned Git that fail-fasts.
@@ -1401,6 +1536,53 @@ fn the_brokers_own_crash_leaves_no_dump_where_the_default_mode_does() {
 fn the_four_ways_to_start_a_program_outside_the_job_start_nothing_from_a_launched_child() {
     let fixture = Fixture::new();
     let mut job = Job::new(Limits::INVOCATION).unwrap();
+    // First, which of the programs the script needs can run as a child at all: each is run under the
+    // boundary token and under the broker's own, and its exit code and output are printed.
+    let system = system_windows_directory().unwrap();
+    let system32 = Path::new(&system).join("System32");
+    let shell = system32
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    for (what, program, arguments) in [
+        (
+            "cmd",
+            system32.join("cmd.exe"),
+            vec!["/c", "echo hello & exit 5"],
+        ),
+        (
+            "powershell",
+            shell.clone(),
+            vec![
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Write-Output hello; exit 5",
+            ],
+        ),
+    ] {
+        for token_name in ["boundary", "own"] {
+            let (read, write) = pipe().unwrap();
+            let (error_read, error_write) = pipe().unwrap();
+            let mut spec = fixture.spec(
+                &job,
+                &program,
+                &arguments,
+                Std::Pipe(write),
+                Std::Pipe(error_write),
+            );
+            if token_name == "own" {
+                spec.token = TokenSpec::Own;
+            }
+            let child = resume(launch(spec).unwrap());
+            let code = child.wait(Duration::from_secs(60)).unwrap();
+            println!(
+                "{what} as {token_name}: exit {code:?}, stdout {:?}, stderr {:?}",
+                read_to_end(&read),
+                read_to_end(&error_read)
+            );
+        }
+    }
     let program = fixture.stand_in.display().to_string();
     let scratch = fixture.scratch.display().to_string();
     let script = format!(

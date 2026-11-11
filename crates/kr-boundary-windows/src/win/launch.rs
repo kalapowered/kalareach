@@ -51,9 +51,9 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::env::EnvBlock;
 
-use super::ffi::{self, Handle, Sid, last, wide, wide_path};
-use super::job::{Job, Limits, State};
-use super::sd::{OwnedSd, Principals, SdKind, descriptor};
+use super::ffi::{self, Handle, last, wide, wide_path};
+use super::job::{Job, State};
+use super::sd::OwnedSd;
 
 /// How a program that was started ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +83,9 @@ pub enum LaunchError {
     /// The process was made but is not in the job. It was ended.
     #[error("the new process was not in its job and was ended")]
     NotInJob,
+    /// The permit to resume was made for another child. The child was ended.
+    #[error("the permit to resume is for another child, and the child was ended")]
+    PermitForAnotherChild,
     /// Another call failed.
     #[error(transparent)]
     Platform(#[from] ffi::Error),
@@ -159,25 +162,56 @@ pub enum Std {
     Pipe(OwnedPipeEnd),
 }
 
-/// Proof that a child's process row is durable, which a resume requires.
-///
-/// The journal makes this value when its append of a process row has returned. Until the journal
-/// exists, the only other maker is for the proof's own programs, which belong to no invocation and
-/// which no recovery has to find.
-#[derive(Debug)]
-pub struct DurableProcessRow(());
+/// The 128-bit identifier of an invocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvocationId(pub [u8; 16]);
 
-impl DurableProcessRow {
-    /// The row of a child that belongs to no invocation: a program of the proof.
-    pub(crate) fn for_proof_child() -> DurableProcessRow {
-        DurableProcessRow(())
+/// Leave to resume one child, bound to the invocation it belongs to and to that child alone, by
+/// its process identifier and its creation time. A permit for another child is refused.
+///
+/// The journal makes the permit of an invocation's child when its append of the child's process
+/// row has returned, so that a child cannot run before its row is durable. A program of the proof
+/// belongs to no invocation and no recovery has to find it: the proof module alone makes the
+/// permits of those.
+#[derive(Debug)]
+pub struct ResumePermit {
+    invocation: Option<InvocationId>,
+    pid: u32,
+    creation_time: u64,
+}
+
+impl ResumePermit {
+    fn bound_to(invocation: Option<InvocationId>, child: &SuspendedChild) -> ResumePermit {
+        ResumePermit {
+            invocation,
+            pid: child.pid,
+            creation_time: child.creation_time,
+        }
     }
 
-    /// A row for the cases that start a child and have no journal to write.
+    /// The permit of an invocation's child, for the journal to make once the child's process row
+    /// is durable.
+    #[cfg_attr(not(feature = "testing"), allow(dead_code))]
+    pub(crate) fn for_invocation(invocation: InvocationId, child: &SuspendedChild) -> ResumePermit {
+        ResumePermit::bound_to(Some(invocation), child)
+    }
+
+    /// The permit of a program of the proof, which belongs to no invocation.
+    pub(super) fn for_proof(child: &SuspendedChild) -> ResumePermit {
+        ResumePermit::bound_to(None, child)
+    }
+
+    /// A permit for the cases that start a child and have no journal to write.
     #[cfg(feature = "testing")]
     #[must_use]
-    pub fn for_cases() -> DurableProcessRow {
-        DurableProcessRow(())
+    pub fn for_cases(invocation: InvocationId, child: &SuspendedChild) -> ResumePermit {
+        ResumePermit::for_invocation(invocation, child)
+    }
+
+    /// The invocation the permit belongs to, or none for a program of the proof.
+    #[must_use]
+    pub fn invocation(&self) -> Option<InvocationId> {
+        self.invocation
     }
 }
 
@@ -251,14 +285,17 @@ impl Drop for SuspendedChild {
 }
 
 impl SuspendedChild {
-    /// Lets the child run, once its process row is durable.
+    /// Lets the child run, with the permit that was made for this child.
     ///
     /// # Errors
     ///
-    /// Returns the platform's error when the thread cannot be resumed, or when it was not suspended
-    /// exactly once; the child is ended.
-    pub fn resume(self, durable: DurableProcessRow) -> Result<Child, LaunchError> {
-        let _: DurableProcessRow = durable;
+    /// Returns an error, and ends the child, when the permit is for another child, when the thread
+    /// cannot be resumed, or when it was not suspended exactly once.
+    pub fn resume(self, permit: ResumePermit) -> Result<Child, LaunchError> {
+        if permit.pid != self.pid || permit.creation_time != self.creation_time {
+            // Dropping `self` ends the child.
+            return Err(LaunchError::PermitForAnotherChild);
+        }
         // SAFETY: the thread handle is open.
         let previous = unsafe { ResumeThread(self.thread.raw()) };
         if previous != 1 {
@@ -609,38 +646,14 @@ pub fn launch(spec: ChildSpec<'_>) -> Result<SuspendedChild, LaunchError> {
     Ok(child)
 }
 
-/// What to run for [`run_captured`].
-pub struct Run<'a> {
-    /// The token the program runs under.
-    pub token: TokenSpec<'a>,
-    /// The group the token carries, named on the program's process and thread; none for a program
-    /// of the broker's own token.
-    pub group: Option<&'a Sid>,
-    /// The program.
-    pub program: VerifiedPath,
-    /// Its command line.
-    pub command_line: String,
-    /// Its working directory.
-    pub cwd: &'a Path,
-    /// Its environment.
-    pub env: &'a EnvBlock,
-}
-
-/// What a captured run wrote and how it ended.
-#[derive(Debug)]
-pub struct Captured {
-    /// How the program ended.
-    pub outcome: Outcome,
-    /// What it wrote to its standard output.
-    pub stdout: Vec<u8>,
-    /// What it wrote to its standard error.
-    pub stderr: Vec<u8>,
-}
-
-/// The most a captured run keeps of each stream; the rest is read and dropped.
+/// The most [`read_pipe`] keeps; the rest is read and dropped.
 const CAPTURE_LIMIT: usize = 8 << 20;
 
-fn read_all(pipe: &Handle) -> Vec<u8> {
+/// Reads a pipe to its end, keeping up to a limit of what it holds. The end comes when every
+/// writer has closed its handle, which for a child's output means the child and everything it
+/// started has ended.
+#[must_use]
+pub fn read_pipe(pipe: &Handle) -> Vec<u8> {
     let mut kept = Vec::new();
     let mut chunk = vec![0_u8; 64 * 1024];
     loop {
@@ -661,67 +674,4 @@ fn read_all(pipe: &Handle) -> Vec<u8> {
         let room = CAPTURE_LIMIT.saturating_sub(kept.len());
         kept.extend_from_slice(&chunk[..(read as usize).min(room)]);
     }
-}
-
-/// Runs a program of the proof to its end, up to a bound, and keeps what it wrote.
-///
-/// The program has a job of its own, which is ended before the function returns, so nothing it
-/// started outlives the call. Its process and thread name the token's group and the system, or the
-/// system alone for the broker's own token. Its process row is not journalled, because it belongs to no invocation.
-///
-/// # Errors
-///
-/// Returns [`LaunchError::NotStarted`] when the platform refuses to start the program, and the
-/// other errors of [`launch`] and of the pipes.
-pub fn run_captured(run: Run<'_>, bound: Duration) -> Result<Captured, LaunchError> {
-    let mut job = Job::new(Limits::INVOCATION)?;
-    let (out_read, out_write) = pipe()?;
-    let (err_read, err_write) = pipe()?;
-    let descriptor = descriptor(
-        SdKind::ProcessThread,
-        &Principals {
-            group: run.group.cloned(),
-            ..Principals::default()
-        },
-    )?;
-    let suspended = launch(ChildSpec {
-        token: run.token,
-        job: &job,
-        program: run.program,
-        command_line: run.command_line,
-        cwd: run.cwd,
-        env: run.env,
-        stdin: Std::Nul,
-        stdout: Std::Pipe(out_write),
-        stderr: Std::Pipe(err_write),
-        process_descriptor: &descriptor,
-        thread_descriptor: &descriptor,
-    })?;
-    let (result, out, err) = std::thread::scope(|scope| {
-        let out = scope.spawn(|| read_all(&out_read));
-        let err = scope.spawn(|| read_all(&err_read));
-        let result = match suspended.resume(DurableProcessRow::for_proof_child()) {
-            Ok(child) => {
-                let waited = child.wait(bound);
-                // Anything the program started ends with the job, which also lets the pipes
-                // reach their end. A program still running at the bound is ended the same way.
-                job.end(&[&child], Duration::from_secs(10));
-                match waited {
-                    Ok(Some(code)) => Ok(Outcome::Ran(code)),
-                    Ok(None) => Ok(Outcome::TimedOut),
-                    Err(error) => Err(LaunchError::Platform(error)),
-                }
-            }
-            Err(error) => {
-                job.end(&[], Duration::from_secs(10));
-                Err(error)
-            }
-        };
-        (result, out.join(), err.join())
-    });
-    Ok(Captured {
-        outcome: result?,
-        stdout: out.unwrap_or_default(),
-        stderr: err.unwrap_or_default(),
-    })
 }

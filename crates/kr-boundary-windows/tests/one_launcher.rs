@@ -92,3 +92,36 @@ fn no_code_in_the_crate_creates_a_process_but_the_launcher() {
         "the launcher makes the one creation call"
     );
 }
+
+/// Where a function that makes a permit to resume a child is called. The journal's maker joins this
+/// list with the journal.
+#[test]
+fn a_permit_to_resume_is_made_only_where_it_is_allowed() {
+    let mut files = Vec::new();
+    sources(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
+    );
+    let mut proof = 0;
+    for path in &files {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let text = code(path);
+        let for_proof = count(&text, "ResumePermit::for_proof(");
+        let for_invocation = count(&text, "ResumePermit::for_invocation(");
+        match name.as_str() {
+            "proof.rs" => proof += for_proof,
+            // The launcher's own definitions, and the cases' maker that calls the invocation's.
+            "launch.rs" => assert_eq!(for_proof, 0, "{}", path.display()),
+            _ => {
+                assert_eq!(for_proof, 0, "a proof permit in {}", path.display());
+                assert_eq!(
+                    for_invocation,
+                    0,
+                    "an invocation permit in {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    assert_eq!(proof, 1, "the proof makes its permit in one place");
+}

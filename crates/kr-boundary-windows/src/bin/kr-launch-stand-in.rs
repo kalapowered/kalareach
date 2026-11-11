@@ -58,15 +58,34 @@ fn main() -> std::process::ExitCode {
     // Git runs an external diff program with seven arguments and no mode: the mode is then in a
     // file beside this program, or the program only reports.
     let from_file;
-    if arguments.len() == 7 {
+    let known = [
+        "report",
+        "diff",
+        "handles",
+        "spawn",
+        "breakaway",
+        "crash-access-violation",
+        "crash-fail-fast",
+        "crash-default-mode",
+        "spawn-crash",
+        "spawn-hold",
+        "marker",
+        "sleep",
+        "write-stderr",
+        "arguments",
+        "environment",
+    ];
+    if arguments.len() >= 7 && !known.contains(&mode) {
         let beside = std::env::current_exe()
             .unwrap()
             .with_file_name("diff-mode.txt");
-        from_file = std::fs::read_to_string(beside).unwrap_or_else(|_| "report".to_owned());
+        from_file = std::fs::read_to_string(beside).unwrap_or_else(|_| "diff".to_owned());
         mode = from_file.trim();
     }
     match mode {
         "report" => report("report"),
+        // The external diff program of Git, when no file beside it asks for a crash.
+        "diff" => report("diff"),
         "handles" => {
             // Every handle value that is open here, whether it is inheritable and what it is.
             let mut value = 4_usize;
