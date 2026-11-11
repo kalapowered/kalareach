@@ -579,7 +579,7 @@ impl Run {
                 }),
         );
         let mut under = Vec::new();
-        match processes_under(&self.root) {
+        match processes_holding_the_root_as_text(&self.root) {
             Ok(found) => {
                 under = found.iter().map(|(pid, _)| *pid).collect();
                 left.extend(
@@ -2151,6 +2151,26 @@ pub fn processes_under(root: &Path) -> Result<Vec<(u32, String)>, String> {
         .collect())
 }
 
+/// Every process, other than this one, whose command line holds the text of `root` anywhere, in a
+/// word of its own or inside one (`-I<root>/x`, a profile's `(subpath "<root>/x")`): what the
+/// closing check reports. The report acts on nothing, so it keeps the wider match; the rule by path
+/// components of [`names_the_root`] decides what the run records and ends.
+///
+/// # Errors
+///
+/// Returns why the process table could not be read, or that the run's directory is not text.
+pub fn processes_holding_the_root_as_text(root: &Path) -> Result<Vec<(u32, String)>, String> {
+    let own = std::process::id();
+    let text = root
+        .to_str()
+        .ok_or_else(|| "the run's directory is not text".to_owned())?;
+    Ok(process_table()?
+        .into_iter()
+        .filter(|entry| entry.pid != own && entry.command.contains(text))
+        .map(|entry| (entry.pid, entry.command))
+        .collect())
+}
+
 /// The number of every process of this user, other than this one, whose environment the system shows
 /// and which holds [`MARK_VARIABLE`] with the value `mark`. A process whose environment the system
 /// does not show (on macOS, the system's own protected programs), or that cleared its own, is not
@@ -2465,6 +2485,41 @@ mod marker_tests {
         {
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// The close reports a process whose command line holds the run's directory anywhere in a word,
+    /// as `-I<directory>/x` does, though the rule by path components, which decides what the run
+    /// records and ends, does not take it for the run's.
+    #[test]
+    fn a_command_line_that_holds_the_runs_path_inside_a_word_is_reported_by_the_close() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .expect("the temporary directory")
+            .join(format!("kr-run-text-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(root.join("w")).expect("a scratch directory");
+        let run = Run::over(&root);
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30; true", "sh"])
+            .arg(format!("-I{}/x", root.display()))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the process starts");
+        let pid = child.id();
+        assert!(
+            !processes_under(&root)
+                .expect("the process table")
+                .iter()
+                .any(|(found, _)| *found == pid),
+            "the rule by path components does not take the word for the run's directory"
+        );
+        let said = run.nothing_running();
+        let _ = child.kill();
+        let _ = child.wait();
+        let said = said.expect_err("the close reports the process");
+        assert!(said.contains(&format!("process {pid} running")), "{said}");
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     /// The marker search against a build signed ad hoc with the hardened runtime, which every
