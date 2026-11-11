@@ -237,10 +237,12 @@ pub trait HostHandler: PairedDirectory + Send + Sync + 'static {
     /// A host that takes data streams reads [`AuthorisedSession::data_streams`] on a task of its
     /// own, and its first call to [`DataStreams::recv`] is what lets the device open streams: it
     /// raises the connection's stream limit from the control stream's one. The listener cannot
-    /// know when the host has finished its own check of the device, so the host calls `recv` only
-    /// after that check, and never at the start of `serve`: a read task started before the check
-    /// gives a device the credit to open nine streams, each with a header task, a queue place and
-    /// a buffer, for as long as the check takes.
+    /// know when the host has finished its own check of the device, so that is the host's to
+    /// arrange: it calls `recv` only after that check, never before it. A read task started before
+    /// the check gives a device the credit to open nine streams (with the default allowance) for
+    /// as long as the check takes, each with a buffer. At most
+    /// [`MAX_PENDING_HEADERS`](crate::streams::MAX_PENDING_HEADERS) of them have a header being
+    /// read at once, under a deadline, and at most [`DATA_STREAM_QUEUE_DEPTH`] wait in the queue.
     fn serve(self: Arc<Self>, session: AuthorisedSession) -> BoxFuture<'static, ()>;
 
     /// Called when a connection's control stream ends.
@@ -496,7 +498,7 @@ pub struct AuthorisedSession {
     /// queue for a device that opens them, each with its registry entry and its flow-control
     /// credit, until the connection ends, and resets the rest. An attachment stream also holds one
     /// of the connection's bulk slots, which the four places share with every other attachment
-    /// stream; a stream of a live kind holds none, so a host that accepts one can hold more
+    /// stream; a stream of any other kind holds none, so a host that accepts one can hold more
     /// streams than the queue's depth: at most as many as the connection's stream limit allows
     /// beside its control stream, 9 with the defaults, of which at most `max_bulk_streams` are
     /// attachment streams. The receiver ends when the connection does, and a stream still queued
@@ -526,8 +528,9 @@ pub struct AuthorisedSession {
 /// only after the check, never before it (see [`HostHandler::serve`]). A host that names kinds in
 /// [`ListenerConfig::accepted_kinds`] and never reads leaves its devices at one stream. Until the
 /// first call the accept task waits for a stream the device has no credit to open. Dropping the
-/// receiver takes the limit back to one: the credit the device already has stays, and the streams
-/// that end give it no more.
+/// receiver takes the limit back to one: the credit the library has already allocated to the device
+/// stays, and any of it not yet sent is still sent, and the streams that end after that give it no
+/// more.
 ///
 /// Dropping it resets every stream still queued, so a host that stops taking streams while its
 /// connection stands tells the device each of them was taken away, instead of letting each finish
@@ -554,13 +557,14 @@ struct Credit {
 impl DataStreams {
     /// Returns the next admitted stream, or `None` once the connection has ended.
     ///
-    /// The first call raises the connection's stream limit, if the host names any stream kind, so
-    /// it is made only after the host's own check of the device. A stream that was revoked while
-    /// it waited in the queue, because its connection lost its control stream, is reset and
-    /// skipped, never returned. That is the only check made: a connection that has closed but
-    /// whose cleanup has not run yet has revoked nothing, and a stream the host is handed can be
-    /// revoked after it is returned, so the host asks [`DataStream::is_revoked`] again where it
-    /// relies on it.
+    /// The first call raises the connection's stream limit, if the host names any stream kind. The
+    /// listener cannot know when the host has finished its own check of the device, so a host makes
+    /// that call only after the check: when it comes is the host's to arrange (see
+    /// [`HostHandler::serve`]). A stream that was revoked while it waited in the queue, because its
+    /// connection lost its control stream, is reset and skipped, never returned. That is the only
+    /// check made: a connection that has closed but whose cleanup has not run yet has revoked
+    /// nothing, and a stream the host is handed can be revoked after it is returned, so the host
+    /// asks [`DataStream::is_revoked`] again where it relies on it.
     pub async fn recv(&mut self) -> Option<DataStream> {
         if let Some(credit) = self.credit.as_mut().filter(|credit| !credit.raised) {
             allow_data_streams(&credit.connection, credit.max_bulk_streams);
@@ -1445,8 +1449,11 @@ async fn data_accept_loop(
         // Header tasks that ended are collected as the next stream arrives, so the set holds the
         // streams still waiting and those that ended since the last one.
         while headers.try_join_next().is_some() {}
-        // The receiver's closure is looked at first, so once the host has gone no further stream is
-        // taken and no header is read for one that arrives at the same moment.
+        // The receiver's closure is looked at first, so once the loop has seen that the host has
+        // gone, no further stream is taken and no header is read for one that arrives at the same
+        // moment. A receiver dropped on another thread just after this look, while a stream is
+        // ready in the same poll, still lets that one stream into a header task, which the next
+        // turn aborts and whose stream is reset.
         let taken = tokio::select! {
             biased;
             () = queue.receiver_closed() => break,

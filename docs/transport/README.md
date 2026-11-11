@@ -555,12 +555,12 @@ streams while the check runs. A host that reads once and stops holds at most fou
 queue for a device that opens them, each with a registry entry and its flow-control credit, until
 the connection ends, and resets the rest. An attachment stream also holds one of the connection's
 bulk slots, which the queue's places share with every other attachment stream and do not add to.
-A stream of a live kind holds no bulk slot, so a host that accepts one can hold more streams than
-the queue's four: as many as the stream limit allows beside the control stream, 9 with the
+A stream of any other kind holds no bulk slot, so a host that accepts one can hold more streams
+than the queue's four: as many as the stream limit allows beside the control stream, 9 with the
 defaults, of which at most four are attachment streams. What a header names beyond this, the
-environment, the transfer and the
-right to use it, is the host's to decide when it receives the stream. A lookup it makes for that runs
-under the admission deadline, which the session carries as `AuthorisedSession::deadlines`.
+environment, the transfer and the right to use it, is the host's to decide when it receives the
+stream. A lookup it makes for that runs under the admission deadline, which the session carries as
+`AuthorisedSession::deadlines`.
 
 `StreamRegistry::accept_pending` and `PendingStream::open` are the two steps the listener's task is
 made of, for a caller that takes streams itself. `StreamRegistry::accept` runs both for one stream
@@ -646,9 +646,10 @@ the bound with it. Until the first `recv` the accept task waits in the connectio
 stream the device has no credit to open, so it queues nothing and holds nothing. When that first
 read comes, relative to the host's own check of the device, is the host's to arrange, and a host
 that wants the check first calls `recv` only after it. When the host drops its receiver the limit
-goes back to one: the credit the device already has stays with it, and the streams that end give
-it no more. A host that names no kind, or never reads, never raises the limit, so its devices can open no stream but the control
-stream.
+goes back to one: the credit the library has already allocated to the device stays with it, and any
+of it not yet sent is still sent, and the streams that end after that give it no more. A host that
+names no kind, or never reads, never raises the limit, so its devices can open no stream but the
+control stream.
 
 An endpoint that only dials (`bind_dialer`) starts at none, because a host opens no stream to a
 client. `StreamRegistry::accept` on a client's connection, which kr-client's

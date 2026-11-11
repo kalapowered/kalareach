@@ -760,9 +760,10 @@ const fn max_peer_bidi_streams(max_bulk_streams: usize) -> u32 {
 ///
 /// A connection starts with room for one bidirectional stream ([`transport_config`]); this raises
 /// it to [`max_peer_bidi_streams`]. The listener calls it when the host first reads its data
-/// streams, which is after the host's own check of the device and not when the connection is
-/// authorised. The library grants the difference at once, and a stream the peer tried to open in
-/// the meantime waits for that credit and is opened when it arrives.
+/// streams, which is not when the connection is authorised: the listener cannot know when the host
+/// has finished its own check of the device, so where that first read falls relative to the check
+/// is the host's to arrange. The library grants the difference at once, and a stream the peer
+/// tried to open in the meantime waits for that credit and is opened when it arrives.
 pub(crate) fn allow_data_streams(connection: &Connection, max_bulk_streams: usize) {
     connection
         .set_max_concurrent_bi_streams(VarInt::from_u32(max_peer_bidi_streams(max_bulk_streams)));
@@ -770,10 +771,10 @@ pub(crate) fn allow_data_streams(connection: &Connection, max_bulk_streams: usiz
 
 /// Takes the peer's stream limit back to the control stream's one.
 ///
-/// The credit the peer was already given stays with it, and the library gives no new credit for a
-/// stream that ends while the number of the peer's streams is at or above the limit: the peer can
-/// use what it was granted and no more. The listener calls it when the host drops its receiver of
-/// data streams.
+/// The credit the library has already allocated to the peer stays with it, and any of it not yet
+/// sent is still sent. The library gives no new credit for a stream that ends while the number of
+/// the peer's streams is at or above the limit: the peer can use what was allocated to it and no
+/// more. The listener calls it when the host drops its receiver of data streams.
 pub(crate) fn withdraw_data_streams(connection: &Connection) {
     connection.set_max_concurrent_bi_streams(VarInt::from_u32(UNAUTHORISED_BIDI_STREAMS));
 }
@@ -789,12 +790,14 @@ pub(crate) fn withdraw_data_streams(connection: &Connection) {
 /// connections at once. The product uses no unidirectional stream, so a peer may open none. A
 /// listening endpoint starts every connection with one bidirectional stream
 /// ([`UNAUTHORISED_BIDI_STREAMS`]) and raises it when a host that takes data streams first reads
-/// them ([`allow_data_streams`]), which is after the host's own check of the device, so a peer
-/// that is not yet admitted by the host holds one stream's buffer and not ten. An endpoint that only dials starts at none: a host opens no stream to a client. What
-/// an authorised connection can hold is then at most [`max_peer_bidi_streams`] streams, each up to
-/// the library's per-stream receive window of 1.25 MB, and one decoded frame for each stream whose
-/// frame is being read. A finite connection-wide receive window, if one is ever set, has to stay
-/// above that product, or a stalled data stream could take the credit the control stream needs.
+/// them ([`allow_data_streams`]). A host that reads only after its own check of the device, as its
+/// documentation asks, leaves a peer that is not yet admitted holding one stream's buffer and not
+/// ten; a host that reads sooner gives the peer ten from that read. An endpoint that only dials
+/// starts at none: a host opens no stream to a client. What an authorised connection can hold is
+/// then at most [`max_peer_bidi_streams`] streams, each up to the library's per-stream receive
+/// window of 1.25 MB, and one decoded frame for each stream whose frame is being read. A finite
+/// connection-wide receive window, if one is ever set, has to stay above that product, or a stalled
+/// data stream could take the credit the control stream needs.
 fn transport_config(incoming_bidi_streams: u32) -> QuicTransportConfig {
     let idle_timeout = IDLE_TIMEOUT
         .try_into()
