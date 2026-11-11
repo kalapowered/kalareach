@@ -904,6 +904,9 @@ async fn newest_window(
 struct WindowSource {
     issued: watch::Receiver<Issued>,
     turned_down: std::sync::Mutex<Option<ActionWindowId>>,
+    /// Runs inside [`WindowSource::turn_down`], between its check and its update.
+    #[cfg(test)]
+    between_check_and_update: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl WindowSource {
@@ -911,6 +914,8 @@ impl WindowSource {
         Self {
             issued,
             turned_down: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            between_check_and_update: None,
         }
     }
 
@@ -925,14 +930,24 @@ impl WindowSource {
     /// Records that the host refused `window`, when it is the newest the host issued. Lanes of one
     /// route answer in any order, and a window that is no longer the newest is never carried
     /// again, so the late refusal of an older one must not replace the refusal of the current one.
+    ///
+    /// The check and the update are one step under the marker's lock. With the lock taken only for
+    /// the update, a refusal of an older window could pass its check, wait while the newer window
+    /// is issued and refused by another lane, and then replace that refusal: a lane opened after
+    /// would carry the refused newer window again.
     fn turn_down(&self, window: &ActionWindowId) {
+        let mut marker = self
+            .turned_down
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.issued.borrow().window.action_window_id != *window {
             return;
         }
-        *self
-            .turned_down
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(window.clone());
+        #[cfg(test)]
+        if let Some(hook) = &self.between_check_and_update {
+            hook();
+        }
+        *marker = Some(window.clone());
     }
 }
 
@@ -1370,14 +1385,11 @@ mod tests {
         serving.abort();
     }
 
-    /// Two lanes of one route answer in any order: the refusal of an older window, arriving after
-    /// the refusal of the current one, leaves the current one refused.
-    #[test]
-    fn a_late_refusal_of_an_older_window_leaves_the_current_one_refused() {
-        let current = ActionWindowId::new("current").expect("a window");
-        let (_issued, held) = watch::channel(Issued {
+    /// A window as the lane's reader delivers it.
+    fn issued_as(name: &str) -> Issued {
+        Issued {
             window: ActionWindow {
-                action_window_id: current.clone(),
+                action_window_id: ActionWindowId::new(name).expect("a window"),
                 connection_id: kr_protocol::ids::ConnectionId::new(
                     kr_protocol::scalars::Uuid::from_bytes([1; 16]),
                 ),
@@ -1386,8 +1398,16 @@ mod tests {
                 valid_for_ms: DurationMs::new(60_000),
             },
             received_at: tokio::time::Instant::now(),
-        });
+        }
+    }
+
+    /// Two lanes of one route answer in any order: the refusal of an older window, arriving after
+    /// the refusal of the current one, leaves the current one refused.
+    #[test]
+    fn a_late_refusal_of_an_older_window_leaves_the_current_one_refused() {
+        let (_issued, held) = watch::channel(issued_as("current"));
         let source = WindowSource::new(held);
+        let current = ActionWindowId::new("current").expect("a window");
         let older = ActionWindowId::new("older").expect("a window");
         source.turn_down(&current);
         source.turn_down(&older);
@@ -1395,6 +1415,62 @@ mod tests {
         assert!(
             !source.turned_down(&older),
             "an older window is never carried"
+        );
+    }
+
+    /// Two lanes of one route, in the order that loses a refusal when the check and the update are
+    /// two steps. The lane that carried the then-newest window is refused, passes its check and is
+    /// parked there; the host issues the next window and another lane has that one refused; the
+    /// parked lane then goes on. The newer refusal has to stand: a lane opened after carries the
+    /// window the host turned down last, and the host refuses it again.
+    #[test]
+    fn a_refusal_cannot_replace_a_newer_one_between_its_check_and_its_update() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+
+        let (issued, held) = watch::channel(issued_as("older"));
+        let (parked, is_parked) = mpsc::channel::<()>();
+        let (release, released) = mpsc::channel::<()>();
+        let released = std::sync::Mutex::new(released);
+        let first = AtomicBool::new(true);
+        let mut source = WindowSource::new(held);
+        source.between_check_and_update = Some(Box::new(move || {
+            if first.swap(false, Ordering::AcqRel) {
+                parked.send(()).expect("the case waits for the park");
+                let _ = released.lock().expect("the release").recv();
+            }
+        }));
+        let source = Arc::new(source);
+        let older = ActionWindowId::new("older").expect("a window");
+        let newer = ActionWindowId::new("newer").expect("a window");
+
+        let older_lane = {
+            let source = Arc::clone(&source);
+            std::thread::spawn(move || source.turn_down(&older))
+        };
+        is_parked
+            .recv()
+            .expect("the older refusal is parked between its check and its update");
+        issued.send_replace(issued_as("newer"));
+        let (done, newer_done) = mpsc::channel::<()>();
+        let newer_lane = {
+            let source = Arc::clone(&source);
+            let newer = newer.clone();
+            std::thread::spawn(move || {
+                source.turn_down(&newer);
+                let _ = done.send(());
+            })
+        };
+        // The newer refusal finishes while the older one is parked, or it waits for the lock the
+        // older one holds. The wait only bounds how long the case looks for the first: a longer one
+        // cannot make a lane that finishes wrongly pass.
+        let _ = newer_done.recv_timeout(Duration::from_millis(200));
+        release.send(()).expect("the parked refusal goes on");
+        older_lane.join().expect("the older refusal ends");
+        newer_lane.join().expect("the newer refusal ends");
+        assert!(
+            source.turned_down(&newer),
+            "the older refusal did not replace the newer one"
         );
     }
 
