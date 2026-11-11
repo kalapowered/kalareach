@@ -122,8 +122,9 @@ fn read_pattern(line: &[u8]) -> (Vec<u8>, &[u8]) {
 
 /// Unquotes a string that opens with a quotation mark, as Git's C-style unquoting does: `\a`, `\b`,
 /// `\f`, `\n`, `\r`, `\t`, `\v`, `\\`, `\"` and three octal digits that start with 0 to 3. Returns
-/// the bytes and where the text after the closing quotation mark begins, or `None` for an escape
-/// Git does not know and for a string that is not closed.
+/// the bytes (a control escape as a NUL: only a macro prefix reads them) and where the text after
+/// the closing quotation mark begins, or `None` for an escape Git does not know and for a string
+/// that is not closed.
 fn unquote(line: &[u8]) -> Option<(Vec<u8>, usize)> {
     let mut bytes = Vec::new();
     let mut at = 1;
@@ -133,13 +134,8 @@ fn unquote(line: &[u8]) -> Option<(Vec<u8>, usize)> {
             b'\\' => {
                 at += 1;
                 let unescaped = match *line.get(at)? {
-                    b'a' => 0x07,
-                    b'b' => 0x08,
-                    b'f' => 0x0c,
-                    b'n' => b'\n',
-                    b'r' => b'\r',
-                    b't' => b'\t',
-                    b'v' => 0x0b,
+                    // A control byte, which can begin no macro prefix, so its value is not kept.
+                    b'a' | b'b' | b'f' | b'n' | b'r' | b't' | b'v' => 0,
                     escaped @ (b'\\' | b'"') => escaped,
                     first @ b'0'..=b'3' => {
                         let (second, third) = (*line.get(at + 1)?, *line.get(at + 2)?);
