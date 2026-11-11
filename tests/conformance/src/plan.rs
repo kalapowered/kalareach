@@ -1646,6 +1646,18 @@ fn windows() -> Vec<Step> {
         ),
         Step::cargo(
             Group::Rust,
+            "the refusal of a native bridge recipe",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--test",
+                "native_bridge",
+            ],
+        ),
+        Step::cargo(
+            Group::Rust,
             "how a session's closure reaches its attachments",
             &["test", "--locked", "-p", "kr-worker", "--test", "closure"],
         ),

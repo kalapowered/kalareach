@@ -682,6 +682,9 @@ jobs:
       #     `catalogue::launch_probes`, `agent_tools`, `machine`, `registry` and `singleton`, and
       #     the `agent_tools`, `contact_skill`, `catalogue`, `voice_broker` (the sign-in cases),
       #     `archive`, `project`, `network_project`, `shell`, `privacy` and `descriptions` suites;
+      #   - the refusal of a native bridge recipe, `kr-controller`'s `native_bridge`: the one case it
+      #     compiles for Windows shows that no recipe is applied, the settings in an application's
+      #     directory keep their bytes and the refusal is recorded at every reconciliation;
       #   - the stores' open, and what they read, while the holder that is letting go of them still
       #     maps their index, across `kr-controller`, `kr-changeset`, `kr-delivery`, `kr-describe`
       #     and `kr-automation`;
@@ -1414,6 +1417,14 @@ jobs:
       - name: Test the descriptions suite
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-controller --test descriptions
+
+      # What a native bridge recipe does on this platform: nothing. Each reconciliation refuses
+      # before anything is written in the application's directory, leaves the settings in it as
+      # they were, and records the refusal in the package's journal where the doctor reads it. The
+      # rest of the suite applies and removes recipes and is compiled for Unix only.
+      - name: Test that a native bridge recipe is refused and the refusal recorded
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-controller --test native_bridge
 
       # How a session's closure reaches its attachments, on this platform's console: a shell that
       # exits, a shell ended from outside, and a close that a shell ignores until the five seconds

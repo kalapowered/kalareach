@@ -2277,15 +2277,24 @@ fn a_package_file_that_is_not_what_the_recipe_names_is_refused() {
     assert_eq!(site.tree(), before);
 }
 
-/// On Windows the host changes no application's directory. Each reconciliation refuses before
-/// anything is written there and records why in the package's journal, and every one after the
-/// first replaces that journal with a copy compared with it, leaving nothing else beside it.
+/// KR-REQ-11.42: on Windows the host changes no application's directory. Each reconciliation
+/// refuses before anything is written there, so the settings somebody keeps in it have every byte
+/// they had and no key of the recipe is added, and records why in the package's journal, where the
+/// doctor reads it as refused and not as a warning. Every reconciliation after the first replaces
+/// that journal with a copy compared with it, leaving nothing else beside it.
 #[cfg(windows)]
 #[test]
 fn on_windows_a_recipe_is_refused_and_recorded_at_every_reconciliation() {
     let why = "does not apply or remove a native bridge on Windows";
     let site = Site::new();
     let before = site.tree();
+    // Somebody's settings are in the directory the recipe would have changed, in their own layout.
+    let settings = site.application().join("settings.json");
+    assert_eq!(
+        std::fs::read(&settings).expect("their settings"),
+        SETTINGS.as_bytes(),
+        "the settings the refusal has to leave alone are there"
+    );
     let bridges = site.bridges();
 
     for _ in 0..3 {
@@ -2294,6 +2303,11 @@ fn on_windows_a_recipe_is_refused_and_recorded_at_every_reconciliation() {
             .expect("the refusal is recorded");
         assert!(refused(&settled).contains(why), "{settled:?}");
         assert_eq!(site.tree(), before, "nothing was written");
+        assert_eq!(
+            std::fs::read(&settings).expect("their settings are still there"),
+            SETTINGS.as_bytes(),
+            "their settings keep every byte, and the recipe's key is not added"
+        );
         // The journal read back says the same: the refusal, and why.
         let reports = bridges.reports().expect("reads");
         assert_eq!(reports.len(), 1, "{reports:?}");
