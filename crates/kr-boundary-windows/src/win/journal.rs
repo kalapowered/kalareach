@@ -38,6 +38,16 @@ pub mod testing {
     pub(super) fn take_failure() -> bool {
         FAIL_NEXT_WRITE.swap(false, Ordering::SeqCst)
     }
+
+    /// Sets the length of the journal's file without a row, as a file that something else made
+    /// longer than the rows the journal knows would be.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error when the length cannot be set.
+    pub fn set_file_length(journal: &super::Journal, length: u64) -> std::io::Result<()> {
+        journal.file.set_len(length)
+    }
 }
 
 /// The extension of a journal file.
@@ -62,6 +72,11 @@ pub enum JournalError {
     /// failure: the caller goes on.
     #[error("the journal already says this, so the row was not written")]
     AlreadyRecorded,
+    /// The journal already says what the row says about the state, and the row has other content
+    /// (another person's acceptance, another reason, another count), so the row was not written.
+    /// The caller does not take it as recorded.
+    #[error("the journal already says this with other content, so the row was not written")]
+    DiffersFromRecorded,
     /// An earlier write failed, so no row is written until the file is taken up again.
     #[error("an earlier row could not be written, so the journal takes no more")]
     Closed,
@@ -215,12 +230,24 @@ impl Journal {
             return Err(OrderError::Order("the row begins another invocation".to_owned()).into());
         }
         let framed = framing::encode(&row.to_bytes())?;
+        // The bound the reader reads up to is held here too, on the file itself and whatever the
+        // tracker believes it holds: a row that would take the file past it is not written.
+        let length = self.file.metadata()?.len();
+        if length.saturating_add(framed.len() as u64) > MAX_FILE as u64 {
+            return Err(OrderError::NoRoom(
+                "the journal's file would be longer than the journal reads, so no more rows are written"
+                    .to_owned(),
+            )
+            .into());
+        }
         // The tracker is not copied for each row: a refused row changes nothing, and a row that
         // was applied and then not written closes the journal, which is taken up again from the
         // file before any row is written (the tracker of a closed journal may be ahead of the file
         // by that one row).
-        if self.tracker.apply(row)? == Applied::AlreadyRecorded {
-            return Err(JournalError::AlreadyRecorded);
+        match self.tracker.apply(row)? {
+            Applied::Written => {}
+            Applied::AlreadyRecorded => return Err(JournalError::AlreadyRecorded),
+            Applied::Differs => return Err(JournalError::DiffersFromRecorded),
         }
         #[cfg(feature = "testing")]
         let injected = testing::take_failure();

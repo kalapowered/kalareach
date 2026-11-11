@@ -16,8 +16,10 @@
 //! end is unproved. A verification needs every granted object released (or named by a leftover of the
 //! tree), and once it was written no grant, no process and no root begins: a release that begins
 //! after it, or an end that is reported uncertain after it, makes it void, and the verification is
-//! written again. A grant undoes the earlier release of its key (the key is released again only by a
-//! release that follows) and is refused while the key's release is pending. An end needs the private
+//! written again. A grant undoes the earlier release of its key and the cover of any leftover that
+//! named the key or its path before the grant (the key is released, or named by a leftover, again
+//! only by a row that follows), and is refused while the key's release is pending. Names are
+//! compared whole, by a 256-bit digest. An end needs the private
 //! root removed, or a leftover of the root that says what remains of it. Nothing follows the end but
 //! the clearing of a leftover of the private root and the removal of the root itself, which a
 //! recovery may record for a root whose intent is all that was written.
@@ -27,24 +29,33 @@
 //! The rows of an object are paid for from [`limits::WRITER_LIMIT`]. A row that starts work (a grant,
 //! a release intent for an object that has no room kept for it) is admitted only when, after it, the
 //! file still has room for every row that the work already begun may write: for a granted object its
-//! release intent (the grant's list and a little growth), then the larger of the row that says it was
-//! released and a leftover with its clearance. A row that ends work is paid from what was kept. The
+//! release intent (the grant's list and a little growth), then a leftover, the row that says it was
+//! released (a recovery that applies the recorded intent writes it after a leftover too) and the
+//! leftover's clearance. A row that ends work is paid from what was kept. The
 //! room of an object is given back when its work ends, so room spent twice is never counted twice,
 //! and an object that has no grant row (one the invocation made) is paid for when its release begins,
 //! from what the grants left. A release that cannot be journalled in its room (its list grew past it,
 //! the file has no room left) is refused with [`OrderError::NoRoom`]; the caller records a leftover
 //! and the object keeps its state. The rows that are not an object's are bounded by their counts and
 //! sizes in [`limits`].
+//!
+//! The budget is also held to the file's bound by what is really in the file. The bytes of the rows
+//! that are not an object's, and what such rows may still add (each kind at its largest size and the
+//! count it has left), come off the bound before the objects' share is counted, so a writer that
+//! takes up a file an earlier writer made with more of those rows than a correct writer makes has
+//! less for objects, and [`Tracker::ceiling`] never passes [`limits::MAX_FILE`] after an object's
+//! row is admitted.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::collections::{BTreeMap, HashMap};
+
+use sha2::{Digest as _, Sha256};
 
 use crate::filekey::FileKey;
 
 use super::framing;
 use super::limits::{
-    self, ACCEPTANCES, END_CHECKS, OBJECTS_PER_TREE, OTHER_LEFTOVERS, ROOT_LEFTOVERS, SNAPSHOTS,
-    VERIFICATIONS,
+    self, ACCEPTANCES, CLEARED_MAX, END_CHECKS, LEFTOVER_MAX, OBJECTS_PER_TREE, OTHER_LEFTOVERS,
+    ROOT_LEFTOVERS, ROOT_MAX, SMALL_MAX, SNAPSHOT_MAX, SNAPSHOTS, UNCERTAIN_MAX, VERIFICATIONS,
 };
 use super::rows::{LeftoverClass, RootName, Row};
 
@@ -115,12 +126,20 @@ pub enum Applied {
     Written,
     /// The journal already says what the row says, so the row is not taken and is not written.
     AlreadyRecorded,
+    /// The journal already says what the row says about the state, with other content in the row:
+    /// another person's acceptance, another reason for the end, another count of objects. The row is
+    /// not taken and is not written, and the caller is not told it is recorded.
+    Differs,
 }
 
-fn text_hash(text: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    text.hash(&mut hasher);
-    hasher.finish()
+/// A name as the tracker compares it: the SHA-256 digest of its text. Two names that differ never
+/// share one, so no name that a hostile tree chooses can stand for another. It takes 32 bytes for
+/// each granted object (and as many for the entry that finds the object by its path), which is about
+/// 6 MB for the most objects a tree may have, and nothing for a name that no grant carries.
+type Name = [u8; 32];
+
+fn name_of(text: &str) -> Name {
+    Sha256::digest(text.as_bytes()).into()
 }
 
 /// Where the work on one object stands.
@@ -141,9 +160,15 @@ enum Stage {
 struct Account {
     granted: bool,
     released: bool,
-    path_hash: u64,
+    /// Whether a leftover of the tree that came after this grant names the object. A later grant
+    /// of the same key is another account, which no earlier leftover covers.
+    covered: bool,
+    path: Option<Name>,
     stage: Stage,
     owed_clear: usize,
+    /// The room kept for the result of a release whose intent is written and whose result is not,
+    /// once a leftover has taken what was kept for the leftover: the result is still admissible.
+    owed_result: usize,
     intent_room: usize,
     leftover_room: usize,
     cleared_room: usize,
@@ -156,9 +181,11 @@ impl Account {
         Account {
             granted: true,
             released: false,
-            path_hash: text_hash(path),
+            covered: false,
+            path: Some(name_of(path)),
             stage: Stage::Fresh,
             owed_clear: 0,
+            owed_result: 0,
             intent_room: limits::intent_room(
                 (list_bytes + limits::LIST_GROWTH).min(limits::LIST_BYTES),
             ),
@@ -173,23 +200,27 @@ impl Account {
         Account {
             granted: false,
             released: false,
-            path_hash: 0,
+            covered: false,
+            path: None,
             stage: Stage::Begun,
             owed_clear: 0,
+            owed_result: 0,
             intent_room: 0,
             leftover_room: limits::leftover_room(limits::KEY_TEXT_BYTES),
             cleared_room: limits::cleared_room(limits::KEY_TEXT_BYTES),
         }
     }
 
-    /// What the rows still to come may take: the result row, or a leftover and its clearance,
-    /// whichever is more.
+    /// What the rows still to come may take once the intent is written: a leftover, then the result
+    /// that the release may still write after it (a recovery applies the recorded intent), then the
+    /// clearance of the leftover.
     fn after_intent(&self) -> usize {
-        limits::released_room().max(self.leftover_room + self.cleared_room)
+        self.leftover_room + limits::released_room() + self.cleared_room
     }
 
     fn need(&self) -> usize {
         self.owed_clear
+            + self.owed_result
             + match self.stage {
                 Stage::Fresh => self.intent_room + self.after_intent(),
                 Stage::Begun => self.after_intent(),
@@ -221,9 +252,8 @@ pub struct Tracker {
     grants: u64,
     grant_complete: bool,
     keys: BTreeMap<FileKey, Account>,
-    by_path: HashMap<u64, FileKey>,
+    by_path: HashMap<Name, FileKey>,
     pending_releases: BTreeMap<FileKey, ()>,
-    tree_objects: HashSet<u64>,
     process: Option<(u32, u64)>,
     job_ended: bool,
     unproved: bool,
@@ -232,8 +262,16 @@ pub struct Tracker {
     verified_once: bool,
     ended: bool,
     leftovers: Vec<OpenLeftover>,
+    /// How many of the open leftovers no object's room paid for: the clearance of each is paid from
+    /// the rows that are not an object's.
+    open_unowned: usize,
     snapshots: Vec<u32>,
-    accepted: Option<u32>,
+    /// The snapshot last accepted, and the person who accepted it.
+    accepted: Option<(u32, String)>,
+    /// The reason of the end check that left the end unproved.
+    uncertain_reason: Option<String>,
+    /// How many objects the standing verification says it covered.
+    verified_objects: Option<u64>,
     counts: Counts,
     enforce: bool,
     limit: usize,
@@ -278,7 +316,6 @@ impl Tracker {
             keys: BTreeMap::new(),
             by_path: HashMap::new(),
             pending_releases: BTreeMap::new(),
-            tree_objects: HashSet::new(),
             process: None,
             job_ended: false,
             unproved: false,
@@ -287,8 +324,11 @@ impl Tracker {
             verified_once: false,
             ended: false,
             leftovers: Vec::new(),
+            open_unowned: 0,
             snapshots: Vec::new(),
             accepted: None,
+            uncertain_reason: None,
+            verified_objects: None,
             counts: Counts::default(),
             enforce: false,
             limit: usize::MAX,
@@ -320,6 +360,54 @@ impl Tracker {
         (self.spent, self.kept)
     }
 
+    /// The longest the file may still become: the bytes in it, what is kept for the rows of the work
+    /// begun, and what the rows that are not an object's may still add. A writer admits an object's
+    /// row only while this stays within [`limits::MAX_FILE`].
+    #[must_use]
+    pub fn ceiling(&self) -> usize {
+        self.bytes + self.kept + self.closing_owed()
+    }
+
+    /// What the rows that are not an object's may still add, each kind at its largest size and the
+    /// count it has left (a kind a resumed file already has over its count has none left), and the
+    /// clearance of each open leftover that no object's room pays for.
+    fn closing_owed(&self) -> usize {
+        let framed = |size: usize| size + framing::FRAME_BYTES;
+        let left = |most: u32, used: u32| most.saturating_sub(used) as usize;
+        let pair = framed(LEFTOVER_MAX) + framed(CLEARED_MAX);
+        let roots = match self.root {
+            RootState::Absent => 3,
+            RootState::IntentOnly(_) => 2,
+            RootState::Made(..) => 1,
+            RootState::Removed => 0,
+        };
+        // The grant's completion, the process's start and the end, once each, and one row more.
+        let small_once = usize::from(!self.grant_complete)
+            + usize::from(self.process.is_none())
+            + usize::from(!self.ended)
+            + 1;
+        left(SNAPSHOTS, self.counts.snapshots) * framed(SNAPSHOT_MAX)
+            + roots * framed(ROOT_MAX)
+            + small_once * framed(SMALL_MAX)
+            + left(END_CHECKS, self.counts.job_ended) * framed(SMALL_MAX)
+            + left(END_CHECKS, self.counts.uncertain) * framed(UNCERTAIN_MAX)
+            + left(VERIFICATIONS, self.counts.verified) * framed(SMALL_MAX)
+            + left(ACCEPTANCES, self.counts.accepted) * framed(limits::ACCEPTED_MAX)
+            + left(ACCEPTANCES, self.counts.repository) * pair
+            + left(ROOT_LEFTOVERS, self.counts.root) * pair
+            + left(OTHER_LEFTOVERS, self.counts.other) * pair
+            + self.open_unowned * framed(CLEARED_MAX)
+    }
+
+    /// The budget of the objects' rows now: the writer's own limit, held to what is left of the
+    /// file's bound after the bytes that are really in the file for rows that are not an object's
+    /// and what such rows may still add. A file that an earlier writer made with more of those than
+    /// a correct writer makes leaves the objects less.
+    fn room_limit(&self) -> usize {
+        let others = self.bytes.saturating_sub(self.spent) + self.closing_owed();
+        self.limit.min(limits::MAX_FILE.saturating_sub(others))
+    }
+
     fn slot_leftovers(&self) -> usize {
         self.leftovers
             .iter()
@@ -334,11 +422,13 @@ impl Tracker {
     /// The granted or made object that a leftover's `object` names, by its key as text or by the
     /// path of its grant.
     fn owner_of(&self, object: &str) -> Option<FileKey> {
+        // The key's text is taken only in the form the key prints, which is the form the room for
+        // the leftover was kept for.
         object
             .parse::<FileKey>()
             .ok()
-            .filter(|key| self.keys.contains_key(key))
-            .or_else(|| self.by_path.get(&text_hash(object)).copied())
+            .filter(|key| self.keys.contains_key(key) && key.to_string() == object)
+            .or_else(|| self.by_path.get(&name_of(object)).copied())
     }
 
     /// Puts an object's account in place and keeps the total of what is kept right.
@@ -448,7 +538,8 @@ impl Tracker {
                             "the tree has more than {OBJECTS_PER_TREE} objects, which the journal does not record"
                         )));
                     }
-                    if self.spent + framed + self.kept - before + account.need() > self.limit {
+                    if self.spent + framed + self.kept - before + account.need() > self.room_limit()
+                    {
                         return Err(OrderError::NoRoom(
                             "the tree is too large for the journal: it could not record the grant of this object and the release that would undo it"
                                 .to_owned(),
@@ -457,7 +548,17 @@ impl Tracker {
                 }
                 self.grants += 1;
                 self.spent += framed;
-                self.by_path.insert(account.path_hash, *key);
+                // The key's earlier names and its path's earlier owner give way to this grant: no
+                // leftover that came before it covers it, and a leftover that names the old path
+                // no longer names this key.
+                if let Some(old) = self.keys.get(key).and_then(|earlier| earlier.path)
+                    && self.by_path.get(&old) == Some(key)
+                {
+                    self.by_path.remove(&old);
+                }
+                if let Some(name) = account.path {
+                    self.by_path.insert(name, *key);
+                }
                 self.set_account(*key, account);
                 Ok(Applied::Written)
             }
@@ -509,10 +610,14 @@ impl Tracker {
                 self.job_ended = true;
                 Ok(Applied::Written)
             }
-            Row::EndUncertain { .. } => {
+            Row::EndUncertain { reason } => {
                 if self.enforce {
                     if self.uncertain && self.unproved {
-                        return Ok(Applied::AlreadyRecorded);
+                        return Ok(if self.uncertain_reason.as_deref() == Some(reason) {
+                            Applied::AlreadyRecorded
+                        } else {
+                            Applied::Differs
+                        });
                     }
                     if self.counts.uncertain >= END_CHECKS {
                         return Err(OrderError::NoRoom(format!(
@@ -521,6 +626,7 @@ impl Tracker {
                     }
                 }
                 self.counts.uncertain += 1;
+                self.uncertain_reason = Some(reason.clone());
                 self.unproved = true;
                 self.uncertain = true;
                 self.job_ended = false;
@@ -542,9 +648,11 @@ impl Tracker {
                     )));
                 }
                 account.stage = Stage::Begun;
+                // The room kept for the intent's result covers the result of an earlier intent too.
+                account.owed_result = 0;
                 if self.enforce
                     && !reserved
-                    && self.spent + framed + self.kept - before + account.need() > self.limit
+                    && self.spent + framed + self.kept - before + account.need() > self.room_limit()
                 {
                     return Err(OrderError::NoRoom(
                         "the journal has no room left for the release of more objects".to_owned(),
@@ -565,12 +673,13 @@ impl Tracker {
                 if let Some(mut account) = self.keys.get(key).cloned() {
                     account.stage = Stage::Settled;
                     account.released = true;
+                    account.owed_result = 0;
                     self.spent += framed;
                     self.set_account(*key, account);
                 }
                 Ok(Applied::Written)
             }
-            Row::ReleaseVerified { leftovers, .. } => {
+            Row::ReleaseVerified { objects, leftovers } => {
                 if self.unproved {
                     return wrong("the release is verified while the end is not proved");
                 }
@@ -583,9 +692,7 @@ impl Tracker {
                     return wrong("the release is verified while a leftover is open");
                 }
                 if let Some(key) = self.keys.iter().find_map(|(key, account)| {
-                    let named = self.tree_objects.contains(&text_hash(&key.to_string()))
-                        || self.tree_objects.contains(&account.path_hash);
-                    (account.granted && !account.released && !named).then_some(key)
+                    (account.granted && !account.released && !account.covered).then_some(key)
                 }) {
                     return wrong(format!(
                         "the release is verified while the granted object {key} is neither released nor named by a leftover"
@@ -593,7 +700,11 @@ impl Tracker {
                 }
                 if self.enforce {
                     if self.release_verified {
-                        return Ok(Applied::AlreadyRecorded);
+                        return Ok(if self.verified_objects == Some(*objects) {
+                            Applied::AlreadyRecorded
+                        } else {
+                            Applied::Differs
+                        });
                     }
                     if self.counts.verified >= VERIFICATIONS {
                         return Err(OrderError::NoRoom(format!(
@@ -603,6 +714,7 @@ impl Tracker {
                 }
                 self.counts.verified += 1;
                 self.release_verified = true;
+                self.verified_objects = Some(*objects);
                 self.verified_once = true;
                 Ok(Applied::Written)
             }
@@ -665,10 +777,26 @@ impl Tracker {
                 if let Some(key) = owner
                     && let Some(mut account) = self.keys.get(&key).cloned()
                 {
+                    // The leftover takes what was kept for it. A release whose intent is written
+                    // may still write its result after it (a recovery applies the recorded
+                    // intent), so the room for that result stays kept, beside the clearance.
+                    if self.pending_releases.contains_key(&key) {
+                        account.owed_result = limits::released_room();
+                    }
                     account.stage = Stage::Settled;
-                    account.owed_clear = account.cleared_room;
+                    account.owed_clear += account.cleared_room;
                     self.spent += framed;
                     self.set_account(key, account);
+                } else {
+                    self.open_unowned += 1;
+                }
+                // A leftover of the tree covers the object it names, as that object is granted now:
+                // a later grant of the same key is another account and is not covered by it.
+                if *class == LeftoverClass::Tree
+                    && let Some(named) = self.owner_of(object)
+                    && let Some(account) = self.keys.get_mut(&named)
+                {
+                    account.covered = true;
                 }
                 self.leftovers.push(OpenLeftover {
                     object: object.clone(),
@@ -677,15 +805,14 @@ impl Tracker {
                     snapshot: *snapshot,
                     owner,
                 });
-                if *class == LeftoverClass::Tree {
-                    self.tree_objects.insert(text_hash(object));
-                }
                 if class.holds_the_slot() {
                     self.release_verified = false;
                 }
                 Ok(Applied::Written)
             }
-            Row::AcceptedState { snapshot, .. } => {
+            Row::AcceptedState {
+                snapshot, person, ..
+            } => {
                 let named = self.leftovers.iter().any(|leftover| {
                     leftover.class == LeftoverClass::Repository
                         && leftover.snapshot == Some(*snapshot)
@@ -694,8 +821,16 @@ impl Tracker {
                     return wrong("a state is accepted that no repository leftover names");
                 }
                 if self.enforce {
-                    if self.accepted == Some(*snapshot) {
-                        return Ok(Applied::AlreadyRecorded);
+                    // The same person's repeat, at any time, says what the journal says; another
+                    // person's acceptance of the same state is not recorded here.
+                    if let Some((accepted, by)) = &self.accepted
+                        && accepted == snapshot
+                    {
+                        return Ok(if by == person {
+                            Applied::AlreadyRecorded
+                        } else {
+                            Applied::Differs
+                        });
                     }
                     if self.counts.accepted >= ACCEPTANCES {
                         return Err(OrderError::NoRoom(format!(
@@ -704,7 +839,7 @@ impl Tracker {
                     }
                 }
                 self.counts.accepted += 1;
-                self.accepted = Some(*snapshot);
+                self.accepted = Some((*snapshot, person.clone()));
                 Ok(Applied::Written)
             }
             Row::LeftoverCleared { key } => {
@@ -719,10 +854,15 @@ impl Tracker {
                 }
                 self.leftovers.retain(|leftover| &leftover.object != key);
                 let mut paid = false;
-                for owner in cleared.into_iter().flatten() {
-                    if let Some(mut account) = self.keys.get(&owner).cloned() {
-                        account.owed_clear = 0;
-                        self.set_account(owner, account);
+                for owner in &cleared {
+                    let Some(owner) = owner else {
+                        self.open_unowned = self.open_unowned.saturating_sub(1);
+                        continue;
+                    };
+                    if let Some(mut account) = self.keys.get(owner).cloned() {
+                        account.owed_clear =
+                            account.owed_clear.saturating_sub(account.cleared_room);
+                        self.set_account(*owner, account);
                         paid = true;
                     }
                 }
@@ -813,7 +953,7 @@ impl Tracker {
     /// The snapshot the person accepted as the tree's baseline, if any.
     #[must_use]
     pub fn accepted_snapshot(&self) -> Option<u32> {
-        self.accepted
+        self.accepted.as_ref().map(|(snapshot, _)| *snapshot)
     }
 
     /// The boot marker the invocation began with.

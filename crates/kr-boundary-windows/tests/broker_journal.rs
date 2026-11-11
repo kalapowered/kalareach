@@ -1065,6 +1065,12 @@ impl Driver {
             "the rows of objects ({spent}) and what is kept for them ({kept}) are over the budget {}",
             self.limit
         );
+        assert!(
+            self.tracker.ceiling() <= limits::MAX_FILE,
+            "the file may become {} bytes, over {}",
+            self.tracker.ceiling(),
+            limits::MAX_FILE
+        );
         Ok(applied)
     }
 
@@ -1304,8 +1310,9 @@ fn the_room_kept_for_an_object_is_exact_and_given_back_as_its_work_ends() {
     // A leftover names the object by its path or its key as text: room is kept for the longer.
     let object = limits::json_bytes(&grant_path(1)).max(limits::KEY_TEXT_BYTES);
     let released_room = limits::released_room();
-    let after_intent =
-        released_room.max(limits::leftover_room(object) + limits::cleared_room(object));
+    // After the intent a leftover may come, then the result a recovery writes after it, then the
+    // leftover's clearance.
+    let after_intent = limits::leftover_room(object) + released_room + limits::cleared_room(object);
     let intent_room = limits::intent_room(4 + limits::LIST_GROWTH);
     assert!(framed(&release_intent(1)) <= intent_room);
 
@@ -1345,9 +1352,21 @@ fn the_room_kept_for_an_object_is_exact_and_given_back_as_its_work_ends() {
             limits::cleared_room(object)
         )
     );
-    let cleared = Row::LeftoverCleared { key: path };
+    let cleared = Row::LeftoverCleared { key: path.clone() };
     tracker.apply(&cleared).unwrap();
     assert_eq!(tracker.budget().1, 0);
+    // A leftover after the intent leaves the result admissible: its room stays kept with the
+    // clearance, and is given back when the result is written.
+    let mut tracker = writer_after(
+        limits::WRITER_LIMIT,
+        &[begin(), grant(1), release_intent(1), tree_leftover(&path)],
+    );
+    assert_eq!(
+        tracker.budget().1,
+        limits::cleared_room(object) + released_room
+    );
+    tracker.apply(&released(1)).unwrap();
+    assert_eq!(tracker.budget().1, limits::cleared_room(object));
     // By its key as text, the same.
     let text = key(1).to_string();
     let tracker = writer_after(
@@ -1364,7 +1383,7 @@ fn the_room_kept_for_an_object_is_exact_and_given_back_as_its_work_ends() {
     let made = limits::leftover_room(limits::KEY_TEXT_BYTES)
         + limits::cleared_room(limits::KEY_TEXT_BYTES);
     let tracker = writer_after(limits::WRITER_LIMIT, &[begin(), release_intent(99)]);
-    assert_eq!(tracker.budget().1, released_room.max(made));
+    assert_eq!(tracker.budget().1, released_room + made);
 }
 
 #[test]
@@ -1644,6 +1663,418 @@ fn the_next_row_over_a_count_is_not_lost_in_silence() {
         .map_err(words)
         .unwrap_err();
     assert!(ninth.contains("at most 8 leftovers"), "{ninth}");
+}
+
+#[test]
+fn a_reason_is_cut_by_its_encoded_size_and_a_row_that_carries_the_cut_is_admitted() {
+    // A backslash and a quote take two bytes in a row, a control character six, an accented
+    // letter two: the text is 300 bytes and takes 720 once written.
+    let text = "\\\"\u{1}é".repeat(60);
+    assert!(text.len() > limits::TEXT_BYTES);
+    let cut = limits::short(&text);
+    assert!(text.starts_with(&cut));
+    assert!(
+        limits::json_bytes(&cut) <= limits::TEXT_BYTES,
+        "the cut text takes {} bytes in a row",
+        limits::json_bytes(&cut)
+    );
+    // It is cut where the next character would not fit, and not before.
+    let next = text[cut.len()..].chars().next().unwrap();
+    assert!(limits::json_bytes(&format!("{cut}{next}")) > limits::TEXT_BYTES);
+    // A text that fits is kept whole.
+    assert_eq!(limits::short("in use"), "in use");
+
+    // Every row that carries a reason, an outcome or a name takes the cut text.
+    Row::EndUncertain {
+        reason: cut.clone(),
+    }
+    .check_caps()
+    .unwrap();
+    Row::ObjectReleased {
+        key: key(1),
+        outcome: cut.clone(),
+    }
+    .check_caps()
+    .unwrap();
+    let mut tracker = writer_after(limits::WRITER_LIMIT, &[begin(), grant(1)]);
+    let leftover = Row::Leftover {
+        object: grant_path(1),
+        reason: cut,
+        class: LeftoverClass::Tree,
+        snapshot: None,
+    };
+    assert_eq!(tracker.apply(&leftover), Ok(Applied::Written));
+}
+
+#[test]
+fn a_grant_after_a_cleared_leftover_of_the_same_object_is_not_covered_by_it() {
+    let path = grant_path(1);
+    for name in [path.clone(), key(1).to_string()] {
+        let cleared = Row::LeftoverCleared { key: name.clone() };
+        let regranted = [
+            begin(),
+            grant(1),
+            tree_leftover(&name),
+            cleared.clone(),
+            grant(1),
+            Row::GrantComplete { count: 2 },
+            started(),
+            Row::JobEnded,
+        ];
+        // The second grant of the key was never released, and the first one's leftover names the
+        // first grant only.
+        assert!(
+            refused_after(&regranted, &verified(1)),
+            "the leftover that was cleared covers the grant that came before it"
+        );
+        // A file that a writer without this rule made: it reads as an invocation that did not end.
+        let mut rows = regranted.to_vec();
+        rows.extend([verified(1), Row::End { root_leftovers: 0 }]);
+        let found = invocation(&file_of(&rows), BOOT);
+        assert_ne!(found.standing, Standing::Finished);
+        assert!(found.needs_recovery());
+
+        // The control: a leftover that comes after the one grant covers it, once cleared.
+        let covered = [
+            begin(),
+            grant(1),
+            tree_leftover(&name),
+            cleared,
+            Row::GrantComplete { count: 1 },
+            started(),
+            Row::JobEnded,
+        ];
+        tracker_after(&covered).apply(&verified(1)).unwrap();
+
+        // A leftover that comes before the grant names something that was there before it.
+        let before = [
+            begin(),
+            tree_leftover(&name),
+            Row::LeftoverCleared { key: name.clone() },
+            grant(1),
+            Row::GrantComplete { count: 1 },
+            started(),
+            Row::JobEnded,
+        ];
+        assert!(refused_after(&before, &verified(1)));
+    }
+}
+
+/// Two different paths to which the tracker's earlier unkeyed 64-bit hash of a name (SipHash with
+/// zero keys) gave one value, 0x240a8f408c96ac02. They were found by a cycle search over
+/// `hash(r"C:\work\tree\f{x:016x}")`.
+fn colliding_paths() -> (String, String) {
+    (
+        r"C:\work\tree\f9a257281bbc9014f".to_owned(),
+        r"C:\work\tree\f8d2dd84bb71df54c".to_owned(),
+    )
+}
+
+#[test]
+fn names_are_compared_whole_and_a_leftover_covers_only_the_object_it_names() {
+    // Two granted paths of one length, and a third that no grant has.
+    let path_of = |n: u64| grant_path(n);
+    assert_eq!(path_of(1).len(), path_of(2).len());
+    let run_the_process = |rows: &mut Vec<Row>| rows.extend([started(), Row::JobEnded]);
+    let setup = vec![
+        begin(),
+        grant(1),
+        grant(2),
+        tree_leftover(&path_of(2)),
+        Row::LeftoverCleared { key: path_of(2) },
+        Row::GrantComplete { count: 2 },
+    ];
+    let mut rows = setup.clone();
+    run_the_process(&mut rows);
+    // The leftover names the second object: the first is not covered by it, and the second is.
+    assert!(refused_after(&rows, &verified(2)));
+    rows.extend([release_intent(1), released(1)]);
+    tracker_after(&rows).apply(&verified(2)).unwrap();
+
+    // A name that differs only by its case, by one character or by a prefix names another object.
+    for other in [
+        path_of(1).to_uppercase(),
+        format!("{}x", path_of(1)),
+        path_of(1)[..path_of(1).len() - 1].to_owned(),
+        path_of(3),
+    ] {
+        let mut rows = vec![
+            begin(),
+            grant(1),
+            tree_leftover(&other),
+            Row::LeftoverCleared { key: other.clone() },
+            Row::GrantComplete { count: 1 },
+        ];
+        run_the_process(&mut rows);
+        assert!(
+            refused_after(&rows, &verified(1)),
+            "{other} is not {}",
+            path_of(1)
+        );
+    }
+
+    // A path that the old unkeyed 64-bit hash of the tracker gave to two names. Neither name covers
+    // the other, and a leftover that names one is not charged to the object granted at the other.
+    let (first, second) = colliding_paths();
+    assert_ne!(first, second);
+    let grant_at = |n: u64, path: &str| match grant(n) {
+        Row::Grant {
+            key,
+            kind,
+            owner,
+            dacl_bytes,
+            control_flags,
+            protected,
+            link_count,
+            added_ace,
+            ..
+        } => Row::Grant {
+            key,
+            path: path.to_owned(),
+            kind,
+            owner,
+            dacl_bytes,
+            control_flags,
+            protected,
+            link_count,
+            added_ace,
+        },
+        _ => unreachable!(),
+    };
+    let mut rows = vec![
+        begin(),
+        grant_at(1, &first),
+        tree_leftover(&second),
+        Row::LeftoverCleared {
+            key: second.clone(),
+        },
+        Row::GrantComplete { count: 1 },
+    ];
+    run_the_process(&mut rows);
+    assert!(
+        refused_after(&rows, &verified(1)),
+        "a leftover of {second} covers the object granted at {first}"
+    );
+    let before = writer_after(limits::WRITER_LIMIT, &[begin(), grant_at(1, &first)]);
+    let mut charged = before.clone();
+    charged.apply(&tree_leftover(&second)).unwrap();
+    assert_eq!(
+        charged.budget().1,
+        before.budget().1,
+        "the room of the object granted at {first} was given to a leftover of {second}"
+    );
+
+    // A key granted again at another path has no earlier path: a leftover that names the path it
+    // had before covers nothing that is granted now.
+    let mut rows = vec![
+        begin(),
+        grant(1),
+        release_intent(1),
+        released(1),
+        grant_at(1, &path_of(7)),
+        tree_leftover(&path_of(1)),
+        Row::LeftoverCleared { key: path_of(1) },
+        Row::GrantComplete { count: 2 },
+    ];
+    run_the_process(&mut rows);
+    assert!(refused_after(&rows, &verified(2)));
+
+    // The key's text names the key in the form the key prints and in no other form: the room kept
+    // for its leftover is the room of that form.
+    let text = key(1).to_string();
+    let mut tracker = writer_after(limits::WRITER_LIMIT, &[begin(), grant(1)]);
+    let before = tracker.budget();
+    tracker.apply(&tree_leftover(&text.to_uppercase())).unwrap();
+    assert_eq!(
+        tracker.budget(),
+        before,
+        "{text} in capitals is another name"
+    );
+    tracker.apply(&tree_leftover(&text)).unwrap();
+    assert_ne!(tracker.budget(), before, "{text} is the key's own name");
+}
+
+#[test]
+fn the_ceiling_follows_each_row_by_what_it_took_and_what_it_still_owes() {
+    let framed = |row: &Row| (row.to_bytes().len() + framing::FRAME_BYTES) as i64;
+    let mut tracker = writer_after(limits::WRITER_LIMIT, &[begin()]);
+    assert!(tracker.ceiling() <= limits::MAX_FILE);
+    // A leftover of the private root that no object's room pays for: its row is in the file, one
+    // leftover and its clearance fewer may still come, and its own clearance is owed.
+    let leftover = worst_leftover("held".to_owned(), LeftoverClass::Root, None);
+    let before = tracker.ceiling() as i64;
+    tracker.apply(&leftover).unwrap();
+    let after = tracker.ceiling() as i64;
+    assert_eq!(
+        after - before,
+        framed(&leftover) - (limits::LEFTOVER_MAX + framing::FRAME_BYTES) as i64
+    );
+    // Its clearance is written: the row is in the file and nothing more is owed for it.
+    let cleared = Row::LeftoverCleared {
+        key: "held".to_owned(),
+    };
+    tracker.apply(&cleared).unwrap();
+    assert_eq!(
+        tracker.ceiling() as i64 - after,
+        framed(&cleared) - (limits::CLEARED_MAX + framing::FRAME_BYTES) as i64
+    );
+}
+
+#[test]
+fn a_leftover_never_gives_away_the_room_of_a_result_that_is_still_admissible() {
+    // After a release intent and a leftover of the same key, the key's release is still pending: a
+    // recovery that applies the recorded intent writes its result. Other work that begins in the
+    // room the leftover gave back must not take the room that result needs.
+    let limit = 400_000;
+    let mut driver = Driver::new(limit);
+    driver.put_ok(begin());
+    let granted = 20;
+    for n in 1..=granted {
+        driver.put_ok(grant(n));
+    }
+    driver.put_ok(Row::GrantComplete { count: granted });
+    for n in 1..=granted {
+        driver.put_ok(release_intent(n));
+    }
+    for n in 1..=granted {
+        driver.put_ok(worst_leftover(grant_path(n), LeftoverClass::Tree, None));
+    }
+    // Objects the invocation made begin their releases until the journal has no room for more.
+    let mut made = 1_000;
+    while driver.put(release_intent(made)).is_ok() {
+        made += 1;
+    }
+    assert!(
+        made > 1_000,
+        "the room a leftover gave back is used by other work"
+    );
+    // Every result is still admitted.
+    for n in (1..=granted).chain(1_000..made) {
+        driver.put_ok(released(n));
+    }
+}
+
+#[test]
+fn a_writer_that_resumes_a_file_counts_the_bytes_that_are_in_it_and_what_it_still_owes() {
+    // An earlier writer made ten snapshot rows of the size the framing allows. The reader takes
+    // them, and they are far over what a correct writer spends on snapshots.
+    let heavy = |id: u32| Row::RepositorySnapshot {
+        id,
+        kind: SnapshotKind::Changed,
+        config_digest: "ab".repeat(32),
+        hooks: (0..2_000)
+            .map(|n| DigestedFile {
+                name: "n".repeat(limits::NAME_BYTES),
+                key: key(n),
+                size: u64::MAX,
+                sha256: "cd".repeat(32),
+            })
+            .collect(),
+        info_attributes: None,
+        absent_names: Vec::new(),
+    };
+    let mut reader = Tracker::reading();
+    reader.apply(&begin()).unwrap();
+    for id in 1..=10 {
+        let row = heavy(id);
+        assert!(row.to_bytes().len() <= framing::MAX_RECORD);
+        reader.apply(&row).unwrap();
+    }
+    assert!(reader.bytes() > limits::CLOSING);
+    let mut writer = reader.into_writer();
+
+    // The writer takes objects until the journal has no room for more.
+    let mut n = 0;
+    loop {
+        n += 1;
+        assert!(n <= 200_000, "the writer takes objects without end");
+        let list = limits::LIST_BYTES - limits::LIST_GROWTH;
+        if writer.apply(&worst_grant(n, list)).is_err() {
+            break;
+        }
+    }
+    assert!(n > 1_000, "the writer took {n} objects");
+
+    // What is in the file, what is kept for the rows of the work begun, and what the rows that are
+    // not an object's may still add (each kind at its largest size and the count it has left) must
+    // fit the bound the reader reads up to.
+    let frame = framing::FRAME_BYTES;
+    let closing_left = limits::CLOSING
+        - (limits::BEGIN_MAX + frame)
+        - limits::SNAPSHOTS as usize * (limits::SNAPSHOT_MAX + frame);
+    let (_, kept) = writer.budget();
+    assert!(writer.ceiling() <= limits::MAX_FILE);
+    assert!(
+        writer.bytes() + kept + closing_left <= limits::MAX_FILE,
+        "the file ({}) with what is kept ({kept}) and what may still be added ({closing_left}) passes {}",
+        writer.bytes(),
+        limits::MAX_FILE
+    );
+}
+
+#[test]
+fn a_repeated_row_with_other_content_is_not_already_recorded() {
+    // An acceptance of a state that was accepted: by the same person it is already recorded, at
+    // whatever time; by another person it differs, and nothing of it is written.
+    let accepted = |person: &str, time: u64| Row::AcceptedState {
+        snapshot: 1,
+        person: person.to_owned(),
+        time,
+    };
+    let mut tracker = writer_after(
+        limits::WRITER_LIMIT,
+        &[
+            begin(),
+            snapshot(1, SnapshotKind::Changed),
+            Row::Leftover {
+                object: "config".to_owned(),
+                reason: "changed".to_owned(),
+                class: LeftoverClass::Repository,
+                snapshot: Some(1),
+            },
+        ],
+    );
+    assert_eq!(
+        tracker.apply(&accepted("S-1-5-21-1", 5)),
+        Ok(Applied::Written)
+    );
+    let size = tracker.bytes();
+    assert_eq!(
+        tracker.apply(&accepted("S-1-5-21-1", 9)),
+        Ok(Applied::AlreadyRecorded)
+    );
+    assert_eq!(
+        tracker.apply(&accepted("S-1-5-21-2", 9)),
+        Ok(Applied::Differs)
+    );
+    assert_eq!(tracker.bytes(), size);
+    assert_eq!(tracker.accepted_snapshot(), Some(1));
+
+    // An end that is not proved, said twice with another reason.
+    let mut tracker = writer_after(
+        limits::WRITER_LIMIT,
+        &[begin(), grant_done(), started(), uncertain()],
+    );
+    let size = tracker.bytes();
+    assert_eq!(tracker.apply(&uncertain()), Ok(Applied::AlreadyRecorded));
+    let other = Row::EndUncertain {
+        reason: "another reason".to_owned(),
+    };
+    assert_eq!(tracker.apply(&other), Ok(Applied::Differs));
+    assert_eq!(tracker.bytes(), size);
+    // It still counts as one check: the sixteen are not used up by a reason that changes.
+    for _ in 0..40 {
+        assert_eq!(tracker.apply(&other), Ok(Applied::Differs));
+    }
+    assert_eq!(tracker.apply(&Row::JobEnded), Ok(Applied::Written));
+
+    // A verification said twice with another count of objects.
+    let mut tracker = writer_after(
+        limits::WRITER_LIMIT,
+        &[begin(), grant_done(), started(), Row::JobEnded, verified(3)],
+    );
+    assert_eq!(tracker.apply(&verified(3)), Ok(Applied::AlreadyRecorded));
+    assert_eq!(tracker.apply(&verified(4)), Ok(Applied::Differs));
 }
 
 #[test]
@@ -2185,6 +2616,67 @@ mod native {
         // The file says what is on the disk: the row that was not written is not there.
         let bytes = std::fs::read(journal.path()).unwrap();
         assert_eq!(framing::read_all(&bytes).records.len(), 1);
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_row_that_would_take_the_file_past_the_bound_is_refused_whatever_the_tracker_holds() {
+        use kr_boundary_windows::journal::limits::MAX_FILE;
+        use kr_boundary_windows::journal::replay::OrderError;
+        use kr_boundary_windows::win::journal::testing;
+        let dir = Dir::new();
+        let mut journal = Journal::create(&dir.0, id()).unwrap();
+        journal.append(&begin()).unwrap();
+        let rows = std::fs::metadata(journal.path()).unwrap().len();
+        // The file is as long as the reader reads, with rows the tracker does not know: the
+        // tracker has room for the row and the file has none.
+        testing::set_file_length(&journal, MAX_FILE as u64).unwrap();
+        let refused = journal
+            .append(&snapshot(1, SnapshotKind::Initial))
+            .unwrap_err();
+        assert!(
+            matches!(refused, JournalError::Order(OrderError::NoRoom(_))),
+            "{refused}"
+        );
+        assert_eq!(
+            std::fs::metadata(journal.path()).unwrap().len(),
+            MAX_FILE as u64,
+            "nothing was written"
+        );
+        // A file that is shorter by the row's length takes it.
+        testing::set_file_length(&journal, rows).unwrap();
+        journal.append(&snapshot(1, SnapshotKind::Initial)).unwrap();
+    }
+
+    #[test]
+    fn a_row_that_differs_from_the_recorded_one_is_not_written_and_is_not_taken_as_recorded() {
+        use kr_boundary_windows::journal::rows::Row;
+        let dir = Dir::new();
+        let mut journal = Journal::create(&dir.0, id()).unwrap();
+        for row in [
+            begin(),
+            Row::GrantComplete { count: 0 },
+            Row::ProcessStarted {
+                pid: 12,
+                creation_time: 34,
+            },
+        ] {
+            journal.append(&row).unwrap();
+        }
+        let uncertain = |reason: &str| Row::EndUncertain {
+            reason: reason.to_owned(),
+        };
+        journal.append(&uncertain("the session is there")).unwrap();
+        let length = std::fs::metadata(journal.path()).unwrap().len();
+        assert!(matches!(
+            journal.append(&uncertain("the session is there")),
+            Err(JournalError::AlreadyRecorded)
+        ));
+        assert!(matches!(
+            journal.append(&uncertain("another reason")),
+            Err(JournalError::DiffersFromRecorded)
+        ));
+        assert_eq!(std::fs::metadata(journal.path()).unwrap().len(), length);
     }
 
     #[test]
