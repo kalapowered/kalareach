@@ -11,6 +11,7 @@
 
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
@@ -83,12 +84,48 @@ pub struct Ended {
     pub active_zero: bool,
 }
 
+impl Ended {
+    /// Whether the end is proved: every retained process has exited and the job counts no active
+    /// process. Anything else is an uncertain end, and nothing is released or removed on the
+    /// strength of it. What a child or the end itself reported on the way is in
+    /// [`Job::unproved_reasons`].
+    #[must_use]
+    pub fn proved(self) -> bool {
+        self.all_exited && self.active_zero
+    }
+}
+
+/// Where the children of a job tell its owner that one of them could not be shown to have ended.
+///
+/// A child that is dropped cannot return an error, so it writes here, and the owner reads it when
+/// it ends the job: a report is never lost and never ignored.
+#[derive(Clone, Debug, Default)]
+pub struct Reports(Arc<Mutex<Vec<String>>>);
+
+impl Reports {
+    /// Adds a report.
+    pub(super) fn add(&self, text: String) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(text);
+    }
+
+    fn all(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
 /// A job object with a completion port.
 #[derive(Debug)]
 pub struct Job {
     handle: Handle,
     port: Handle,
     state: State,
+    reports: Reports,
 }
 
 impl Job {
@@ -143,6 +180,7 @@ impl Job {
             handle,
             port,
             state: State::Fresh,
+            reports: Reports::default(),
         };
         let read = job.read_back()?;
         if read.flags != LIMIT_FLAGS
@@ -155,6 +193,18 @@ impl Job {
             ));
         }
         Ok(job)
+    }
+
+    /// Where the job's children report an end that was not proved.
+    pub(super) fn reports(&self) -> Reports {
+        self.reports.clone()
+    }
+
+    /// What the job's children and its own end reported as not shown to have ended. An owner that
+    /// closes a job without ending it reads this before it treats the children as gone.
+    #[must_use]
+    pub fn unproved_reasons(&self) -> Vec<String> {
+        self.reports.all()
     }
 
     /// The raw handle, still owned by the job.
@@ -290,6 +340,7 @@ impl Job {
             handle: copy(&self.handle, JOB_OBJECT_QUERY)?,
             port: copy(&self.port, 0x0010_0000)?,
             state: self.state,
+            reports: self.reports.clone(),
         })
     }
 
@@ -313,12 +364,16 @@ impl Job {
     /// The completion port wakes the wait; the answer is the job's own active count and the
     /// retained process objects, read after each wake-up. A message that never comes changes
     /// nothing but how soon the next read happens.
+    ///
+    /// A job that is not seen empty at the bound is reported with the reason, beside what its
+    /// children reported, and its end is not proved. A refused call to end the job does not by
+    /// itself keep the end from being proved: the observation decides, and the refusal is in the
+    /// report when the observation fails.
     pub fn end(&mut self, retained: &[&Child], bound: Duration) -> Ended {
         self.state = State::Ended;
         // SAFETY: the handle is open.
-        unsafe {
-            TerminateJobObject(self.handle.raw(), 1);
-        }
+        let terminated = unsafe { TerminateJobObject(self.handle.raw(), 1) } != 0;
+        let terminate_error = (!terminated).then(|| last("ending the job"));
         let deadline = Instant::now() + bound;
         loop {
             let all_exited = retained.iter().all(|child| {
@@ -328,6 +383,16 @@ impl Job {
             let active_zero = self.active_processes().is_ok_and(|count| count == 0);
             let remaining = deadline.saturating_duration_since(Instant::now());
             if (all_exited && active_zero) || remaining.is_zero() {
+                if !(all_exited && active_zero) {
+                    let call = terminate_error.map_or_else(
+                        || "the call to end the job succeeded".to_owned(),
+                        |error| error.to_string(),
+                    );
+                    self.reports.add(format!(
+                        "the job was not seen empty within the bound (exited {all_exited}, \
+                         active count zero {active_zero}; {call})"
+                    ));
+                }
                 return Ended {
                     all_exited,
                     active_zero,

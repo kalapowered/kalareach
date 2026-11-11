@@ -25,11 +25,11 @@
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    FILETIME, GENERIC_READ, GENERIC_WRITE, GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
-    SetHandleInformation, WAIT_OBJECT_0,
+    ERROR_BROKEN_PIPE, FILETIME, GENERIC_READ, GENERIC_WRITE, GetHandleInformation, HANDLE,
+    HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::{
     DuplicateTokenEx, SECURITY_ATTRIBUTES, SecurityImpersonation, TOKEN_ASSIGN_PRIMARY,
@@ -38,7 +38,7 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
 };
-use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
 use windows_sys::Win32::System::SystemServices::MAXIMUM_ALLOWED;
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, DETACHED_PROCESS,
@@ -52,8 +52,8 @@ use windows_sys::Win32::System::Threading::{
 use crate::env::EnvBlock;
 
 use super::ffi::{self, Handle, last, wide, wide_path};
-use super::job::{Job, State};
-use super::sd::OwnedSd;
+use super::job::{Job, Reports, State};
+use super::sd::{OwnedSd, Principals, SdKind, descriptor};
 
 /// How a program that was started ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,9 +83,14 @@ pub enum LaunchError {
     /// The process was made but is not in the job. It was ended.
     #[error("the new process was not in its job and was ended")]
     NotInJob,
-    /// The permit to resume was made for another child. The child was ended.
+    /// The permit to resume was made for another child, or for another invocation. The child was
+    /// ended.
     #[error("the permit to resume is for another child, and the child was ended")]
     PermitForAnotherChild,
+    /// A child or a job could not be shown to have ended. Nothing may be released or removed on
+    /// the strength of this end.
+    #[error("the end is not proved: {0}")]
+    EndUncertain(String),
     /// Another call failed.
     #[error(transparent)]
     Platform(#[from] ffi::Error),
@@ -167,7 +172,8 @@ pub enum Std {
 pub struct InvocationId(pub [u8; 16]);
 
 /// Leave to resume one child, bound to the invocation it belongs to and to that child alone, by
-/// its process identifier and its creation time. A permit for another child is refused.
+/// its process identifier and its creation time. A permit for another invocation or another child
+/// is refused: each of the three is compared.
 ///
 /// The journal makes the permit of an invocation's child when its append of the child's process
 /// row has returned, so that a child cannot run before its row is durable. A program of the proof
@@ -207,6 +213,21 @@ impl ResumePermit {
         ResumePermit::for_invocation(invocation, child)
     }
 
+    /// A permit with each of the three facts given, for the cases that show each one is compared.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn with_identity(
+        invocation: Option<InvocationId>,
+        pid: u32,
+        creation_time: u64,
+    ) -> ResumePermit {
+        ResumePermit {
+            invocation,
+            pid,
+            creation_time,
+        }
+    }
+
     /// The invocation the permit belongs to, or none for a program of the proof.
     #[must_use]
     pub fn invocation(&self) -> Option<InvocationId> {
@@ -216,6 +237,9 @@ impl ResumePermit {
 
 /// What to start, and how.
 pub struct ChildSpec<'a> {
+    /// The invocation the child belongs to, or none for a program of the proof. Only a permit for
+    /// this invocation resumes the child.
+    pub invocation: Option<InvocationId>,
     /// The token the child runs under.
     pub token: TokenSpec<'a>,
     /// The job the child is made in.
@@ -259,6 +283,10 @@ pub struct SuspendedChild {
     pub in_job_checked: bool,
     /// Whether the child was made suspended.
     suspended: bool,
+    /// The invocation the child belongs to, or none for a program of the proof.
+    invocation: Option<InvocationId>,
+    /// Where the job's owner is told that this child could not be shown to have ended.
+    reports: Reports,
 }
 
 /// A child that has been resumed.
@@ -272,20 +300,60 @@ pub struct Child {
     pub creation_time: u64,
 }
 
+/// Hooks for the cases.
+#[cfg(feature = "testing")]
+pub mod testing {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static SKIP_NEXT_TERMINATION: AtomicBool = AtomicBool::new(false);
+
+    /// Makes the next dropped suspended child skip its call to end the process, as if the platform
+    /// had refused it: the child stays, and its drop must report that it was not seen to end.
+    pub fn skip_next_termination() {
+        SKIP_NEXT_TERMINATION.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn take_skip() -> bool {
+        SKIP_NEXT_TERMINATION.swap(false, Ordering::SeqCst)
+    }
+}
+
 /// How long a dropped suspended child is waited for.
-const END_WAIT_MS: u32 = 10_000;
+const END_WAIT_MS: u32 = 5_000;
 
 impl Drop for SuspendedChild {
     fn drop(&mut self) {
+        #[cfg(feature = "testing")]
+        let skipped = testing::take_skip();
+        #[cfg(not(feature = "testing"))]
+        let skipped = false;
         // SAFETY: the process handle is open and the process is this value's own child.
-        unsafe {
-            TerminateProcess(self.process.raw(), 1);
-            WaitForSingleObject(self.process.raw(), END_WAIT_MS);
+        let terminated = !skipped && unsafe { TerminateProcess(self.process.raw(), 1) } != 0;
+        let terminate_error = (!terminated).then(|| last("ending a suspended child"));
+        // SAFETY: as above.
+        let waited = unsafe { WaitForSingleObject(self.process.raw(), END_WAIT_MS) };
+        if waited != WAIT_OBJECT_0 {
+            // The end is not proved, whatever the call said: the job's owner is told, and no
+            // release or removal may rest on this child's end.
+            let call = terminate_error.map_or_else(
+                || "the call succeeded".to_owned(),
+                |error| error.to_string(),
+            );
+            self.reports.add(format!(
+                "the suspended child (process {}) was not seen to end within {} ms ({call})",
+                self.pid, END_WAIT_MS
+            ));
         }
     }
 }
 
 impl SuspendedChild {
+    /// The invocation the child belongs to, or none for a program of the proof.
+    #[must_use]
+    pub fn invocation(&self) -> Option<InvocationId> {
+        self.invocation
+    }
+
     /// Lets the child run, with the permit that was made for this child.
     ///
     /// # Errors
@@ -293,7 +361,10 @@ impl SuspendedChild {
     /// Returns an error, and ends the child, when the permit is for another child, when the thread
     /// cannot be resumed, or when it was not suspended exactly once.
     pub fn resume(self, permit: ResumePermit) -> Result<Child, LaunchError> {
-        if permit.pid != self.pid || permit.creation_time != self.creation_time {
+        if permit.invocation != self.invocation
+            || permit.pid != self.pid
+            || permit.creation_time != self.creation_time
+        {
             // Dropping `self` ends the child.
             return Err(LaunchError::PermitForAnotherChild);
         }
@@ -349,11 +420,17 @@ impl Child {
     }
 
     /// Ends the child by force.
-    pub fn terminate(&self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error when the call fails: the child's end is then not proved until
+    /// it is observed.
+    pub fn terminate(&self) -> Result<(), ffi::Error> {
         // SAFETY: the process handle is open.
-        unsafe {
-            TerminateProcess(self.process.raw(), 1);
+        if unsafe { TerminateProcess(self.process.raw(), 1) } == 0 {
+            return Err(last("ending a child"));
         }
+        Ok(())
     }
 }
 
@@ -396,17 +473,16 @@ fn standard(std: Std, access: u32) -> Result<Handle, ffi::Error> {
 }
 
 /// An anonymous pipe: the end the broker reads, which no child can inherit, and the end a child
-/// writes, which it inherits.
+/// writes, which it inherits. Its descriptor is explicit: only the system may open the pipe
+/// object, and the child holds its end as an inherited handle.
 ///
 /// # Errors
 ///
 /// Returns the platform's error when the pipe cannot be made.
 pub fn pipe() -> Result<(Handle, OwnedPipeEnd), ffi::Error> {
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: null_mut(),
-        bInheritHandle: 1,
-    };
+    let descriptor = descriptor(SdKind::CapturePipe, &Principals::default())?;
+    let mut attributes = descriptor.attributes();
+    attributes.bInheritHandle = 1;
     let mut read: HANDLE = null_mut();
     let mut write: HANDLE = null_mut();
     // SAFETY: the out-parameters and the attributes are this function's own for the call.
@@ -643,6 +719,8 @@ pub fn launch(spec: ChildSpec<'_>) -> Result<SuspendedChild, LaunchError> {
         creation_time: 0,
         in_job_checked: false,
         suspended: true,
+        invocation: spec.invocation,
+        reports: spec.job.reports(),
     };
     // From here a failure drops `child`, which ends it.
     child.creation_time = time_of(&child.process)?;
@@ -657,27 +735,75 @@ pub fn launch(spec: ChildSpec<'_>) -> Result<SuspendedChild, LaunchError> {
 /// The most [`read_pipe`] keeps; the rest is read and dropped.
 const CAPTURE_LIMIT: usize = 8 << 20;
 
-/// Reads a pipe to its end, keeping up to a limit of what it holds. The end comes when every
-/// writer has closed its handle, which for a child's output means the child and everything it
-/// started has ended.
+/// How often [`read_pipe`] looks again at a pipe that holds nothing yet.
+const PIPE_POLL: Duration = Duration::from_millis(10);
+
+/// What [`read_pipe`] read.
+#[derive(Debug)]
+pub struct Piped {
+    /// What the pipe held, up to a limit.
+    pub bytes: Vec<u8>,
+    /// Whether the pipe reached its end: every writer had closed its handle. When it did not, a
+    /// process that is not shown to have ended still holds the child's output.
+    pub ended: bool,
+}
+
+/// Reads a pipe to its end or to a deadline, whichever comes first, keeping up to a limit of what
+/// it holds. The end comes when every writer has closed its handle, which for a child's output
+/// means the child and everything it started has ended. The reader looks at what the pipe holds
+/// before it reads, so no call waits on a writer that never closes.
 #[must_use]
-pub fn read_pipe(pipe: &Handle) -> Vec<u8> {
+pub fn read_pipe(pipe: &Handle, deadline: Instant) -> Piped {
     let mut kept = Vec::new();
     let mut chunk = vec![0_u8; 64 * 1024];
     loop {
+        let mut available = 0_u32;
+        // SAFETY: the pipe is open and only the available-bytes out-parameter is used.
+        let peeked = unsafe {
+            PeekNamedPipe(
+                pipe.raw(),
+                null_mut(),
+                0,
+                null_mut(),
+                &raw mut available,
+                null_mut(),
+            )
+        };
+        if peeked == 0 {
+            // A pipe with no writer left answers with a broken pipe: that is its end. Any other
+            // failure leaves the end unproved.
+            // SAFETY: reads the calling thread's last error.
+            let ended =
+                unsafe { windows_sys::Win32::Foundation::GetLastError() } == ERROR_BROKEN_PIPE;
+            return Piped { bytes: kept, ended };
+        }
+        if available == 0 {
+            if Instant::now() >= deadline {
+                return Piped {
+                    bytes: kept,
+                    ended: false,
+                };
+            }
+            std::thread::sleep(PIPE_POLL);
+            continue;
+        }
         let mut read = 0_u32;
-        // SAFETY: the pipe is open and the buffer is the length given.
+        let wanted = available.min(chunk.len() as u32);
+        // SAFETY: the pipe is open, `wanted` bytes are waiting and the buffer is at least that long.
         let ok = unsafe {
             ReadFile(
                 pipe.raw(),
                 chunk.as_mut_ptr().cast(),
-                chunk.len() as u32,
+                wanted,
                 &raw mut read,
                 null_mut(),
             )
         };
         if ok == 0 || read == 0 {
-            return kept;
+            // SAFETY: reads the calling thread's last error.
+            let ended = ok == 0
+                && unsafe { windows_sys::Win32::Foundation::GetLastError() } == ERROR_BROKEN_PIPE;
+            return Piped { bytes: kept, ended };
         }
         let room = CAPTURE_LIMIT.saturating_sub(kept.len());
         kept.extend_from_slice(&chunk[..(read as usize).min(room)]);

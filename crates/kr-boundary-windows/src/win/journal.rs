@@ -37,6 +37,9 @@ pub enum JournalError {
     /// The row may not come now.
     #[error("the row is out of order: {0}")]
     Order(#[from] OrderError),
+    /// The child belongs to another invocation than this journal's.
+    #[error("the child belongs to another invocation than this journal's")]
+    OtherChild,
     /// An earlier write failed, so no row is written until the file is taken up again.
     #[error("an earlier row could not be written, so the journal takes no more")]
     Closed,
@@ -200,11 +203,15 @@ impl Journal {
     ///
     /// # Errors
     ///
-    /// Returns an error when the row is not durable; no leave is made then.
+    /// Returns an error when the child belongs to another invocation, and nothing is written; and
+    /// an error when the row is not durable, and no leave is made.
     pub fn append_process_started(
         &mut self,
         child: &SuspendedChild,
     ) -> Result<ResumePermit, JournalError> {
+        if child.invocation() != Some(self.invocation) {
+            return Err(JournalError::OtherChild);
+        }
         self.append(&Row::ProcessStarted {
             pid: child.pid,
             creation_time: child.creation_time,
