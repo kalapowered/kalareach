@@ -468,7 +468,8 @@ lost() {
 # What the sections of identifier `$3` that file `$1` gained beyond byte `$2` say against the target
 # and the reference host: one "missed <heading>: <verdict>" line for each verdict that says the
 # target was not met, and one "short <heading>: <condition>" line for each condition the
-# measurement found missing. The whole of the gained text is read.
+# measurement found missing, and for each verdict that says a figure is not shown on this host,
+# which is no missed target. The whole of the gained text is read.
 verdicts() {
   tail -c +"$(($2 + 1))" "$1" | awk -v id="$3" '
     /^## / { heading = substr($0, 4); inside = (heading == id || index(heading, id " ") == 1); next }
@@ -476,7 +477,8 @@ verdicts() {
     { line = $0; sub(/^ +/, "", line) }
     line ~ /^verdict / {
       verdict = line; sub(/^verdict +/, "", verdict)
-      if (verdict ~ /not met|below the target|outside the target|not valid/) print "missed " heading ": " verdict
+      if (verdict ~ /not shown on this host/) print "short " heading ": " verdict
+      else if (verdict ~ /not met|below the target|outside the target|not valid/) print "missed " heading ": " verdict
     }
     line ~ /^condition missing / { sub(/^condition missing +/, "", line); print "short " heading ": " line }
     line ~ /^reference host +short: / { sub(/^reference host +short: +/, "", line); print "short " heading ": " line }'

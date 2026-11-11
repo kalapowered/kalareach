@@ -682,8 +682,9 @@ struct Idle {
     /// The sum of the processes' resident sizes, in kibibytes: a page that several processes map
     /// is counted for each of them.
     sum: u64,
-    /// What the group holds with each resident page counted once, in kibibytes, where this host can
-    /// read it (Linux). Where it is read it is the figure the memory bound is held to.
+    /// What the group holds, in kibibytes, where this host can read it (Linux): each resident page
+    /// counted once for the group, each page in swap, and what the reader's scan may have missed.
+    /// Where it is read it is the figure the memory bound is held to.
     combined: Option<u64>,
     /// Each condition of the reference host this host can be shown not to meet. The processor
     /// figure is a claim about a reference host, so it is asserted only while this is empty; the
@@ -707,6 +708,21 @@ impl Idle {
         self.combined.unwrap_or(self.sum)
     }
 
+    /// Where the sum stands in for what the group holds and is over the bound, the words that say
+    /// the figure is the sum, which counts a shared page once for each process, so that it shows no
+    /// miss of the requirement: Linux holds the bound to the figure that counts each page once.
+    fn memory_not_shown(&self) -> Option<String> {
+        (self.combined.is_none() && self.sum >= RESIDENT_BOUND_KIB).then(|| {
+            format!(
+                "not shown on this host: the sum of the resident sizes is {} KiB against \
+                 {RESIDENT_BOUND_KIB} KiB and counts a shared page once for each process, and \
+                 Linux holds the bound to what the group holds with each resident page counted \
+                 once",
+                self.sum
+            )
+        })
+    }
+
     /// The lines that say what the figures came to against the target, and what stood in the way
     /// of asserting it where something did.
     fn verdict(&self) -> Vec<String> {
@@ -716,19 +732,21 @@ impl Idle {
         if self.shortfalls.is_empty() {
             return vec![format!(
                 "  verdict           {}",
-                if processor && memory {
-                    "the target is met on this host"
-                } else {
-                    "the target is not met on this host"
+                match self.memory_not_shown() {
+                    Some(words) if processor => format!("resident memory is {words}"),
+                    _ if processor && memory => "the target is met on this host".to_owned(),
+                    _ => "the target is not met on this host".to_owned(),
                 }
             )];
         }
         let mut lines = vec![format!(
             "  verdict           processor use is {} the target, with a condition missing, so it is \
-             recorded and not asserted here; resident memory is {} the target, which is asserted \
-             on every host",
+             recorded and not asserted here; resident memory is {}",
             inside(processor),
-            inside(memory)
+            self.memory_not_shown().unwrap_or_else(|| format!(
+                "{} the target, which is asserted on every host",
+                inside(memory)
+            ))
         )];
         for shortfall in &self.shortfalls {
             lines.push(format!("  condition missing {shortfall}"));
@@ -758,7 +776,9 @@ impl Idle {
                 if self.combined.is_some() {
                     ", each resident page counted once for the group"
                 } else {
-                    ""
+                    ", as the sum of the resident sizes, which counts a shared page once for each \
+                     process (Linux holds the bound to what the group holds with each resident \
+                     page counted once)"
                 },
                 self.memory()
             ));
@@ -859,6 +879,70 @@ fn a_host_short_of_the_reference_host_still_fails_idle_memory_over_the_bound() {
             .is_err_and(|failure| failure.contains("resident memory")),
         "resident memory at the bound fails on a short host too: {:?}",
         idle.check()
+    );
+}
+
+/// KR-PERF-003: where the memory the group holds is not read (macOS), a sum over the bound fails with
+/// the words that say the figure is the sum, which counts a shared page once for each process, and
+/// that Linux holds the bound to the figure that counts each page once; the record's verdict says the
+/// figure is not shown on this host and uses none of the words that `scripts/bench-all.sh` counts as
+/// a missed target.
+#[test]
+fn a_sum_over_the_bound_where_the_group_is_not_read_says_it_is_the_sum_and_shows_no_missed_target()
+{
+    let counted_as_missed = [
+        "not met",
+        "below the target",
+        "outside the target",
+        "not valid",
+    ];
+    for reference in [
+        record::Conditions::supplied(4, 8 * 1024, Some(0.0)),
+        record::Conditions::supplied(3, 7 * 1024, None),
+    ] {
+        let over = Idle::new(0.0075, RESIDENT_BOUND_KIB + 1, None, &reference);
+
+        let failure = over.check().expect_err("a sum over the bound");
+        assert!(
+            failure.contains("sum of the resident sizes")
+                && failure.contains("once for each process")
+                && failure.contains("Linux holds the bound"),
+            "the failure says what the figure is: {failure}"
+        );
+        // The script reads the lines that begin with the word verdict.
+        let verdict = over
+            .verdict()
+            .iter()
+            .filter(|line| line.starts_with("  verdict "))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            verdict.contains("not shown on this host"),
+            "the verdict says the figure is not shown here: {verdict}"
+        );
+        for words in counted_as_missed {
+            assert!(
+                !verdict.contains(words),
+                "and does not read as a missed target (`{words}`): {verdict}"
+            );
+        }
+    }
+
+    // A processor figure over its bound on a host that meets the reference conditions is a miss,
+    // whatever the memory says.
+    let reference = record::Conditions::supplied(4, 8 * 1024, Some(0.0));
+    let missed = Idle::new(
+        OVER_THE_PROCESSOR_BOUND,
+        RESIDENT_BOUND_KIB + 1,
+        None,
+        &reference,
+    );
+    assert!(
+        missed
+            .verdict()
+            .join("\n")
+            .contains("the target is not met on this host")
     );
 }
 
