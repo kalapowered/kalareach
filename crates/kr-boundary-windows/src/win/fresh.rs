@@ -44,16 +44,49 @@ pub fn directory(
     kind: SdKind,
     principals: &Principals,
 ) -> io::Result<PathBuf> {
+    let path = under.join(random_name(prefix, ""));
+    directory_at(&path, kind, principals)?;
+    Ok(path)
+}
+
+/// Makes a directory at the path, with the descriptor of the kind in the call that makes it. Fails
+/// when anything is at the path.
+///
+/// # Errors
+///
+/// Returns the platform's error when the call fails.
+pub fn directory_at(path: &Path, kind: SdKind, principals: &Principals) -> io::Result<()> {
     let descriptor = descriptor_of(kind, principals)?;
     let attributes = descriptor.attributes();
-    let path = under.join(random_name(prefix, ""));
-    let wide = ffi::wide_path(&path);
+    let wide = ffi::wide_path(path);
     // SAFETY: the path is NUL-terminated and the attributes point at a descriptor that lives
     // through the call.
     if unsafe { CreateDirectoryW(wide.as_ptr(), &raw const attributes) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(path)
+    Ok(())
+}
+
+/// Makes the directory at the path and every directory above it that is not there, each with the
+/// descriptor of the kind in the call that makes it, and leaves what is there as it is. Returns
+/// whether the directory itself was made.
+///
+/// # Errors
+///
+/// Returns the platform's error when a call fails.
+pub fn directory_all(path: &Path, kind: SdKind, principals: &Principals) -> io::Result<bool> {
+    let mut missing = Vec::new();
+    for ancestor in path.ancestors() {
+        if ancestor.as_os_str().is_empty() || ancestor.exists() {
+            break;
+        }
+        missing.push(ancestor);
+    }
+    let made = !missing.is_empty();
+    for ancestor in missing.into_iter().rev() {
+        directory_at(ancestor, kind, principals)?;
+    }
+    Ok(made)
 }
 
 /// Opens a file at the path for writing, with the descriptor of the kind in the call that makes it.
@@ -64,7 +97,21 @@ pub fn directory(
 ///
 /// Returns the platform's error when the call fails.
 pub fn file_at(path: &Path, kind: SdKind, only_new: bool) -> io::Result<File> {
-    let descriptor = descriptor_of(kind, &Principals::default())?;
+    file_with(path, kind, &Principals::default(), only_new)
+}
+
+/// [`file_at`] with the identities the kind's descriptor needs.
+///
+/// # Errors
+///
+/// Returns the platform's error when the call fails.
+pub fn file_with(
+    path: &Path,
+    kind: SdKind,
+    principals: &Principals,
+    only_new: bool,
+) -> io::Result<File> {
+    let descriptor = descriptor_of(kind, principals)?;
     let attributes = descriptor.attributes();
     let wide = ffi::wide_path(path);
     // SAFETY: the path is NUL-terminated and the attributes point at a descriptor that lives

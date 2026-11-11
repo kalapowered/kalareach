@@ -277,11 +277,17 @@ fn create(path: &Path, only_new: bool) -> io::Result<File> {
 }
 
 /// Writes a file whole: to a sibling first, then over the name, so a reader sees the old record or
-/// the new one and never half of either.
+/// the new one and never half of either. The sibling has a name of its own that nothing could
+/// have made before (the file's stem, a random name and `.new`) and is made new, so that the
+/// record the broker reads by path is never one that was there before it was written.
 fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let staging = path.with_extension("new");
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let staging = path.with_file_name(format!("{stem}-{}.new", uuid::Uuid::new_v4().simple()));
     {
-        let mut file: File = create(&staging, false)?;
+        let mut file: File = create(&staging, true)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }

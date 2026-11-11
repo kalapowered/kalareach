@@ -167,6 +167,31 @@ fn removal_keeps_the_allow_all_rule_beside_an_administrators_rule() {
 }
 
 #[test]
+fn the_manifests_replacement_is_a_new_file_under_a_name_nothing_could_have_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("manifest.json");
+    // What an earlier or another program left under the old fixed name is not touched, not read
+    // and not renamed over the manifest.
+    let decoy = dir.path().join("manifest.new");
+    std::fs::write(&decoy, b"not a manifest").unwrap();
+    let mut manifest = Manifest::begin();
+    manifest.record(ObjectKind::Service, "KalaReachBoundary", None);
+    manifest.save(&path).unwrap();
+    manifest.save(&path).unwrap();
+    assert_eq!(std::fs::read(&decoy).unwrap(), b"not a manifest");
+    assert_eq!(Manifest::load(&path).unwrap(), manifest);
+    let names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        names.len(),
+        2,
+        "the replacement is gone once it is renamed over the manifest: {names:?}"
+    );
+}
+
+#[test]
 fn the_manifest_is_a_store_that_refuses_what_it_does_not_know() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("manifest.json");
