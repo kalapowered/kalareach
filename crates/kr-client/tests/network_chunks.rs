@@ -1506,12 +1506,14 @@ impl ControlTransport for Counted {
     }
 }
 
-/// A transport whose account can be signed out: it says why this device ended the connection once
-/// the flag is set, as the companion's bound transport does.
+/// A transport whose account can be signed out: once the flag is set it says why this device ended
+/// the connection, under the code the case chooses, and sends nothing more, as the companion's
+/// bound transport does.
 #[derive(Debug)]
 struct Ending {
     inner: Arc<dyn ControlTransport>,
     ended: Arc<AtomicBool>,
+    code: ErrorCode,
 }
 
 impl ControlTransport for Ending {
@@ -1527,9 +1529,12 @@ impl ControlTransport for Ending {
     fn ended_by_this_device(&self) -> Option<ProtocolError> {
         self.ended
             .load(Ordering::Acquire)
-            .then(|| ProtocolError::new(ErrorCode::LeaseLost, "the account signed out"))
+            .then(|| ProtocolError::new(self.code, "the account signed out"))
     }
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
+        if self.ended.load(Ordering::Acquire) {
+            return Box::pin(async { Err(ClientError::ConnectionEnded) });
+        }
         self.inner.send(frame)
     }
     fn claim_receiver(&self) -> kr_client::Result<()> {
@@ -1560,6 +1565,7 @@ async fn a_lane_stops_when_the_transport_says_this_device_ended_the_connection()
         Ok(Arc::new(Ending {
             inner: Arc::new(transport),
             ended: flag,
+            code: ErrorCode::LeaseLost,
         }) as Arc<dyn ControlTransport>)
     })
     .await;
@@ -1641,6 +1647,7 @@ async fn a_sign_out_during_the_wait_for_a_window_is_told_with_its_reason() {
         Ok(Arc::new(Ending {
             inner: Arc::new(transport),
             ended: flag,
+            code: ErrorCode::LeaseLost,
         }) as Arc<dyn ControlTransport>)
     })
     .await;
@@ -1670,6 +1677,60 @@ async fn a_sign_out_during_the_wait_for_a_window_is_told_with_its_reason() {
     let (second, ()) = within(async { tokio::join!(waiting, signing_out) }).await;
     let told = second.expect_err("the wait ends with the sign-out");
     assert_eq!(told.code(), ErrorCode::LeaseLost, "{told}");
+    session.close();
+    serving.abort();
+}
+
+/// A sign-out that ends the connection while the driver's lane waits for a window reaches the
+/// caller of `uploads::send` as its reason. The companion's sign-out reasons carry the code a host
+/// refuses an expired window with, so the driver must not read that code as a refused window: it
+/// would retry, read the status on the connection that has ended, and tell the caller the
+/// connection ended. Another upload's lane has the shared window refused first, so the driver's
+/// first lane waits for a window the host has not issued.
+#[tokio::test]
+async fn a_sign_out_that_reads_as_a_refused_window_reaches_the_caller_of_send_as_its_reason() {
+    let script = Script::new(true);
+    let ended = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&ended);
+    let (session, _host, _client, serving) = pair_over(Arc::clone(&script), move |transport| {
+        Ok(Arc::new(Ending {
+            inner: Arc::new(transport),
+            ended: flag,
+            code: ErrorCode::PermissionDenied,
+        }) as Arc<dyn ControlTransport>)
+    })
+    .await;
+    let shared = session.action_window().await.action_window_id;
+    *script.ended_window.lock().expect("the script") = Some(shared);
+    let route = ChunkRoute::network(&session, environment())
+        .await
+        .expect("a route");
+    let other = TransferId::new(Uuid::from_bytes([12; 16]));
+    let at = target();
+    let mut lane = within(route.open(other)).await.expect("a lane");
+    let refused = within(lane.send_chunk(&at, &some_chunk(other), TTL))
+        .await
+        .expect_err("the host refuses the shared window");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied);
+    drop(lane);
+
+    let mut upload = plan(THREE_CHUNKS);
+    let progress = unwatched();
+    let sending = uploads::send(&session, &route, &at, &mut upload, TTL, &progress);
+    let signing_out = async {
+        script
+            .until("the reservation", |seen| seen.begins == 1)
+            .await;
+        ended.store(true, Ordering::Release);
+        session.transport().revoke_streams();
+    };
+    let (sent, ()) = within(async { tokio::join!(sending, signing_out) }).await;
+    let told = sent.expect_err("the upload ends with the sign-out");
+    assert!(
+        matches!(told, ClientError::Host(_)),
+        "the caller is told the account's reason and not that the connection ended: {told}"
+    );
+    assert_eq!(told.code(), ErrorCode::PermissionDenied);
     session.close();
     serving.abort();
 }

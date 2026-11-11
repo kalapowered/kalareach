@@ -673,6 +673,10 @@ struct Unconditional {}
 /// * A chunk refused `PERMISSION_DENIED`, which is how a host refuses a window that has expired, goes
 ///   once more on a new lane, whose window the host has just issued, after the same status read. A
 ///   second such refusal in a row is the host's answer and ends the upload.
+/// * A connection this device ended, as a sign-out does, ends the send with the reason the
+///   transport recorded (`ControlTransport::ended_by_this_device`), whatever code the lane saw:
+///   the reason can carry `PERMISSION_DENIED`, which only a host's answer to a chunk means a window
+///   refused.
 /// * The plan records a reservation as asked for before `upload.begin` leaves
 ///   ([`Upload::reserving`]), and only a definite answer clears that: the host's result, or its
 ///   refusal. A reply that was lost, a refusal saying the outcome is unknown, a receipt with no
@@ -781,6 +785,14 @@ pub async fn send(
                 match send_chunk(&mut lane, route, target, &params, requested_ttl).await {
                     Ok(accepted) => plan.accept(Answer::Chunked(Box::new(accepted)))?,
                     Err(error) => {
+                        // A sign-out ends the connection for good, and its reason can carry the
+                        // code a host refuses an expired window with. This device's own ending is
+                        // asked first, so that the caller is told the reason, nothing is read on
+                        // the ended connection, and the refused-window retry below acts only on a
+                        // host's answer to a chunk.
+                        if let Some(reason) = session.transport().ended_by_this_device() {
+                            return Err(ClientError::Host(reason));
+                        }
                         let delay = if error.code()
                             == kr_protocol::error::ErrorCode::PermissionDenied
                             && new_window
