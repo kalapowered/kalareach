@@ -56,6 +56,8 @@ pub enum Error {
     TimedOut {
         /// What was run.
         what: &'static str,
+        /// Whether the deadline the caller gave set that end, and not the run's own bound.
+        by_the_deadline: bool,
     },
     /// A program of the proof could not be started through the launcher.
     #[error("{what} could not be started: {source}")]
@@ -276,6 +278,7 @@ fn wevtutil(
             "the deadline passed before the event log was asked".to_owned(),
         ));
     }
+    let bound = crate::window::bound(deadline, Instant::now() + QUERY_BOUND);
     let program = system_root().join("System32").join("wevtutil.exe");
     let name = program.display().to_string();
     let mut parts = vec![name.as_str()];
@@ -291,13 +294,16 @@ fn wevtutil(
             cwd: scratch,
             env,
         },
-        deadline.min(Instant::now() + QUERY_BOUND),
+        bound.by,
     )
     .map_err(launch_error)?;
     let text = String::from_utf8_lossy(&captured.stdout).into_owned();
     match captured.outcome {
         Outcome::Ran(0) => Ok(text),
-        Outcome::TimedOut => Err(Error::TimedOut { what }),
+        Outcome::TimedOut => Err(Error::TimedOut {
+            what,
+            by_the_deadline: bound.by_the_window,
+        }),
         other => Err(Error::Failed {
             what,
             status: format!("{other:?}"),

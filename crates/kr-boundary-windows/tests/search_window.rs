@@ -1,77 +1,75 @@
-//! When the proof's search for a refusal is over: a run cut by the window's own end ends the
-//! search, and a run that failed at something never does before the window's end.
+//! When the proof's search for a refusal is over: only a run that was cut at a deadline that the
+//! window's own end set ends the search. A run's own bound, and every failure of a run (it could
+//! not start, a pipe failed, it ended badly), is the proof's failure at any time, near the window's
+//! end or after it.
 
 use std::time::{Duration, Instant};
 
-use kr_boundary_windows::window::search_is_over;
-
-const RESERVE: Duration = Duration::from_secs(2);
+use kr_boundary_windows::window::{bound, search_is_over};
 
 #[test]
-fn a_run_cut_inside_the_reserve_before_the_end_ends_the_search() {
+fn a_run_given_the_windows_end_has_it_as_its_deadline_and_says_so() {
+    let end = Instant::now() + Duration::from_secs(60);
+    let own = end + Duration::from_secs(30);
+    let given = bound(end, own);
+    assert_eq!(given.by, end);
+    assert!(given.by_the_window);
+}
+
+#[test]
+fn a_run_given_its_own_bound_has_it_as_its_deadline_and_does_not_say_so() {
+    let end = Instant::now() + Duration::from_secs(60);
+    let own = end - Duration::from_millis(1);
+    let given = bound(end, own);
+    assert_eq!(given.by, own);
+    assert!(
+        !given.by_the_window,
+        "a bound 1 ms inside the window is the run's own"
+    );
+}
+
+#[test]
+fn a_bound_that_is_the_windows_end_to_the_instant_is_the_windows() {
+    let end = Instant::now() + Duration::from_secs(60);
+    assert!(bound(end, end).by_the_window);
+}
+
+#[test]
+fn a_run_cut_at_the_windows_end_ends_the_search() {
     let end = Instant::now() + Duration::from_secs(60);
     assert!(search_is_over(
         true,
-        end - Duration::from_millis(1500),
-        end,
-        RESERVE
+        bound(end, end + Duration::from_secs(30))
     ));
 }
 
 #[test]
-fn a_run_cut_earlier_than_the_reserve_before_the_end_does_not_end_the_search() {
+fn a_run_cut_at_its_own_bound_does_not_end_the_search_however_near_the_end_it_was() {
     let end = Instant::now() + Duration::from_secs(60);
-    assert!(!search_is_over(
-        true,
+    for before in [
+        Duration::from_millis(1),
+        Duration::from_millis(1_500),
+        Duration::from_secs(3),
+    ] {
+        assert!(
+            !search_is_over(true, bound(end, end - before)),
+            "a run cut {before:?} before the window's end by its own bound"
+        );
+    }
+}
+
+#[test]
+fn a_run_that_failed_otherwise_never_ends_the_search_whatever_bound_it_had() {
+    let end = Instant::now() + Duration::from_secs(60);
+    for own in [
         end - Duration::from_secs(3),
+        end - Duration::from_millis(1_500),
         end,
-        RESERVE
-    ));
-}
-
-#[test]
-fn the_reserve_itself_is_inside_and_a_moment_before_it_is_not() {
-    let end = Instant::now() + Duration::from_secs(60);
-    assert!(search_is_over(true, end - RESERVE, end, RESERVE));
-    assert!(!search_is_over(
-        true,
-        end - RESERVE - Duration::from_millis(1),
-        end,
-        RESERVE
-    ));
-}
-
-#[test]
-fn a_run_that_failed_otherwise_before_the_end_is_still_a_failure() {
-    let end = Instant::now() + Duration::from_secs(60);
-    assert!(!search_is_over(
-        false,
-        end - Duration::from_millis(1500),
-        end,
-        RESERVE
-    ));
-    assert!(!search_is_over(
-        false,
-        end - Duration::from_secs(3),
-        end,
-        RESERVE
-    ));
-}
-
-#[test]
-fn after_the_end_every_result_ends_the_search() {
-    let end = Instant::now() + Duration::from_secs(60);
-    assert!(search_is_over(false, end, end, RESERVE));
-    assert!(search_is_over(
-        false,
-        end + Duration::from_millis(1),
-        end,
-        RESERVE
-    ));
-    assert!(search_is_over(
-        true,
-        end + Duration::from_secs(5),
-        end,
-        RESERVE
-    ));
+        end + Duration::from_secs(30),
+    ] {
+        assert!(
+            !search_is_over(false, bound(end, own)),
+            "a failure to start, a pipe error or a bad exit is the proof's failure"
+        );
+    }
 }
