@@ -62,7 +62,8 @@ pub(super) enum DeviceWrite {
     Automation,
     /// The pairing and owner-confirmation mutations.
     Pairing,
-    /// The draft writes, performed by the transfer service under the device's own principal.
+    /// The draft writes and the upload writes other than the chunk, performed by the transfer
+    /// service under the device's own principal.
     Transfer,
     /// `upload.chunk`, performed by the transfer service under the device's own principal. It is
     /// served on an attachment-chunk stream and refused by name on the control stream.
@@ -100,12 +101,12 @@ impl DeviceWrite {
             Method::DevicePreviewKeyUpdate => Self::PreviewKey,
             Method::DevicePushRegister => Self::PushRegistration,
             Method::DeviceKeysComplete => Self::KeysComplete,
-            Method::DraftCreate | Method::DraftUpdate | Method::AgentDraftAddAttachment => {
-                Self::Transfer
-            }
-            Method::UploadBegin | Method::UploadFinish | Method::UploadCancel => {
-                Self::Refused(Unserved::Upload)
-            }
+            Method::DraftCreate
+            | Method::DraftUpdate
+            | Method::AgentDraftAddAttachment
+            | Method::UploadBegin
+            | Method::UploadFinish
+            | Method::UploadCancel => Self::Transfer,
             Method::UploadChunk => Self::Chunk,
             Method::TerminalPaletteSet => Self::Refused(Unserved::Palette),
             Method::InputWrite => Self::Refused(Unserved::RawInput),

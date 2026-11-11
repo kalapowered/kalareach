@@ -496,6 +496,21 @@ impl RemoteConnection {
         received_at: kr_transport::clock::ContinuousInstant,
         asked: &Asked,
     ) -> std::result::Result<AcceptedDeadline, ProtocolError> {
+        let authority = self.check_envelope_but_the_window(mutation, entry, asked)?;
+        self.accept_in_window(mutation, received_at, authority)
+    }
+
+    /// Every check of [`Self::check_envelope`] but the window's, and the time the authority the
+    /// request was decided under ends at, which bounds the deadline the window gives it.
+    ///
+    /// A repeat of a transfer action that an earlier connection began is owed what its claim says
+    /// whatever window it carries, so it is asked the window's question apart from the rest.
+    pub(super) fn check_envelope_but_the_window(
+        &self,
+        mutation: &MutationRequest,
+        entry: &'static MethodEntry,
+        asked: &Asked,
+    ) -> std::result::Result<Option<kr_transport::clock::ContinuousInstant>, ProtocolError> {
         mutation
             .target
             .validate()
@@ -590,30 +605,46 @@ impl RemoteConnection {
         // A draft write names its draft in its parameters, which an action target cannot carry:
         // the environment and the session a draft is made for have to be the ones the target
         // names, as at the local ingress, and the service compares the stored subject with the
-        // target once it has looked the draft up. The device a draft is labelled with is recorded
-        // as the service finds it, so it is this device or none: a device does not label what it
-        // makes as another's.
+        // target once it has looked the draft up. The device a draft or an upload is labelled with
+        // is recorded as the service finds it, so it is this device or none: a device does not
+        // label what it makes as another's.
         if crate::transfer::TransferModule::serves(entry.method) {
             crate::transfer::TransferModule::check_subject(entry.method, mutation)
                 .map_err(|error| error.to_protocol_error())?;
-            if entry.method == Method::DraftCreate {
-                let params = mutation
-                    .params
-                    .to_typed::<kr_protocol::transfer::DraftCreateParams>()
-                    .map_err(|error| {
-                        ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
-                    })?;
-                if params
-                    .device_id
-                    .0
-                    .is_some_and(|label| label != self.device.device_id)
-                {
-                    return Err(ProtocolError::new(
-                        ErrorCode::PermissionDenied,
-                        "a draft carries the identity of the device that makes it, and this \
-                         connection is another device's",
-                    ));
-                }
+            let invalid = |error: kr_cbor::CborError| {
+                ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
+            };
+            let label = match entry.method {
+                Method::DraftCreate => Some((
+                    "a draft",
+                    mutation
+                        .params
+                        .to_typed::<kr_protocol::transfer::DraftCreateParams>()
+                        .map_err(invalid)?
+                        .device_id
+                        .0,
+                )),
+                Method::UploadBegin => Some((
+                    "an upload",
+                    mutation
+                        .params
+                        .to_typed::<kr_protocol::transfer::UploadBeginParams>()
+                        .map_err(invalid)?
+                        .device_id
+                        .0,
+                )),
+                _ => None,
+            };
+            if let Some((made, Some(label))) = label
+                && label != self.device.device_id
+            {
+                return Err(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    format!(
+                        "{made} carries the identity of the device that makes it, and this \
+                         connection is another device's"
+                    ),
+                ));
             }
         }
         // The target and the parameters have to name the same subject. One that pointed at a
@@ -700,7 +731,17 @@ impl RemoteConnection {
         }
         // The authority the request was decided under bounds the deadline it is accepted with, on
         // both of each bound's clocks.
-        let authority = self.authority_until(asked)?;
+        self.authority_until(asked)
+    }
+
+    /// Accepts the window the mutation carries, which is this connection's own and live, and gives
+    /// the deadline it is admitted under.
+    pub(super) fn accept_in_window(
+        &self,
+        mutation: &MutationRequest,
+        received_at: kr_transport::clock::ContinuousInstant,
+        authority: Option<kr_transport::clock::ContinuousInstant>,
+    ) -> std::result::Result<AcceptedDeadline, ProtocolError> {
         self.windows
             .accept_at(
                 &mutation.action_window_id,

@@ -40,7 +40,7 @@ use kr_protocol::envelope::{
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
-use kr_protocol::ids::{ActorId, RequestId, SessionId};
+use kr_protocol::ids::{ActorId, RequestId, SessionId, TransferId};
 use kr_protocol::method::{Method, MethodGroup};
 use kr_protocol::scalars::TimestampMs;
 use kr_transfer::service::{Action, RetainedOutcome, Subject};
@@ -1055,6 +1055,26 @@ impl TransferModule {
         })
         .await
         .map_err(|_| unavailable("the sessions of earlier builds could not be noted".to_owned()))?
+    }
+
+    /// The session the upload `transfer_id` of `actor_id` is bound to, when it is bound to one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the service's unknown-transfer refusal when `actor_id` holds no such upload.
+    pub(crate) async fn stored_session(
+        &self,
+        actor_id: &ActorId,
+        transfer_id: TransferId,
+    ) -> Answer<Option<SessionId>> {
+        let service = Arc::clone(&self.service);
+        let actor = actor_id.clone();
+        blocking(move || {
+            Ok(service
+                .stored_subject(&actor, Subject::Transfer(transfer_id))?
+                .session_id)
+        })
+        .await
     }
 
     /// Serves one transfer read and returns the frame it answers with.
