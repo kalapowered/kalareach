@@ -35,6 +35,7 @@ use crate::policy::{self, Policy};
 
 use super::acl;
 use super::applocker::{self, Channel};
+use super::broker::PROOF_BOUND;
 use super::ffi::{self, Sid};
 use super::proof;
 use super::registry;
@@ -826,21 +827,22 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         .clone()
         .ok_or_else(|| Error::Failed("no Git installation is recorded".to_owned()))?;
     let log_env = proof::proof_environment(&git, &paths.staging).map_err(Error::Failed)?;
-    let before_start = applocker::newest_record(&paths.staging, &log_env)?;
-    let was_running = appid.status()?.running();
-    if !was_running {
-        appid.start()?;
-        appid.wait_for(false, Duration::from_secs(60))?;
+    let before_start = applocker::newest_record(&paths.staging, &log_env, within(QUERY_BOUND))?;
+    // The first event that is waited for is the one of a start that this installation made: a
+    // service that is already running is stopped and started, because an event of an earlier start
+    // of the service, in this boot or before, says nothing about what the current one has applied.
+    if appid.status()?.running() {
+        appid.stop()?;
+        appid.wait_for(true, Duration::from_secs(60))?;
     }
+    appid.start()?;
+    appid.wait_for(false, Duration::from_secs(60))?;
+    let first_deadline = within(FIRST_APPLIED_BOUND);
     inject("appid")?;
     say(messages::APPLICATION_CONTROL_STARTING);
     let waited = wait_for_applied(
-        if was_running {
-            Applied::ThisStart
-        } else {
-            Applied::After(before_start)
-        },
-        FIRST_APPLIED_BOUND,
+        before_start,
+        first_deadline,
         "the Application Identity service's first \"policy applied\" event",
         &paths.staging,
         &log_env,
@@ -859,13 +861,13 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     ] {
         run.record(ObjectKind::PolicyRule, id, None)?;
     }
-    let before_write = applocker::newest_record(&paths.staging, &log_env)?;
+    let before_write = applocker::newest_record(&paths.staging, &log_env, within(QUERY_BOUND))?;
     channel.set(&wanted.render())?;
     say("the policy is written");
     inject("policy")?;
     wait_for_applied(
-        Applied::After(before_write),
-        NEXT_APPLIED_BOUND,
+        before_write,
+        within(NEXT_APPLIED_BOUND),
         "the \"policy applied\" event after the policy was written",
         &paths.staging,
         &log_env,
@@ -881,14 +883,25 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         )));
     }
 
-    // The broker, and the proof through it.
+    // The broker, and the proof through it. The broker's proofs share one deadline that ends
+    // `PROOF_BOUND` after its start; an answer that comes after it, with a little time for the
+    // answer to travel, is not taken as a success.
+    let broker_started = Instant::now();
     broker_service.start()?;
     broker_service.wait_for(false, Duration::from_secs(60))?;
     say("the broker is running");
     inject("broker")?;
     let mut session = open_session()?;
+    let proof_deadline = broker_started + PROOF_BOUND + PROOF_ANSWER_SLACK;
     for class in [Class::Checkout, Class::Connect] {
-        match ask(&mut session, &Request::Prove { class })? {
+        let response = ask(&mut session, &Request::Prove { class })?;
+        if Instant::now() > proof_deadline {
+            return Err(Error::Failed(format!(
+                "the broker answered the proof for {class:?} after its deadline of {} seconds",
+                PROOF_BOUND.as_secs()
+            )));
+        }
+        match response {
             Response::Proof {
                 ready: true,
                 detail,
@@ -920,41 +933,47 @@ const FIRST_APPLIED_BOUND: Duration = Duration::from_secs(300);
 /// the policy within a second of the write in every run of the guest.
 const NEXT_APPLIED_BOUND: Duration = Duration::from_secs(60);
 
-/// What a "policy applied" event has to come after.
-enum Applied {
-    /// A record number in the application-control log: the log's newest before the step.
-    After(u64),
-    /// The start of Windows: the service was already running, so it applied its first policy
-    /// before this installation began, or has not yet since the machine started.
-    ThisStart,
+/// The most one query of the application-control log may take.
+const QUERY_BOUND: Duration = Duration::from_secs(60);
+/// How much later than its own deadline the broker's answer to a proof may arrive, for the time the
+/// answer takes to reach the installation.
+const PROOF_ANSWER_SLACK: Duration = Duration::from_secs(10);
+
+/// The time `bound` from now.
+fn within(bound: Duration) -> Instant {
+    Instant::now() + bound
 }
 
-/// Waits for the platform's "policy applied" event, and returns how long it took.
+/// Waits for the platform's "policy applied" event after a record number, and returns how long it
+/// took. Every query of the log stays within the deadline, and an event that was in hand only after
+/// the deadline is not taken as a success.
 fn wait_for_applied(
-    since: Applied,
-    bound: Duration,
+    after: u64,
+    deadline: Instant,
     what: &str,
     scratch: &Path,
     env: &crate::env::EnvBlock,
 ) -> Result<Duration, Error> {
     let begun = Instant::now();
+    let too_late = || {
+        Error::Failed(format!(
+            "Windows did not report {what} within {} seconds",
+            deadline.saturating_duration_since(begun).as_secs()
+        ))
+    };
     loop {
-        let seen = match since {
-            Applied::After(record) => applocker::policy_applied_after(record, scratch, env)?,
-            Applied::ThisStart => {
-                applocker::policy_applied_within(ffi::uptime_millis(), scratch, env)?
-            }
-        };
+        let seen = applocker::policy_applied_after(after, scratch, env, deadline)?;
+        if Instant::now() > deadline {
+            return Err(too_late());
+        }
         if seen {
             return Ok(begun.elapsed());
         }
-        if begun.elapsed() >= bound {
-            return Err(Error::Failed(format!(
-                "Windows did not report {what} within {} seconds",
-                bound.as_secs()
-            )));
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(too_late());
         }
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_secs(1).min(left));
     }
 }
 

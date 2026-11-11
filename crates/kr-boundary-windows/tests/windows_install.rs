@@ -15,6 +15,7 @@
 //! Each case ends with the computer as it found it, whether it passes or fails.
 
 #![cfg(windows)]
+#![allow(unsafe_code)]
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -407,6 +408,19 @@ fn installation_lays_down_and_removal_restores() {
     assert_eq!(prior.appid_start_type, before.appid_start);
     assert!(Policy::parse(&prior.policy_xml).unwrap().is_unconfigured());
 
+    // A proof whose deadline has passed fails and takes no success.
+    let manifest = Manifest::load(&paths.manifest).unwrap();
+    let stop = kr_boundary_windows::win::pipe::Stop::new().unwrap();
+    let late = kr_boundary_windows::win::proof::prove(
+        &manifest,
+        Class::Checkout,
+        &paths.staging,
+        std::time::Instant::now(),
+        &stop,
+    );
+    assert!(!late.ready, "{}", late.detail);
+    assert!(late.detail.contains("deadline"), "{}", late.detail);
+
     let (code, output) = setup(&["remove"], "yes\n", &[]);
     assert_eq!(code, 0, "the removal succeeds: {output}");
     assert_eq!(
@@ -619,23 +633,99 @@ fn entry_states_are_told_apart_and_a_repair_enrols_another_person() {
     assert_eq!(snapshot(), before);
 }
 
+/// How long the process has existed.
+fn process_age(pid: u32) -> std::time::Duration {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
+    use windows_sys::Win32::System::Threading::{GetProcessTimes, OpenProcess};
+    let ticks =
+        |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+    // SAFETY: opens a process for a limited query and reads its times; each result is checked.
+    unsafe {
+        let raw = OpenProcess(0x1000, 0, pid);
+        let process = ffi::Handle::new(raw, "the broker's process").unwrap();
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        assert_ne!(
+            GetProcessTimes(
+                process.raw(),
+                &raw mut created,
+                &raw mut exited,
+                &raw mut kernel,
+                &raw mut user
+            ),
+            0
+        );
+        let mut now = zero;
+        GetSystemTimeAsFileTime(&raw mut now);
+        std::time::Duration::from_nanos((ticks(now) - ticks(created)) * 100)
+    }
+}
+
+#[cfg(feature = "testing")]
+#[test]
+fn an_unlisted_program_that_runs_after_an_earlier_refusal_fails_the_proof() {
+    use kr_boundary_windows::win::launch::{LaunchError, REFUSED_BY_POLICY};
+    use kr_boundary_windows::win::proof::{Captured, testing};
+    let ran = || {
+        Ok(Captured {
+            outcome: Outcome::Ran(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        })
+    };
+    assert_eq!(
+        testing::judge(Err(LaunchError::NotStarted(REFUSED_BY_POLICY)), false),
+        Ok(true)
+    );
+    assert_eq!(
+        testing::judge(ran(), false),
+        Ok(false),
+        "a run before any refusal is the policy not yet binding"
+    );
+    let failed = testing::judge(ran(), true).unwrap_err();
+    assert!(failed.contains("after it was refused"), "{failed}");
+    assert!(
+        testing::judge(Err(LaunchError::NotStarted(1326)), false).is_err(),
+        "an error that is not the policy's refusal is no refusal"
+    );
+}
+
 /// Run by a startup task after the guest's Windows restarts with the boundary installed: the broker
-/// that the service manager started with Windows proves the boundary inside its bound.
+/// that the service manager started with Windows proves the boundary inside its bound, which is
+/// measured from the broker's own start.
 #[test]
 #[ignore = "runs after a restart of the guest with the boundary installed (see the file's header)"]
 fn after_a_restart_the_brokers_proof_passes_inside_its_bound() {
     let uptime = std::time::Duration::from_millis(ffi::uptime_millis());
     let mut session = install::open_session().expect("the broker started with Windows");
+    let broker = service::manager()
+        .unwrap()
+        .open(SERVICE)
+        .unwrap()
+        .unwrap()
+        .status()
+        .unwrap()
+        .pid;
     for class in [Class::Checkout, Class::Connect] {
         let begun = std::time::Instant::now();
         match install::ask(&mut session, &Request::Prove { class }).expect("the broker answers") {
             Response::Proof { ready, detail } => {
+                let age = process_age(broker);
                 eprintln!(
-                    "{class:?}: ready {ready} after {:.1} s, asked {:.0} s after the start of Windows: {detail}",
+                    "{class:?}: ready {ready} after {:.1} s, asked {:.0} s after the start of Windows, answered {:.0} s after the broker's start: {detail}",
                     begun.elapsed().as_secs_f32(),
-                    uptime.as_secs_f32()
+                    uptime.as_secs_f32(),
+                    age.as_secs_f32()
                 );
                 assert!(ready, "the proof passes: {detail}");
+                assert!(
+                    age <= kr_boundary_windows::win::broker::PROOF_BOUND,
+                    "the proof for {class:?} was answered {age:?} after the broker's start, past its deadline"
+                );
             }
             other => panic!("the broker answered a proof with {other:?}"),
         }
