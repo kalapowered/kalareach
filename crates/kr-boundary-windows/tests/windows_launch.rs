@@ -61,6 +61,7 @@ const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 const PROCESS_VM_READ: u32 = 0x0010;
 const THREAD_QUERY_LIMITED_INFORMATION: u32 = 0x0800;
 const SYSTEM_SID: &str = "S-1-5-18";
+const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
 const GUEST_GIT: &str = r"C:\Program Files\Git";
 
 fn bin() -> PathBuf {
@@ -1430,7 +1431,7 @@ fn the_capture_pipe_has_an_explicit_descriptor_that_only_the_system_can_open() {
     let fixture = Fixture::new();
     let (read, _write) = pipe().unwrap();
     let found = security_of(read.raw());
-    assert_eq!(found.owner, SYSTEM_SID);
+    assert_eq!(found.owner, ADMINISTRATORS_SID);
     assert!(found.protected, "the list takes nothing from a default");
     assert_eq!(
         found
@@ -1452,6 +1453,40 @@ fn the_capture_pipe_has_an_explicit_descriptor_that_only_the_system_can_open() {
         open_as(&fixture.token, std::process::id(), PROCESS_DUP_HANDLE),
         Err(5),
         "access is denied to the sibling's token when it asks for a handle out of this process"
+    );
+}
+
+/// The pipe is made, written through and read from by whoever calls: the system, and an elevated
+/// administrator whose token's default owner is the administrator's own account. Naming the system
+/// as owner failed the second with the platform's "invalid owner" error.
+#[test]
+#[ignore = "needs an elevated session in a disposable Windows guest (see the file's header)"]
+fn a_capture_pipe_is_made_and_carries_bytes_for_the_system_and_for_an_elevated_administrator() {
+    let (read, write) = pipe().expect("the pipe is made under this token");
+    let found = security_of(read.raw());
+    assert_eq!(
+        found.owner, ADMINISTRATORS_SID,
+        "the owner is named, not taken from the token"
+    );
+    let mut written = 0_u32;
+    // SAFETY: the write end is open and the buffer is the length given.
+    let ok = unsafe {
+        WriteFile(
+            write.raw(),
+            b"through".as_ptr().cast(),
+            7,
+            &raw mut written,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(ok, 0, "one write goes in");
+    assert_eq!(written, 7);
+    drop(write);
+    let held = read_pipe(&read, Instant::now() + Duration::from_secs(10));
+    assert_eq!(held.bytes, b"through", "the same bytes come out");
+    assert!(
+        held.ended,
+        "the end is the pipe's own once the writer closed"
     );
 }
 

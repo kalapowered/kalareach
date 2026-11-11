@@ -70,7 +70,9 @@ pub enum SdKind {
     /// One of the anonymous pipes that carry a child's standard output and error to the broker.
     /// Only the system may open the pipe object. The child is not given the object to open: it
     /// receives its end of the pipe as an inherited handle, which is not an access check, and no
-    /// account, the child's own included, can open the pipe by any other route.
+    /// account, the child's own included, can open the pipe by any other route. The Administrators
+    /// group owns it, so that it can be made by the system and by an elevated administrator alike: only
+    /// the system's own token may name the system as an owner.
     CapturePipe,
     /// The `%ProgramData%\KalaReach` folder that holds the installation's data directory: the
     /// Administrators group owns it, and only the system and the administrators may do anything
@@ -200,7 +202,7 @@ pub fn descriptor_text(kind: SdKind, principals: &Principals) -> Result<String> 
             None => format!("O:SYD:P(A;;{ALL_ACCESS};;;SY)"),
         }),
         SdKind::BootMarker => Ok("O:SYD:P(A;;KA;;;SY)(A;;KA;;;BA)".to_owned()),
-        SdKind::CapturePipe => Ok("O:SYD:P(A;;GA;;;SY)".to_owned()),
+        SdKind::CapturePipe => Ok("O:BAD:P(A;;GA;;;SY)".to_owned()),
         SdKind::DataParent => Ok("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)".to_owned()),
         SdKind::AdminDir => Ok(if principals.users_may_read {
             format!("O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;{READ_AND_ENTER};;;BU)")
