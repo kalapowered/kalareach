@@ -175,6 +175,11 @@ fn serve() -> Result<(), String> {
     report(SERVICE_RUNNING, 0, 0);
     let mut threads = Vec::new();
     while let Some(connection) = listener.accept().map_err(|error| error.to_string())? {
+        // A thread that could not give its privileges back is not trusted again: no request is
+        // taken until the service has been restarted.
+        if super::privilege::revert_failed() {
+            continue;
+        }
         if state.active.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
             continue;
         }
