@@ -122,31 +122,104 @@ fn a_macro_definition_is_refused_wherever_it_starts_a_line() {
 }
 
 #[test]
-fn the_scan_reads_a_line_as_git_could_and_more() {
-    // Any byte up to the space can end a piece, so none of these hides an attribute.
-    for separator in [
-        "\t", "\r", "\x0b", "\x0c", "\0", "\x01", "\x1f", "\x7f", "  ",
-    ] {
-        let line = format!("*.x{separator}filter=lfs\n");
-        assert_eq!(rule(&line), RULE_FILTER, "{separator:?}");
-        let line = format!("*.x text{separator}diff=foo\n");
-        assert_eq!(rule(&line), RULE_DIFF, "{separator:?}");
+fn a_pattern_ends_at_a_space_tab_carriage_return_or_line_feed_and_at_no_other_byte() {
+    // Each of the four blanks ends the pattern, so the attribute after it is an attribute.
+    for blank in [" ", "\t", "\r", "  ", " \t \r"] {
+        assert_eq!(
+            rule(&format!("*.x{blank}filter=lfs\n")),
+            RULE_FILTER,
+            "{blank:?}"
+        );
+        assert_eq!(
+            rule(&format!("*.x text{blank}diff=foo\n")),
+            RULE_DIFF,
+            "{blank:?}"
+        );
     }
-    // A quoted pattern is scanned as well, so a quote that Git would not close hides nothing.
-    assert_eq!(rule("\"a\\q filter=lfs\"\n"), RULE_FILTER);
-    assert_eq!(rule("\"a b\" filter=lfs\n"), RULE_FILTER);
-    // An attribute may follow the closing quotation mark with no space, and a quoted pattern that
-    // is spelled like an attribute is read as one: the scan refuses both.
-    assert_eq!(rule("\"x\"filter=lfs\n"), RULE_FILTER);
-    assert_eq!(rule("\"a b\"diff=foo\n"), RULE_DIFF);
-    assert_eq!(rule("\"filter=lfs\" text\n"), RULE_FILTER);
-    assert_eq!(rule("a\"filter=lfs\n"), RULE_FILTER);
-    assert_eq!(rule("\"a\" \"b\" diff=foo\n"), RULE_DIFF);
-    // Only a line feed ends a line, so a carriage return does not hide the next line's driver.
+    // No other byte does: the whole token is the pattern, and Git reads no attribute from it.
+    for byte in ["\x0b", "\x0c", "\0", "\x01", "\x1f", "\x7f", "\"", "\u{a0}"] {
+        allowed(&format!("*.x{byte}filter=lfs\n"));
+        allowed(&format!("*.x{byte}diff=foo\n"));
+    }
+    // Only a line feed ends a line, and a carriage return is a blank inside it.
     assert_eq!(rule("*.x text\rfilter=lfs\n"), RULE_FILTER);
     // Bytes that are not text do not stop the scan.
     let bytes = b"*.x \xff\xfe text\n*.y filter=lfs\n";
     assert_eq!(scan_attributes(bytes).unwrap_err().rule, RULE_FILTER);
+}
+
+#[test]
+fn a_pattern_of_bytes_that_are_no_blank_does_not_hide_the_attributes_after_it() {
+    // A file named DEL is valid on NTFS, Git for Windows writes it, and `check-attr` gives
+    // `filter: lfs` for it. A form feed is no blank either, and neither is a control byte.
+    assert_eq!(rule("\x7f filter=lfs\n"), RULE_FILTER);
+    assert_eq!(rule("\x0c filter=lfs\n"), RULE_FILTER);
+    assert_eq!(rule("\x01 \x1f filter=lfs\n"), RULE_FILTER);
+    assert_eq!(rule("\x7f diff=foo\n"), RULE_DIFF);
+    assert_eq!(rule("\x7f merge=ours\n"), RULE_MERGE);
+    // Only the four blanks are skipped before a pattern, so a form feed before `#` makes the
+    // line a pattern with attributes, not a comment.
+    assert_eq!(rule(" \t\r\x7f filter=lfs\n"), RULE_FILTER);
+    assert_eq!(rule("\x0c# filter=lfs\n"), RULE_FILTER);
+    allowed(" \t\r# filter=lfs\n");
+}
+
+#[test]
+fn an_attribute_value_is_everything_up_to_the_next_blank_quotes_included() {
+    // Git names the drivers `cpp"custom` and `union"custom`, which are no built-in names.
+    let both = b"*.txt diff=cpp\"custom merge=union\"custom\n";
+    assert_eq!(scan_attributes(both).unwrap_err().rule, RULE_DIFF);
+    assert_eq!(rule("*.txt merge=union\"custom\n"), RULE_MERGE);
+    assert_eq!(rule("*.txt diff=\"cpp\"\n"), RULE_DIFF);
+    assert_eq!(rule("*.txt merge=\"text\"\n"), RULE_MERGE);
+    assert_eq!(rule("*.txt filter=\"lfs\"\n"), RULE_FILTER);
+    // Any byte that is no blank is part of the value and makes the name a different one.
+    for byte in ["\x01", "\x0b", "\x0c", "\x7f", "\"", "\u{a0}", "\0"] {
+        assert_eq!(
+            rule(&format!("*.x diff=cpp{byte}\n")),
+            RULE_DIFF,
+            "{byte:?}"
+        );
+        assert_eq!(
+            rule(&format!("*.x merge=text{byte}\n")),
+            RULE_MERGE,
+            "{byte:?}"
+        );
+    }
+    // A blank ends the value, and the name before it is the built-in one.
+    for blank in [" ", "\t", "\r"] {
+        allowed(&format!("*.x diff=cpp{blank}text\n"));
+        allowed(&format!("*.x merge=text{blank}text\n"));
+    }
+}
+
+#[test]
+fn a_quoted_pattern_is_read_as_git_unquotes_it() {
+    // The attributes follow the closing quotation mark, with a blank or without one.
+    assert_eq!(rule("\"a b\" filter=lfs\n"), RULE_FILTER);
+    assert_eq!(rule("\"x\"filter=lfs\n"), RULE_FILTER);
+    assert_eq!(rule("\"a b\"diff=foo\n"), RULE_DIFF);
+    assert_eq!(rule("\"a\" \"b\" diff=foo\n"), RULE_DIFF);
+    // An escaped quotation mark and an octal escape do not end or change the pattern's reading.
+    assert_eq!(rule("\"a\\\"b\" filter=lfs\n"), RULE_FILTER);
+    assert_eq!(rule("\"\\141.x\" filter=lfs\n"), RULE_FILTER);
+    allowed("\"a\\\" filter=lfs\"\n");
+    // An escape Git does not know, or no closing quotation mark, fails the unquoting: the pattern
+    // is then the text up to the first blank, quotation marks and all.
+    assert_eq!(rule("\"a\\q\" filter=lfs\n"), RULE_FILTER);
+    assert_eq!(rule("\"a\\q filter=lfs\"\n"), RULE_FILTER);
+    assert_eq!(rule("\"a b filter=lfs\n"), RULE_FILTER);
+    assert_eq!(rule("\"\\400\" filter=lfs\n"), RULE_FILTER);
+    assert_eq!(rule("\"\\18\" filter=lfs\n"), RULE_FILTER);
+    // A quoted pattern is a pattern, whatever it is spelled like, and so is one that a quotation
+    // mark inside a token does not open.
+    allowed("\"filter=lfs\" text\n");
+    allowed("\"diff=foo\" text\n");
+    allowed("\"a b\" text\n");
+    allowed("a\"filter=lfs\n");
+    // A pattern that unquotes to the start of a macro definition is one.
+    assert_eq!(rule("\"[attr]x\" text\n"), RULE_MACRO);
+    assert_eq!(rule("\"\\133attr]x\" filter=lfs\n"), RULE_MACRO);
 }
 
 #[test]
