@@ -13,7 +13,8 @@
 //! directory without following a link, a file is known by the device and inode a rename keeps, and
 //! a copy about to replace a document keeps its permission bits, owners and protection. So every
 //! test of what applying or removing does, and of where a run can stop, is compiled for Unix only,
-//! and on Windows the one test of that refusal runs, with the helpers the others share unused.
+//! and on Windows the one test of that refusal runs, with the test of which directories a host
+//! names; the helpers the others share are unused.
 #![cfg_attr(windows, allow(dead_code, unused_imports))]
 
 use std::collections::BTreeMap;
@@ -2278,10 +2279,11 @@ fn a_package_file_that_is_not_what_the_recipe_names_is_refused() {
 }
 
 /// KR-REQ-11.42: on Windows the host changes no application's directory. Each reconciliation
-/// refuses before anything is written there, so the settings somebody keeps in it have every byte
-/// they had and no key of the recipe is added, and records why in the package's journal, where the
-/// doctor reads it as refused and not as a warning. Every reconciliation after the first replaces
-/// that journal with a copy compared with it, leaving nothing else beside it.
+/// refuses before anything is written there and records why in the package's journal, where the
+/// doctor reads it as refused and not as a warning. The settings somebody keeps in that directory
+/// have every byte they had, and no key of the recipe is added. Every reconciliation after the
+/// first replaces the journal with a copy compared with it, which says the same and leaves nothing
+/// else beside it.
 #[cfg(windows)]
 #[test]
 fn on_windows_a_recipe_is_refused_and_recorded_at_every_reconciliation() {
@@ -2296,6 +2298,8 @@ fn on_windows_a_recipe_is_refused_and_recorded_at_every_reconciliation() {
         "the settings the refusal has to leave alone are there"
     );
     let bridges = site.bridges();
+    let journals = site.root.join("state/native-bridges");
+    let mut first = None;
 
     for _ in 0..3 {
         let settled = bridges
@@ -2303,6 +2307,11 @@ fn on_windows_a_recipe_is_refused_and_recorded_at_every_reconciliation() {
             .expect("the refusal is recorded");
         assert!(refused(&settled).contains(why), "{settled:?}");
         assert_eq!(site.tree(), before, "nothing was written");
+        assert_eq!(
+            bridges.steps(),
+            [format!("save {}", journals.display())],
+            "the run saved its journal and took no other durable step"
+        );
         assert_eq!(
             std::fs::read(&settings).expect("their settings are still there"),
             SETTINGS.as_bytes(),
@@ -2316,16 +2325,26 @@ fn on_windows_a_recipe_is_refused_and_recorded_at_every_reconciliation() {
             reports[0].notes.iter().any(|note| note.contains(why)),
             "{reports:?}"
         );
+        assert!(
+            reports[0].files.is_empty(),
+            "nothing is in place: {reports:?}"
+        );
+        // It says the same at every reconciliation, and gathers no notes.
+        if let Some(first) = &first {
+            assert_eq!(&reports, first, "the report is the same each time");
+        } else {
+            first = Some(reports.clone());
+        }
         // The doctor reports it as refused, with nothing of it in place, and it is no warning.
         let check = kr_controller::catalogue::native_bridge::check(&reports);
         assert_eq!(check.status, kr_protocol::hostinfo::DoctorStatus::Ok);
         assert!(check.detail().contains("refused"), "{}", check.detail());
     }
-    let journals: Vec<_> = std::fs::read_dir(site.root.join("state/native-bridges"))
+    let entries: Vec<_> = std::fs::read_dir(&journals)
         .expect("the journals")
         .map(|entry| entry.expect("an entry").file_name())
         .collect();
-    assert_eq!(journals.len(), 1, "one journal and no copy: {journals:?}");
+    assert_eq!(entries.len(), 1, "one journal and no copy: {entries:?}");
 }
 
 // ---------------------------------------------------------------------------------------------

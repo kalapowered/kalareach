@@ -682,9 +682,10 @@ jobs:
       #     `catalogue::launch_probes`, `agent_tools`, `machine`, `registry` and `singleton`, and
       #     the `agent_tools`, `contact_skill`, `catalogue`, `voice_broker` (the sign-in cases),
       #     `archive`, `project`, `network_project`, `shell`, `privacy` and `descriptions` suites;
-      #   - the refusal of a native bridge recipe, `kr-controller`'s `native_bridge`: the one case it
-      #     compiles for Windows shows that no recipe is applied, the settings in an application's
-      #     directory keep their bytes and the refusal is recorded at every reconciliation;
+      #   - the refusal of a native bridge recipe, `kr-controller`'s `native_bridge`: of its cases
+      #     two are compiled for Windows, and one shows that no recipe is applied, the settings in
+      #     an application's directory keep their bytes and the refusal is recorded at every
+      #     reconciliation, while the other names the directories a host looks in;
       #   - the stores' open, and what they read, while the holder that is letting go of them still
       #     maps their index, across `kr-controller`, `kr-changeset`, `kr-delivery`, `kr-describe`
       #     and `kr-automation`;
@@ -1421,7 +1422,8 @@ jobs:
       # What a native bridge recipe does on this platform: nothing. Each reconciliation refuses
       # before anything is written in the application's directory, leaves the settings in it as
       # they were, and records the refusal in the package's journal where the doctor reads it. The
-      # rest of the suite applies and removes recipes and is compiled for Unix only.
+      # suite's one other case here names the directories a host looks in; the rest of it applies
+      # and removes recipes and is compiled for Unix only.
       - name: Test that a native bridge recipe is refused and the refusal recorded
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-controller --test native_bridge
