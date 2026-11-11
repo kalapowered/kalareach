@@ -19,7 +19,9 @@ use std::path::{Path, PathBuf};
 use kr_e2e_m1b::run::Run;
 use serde_json::{Value, json};
 
-use crate::account::{self, KeyScan, files_holding, files_holding_any, now_ms, record_key_scan};
+use crate::account::{
+    self, KeyScan, now_ms, record_key_scan, run_files_holding, run_files_holding_any,
+};
 use crate::build::Account;
 use crate::{confine, keys};
 
@@ -460,10 +462,10 @@ impl RunScan {
         let key = held
             .key
             .as_ref()
-            .map(|(name, value)| (name.clone(), files_holding(root, value.as_bytes())));
+            .map(|(name, value)| (name.clone(), run_files_holding(root, value.as_bytes())));
         let others = (!held.others.is_empty()).then(|| {
             let values: Vec<&[u8]> = held.others.iter().map(String::as_bytes).collect();
-            files_holding_any(root, &values)
+            run_files_holding_any(root, &values)
         });
         Self { key, others }
     }
@@ -543,11 +545,13 @@ struct Tree {
 
 /// Why a tree could not be looked at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Class {
+pub(crate) enum Class {
     /// The tree's own path is a symbolic link: the guard refuses it and follows nothing.
     LinkAtRoot,
-    /// An entry of the agent's record, or a directory on the way to it, is a symbolic link: the
-    /// reading of the record refuses it and reads nothing through it.
+    /// An entry of the agent's record, or a directory on the way to it, is a symbolic link, or a
+    /// file that has more than one name (a hard link, which is the same file under another name,
+    /// possibly one of the person's): the reading of the record refuses it and reads nothing
+    /// through it.
     Link,
     /// An entry of the agent's record is neither a file nor a directory, or a path that is not a
     /// plain run of names was asked for.
@@ -565,9 +569,9 @@ enum Class {
 /// A tree that could not be looked at: the class of the failure and how many entries had been looked
 /// at by then. It says no name, so that nothing under the person's own directory is said.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Unlooked {
-    class: Class,
-    seen: usize,
+pub(crate) struct Unlooked {
+    pub(crate) class: Class,
+    pub(crate) seen: usize,
 }
 
 impl std::fmt::Display for Unlooked {
@@ -577,8 +581,8 @@ impl std::fmt::Display for Unlooked {
             Class::LinkAtRoot => write!(formatter, "the directory is a symbolic link"),
             Class::Link => write!(
                 formatter,
-                "an entry is a symbolic link, which is refused and read through by nothing \
-                 (after {seen} entries)"
+                "an entry is a symbolic link or a file with more than one name, which is refused \
+                 and read through by nothing (after {seen} entries)"
             ),
             Class::NotAFile => write!(
                 formatter,
@@ -606,7 +610,7 @@ impl std::fmt::Display for Unlooked {
 }
 
 /// The deepest the walk goes: what lies below is not looked at, and that is a failure.
-const DEEPEST: usize = 64;
+pub(crate) const DEEPEST: usize = 64;
 
 /// The two moments of the walk at which a test changes the tree under it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -619,7 +623,7 @@ enum Moment {
 
 /// Opens `name` in `directory` as a directory and follows no link: a name that was made a link, or
 /// any other kind of entry, since it was looked at is refused.
-fn opened_directory(
+pub(crate) fn opened_directory(
     directory: &std::os::fd::OwnedFd,
     name: &std::ffi::CStr,
     looked: &rustix::fs::Stat,
@@ -643,7 +647,7 @@ fn opened_directory(
 }
 
 /// The class of a failed opening of a name that was a directory when it was looked at.
-fn opening_failed(error: rustix::io::Errno) -> Class {
+pub(crate) fn opening_failed(error: rustix::io::Errno) -> Class {
     match error {
         rustix::io::Errno::NOENT => Class::Vanished,
         // What `O_NOFOLLOW` and `O_DIRECTORY` say of a name that is now a link or another kind.
@@ -882,16 +886,27 @@ impl ProcessRow {
     }
 
     /// What is said of this process in a refusal: the path of its executable as the system gives
-    /// it, and nothing else, not the name its parent gave it.
-    fn said(&self) -> String {
-        self.executable
-            .clone()
-            .unwrap_or_else(|| "an executable the system does not name".to_owned())
+    /// it, and nothing else, not the name its parent gave it; where that path lies under
+    /// `agent_folder`, the person's own agent folder, only that it does, since the path would name
+    /// something under the folder; and where the system names no executable, that it does not.
+    fn said(&self, agent_folder: Option<&Path>) -> String {
+        match self.executable.as_deref() {
+            Some(path)
+                if agent_folder.is_some_and(|folder| Path::new(path).starts_with(folder)) =>
+            {
+                UNDER_THE_AGENT_FOLDER.to_owned()
+            }
+            Some(path) => path.to_owned(),
+            None => "an executable the system does not name".to_owned(),
+        }
     }
 }
 
+/// What a refusal says of a process whose executable lies under the person's own agent folder.
+const UNDER_THE_AGENT_FOLDER: &str = "an executable under the person's agent folder";
+
 /// The processes of `user` that are the agent called `agent` ([`ProcessRow::is_the_agent`]) and are
-/// not the run's, each as the refusal says it: a process is the run's when it or an ancestor of it
+/// not the run's, each as the refusal says it ([`ProcessRow::said`], with `agent_folder`): a process is the run's when it or an ancestor of it
 /// is one of `marked`, the processes whose command line names the run's directory. Nothing else of
 /// a process is said: no argument, no directory, no file it has open.
 fn outside_the_run(
@@ -899,6 +914,7 @@ fn outside_the_run(
     marked: &BTreeSet<u32>,
     user: u32,
     agent: &str,
+    agent_folder: Option<&Path>,
 ) -> Vec<String> {
     let parents: std::collections::BTreeMap<u32, u32> =
         rows.iter().map(|row| (row.pid, row.parent)).collect();
@@ -918,7 +934,7 @@ fn outside_the_run(
             }
             true
         })
-        .map(ProcessRow::said)
+        .map(|row| row.said(agent_folder))
         .collect()
 }
 
@@ -929,7 +945,8 @@ fn outside_the_run(
 /// directory. A process counts when the file name of that path or of the name its parent gave it
 /// (`argv[0]`) is the agent's ([`names_the_agent`]: `codex`, the release files `codex-<target>`, the
 /// desktop application's main process `Codex`, in any case). A process of the run's own, an agent
-/// it started among them, is not counted.
+/// it started among them, is not counted. Where a counted process runs a file under `agent_folder`,
+/// the person's own agent folder, the refusal says that and not the path.
 ///
 /// This is a help and not a proof. It does not find an agent that runs as another program (a
 /// Node script, a wrapper under another name that has no `codex` child), a process of another user,
@@ -941,7 +958,11 @@ fn outside_the_run(
 ///
 /// Returns why the listing is not known: a listing that cannot be read says nothing of which
 /// processes run, so it is never read as none.
-pub fn other_agent_processes(agent: &str, run_root: Option<&Path>) -> Result<Vec<String>, String> {
+pub fn other_agent_processes(
+    agent: &str,
+    run_root: Option<&Path>,
+    agent_folder: Option<&Path>,
+) -> Result<Vec<String>, String> {
     let mut ps = std::process::Command::new("/bin/ps");
     ps.args(["-A", "-ww", "-o", "pid=,ppid=,uid=,comm="])
         .env_clear()
@@ -987,7 +1008,7 @@ pub fn other_agent_processes(agent: &str, run_root: Option<&Path>) -> Result<Vec
             .collect(),
         None => BTreeSet::new(),
     };
-    Ok(outside_the_run(&rows, &marked, me, agent))
+    Ok(outside_the_run(&rows, &marked, me, agent, agent_folder))
 }
 
 /// What a driver says when processes of the user are the agent outside the run: the count and the
@@ -1224,6 +1245,11 @@ fn read_files(
                 read_files(&child, &path, depth + 1, seen, visit, between)?;
             }
             FileType::RegularFile => {
+                // A file with a second name is the same file under another name, whoever made
+                // it: refused before it is opened.
+                if looked.st_nlink != 1 {
+                    return Err(unlooked(Class::Link, seen));
+                }
                 between(Moment::Looked, name.to_bytes());
                 let handle = rustix::fs::openat(
                     directory,
@@ -1238,6 +1264,11 @@ fn read_files(
                     || (opened.st_dev, opened.st_ino) != (looked.st_dev, looked.st_ino)
                 {
                     return Err(unlooked(Class::Replaced, seen));
+                }
+                // A name added since the look is a second name too: counted again on the handle
+                // that will be read, after the identity check and before any read.
+                if opened.st_nlink != 1 {
+                    return Err(unlooked(Class::Link, seen));
                 }
                 let mut bytes = Vec::new();
                 std::fs::File::from(handle)
@@ -1319,15 +1350,17 @@ pub struct Recorded {
     pub by_uuid: u64,
     /// How many turn names, each for its file, are not UUIDs, and count once for each file.
     pub by_other_name: u64,
-    /// The forms of the names that are not UUIDs (a digit as `9`, a lower-case letter as `a`, an
-    /// upper-case one as `A`, anything else as it is, at most forty characters, at most five
-    /// forms), so that the record says what the names look like though the run's directory, and
-    /// with it the agent's record, is removed.
+    /// The forms of the names that are not UUIDs (an ASCII digit as `9`, a lower-case letter as
+    /// `a`, an upper-case one as `A`, a hyphen and an underscore as they are, any other character
+    /// as `?`; at most forty characters, at most five forms), so that the record says what the
+    /// names look like though the run's directory, and with it the agent's record, is removed.
     pub forms: Vec<String>,
 }
 
-/// The form of a turn name that is not a UUID: see [`Recorded::forms`]. No letter or digit of the
-/// name is kept.
+/// The form of a turn name that is not a UUID: see [`Recorded::forms`]. Every character becomes one
+/// of six marks: `9` for an ASCII digit, `a` for an ASCII lower-case letter, `A` for an ASCII
+/// upper-case one, `-`, `_`, and `?` for any other character, so that no character of the name,
+/// whatever script or symbol it is, survives.
 fn form_of(name: &str) -> String {
     name.chars()
         .take(40)
@@ -1335,7 +1368,9 @@ fn form_of(name: &str) -> String {
             '0'..='9' => '9',
             'a'..='z' => 'a',
             'A'..='Z' => 'A',
-            other => other,
+            '-' => '-',
+            '_' => '_',
+            _ => '?',
         })
         .collect()
 }
@@ -1916,7 +1951,7 @@ mod tests {
         ];
         let marked: BTreeSet<u32> = [10].into_iter().collect();
         assert_eq!(
-            outside_the_run(&rows, &marked, 501, "codex"),
+            outside_the_run(&rows, &marked, 501, "codex", None),
             vec![
                 "/opt/homebrew/lib/codex/bin/codex".to_owned(),
                 "/opt/homebrew/lib/codex/bin/codex-code-mode-host".to_owned(),
@@ -1932,9 +1967,33 @@ mod tests {
         );
         // Before a run exists nothing is the run's: the pinned file's process counts too.
         assert_eq!(
-            outside_the_run(&rows, &BTreeSet::new(), 501, "codex").len(),
+            outside_the_run(&rows, &BTreeSet::new(), 501, "codex", None).len(),
             9
         );
+        // A counted executable that lies under the person's agent folder is said to, never named;
+        // one beside it, or under a folder of a like name, is named as before.
+        let folder = Path::new("/Users/r/.codex");
+        let under = [
+            row(
+                70,
+                1,
+                501,
+                "codex",
+                Some("/Users/r/.codex/bin/secret-name/codex"),
+            ),
+            row(71, 1, 501, "codex", Some("/Users/r/.codex-other/codex")),
+            row(72, 1, 501, "codex", Some("/Users/r/bin/codex")),
+        ];
+        let said = outside_the_run(&under, &BTreeSet::new(), 501, "codex", Some(folder));
+        assert_eq!(
+            said,
+            vec![
+                "an executable under the person's agent folder".to_owned(),
+                "/Users/r/.codex-other/codex".to_owned(),
+                "/Users/r/bin/codex".to_owned(),
+            ]
+        );
+        assert!(!said.iter().any(|text| text.contains("secret-name")));
         let said = other_agents_refusal(&["/x/codex".to_owned(), "/x/codex".to_owned()], "now");
         assert!(
             said.starts_with("2 process(es)") && said.contains("(/x/codex)"),
@@ -1981,7 +2040,7 @@ mod tests {
         };
         let started = std::time::Instant::now();
         let seen = loop {
-            let seen = other_agent_processes("codex", None).expect("a listing");
+            let seen = other_agent_processes("codex", None, None).expect("a listing");
             if (here(&seen, "/codex") && here(&seen, "/other-file"))
                 || started.elapsed() > std::time::Duration::from_secs(20)
             {
@@ -2039,14 +2098,14 @@ mod tests {
         };
         let started = std::time::Instant::now();
         let seen = loop {
-            let seen = other_agent_processes("codex", None).expect("a listing");
+            let seen = other_agent_processes("codex", None, None).expect("a listing");
             if seen.iter().any(ours) || started.elapsed() > std::time::Duration::from_secs(20) {
                 break seen;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         };
         // Inside a run whose directory its command line names, it is the run's.
-        let inside = other_agent_processes("codex", Some(&directory)).expect("a listing");
+        let inside = other_agent_processes("codex", Some(&directory), None).expect("a listing");
         running.kill().expect("ended by its own handle");
         running.wait().expect("reaped");
         std::fs::remove_dir_all(&directory).expect("clean up");
@@ -2145,6 +2204,46 @@ mod tests {
                 .all(|content| !String::from_utf8_lossy(content).contains("0000aa")),
             "nothing was read through the link a file became"
         );
+        // A hard link: a second name for a file of the person's, which has the device and the
+        // inode of the file that is read; and a second name of the run's own file. Neither is read.
+        for target in [
+            elsewhere.join("outside-name.jsonl"),
+            run.join("agent-config/sessions/2026/11/own-name.jsonl"),
+        ] {
+            make();
+            std::fs::hard_link(&target, run.join("agent-config/sessions/2026/hard.jsonl"))
+                .expect("a hard link");
+            let mut read = Vec::new();
+            let why = read_record(&run, sessions, &mut |_, content| {
+                read.push(content.to_vec())
+            })
+            .expect_err("a file with a second name");
+            refused(why);
+            assert!(
+                read.iter()
+                    .all(|content| !String::from_utf8_lossy(content).contains("0000aa")),
+                "nothing was read through the second name"
+            );
+        }
+        // A name added between the look and the open is caught on the handle that would be read.
+        make();
+        let mut read = Vec::new();
+        let why = read_record_by(
+            &run,
+            sessions,
+            &mut |_, content| read.push(content.to_vec()),
+            &mut |moment, name| {
+                if moment == Moment::Looked && name == b"own-name.jsonl" {
+                    std::fs::hard_link(
+                        run.join("agent-config/sessions/2026/11/own-name.jsonl"),
+                        run.join("agent-config/sessions/2026/11/second-name.jsonl"),
+                    )
+                    .expect("a second name");
+                }
+            },
+        )
+        .expect_err("a name added after the look");
+        refused(why);
         // An entry that is neither a file nor a directory is refused without being opened.
         make();
         let made = std::process::Command::new("/usr/bin/mkfifo")
@@ -2161,6 +2260,24 @@ mod tests {
         );
         std::fs::remove_dir_all(&run).expect("clean up");
         std::fs::remove_dir_all(&elsewhere).expect("clean up");
+    }
+
+    #[test]
+    fn a_turn_name_form_is_made_of_six_fixed_marks_and_no_character_of_the_name_survives() {
+        assert_eq!(form_of("Ab-9_x"), "Aa-9_a");
+        // A path, an email, other scripts, other digits, punctuation, spaces and controls are all
+        // the one mark for any other character.
+        assert_eq!(form_of("/\u{79d8}\u{5bc6}/\u{6587}\u{4ef6}"), "??????");
+        assert_eq!(form_of("a.b@c.d"), "a?a?a?a");
+        assert_eq!(form_of("\u{663}\u{e4}\u{df} \t\u{0}"), "??????");
+        assert_eq!(form_of(&"x".repeat(100)).len(), 40);
+        // In the record: a name that is a path keeps nothing of it.
+        let root = scratch("forms");
+        let line = r#"{"type":"task_started","turn_id":"/\u79d8\u5bc6/file-1"}"#;
+        std::fs::write(root.join("a.jsonl"), format!("{line}\n")).expect("a record");
+        let found = turns_recorded(&account(), &root, Path::new("")).expect("a count");
+        assert_eq!(found.forms, vec!["????aaaa-9".to_owned()]);
+        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     #[test]
