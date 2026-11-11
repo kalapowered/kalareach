@@ -169,7 +169,10 @@ class VoiceCall private constructor(
                     }
 
                     override fun onWebRtcAudioRecordStop() {
-                        handler.post { control.recorder(false) }
+                        handler.post {
+                            control.recorder(false)
+                            DropHook.recorderStopped()
+                        }
                     }
                 },
             )

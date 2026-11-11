@@ -8,11 +8,13 @@ import java.util.concurrent.atomic.AtomicLong
  * time, and the recorder's thread stalls for that long before it hands the next buffer to the call,
  * so two buffers reach the call that far apart, as when a recorder loses audio.
  *
- * Only a debug build has it; a release build has a hook that does nothing.
+ * It also counts the times the call was told the recorder stopped. Only a debug build has it; a
+ * release build has a hook that does nothing.
  */
 object DropHook {
     private val pending = AtomicLong()
     private val done = AtomicInteger()
+    private val stops = AtomicInteger()
 
     /** Has the next buffer wait [milliseconds] before it is handed on. */
     fun arm(milliseconds: Long) {
@@ -21,6 +23,18 @@ object DropHook {
 
     /** How many stalls the recorder's thread has made. */
     fun stalls(): Int = done.get()
+
+    /**
+     * Notes that the call has been told the recorder stopped. The call's display says a muted
+     * microphone is muted whether or not the recorder is running, so this is the device run's only
+     * sign that the recorder stopped with the muted track.
+     */
+    fun recorderStopped() {
+        stops.incrementAndGet()
+    }
+
+    /** How many times the call has been told the recorder stopped. */
+    fun recorderStops(): Int = stops.get()
 
     /** Called on the recorder's thread before each buffer is handed on. */
     fun beforeBuffer() {

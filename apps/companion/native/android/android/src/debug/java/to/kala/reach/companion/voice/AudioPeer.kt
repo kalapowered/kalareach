@@ -251,6 +251,7 @@ internal class AudioPeer private constructor(context: Context, private val token
             .put("eventsOpen", events?.state() == DataChannel.State.OPEN)
             .put("eventsSent", eventsSent.get())
             .put("dropsDone", DropHook.stalls())
+            .put("recorderStops", DropHook.recorderStops())
             .put("errors", org.json.JSONArray(errors.toList()))
         val open = connection
         if (open != null) {

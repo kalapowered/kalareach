@@ -382,10 +382,11 @@ pub async fn bridge_check(
     };
 
     // A mute is carried out whatever the microphone was doing. What the gate shows of it depends on
-    // the device: a microphone that is capturing reads as muted, and one with no recorder running
-    // (a call whose connection never carries media) stays unavailable, which says more. So the
-    // check holds what must be true either way: the person's mute is held, the microphone is never
-    // shown as capturing afterwards, and the news and the state agree.
+    // the device: a microphone that is capturing reads as muted, and so does one whose recorder
+    // stopped with the muted track, while a phone with no recorder at all (a call whose connection
+    // never carries media) may stay unavailable. So the check holds what must be true either way:
+    // the person's mute is held, the microphone is never shown as capturing afterwards, and the
+    // news and the state agree.
     match platform.mute(&call, Mute::Microphone, true).await {
         Ok(()) => {
             let heard = hear(&mut permitted.events, AFTER_PERMIT, |_| false).await;

@@ -90,10 +90,16 @@ pub trait Driver: Send + Sync {
 
     /// Whether the recorder this driver plays is known to stop when the call's microphone track is
     /// turned off: the voice stack stops recording once nothing is being sent, which the Android
-    /// voice stack does. Where it is, the mute leg waits for native code to say the recorder stopped
-    /// before it unmutes, and fails when that never comes. A driver that stands in for native code
-    /// has no recorder to stop, and a platform whose recorder is not known to stop is not waited on.
+    /// voice stack does. Where it is, the mute leg waits for the call to be told the recorder
+    /// stopped before it unmutes, and fails when that never comes. A driver that stands in for
+    /// native code has no recorder to stop, and a platform whose recorder is not known to stop is
+    /// not waited on.
     fn recorder_stops_with_the_mute(&self) -> bool;
+
+    /// How many times the call has been told the recorder stopped, where
+    /// [`Driver::recorder_stops_with_the_mute`] holds. The display says a muted microphone is muted
+    /// whether or not the recorder runs, so this is the leg's sign that it stopped.
+    fn recorder_stops(&self) -> DriverFuture<'_, u64>;
 }
 
 /// What a [`Driver`] step comes to.
@@ -320,6 +326,14 @@ impl Driver for PeerDriver {
     fn recorder_stops_with_the_mute(&self) -> bool {
         cfg!(target_os = "android")
     }
+
+    fn recorder_stops(&self) -> DriverFuture<'_, u64> {
+        Box::pin(async move {
+            self.figures().await?["recorderStops"]
+                .as_u64()
+                .ok_or_else(|| "the peer reports no recorder stops".to_owned())
+        })
+    }
 }
 
 /// The provider's fragment of what the caller said.
@@ -478,8 +492,18 @@ impl<R: Runtime> Play<'_, R> {
     }
 
     /// Waits until native code holds the person's mute and capture no longer shows as capturing. What
-    /// capture reads then is the display's own word (muted by the person, or unavailable where the
+    /// capture reads then is the display's own word (muted by the person, whether or not the
     /// recorder stopped with the mute); the mute is read as a fact of its own. Returns the word.
+    /// Waits until the call has been told the recorder stopped more times than `before`.
+    async fn recorder_has_stopped_since(&self, before: u64) -> bool {
+        let driver = self.driver;
+        until(SIGN_WITHIN, || async move {
+            (driver.recorder_stops().await.ok()? > before).then_some(())
+        })
+        .await
+        .is_some()
+    }
+
     async fn mute_is_held(&self) -> Option<String> {
         let (app, platform) = (self.app, self.platform);
         until(SIGN_WITHIN, || async move {
@@ -851,17 +875,26 @@ async fn mute<R: Runtime>(play: &Play<'_, R>, checks: &mut Checks<'_>) -> Result
     // One command in two parts, announced before either: "what is", the mute, "the status".
     play.driver.announce("d-2", 12_000 + 200 * 4 - 200).await?;
     play.speak(12_000, "what is").await?;
+    let waits = play.driver.recorder_stops_with_the_mute();
+    let stops_before = if waits {
+        play.driver.recorder_stops().await.ok()
+    } else {
+        None
+    };
     let muted =
         commands::voice_set_muted(play.app.state(), commands::VoiceMute::Microphone, true).await;
     play.driver.after_a_mute(true).await?;
     let shown = play.mute_is_held().await;
-    // Where the recorder is known to stop with the muted track, native code says so once it has seen
-    // it stop, and the unmute is made after that: a track that waited for the recorder would never be
-    // turned on again, which a person who stays muted for a while meets and one who unmutes at once
-    // does not. The check fails where that is never said, and says "not waited on" where the recorder
-    // is not known to stop.
-    let waits = play.driver.recorder_stops_with_the_mute();
-    let seen = waits && play.capture_is("unavailable").await;
+    // Where the recorder is known to stop with the muted track, the call is told it stopped, and the
+    // unmute is made after that: a track that waited for the recorder would never be turned on again,
+    // which a person who stays muted for a while meets and one who unmutes at once does not. The
+    // display says the microphone is muted throughout, so the stop is read from the count of times
+    // the call was told. The check fails where that is never counted, and says "not waited on" where
+    // the recorder is not known to stop.
+    let seen = match stops_before {
+        Some(before) => play.recorder_has_stopped_since(before).await,
+        None => false,
+    };
     let stop = match (waits, seen) {
         (false, _) => "not waited on",
         (true, true) => "seen",
