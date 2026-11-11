@@ -34,7 +34,7 @@ import {
   statSync
 } from 'node:fs'
 import { dirname, extname, join, relative, resolve, sep } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { startedAs } from './entry-point.mjs'
 
 import { jniMangled, libraryClassNames, libraryNatives, nativeSymbols } from './android-native-names.mjs'
 
@@ -204,7 +204,15 @@ function contents(handle, member, archiveSize) {
   if (member.method === 0) bytes = raw
   else if (member.method === 8) {
     try {
-      bytes = inflateRawSync(raw)
+      const inflated = inflateRawSync(raw, { info: true })
+      bytes = inflated.buffer
+      // The stream ends where it ends: bytes after it, up to what the directory gives, are not part of
+      // the member that was read.
+      if (inflated.engine.bytesWritten !== member.compressedSize) {
+        throw new Error(
+          `the compressed stream used ${inflated.engine.bytesWritten} of the ${member.compressedSize} bytes its directory gives`
+        )
+      }
     } catch (failure) {
       // The decompressor's own message says nothing of which member it was reading.
       throw new Error(`${member.name}: ${failure.message}`, { cause: failure })
@@ -300,12 +308,21 @@ function reader(dex) {
   const protos = table('prototype', 0x48, 0x4c, 12)
   const methods = table('method', 0x58, 0x5c, 8)
   const classes = table('class', 0x60, 0x64, 32)
+  // The data section holds the string data, type lists, class data and code. An offset that lies in
+  // the file and outside it reads whatever else is there (the header's own zero fields, at 0x2c, read
+  // as four empty lists), so every offset into the data is checked against it.
+  const dataAt = u32(dex, 0x6c)
+  const dataEnd = dataAt + u32(dex, 0x68)
+  if (dataEnd > dex.length) throw new Error('a dex file whose data section is not within it')
+  const inData = (offset) => offset >= dataAt && offset < dataEnd
   const string = (index) => {
-    const [length, textAt] = leb128(dex, u32(dex, place(strings, index, 4)))
+    const stringAt = u32(dex, place(strings, index, 4))
+    if (!inData(stringAt)) throw new Error('a dex file with string data outside its data section')
+    const [length, textAt] = leb128(dex, stringAt)
     return modifiedUtf8(dex, textAt, length)
   }
   const descriptor = (typeIndex) => string(u32(dex, place(types, typeIndex, 4)))
-  return { strings, protos, methods, classes, string, descriptor }
+  return { strings, protos, methods, classes, string, descriptor, inData }
 }
 
 /** The text of a string's data at `at`, in UTF-16 units. */
@@ -387,12 +404,13 @@ const ACC_NATIVE = 0x100
  * lists the methods the code merely calls as well as the ones a class declares.
  */
 export function definedNatives(dex) {
-  const { protos, methods, classes, string, descriptor } = reader(dex)
+  const { protos, methods, classes, string, descriptor, inData } = reader(dex)
   /** The argument types of the method at `methodIndex`, from its prototype's type list. */
   const argumentsOf = (methodIndex) => {
     const proto = u16(dex, place(methods, methodIndex, 8) + 2)
     const listAt = u32(dex, place(protos, proto, 12) + 8)
     if (listAt === 0) return ''
+    if (!inData(listAt)) throw new Error('a dex file with a type list outside its data section')
     const count = u32(dex, listAt)
     if (listAt + 4 + count * 2 > dex.length) throw new Error('a dex file with a type list past its end')
     let types = ''
@@ -410,7 +428,7 @@ export function definedNatives(dex) {
     found.set(type.slice(1, -1).replaceAll('/', '.'), natives)
     const dataAt = u32(dex, classDef + 24)
     if (dataAt === 0) continue
-    if (dataAt >= dex.length) throw new Error('a dex file with class data past its end')
+    if (!inData(dataAt)) throw new Error('a dex file with class data outside its data section')
     // The counts of the four lists, then the fields, which are skipped, then the two lists of methods.
     let at = dataAt
     const sizes = []
@@ -432,12 +450,17 @@ export function definedNatives(dex) {
       for (let each = 0; each < size; each += 1) {
         const [step, afterIndex] = leb128(dex, at)
         const [flags, afterFlags] = leb128(dex, afterIndex)
-        const [, afterCode] = leb128(dex, afterFlags)
+        const [code, afterCode] = leb128(dex, afterFlags)
         at = afterCode
         methodIndex += step
+        // Every method is read as far as its own index and code offset, native or not: one whose
+        // index runs off the table, or whose code lies outside the data, is a class data item that has
+        // gone wrong, and what follows it would be read from the wrong place.
+        const entry = place(methods, methodIndex, 8)
+        if (code !== 0 && !inData(code)) throw new Error('a dex file with a code item outside its data section')
         if ((flags & ACC_NATIVE) !== 0) {
           natives.push({
-            name: string(u32(dex, place(methods, methodIndex, 8) + 4)),
+            name: string(u32(dex, entry + 4)),
             signature: jniMangled(argumentsOf(methodIndex))
           })
         }
@@ -1020,7 +1043,7 @@ function list(paths) {
   }
 }
 
-if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+if (startedAs(import.meta.url)) {
   const argv = process.argv.slice(2)
   const listing = argv.includes('--list')
   const paths = argv.filter((each) => each !== '--list')

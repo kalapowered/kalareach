@@ -165,7 +165,10 @@ export function dex({ defined = [], referenced = [], constants = [], methods = {
         .sort((a, b) => a.index - b.index)
         .flatMap((entry, place, all) => {
           const flags = 0x1 | (entry.method.static ? 0x8 : 0) | (entry.method.native ? 0x100 : 0)
-          return [uleb(entry.index - (place === 0 ? 0 : all[place - 1].index)), uleb(flags), uleb(0)]
+          // A method's code item is not written; its offset is 0 unless a case gives one (`'inside'` is
+          // a place in the data section).
+          const code = entry.method.code === 'inside' ? dataAt : (entry.method.code ?? 0)
+          return [uleb(entry.index - (place === 0 ? 0 : all[place - 1].index)), uleb(flags), uleb(code)]
         })
     const direct = own.filter((method) => method.static)
     const virtual = own.filter((method) => !method.static)
@@ -183,6 +186,9 @@ export function dex({ defined = [], referenced = [], constants = [], methods = {
     data.push(item)
     at += item.length
   })
+  // The data section, which every offset of the string data, type lists, class data and code lies in.
+  header.writeUInt32LE(at - dataAt, 0x68)
+  header.writeUInt32LE(dataAt, 0x6c)
   return Buffer.concat([header, stringIds, typeIds, protoIds, methodIds, classDefs, ...data])
 }
 
@@ -201,7 +207,8 @@ export function dex({ defined = [], referenced = [], constants = [], methods = {
  * The rest make the tables wrong in one way each: `entsize` is the entry size the symbol table's
  * header gives (its own, by default), `tail` bytes follow the last symbol and are counted in the
  * table's size, `nameBeyond` puts the first exported symbol's name past the end of the string table,
- * and `unterminated` cuts the NUL off the end of the string table's last name.
+ * `unterminated` cuts the NUL off the end of the string table's last name, and `emptySymbols` leaves
+ * the symbol table with no bytes at all, not even the reserved first entry.
  */
 export function elf({
   exports = [],
@@ -217,7 +224,8 @@ export function elf({
   entsize = null,
   tail = Buffer.alloc(0),
   nameBeyond = false,
-  unterminated = false
+  unterminated = false,
+  emptySymbols = false
 } = {}) {
   const sectionNames = ['', '.dynstr', '.dynsym', '.shstrtab']
   const text = (names) => {
@@ -245,7 +253,9 @@ export function elf({
     ...hidden.map((name) => [name, 1, 0x12, 2]),
     ...weak.map((name) => [name, 1, 0x22, 0])
   ]
-  const dynsym = Buffer.concat([Buffer.alloc((1 + symbols.length) * symbolSize), tail])
+  const dynsym = emptySymbols
+    ? Buffer.alloc(0)
+    : Buffer.concat([Buffer.alloc((1 + symbols.length) * symbolSize), tail])
   symbols.forEach(([name, section, info, other], index) => {
     const at = (index + 1) * symbolSize
     const beyond = nameBeyond && name === exports[0]

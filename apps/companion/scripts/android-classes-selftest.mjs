@@ -23,6 +23,7 @@ import { Buffer } from 'node:buffer'
 import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
+import { deflateRawSync } from 'node:zlib'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 import { dex, elf, zip } from './archive-fixtures.mjs'
@@ -886,6 +887,12 @@ refusedLibrary(
   mediaLibrary({ wide: false }).subarray(0, 50),
   'an ELF library cut short within its header'
 )
+refusedLibrary(
+  'a symbol table with no bytes, not even its reserved first entry, is refused, not read as no symbols',
+  'libraries-empty-symbols.apk',
+  elf({ emptySymbols: true }),
+  'an ELF library whose dynamic symbol table is smaller than its reserved first entry'
+)
 expectNames(
   'a bundle holds each ABI to its own libraries',
   'libraries-two-abis.aab',
@@ -1101,6 +1108,17 @@ expectNames(
     String(readAs(nativeNames, path).startsWith(`${MEDIA}: `))
   )
 }
+{
+  // The stream ends where it ends, whatever the directory says: a directory that gives a byte more
+  // than the stream used describes a member other than the one that was read.
+  const used = deflateRawSync(mediaLibrary()).length
+  expectNames(
+    'a compressed member whose stream uses fewer bytes than its directory gives is refused',
+    'members-stream-short.apk',
+    [application(), { ...library(), deflate: true, claimCompressed: used + 1 }],
+    `refused: ${MEDIA}: the compressed stream used ${used} of the ${used + 1} bytes its directory gives`
+  )
+}
 expectNames(
   'a compressed member whose directory is right is read',
   'members-deflated.apk',
@@ -1146,7 +1164,7 @@ function classWithData(params = []) {
     'a class whose data lies past the end of the file is refused, not read as a class with no natives',
     definedNatives,
     (bytes, classDef) => bytes.writeUInt32LE(bytes.length + 10, classDef + 24),
-    'a dex file with class data past its end'
+    'a dex file with class data outside its data section'
   )
   refuses(
     'a number of more than five bytes is refused',
@@ -1200,9 +1218,9 @@ function classWithData(params = []) {
     'a dex file with an index past its table'
   )
   refuses(
-    'a prototype whose type list lies past the end of the file is refused',
+    'a prototype whose type list count lies past the end of the file is refused',
     definedNatives,
-    (bytes) => bytes.writeUInt32LE(bytes.length + 20, bytes.readUInt32LE(0x4c) + 8),
+    (bytes) => bytes.writeUInt32LE(bytes.length - 2, bytes.readUInt32LE(0x4c) + 8),
     'a dex file with an offset past its end'
   )
   refuses(
@@ -1212,6 +1230,54 @@ function classWithData(params = []) {
     'a dex file with a type list past its end',
     { params: ['I', 'I'] }
   )
+  // An offset that lies in the file and not in the data section reads whatever is there: the header's
+  // own zero fields at 0x2c read as four empty lists, a class with no natives.
+  refuses(
+    'class data that lies in the header and not in the data section is refused, not read as no natives',
+    definedNatives,
+    (bytes, classDef) => bytes.writeUInt32LE(0x2c, classDef + 24),
+    'a dex file with class data outside its data section'
+  )
+  refuses(
+    'a data section that is not within the file is refused',
+    definedNatives,
+    (bytes) => bytes.writeUInt32LE(0x7fffffff, 0x68),
+    'a dex file whose data section is not within it'
+  )
+  refuses(
+    'string data that lies outside the data section is refused',
+    definedStrings,
+    (bytes) => bytes.writeUInt32LE(0x2c, bytes.readUInt32LE(0x3c)),
+    'a dex file with string data outside its data section'
+  )
+  refuses(
+    'a type list that lies outside the data section is refused',
+    definedNatives,
+    (bytes) => bytes.writeUInt32LE(0x2c, bytes.readUInt32LE(0x4c) + 8),
+    'a dex file with a type list outside its data section',
+    { params: ['I', 'I'] }
+  )
+  // A method that is not native is read as far as its own offsets and index, so that a class data
+  // item that has gone wrong cannot end where it looks as if it did.
+  const plainMethod = (extra) => {
+    const bytes = Buffer.from(dex({ defined: [FACTORY], methods: { [FACTORY]: [{ name: 'create', ...extra }] } }))
+    return { bytes, data: bytes.readUInt32LE(bytes.readUInt32LE(0x64) + 24) }
+  }
+  {
+    const { bytes, data } = plainMethod({})
+    bytes[data + 4] = 0x7f
+    held(
+      'the method index of a method that is not native is checked against the method table',
+      'a dex file with an index past its table',
+      readAs(definedNatives, bytes)
+    )
+    held(
+      'a method with a code item outside the data section is refused',
+      'a dex file with a code item outside its data section',
+      readAs(definedNatives, plainMethod({ code: 5_000_000 }).bytes)
+    )
+    held('a method with a code item inside the data section is read', 'read', readAs(definedNatives, plainMethod({ code: 'inside' }).bytes))
+  }
   const plain = Buffer.from(dex({ defined: [FACTORY] }))
   const stringAtIndex = (bytes, index) => bytes.readUInt32LE(bytes.readUInt32LE(0x3c) + index * 4)
   const endless = Buffer.from(plain)
@@ -1425,6 +1491,32 @@ held(
     '2 true',
     `${started.status} ${started.stderr.includes('pnpm ios runs')}`
   )
+}
+
+// Every file that runs as a command takes the same path to its work whether it is started by its real
+// path or through a link (`/tmp` and `/var` are links on macOS): a start through a link that did
+// nothing and ended 0 would pass a store run that checked nothing. The inputs are ones each refuses.
+{
+  const link = join(work, 'entry-link')
+  symlinkSync(import.meta.dirname, link)
+  const missing = join(work, 'no-such-package')
+  for (const [file, args] of [
+    ['sign-ios.mjs', ['--no-such-mode']],
+    ['store-ios-sign.mjs', []],
+    ['android-classes.mjs', [`${missing}.apk`]],
+    ['identifiers.mjs', ['--no-such-mode']],
+    ['privacy-manifest.mjs', [`${missing}.app`]],
+    ['store-bundle.mjs', ['--no-such-mode']]
+  ]) {
+    const byReal = spawnSync(process.execPath, [join(import.meta.dirname, file), ...args], { encoding: 'utf8' })
+    const byLink = spawnSync(process.execPath, [join(link, file), ...args], { encoding: 'utf8' })
+    held(`${file} refuses this input when started by its real path`, 'true', String(byReal.status !== 0))
+    held(
+      `${file} started through a link answers as it does by its real path`,
+      `${byReal.status}|${byReal.stderr}`,
+      `${byLink.status}|${byLink.stderr}`
+    )
+  }
 }
 
 // -- the rule files the Rust build writes --------------------------------------------------------

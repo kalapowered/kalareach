@@ -147,6 +147,11 @@ function exportedSymbols(bytes) {
     if (symbols.size % symbolSize !== 0) {
       throw new Error('an ELF library whose dynamic symbol table does not divide into entries')
     }
+    // The first entry of a symbol table is reserved and holds no symbol, so a table of no bytes is no
+    // table: it would read as a library that exports nothing.
+    if (symbols.size < symbolSize) {
+      throw new Error('an ELF library whose dynamic symbol table is smaller than its reserved first entry')
+    }
     const stringsEnd = strings.offset + strings.size
     for (let at = symbols.offset; at < symbols.offset + symbols.size; at += symbolSize) {
       // Every symbol's name is a string inside the table, ended there, whether or not the symbol is
