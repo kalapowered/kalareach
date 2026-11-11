@@ -119,6 +119,17 @@ impl SessionRetention for RetainEverything {
     }
 }
 
+/// What a paired device is held to and shown when it reserves an upload.
+///
+/// The person at this machine passes none: they are held to no count of staged uploads and are
+/// told the environment's staged total.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceView {
+    /// How many uploads the device may keep staged ([`crate::store::Store::staged_uploads`] counts them). A
+    /// device at the limit is refused the next reservation until an upload ends.
+    pub staged_upload_limit: u64,
+}
+
 /// What one expiry sweep did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Sweep {
@@ -835,14 +846,19 @@ impl TransferService {
     ///
     /// Returns [`TransferError::WrongEnvironment`] for another environment,
     /// [`TransferError::InvalidArgument`] for a size or a declaration this service will not accept,
-    /// [`TransferError::QuotaExceeded`] when the environment's staged bytes would exceed their
-    /// limit, or [`TransferError::Concurrency`] when the caller already holds as many transfers as
-    /// it may.
+    /// limit, or when a device already keeps as many uploads as it may, or
+    /// [`TransferError::Concurrency`] when the caller already holds as many transfers as it may.
+    ///
+    /// `device` is what a paired device is held to and shown. The answer tells a device how many
+    /// bytes its own principal has staged and a refusal for the environment's bytes names the
+    /// environment's limit and nothing another principal holds; the person at this machine, who
+    /// passes none, is told the environment's total.
     pub fn upload_begin(
         &self,
         actor: &ActorId,
         params: &UploadBeginParams,
         action: Option<&Action>,
+        device: Option<DeviceView>,
     ) -> Result<UploadBeginResult> {
         self.check_environment(params.environment_id)?;
         let declared = params.declared_byte_len.get();
@@ -881,19 +897,49 @@ impl TransferService {
             drop(store);
             return self.refuse_unless_performed(action, refusal);
         }
+        if let Some(device) = device {
+            let kept = store.staged_uploads(actor)?;
+            if kept >= device.staged_upload_limit {
+                let refusal = TransferError::QuotaExceeded {
+                    detail: format!(
+                        "this device keeps {kept} of the {} uploads it may have staged: cancel an \
+                         upload that is still receiving, send the files that are waiting to a \
+                         session, or let an unused file expire, which it does after {} days",
+                        device.staged_upload_limit,
+                        UNUSED_ATTACHMENT_LIFETIME.get() / (24 * 60 * 60 * 1000)
+                    ),
+                };
+                drop(store);
+                return self.refuse_unless_performed(action, refusal);
+            }
+        }
         let staged = store.staged_byte_len()?;
         let after = staged.saturating_add(declared);
         if after > limits.max_staged_len {
-            let refusal = TransferError::QuotaExceeded {
-                detail: format!(
+            // A device is told the environment's limit and not what anyone else holds of it.
+            let detail = if device.is_some() {
+                format!(
+                    "this environment stages at most {} bytes in all, and the {declared} this \
+                     upload declares do not fit in what is left of that",
+                    limits.max_staged_len
+                )
+            } else {
+                format!(
                     "this environment has {staged} of {} staged bytes, and {declared} more would \
                      exceed it",
                     limits.max_staged_len
-                ),
+                )
             };
+            let refusal = TransferError::QuotaExceeded { detail };
             drop(store);
             return self.refuse_unless_performed(action, refusal);
         }
+        // What a device is shown is the bytes its own principal has staged, this reservation
+        // included, and not the environment's.
+        let shown = match device {
+            Some(_) => store.staged_byte_len_of(actor)?.saturating_add(declared),
+            None => after,
+        };
         // Everything above wrote nothing. A repeat of an action this service already performed is
         // answered from its record, which is no new effect, and anything else asks the host here,
         // under the lock, before the staging file is created: the file is the first write.
@@ -914,7 +960,7 @@ impl TransferService {
             layout,
             received_chunks: ChunkBitmap::empty(layout.chunk_count.get()).encode(),
             expires_at_ms,
-            staged_byte_len: U64::new(after),
+            staged_byte_len: U64::new(shown),
             staged_byte_limit: U64::new(limits.max_staged_len),
         };
         let retained = match action {

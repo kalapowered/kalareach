@@ -766,7 +766,8 @@ pub struct UploadBeginResult {
     pub received_chunks: Bytes,
     /// When the unfinished upload expires.
     pub expires_at_ms: TimestampMs,
-    /// Bytes now staged in this environment, this reservation included.
+    /// Bytes now staged, this reservation included: for a paired device, the bytes its own
+    /// principal has staged; for any other caller, the bytes staged in this environment.
     pub staged_byte_len: U64,
     /// The environment's staged-byte limit.
     pub staged_byte_limit: U64,

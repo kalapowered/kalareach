@@ -852,6 +852,7 @@ fn an_upload_binds_to_its_environment_and_session_and_never_aliases_another() {
                 original_file_name: "notes.bin".to_owned(),
             },
             None,
+            None,
         )
         .expect_err("refuses another environment");
     assert_eq!(refusal.code(), ErrorCode::EnvironmentUnavailable);
@@ -1778,6 +1779,7 @@ fn a_restart_mid_publish_resolves_by_identifier_without_losing_the_completed_fil
                     declared_media_type: "application/octet-stream".to_owned(),
                     original_file_name: "notes.bin".to_owned(),
                 },
+                None,
                 None,
             )
             .expect("reserves the upload");
@@ -3154,6 +3156,7 @@ fn a_sweep_during_an_unresolved_publication_leaves_no_charged_bytes() {
                     original_file_name: "notes.bin".to_owned(),
                 },
                 None,
+                None,
             )
             .expect("reserves the upload");
         transfer_id = begun.transfer_id;
@@ -3257,6 +3260,7 @@ fn a_cancellation_during_a_publication_releases_the_payload_and_the_bytes() {
                     declared_media_type: "application/octet-stream".to_owned(),
                     original_file_name: "notes.bin".to_owned(),
                 },
+                None,
                 None,
             )
             .expect("reserves the upload");

@@ -3164,6 +3164,7 @@ pub(super) fn a_published_attachment_for(
                 original_file_name: name.to_owned(),
             },
             None,
+            None,
         )
         .expect("reserves the upload");
     service

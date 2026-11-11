@@ -7,9 +7,11 @@
 
 use std::sync::Arc;
 
-use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Request, Response};
+use kr_protocol::envelope::{
+    ActionTarget, ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
+};
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{ActorId, RequestId, TransferId};
+use kr_protocol::ids::{ActorId, RequestId, SessionEpoch, SessionId, TransferId};
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Bytes, Digest256, Nullable, U64};
@@ -17,7 +19,7 @@ use kr_protocol::transfer::{
     ChunkDescriptor, UploadBeginParams, UploadChunkParams, UploadStatusParams, UploadStatusResult,
 };
 
-use super::a_copy_from_a_services_record::mutation_of;
+use super::a_copy_from_a_services_record::{mutation_of, written};
 use super::routes::DeviceRead;
 use super::write_boundary::paired_connection;
 use super::writes::DeviceWrite;
@@ -45,6 +47,7 @@ fn begun_for(world: &fake::Silent, actor: &ActorId, bytes: &[u8]) -> TransferId 
                 declared_media_type: "application/octet-stream".to_owned(),
                 original_file_name: "notes.bin".to_owned(),
             },
+            None,
             None,
         )
         .expect("the upload begins")
@@ -142,8 +145,12 @@ async fn a_chunk_another_attempt_recorded_is_not_given_back_while_a_fence_is_owe
         )
     };
 
-    attempt()
-        .await
+    let first = attempt().await;
+    assert!(
+        !first.is_copied(),
+        "the attempt that stages the chunk is not told as a copy of an answer it recorded itself"
+    );
+    first
         .into_answer()
         .expect("the first attempt stages the chunk");
     let late = attempt().await;
@@ -226,6 +233,134 @@ async fn an_upload_status_is_withheld_while_a_fence_is_owed_before_its_end_check
     assert_eq!(
         unknown.code, never.code,
         "another principal's upload is refused as an upload that never existed is"
+    );
+    world.serving.abort();
+}
+
+/// Serves `mutation` twice at once, the first copy stopped inside the transfer service once it has
+/// passed the door's check and before it takes the service's lock, and returns what each copy was
+/// answered with.
+async fn two_copies_stopped_in_the_service(
+    controller: &Arc<crate::service::Controller>,
+    connection: &super::RemoteConnection,
+    mutation: &MutationRequest,
+) -> (super::Answered, super::Answered) {
+    let (arrived, release) = controller.transfer().pause_after_the_outer_check();
+    let first = connection.answer_now(ControlFrame::Mutation(Box::new(mutation.clone())));
+    tokio::pin!(first);
+    let waiting = tokio::task::spawn_blocking(move || arrived.recv_timeout(WAIT_BOUND));
+    tokio::pin!(waiting);
+    tokio::select! {
+        arrived = &mut waiting => {
+            arrived
+                .expect("the waiting thread finishes")
+                .expect("the first copy reaches the service");
+        }
+        early = &mut first => panic!("the first copy was answered before the service: {early:?}"),
+    }
+    let (copied, fresh) = tokio::join!(first, async {
+        let fresh = connection
+            .answer_now(ControlFrame::Mutation(Box::new(mutation.clone())))
+            .await;
+        release.send(()).expect("the first copy goes on");
+        fresh
+    });
+    (
+        copied.expect("the first copy is answered"),
+        fresh.expect("the second copy is answered"),
+    )
+}
+
+/// KR-REQ-23.21 and KR-REQ-09.09: a reservation for a session that another copy of the action
+/// performed while this one was on its way to the service is told as the copy it is, and the copy
+/// that performed is a fresh answer: a device that may upload to the session and not view it is
+/// given its own first answer, and told the outcome is unknown for the copy, whose record it may not
+/// read. The control is a device that may view the session, which is given the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_begin_a_service_copied_after_the_door_looked_is_told_as_a_copy_and_the_first_is_not() {
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    let session = world.session_id;
+    let params = UploadBeginParams {
+        environment_id: world.environment_id,
+        session_id: Nullable::some(session),
+        device_id: Nullable::null(),
+        declared_byte_len: U64::ZERO,
+        declared_digest: Digest256::from_bytes(kr_cbor::sha256(&[])),
+        declared_media_type: "application/octet-stream".to_owned(),
+        original_file_name: "notes.bin".to_owned(),
+    };
+    let on_the_session = |connection: &super::RemoteConnection, request_id: u64| {
+        let mut mutation = mutation_of(
+            &world,
+            connection,
+            Method::UploadBegin,
+            request_id,
+            ParamsValue::from_typed(&params).expect("encodes"),
+        );
+        mutation.target = ActionTarget {
+            environment_id: world.environment_id,
+            session_id: Nullable::some(session),
+            session_epoch: Nullable::some(SessionEpoch::V1),
+            application_instance_id: Nullable::null(),
+            agent_binding_revision: Nullable::null(),
+        };
+        mutation
+    };
+
+    let (blind, recording) = paired_connection(controller, 42, &[ActionRight::FilesUpload]);
+    let mutation = on_the_session(&blind, 91);
+    let (copied, fresh) = two_copies_stopped_in_the_service(controller, &blind, &mutation).await;
+    assert!(
+        copied
+            .asked
+            .as_ref()
+            .is_some_and(super::decision::Asked::is_kept),
+        "the copy that read the record is held as a kept answer"
+    );
+    assert!(
+        fresh.asked.as_ref().is_some_and(|asked| !asked.is_kept()),
+        "the copy that performed is a fresh answer"
+    );
+    let told = written(&blind, &recording, copied).await;
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    assert!(
+        blind.write_answer(blind.output(), fresh).await,
+        "the connection stands"
+    );
+    assert!(
+        matches!(
+            recording.frames().last(),
+            Some(ControlFrame::Response(Response {
+                outcome: Outcome::Ok(_),
+                ..
+            }))
+        ),
+        "the device is given its own first answer: {:?}",
+        recording.frames()
+    );
+
+    let (sighted, recording) = paired_connection(
+        controller,
+        43,
+        &[ActionRight::FilesUpload, ActionRight::SessionView],
+    );
+    let mutation = on_the_session(&sighted, 92);
+    let (copied, _fresh) = two_copies_stopped_in_the_service(controller, &sighted, &mutation).await;
+    assert!(
+        sighted.write_answer(sighted.output(), copied).await,
+        "the connection stands"
+    );
+    assert!(
+        matches!(
+            recording.frames().last(),
+            Some(ControlFrame::Response(Response {
+                outcome: Outcome::Ok(_),
+                ..
+            }))
+        ),
+        "a device that may view the session is given the record: {:?}",
+        recording.frames()
     );
     world.serving.abort();
 }

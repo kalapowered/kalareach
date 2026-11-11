@@ -8,8 +8,8 @@ mod net_support;
 
 use std::time::Duration;
 
-use kr_crypto::keys::DeviceKeys;
 use kr_controller::service::net::devices::DeviceRecord;
+use kr_crypto::keys::DeviceKeys;
 use kr_protocol::envelope::{ControlFrame, MutationRequest, Outcome, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::{StreamHeader, StreamKind, StreamResource};
@@ -22,6 +22,7 @@ use kr_protocol::transfer::{
     UploadCancelResult, UploadChunkParams, UploadChunkResult, UploadFinishParams,
     UploadFinishResult, UploadState, UploadStatusParams, UploadStatusResult,
 };
+use kr_transfer::store::{Limits, UploadRow};
 use kr_transport::streams::DataStream;
 use net_support::{Device, Host, RawDevice, on_the_host};
 
@@ -198,13 +199,13 @@ fn chunk_frame(
 /// Sends every chunk of `bytes` as part of `transfer`, on a stream the device opens for it.
 async fn send_every_chunk(host: &Host, raw: &RawDevice, transfer: TransferId, bytes: &[u8]) {
     let mut stream = raw.open_stream(header(host, raw, transfer)).await;
-    for index in 0..ChunkLayout::for_length(bytes.len() as u64).chunk_count.get() {
-        ask(
-            &mut stream,
-            &chunk_frame(host, raw, transfer, bytes, index),
-        )
-        .await
-        .expect("the chunk is staged");
+    for index in 0..ChunkLayout::for_length(bytes.len() as u64)
+        .chunk_count
+        .get()
+    {
+        ask(&mut stream, &chunk_frame(host, raw, transfer, bytes, index))
+            .await
+            .expect("the chunk is staged");
     }
 }
 
@@ -319,7 +320,6 @@ fn composed<P: serde::Serialize>(
 }
 
 /// The transfer journal, opened beside the host's own handle on it.
-#[cfg(unix)]
 fn journal(host: &Host) -> kr_transfer::Store {
     kr_transfer::Store::open(
         kr_transfer::StagingArea::store_path(host.controller().paths()),
@@ -490,7 +490,14 @@ async fn a_lost_finish_answer_is_resolved_and_an_interrupted_finish_or_cancel_is
         Method::UploadFinish,
         &finish_of(claimed),
     );
-    leave_a_publication_unrecorded(&host, claimed, &bytes, "claimed.bin", &device.actor(), &finish);
+    leave_a_publication_unrecorded(
+        &host,
+        claimed,
+        &bytes,
+        "claimed.bin",
+        &device.actor(),
+        &finish,
+    );
     let settled: UploadFinishResult = typed(
         &again
             .mutate_in(
@@ -505,7 +512,10 @@ async fn a_lost_finish_answer_is_resolved_and_an_interrupted_finish_or_cancel_is
     );
     assert_eq!(settled.handle.transfer_id, claimed);
     assert_eq!(settled.handle.content_digest, digest(&bytes));
-    assert_eq!(status_of(&again, claimed).await.state, UploadState::Published);
+    assert_eq!(
+        status_of(&again, claimed).await.state,
+        UploadState::Published
+    );
 
     // The control: a finish this host never admitted gets no such allowance.
     let never = begin_at_the_door(&device.raw, &host, &bytes, "never.bin")
@@ -576,5 +586,179 @@ async fn a_lost_finish_answer_is_resolved_and_an_interrupted_finish_or_cancel_is
     assert_eq!(status_of(&again, kept).await.state, UploadState::Receiving);
     again.close();
     device.raw.close();
+    host.stop().await;
+}
+
+/// KR-REQ-23.21: a device that reserves an upload is shown the bytes its own principal has staged,
+/// and a retained copy of the answer shows the same; the refusal for the environment's bytes names
+/// the environment's limit and no other principal's total. The control is the person at this
+/// machine, who is told what is staged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_is_shown_its_own_bytes_and_a_quota_refusal_names_no_ones_total() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = paired(&host, &owner, &[ActionRight::FilesUpload]).await;
+    let other = paired(&host, &owner, &[ActionRight::FilesUpload]).await;
+    let service = host.controller().transfer().service();
+    service
+        .set_limits(Limits {
+            max_staged_len: 10_000,
+            ..Limits::default()
+        })
+        .expect("sets the limits");
+    let the_owner = ActorId::new("local:501").expect("the owner's principal");
+    service
+        .upload_begin(
+            &the_owner,
+            &begin_params(&host, &[1; 2_345], "owners.bin"),
+            None,
+            None,
+        )
+        .expect("the owner stages 2,345 bytes");
+    begin_at_the_door(&other.raw, &host, &[2; 3_000], "theirs.bin").await;
+
+    let params = begin_params(&host, &[3; 1_000], "mine.bin");
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let target = on_the_host(&host);
+    let first: UploadBeginResult = typed(
+        &device
+            .raw
+            .mutate(Method::UploadBegin, action, target.clone(), &params)
+            .await
+            .expect("the device begins"),
+    );
+    assert_eq!(first.staged_byte_len.get(), 1_000, "its own bytes");
+    assert_eq!(first.staged_byte_limit.get(), 10_000);
+    begin_at_the_door(&other.raw, &host, &[4; 100], "more.bin").await;
+    let repeated: UploadBeginResult = typed(
+        &device
+            .raw
+            .mutate(Method::UploadBegin, action, target, &params)
+            .await
+            .expect("the repeat is answered from the record"),
+    );
+    assert_eq!(repeated, first, "a retained copy shows the same");
+
+    // 2,345 + 3,000 + 100 + 1,000 are staged: 6,445 bytes, of which the device holds 1,000.
+    let refused: ProtocolError = device
+        .raw
+        .mutate(
+            Method::UploadBegin,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_host(&host),
+            &begin_params(&host, &[5; 5_000], "big.bin"),
+        )
+        .await
+        .expect_err("the environment has no room");
+    assert_eq!(refused.code, ErrorCode::QuotaExceeded, "{refused:?}");
+    assert!(refused.message.contains("10000"), "{refused:?}");
+    for number in ["6445", "2345", "3000"] {
+        assert!(
+            !refused.message.contains(number),
+            "the refusal names no one's total ({number}): {refused:?}"
+        );
+    }
+    let told = service
+        .upload_begin(
+            &the_owner,
+            &begin_params(&host, &[5; 5_000], "owners-big.bin"),
+            None,
+            None,
+        )
+        .expect_err("the owner is refused too")
+        .to_string();
+    assert!(told.contains("6445"), "the owner is told the total: {told}");
+    device.raw.close();
+    other.raw.close();
+    host.stop().await;
+}
+
+/// One published upload of no bytes, recorded in the journal as a finished upload of `actor`'s.
+fn a_published_upload(host: &Host, actor: &ActorId) -> UploadRow {
+    let now = kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get());
+    UploadRow {
+        transfer_id: TransferId::new(kr_ipc::new_uuid()),
+        environment_id: host.environment_id,
+        session_id: None,
+        device_id: None,
+        actor_id: actor.clone(),
+        declared_byte_len: 0,
+        declared_digest: digest(&[]),
+        declared_media_type: "application/octet-stream".to_owned(),
+        original_file_name: "kept.bin".to_owned(),
+        stored_name: "kept.bin".to_owned(),
+        state: UploadState::Published,
+        invalid_reason: None,
+        reserved_byte_len: 0,
+        content_digest: Some(digest(&[])),
+        payload_identity: None,
+        cleanup_pending: false,
+        preview: None,
+        preview_unavailable: None,
+        created_at_ms: now,
+        expires_at_ms: now,
+        published_at_ms: Some(now),
+        submitted_at_ms: None,
+    }
+}
+
+/// KR-REQ-23.21: a device keeps at most `DEVICE_STAGED_UPLOADS` uploads staged. The next reservation
+/// is refused with the quota code, in words that name the bound and how a place is freed; a cancel
+/// of an upload that is still receiving frees a place; another device is unaffected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_keeps_at_most_the_bound_of_staged_uploads_and_a_cancel_frees_a_place() {
+    let bound = kr_controller::transfer::DEVICE_STAGED_UPLOADS;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = paired(&host, &owner, &[ActionRight::FilesUpload]).await;
+    let other = paired(&host, &owner, &[ActionRight::FilesUpload]).await;
+    {
+        let mut journal = journal(&host);
+        for _ in 1..bound {
+            journal
+                .insert_upload(&a_published_upload(&host, &device.actor()), None)
+                .expect("records the upload");
+        }
+    }
+
+    let last = begin_at_the_door(&device.raw, &host, &[1; 64], "last.bin").await;
+    let refused: ProtocolError = device
+        .raw
+        .mutate(
+            Method::UploadBegin,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_host(&host),
+            &begin_params(&host, &[2; 64], "over.bin"),
+        )
+        .await
+        .expect_err("the device keeps as many uploads as it may");
+    assert_eq!(refused.code, ErrorCode::QuotaExceeded, "{refused:?}");
+    assert!(
+        refused.message.contains(&format!("{bound} of the {bound}"))
+            && refused
+                .message
+                .contains("cancel an upload that is still receiving"),
+        "the refusal names the bound and how a place is freed: {refused:?}"
+    );
+
+    begin_at_the_door(&other.raw, &host, &[3; 64], "theirs.bin").await;
+    let cancelled: UploadCancelResult = typed(
+        &device
+            .raw
+            .mutate(
+                Method::UploadCancel,
+                ActionId::new(kr_ipc::new_uuid()),
+                on_the_host(&host),
+                &UploadCancelParams {
+                    transfer_id: last.transfer_id,
+                },
+            )
+            .await
+            .expect("cancels the upload that is still receiving"),
+    );
+    assert_eq!(cancelled.state, UploadState::Cancelled);
+    begin_at_the_door(&device.raw, &host, &[4; 64], "again.bin").await;
+    device.raw.close();
+    other.raw.close();
     host.stop().await;
 }
