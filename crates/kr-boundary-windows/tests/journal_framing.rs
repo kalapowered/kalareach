@@ -170,6 +170,59 @@ fn a_length_that_runs_past_the_end_with_valid_records_after_it_is_damage_not_a_t
 }
 
 #[test]
+fn a_failed_checksum_whose_length_ends_exactly_at_the_end_is_damage_when_a_valid_record_follows_its_start()
+ {
+    let first = journal(&[b"begin"]);
+    let second = encode(b"the second row").unwrap();
+    let later = journal(&[b"third", b"fourth"]);
+    // The second record's length grows until its record ends exactly where the journal ends, so
+    // its checksum fails and the records that really follow lie inside it.
+    let mut bytes = first.clone();
+    bytes.extend_from_slice(&second);
+    bytes.extend_from_slice(&later);
+    let length = u32::try_from(bytes.len() - first.len() - 8).unwrap();
+    bytes[first.len()..first.len() + 4].copy_from_slice(&length.to_le_bytes());
+    let reading = read_all(&bytes);
+    assert_eq!(
+        reading.damage,
+        Some(FramingError::Damaged {
+            index: 1,
+            offset: first.len()
+        })
+    );
+    assert_eq!(reading.records, [b"begin".as_slice()]);
+    assert_eq!(reading.valid_len, first.len());
+    assert_eq!(reading.torn_len(bytes.len()), 0);
+
+    // The first record of a journal is no different: its rows are not dropped as a torn tail.
+    let mut whole = second.clone();
+    whole.extend_from_slice(&later);
+    let length = u32::try_from(whole.len() - 8).unwrap();
+    whole[..4].copy_from_slice(&length.to_le_bytes());
+    let reading = read_all(&whole);
+    assert_eq!(
+        reading.damage,
+        Some(FramingError::Damaged {
+            index: 0,
+            offset: 0
+        })
+    );
+    assert!(reading.records.is_empty());
+
+    // A last record that was written whole in length but not in content has no valid record in
+    // it, and is still a torn tail.
+    let mut torn = first.clone();
+    let mut last =
+        encode(b"a last record with enough bytes to hold a second record's worth").unwrap();
+    let at = last.len() / 2;
+    last[at] ^= 0xff;
+    torn.extend_from_slice(&last);
+    let reading = read_all(&torn);
+    assert_eq!(reading.damage, None);
+    assert_eq!(reading.valid_len, first.len());
+}
+
+#[test]
 fn a_length_over_the_limit_is_damage_not_a_tail() {
     let mut bytes = journal(&[b"begin"]);
     let length = u32::try_from(MAX_RECORD + 1).unwrap();

@@ -9,8 +9,8 @@
 //! last record whose checksum is wrong and a tail of zero bytes as a torn tail: it returns the
 //! complete records before it and says how many bytes it dropped. A record that is not the last
 //! and whose checksum is wrong cannot come from a cut write, and neither can a length over
-//! [`MAX_RECORD`] or a length that runs past the end of the journal while a valid record follows
-//! it: the reader returns the records before the damage and the damage, so that the invocation's
+//! [`MAX_RECORD`], or a length that runs past the end of the journal or ends exactly there with a
+//! failed checksum, while a valid record begins inside it: the reader returns the records before the damage and the damage, so that the invocation's
 //! first rows are still known. A cut record is the last thing in the file, so a valid record found
 //! after a record that does not complete shows the length is damaged and nothing was cut.
 //!
@@ -22,6 +22,9 @@ pub const MAX_RECORD: usize = 1024 * 1024;
 
 const LENGTH_BYTES: usize = 4;
 const CHECKSUM_BYTES: usize = 4;
+
+/// What framing adds to a record's bytes: its length and its checksum.
+pub const FRAME_BYTES: usize = LENGTH_BYTES + CHECKSUM_BYTES;
 
 /// What the framing refuses.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -115,9 +118,10 @@ pub fn encode(payload: &[u8]) -> Result<Vec<u8>, FramingError> {
 
 /// Whether a valid record begins after the first record's own length and checksum within `rest`.
 ///
-/// It is asked only of bytes that end before the length at their start says they should, so `rest`
-/// is shorter than one record can be and the search is bounded by that: it tries each starting
-/// point whose length is plausible and checks one record's checksum there.
+/// It is asked only of the last bytes of a journal, which either end before the length at their start
+/// says they should or end exactly there with a checksum that fails, so `rest` is no longer than one
+/// record can be and the search is bounded by that: it tries each starting point whose length is
+/// plausible and checks one record's checksum there.
 fn a_valid_record_follows(rest: &[u8]) -> bool {
     for start in LENGTH_BYTES + CHECKSUM_BYTES..rest.len() {
         let Some(length) = rest[start..].first_chunk::<LENGTH_BYTES>() else {
@@ -147,8 +151,9 @@ fn a_valid_record_follows(rest: &[u8]) -> bool {
 /// Reads every complete record in a journal's bytes, and says how the reading ended.
 ///
 /// A torn tail ends the reading with no damage. A record before the tail whose checksum is wrong,
-/// a length over [`MAX_RECORD`] and a length that runs past the end while a valid record follows
-/// it end it with [`FramingError::Damaged`], and the records before that point are returned.
+/// a length over [`MAX_RECORD`] and a length that runs past the end, or ends exactly at it with a
+/// failed checksum, while a valid record begins inside it end it with [`FramingError::Damaged`], and
+/// the records before that point are returned.
 #[must_use]
 pub fn read_all(bytes: &[u8]) -> Reading<'_> {
     let mut records = Vec::new();
@@ -187,7 +192,10 @@ pub fn read_all(bytes: &[u8]) -> Reading<'_> {
             rest[total - 1],
         ]);
         if crc32c(covered) != stored {
-            if rest.len() != total {
+            // A record that ends where the journal ends may be a cut write. It is not when a valid
+            // record begins inside it: a cut write leaves nothing valid after its own start, so the
+            // length is the damage.
+            if rest.len() != total || a_valid_record_follows(rest) {
                 damage = Some(damaged);
             }
             break;
