@@ -23,6 +23,8 @@
 #[cfg(unix)]
 mod contract;
 #[cfg(unix)]
+mod record;
+#[cfg(unix)]
 mod server;
 #[cfg(unix)]
 mod terminal;

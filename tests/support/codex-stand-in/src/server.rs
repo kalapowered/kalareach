@@ -523,7 +523,7 @@ impl Server {
     /// started by `request`: below `sessions/<year>/<month>/<day>` in the directory `CODEX_HOME`
     /// names, a line that marks the turn's start and a line that holds its prompt, in the file of
     /// the thread. Nothing is written for a turn whose input holds no text, or where `CODEX_HOME`
-    /// is not set.
+    /// is not set, or where it does not name a directory inside the run ([`crate::record`]).
     fn writes_the_record(request: &Value, thread_id: &str, turn_id: &str) {
         let Some(home) = std::env::var_os(crate::variants::CONFIG_VARIABLE) else {
             return;
@@ -536,25 +536,25 @@ impl Server {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
         let (year, month, day) = crate::variants::civil_date(seconds);
-        let directory = std::path::Path::new(&home)
-            .join("sessions")
-            .join(format!("{year:04}"))
-            .join(format!("{month:02}"))
-            .join(format!("{day:02}"));
+        let below = [
+            "sessions".to_owned(),
+            format!("{year:04}"),
+            format!("{month:02}"),
+            format!("{day:02}"),
+        ];
         let lines = format!(
             "{}\n{}\n",
             json!({"type":"event_msg","payload":{"type":"task_started","turn_id":turn_id}}),
             json!({"type":"response_item","payload":{
                 "type":"message","role":"user","content":[{"type":"input_text","text":prompt}]}}),
         );
-        let written = std::fs::create_dir_all(&directory).and_then(|()| {
-            use std::io::Write as _;
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(directory.join(format!("rollout-{thread_id}.jsonl")))
-                .and_then(|mut file| file.write_all(lines.as_bytes()))
-        });
+        let written = crate::record::appends(
+            &home,
+            std::env::var_os("TMPDIR").as_deref(),
+            &below.iter().map(String::as_str).collect::<Vec<_>>(),
+            &format!("rollout-{thread_id}.jsonl"),
+            lines.as_bytes(),
+        );
         if let Err(error) = written {
             eprintln!("stand-in: the record of {turn_id} could not be written: {error}");
         }
