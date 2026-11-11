@@ -1656,6 +1656,14 @@ mod tests {
         counter.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Waits for `step`, or fails naming what never came: a bound that turns a missing wake-up
+    /// into a failure, and decides nothing.
+    async fn awaited<T>(what: &str, step: impl Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(30), step)
+            .await
+            .unwrap_or_else(|_| panic!("{what} never came"))
+    }
+
     /// The two orders of a send and the receiver's closing, one after the other. One lock covers
     /// each operation, so these are all the outcomes there are: a send before the closing is taken
     /// by it, and a send after is handed back to the task that made it, and neither leaves the
@@ -1705,11 +1713,11 @@ mod tests {
         queue.finish();
 
         assert!(
-            queue.next().await.is_some(),
+            awaited("the queued item", queue.next()).await.is_some(),
             "a queued item was lost at the end"
         );
         assert!(
-            queue.next().await.is_none(),
+            awaited("the end", queue.next()).await.is_none(),
             "the end did not follow the last item"
         );
     }
@@ -1729,7 +1737,12 @@ mod tests {
         assert!(queue.push(Counted(Arc::clone(&counter))).is_ok());
         tokio::task::yield_now().await;
         queue.finish();
-        assert_eq!(waiting.await.expect("the receiver's task"), (true, true));
+        assert_eq!(
+            awaited("the receiver's task", waiting)
+                .await
+                .expect("the receiver's task"),
+            (true, true)
+        );
 
         let closed = tokio::spawn({
             let queue = Arc::clone(&queue);
@@ -1737,7 +1750,9 @@ mod tests {
         });
         tokio::task::yield_now().await;
         drop(queue.close_receiver());
-        closed.await.expect("the sender's wait ended");
+        awaited("the sender's wait", closed)
+            .await
+            .expect("the sender's wait ended");
     }
 
     /// A stream queued before the receiver's closing is taken by it: closing hands back everything
