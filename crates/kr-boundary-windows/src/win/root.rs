@@ -352,9 +352,14 @@ impl Removal {
             }
             Kind::Directory => {
                 let held = DirHandle::from_opened(opened)?;
+                let before = self.leftovers.len();
                 self.empty(&held, path, depth + 1)?;
                 if !held.children()?.is_empty() {
-                    self.leave(path, "not empty after its contents were removed");
+                    // A directory that stays only because of a leftover inside it is not listed
+                    // beside it; one that holds something new is.
+                    if self.leftovers.len() == before {
+                        self.leave(path, "not empty after its contents were removed");
+                    }
                 } else if let Err(failure) = delete(held.handle()) {
                     self.leave(
                         path,
