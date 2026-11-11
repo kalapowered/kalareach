@@ -14,15 +14,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, GENERIC_READ, GENERIC_WRITE, HANDLE, WAIT_OBJECT_0,
+};
 use windows_sys::Win32::Security::{ImpersonateLoggedOnUser, RevertToSelf};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_DIR_NAME,
-    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_SECURITY, FILE_NOTIFY_INFORMATION,
-    GetShortPathNameW, OPEN_EXISTING, ReadDirectoryChangesW,
+    CreateFileW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ATTRIBUTE_NORMAL,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY,
+    FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_SECURITY,
+    FILE_NOTIFY_INFORMATION, GetShortPathNameW, OPEN_EXISTING, ReadDirectoryChangesW,
 };
-use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+use windows_sys::Win32::System::IO::{DeviceIoControl, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use kr_boundary_windows::filekey::FileKey;
@@ -307,6 +309,28 @@ fn the_group_reaches_its_root_tmp_and_home_and_a_sibling_and_the_run_directory_d
         refused,
         (denied, denied),
         "no boundary token may list, create in or delete from the run directory"
+    );
+    // A sibling can neither remove the root, move it nor make another name beside it.
+    let sibling_against_run = as_token(&siblings.second, {
+        let (path, root_path) = (run.path.clone(), root.path().to_owned());
+        move || {
+            (
+                std::fs::remove_dir(&root_path).map_err(|e| e.raw_os_error()),
+                std::fs::rename(&root_path, path.join("moved")).map_err(|e| e.raw_os_error()),
+                std::fs::create_dir(path.join("other")).map_err(|e| e.raw_os_error()),
+            )
+        }
+    });
+    assert_eq!(
+        sibling_against_run,
+        (denied, denied, denied),
+        "a sibling can neither remove, move nor replace another invocation's root"
+    );
+    assert!(
+        root.path().exists()
+            && !run.path.join("moved").exists()
+            && !run.path.join("other").exists(),
+        "and the run directory holds only the root"
     );
     let (leftovers, _) = remove_with_the_walks_privileges(&root);
     assert!(leftovers.is_empty(), "{leftovers:?}");
@@ -866,9 +890,14 @@ fn objects_with_short_names_and_names_that_look_like_short_names_are_removed_by_
     )
     .unwrap();
     let short = short_form(&long);
+    let alias = Path::new(&short)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     assert!(
-        short.contains('~'),
-        "the volume gives the file a short name, or the case shows nothing: {short}"
+        alias.contains('~') && alias != long.file_name().unwrap().to_string_lossy(),
+        "the volume gives the file itself a short name, or the case shows nothing: {short}"
     );
     // Long names that are another object's short alias can only be made when no object has the
     // alias yet; these are made by their long form and sit beside objects that have aliases.
@@ -946,14 +975,17 @@ fn a_file_whose_stream_another_process_holds_open_is_removed_or_left_over_and_ne
         "delete sharing lets the file go, stream and all: {leftovers:?} {stays}"
     );
     let (leftovers, stays) = remove_while_a_stream_is_held(3);
-    assert_eq!(
-        leftovers.is_empty(),
-        !stays,
-        "without delete sharing the file is gone exactly when nothing is left over: {leftovers:?}"
-    );
     assert!(
-        leftovers.iter().all(|l| l.path == "tmp\\with-stream.txt"),
-        "and what is left names the file: {leftovers:?}"
+        stays,
+        "a stream held without delete sharing keeps the file in use"
+    );
+    assert_eq!(
+        leftovers,
+        [Leftover {
+            path: "tmp\\with-stream.txt".to_owned(),
+            reason: "in use".to_owned()
+        }],
+        "and the removal says so and leaves nothing else"
     );
 }
 
@@ -1381,6 +1413,159 @@ fn a_repair_sets_the_run_directorys_list_on_its_handle_and_only_when_it_is_empty
         Reset::Refused(AnchorRefusal::ReparsePoint)
     );
     assert_eq!(look_at(&outside), target_before, "the target is as it was");
+}
+
+/// An opportunistic lock (read, write and handle caching) that a process holds on a file and
+/// never gives up: an open of the file by another handle owes it a break, and it does not answer.
+struct Lock {
+    _file: Handle,
+    event: Handle,
+    _overlapped: Box<OVERLAPPED>,
+    _input: Box<[u32; 3]>,
+    _output: Box<[u32; 6]>,
+}
+
+const FSCTL_REQUEST_OPLOCK: u32 = 0x0009_0240;
+
+impl Lock {
+    fn take(path: &Path) -> Lock {
+        let wide = wide_path(path);
+        // SAFETY: the path is NUL-terminated and the call keeps nothing of it.
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                7,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+                std::ptr::null_mut(),
+            )
+        };
+        let file = Handle::new(raw, "the file the lock is taken on").unwrap();
+        // SAFETY: an unnamed manual-reset event with the default descriptor.
+        let event = Handle::new(
+            unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) },
+            "an event",
+        )
+        .unwrap();
+        // REQUEST_OPLOCK_INPUT_BUFFER: version 1, its length 12, the levels read, handle and write
+        // (1, 2 and 4) and the flag that requests.
+        let mut input = Box::new([1_u32 | (12 << 16), 7, 1]);
+        let mut output = Box::new([0_u32; 6]);
+        // SAFETY: an all-zero OVERLAPPED is the documented initial state.
+        let mut overlapped: Box<OVERLAPPED> = Box::new(unsafe { std::mem::zeroed() });
+        overlapped.hEvent = event.raw();
+        // SAFETY: the buffers and the overlapped record are boxed and live as long as the lock,
+        // which closes the file before they are freed.
+        let asked = unsafe {
+            DeviceIoControl(
+                file.raw(),
+                FSCTL_REQUEST_OPLOCK,
+                input.as_mut_ptr().cast(),
+                12,
+                output.as_mut_ptr().cast(),
+                24,
+                std::ptr::null_mut(),
+                &raw mut *overlapped,
+            )
+        };
+        let error = std::io::Error::last_os_error().raw_os_error();
+        assert!(
+            asked == 0 && error == Some(997),
+            "the lock is granted and waits for a break (a granted request is pending): {asked} {error:?}"
+        );
+        Lock {
+            _file: file,
+            event,
+            _overlapped: overlapped,
+            _input: input,
+            _output: output,
+        }
+    }
+
+    /// Whether a break of the lock was asked for.
+    fn break_was_asked_for(&self) -> bool {
+        // SAFETY: the event is open.
+        unsafe { WaitForSingleObject(self.event.raw(), 0) == WAIT_OBJECT_0 }
+    }
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn an_object_held_by_a_lock_that_is_not_given_up_is_a_leftover_within_the_waits_and_not_a_hang() {
+    let scratch = Scratch::new();
+    let (_run, root, _owner) = made_root(&scratch);
+    let held = root.tmp().join("locked.txt");
+    std::fs::write(&held, b"locked").unwrap();
+    let lock = Lock::take(&held);
+    let guard = privilege::enter().unwrap();
+    let mut rows = Rows::default();
+    let started = Instant::now();
+    let leftovers = remove_root_within(
+        &root,
+        &guard,
+        Limits {
+            wait_each: Duration::from_secs(1),
+            wait_total: Duration::from_secs(2),
+            ..ROOT_LIMITS
+        },
+        &mut rows,
+    )
+    .unwrap();
+    let spent = started.elapsed();
+    drop(guard);
+    assert!(
+        lock.break_was_asked_for(),
+        "the removal's open owed the lock a break, or the case shows nothing"
+    );
+    assert!(
+        spent < Duration::from_secs(20),
+        "the removal did not wait inside an open for the lock's break (the platform gives up after about 35 seconds): {spent:?}"
+    );
+    assert_eq!(
+        leftovers,
+        [Leftover {
+            path: "tmp\\locked.txt".to_owned(),
+            reason: "in use".to_owned()
+        }]
+    );
+    assert!(held.exists(), "the object is as it was");
+    drop(lock);
+    let (rest, _) = remove_with_the_walks_privileges(&root);
+    assert!(
+        rest.is_empty(),
+        "once the lock is gone the next removal finishes: {rest:?}"
+    );
+    assert!(common::is_gone(root), "the root is gone");
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_child_made_between_the_empty_check_and_the_change_is_reported_and_not_hidden() {
+    let scratch = Scratch::new();
+    let wanted = sd::descriptor(SdKind::AdminDir, &Principals::default()).unwrap();
+    let directory = scratch.path("raced");
+    std::fs::create_dir(&directory).unwrap();
+    {
+        let directory = directory.clone();
+        acl::testing::set_after_check(move || {
+            std::fs::write(directory.join("late.txt"), b"made in the window").unwrap();
+        });
+    }
+    let result = acl::set_protected_when_empty(&directory, &wanted).unwrap();
+    acl::testing::clear();
+    assert_eq!(
+        result,
+        Reset::NotEmpty,
+        "a child that appeared in the window is reported, not hidden"
+    );
+    assert!(directory.join("late.txt").exists());
+    let summary = look_at(&directory).summary;
+    assert!(
+        summary.protected && summary.entries.as_ref().map(Vec::len) == Some(2),
+        "the list was set, which the caller is told by the same answer: {summary:?}"
+    );
 }
 
 #[test]

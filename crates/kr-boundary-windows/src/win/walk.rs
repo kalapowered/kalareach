@@ -33,13 +33,13 @@ use std::ptr::null;
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT,
-    FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, FileFsDeviceInformation, NtCreateFile,
-    NtQueryVolumeInformationFile,
+    FILE_COMPLETE_IF_OPLOCKED, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN,
+    FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+    FileFsDeviceInformation, NtCreateFile, NtQueryVolumeInformationFile,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, GetLastError, HANDLE,
-    RtlNtStatusToDosError, UNICODE_STRING,
+    ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
+    GetLastError, HANDLE, RtlNtStatusToDosError, STATUS_OPLOCK_BREAK_IN_PROGRESS, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ExtendedFileIdType, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -945,6 +945,14 @@ impl DirHandle {
         let mut status_block = IO_STATUS_BLOCK::default();
         let share =
             FILE_SHARE_READ | FILE_SHARE_WRITE | if share_delete { FILE_SHARE_DELETE } else { 0 };
+        // A lock that another process holds on an existing object is broken by an open, and a
+        // synchronous open waits inside the call for the holder to acknowledge, where no limit of
+        // the caller counts. The open asks to complete at once instead.
+        let complete_if_oplocked = if disposition == FILE_OPEN {
+            FILE_COMPLETE_IF_OPLOCKED
+        } else {
+            0
+        };
         let file_attributes = if options & FILE_DIRECTORY_FILE != 0 {
             FILE_ATTRIBUTE_DIRECTORY
         } else {
@@ -965,7 +973,8 @@ impl DirHandle {
                 options
                     | FILE_OPEN_REPARSE_POINT
                     | FILE_OPEN_FOR_BACKUP_INTENT
-                    | FILE_SYNCHRONOUS_IO_NONALERT,
+                    | FILE_SYNCHRONOUS_IO_NONALERT
+                    | complete_if_oplocked,
                 null(),
                 0,
             )
@@ -973,7 +982,18 @@ impl DirHandle {
         if status < 0 {
             return Err(nt_error(status, "opening a name beneath a held directory"));
         }
-        Handle::new(raw, "opening a name beneath a held directory")
+        let handle = Handle::new(raw, "opening a name beneath a held directory")?;
+        if status == STATUS_OPLOCK_BREAK_IN_PROGRESS {
+            // Another process holds an opportunistic lock on the object and has been asked to give
+            // it up. The open did not wait for it to answer, so no limit on a wait is lost inside
+            // the call; the object is in use, and the caller's bounded retries apply.
+            drop(handle);
+            return Err(error(
+                ERROR_SHARING_VIOLATION,
+                "the object is held by a lock that is being broken",
+            ));
+        }
+        Ok(handle)
     }
 }
 

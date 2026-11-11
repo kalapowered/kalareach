@@ -86,7 +86,10 @@ pub fn set_protected(path: &Path, descriptor: &OwnedSd) -> Result<()> {
 pub enum Reset {
     /// The directory was empty and now has the list.
     Applied,
-    /// The directory holds something, so its list was not changed.
+    /// The directory holds something. Either it held a child before the call, and its list was
+    /// not changed, or a child appeared between the check and the change, and the list was set.
+    /// A child made before the set keeps the entries it inherited from the old list. The caller
+    /// verifies what the directory holds before it trusts it.
     NotEmpty,
     /// The path is not a directory that a walk may anchor on: a reparse point, something that is
     /// not a directory, or a volume that is not accepted. Nothing was changed.
@@ -102,7 +105,13 @@ const WRITE_DAC: u32 = 0x0004_0000;
 /// sharing, and stays held from the check that it is empty to the change. The change is made with
 /// `NtSetSecurityObject` on that handle and propagates to nothing, so a child that appears is not
 /// reached. It is for the broker's `run` directory, which holds invocations' private roots and
-/// must not be changed under one.
+/// must not be changed under one. A directory that is not empty is left as it is and reported, so
+/// the caller can leave it or refuse.
+///
+/// What the platform allows is a hold against a rename and a removal of the directory, not
+/// against the creation of a child: no sharing mode on a directory shuts out a creator, whose
+/// right comes from the old list. So the directory is looked at again after the change, and a
+/// child that appeared is reported as [`Reset::NotEmpty`], for the caller to verify.
 ///
 /// # Errors
 ///
@@ -131,6 +140,8 @@ pub fn set_protected_when_empty(path: &Path, descriptor: &OwnedSd) -> Result<Res
     if !held.children(1)?.is_empty() {
         return Ok(Reset::NotEmpty);
     }
+    #[cfg(feature = "testing")]
+    testing::after_check();
     // SAFETY: the handle is open with the right to change the list and the descriptor lives
     // through the call.
     let status = unsafe {
@@ -148,7 +159,38 @@ pub fn set_protected_when_empty(path: &Path, descriptor: &OwnedSd) -> Result<Res
             format!("setting the permissions of {}", path.display()),
         ));
     }
+    if !held.children(1)?.is_empty() {
+        return Ok(Reset::NotEmpty);
+    }
     Ok(Reset::Applied)
+}
+
+/// What the cases use to make a creator act where a real one could.
+#[cfg(feature = "testing")]
+pub mod testing {
+    use std::sync::{Arc, Mutex};
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    static AFTER_CHECK: Mutex<Option<Hook>> = Mutex::new(None);
+
+    /// Sets the function called after [`super::set_protected_when_empty`] has found its directory
+    /// empty and before it changes the list, until [`clear`].
+    pub fn set_after_check(hook: impl Fn() + Send + Sync + 'static) {
+        *AFTER_CHECK.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    /// Removes the function.
+    pub fn clear() {
+        *AFTER_CHECK.lock().unwrap() = None;
+    }
+
+    pub(super) fn after_check() {
+        let hook = AFTER_CHECK.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }
 
 /// Reads a path's owner and permission list as text.
