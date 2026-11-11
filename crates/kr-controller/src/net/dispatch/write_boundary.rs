@@ -169,7 +169,7 @@ fn output_receiving(
 }
 
 /// The authority of a connection registered for `actor_id`.
-fn authority_for(controller: &Arc<Controller>, actor_id: ActorId) -> Arc<Authorisation> {
+pub(super) fn authority_for(controller: &Arc<Controller>, actor_id: ActorId) -> Arc<Authorisation> {
     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
     controller.admitted_write().insert(
         connection_id,
@@ -186,6 +186,8 @@ fn authority_for(controller: &Arc<Controller>, actor_id: ActorId) -> Arc<Authori
         grant_expires_at_ms: None,
         expired: AtomicBool::new(false),
         recorded: AtomicBool::new(false),
+        latch: Arc::new(AtomicBool::new(false)),
+        attached: std::sync::Once::new(),
     })
 }
 
@@ -1186,7 +1188,7 @@ async fn an_answer_whose_lease_ran_out_is_answered_with_its_refusal() {
             continuous.advance(Duration::from_secs(15 * 60 + 30));
         }
         assert!(
-            connection.write_answer(answered).await,
+            connection.write_answer(connection.output(), answered).await,
             "the connection stands"
         );
         let written = recording.frames();
@@ -1226,16 +1228,19 @@ async fn an_answer_held_at_the_writer_is_not_written_once_a_feed_refusal_rises()
             .answer_now(ControlFrame::Request(listing(1)))
             .await
             .expect("an answer");
-        let (stands, ()) = tokio::join!(connection.write_answer(answered), async {
-            stream.waited(1).await;
-            if refused {
-                controller.raise_the_unverified_withdrawal_refusal().await;
-            } else {
-                controller.advance_authority_epoch();
+        let (stands, ()) = tokio::join!(
+            connection.write_answer(connection.output(), answered),
+            async {
+                stream.waited(1).await;
+                if refused {
+                    controller.raise_the_unverified_withdrawal_refusal().await;
+                } else {
+                    controller.advance_authority_epoch();
+                }
+                // The answer, and the refusal that replaces it when the answer is not written.
+                stream.writer.add_permits(2);
             }
-            // The answer, and the refusal that replaces it when the answer is not written.
-            stream.writer.add_permits(2);
-        });
+        );
         assert!(stands, "the connection stands");
         let frames = stream.frames();
         assert_eq!(frames.len(), 1, "one frame reached the peer: {frames:?}");
@@ -1411,10 +1416,13 @@ async fn a_refusal_made_after_an_answer_is_told_by_what_the_answer_leaves_open()
         };
         assert!(
             connection
-                .write_answer(super::decision::Answered {
-                    frame: answer.clone(),
-                    asked: Some(asked),
-                })
+                .write_answer(
+                    connection.output(),
+                    super::decision::Answered {
+                        frame: answer.clone(),
+                        asked: Some(asked),
+                    }
+                )
                 .await,
             "the connection stands"
         );
@@ -1532,7 +1540,7 @@ async fn a_recorded_key_registration_is_told_as_unknown_when_a_feed_refusal_rise
 
         controller.raise_the_unverified_withdrawal_refusal().await;
         assert!(
-            connection.write_answer(answered).await,
+            connection.write_answer(connection.output(), answered).await,
             "the connection stands"
         );
         let frames = recording.frames();
@@ -1608,10 +1616,13 @@ async fn a_kept_owner_confirmation_answer_is_told_as_unknown_when_a_feed_refusal
     controller.raise_the_unverified_withdrawal_refusal().await;
     assert!(
         connection
-            .write_answer(super::decision::Answered {
-                frame: kept,
-                asked: Some(asked),
-            })
+            .write_answer(
+                connection.output(),
+                super::decision::Answered {
+                    frame: kept,
+                    asked: Some(asked),
+                }
+            )
             .await,
         "the connection stands"
     );
@@ -1661,19 +1672,22 @@ async fn an_answer_decided_before_the_feed_removed_the_host_is_not_written_when_
             .answer_now(ControlFrame::Request(listing(1)))
             .await
             .expect("an answer");
-        let (stands, ()) = tokio::join!(connection.write_answer(answered), async {
-            stream.waited(1).await;
-            if removed {
-                controller
-                    .authority_feed_removed("https://feed.example")
-                    .await
-                    .expect("the removal is written down");
-            } else {
-                controller.advance_authority_epoch();
+        let (stands, ()) = tokio::join!(
+            connection.write_answer(connection.output(), answered),
+            async {
+                stream.waited(1).await;
+                if removed {
+                    controller
+                        .authority_feed_removed("https://feed.example")
+                        .await
+                        .expect("the removal is written down");
+                } else {
+                    controller.advance_authority_epoch();
+                }
+                // The answer, and the refusal that replaces it when the answer is not written.
+                stream.writer.add_permits(2);
             }
-            // The answer, and the refusal that replaces it when the answer is not written.
-            stream.writer.add_permits(2);
-        });
+        );
         assert!(stands, "the connection stands");
         let frames = stream.frames();
         assert_eq!(frames.len(), 1, "one frame reached the peer: {frames:?}");
@@ -1746,7 +1760,7 @@ async fn a_response_is_not_written_under_a_lease_installed_after_its_own_ended()
             .expect("the replacement installs");
         }
         assert!(
-            connection.write_answer(answered).await,
+            connection.write_answer(connection.output(), answered).await,
             "the connection stands"
         );
         let written = recording.frames();
@@ -1815,10 +1829,13 @@ async fn a_diagnostics_answer_is_written_with_the_metrics_only_under_a_decision_
             .expect("the grant admits the diagnostics");
         assert!(
             connection
-                .write_answer(super::decision::Answered {
-                    frame: frame.clone(),
-                    asked: Some(asked),
-                })
+                .write_answer(
+                    connection.output(),
+                    super::decision::Answered {
+                        frame: frame.clone(),
+                        asked: Some(asked),
+                    }
+                )
                 .await,
             "the connection stands"
         );
@@ -2105,10 +2122,13 @@ async fn a_close_answer_carries_the_description_only_to_a_device_that_may_read_t
 
         assert!(
             connection
-                .write_answer(super::decision::Answered {
-                    frame: close_answer(&accepted),
-                    asked: Some(asked),
-                })
+                .write_answer(
+                    connection.output(),
+                    super::decision::Answered {
+                        frame: close_answer(&accepted),
+                        asked: Some(asked),
+                    }
+                )
                 .await,
             "the connection stands"
         );
@@ -2226,10 +2246,13 @@ async fn a_close_answer_this_build_cannot_decode_goes_without_the_description_to
 
         assert!(
             connection
-                .write_answer(super::decision::Answered {
-                    frame: answer,
-                    asked: Some(asked),
-                })
+                .write_answer(
+                    connection.output(),
+                    super::decision::Answered {
+                        frame: answer,
+                        asked: Some(asked),
+                    }
+                )
                 .await,
             "the connection stands"
         );
@@ -2336,10 +2359,13 @@ async fn a_close_answer_written_under_a_replacement_lease_without_view_goes_with
         }
         assert!(
             connection
-                .write_answer(super::decision::Answered {
-                    frame: close_answer(&accepted),
-                    asked: Some(asked),
-                })
+                .write_answer(
+                    connection.output(),
+                    super::decision::Answered {
+                        frame: close_answer(&accepted),
+                        asked: Some(asked),
+                    }
+                )
                 .await,
             "the connection stands"
         );
@@ -2463,10 +2489,13 @@ async fn a_question_resolution_shows_the_question_only_to_a_device_that_may_view
         });
         assert!(
             connection
-                .write_answer(super::decision::Answered {
-                    frame,
-                    asked: Some(asked),
-                })
+                .write_answer(
+                    connection.output(),
+                    super::decision::Answered {
+                        frame,
+                        asked: Some(asked),
+                    }
+                )
                 .await,
             "the connection stands"
         );
@@ -2537,10 +2566,13 @@ async fn an_action_read_of_a_close_carries_the_description_only_as_far_as_the_hi
         });
         assert!(
             connection
-                .write_answer(super::decision::Answered {
-                    frame,
-                    asked: Some(asked.answering(Method::ActionRead)),
-                })
+                .write_answer(
+                    connection.output(),
+                    super::decision::Answered {
+                        frame,
+                        asked: Some(asked.answering(Method::ActionRead)),
+                    }
+                )
                 .await,
             "the connection stands"
         );
@@ -2654,10 +2686,13 @@ async fn a_retained_answer_written_under_a_replacement_lease_without_view_is_not
         });
         assert!(
             connection
-                .write_answer(super::decision::Answered {
-                    frame,
-                    asked: Some(asked),
-                })
+                .write_answer(
+                    connection.output(),
+                    super::decision::Answered {
+                        frame,
+                        asked: Some(asked),
+                    }
+                )
                 .await,
             "the connection stands"
         );
@@ -3616,7 +3651,7 @@ async fn an_answer_whose_decision_is_lost_before_every_write_is_told_by_what_it_
             asked: Some(asked),
         };
         assert!(
-            connection.write_answer(answered).await,
+            connection.write_answer(connection.output(), answered).await,
             "the connection stands"
         );
         assert_eq!(

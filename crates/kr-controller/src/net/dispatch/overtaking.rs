@@ -162,7 +162,7 @@ impl RemoteConnection {
             let Some(answer) = self.answer(received).await else {
                 return false;
             };
-            return self.write_answer(answer).await;
+            return self.write_answer(&self.output, answer).await;
         };
 
         let mut ordered = Answering(tokio::spawn({
@@ -221,13 +221,13 @@ impl RemoteConnection {
         let Some(answer) = answered else {
             return false;
         };
-        self.write_answer(answer).await
+        self.write_answer(&self.output, answer).await
     }
 
     /// Answers one frame and writes the answer, and says whether the connection goes on.
     async fn answer_and_write(&self, received: ReceivedFrame) -> bool {
         match self.answer(received).await {
-            Some(answer) => self.write_answer(answer).await,
+            Some(answer) => self.write_answer(&self.output, answer).await,
             None => false,
         }
     }

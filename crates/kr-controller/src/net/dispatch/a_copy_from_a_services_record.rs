@@ -119,7 +119,7 @@ pub(super) async fn written(
     answered: Answered,
 ) -> ProtocolError {
     assert!(
-        connection.write_answer(answered).await,
+        connection.write_answer(connection.output(), answered).await,
         "the connection stands"
     );
     let frames = recording.frames();
