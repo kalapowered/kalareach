@@ -324,7 +324,7 @@ pub fn entry(paths: &Paths) -> Result<Entry, Error> {
 /// own class (the system, the administrators, the installer service and the creator-owner
 /// placeholder) owns it, when another account may write, delete in or change it, when its list has
 /// an entry of a type the check does not read, and when another program holds it open with a right
-/// to delete it. Whoever owns or may change the folder can rename the data directory away and put a
+/// to delete it or that does not share it. Whoever owns or may change the folder can rename the data directory away and put a
 /// manifest, a journal and a directory of private roots of their own in its place, which the
 /// broker, running as the system, would read by path. A folder that an earlier installation made
 /// with an inherited list is refused the same way, since nothing of the earlier form is kept.
@@ -357,7 +357,7 @@ pub fn check_data_parent(paths: &Paths) -> Result<Option<ffi::Handle>, Error> {
         Err(failure) if failure.code == ERROR_SHARING_VIOLATION => {
             return Err(parent_refusal(
                 parent,
-                "another program holds it open with a right to delete or rename it",
+                "another program holds it open: with a right to delete or rename it, or without sharing it for reading and writing, and the check needs both so that it can hold the folder against a rename or a delete",
             ));
         }
         Err(failure) => return Err(failure.into()),
