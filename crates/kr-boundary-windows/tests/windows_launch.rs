@@ -1490,6 +1490,58 @@ fn a_capture_pipe_is_made_and_carries_bytes_for_the_system_and_for_an_elevated_a
     );
 }
 
+/// The installer's own event log queries start a program of its own token through the proof's
+/// runner, with no group on the process or the thread. That runs and is read to its end for the
+/// system and for an elevated administrator whose token's default owner is the administrator's own
+/// account: the descriptor of the process and its thread must name an owner that either token may
+/// name.
+#[test]
+#[ignore = "needs an elevated session in a disposable Windows guest (see the file's header)"]
+fn a_program_started_with_the_brokers_own_token_runs_and_is_read_to_its_end_for_the_system_and_for_an_elevated_administrator()
+ {
+    use kr_boundary_windows::win::proof::{Run, run_captured};
+    let system = PathBuf::from(system_windows_directory().unwrap());
+    let program = system.join("System32").join("cmd.exe");
+    let name = program.display().to_string();
+    let scratch = std::env::temp_dir();
+    let env = build_env(
+        Kind::Proof,
+        &RootPaths {
+            system: system.display().to_string(),
+            boundary: r"C:\Program Files\KalaReach\Boundary".to_owned(),
+            private_root: scratch.display().to_string(),
+        },
+        None,
+        &QualifiedGit {
+            dir: GUEST_GIT.to_owned(),
+        },
+    )
+    .unwrap();
+    let held = run_captured(
+        Run {
+            token: TokenSpec::Own,
+            group: None,
+            program: VerifiedPath::new(&program).unwrap(),
+            command_line: quote_command_line(&[name.as_str(), "/c", "echo", "through"]),
+            cwd: &scratch,
+            env: &env,
+        },
+        Instant::now() + Duration::from_secs(30),
+    )
+    .expect("the program starts and its output is read under this token");
+    assert!(
+        matches!(held.outcome, Outcome::Ran(0)),
+        "the program ends with success: {:?}",
+        held.outcome
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&held.stdout).trim(),
+        "through",
+        "the output is read to its end"
+    );
+    assert!(held.stderr.is_empty(), "nothing on standard error");
+}
+
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_launch_that_cannot_use_the_job_attribute_starts_nothing() {
