@@ -27,7 +27,8 @@ use kr_boundary_windows::quote::quote_command_line;
 use kr_boundary_windows::win::applocker::Channel;
 use kr_boundary_windows::win::ffi::Sid;
 use kr_boundary_windows::win::install::{CHECKOUT, CONNECT, Paths, SERVICE, STEPS};
-use kr_boundary_windows::win::launch::{Outcome, Run, TokenSpec, VerifiedPath, run_captured};
+use kr_boundary_windows::win::launch::{Outcome, TokenSpec, VerifiedPath};
+use kr_boundary_windows::win::proof::{Run, run_captured};
 use kr_boundary_windows::win::{account, acl, registry, service, token};
 
 const CLEAR: &str = r#"<AppLockerPolicy Version="1"><RuleCollection Type="Exe" EnforcementMode="NotConfigured" /></AppLockerPolicy>"#;

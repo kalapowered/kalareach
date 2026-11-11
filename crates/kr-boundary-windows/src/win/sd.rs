@@ -182,6 +182,16 @@ pub fn descriptor_text(kind: SdKind, principals: &Principals) -> Result<String> 
     }
 }
 
+/// A descriptor from text the case writes, for a control that needs a list the broker never makes.
+///
+/// # Errors
+///
+/// Returns an error when the platform refuses the text.
+#[cfg(feature = "testing")]
+pub fn descriptor_from_text(text: &str) -> Result<OwnedSd> {
+    OwnedSd::from_text(text.to_owned())
+}
+
 /// Makes the descriptor of an object the broker is about to create.
 ///
 /// # Errors

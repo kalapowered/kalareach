@@ -30,6 +30,15 @@
 //! places every account may write, and any folder someone has granted them. What they cannot do is
 //! start a program they were not given. An administrator can change the rules; the boundary guards
 //! against a hostile repository and a misbehaving Git, not against an administrator.
+//!
+//! ### Crash reports
+//!
+//! The broker sets its error mode once, when it starts, and every program it starts inherits that
+//! mode. The claim is this and no more: on the Windows builds the cases ran on, the system's own
+//! crash reporting is not invoked for the broker or for a program that inherits the mode, so a
+//! crash of either leaves no dump of its memory. A program that asks for the default error mode
+//! again, or that writes a dump of itself, is outside the claim, and so is a computer on which an
+//! administrator has configured error reporting for the broker's own program.
 
 pub mod env;
 pub mod events;

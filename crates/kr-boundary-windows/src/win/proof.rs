@@ -29,8 +29,10 @@ use super::acl;
 use super::applocker;
 use super::ffi::{self, Sid};
 use super::install::Paths;
+use super::job::{Job, Limits};
 use super::launch::{
-    Captured, LaunchError, Outcome, REFUSED_BY_POLICY, Run, TokenSpec, VerifiedPath, run_captured,
+    ChildSpec, LaunchError, Outcome, REFUSED_BY_POLICY, ResumePermit, Std, TokenSpec, VerifiedPath,
+    launch, pipe, read_pipe,
 };
 use super::pipe::Stop;
 use super::sd::{Principals, SdKind, descriptor};
@@ -59,6 +61,99 @@ fn account_of(manifest: &Manifest, class: Class) -> Option<(String, String)> {
     };
     let object = manifest.find(ObjectKind::Account, name)?;
     Some((name.to_owned(), object.detail.clone()?))
+}
+
+/// What to run for [`run_captured`].
+pub struct Run<'a> {
+    /// The token the program runs under.
+    pub token: TokenSpec<'a>,
+    /// The group the token carries, named on the program's process and thread; none for a program
+    /// of the broker's own token.
+    pub group: Option<&'a Sid>,
+    /// The program.
+    pub program: VerifiedPath,
+    /// Its command line.
+    pub command_line: String,
+    /// Its working directory.
+    pub cwd: &'a Path,
+    /// Its environment.
+    pub env: &'a EnvBlock,
+}
+
+/// What a captured run wrote and how it ended.
+#[derive(Debug)]
+pub struct Captured {
+    /// How the program ended.
+    pub outcome: Outcome,
+    /// What it wrote to its standard output.
+    pub stdout: Vec<u8>,
+    /// What it wrote to its standard error.
+    pub stderr: Vec<u8>,
+}
+
+/// Runs a program of the proof to its end, up to a bound, and keeps what it wrote.
+///
+/// The program has a job of its own, which is ended before the function returns, so nothing it
+/// started outlives the call. Its process and thread name the token's group and the system, or the
+/// system alone for the broker's own token. It belongs to no invocation, so its permit to resume
+/// is the proof's own: this is the one place that makes one.
+///
+/// # Errors
+///
+/// Returns [`LaunchError::NotStarted`] when the platform refuses to start the program, and the
+/// other errors of [`launch`] and of the pipes.
+pub fn run_captured(run: Run<'_>, bound: Duration) -> Result<Captured, LaunchError> {
+    let mut job = Job::new(Limits::INVOCATION)?;
+    let (out_read, out_write) = pipe()?;
+    let (err_read, err_write) = pipe()?;
+    let descriptor = descriptor(
+        SdKind::ProcessThread,
+        &Principals {
+            group: run.group.cloned(),
+            ..Principals::default()
+        },
+    )?;
+    let suspended = launch(ChildSpec {
+        token: run.token,
+        job: &job,
+        program: run.program,
+        command_line: run.command_line,
+        cwd: run.cwd,
+        env: run.env,
+        stdin: Std::Nul,
+        stdout: Std::Pipe(out_write),
+        stderr: Std::Pipe(err_write),
+        process_descriptor: &descriptor,
+        thread_descriptor: &descriptor,
+    })?;
+    let (result, out, err) = std::thread::scope(|scope| {
+        let out = scope.spawn(|| read_pipe(&out_read));
+        let err = scope.spawn(|| read_pipe(&err_read));
+        let permit = ResumePermit::for_proof(&suspended);
+        let result = match suspended.resume(permit) {
+            Ok(child) => {
+                let waited = child.wait(bound);
+                // Anything the program started ends with the job, which also lets the pipes
+                // reach their end. A program still running at the bound is ended the same way.
+                job.end(&[&child], Duration::from_secs(10));
+                match waited {
+                    Ok(Some(code)) => Ok(Outcome::Ran(code)),
+                    Ok(None) => Ok(Outcome::TimedOut),
+                    Err(error) => Err(LaunchError::Platform(error)),
+                }
+            }
+            Err(error) => {
+                job.end(&[], Duration::from_secs(10));
+                Err(error)
+            }
+        };
+        (result, out.join(), err.join())
+    });
+    Ok(Captured {
+        outcome: result?,
+        stdout: out.unwrap_or_default(),
+        stderr: err.unwrap_or_default(),
+    })
 }
 
 /// The system's own Windows directory, from the platform and not from any environment.
