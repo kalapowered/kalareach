@@ -484,28 +484,13 @@ impl RemoteConnection {
             .map_err(|error| error.to_protocol_error())
     }
 
-    /// Checks the envelope of one mutation and returns the deadline the host accepted.
-    ///
-    /// The window is this connection's own, issued by the transport when the connection was
-    /// authorised and replaced on the live connection at half its validity. A window from another
-    /// connection, or from before a restart, first-admits nothing.
-    pub(super) fn check_envelope(
-        &self,
-        mutation: &MutationRequest,
-        entry: &'static MethodEntry,
-        received_at: kr_transport::clock::ContinuousInstant,
-        asked: &Asked,
-    ) -> std::result::Result<AcceptedDeadline, ProtocolError> {
-        let authority = self.check_envelope_but_the_window(mutation, entry, asked)?;
-        self.accept_in_window(mutation, received_at, authority)
-    }
-
-    /// Every check of [`Self::check_envelope`] but the window's, and the time the authority the
-    /// request was decided under ends at, which bounds the deadline the window gives it.
+    /// Checks the envelope of one mutation, apart from the window it carries, and returns the time
+    /// the authority the request was decided under ends at, which bounds the deadline
+    /// [`Self::accept_in_window`] gives it.
     ///
     /// A repeat of a transfer action that an earlier connection began is owed what its claim says
-    /// whatever window it carries, so it is asked the window's question apart from the rest.
-    pub(super) fn check_envelope_but_the_window(
+    /// whatever window it carries, so the window's question is asked apart from the rest.
+    pub(super) fn check_envelope(
         &self,
         mutation: &MutationRequest,
         entry: &'static MethodEntry,
@@ -736,6 +721,10 @@ impl RemoteConnection {
 
     /// Accepts the window the mutation carries, which is this connection's own and live, and gives
     /// the deadline it is admitted under.
+    ///
+    /// The window is issued by the transport when the connection was authorised and replaced on the
+    /// live connection at half its validity. A window from another connection, or from before a
+    /// restart, first-admits nothing.
     pub(super) fn accept_in_window(
         &self,
         mutation: &MutationRequest,

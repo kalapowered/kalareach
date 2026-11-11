@@ -137,6 +137,9 @@ impl RemoteConnection {
     /// The effect runs on a task that outlives this connection, because dropping a future is a
     /// cancellation and a durable commit cannot be left half done because a peer went away. The
     /// answer says whether the service read it from its record of an earlier submission.
+    ///
+    /// `settling` is an exact repeat that carries no usable window: it may finish what its action
+    /// already claimed and begins nothing.
     pub(super) async fn transfer_write(
         &self,
         mutation: &MutationRequest,
@@ -145,6 +148,7 @@ impl RemoteConnection {
         carried: crate::authority::AdmittedMutation,
         own_claim: &OwnClaim,
         on_stream: Option<&Arc<ChunkAdmission>>,
+        settling: bool,
     ) -> std::result::Result<Given<ControlFrame>, ProtocolError> {
         self.controller
             .transfer
@@ -168,13 +172,18 @@ impl RemoteConnection {
                     )
                     .await;
             }
-            let admission = match on_stream {
-                Some(stream) => crate::transfer::TransferAdmission::on_a_stream(
+            let admission = match (on_stream, settling) {
+                (Some(stream), _) => crate::transfer::TransferAdmission::on_a_stream(
                     Arc::clone(&controller),
                     carried,
                     stream,
                 ),
-                None => crate::transfer::TransferAdmission::new(Arc::clone(&controller), carried),
+                (None, true) => {
+                    crate::transfer::TransferAdmission::settling(Arc::clone(&controller), carried)
+                }
+                (None, false) => {
+                    crate::transfer::TransferAdmission::new(Arc::clone(&controller), carried)
+                }
             };
             controller
                 .transfer
