@@ -13,20 +13,20 @@
 mod common;
 
 use std::cell::RefCell;
-use std::os::windows::fs::MetadataExt as _;
+use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::Path;
 
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_APPEND_DATA, FILE_BASIC_INFO, FILE_EXECUTE, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
-    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FileBasicInfo, GetFileInformationByHandleEx,
-    SetFileInformationByHandle,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FileBasicInfo,
+    GetFileInformationByHandleEx, SetFileInformationByHandle,
 };
 
 use kr_boundary_windows::win::ffi::Handle;
 use kr_boundary_windows::win::privilege;
 use kr_boundary_windows::win::walk::{
     AnchorRefusal, Bounds, DELETE, DirHandle, Entry, Kind, LIST, Lost, RecordedDir, Verdict,
-    VolumeRefusal, WalkError, walk,
+    VolumeRefusal, WalkError, testing as walking, walk,
 };
 
 use common::{Scratch, look_at, run};
@@ -83,14 +83,17 @@ fn mark_visitor<'a>(
         // The right to write attributes alone would hold nothing, so a data right comes with it.
         match entry.open(FILE_WRITE_ATTRIBUTES | FILE_READ_DATA)? {
             Ok(opened) => {
-                let kind = opened.kind;
-                if kind != Kind::ReparsePoint && opened.links == 1 {
-                    mark(&opened.handle);
+                let kind = opened.kind();
+                if kind != Kind::ReparsePoint && opened.links() == 1 {
+                    mark(opened.handle());
                     seen.borrow_mut().push((name, Ok(kind)));
                 } else {
                     seen.borrow_mut().push((
                         name,
-                        Err(format!("not acted on: {kind:?}, {} link(s)", opened.links)),
+                        Err(format!(
+                            "not acted on: {kind:?}, {} link(s)",
+                            opened.links()
+                        )),
                     ));
                 }
             }
@@ -165,6 +168,17 @@ fn a_walk_goes_through_every_object_and_never_enters_a_junction_or_a_symbolic_li
         "nothing behind a link was visited: {names:?}"
     );
     assert!(report.problems.is_empty(), "{:?}", report.problems);
+    for link in ["junction", "symlink"] {
+        let result = seen
+            .iter()
+            .find(|(name, _)| name == link)
+            .map(|(_, result)| result);
+        assert_eq!(
+            result,
+            Some(&Err("not acted on: ReparsePoint, 1 link(s)".to_owned())),
+            "{link} opens as itself, a reparse point, and not as the directory it points at"
+        );
+    }
     assert!(
         marked(&tree.join("sub").join("deeper").join("three.txt")),
         "a file three levels down is marked"
@@ -532,12 +546,10 @@ fn an_open_that_asks_for_no_delete_or_data_right_is_refused_and_one_that_does_ho
     // The platform fact the refusal rests on: an open for attributes alone is not held against a
     // rename, and one that takes part in share checks is.
     {
-        let weak = start
-            .open_name(
-                &units("file.txt"),
-                READ_CONTROL | FILE_READ_ATTRIBUTES,
-                false,
-            )
+        let weak = std::fs::OpenOptions::new()
+            .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(tree.join("file.txt"))
             .unwrap();
         std::fs::rename(tree.join("file.txt"), tree.join("renamed.txt"))
             .expect("an attribute-only handle holds nothing");
@@ -632,15 +644,32 @@ fn a_listing_stops_at_the_limit_it_is_given() {
         std::fs::write(tree.join(format!("f{index}.txt")), b"x").unwrap();
     }
     let start = anchor(&tree);
+    let within = String::from_utf16_lossy(start.path());
+    let recording = walking::record(&within);
     let five = start.children(5).unwrap();
     assert_eq!(five.children.len(), 5, "no more than the limit is returned");
     assert!(five.more, "and the listing says there are more");
+    assert_eq!(
+        recording.listing_calls(&within),
+        1,
+        "the listing stopped in the first read of the directory and did not read the rest to cut it"
+    );
     let exact = start.children(1000).unwrap();
     assert_eq!((exact.children.len(), exact.more), (1000, false));
+    assert!(
+        recording.listing_calls(&within) >= 3,
+        "the directory takes several reads to list whole, or the count above shows nothing"
+    );
     let all = start.children(usize::MAX).unwrap();
     assert_eq!((all.children.len(), all.more), (1000, false));
+    let before_none = recording.listing_calls(&within);
     let none = start.children(0).unwrap();
     assert_eq!((none.children.len(), none.more), (0, true));
+    assert_eq!(
+        recording.listing_calls(&within) - before_none,
+        1,
+        "a limit of nothing is answered by the first read"
+    );
     let empty = scratch.path("empty");
     std::fs::create_dir_all(&empty).unwrap();
     assert!(anchor(&empty).children(0).unwrap().is_empty());

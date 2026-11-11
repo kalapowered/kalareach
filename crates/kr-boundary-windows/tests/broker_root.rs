@@ -11,7 +11,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
@@ -42,9 +42,6 @@ use kr_boundary_windows::win::walk::{AnchorRefusal, Bounds, testing as walking};
 use kr_boundary_windows::win::{account, broker, token};
 
 use common::{Outside, Rows, Scratch, group, hostile_dir, hostile_file, look_at, run, run_dir};
-
-/// The removal's observation hook is one for the process, so the cases that set it take turns.
-static HOOK: Mutex<()> = Mutex::new(());
 
 const SYSTEM_SID: &str = "S-1-5-18";
 const MODIFY: u32 = 0x0013_01bf;
@@ -94,6 +91,33 @@ impl RootRows for RunRows {
 
     fn removed(&mut self) -> Result<(), RootError> {
         self.rows.removed()
+    }
+}
+
+/// Notes the names a removal listed in `directory`, each as its path below the root.
+fn note_listed(listed: &Mutex<Vec<String>>, directory: &str, names: &[String]) {
+    let mut listed = listed.lock().unwrap();
+    for name in names {
+        listed.push(if directory.is_empty() {
+            name.clone()
+        } else {
+            format!("{directory}\\{name}")
+        });
+    }
+}
+
+/// Asserts that the removal opened each name it listed once and no name twice, from the opens a
+/// recording made on its root. A name opened a second time after its check is the removal reaching
+/// for an object it did not check.
+fn assert_each_listed_name_was_opened_once(opens: &[String], listed: &[String]) {
+    assert!(!listed.is_empty(), "the removal listed something");
+    for path in listed {
+        let suffix = format!("\\{path}");
+        let count = opens.iter().filter(|open| open.ends_with(&suffix)).count();
+        assert_eq!(
+            count, 1,
+            "{path} was opened once by the removal, and not again after its check: {opens:?}"
+        );
     }
 }
 
@@ -992,7 +1016,6 @@ fn a_file_whose_stream_another_process_holds_open_is_removed_or_left_over_and_ne
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_link_replaced_by_another_object_after_the_listing_is_a_leftover_and_nothing_is_deleted() {
-    let _turn = HOOK.lock().unwrap_or_else(PoisonError::into_inner);
     let scratch = Scratch::new();
     let (_run, root, _owner) = made_root(&scratch);
     let outside = scratch.path("outside");
@@ -1012,14 +1035,21 @@ fn a_link_replaced_by_another_object_after_the_listing_is_a_leftover_and_nothing
     let moved = scratch.path("moved.txt");
     let before = (look_at(&outside), look_at(&outside.join("victim.txt")));
     let opened = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listed = Arc::new(Mutex::new(Vec::<String>::new()));
     {
-        let (opened, link, moved) = (opened.clone(), link.clone(), moved.clone());
-        removal::set(move |event| match event {
-            Event::Listed { directory, .. } if *directory == "tmp" => {
-                // After the listing and before the open: a sibling takes the junction away and
-                // puts a plain file under its name.
-                std::fs::remove_dir(&link).unwrap();
-                std::fs::write(&link, b"swapped in").unwrap();
+        let (opened, listed, link, moved) =
+            (opened.clone(), listed.clone(), link.clone(), moved.clone());
+        removal::set(root.name(), move |event| match event {
+            Event::Listed {
+                directory, names, ..
+            } => {
+                note_listed(&listed, directory, names);
+                if *directory == "tmp" {
+                    // After the listing and before the open: a sibling takes the junction away and
+                    // puts a plain file under its name.
+                    std::fs::remove_dir(&link).unwrap();
+                    std::fs::write(&link, b"swapped in").unwrap();
+                }
             }
             Event::Opened { path } if *path == "tmp\\swap-link" => {
                 opened.lock().unwrap().push((*path).to_owned());
@@ -1029,8 +1059,11 @@ fn a_link_replaced_by_another_object_after_the_listing_is_a_leftover_and_nothing
             _ => {}
         });
     }
+    let recording = walking::record(root.name().as_str());
     let (leftovers, log) = remove_with_the_walks_privileges(&root);
-    removal::clear();
+    removal::clear(root.name());
+    let opens = recording.opens();
+    assert_each_listed_name_was_opened_once(&opens, &listed.lock().unwrap());
     assert!(
         opened.lock().unwrap().is_empty(),
         "the name that holds another object is not opened for removal"
@@ -1057,7 +1090,6 @@ fn a_link_replaced_by_another_object_after_the_listing_is_a_leftover_and_nothing
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_link_or_a_file_with_several_names_stays_held_between_its_check_and_its_deletion() {
-    let _turn = HOOK.lock().unwrap_or_else(PoisonError::into_inner);
     let scratch = Scratch::new();
     let (_run, root, _owner) = made_root(&scratch);
     let outside = scratch.path("outside");
@@ -1089,9 +1121,21 @@ fn a_link_or_a_file_with_several_names_stays_held_between_its_check_and_its_dele
         look_at(&kept_name),
     );
     let attempts = Arc::new(Mutex::new(Vec::<(String, Option<i32>)>::new()));
+    let listed = Arc::new(Mutex::new(Vec::<String>::new()));
     {
-        let (attempts, tmp, away) = (attempts.clone(), root.tmp(), scratch.path("away"));
-        removal::set(move |event| {
+        let (attempts, listed, tmp, away) = (
+            attempts.clone(),
+            listed.clone(),
+            root.tmp(),
+            scratch.path("away"),
+        );
+        removal::set(root.name(), move |event| {
+            if let Event::Listed {
+                directory, names, ..
+            } = event
+            {
+                note_listed(&listed, directory, names);
+            }
             if let Event::Opened { path } = event
                 && let Some(name) = path.strip_prefix("tmp\\held-")
             {
@@ -1104,8 +1148,10 @@ fn a_link_or_a_file_with_several_names_stays_held_between_its_check_and_its_dele
             }
         });
     }
+    let recording = walking::record(root.name().as_str());
     let (leftovers, log) = remove_with_the_walks_privileges(&root);
-    removal::clear();
+    removal::clear(root.name());
+    assert_each_listed_name_was_opened_once(&recording.opens(), &listed.lock().unwrap());
     let attempts = attempts.lock().unwrap();
     assert_eq!(
         attempts.len(),
@@ -1195,17 +1241,20 @@ fn an_object_that_cannot_be_read_after_it_opens_is_a_leftover_and_the_removal_go
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_listing_stops_at_the_object_budget_and_a_root_that_is_too_large_is_one_leftover() {
-    let _turn = HOOK.lock().unwrap_or_else(PoisonError::into_inner);
     let scratch = Scratch::new();
     let (_run, root, _owner) = made_root(&scratch);
-    for index in 0..50 {
+    // More than one read of the platform's buffer holds, so that a read of the whole directory
+    // that is cut afterwards takes more calls than a read that stops at the budget.
+    for index in 0..1000 {
         std::fs::write(root.tmp().join(format!("f{index}.txt")), b"x").unwrap();
+    }
+    for index in 0..50 {
         std::fs::write(root.home().join(format!("g{index}.txt")), b"x").unwrap();
     }
     let listed = Arc::new(Mutex::new(Vec::<(String, usize, bool)>::new()));
     {
         let listed = listed.clone();
-        removal::set(move |event| {
+        removal::set(root.name(), move |event| {
             if let Event::Listed {
                 directory,
                 names,
@@ -1219,6 +1268,7 @@ fn the_listing_stops_at_the_object_budget_and_a_root_that_is_too_large_is_one_le
             }
         });
     }
+    let recording = walking::record(root.name().as_str());
     let guard = privilege::enter().unwrap();
     let mut rows = Rows::default();
     let leftovers = remove_root_within(
@@ -1234,7 +1284,8 @@ fn the_listing_stops_at_the_object_budget_and_a_root_that_is_too_large_is_one_le
         &mut rows,
     )
     .unwrap();
-    removal::clear();
+    removal::clear(root.name());
+    let calls_bounded = recording.listing_calls("\\tmp");
     let listed = listed.lock().unwrap().clone();
     let total: usize = listed.iter().map(|(_, count, _)| *count).sum();
     assert!(total <= 8, "no listing went past the budget: {listed:?}");
@@ -1242,10 +1293,18 @@ fn the_listing_stops_at_the_object_budget_and_a_root_that_is_too_large_is_one_le
         listed.iter().any(|(_, _, more)| *more),
         "a listing said that it stopped early: {listed:?}"
     );
+    assert!(
+        calls_bounded <= 2,
+        "the thousand names of tmp were listed by one read that stopped at the budget and one that looked for a child after it, not read whole: {calls_bounded}"
+    );
     assert_eq!(
-        leftovers.iter().filter(|l| l.reason == "too large").count(),
-        1,
-        "one leftover for the root, not one for each child left: {leftovers:?}"
+        leftovers
+            .iter()
+            .filter(|l| l.reason == "too large")
+            .map(|l| l.path.as_str())
+            .collect::<Vec<_>>(),
+        [""],
+        "one leftover, for the root and not for one child or directory: {leftovers:?}"
     );
     assert!(
         leftovers.len() <= 3,
@@ -1260,6 +1319,10 @@ fn the_listing_stops_at_the_object_budget_and_a_root_that_is_too_large_is_one_le
     assert!(
         rest.is_empty(),
         "within the usual limits the next removal finishes: {rest:?}"
+    );
+    assert!(
+        recording.listing_calls("\\tmp") - calls_bounded >= 3,
+        "tmp takes several reads to list whole, or the count above shows nothing"
     );
 }
 
@@ -1297,6 +1360,7 @@ fn a_tree_nested_past_the_depth_bound_is_one_leftover_and_not_one_for_each_direc
     drop(guard);
     assert_eq!(leftovers.len(), 1, "{leftovers:?}");
     assert_eq!(leftovers[0].reason, "too large");
+    assert_eq!(leftovers[0].path, "", "it is the root's leftover");
     let (rest, _) = remove_with_the_walks_privileges(&root);
     assert!(
         rest.is_empty(),
@@ -1415,8 +1479,8 @@ fn a_repair_sets_the_run_directorys_list_on_its_handle_and_only_when_it_is_empty
     assert_eq!(look_at(&outside), target_before, "the target is as it was");
 }
 
-/// An opportunistic lock (read, write and handle caching) that a process holds on a file and
-/// never gives up: an open of the file by another handle owes it a break, and it does not answer.
+/// An opportunistic lock that a process holds on a file and never gives up: a break that the
+/// platform asks of it is never answered.
 struct Lock {
     _file: Handle,
     event: Handle,
@@ -1426,9 +1490,13 @@ struct Lock {
 }
 
 const FSCTL_REQUEST_OPLOCK: u32 = 0x0009_0240;
+const LOCK_READ: u32 = 1;
+const LOCK_HANDLE: u32 = 2;
+const LOCK_WRITE: u32 = 4;
 
 impl Lock {
-    fn take(path: &Path) -> Lock {
+    /// Takes a lock of the given levels (read, handle and write caching, alone or together).
+    fn take(path: &Path, levels: u32) -> Lock {
         let wide = wide_path(path);
         // SAFETY: the path is NUL-terminated and the call keeps nothing of it.
         let raw = unsafe {
@@ -1449,9 +1517,9 @@ impl Lock {
             "an event",
         )
         .unwrap();
-        // REQUEST_OPLOCK_INPUT_BUFFER: version 1, its length 12, the levels read, handle and write
-        // (1, 2 and 4) and the flag that requests.
-        let mut input = Box::new([1_u32 | (12 << 16), 7, 1]);
+        // REQUEST_OPLOCK_INPUT_BUFFER: version 1, its length 12, the levels and the flag that
+        // requests.
+        let mut input = Box::new([1_u32 | (12 << 16), levels, 1]);
         let mut output = Box::new([0_u32; 6]);
         // SAFETY: an all-zero OVERLAPPED is the documented initial state.
         let mut overlapped: Box<OVERLAPPED> = Box::new(unsafe { std::mem::zeroed() });
@@ -1498,7 +1566,7 @@ fn an_object_held_by_a_lock_that_is_not_given_up_is_a_leftover_within_the_waits_
     let (_run, root, _owner) = made_root(&scratch);
     let held = root.tmp().join("locked.txt");
     std::fs::write(&held, b"locked").unwrap();
-    let lock = Lock::take(&held);
+    let lock = Lock::take(&held, LOCK_READ | LOCK_HANDLE | LOCK_WRITE);
     let guard = privilege::enter().unwrap();
     let mut rows = Rows::default();
     let started = Instant::now();
@@ -1521,7 +1589,7 @@ fn an_object_held_by_a_lock_that_is_not_given_up_is_a_leftover_within_the_waits_
     );
     assert!(
         spent < Duration::from_secs(20),
-        "the removal did not wait inside an open for the lock's break (the platform gives up after about 35 seconds): {spent:?}"
+        "the removal did not wait inside an open for the lock's break, which nobody answers: {spent:?}"
     );
     assert_eq!(
         leftovers,
@@ -1536,6 +1604,106 @@ fn an_object_held_by_a_lock_that_is_not_given_up_is_a_leftover_within_the_waits_
     assert!(
         rest.is_empty(),
         "once the lock is gone the next removal finishes: {rest:?}"
+    );
+    assert!(common::is_gone(root), "the root is gone");
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn an_object_held_by_a_lock_of_any_kind_is_removed_or_a_leftover_and_no_call_waits_without_end() {
+    for (levels, kind) in [
+        (LOCK_READ, "read"),
+        (LOCK_READ | LOCK_HANDLE, "read and handle"),
+        (LOCK_READ | LOCK_WRITE, "read and write"),
+        (
+            LOCK_READ | LOCK_WRITE | LOCK_HANDLE,
+            "read, write and handle",
+        ),
+    ] {
+        let scratch = Scratch::new();
+        let (_run, root, _owner) = made_root(&scratch);
+        let held = root.tmp().join("locked.txt");
+        std::fs::write(&held, b"locked").unwrap();
+        let lock = Lock::take(&held, levels);
+        let guard = privilege::enter().unwrap();
+        let mut rows = Rows::default();
+        let started = Instant::now();
+        let leftovers = remove_root_within(
+            &root,
+            &guard,
+            Limits {
+                wait_each: Duration::from_secs(1),
+                wait_total: Duration::from_secs(2),
+                ..ROOT_LIMITS
+            },
+            &mut rows,
+        )
+        .unwrap();
+        let spent = started.elapsed();
+        drop(guard);
+        let asked = lock.break_was_asked_for();
+        println!("lock of {kind}: break asked for {asked}, {leftovers:?}, {spent:?}");
+        assert!(
+            spent < Duration::from_secs(20),
+            "{kind}: no call of the removal waited for the lock's break: {spent:?}"
+        );
+        match leftovers.as_slice() {
+            [] => assert!(!held.exists(), "{kind}: removed means gone"),
+            [one] => {
+                assert_eq!(
+                    (one.path.as_str(), one.reason.as_str()),
+                    ("tmp\\locked.txt", "in use"),
+                    "{kind}: a lock that is not given up makes the object one in use"
+                );
+                assert!(held.exists(), "{kind}: the object is as it was");
+            }
+            more => panic!("{kind}: {more:?}"),
+        }
+        drop(lock);
+        let (rest, _) = remove_with_the_walks_privileges(&root);
+        assert!(rest.is_empty(), "{kind}: once the lock is gone: {rest:?}");
+        assert!(common::is_gone(root), "{kind}: the root is gone");
+    }
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_listed_object_renamed_by_case_alone_is_a_leftover_and_is_not_removed_under_its_old_name() {
+    let scratch = Scratch::new();
+    let (_run, root, _owner) = made_root(&scratch);
+    let tmp = root.tmp();
+    std::fs::write(tmp.join("case-swap.txt"), b"the same object").unwrap();
+    {
+        let tmp = tmp.clone();
+        removal::set(root.name(), move |event| {
+            // After the listing and before the open: the object keeps its identity and takes the
+            // same name in capitals. The old spelling still opens it.
+            if let Event::Listed { directory, .. } = event
+                && *directory == "tmp"
+            {
+                std::fs::rename(tmp.join("case-swap.txt"), tmp.join("CASE-SWAP.TXT")).unwrap();
+            }
+        });
+    }
+    let (leftovers, log) = remove_with_the_walks_privileges(&root);
+    removal::clear(root.name());
+    assert_eq!(
+        leftovers,
+        [Leftover {
+            path: "tmp\\case-swap.txt".to_owned(),
+            reason: "the object is no longer directly beneath its directory".to_owned()
+        }]
+    );
+    assert!(log.is_empty(), "no removed row while something is left");
+    let names: Vec<String> = std::fs::read_dir(&tmp)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["CASE-SWAP.TXT"], "the object is as it was");
+    let (rest, _) = remove_with_the_walks_privileges(&root);
+    assert!(
+        rest.is_empty(),
+        "the next removal lists the new spelling: {rest:?}"
     );
     assert!(common::is_gone(root), "the root is gone");
 }

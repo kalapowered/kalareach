@@ -255,27 +255,136 @@ impl Listing {
     }
 }
 
-/// A child that was opened by its listed name and read back.
+/// A child that was opened by its listed name and read back. Only [`DirHandle::open_child`] makes
+/// one, so a handle that did not come from such an open cannot be turned into a held directory.
 #[derive(Debug)]
 pub struct Opened {
-    /// The open handle. It is not open for delete sharing.
-    pub handle: Handle,
-    /// The object's identity.
-    pub key: FileKey,
-    /// What kind of object it is.
-    pub kind: Kind,
-    /// The attributes read from the handle.
-    pub attributes: u32,
-    /// The number of names the object has.
-    pub links: u32,
+    handle: Handle,
+    key: FileKey,
+    kind: Kind,
+    attributes: u32,
+    links: u32,
 }
 
-/// What the cases use to make the platform fail where a hostile tree cannot be made to.
+impl Opened {
+    /// The open handle. It is not open for delete sharing.
+    #[must_use]
+    pub fn handle(&self) -> &Handle {
+        &self.handle
+    }
+
+    /// The object's identity.
+    #[must_use]
+    pub fn key(&self) -> FileKey {
+        self.key
+    }
+
+    /// What kind of object it is.
+    #[must_use]
+    pub fn kind(&self) -> Kind {
+        self.kind
+    }
+
+    /// The attributes read from the handle.
+    #[must_use]
+    pub fn attributes(&self) -> u32 {
+        self.attributes
+    }
+
+    /// The number of names the object has.
+    #[must_use]
+    pub fn links(&self) -> u32 {
+        self.links
+    }
+}
+
+/// What the cases use to make the platform fail where a hostile tree cannot be made to, and to
+/// count the platform calls a walk makes.
 #[cfg(feature = "testing")]
 pub mod testing {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     static FAIL_READ_OF: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    #[derive(Default)]
+    struct Calls {
+        opens: Vec<String>,
+        listings: Vec<String>,
+    }
+
+    static RECORDINGS: Mutex<Vec<(String, Arc<Mutex<Calls>>)>> = Mutex::new(Vec::new());
+
+    /// The opens of names and the listing calls made on directories whose final path holds a text,
+    /// from [`record`] until it is dropped. A case records on the name of its own root, so cases
+    /// that run side by side do not count each other's calls.
+    pub struct Recording {
+        calls: Arc<Mutex<Calls>>,
+    }
+
+    /// Starts recording the calls on directories whose final path holds `within`.
+    #[must_use]
+    pub fn record(within: &str) -> Recording {
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        RECORDINGS
+            .lock()
+            .unwrap()
+            .push((within.to_owned(), calls.clone()));
+        Recording { calls }
+    }
+
+    impl Recording {
+        /// Every open of a name made relative to a recorded directory, each as the directory's
+        /// final path, a backslash and the name, in the order made. An open that fails counts.
+        #[must_use]
+        pub fn opens(&self) -> Vec<String> {
+            self.calls.lock().unwrap().opens.clone()
+        }
+
+        /// How many times the platform was asked for entries of a recorded directory whose final
+        /// path ends with `directory_ends_with`.
+        #[must_use]
+        pub fn listing_calls(&self, directory_ends_with: &str) -> usize {
+            self.calls
+                .lock()
+                .unwrap()
+                .listings
+                .iter()
+                .filter(|path| path.ends_with(directory_ends_with))
+                .count()
+        }
+    }
+
+    impl Drop for Recording {
+        fn drop(&mut self) {
+            RECORDINGS
+                .lock()
+                .unwrap()
+                .retain(|(_, calls)| !Arc::ptr_eq(calls, &self.calls));
+        }
+    }
+
+    pub(super) fn note_open(directory: &[u16], name: &[u16]) {
+        let directory = String::from_utf16_lossy(directory);
+        let name = String::from_utf16_lossy(name);
+        for (within, calls) in RECORDINGS.lock().unwrap().iter() {
+            if directory.contains(within.as_str()) {
+                calls
+                    .lock()
+                    .unwrap()
+                    .opens
+                    .push(format!("{directory}\\{name}"));
+            }
+        }
+    }
+
+    pub(super) fn note_listing(directory: &[u16]) {
+        let directory = String::from_utf16_lossy(directory);
+        for (within, calls) in RECORDINGS.lock().unwrap().iter() {
+            if directory.contains(within.as_str()) {
+                calls.lock().unwrap().listings.push(directory.clone());
+            }
+        }
+    }
 
     /// Makes the next read-back of the child listed under `name` fail, once, as if the platform
     /// had refused the query after the open.
@@ -602,6 +711,8 @@ impl DirHandle {
         let mut class = FileIdExtdDirectoryRestartInfo;
         let mut children = Vec::new();
         loop {
+            #[cfg(feature = "testing")]
+            testing::note_listing(&self.path);
             // SAFETY: the handle is open for listing and the buffer length is passed.
             let read = unsafe {
                 GetFileInformationByHandleEx(
@@ -672,10 +783,11 @@ impl DirHandle {
     /// while it is held the child cannot be renamed or removed by anyone else. That holds only for
     /// an open that takes part in share checks, so `access` must include a delete or a data
     /// right: a call that asks for attribute or security rights alone is refused. The whole key,
-    /// volume and identifier, is compared with the listing's on the handle returned. A directory,
-    /// or a file with one name, must have a final path that is this directory's plus exactly the
-    /// listed name. A file with more than one name may show any of them as its final path, so its
-    /// place is not shown that way and the caller reads `links` and decides.
+    /// volume and identifier, is compared with the listing's on the handle returned. Its final path
+    /// must be this directory's plus exactly the listed name, a file with several names included:
+    /// only NTFS volumes are accepted, and on one a handle opened by name relative to a directory
+    /// reports the name it was opened through. The caller reads `links` to learn that the object has
+    /// other names.
     ///
     /// # Errors
     ///
@@ -732,12 +844,9 @@ impl DirHandle {
         } else {
             Kind::File
         };
-        let several_names = kind == Kind::File && standard.NumberOfLinks > 1;
-        if !several_names {
-            let path = final_path(&handle)?;
-            if !is_beneath(&self.path, &path, &child.name) {
-                return Ok(Err(Lost::MovedOut));
-            }
+        let path = final_path(&handle)?;
+        if !is_beneath(&self.path, &path, &child.name) {
+            return Ok(Err(Lost::MovedOut));
         }
         Ok(Ok(Opened {
             handle,
@@ -750,6 +859,12 @@ impl DirHandle {
 
     /// Turns a directory that was opened as a child, with listing access, into a held directory.
     pub(super) fn from_opened(opened: Opened) -> Result<DirHandle> {
+        if opened.kind != Kind::Directory {
+            return Err(error(
+                ERROR_INVALID_PARAMETER,
+                "only an object that read back as a directory is held as one",
+            ));
+        }
         let path = final_path(&opened.handle)?;
         Ok(DirHandle {
             handle: opened.handle,
@@ -874,17 +989,25 @@ fn nt_error(status: i32, what: &str) -> super::ffi::Error {
 }
 
 impl DirHandle {
-    /// Opens the name `name` directly beneath this directory, relative to its handle and never
-    /// through a path, without following a reparse point: a link is opened as itself. The handle
-    /// is not open for delete sharing unless `share_delete` says so. It is for a probe or a name
-    /// the caller already knows; an object a walk acts on is opened with
-    /// [`DirHandle::open_child`].
+    /// Tells whether the name `name` exists directly beneath this directory. It is a probe and
+    /// gives nothing else: the open is relative to this directory's handle, asks for no right but
+    /// to read attributes, shares everything and is closed at once, so it holds nothing and
+    /// follows no reparse point. An object a walk acts on is opened with [`DirHandle::open_child`].
     ///
     /// # Errors
     ///
-    /// Returns the platform's error when the name cannot be opened.
-    pub fn open_name(&self, name: &[u16], access: u32, share_delete: bool) -> Result<Handle> {
-        self.nt_open(name, access, share_delete, FILE_OPEN, 0, None)
+    /// Returns the platform's error when the platform refuses the probe for a reason other than
+    /// the name's absence.
+    pub fn name_exists(&self, name: &[u16]) -> Result<bool> {
+        match self.nt_open(name, 0, true, FILE_OPEN, 0, None) {
+            Ok(_) => Ok(true),
+            Err(failure)
+                if failure.code == ERROR_FILE_NOT_FOUND || failure.code == ERROR_PATH_NOT_FOUND =>
+            {
+                Ok(false)
+            }
+            Err(failure) => Err(failure),
+        }
     }
 
     /// Makes a new file named `name` directly beneath this directory, relative to its handle, and
@@ -916,6 +1039,8 @@ impl DirHandle {
         options: u32,
         descriptor: Option<&OwnedSd>,
     ) -> Result<Handle> {
+        #[cfg(feature = "testing")]
+        testing::note_open(&self.path, name);
         let bytes = name.len() * 2;
         if bytes > usize::from(u16::MAX) {
             return Err(error(
@@ -1013,7 +1138,7 @@ impl DirHandle {
         access: u32,
     ) -> Result<std::result::Result<DirHandle, Lost>> {
         require_holding(access)?;
-        let handle = match self.open_name(name, access, false) {
+        let handle = match self.nt_open_name(name, access, false, FILE_OPEN) {
             Ok(handle) => handle,
             Err(failure)
                 if failure.code == ERROR_FILE_NOT_FOUND || failure.code == ERROR_PATH_NOT_FOUND =>

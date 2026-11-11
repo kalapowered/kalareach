@@ -4,8 +4,9 @@
 //! The system's own walk that propagates a list to every child (`SetNamedSecurityInfoW`) is used
 //! only by [`set_protected`], for a directory that belongs to the installation and whose children
 //! the installer made itself. A directory that a boundary account can reach, and one that may hold
-//! what a hostile repository wrote, is changed only on a held handle, with nothing propagated:
-//! [`set_protected_when_empty`].
+//! what a hostile repository wrote, is not changed with it: [`set_protected_when_empty`] changes
+//! its list on a held handle with nothing propagated, and the caller chooses which function a
+//! directory takes.
 
 #![allow(unsafe_code)]
 

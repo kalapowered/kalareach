@@ -26,7 +26,9 @@
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_DISPOSITION_DELETE, FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE,
@@ -34,7 +36,7 @@ use windows_sys::Wdk::Storage::FileSystem::{
     FileDispositionInformationEx, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
+    ERROR_ACCESS_DENIED, ERROR_OPERATION_ABORTED, ERROR_SHARING_VIOLATION, HANDLE,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
@@ -42,7 +44,7 @@ use windows_sys::Win32::Security::Cryptography::{
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
 };
-use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+use windows_sys::Win32::System::IO::{CancelIoEx, IO_STATUS_BLOCK};
 
 use super::ffi::{Handle, Sid, error};
 use super::privilege::PrivGuard;
@@ -53,6 +55,12 @@ use crate::journal::rows::RootName;
 
 const READ_CONTROL: u32 = 0x0002_0000;
 const RETRY_EVERY: Duration = Duration::from_millis(100);
+/// How often the watch over a delete call looks at it.
+const WATCH_EVERY: Duration = Duration::from_millis(50);
+/// What a delete call is given at least, once the waits for the whole root are spent: an ordinary
+/// delete takes a few milliseconds, and one that is still waiting after this long is held by a
+/// lock that nobody answers.
+const DELETE_FLOOR: Duration = Duration::from_millis(500);
 
 /// The figures a removal works within, stated once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,10 +68,13 @@ pub struct Limits {
     /// The most objects a root may hold and the deepest it may be nested. More is one
     /// `too large` leftover for the root.
     pub bounds: Bounds,
-    /// How long the removal waits for one object that another process has open.
+    /// How long the removal waits for one object that another process has open, and how long the
+    /// delete call on an opened object may take before it is cancelled and the object is a
+    /// leftover.
     pub wait_each: Duration,
-    /// How long the removal waits for objects in use in all, for one root. Past it, an object in
-    /// use is a leftover at once.
+    /// How long the removal waits for objects in use in all, for one root, the time of cancelled
+    /// delete calls included. Past it, an object in use is a leftover at once, and a delete call
+    /// is given [`DELETE_FLOOR`].
     pub wait_total: Duration,
 }
 
@@ -310,12 +321,38 @@ pub fn remove_root_within(
     limits: Limits,
     rows: &mut dyn RootRows,
 ) -> Result<Vec<Leftover>, RootError> {
+    let watch = Watch::default();
+    std::thread::scope(|scope| {
+        scope.spawn(|| watch.run());
+        // The watch ends when the removal does, by a panic too.
+        let _end = EndWatch(&watch.finished);
+        remove_root_watched(root, limits, &watch, rows)
+    })
+}
+
+struct EndWatch<'a>(&'a AtomicBool);
+
+impl Drop for EndWatch<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+fn remove_root_watched(
+    root: &PrivateRoot,
+    limits: Limits,
+    watch: &Watch,
+    rows: &mut dyn RootRows,
+) -> Result<Vec<Leftover>, RootError> {
     let mut state = Removal {
         limits,
         listed: 0,
         waited: Duration::ZERO,
         too_large: false,
         leftovers: Vec::new(),
+        watch,
+        #[cfg(feature = "testing")]
+        root: root.name.as_str().to_owned(),
     };
     state.empty(&root.dir, "", 1);
     if state.leftovers.is_empty() {
@@ -330,11 +367,42 @@ pub fn remove_root_within(
     Ok(state.leftovers)
 }
 
+/// A delete call that is under way, as the watch over it sees it.
+#[derive(Default)]
+struct Watch {
+    /// The handle of the delete call in progress, when it began and how long it may take.
+    current: Mutex<Option<(usize, Instant, Duration)>>,
+    finished: AtomicBool,
+}
+
+impl Watch {
+    /// Cancels the delete call in progress once it has taken longer than it may. An object that
+    /// another process holds by a lock it does not give up makes the call wait for an answer that
+    /// never comes, and no wait of the caller counts inside it; the cancelled call fails and the
+    /// object is a leftover.
+    fn run(&self) {
+        while !self.finished.load(Ordering::Acquire) {
+            std::thread::sleep(WATCH_EVERY);
+            let current = self.current.lock().unwrap();
+            if let Some((raw, since, limit)) = *current
+                && since.elapsed() >= limit
+            {
+                // SAFETY: the removal clears `current` under this lock before it lets go of the
+                // handle, so the handle is open while the lock is held with it set. The call only
+                // cancels requests that are pending on it.
+                unsafe { CancelIoEx(raw as HANDLE, std::ptr::null()) };
+            }
+        }
+    }
+}
+
 /// What the cases may watch and use during a removal: the points between a listing and the open
 /// of what it named, and between that open and the deletion, where a sibling's change would land.
 #[cfg(feature = "testing")]
 pub mod testing {
     use std::sync::{Arc, Mutex};
+
+    use crate::journal::rows::RootName;
 
     /// A point of the removal.
     #[derive(Debug)]
@@ -357,27 +425,39 @@ pub mod testing {
 
     type Hook = Arc<dyn Fn(&Event<'_>) + Send + Sync>;
 
-    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+    static HOOKS: Mutex<Vec<(String, Hook)>> = Mutex::new(Vec::new());
 
-    /// Sets the function called at each point, until [`clear`].
-    pub fn set(hook: impl Fn(&Event<'_>) + Send + Sync + 'static) {
-        *HOOK.lock().unwrap() = Some(Arc::new(hook));
+    /// Sets the function called at each point of the removal of the root named `root`, until
+    /// [`clear`]. The removal of another root does not call it, so cases that run side by side do
+    /// not meet each other's function.
+    pub fn set(root: &RootName, hook: impl Fn(&Event<'_>) + Send + Sync + 'static) {
+        let mut hooks = HOOKS.lock().unwrap();
+        hooks.retain(|(name, _)| name != root.as_str());
+        hooks.push((root.as_str().to_owned(), Arc::new(hook)));
     }
 
-    /// Removes the function.
-    pub fn clear() {
-        *HOOK.lock().unwrap() = None;
+    /// Removes the function of the root named `root`.
+    pub fn clear(root: &RootName) {
+        HOOKS
+            .lock()
+            .unwrap()
+            .retain(|(name, _)| name != root.as_str());
     }
 
-    pub(super) fn fire(event: &Event<'_>) {
-        let hook = HOOK.lock().unwrap().clone();
+    pub(super) fn fire(root: &str, event: &Event<'_>) {
+        let hook = HOOKS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(name, _)| name == root)
+            .map(|(_, hook)| hook.clone());
         if let Some(hook) = hook {
             hook(event);
         }
     }
 }
 
-struct Removal {
+struct Removal<'a> {
     limits: Limits,
     /// The children listed so far, in every directory: the objects the root has used.
     listed: usize,
@@ -386,6 +466,11 @@ struct Removal {
     /// Whether the one `too large` leftover was made.
     too_large: bool,
     leftovers: Vec<Leftover>,
+    /// The watch over the delete calls.
+    watch: &'a Watch,
+    /// The root's name, which the cases' functions are set by.
+    #[cfg(feature = "testing")]
+    root: String,
 }
 
 fn joined(at: &str, child: &Child) -> String {
@@ -396,7 +481,7 @@ fn joined(at: &str, child: &Child) -> String {
     }
 }
 
-impl Removal {
+impl Removal<'_> {
     fn leave(&mut self, path: &str, reason: impl Into<String>) {
         self.leftovers.push(Leftover {
             path: path.to_owned(),
@@ -405,11 +490,11 @@ impl Removal {
     }
 
     /// The root's tree has more than the limits allow. That is one leftover for the root, made
-    /// the first time and naming where it was first seen.
-    fn leave_too_large(&mut self, path: &str) {
+    /// the first time, whichever directory is the first to show it.
+    fn leave_too_large(&mut self) {
         if !self.too_large {
             self.too_large = true;
-            self.leave(path, "too large");
+            self.leave("", "too large");
         }
     }
 
@@ -430,13 +515,16 @@ impl Removal {
         };
         self.listed += listing.children.len();
         #[cfg(feature = "testing")]
-        testing::fire(&testing::Event::Listed {
-            directory: at,
-            names: listing.children.iter().map(Child::display).collect(),
-            more: listing.more,
-        });
+        testing::fire(
+            &self.root,
+            &testing::Event::Listed {
+                directory: at,
+                names: listing.children.iter().map(Child::display).collect(),
+                more: listing.more,
+            },
+        );
         if listing.more {
-            self.leave_too_large(at);
+            self.leave_too_large();
         }
         for child in &listing.children {
             let path = joined(at, child);
@@ -448,7 +536,7 @@ impl Removal {
         let listed_directory = child.attributes & FILE_ATTRIBUTE_DIRECTORY != 0
             && child.attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0;
         if listed_directory && depth >= self.limits.bounds.depth {
-            self.leave_too_large(path);
+            self.leave_too_large();
             return;
         }
         // A link is opened as itself, with the right to delete it alone; a directory also with
@@ -471,16 +559,9 @@ impl Removal {
             }
         };
         #[cfg(feature = "testing")]
-        testing::fire(&testing::Event::Opened { path });
-        match opened.kind {
-            Kind::File | Kind::ReparsePoint => {
-                if let Err(failure) = delete(&opened.handle) {
-                    self.leave(
-                        path,
-                        format!("not removed (Windows error {})", failure.code),
-                    );
-                }
-            }
+        testing::fire(&self.root, &testing::Event::Opened { path });
+        match opened.kind() {
+            Kind::File | Kind::ReparsePoint => self.remove(opened.handle(), path),
             Kind::Directory if !listed_directory => {
                 // The listing said a link and the object now reads as an ordinary directory:
                 // it was opened for deletion alone and is not entered.
@@ -518,14 +599,7 @@ impl Removal {
                             self.leave(path, "not empty after its contents were removed");
                         }
                     }
-                    Ok(_) => {
-                        if let Err(failure) = delete(held.handle()) {
-                            self.leave(
-                                path,
-                                format!("not removed (Windows error {})", failure.code),
-                            );
-                        }
-                    }
+                    Ok(_) => self.remove(held.handle(), path),
                 }
             }
         }
@@ -555,10 +629,32 @@ impl Removal {
             }
         }
     }
-}
 
-fn is_gone(code: u32) -> bool {
-    code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND
+    /// Deletes the object behind `handle`, which was opened and checked, and makes a leftover of
+    /// it when it cannot be. The open of every name completes at once on a lock that is not given
+    /// up, so no delete call is reached on a handle that was opened while a break was owed; a
+    /// break that the delete itself owes is the one a lock can still make it wait for, and the
+    /// watch cancels the call after the wait the removal allows, which makes the object one that
+    /// is in use.
+    fn remove(&mut self, handle: &Handle, path: &str) {
+        let remaining = self.limits.wait_total.saturating_sub(self.waited);
+        let limit = remaining.min(self.limits.wait_each).max(DELETE_FLOOR);
+        let started = Instant::now();
+        *self.watch.current.lock().unwrap() = Some((handle.raw() as usize, started, limit));
+        let result = delete(handle);
+        *self.watch.current.lock().unwrap() = None;
+        match result {
+            Ok(()) => {}
+            Err(failure) if failure.code == ERROR_OPERATION_ABORTED => {
+                self.waited += started.elapsed();
+                self.leave(path, "in use");
+            }
+            Err(failure) => self.leave(
+                path,
+                format!("not removed (Windows error {})", failure.code),
+            ),
+        }
+    }
 }
 
 /// Deletes the object behind the handle with POSIX semantics: the name goes at once, whatever
@@ -602,11 +698,10 @@ pub fn check_disposition(dir: &DirHandle) -> Result<(), RootError> {
     let handle = dir.create_file_named(&units, DELETE)?;
     delete(&handle)?;
     drop(handle);
-    match dir.open_name(&units, 0, false) {
-        Ok(_) => Err(RootError::Refused(
+    if dir.name_exists(&units)? {
+        return Err(RootError::Refused(
             "the platform's delete with POSIX semantics left the scratch file".to_owned(),
-        )),
-        Err(failure) if is_gone(failure.code) => Ok(()),
-        Err(failure) => Err(failure.into()),
+        ));
     }
+    Ok(())
 }
