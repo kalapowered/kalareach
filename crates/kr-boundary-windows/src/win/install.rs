@@ -340,14 +340,14 @@ fn made_if_missing(path: &Path, readable: &Principals, what: &str) -> Result<(),
 /// Puts a program file in the program directory: made new with its descriptor when it is not there;
 /// a file that an earlier run of this installation put there was checked on its handle when the
 /// installation was entered, and is overwritten as it is, keeping the descriptor that was checked.
-fn install_program_file(source: &Path, target: &Path, readable: &Principals) -> io::Result<()> {
+fn install_program_file(source: &Path, target: &Path) -> io::Result<()> {
     let mut from = fs::File::open(source)?;
     if target.exists() {
         let mut to = OpenOptions::new().write(true).truncate(true).open(target)?;
         io::copy(&mut from, &mut to)?;
         return to.sync_all();
     }
-    let mut to = fresh::file_with(target, SdKind::AdminFile, readable, true)?;
+    let mut to = fresh::file_at(target, SdKind::ProgramFile, true)?;
     io::copy(&mut from, &mut to)?;
     to.sync_all()
 }
@@ -1331,7 +1331,10 @@ fn check_program_directory(paths: &Paths) -> Result<(), Error> {
     inspect_within(paths, Scope::Program, &paths.program, &held, 1)
 }
 
-/// The one name a proof directory holds: the unlisted program.
+/// The one name a proof directory holds: the unlisted program. Its bytes are those of the system's
+/// own `hostname.exe`, so the file holds no secret; the proof makes it with a descriptor of its own
+/// kind, which lets the one boundary account under proof read and run it and nobody else but the
+/// system and the administrators have any right on it.
 const PROOF_PROGRAM: &str = "unlisted.exe";
 
 /// Reads what a proof directory holds: the unlisted program and nothing else, a file with one
@@ -2092,7 +2095,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         Some(&hex::encode(Sha256::digest(b""))),
     )?;
     if !empty_config.exists() {
-        fresh::file_with(&empty_config, SdKind::AdminFile, &readable, true)
+        fresh::file_at(&empty_config, SdKind::ProgramFile, true)
             .map_err(io_error("making the empty global configuration"))?;
     }
     for file in &staged {
@@ -2102,7 +2105,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
             &target.display().to_string(),
             Some(&file.sha256),
         )?;
-        install_program_file(&file.path, &target, &readable)
+        install_program_file(&file.path, &target)
             .map_err(io_error(format!("installing {}", file.name)))?;
         if sha256_of(&target)? != file.sha256 {
             return Err(Error::Failed(format!(

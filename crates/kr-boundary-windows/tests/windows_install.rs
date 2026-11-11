@@ -1673,6 +1673,93 @@ fn a_file_that_another_program_reads_by_path_is_made_new_and_owned_by_the_admini
     let _ = std::fs::remove_dir_all(&folder);
 }
 
+/// The proof's program is readable and runnable through the invocation's group that the token of the
+/// account under proof carries, and a program file of the installation by every account: neither
+/// gives a reader a write, a delete or a change of the list, and a plain file names no reader.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_proofs_program_and_the_program_files_give_their_readers_read_and_run_and_nothing_more() {
+    use kr_boundary_windows::win::ffi::Sid;
+    use kr_boundary_windows::win::fresh;
+    use kr_boundary_windows::win::sd::{self, Principals, SdKind};
+    const SYSTEM: &str = "S-1-5-18";
+    const ADMINISTRATORS: &str = "S-1-5-32-544";
+    const USERS: &str = "S-1-5-32-545";
+    const GROUP: &str = "S-1-5-21-1111-2222-3333-1001";
+    const FULL: u32 = 0x001f_01ff;
+    const READ_AND_RUN: u32 = 0x0012_00a9;
+    let named = Principals {
+        group: Some(Sid::parse(GROUP).unwrap()),
+        ..Principals::default()
+    };
+
+    // The text of each kind.
+    assert_eq!(
+        sd::descriptor_text(SdKind::ProofProgram, &named).unwrap(),
+        format!("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;{GROUP})")
+    );
+    sd::descriptor_text(SdKind::ProofProgram, &Principals::default())
+        .expect_err("the proof's program names the invocation's group, and none is given");
+    assert_eq!(
+        sd::descriptor_text(SdKind::ProgramFile, &Principals::default()).unwrap(),
+        "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"
+    );
+    assert_eq!(
+        sd::descriptor_text(
+            SdKind::AdminFile,
+            &Principals {
+                users_may_read: true,
+                ..named.clone()
+            }
+        )
+        .unwrap(),
+        "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)",
+        "a plain file names no reader, whatever the principals say"
+    );
+
+    // The files the kinds make carry that list from the call that makes them.
+    let folder = inherited_folder();
+    let entries = |path: &std::path::Path| -> Vec<(String, u32)> {
+        let made = summary_of(path);
+        assert_eq!(made.owner, ADMINISTRATORS);
+        assert!(made.protected);
+        made.entries
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                assert_eq!(
+                    (entry.kind, entry.flags),
+                    (0, 0),
+                    "an allow entry, not inherited"
+                );
+                (entry.sid.clone(), entry.mask)
+            })
+            .collect()
+    };
+    let proof = folder.join("unlisted.exe");
+    drop(fresh::file_with(&proof, SdKind::ProofProgram, &named, true).unwrap());
+    assert_eq!(
+        entries(&proof),
+        [
+            (SYSTEM.to_owned(), FULL),
+            (ADMINISTRATORS.to_owned(), FULL),
+            (GROUP.to_owned(), READ_AND_RUN)
+        ]
+    );
+    let program = folder.join("program.exe");
+    drop(fresh::file_at(&program, SdKind::ProgramFile, true).unwrap());
+    assert_eq!(
+        entries(&program),
+        [
+            (SYSTEM.to_owned(), FULL),
+            (ADMINISTRATORS.to_owned(), FULL),
+            (USERS.to_owned(), READ_AND_RUN)
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_installation_stops_before_it_lays_anything_down_when_the_parent_folder_is_not_its_own() {

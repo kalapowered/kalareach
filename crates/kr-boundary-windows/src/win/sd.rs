@@ -39,8 +39,9 @@ const ALL_BUT_CHANGING_THE_DESCRIPTOR: &str = "0x13ffff";
 const MODIFY: &str = "0x1301bf";
 /// Read a pipe's data and its attributes, and nothing else.
 const PIPE_READ: &str = "0x120089";
-/// Read and enter, for every account.
-const READ_AND_ENTER: &str = "0x1200a9";
+/// Read and enter a folder, or read and run a file, and nothing else: no write, no delete, no
+/// change of the list or the owner.
+const READ_AND_EXECUTE: &str = "0x1200a9";
 
 /// What an object's descriptor is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,9 +63,21 @@ pub enum SdKind {
     AdminDir,
     /// A file only the system and administrators may use, owned by the Administrators group for the
     /// same reason as an [`SdKind::AdminDir`]: the installation's manifest, its earlier-state
-    /// record and the files it hands to another program by path. When the principals say that every
-    /// account may read, every account may also read and run it (the proof's unlisted program).
+    /// record and the files it hands to another program by path.
     AdminFile,
+    /// A program file of the installation's program directory, which every account may read and
+    /// run and none may change: the system and the administrators have every right, owned by the
+    /// Administrators group as an [`SdKind::AdminFile`] is.
+    ProgramFile,
+    /// The proof's unlisted program, a copy of the system's own `hostname.exe` made in the proof's
+    /// directory for one run. The file holds the bytes of a program that ships with Windows and no
+    /// secret. The system and the administrators have every right; the invocation's group, which
+    /// is enabled in the token of both boundary accounts, may read and run it, because the file
+    /// system would otherwise refuse the launch before application control could, and the proof
+    /// would prove nothing. The account's own identifier is deny-only in that token, so naming the
+    /// account would let nothing through. Nobody else is named, and nobody but the system and the
+    /// administrators may write, delete or change the file. Only the proof makes this kind.
+    ProofProgram,
     /// The volatile registry key that holds the identifier of the current boot: the system and the
     /// administrators alone may do anything with it, and nobody else may even read it.
     BootMarker,
@@ -86,8 +99,8 @@ pub enum SdKind {
 /// without them.
 #[derive(Clone, Debug, Default)]
 pub struct Principals {
-    /// The invocation's group. [`SdKind::PrivateRoot`] needs it; [`SdKind::ProcessThread`] names it
-    /// when it is given.
+    /// The invocation's group. [`SdKind::PrivateRoot`] and [`SdKind::ProofProgram`] need it;
+    /// [`SdKind::ProcessThread`] names it when it is given.
     pub group: Option<Sid>,
     /// The client of a data pipe. [`SdKind::DataPipe`] needs it.
     pub client: Option<Sid>,
@@ -206,15 +219,21 @@ pub fn descriptor_text(kind: SdKind, principals: &Principals) -> Result<String> 
         SdKind::CapturePipe => Ok("O:BAD:P(A;;GA;;;SY)".to_owned()),
         SdKind::DataParent => Ok("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)".to_owned()),
         SdKind::AdminDir => Ok(if principals.users_may_read {
-            format!("O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;{READ_AND_ENTER};;;BU)")
+            format!("O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;{READ_AND_EXECUTE};;;BU)")
         } else {
             "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)".to_owned()
         }),
-        SdKind::AdminFile => Ok(if principals.users_may_read {
-            format!("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;{READ_AND_ENTER};;;BU)")
-        } else {
-            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)".to_owned()
-        }),
+        SdKind::AdminFile => Ok("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)".to_owned()),
+        SdKind::ProgramFile => Ok(format!(
+            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;{READ_AND_EXECUTE};;;BU)"
+        )),
+        SdKind::ProofProgram => {
+            let group = needed(principals.group.as_ref(), "the invocation's group")?;
+            Ok(format!(
+                "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;{READ_AND_EXECUTE};;;{})",
+                group.to_text()
+            ))
+        }
     }
 }
 
