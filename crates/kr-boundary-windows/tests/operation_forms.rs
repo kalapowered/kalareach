@@ -2359,3 +2359,64 @@ fn a_refusal_carries_the_command_and_the_position_and_never_the_element() {
         refusal.detail()
     );
 }
+
+#[test]
+fn the_bounds_of_a_path_and_of_a_revision_are_these_numbers() {
+    assert_eq!(MAX_PATHS, 256);
+    assert_eq!(MAX_PATH_COMPONENTS, 32);
+    assert_eq!(MAX_PATH_BYTES, 240);
+    assert_eq!(MAX_REV_BYTES, 240);
+    assert_eq!(MAX_NAME_BYTES, 200);
+    assert_eq!(MAX_REF_NAME_BYTES, 211);
+    assert_eq!(MAX_MESSAGE_BYTES, 8192);
+}
+
+#[test]
+fn the_grammar_refuses_a_control_character_on_its_own() {
+    use kr_boundary_windows::operation::grammar;
+    for control in ['\u{0}', '\u{1}', '\t', '\n', '\u{1f}', '\u{7f}'] {
+        let path = format!("a{control}b");
+        assert_eq!(grammar::path(&path), Err(RULE_PATH), "{control:?}");
+    }
+    assert_eq!(grammar::path("a/./b"), Err(RULE_PATH));
+    assert_eq!(grammar::path("a/../b"), Err(RULE_PATH));
+    assert_eq!(grammar::path("."), Ok(()));
+    assert_eq!(grammar::count("", 0, 10), None);
+    assert_eq!(grammar::count("0", 0, 10), Some(0));
+    assert_eq!(grammar::count("10", 0, 10), Some(10));
+    assert_eq!(grammar::count("11", 0, 10), None);
+}
+
+#[test]
+fn a_revision_of_exactly_the_limit_is_refused_by_its_grammar_and_one_more_by_its_length() {
+    // 240 bytes is the limit and is not over it: no accepted revision is that long, so the grammar
+    // refuses it, and the length rule is for the 241st byte.
+    let exactly = format!("{}{}", "n".repeat(MAX_REV_BYTES - 4), "^^^^");
+    assert_eq!(exactly.len(), MAX_REV_BYTES);
+    assert_eq!(refused(Command::RevParse, &[r(&exactly)]), RULE_REVISION);
+    let over = format!("{exactly}^");
+    assert_eq!(
+        refused(Command::RevParse, &[r(&over)]),
+        RULE_REVISION_LENGTH
+    );
+}
+
+#[test]
+fn an_option_that_is_listed_but_out_of_place_is_an_order_refusal_in_any_spelling() {
+    assert_eq!(
+        refused(Command::Diff, &[r("a"), w("--cached=1")]),
+        RULE_ORDER
+    );
+    assert_eq!(refused(Command::Diff, &[r("a"), w("-U")]), RULE_ORDER);
+    assert_eq!(refused(Command::Diff, &[r("a"), w("-U9999")]), RULE_ORDER);
+    assert_eq!(refused(Command::Log, &[r("a"), w("-0")]), RULE_ORDER);
+    assert_eq!(refused(Command::Log, &[r("a"), w("--format")]), RULE_ORDER);
+    // A word no row knows stays unlisted, in any place.
+    assert_eq!(
+        refused(Command::Diff, &[r("a"), w("--nothing")]),
+        RULE_OPTION_UNLISTED
+    );
+    assert_eq!(refused(Command::Log, &[w("-")]), RULE_OPTION_UNLISTED);
+    assert_eq!(refused(Command::Log, &[w("-x5")]), RULE_OPTION_UNLISTED);
+    assert_eq!(refused(Command::Log, &[w("--5")]), RULE_OPTION_UNLISTED);
+}
