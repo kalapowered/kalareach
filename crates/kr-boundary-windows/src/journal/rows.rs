@@ -9,6 +9,68 @@ use serde::{Deserialize, Serialize};
 
 use crate::filekey::FileKey;
 
+/// The name of an invocation's private root, one directory directly under the broker's `run`
+/// directory: exactly 32 lowercase hexadecimal digits.
+///
+/// A row records this name and never a path, so a recovery that acts on a row can only open that
+/// one name relative to the `run` directory it holds.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct RootName(String);
+
+/// Text that is not a private root's name.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("a private root's name is 32 lowercase hexadecimal digits")]
+pub struct RootNameError;
+
+impl RootName {
+    /// How many digits a name has.
+    pub const DIGITS: usize = 32;
+
+    /// Checks that the text is exactly 32 lowercase hexadecimal digits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RootNameError`] for any other text.
+    pub fn parse(text: &str) -> Result<RootName, RootNameError> {
+        if text.len() == Self::DIGITS
+            && text
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            Ok(RootName(text.to_owned()))
+        } else {
+            Err(RootNameError)
+        }
+    }
+
+    /// The name that 16 bytes make.
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; 16]) -> RootName {
+        RootName(hex::encode(bytes))
+    }
+
+    /// The name's digits.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for RootName {
+    type Error = RootNameError;
+
+    fn try_from(text: String) -> Result<RootName, RootNameError> {
+        RootName::parse(&text)
+    }
+}
+
+impl From<RootName> for String {
+    fn from(name: RootName) -> String {
+        name.0
+    }
+}
+
 /// What kind of object a row names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -138,15 +200,15 @@ pub enum Row {
         /// The names that must be absent from the Git directory.
         absent_names: Vec<String>,
     },
-    /// The private root is about to be made at this path.
+    /// The private root is about to be made under this name in the `run` directory.
     RootIntent {
-        /// The root's path.
-        path: String,
+        /// The root's name.
+        name: RootName,
     },
     /// The private root was made.
     RootMade {
-        /// The root's path.
-        path: String,
+        /// The root's name.
+        name: RootName,
         /// The root's identity.
         key: FileKey,
     },
