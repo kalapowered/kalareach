@@ -58,13 +58,16 @@ pub const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6
 
 /// How many open drafts one paired device may hold.
 ///
-/// A draft is open until a prompt sends it to a session or its target session ends, and the
-/// service counts it against the device's own principal. The page makes one draft for each session
-/// it attaches files in, and another for each eight files, so the bound is several times what a
-/// person works in at once; a device holds at most this many open drafts, each of up to
+/// This counts a device's drafts whose session has not ended and that no prompt has sent. A draft
+/// is open until a prompt sends it to a session or its target session ends, and the service
+/// counts it against the device's own principal. Nothing else ends a draft, so a device's draft
+/// names the session it is for: the paired door refuses a create that names none, which would
+/// take its place for good. The page makes one draft for each session it attaches files in, and
+/// another for each eight files, so the bound is several times what a person works in at once; a
+/// device holds at most this many open drafts, each of up to
 /// [`kr_protocol::transfer::MAX_TRANSFER_RESULT_BYTES`] of text. The person at this machine has
-/// no bound, and nothing a device sends changes it: the limit is a constant of this host, which an
-/// owner cannot change.
+/// no bound and may make a draft with no session, and nothing a device sends changes the limit:
+/// it is a constant of this host, which an owner cannot change.
 pub const DEVICE_OPEN_DRAFTS: u64 = 64;
 
 /// How many uploads one paired device may keep staged.
