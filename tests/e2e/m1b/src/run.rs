@@ -2413,8 +2413,9 @@ mod marker_tests {
 
     /// Starts a child that leaves the process group of the one that started it and is adopted by the
     /// system's first process, whose command line names nothing of the run, with the run's marker
-    /// in its environment or with the environment cleared; returns its number.
-    fn detached(root: &Path, run: &Run, keeps_environment: bool) -> u32 {
+    /// in its environment or with the environment cleared; returns its number. The child is the
+    /// sleeper test of the executable `program`.
+    fn detached(root: &Path, run: &Run, keeps_environment: bool, program: &Path) -> u32 {
         use std::io::Read as _;
         let mut command = std::process::Command::new("/usr/bin/perl");
         command
@@ -2426,10 +2427,7 @@ mod marker_tests {
                  open(STDIN, '<', '/dev/null'); \
                  exec $ARGV[0], '--exact', 'run::marker_tests::a_sleeper_the_closing_checks_case_starts', \
                  '--ignored', '--nocapture';",
-                &std::env::current_exe()
-                    .expect("this test executable")
-                    .display()
-                    .to_string(),
+                &program.display().to_string(),
             ])
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -2469,6 +2467,71 @@ mod marker_tests {
         }
     }
 
+    /// The marker search against a build signed ad hoc with the hardened runtime, which every
+    /// other case lacks: a copy of this test executable, signed in the case's own directory, is
+    /// started detached with the marker in its environment. The close finds the child exactly where
+    /// the system's own listing of the child's environment carries the marker, and the case prints
+    /// whether the system showed it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_signed_child_is_found_at_the_close_where_the_system_shows_its_environment() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .expect("the temporary directory")
+            .join(format!("kr-run-signed-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(root.join("w")).expect("a scratch directory");
+        // Beside the run's directory and not in it: a command line that names the run's directory
+        // is found by that, and the case is about the marker.
+        let elsewhere = std::fs::canonicalize(std::env::temp_dir())
+            .expect("the temporary directory")
+            .join(format!("kr-run-signed-copy-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&elsewhere).expect("a directory for the copy");
+        let copy = elsewhere.join("signed-copy");
+        std::fs::copy(
+            std::env::current_exe().expect("this test executable"),
+            &copy,
+        )
+        .expect("a copy of this test executable");
+        let signed = std::process::Command::new("/usr/bin/codesign")
+            .args(["-s", "-", "-o", "runtime", "--force"])
+            .arg(&copy)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("codesign starts");
+        assert!(
+            signed.success(),
+            "the copy is signed with the hardened runtime"
+        );
+        let run = Run::over(&root);
+        let child = detached(&root, &run, true, &copy);
+        let listing = std::process::Command::new("/bin/ps")
+            .args(["-ww", "-E", "-p", &child.to_string(), "-o", "command="])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .expect("ps starts");
+        let (name, value) = run.mark();
+        let shown = String::from_utf8_lossy(&listing.stdout)
+            .split_whitespace()
+            .any(|word| word == format!("{name}={value}"));
+        let closing = run.nothing_running();
+        let found = closing
+            .as_ref()
+            .is_err_and(|said| said.contains(&format!("process {child} holds the run's marker")));
+        println!(
+            "a build signed with the hardened runtime: the system shows its environment: {shown}; \
+             the close finds it: {found}"
+        );
+        assert_eq!(
+            found, shown,
+            "the close finds the child where the system shows it: {closing:?}"
+        );
+        ended(child);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+        std::fs::remove_dir_all(&elsewhere).expect("clean up");
+    }
+
     /// A child that leaves the process group, is adopted by the system's first process and names
     /// nothing of the run is found at the close by the marker in its environment, and the close
     /// fails on it; the child that cleared its environment is not found, which is the limit the
@@ -2480,7 +2543,11 @@ mod marker_tests {
             .join(format!("kr-run-marker-{}", kr_ipc::new_uuid()));
         std::fs::create_dir_all(root.join("w")).expect("a scratch directory");
         let run = Run::over(&root);
-        let (kept, cleared) = (detached(&root, &run, true), detached(&root, &run, false));
+        let this = std::env::current_exe().expect("this test executable");
+        let (kept, cleared) = (
+            detached(&root, &run, true, &this),
+            detached(&root, &run, false, &this),
+        );
         let said = run
             .nothing_running()
             .expect_err("the child that kept its environment is found");
