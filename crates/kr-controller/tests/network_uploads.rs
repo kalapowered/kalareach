@@ -1042,6 +1042,37 @@ async fn a_grant_that_ends_while_a_chunk_is_held_keeps_it_from_being_staged() {
     host.stop().await;
 }
 
+/// KR-REQ-23.21 and KR-REQ-23.41: a chunk whose action window runs out while it is held between the
+/// door's check and the service is refused at the service for the deadline it was admitted under,
+/// with the grant standing, and nothing is staged. The control is the same hold with the window
+/// standing, whose chunk is staged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_window_that_lapses_while_a_chunk_is_held_keeps_it_from_being_staged() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let (moved, clocks) = Moved::new();
+    let host = Host::start_on_clocks(&owner, clocks).await;
+    let device = paired(&host, &owner, &[ActionRight::FilesUpload]).await;
+    let bytes = [3_u8; 96];
+
+    let (kept, answered, _stream) = hold_a_chunk_while(&host, &device, &bytes, || {}).await;
+    answered
+        .expect("the host answers")
+        .expect("a chunk held while its window stands is staged");
+    assert_eq!(received(&host, &device.actor(), kept), 96);
+
+    let (lost, answered, _stream) = hold_a_chunk_while(&host, &device, &bytes, || {
+        moved.advance(Duration::from_secs(60 * 60));
+    })
+    .await;
+    let refused = answered
+        .expect("the device is told")
+        .expect_err("a chunk held past its deadline is refused");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(refused.message.contains("deadline"), "{refused:?}");
+    assert_eq!(received(&host, &device.actor(), lost), 0);
+    host.stop().await;
+}
+
 /// KR-REQ-23.21 and KR-REQ-23.41: a fence owed while a chunk is held between the door's check and
 /// the service refuses the chunk and ends the stream, with nothing staged; once the debt is paid the
 /// device's next stream is served. The control is the same hold with no debt.
