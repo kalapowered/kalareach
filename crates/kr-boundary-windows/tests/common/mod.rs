@@ -15,6 +15,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use kr_boundary_windows::filekey::FileKey;
+use kr_boundary_windows::journal::rows::RootName;
 use kr_boundary_windows::win::ffi::{Handle, Sid, wide_path};
 use kr_boundary_windows::win::root::{RootError, RootRows};
 use kr_boundary_windows::win::sd::{
@@ -85,19 +86,14 @@ pub struct Rows {
 }
 
 impl RootRows for Rows {
-    fn intent(&mut self, path: &Path) -> Result<(), RootError> {
-        assert!(
-            !path.exists(),
-            "the intent is durable before the directory exists"
-        );
-        self.log.push(format!("intent {}", path.display()));
+    fn intent(&mut self, name: &RootName) -> Result<(), RootError> {
+        self.log.push(format!("intent {}", name.as_str()));
         Ok(())
     }
 
-    fn made(&mut self, path: &Path, key: &FileKey) -> Result<(), RootError> {
-        assert!(path.exists(), "the root exists when it is recorded as made");
+    fn made(&mut self, name: &RootName, key: &FileKey) -> Result<(), RootError> {
         self.key = Some(*key);
-        self.log.push(format!("made {}", path.display()));
+        self.log.push(format!("made {}", name.as_str()));
         Ok(())
     }
 

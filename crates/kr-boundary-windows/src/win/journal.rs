@@ -17,7 +17,7 @@ use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_WRITE_THROUGH, FILE_SHAR
 use crate::filekey::FileKey;
 use crate::journal::framing::{self, FramingError};
 use crate::journal::replay::{self, Invocation, OrderError, Reading, Standing, Tracker};
-use crate::journal::rows::Row;
+use crate::journal::rows::{RootName, Row};
 
 use super::launch::{InvocationId, ResumePermit, SuspendedChild};
 use super::root::{RootError, RootRows};
@@ -204,17 +204,15 @@ impl Journal {
 }
 
 impl RootRows for Journal {
-    fn intent(&mut self, path: &Path) -> Result<(), RootError> {
-        self.append(&Row::RootIntent {
-            path: path.display().to_string(),
-        })
-        .map(|_| ())
-        .map_err(|error| RootError::Journal(error.to_string()))
+    fn intent(&mut self, name: &RootName) -> Result<(), RootError> {
+        self.append(&Row::RootIntent { name: name.clone() })
+            .map(|_| ())
+            .map_err(|error| RootError::Journal(error.to_string()))
     }
 
-    fn made(&mut self, path: &Path, key: &FileKey) -> Result<(), RootError> {
+    fn made(&mut self, name: &RootName, key: &FileKey) -> Result<(), RootError> {
         self.append(&Row::RootMade {
-            path: path.display().to_string(),
+            name: name.clone(),
             key: *key,
         })
         .map(|_| ())

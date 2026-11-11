@@ -10,7 +10,9 @@
 use kr_boundary_windows::filekey::FileKey;
 use kr_boundary_windows::journal::framing;
 use kr_boundary_windows::journal::replay::{self, Reading, RootState, Standing, Tracker};
-use kr_boundary_windows::journal::rows::{DigestedFile, LeftoverClass, Row, SnapshotKind};
+use kr_boundary_windows::journal::rows::{
+    DigestedFile, LeftoverClass, RootName, RootNameError, Row, SnapshotKind,
+};
 
 #[cfg(all(windows, feature = "testing"))]
 mod common;
@@ -20,6 +22,10 @@ const ID: &str = "000102030405060708090a0b0c0d0e0f";
 
 fn key(n: u64) -> FileKey {
     FileKey::ntfs(0xabcd, n)
+}
+
+fn root_name(n: u8) -> RootName {
+    RootName::from_bytes([n; 16])
 }
 
 fn begin() -> Row {
@@ -88,11 +94,9 @@ fn every_row_reads_back_as_written() {
     let rows = vec![
         begin(),
         snapshot(1, SnapshotKind::Initial),
-        Row::RootIntent {
-            path: r"C:\run\a".to_owned(),
-        },
+        Row::RootIntent { name: root_name(1) },
         Row::RootMade {
-            path: r"C:\run\a".to_owned(),
+            name: root_name(1),
             key: key(9),
         },
         Row::Grant {
@@ -130,19 +134,11 @@ fn every_row_reads_back_as_written() {
 #[test]
 fn a_crash_after_the_root_intent_and_before_the_made_row_leaves_the_root_in_doubt() {
     let found = invocation(
-        &file_of(&[
-            begin(),
-            Row::RootIntent {
-                path: r"C:\run\a".to_owned(),
-            },
-        ]),
+        &file_of(&[begin(), Row::RootIntent { name: root_name(1) }]),
         BOOT,
     );
     assert_eq!(found.standing, Standing::Unfinished);
-    assert_eq!(
-        found.tracker.root(),
-        &RootState::IntentOnly(r"C:\run\a".to_owned())
-    );
+    assert_eq!(found.tracker.root(), &RootState::IntentOnly(root_name(1)));
     assert!(found.tracker.holds_the_slot());
 }
 
@@ -223,9 +219,7 @@ fn refused_after(rows: &[Row], refused: &Row) -> bool {
 
 #[test]
 fn every_row_that_comes_out_of_order_is_refused() {
-    let intent = |path: &str| Row::RootIntent {
-        path: path.to_owned(),
-    };
+    let intent = |n: u8| Row::RootIntent { name: root_name(n) };
     let verified = Row::ReleaseVerified {
         objects: 0,
         leftovers: 0,
@@ -237,27 +231,27 @@ fn every_row_that_comes_out_of_order_is_refused() {
         snapshot: None,
     };
     let cases: Vec<(&str, Vec<Row>, Row)> = vec![
-        ("a first row that does not begin", vec![], intent("a")),
+        ("a first row that does not begin", vec![], intent(1)),
         ("a second beginning", vec![begin()], begin()),
         (
             "a snapshot written twice",
             vec![begin(), snapshot(1, SnapshotKind::Initial)],
             snapshot(1, SnapshotKind::Changed),
         ),
-        ("a second root", vec![begin(), intent("a")], intent("b")),
+        ("a second root", vec![begin(), intent(1)], intent(2)),
         (
             "a root made without its intent",
             vec![begin()],
             Row::RootMade {
-                path: "a".to_owned(),
+                name: root_name(1),
                 key: key(9),
             },
         ),
         (
-            "a root made at another path than its intent",
-            vec![begin(), intent("a")],
+            "a root made under another name than its intent",
+            vec![begin(), intent(1)],
             Row::RootMade {
-                path: "b".to_owned(),
+                name: root_name(2),
                 key: key(9),
             },
         ),
@@ -386,13 +380,7 @@ fn a_row_that_arrives_out_of_order_in_a_file_makes_the_invocation_unreadable() {
 #[test]
 fn a_torn_tail_is_dropped_and_the_rows_before_it_stand() {
     let whole = file_of(&[begin(), snapshot(1, SnapshotKind::Initial)]);
-    let next = framing::encode(
-        &Row::RootIntent {
-            path: r"C:\run\a".to_owned(),
-        }
-        .to_bytes(),
-    )
-    .unwrap();
+    let next = framing::encode(&Row::RootIntent { name: root_name(1) }.to_bytes()).unwrap();
     let mut bytes = whole.clone();
     bytes.extend_from_slice(&next[..5]);
     let found = invocation(&bytes, BOOT);
@@ -433,6 +421,61 @@ fn the_boot_marker_now_is_compared_with_the_one_the_invocation_began_with() {
     assert!(!invocation(&bytes, "another boot").same_boot);
 }
 
+#[test]
+fn a_private_roots_name_is_exactly_thirty_two_lowercase_hexadecimal_digits() {
+    let good = "0123456789abcdef0123456789abcdef";
+    assert_eq!(RootName::parse(good).unwrap().as_str(), good);
+    assert_eq!(RootName::from_bytes([0xab; 16]).as_str(), "ab".repeat(16));
+    for bad in [
+        "",
+        "0123456789abcdef0123456789abcde",
+        "0123456789abcdef0123456789abcdef0",
+        "0123456789ABCDEF0123456789ABCDEF",
+        "0123456789abcdef0123456789abcdeg",
+        "..\\..\\..\\..\\..\\..\\..\\..\\..",
+        r"C:\run\0123456789abcdef0123456789abcdef",
+        "0123456789abcdef/123456789abcdef",
+        "0123456789abcdef0123456789abcde\u{e9}",
+    ] {
+        assert_eq!(RootName::parse(bad), Err(RootNameError), "{bad:?}");
+    }
+}
+
+#[test]
+fn a_root_row_whose_name_is_not_a_name_is_refused_and_the_invocation_is_unreadable() {
+    let good = Row::RootIntent { name: root_name(3) }.to_bytes();
+    assert_eq!(
+        Row::from_bytes(&good).unwrap(),
+        Row::RootIntent { name: root_name(3) }
+    );
+    for name in [r"C:\run\a", "a", "ABCDEF0123456789ABCDEF0123456789", ".."] {
+        let text = format!(
+            r#"{{"row":"RootIntent","name":{}}}"#,
+            serde_json::to_string(name).unwrap()
+        );
+        assert!(Row::from_bytes(text.as_bytes()).is_err(), "{name}");
+        let text = format!(
+            r#"{{"row":"RootMade","name":{},"key":{}}}"#,
+            serde_json::to_string(name).unwrap(),
+            serde_json::to_string(&key(9)).unwrap()
+        );
+        assert!(Row::from_bytes(text.as_bytes()).is_err(), "{name}");
+        let mut bytes = file_of(&[begin()]);
+        let framed = framing::encode(
+            format!(
+                r#"{{"row":"RootIntent","name":{}}}"#,
+                serde_json::to_string(name).unwrap()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        bytes.extend_from_slice(&framed);
+        let found = invocation(&bytes, BOOT);
+        assert_eq!(found.standing, Standing::Unreadable, "{name}");
+        assert_eq!(found.rows.len(), 1, "the Begin row is kept");
+    }
+}
+
 #[cfg(windows)]
 mod native {
     use std::path::PathBuf;
@@ -444,7 +487,7 @@ mod native {
     };
     use kr_boundary_windows::win::launch::InvocationId;
 
-    use super::{BOOT, ID, begin, framing, snapshot};
+    use super::{BOOT, ID, begin, framing, root_name, snapshot};
 
     fn id() -> InvocationId {
         let mut bytes = [0_u8; 16];
@@ -506,13 +549,7 @@ mod native {
             // The process ends here, between two rows, with half of the next one written.
         }
         let path = dir.0.join(file_name(id()));
-        let next = framing::encode(
-            &Row::RootIntent {
-                path: r"C:\run\a".to_owned(),
-            }
-            .to_bytes(),
-        )
-        .unwrap();
+        let next = framing::encode(&Row::RootIntent { name: root_name(1) }.to_bytes()).unwrap();
         let mut bytes = std::fs::read(&path).unwrap();
         let whole = bytes.len();
         bytes.extend_from_slice(&next[..7]);
@@ -529,9 +566,7 @@ mod native {
         assert_eq!(found.valid_len, whole);
         assert_eq!(std::fs::metadata(&path).unwrap().len(), whole as u64);
         journal
-            .append(&Row::RootIntent {
-                path: r"C:\run\a".to_owned(),
-            })
+            .append(&Row::RootIntent { name: root_name(1) })
             .unwrap();
         let after = std::fs::read(&path).unwrap();
         let reading = framing::read_all(&after).unwrap();
@@ -608,7 +643,7 @@ mod guest {
     use kr_boundary_windows::filekey::FileKey;
     use kr_boundary_windows::journal::framing;
     use kr_boundary_windows::journal::replay::RootState;
-    use kr_boundary_windows::journal::rows::Row;
+    use kr_boundary_windows::journal::rows::{RootName, Row};
     use kr_boundary_windows::win::journal::{Journal, file_name, replay as replay_dir};
     use kr_boundary_windows::win::launch::InvocationId;
     use kr_boundary_windows::win::privilege;
@@ -624,6 +659,7 @@ mod guest {
     /// The journal as the root's rows, checking that each row is on the disk at the right moment.
     struct Checked<'a> {
         journal: &'a mut Journal,
+        run: &'a Path,
     }
 
     impl Checked<'_> {
@@ -635,19 +671,22 @@ mod guest {
     }
 
     impl RootRows for Checked<'_> {
-        fn intent(&mut self, path: &Path) -> Result<(), RootError> {
+        fn intent(&mut self, name: &RootName) -> Result<(), RootError> {
             assert!(
-                !path.exists(),
+                !self.run.join(name.as_str()).exists(),
                 "the intent is durable before the directory exists"
             );
-            self.journal.intent(path)?;
-            assert!(matches!(self.last_row(), Row::RootIntent { .. }));
+            self.journal.intent(name)?;
+            assert_eq!(self.last_row(), Row::RootIntent { name: name.clone() });
             Ok(())
         }
 
-        fn made(&mut self, path: &Path, key: &FileKey) -> Result<(), RootError> {
-            assert!(path.exists(), "the root exists when it is recorded as made");
-            self.journal.made(path, key)?;
+        fn made(&mut self, name: &RootName, key: &FileKey) -> Result<(), RootError> {
+            assert!(
+                self.run.join(name.as_str()).exists(),
+                "the root exists when it is recorded as made"
+            );
+            self.journal.made(name, key)?;
             assert!(matches!(self.last_row(), Row::RootMade { .. }));
             Ok(())
         }
@@ -671,14 +710,15 @@ mod guest {
         let root = {
             let mut rows = Checked {
                 journal: &mut journal,
+                run: &run.path,
             };
             create_root(&run.dir, &run.path, &group(), &mut rows).expect("the root is made")
         };
         let unfinished = replay_dir(&journals, super::BOOT).unwrap();
         assert_eq!(unfinished.len(), 1);
         match unfinished[0].tracker.root() {
-            RootState::Made(path, key) => {
-                assert_eq!(Path::new(path), root.path());
+            RootState::Made(name, key) => {
+                assert_eq!(run.path.join(name.as_str()), root.path());
                 assert_eq!(*key, root.key());
             }
             other => panic!("the root is recorded as made: {other:?}"),
@@ -687,6 +727,7 @@ mod guest {
         let leftovers = {
             let mut rows = Checked {
                 journal: &mut journal,
+                run: &run.path,
             };
             remove_root(&root, &guard, &mut rows).expect("the removal runs")
         };

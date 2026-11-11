@@ -45,6 +45,7 @@ use super::privilege::PrivGuard;
 use super::sd::{self, Principals, SdKind};
 use super::walk::{Bounds, Child, DirHandle, Kind, LIST, Lost, ROOT_BOUNDS};
 use crate::filekey::FileKey;
+use crate::journal::rows::RootName;
 
 const DELETE: u32 = 0x0001_0000;
 const READ_CONTROL: u32 = 0x0002_0000;
@@ -54,18 +55,18 @@ const RETRY_EVERY: Duration = Duration::from_millis(100);
 
 /// The rows the root writes about itself, each durable before the step it protects.
 pub trait RootRows {
-    /// The root is about to be made at this path.
+    /// The root is about to be made under this name in the `run` directory.
     ///
     /// # Errors
     ///
     /// Returns an error when the row is not durable; nothing is made then.
-    fn intent(&mut self, path: &Path) -> Result<(), RootError>;
+    fn intent(&mut self, name: &RootName) -> Result<(), RootError>;
     /// The root was made, and this is its identity.
     ///
     /// # Errors
     ///
     /// Returns an error when the row cannot be written.
-    fn made(&mut self, path: &Path, key: &FileKey) -> Result<(), RootError>;
+    fn made(&mut self, name: &RootName, key: &FileKey) -> Result<(), RootError>;
     /// The root was removed.
     ///
     /// # Errors
@@ -142,7 +143,7 @@ impl PrivateRoot {
     }
 }
 
-fn random_name() -> Result<String, RootError> {
+fn random_name() -> Result<RootName, RootError> {
     let mut bytes = [0_u8; 16];
     // SAFETY: the buffer is 16 bytes, which is the length passed; no algorithm handle is used.
     let status = unsafe {
@@ -156,7 +157,7 @@ fn random_name() -> Result<String, RootError> {
     if status < 0 {
         return Err(error(status as u32, "drawing a random name for the private root").into());
     }
-    Ok(hex::encode(bytes))
+    Ok(RootName::from_bytes(bytes))
 }
 
 /// Makes a directory with one call that carries the descriptor. The call fails on an existing
@@ -198,10 +199,10 @@ pub fn create_root(
     };
     let descriptor = sd::descriptor(SdKind::PrivateRoot, &principals)?;
     let name = random_name()?;
-    let path = run_path.join(&name);
-    rows.intent(&path)?;
+    let path = run_path.join(name.as_str());
+    rows.intent(&name)?;
     make_directory(&path, &descriptor)?;
-    let wide_name: Vec<u16> = name.encode_utf16().collect();
+    let wide_name: Vec<u16> = name.as_str().encode_utf16().collect();
     let held = run
         .open_directory_named(&wide_name, LIST | DELETE | READ_CONTROL)?
         .map_err(|lost| RootError::Refused(format!("the new private root: {lost}")))?;
@@ -212,7 +213,7 @@ pub fn create_root(
             "the private root's descriptor is not the one that was sent".to_owned(),
         ));
     }
-    rows.made(&path, &held.key())?;
+    rows.made(&name, &held.key())?;
     for part in ["tmp", "home"] {
         make_directory(&path.join(part), &descriptor)?;
         let units: Vec<u16> = part.encode_utf16().collect();
@@ -472,7 +473,7 @@ fn delete(handle: &Handle) -> Result<(), super::ffi::Error> {
 ///
 /// Returns an error when the file cannot be made or the call does not delete it.
 pub fn check_disposition(dir: &DirHandle) -> Result<(), RootError> {
-    let name = format!("disposition-check-{}", random_name()?);
+    let name = format!("disposition-check-{}", random_name()?.as_str());
     let units: Vec<u16> = name.encode_utf16().collect();
     let handle = dir.create_file_named(&units, DELETE)?;
     delete(&handle)?;

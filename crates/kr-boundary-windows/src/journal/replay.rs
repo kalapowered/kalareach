@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use crate::filekey::FileKey;
 
 use super::framing::{self, FramingError};
-use super::rows::{LeftoverClass, Row};
+use super::rows::{LeftoverClass, RootName, Row};
 
 /// Where an invocation stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,9 +33,9 @@ pub enum RootState {
     /// No row names a root.
     Absent,
     /// The intent is there and the made row is not: the directory may exist, under this name.
-    IntentOnly(String),
+    IntentOnly(RootName),
     /// The root was made.
-    Made(String, FileKey),
+    Made(RootName, FileKey),
     /// The root was removed.
     Removed,
 }
@@ -155,16 +155,16 @@ impl Tracker {
                 self.snapshots.push(*id);
                 Ok(())
             }
-            Row::RootIntent { path } => {
+            Row::RootIntent { name } => {
                 if self.root != RootState::Absent {
                     return wrong("a second private root is begun");
                 }
-                self.root = RootState::IntentOnly(path.clone());
+                self.root = RootState::IntentOnly(name.clone());
                 Ok(())
             }
-            Row::RootMade { path, key } => match &self.root {
-                RootState::IntentOnly(intended) if intended == path => {
-                    self.root = RootState::Made(path.clone(), *key);
+            Row::RootMade { name, key } => match &self.root {
+                RootState::IntentOnly(intended) if intended == name => {
+                    self.root = RootState::Made(name.clone(), *key);
                     Ok(())
                 }
                 _ => wrong("the root is recorded as made without its intent"),
