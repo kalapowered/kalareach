@@ -942,8 +942,8 @@ pub fn other_agents_refusal(found: &[String], when: &str) -> String {
     paths.sort_unstable();
     paths.dedup();
     format!(
-        "{} process(es) of this user run the agent's executable outside the run ({}), {when}: a \\
-         write of theirs to the person's agent directory would be taken for the run's, so no turn \\
+        "{} process(es) of this user run the agent's executable outside the run ({}), {when}: a \
+         write of theirs to the person's agent directory would be taken for the run's, so no turn \
          is started or charged while they run; end them, and start again",
         found.len(),
         paths.join(", ")

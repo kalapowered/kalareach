@@ -299,6 +299,9 @@ impl Route {
         // another `HOME` would guard a tree that is not theirs and pass.
         let home =
             person_home(std::env::var_os("HOME").as_deref()).unwrap_or_else(|why| panic!("{why}"));
+        // The turn ledger is made by the operator before the run: a missing one, or one with no
+        // array for the budget, stops the run here, before anything starts and before any key is read.
+        let ledger = Ledger::from_environment(&account.budget, account.turns);
         // The guard over the person's directory compares the whole of it at the end, and cannot
         // tell a write of another agent process of theirs from the run's: none runs at the start.
         let others = other_agent_processes(&executable_name(&build.command), None)
@@ -309,7 +312,6 @@ impl Route {
             other_agents_refusal(&others, "before the run starts")
         );
         let held = HeldKeys::read(&format!("gateway case {case}"), &account);
-        let ledger = Ledger::from_environment(&account.budget, account.turns);
         let person = MetaGuard::take(&home, &PERSON_TREES);
         Self::Real(Box::new(Real {
             build,
