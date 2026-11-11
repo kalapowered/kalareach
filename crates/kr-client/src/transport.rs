@@ -67,8 +67,9 @@ pub trait StreamOpener: Send + Sync + std::fmt::Debug {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::ConnectionEnded`] when the connection, or the sign-in it was opened
-    /// under, has ended, and otherwise the bulk-limit refusal or a stream failure.
+    /// Returns [`ClientError::ConnectionEnded`] when the sign-in the connection was opened under
+    /// has ended, and otherwise the bulk-limit refusal, a failure of the connection that says its
+    /// control stream is lost, or a stream failure.
     fn open(&self, header: StreamHeader) -> TransportFuture<'_, DataStream>;
 }
 

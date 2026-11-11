@@ -386,4 +386,109 @@ mod tests {
         );
         assert!(inner.0.load(Ordering::SeqCst), "the connection was closed");
     }
+
+    /// Opens of a data stream, counted: the inner connection is reached only when the opener lets
+    /// the open through.
+    #[derive(Debug, Default)]
+    struct Counting(std::sync::atomic::AtomicU32);
+
+    impl StreamOpener for Counting {
+        fn open(&self, _: StreamHeader) -> TransportFuture<'_, kr_transport::streams::DataStream> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(ClientError::ConnectionEnded) })
+        }
+    }
+
+    fn header() -> StreamHeader {
+        use kr_protocol::scalars::{Nullable, Uuid};
+
+        StreamHeader {
+            kind: kr_protocol::frame::StreamKind::AttachmentChunks,
+            connection_id: ConnectionId::new(Uuid::from_bytes([1; 16])),
+            stream_id: Nullable::null(),
+            resource: kr_protocol::frame::StreamResource {
+                environment_id: kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([2; 16])),
+                session_id: Nullable::null(),
+                attachment_id: Nullable::null(),
+                transfer_id: Nullable::some(kr_protocol::ids::TransferId::new(Uuid::from_bytes(
+                    [3; 16],
+                ))),
+            },
+        }
+    }
+
+    /// A data stream opens only under the sign-in its connection was opened under: once the account
+    /// has left, the open is refused, the connection is closed and the inner opener is never
+    /// reached. While the sign-in stands, the open goes through to it.
+    #[tokio::test]
+    async fn a_stream_does_not_open_after_the_account_left() {
+        let (account, status) = watch::channel(signed_in("first"));
+        let inner = Arc::new(Closing::default());
+        let counting = Arc::new(Counting::default());
+        let binding = Binding::new(
+            Arc::clone(&inner) as Arc<dyn ControlTransport>,
+            "first".to_owned(),
+            status,
+            Arc::new(|| Ok(())),
+        );
+        let opener = BoundOpener {
+            binding,
+            inner: Arc::clone(&counting) as Arc<dyn StreamOpener>,
+        };
+
+        let _ = opener.open(header()).await;
+        assert_eq!(counting.0.load(Ordering::SeqCst), 1, "the sign-in stands");
+
+        account.send_replace(AccountStatus::SignedOut);
+        let refused = opener.open(header()).await.expect_err("the account left");
+        assert!(matches!(refused, ClientError::ConnectionEnded));
+        assert_eq!(counting.0.load(Ordering::SeqCst), 1, "nothing was opened");
+        assert!(inner.0.load(Ordering::SeqCst), "the connection was closed");
+    }
+
+    /// A connection that presents no lease of its own opens a stream only while the keeper of its
+    /// sign-in holds a lease the host took; one that presented its own is judged by the host.
+    #[tokio::test]
+    async fn a_stream_does_not_open_without_a_lease_the_host_took() {
+        let (_account, status) = watch::channel(signed_in("first"));
+        let inner = Arc::new(Closing::default());
+        let counting = Arc::new(Counting::default());
+        let binding = Binding::new(
+            Arc::clone(&inner) as Arc<dyn ControlTransport>,
+            "first".to_owned(),
+            status,
+            Arc::new(|| Err(LeaseStop::SignIn)),
+        );
+        let opener = BoundOpener {
+            binding: Arc::clone(&binding),
+            inner: Arc::clone(&counting) as Arc<dyn StreamOpener>,
+        };
+
+        let refused = opener.open(header()).await.expect_err("no lease is held");
+        assert!(matches!(refused, ClientError::ConnectionEnded));
+        assert_eq!(counting.0.load(Ordering::SeqCst), 0, "nothing was opened");
+
+        assert!(inner.0.load(Ordering::SeqCst), "the connection was ended");
+
+        // One that presented a lease of its own is judged by the host on it, whatever the keeper
+        // of the sign-in holds.
+        let (_account, status) = watch::channel(signed_in("first"));
+        let binding = Binding::new(
+            Arc::new(Closing::default()) as Arc<dyn ControlTransport>,
+            "first".to_owned(),
+            status,
+            Arc::new(|| Err(LeaseStop::SignIn)),
+        );
+        binding.presented.store(true, Ordering::Release);
+        let opener = BoundOpener {
+            binding,
+            inner: Arc::clone(&counting) as Arc<dyn StreamOpener>,
+        };
+        let _ = opener.open(header()).await;
+        assert_eq!(
+            counting.0.load(Ordering::SeqCst),
+            1,
+            "the host judges its lease"
+        );
+    }
 }

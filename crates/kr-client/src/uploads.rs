@@ -213,7 +213,8 @@ pub enum Stage {
     /// Sending chunks.
     Sending,
     /// A lane failed, or the host refused a chunk's window: the driver is reading what the host
-    /// holds and will send from the first chunk it lacks, until a chunk is acknowledged.
+    /// holds and will send from the first chunk it lacks, until a chunk is acknowledged. A plan
+    /// that already holds a transfer starts here, since the host's bitmap decides what it sends.
     Resuming,
     /// Every chunk is acknowledged and the handle is being published.
     Publishing,
@@ -360,6 +361,10 @@ impl Upload {
     /// How many of the layout's chunks the host has acknowledged.
     #[must_use]
     pub fn acknowledged_chunks(&self) -> u64 {
+        // A published upload has every chunk, whatever bitmap the plan last adopted.
+        if self.phase == Phase::Published {
+            return self.layout.chunk_count.get();
+        }
         let Some(bitmap) = self.sent.as_ref() else {
             return 0;
         };
@@ -1091,6 +1096,12 @@ mod tests {
         };
         assert_eq!(*published, handle);
         assert_eq!(upload.handle(), Some(&handle));
+        assert_eq!(
+            upload.acknowledged_chunks(),
+            1,
+            "a published upload has every chunk, whichever bitmap the plan last took"
+        );
+        assert!((upload.progress() - 1.0).abs() < 1e-9);
     }
 
     #[test]
