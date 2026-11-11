@@ -6,17 +6,19 @@
 
 mod net_support;
 
+use std::task::Poll;
 use std::time::Duration;
 
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_crypto::keys::DeviceKeys;
-use kr_protocol::envelope::{ControlFrame, MutationRequest, Outcome, ParamsValue};
+use kr_protocol::envelope::{ActionTarget, ControlFrame, MutationRequest, Outcome, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::{StreamHeader, StreamKind, StreamResource};
-use kr_protocol::ids::{ActionId, ActorId, TransferId};
+use kr_protocol::ids::{ActionId, ActorId, SessionId, TransferId};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Bytes, Digest256, Nullable, U64};
+use kr_protocol::session::SessionOpenParams;
 use kr_protocol::transfer::{
     ChunkDescriptor, ChunkLayout, UploadBeginParams, UploadBeginResult, UploadCancelParams,
     UploadCancelResult, UploadChunkParams, UploadChunkResult, UploadFinishParams,
@@ -24,7 +26,8 @@ use kr_protocol::transfer::{
 };
 use kr_transfer::store::{Limits, UploadRow};
 use kr_transport::streams::DataStream;
-use net_support::{Device, Host, RawDevice, on_the_host};
+use net_support::worker::Adopted;
+use net_support::{Device, Host, Moved, RawDevice, on_the_host, on_the_session};
 
 /// What a case waits at most for a frame, an answer or a reset. A host that does what the case
 /// says answers at once: the bound only ends a case that would hang.
@@ -182,11 +185,22 @@ fn chunk_frame(
     bytes: &[u8],
     index: u64,
 ) -> ControlFrame {
+    chunk_frame_on(raw, on_the_host(host), transfer, bytes, index)
+}
+
+/// The frame that sends chunk `index` of `bytes` as part of `transfer`, on `target`.
+fn chunk_frame_on(
+    raw: &RawDevice,
+    target: ActionTarget,
+    transfer: TransferId,
+    bytes: &[u8],
+    index: u64,
+) -> ControlFrame {
     let (chunk, payload) = chunk_of(bytes, index);
     raw.mutation_frame_for(
         Method::UploadChunk,
         ActionId::new(kr_ipc::new_uuid()),
-        on_the_host(host),
+        target,
         &UploadChunkParams {
             transfer_id: transfer,
             chunk,
@@ -760,5 +774,517 @@ async fn a_device_keeps_at_most_the_bound_of_staged_uploads_and_a_cancel_frees_a
     begin_at_the_door(&device.raw, &host, &[4; 64], "again.bin").await;
     device.raw.close();
     other.raw.close();
+    host.stop().await;
+}
+
+/// Reads the next frame the host sent on a stream: an answer, or why there is none.
+async fn next(stream: &mut DataStream) -> std::result::Result<Option<ControlFrame>, String> {
+    tokio::time::timeout(WAIT, stream.read_message::<ControlFrame>())
+        .await
+        .expect("the host answers or ends the stream in time")
+        .map_err(|error| format!("{error:?}"))
+}
+
+/// Whether the host took the stream away: a reset, and not a clean end or an answer.
+async fn reset(stream: &mut DataStream) {
+    match next(stream).await {
+        Err(_) => {}
+        other => panic!("the stream was to be reset, and it said {other:?}"),
+    }
+}
+
+/// What the host did with a frame the case wrote: its answer, or `None` when it ended the stream
+/// without one.
+async fn answer_or_end(
+    stream: &mut DataStream,
+) -> Option<std::result::Result<ParamsValue, ProtocolError>> {
+    match next(stream).await {
+        Ok(Some(ControlFrame::Response(response))) => Some(match response.outcome {
+            Outcome::Ok(value) => Ok(value),
+            Outcome::Error(error) => Err(error),
+        }),
+        Ok(Some(other)) => panic!("an answer was expected, and the stream said {other:?}"),
+        Ok(None) | Err(_) => None,
+    }
+}
+
+/// Waits for a blocking pause to say it has arrived, without holding a worker thread of the case.
+async fn arrived(rx: std::sync::mpsc::Receiver<()>) {
+    tokio::task::spawn_blocking(move || rx.recv_timeout(WAIT))
+        .await
+        .expect("the wait ends")
+        .expect("the held call arrives");
+}
+
+/// Polls `future` once and returns what it said.
+async fn poll_once<F: std::future::Future + Unpin>(future: &mut F) -> Poll<F::Output> {
+    std::future::poll_fn(|context| Poll::Ready(std::pin::Pin::new(&mut *future).poll(context)))
+        .await
+}
+
+/// Writes `frame` to a stream the future owns, and gives the stream back with the result, so that a
+/// write that is pending holds the stream and the case can ask again.
+async fn write_owned(
+    mut stream: DataStream,
+    frame: ControlFrame,
+) -> (DataStream, kr_transport::Result<()>) {
+    let written = stream.write_message(&frame).await;
+    (stream, written)
+}
+
+/// How many bytes of the upload are staged and verified, read from the service.
+fn received(host: &Host, actor: &ActorId, transfer: TransferId) -> u64 {
+    host.controller()
+        .transfer()
+        .service()
+        .upload_status(
+            actor,
+            &UploadStatusParams {
+                transfer_id: transfer,
+            },
+        )
+        .expect("the upload's status")
+        .received_byte_len
+        .get()
+}
+
+/// Opens the connection on `raw` for `session`, or for the host alone.
+async fn open_for(raw: &RawDevice, session: Option<SessionId>) {
+    raw.read(
+        Method::SessionOpen,
+        &SessionOpenParams {
+            session_id: Nullable(session),
+            grant_id: Nullable::null(),
+        },
+    )
+    .await
+    .expect("the connection is opened");
+}
+
+/// Reserves an upload of `bytes` bound to `session`, through the host's door.
+async fn begin_in_session(
+    raw: &RawDevice,
+    host: &Host,
+    session: SessionId,
+    bytes: &[u8],
+) -> TransferId {
+    let mut params = begin_params(host, bytes, "scoped.bin");
+    params.session_id = Nullable::some(session);
+    typed::<UploadBeginResult>(
+        &raw.mutate(
+            Method::UploadBegin,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_session(host, session),
+            &params,
+        )
+        .await
+        .expect("the host reserves the upload in the session"),
+    )
+    .transfer_id
+}
+
+/// KR-REQ-23.21 and KR-REQ-23.41: a stream is held to the session its connection was opened for. A
+/// header for an upload bound to a session is reset on a connection opened for another session, with
+/// nothing staged; the control is the connection opened for that session, whose chunk is staged. The
+/// sessions are two the daemon serves through workers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_header_for_a_session_the_connection_is_not_opened_for_is_reset() {
+    let adopted = Adopted::start(2).await;
+    let host = &adopted.host;
+    let session = adopted.workers[0].session_id;
+    let another = adopted.workers[1].session_id;
+    let device = paired(
+        host,
+        &adopted.owner,
+        &[ActionRight::FilesUpload, ActionRight::SessionView],
+    )
+    .await;
+    let to_another = device.again(host).await;
+    open_for(&device.raw, Some(session)).await;
+    open_for(&to_another, Some(another)).await;
+
+    let bytes = [9_u8; 96];
+    let upload = begin_in_session(&device.raw, host, session, &bytes).await;
+    let mut stream = to_another
+        .open_stream(header(host, &to_another, upload))
+        .await;
+    reset(&mut stream).await;
+    assert_eq!(received(host, &device.actor(), upload), 0);
+
+    let mut stream = device
+        .raw
+        .open_stream(header(host, &device.raw, upload))
+        .await;
+    let frame = chunk_frame_on(
+        &device.raw,
+        on_the_session(host, session),
+        upload,
+        &bytes,
+        0,
+    );
+    ask(&mut stream, &frame)
+        .await
+        .expect("the connection opened for the upload's session is served");
+    assert_eq!(received(host, &device.actor(), upload), 96);
+    device.raw.close();
+    to_another.close();
+    adopted.stop().await;
+}
+
+/// Begins an upload of `bytes` through the door, holds its one chunk at the transfer service's
+/// first pause, runs `meanwhile`, releases the chunk, and says what the host did with it.
+async fn hold_a_chunk_while(
+    host: &Host,
+    device: &Paired,
+    bytes: &[u8],
+    meanwhile: impl FnOnce(),
+) -> (
+    TransferId,
+    Option<std::result::Result<ParamsValue, ProtocolError>>,
+    DataStream,
+) {
+    let transfer = begin_at_the_door(&device.raw, host, bytes, "held.bin")
+        .await
+        .transfer_id;
+    let (held, release) = host.controller().transfer().pause_after_the_outer_check();
+    let mut stream = device
+        .raw
+        .open_stream(header(host, &device.raw, transfer))
+        .await;
+    stream
+        .write_message(&chunk_frame(host, &device.raw, transfer, bytes, 0))
+        .await
+        .expect("the frame is written");
+    arrived(held).await;
+    meanwhile();
+    release.send(()).expect("the chunk goes on");
+    let answered = answer_or_end(&mut stream).await;
+    host.network()
+        .until_no_chunk_is_in_the_service(device.record.device_id, transfer)
+        .await;
+    (transfer, answered, stream)
+}
+
+/// KR-REQ-23.21 and KR-REQ-23.41: a device revoked while its header's lookup runs has the stream
+/// reset, with nothing staged: the header is admitted against the registration as it stands when the
+/// lookup ends. The control is the same hold, released with the device standing, whose chunk is staged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_revoked_while_its_header_is_looked_up_has_the_stream_reset() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = paired(&host, &owner, &[ActionRight::FilesUpload]).await;
+    let bytes = [8_u8; 96];
+    let kept = begin_at_the_door(&device.raw, &host, &bytes, "kept.bin")
+        .await
+        .transfer_id;
+    let lost = begin_at_the_door(&device.raw, &host, &bytes, "lost.bin")
+        .await
+        .transfer_id;
+
+    let (arrivals, release) = host.controller().transfer().hold_the_stream_lookups();
+    let mut stream = device
+        .raw
+        .open_stream(header(&host, &device.raw, kept))
+        .await;
+    arrived(arrivals).await;
+    release.release();
+    ask(
+        &mut stream,
+        &chunk_frame(&host, &device.raw, kept, &bytes, 0),
+    )
+    .await
+    .expect("a header whose lookup ended with the device standing is served");
+    assert_eq!(received(&host, &device.actor(), kept), 96);
+
+    let (arrivals, release) = host.controller().transfer().hold_the_stream_lookups();
+    let mut stream = device
+        .raw
+        .open_stream(header(&host, &device.raw, lost))
+        .await;
+    arrived(arrivals).await;
+    host.network()
+        .revoke_device(device.record.device_id)
+        .await
+        .expect("the device is revoked");
+    release.release();
+    assert!(
+        !matches!(next(&mut stream).await, Ok(Some(_))),
+        "the stream of a revoked device is taken away"
+    );
+    assert_eq!(received(&host, &device.actor(), lost), 0);
+    host.stop().await;
+}
+
+/// KR-REQ-23.21 and KR-REQ-23.41: a grant that runs out while a chunk is held between the door's
+/// check and the service keeps the chunk from being staged. The control is the same hold with the
+/// grant standing, whose chunk is staged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_that_ends_while_a_chunk_is_held_keeps_it_from_being_staged() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let (moved, clocks) = Moved::new();
+    let host = Host::start_on_clocks(&owner, clocks).await;
+    let device = paired(&host, &owner, &[ActionRight::FilesUpload]).await;
+    let bytes = [3_u8; 96];
+
+    let (kept, answered, _stream) = hold_a_chunk_while(&host, &device, &bytes, || {}).await;
+    answered
+        .expect("the host answers")
+        .expect("a chunk held while the grant stands is staged");
+    assert_eq!(received(&host, &device.actor(), kept), 96);
+
+    let (lost, answered, _stream) =
+        hold_a_chunk_while(&host, &device, &bytes, || moved.past_the_grant()).await;
+    if let Some(answer) = answered {
+        let refused = answer.expect_err("a chunk held while the grant ends is refused");
+        assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    }
+    assert_eq!(received(&host, &device.actor(), lost), 0);
+    host.stop().await;
+}
+
+/// KR-REQ-23.21 and KR-REQ-23.41: a fence owed while a chunk is held between the door's check and
+/// the service refuses the chunk and ends the stream, with nothing staged; once the debt is paid the
+/// device's next stream is served. The control is the same hold with no debt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_owed_while_a_chunk_is_held_refuses_it_and_ends_the_stream() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = paired(&host, &owner, &[ActionRight::FilesUpload]).await;
+    let bytes = [4_u8; 96];
+
+    let (kept, answered, _stream) = hold_a_chunk_while(&host, &device, &bytes, || {}).await;
+    answered
+        .expect("the host answers")
+        .expect("a chunk held with no fence owed is staged");
+    assert_eq!(received(&host, &device.actor(), kept), 96);
+
+    let controller = host.controller();
+    let (owed, answered, mut stream) =
+        hold_a_chunk_while(&host, &device, &bytes, || controller.hold_fence(true)).await;
+    let refused = answered
+        .expect("the device is told")
+        .expect_err("a chunk held while a fence is owed is refused");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        !matches!(next(&mut stream).await, Ok(Some(_))),
+        "the stream ends after the refusal"
+    );
+    controller.hold_fence(false);
+    assert_eq!(received(&host, &device.actor(), owed), 0);
+
+    let mut again = device
+        .raw
+        .open_stream(header(&host, &device.raw, owed))
+        .await;
+    ask(
+        &mut again,
+        &chunk_frame(&host, &device.raw, owed, &bytes, 0),
+    )
+    .await
+    .expect("once the debt is paid the device's next stream is served");
+    assert_eq!(received(&host, &device.actor(), owed), 96);
+    device.raw.close();
+    host.stop().await;
+}
+
+/// KR-REQ-23.21: a chunk that the service refused at its ask because its stream was replaced left
+/// nothing behind, so the exact repeat of it (same action, same window) on the replacing stream is a
+/// first attempt: it is staged and answered as one. The upload's status shows both chunks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exact_repeat_of_a_chunk_refused_for_its_replaced_stream_is_staged() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = paired(&host, &owner, &[ActionRight::FilesUpload]).await;
+    let bytes = pattern(kr_protocol::limits::UPLOAD_CHUNK_LEN + 100);
+    let transfer = begin_at_the_door(&device.raw, &host, &bytes, "replaced.bin")
+        .await
+        .transfer_id;
+    let first = chunk_frame(&host, &device.raw, transfer, &bytes, 0);
+    let second = chunk_frame(&host, &device.raw, transfer, &bytes, 1);
+
+    let (held, release) = host.controller().transfer().pause_after_the_outer_check();
+    let mut older = device
+        .raw
+        .open_stream(header(&host, &device.raw, transfer))
+        .await;
+    older
+        .write_message(&first)
+        .await
+        .expect("the first chunk is written");
+    arrived(held).await;
+    // The newer stream replaces the older, and its frame waits at the transfer's gate behind the
+    // older's chunk, which is refused at the service's ask once it is released.
+    let mut waits = host.network().chunk_gate_waits();
+    let mut newer = device
+        .raw
+        .open_stream(header(&host, &device.raw, transfer))
+        .await;
+    newer
+        .write_message(&second)
+        .await
+        .expect("the second chunk is written");
+    tokio::time::timeout(WAIT, waits.wait_for(|waits| *waits >= 1))
+        .await
+        .expect("the newer frame finds the gate held")
+        .expect("the count stays open");
+    release.send(()).expect("the older chunk goes on");
+    answer_or_end(&mut newer)
+        .await
+        .expect("the newer stream is answered")
+        .expect("the newer stream's chunk is staged");
+    assert_eq!(received(&host, &device.actor(), transfer), 100);
+
+    ask(&mut newer, &first)
+        .await
+        .expect("the exact repeat is a first attempt: the refusal left nothing of it");
+    let status = status_of(&device.raw, transfer).await;
+    assert_eq!(
+        status.received_byte_len.get(),
+        kr_protocol::limits::UPLOAD_CHUNK_LEN as u64 + 100
+    );
+    drop(older);
+    device.raw.close();
+    host.stop().await;
+}
+
+/// KR-REQ-23.21: a chunk that the service refused at its ask because its connection was lost may or
+/// may not have been carried out as far as the host can say, and a replacement connection is not
+/// where it settles a chunk: the exact repeat there is told `OUTCOME_UNKNOWN`, and stages nothing. The
+/// device reads the upload's status, which shows what is staged, and sends the chunk again as a new
+/// action, which is staged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exact_repeat_of_a_chunk_refused_for_its_lost_connection_is_told_the_outcome_is_unknown()
+{
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = paired(&host, &owner, &[ActionRight::FilesUpload]).await;
+    let bytes = [6_u8; 96];
+    let transfer = begin_at_the_door(&device.raw, &host, &bytes, "lost.bin")
+        .await
+        .transfer_id;
+    let frame = chunk_frame(&host, &device.raw, transfer, &bytes, 0);
+
+    let (held, release) = host.controller().transfer().pause_after_the_outer_check();
+    let mut stream = device
+        .raw
+        .open_stream(header(&host, &device.raw, transfer))
+        .await;
+    stream
+        .write_message(&frame)
+        .await
+        .expect("the chunk is written");
+    arrived(held).await;
+    let mut ended = host.network().chunk_tasks_ended();
+    device.raw.close();
+    tokio::time::timeout(WAIT, ended.wait_for(|ended| *ended >= 1))
+        .await
+        .expect("the lost connection's stream task ends")
+        .expect("the count stays open");
+    release.send(()).expect("the chunk goes on");
+    host.network()
+        .until_no_chunk_is_in_the_service(device.record.device_id, transfer)
+        .await;
+    assert_eq!(received(&host, &device.actor(), transfer), 0);
+
+    let again = device.again(&host).await;
+    let mut stream = again.open_stream(header(&host, &again, transfer)).await;
+    let told = ask(&mut stream, &frame)
+        .await
+        .expect_err("the exact repeat on the replacement connection is not served");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    assert_eq!(status_of(&again, transfer).await.received_byte_len.get(), 0);
+
+    ask(
+        &mut stream,
+        &chunk_frame(&host, &again, transfer, &bytes, 0),
+    )
+    .await
+    .expect("the chunk sent again as a new action is staged");
+    assert_eq!(
+        status_of(&again, transfer).await.received_byte_len.get(),
+        96
+    );
+    again.close();
+    host.stop().await;
+}
+
+/// KR-REQ-23.21: a stream whose peer writes past the credit stalls on its own, and the upload's
+/// status is still read on the control stream, with the bitmap of what is staged: nothing, while the
+/// first chunk is held; the held chunk once it is released. The control is the same read with nothing
+/// held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_chunk_stream_leaves_the_upload_status_readable_with_its_bitmap() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = paired(&host, &owner, &[ActionRight::FilesUpload]).await;
+    let whole = vec![5_u8; 4 * 1024 * 1024];
+    let transfer = begin_at_the_door(&device.raw, &host, &whole, "big.bin")
+        .await
+        .transfer_id;
+    let nothing_staged = |status: &UploadStatusResult| {
+        status.state == UploadState::Receiving
+            && status.received_byte_len.get() == 0
+            && status
+                .received_chunks
+                .as_slice()
+                .iter()
+                .all(|byte| *byte == 0)
+    };
+    assert!(nothing_staged(&status_of(&device.raw, transfer).await));
+
+    let (held, release) = host.controller().transfer().pause_after_the_outer_check();
+    let mut stream = device
+        .raw
+        .open_stream(header(&host, &device.raw, transfer))
+        .await;
+    stream
+        .write_message(&chunk_frame(&host, &device.raw, transfer, &whole, 0))
+        .await
+        .expect("the first chunk is written");
+    arrived(held).await;
+
+    // Further frames are written until a write is pending, by the sizes.
+    let mut idle = Some(stream);
+    let mut stalled = None;
+    for index in 1..4 {
+        let frame = chunk_frame(&host, &device.raw, transfer, &whole, index);
+        let mut write = Box::pin(write_owned(idle.take().expect("the stream"), frame));
+        match poll_once(&mut write).await {
+            Poll::Ready((stream, written)) => {
+                written.expect("a frame that fits the credit is written");
+                idle = Some(stream);
+            }
+            Poll::Pending => {
+                stalled = Some(write);
+                break;
+            }
+        }
+    }
+    let mut stalled = stalled.expect("a write is pending once the credit is spent");
+    let status = status_of(&device.raw, transfer).await;
+    assert!(
+        nothing_staged(&status),
+        "the held chunk is not staged, and the bitmap says so: {status:?}"
+    );
+    assert!(
+        matches!(poll_once(&mut stalled).await, Poll::Pending),
+        "the stalled write is still pending after the status was read"
+    );
+    drop(stalled);
+    release.send(()).expect("the chunk goes on");
+    host.network()
+        .until_no_chunk_is_in_the_service(device.record.device_id, transfer)
+        .await;
+    let status = status_of(&device.raw, transfer).await;
+    assert!(
+        status.received_byte_len.get() >= 1024 * 1024
+            && status
+                .received_chunks
+                .as_slice()
+                .iter()
+                .any(|byte| *byte != 0),
+        "the released chunk is staged, and the bitmap says so: {status:?}"
+    );
+    device.raw.close();
     host.stop().await;
 }
