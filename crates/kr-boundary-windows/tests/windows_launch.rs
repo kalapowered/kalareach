@@ -694,7 +694,7 @@ fn the_process_and_thread_name_the_group_and_the_system_and_the_group_cannot_cha
         ("thread", suspended.thread.raw()),
     ] {
         let found = security_of(object);
-        assert_eq!(found.owner, SYSTEM_SID, "the {what}'s owner");
+        assert_eq!(found.owner, ADMINISTRATORS_SID, "the {what}'s owner");
         assert!(found.protected, "the {what}'s list is protected");
         let mut allowed = found.allowed.clone();
         allowed.sort();

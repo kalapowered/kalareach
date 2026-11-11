@@ -54,7 +54,9 @@ pub enum SdKind {
     DataPipe,
     /// A child's process and its thread: the invocation's group and the system, protected, and the
     /// group cannot change the descriptor or the owner of the object. A child of the broker's own
-    /// token names the system alone.
+    /// token names the system alone. The Administrators group owns both, so that they can be made
+    /// by the system and by an elevated administrator alike (the installer's own event log queries
+    /// make them): only the system's own token may name the system as an owner.
     ProcessThread,
     /// A folder only the system and administrators may change, which every account may read and
     /// enter when the principals say so. The Administrators group owns it, named in the descriptor
@@ -210,10 +212,10 @@ pub fn descriptor_text(kind: SdKind, principals: &Principals) -> Result<String> 
         }
         SdKind::ProcessThread => Ok(match principals.group.as_ref() {
             Some(group) => format!(
-                "O:SYD:P(A;;{ALL_BUT_CHANGING_THE_DESCRIPTOR};;;{})(A;;{ALL_ACCESS};;;SY)",
+                "O:BAD:P(A;;{ALL_BUT_CHANGING_THE_DESCRIPTOR};;;{})(A;;{ALL_ACCESS};;;SY)",
                 group.to_text()
             ),
-            None => format!("O:SYD:P(A;;{ALL_ACCESS};;;SY)"),
+            None => format!("O:BAD:P(A;;{ALL_ACCESS};;;SY)"),
         }),
         SdKind::BootMarker => Ok("O:SYD:P(A;;KA;;;SY)(A;;KA;;;BA)".to_owned()),
         SdKind::CapturePipe => Ok("O:BAD:P(A;;GA;;;SY)".to_owned()),
