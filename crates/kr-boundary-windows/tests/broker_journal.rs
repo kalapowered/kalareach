@@ -1954,6 +1954,93 @@ fn a_leftover_never_gives_away_the_room_of_a_result_that_is_still_admissible() {
     }
 }
 
+fn grant_at(n: u64, path: &str) -> Row {
+    let mut row = grant(n);
+    if let Row::Grant { path: made, .. } = &mut row {
+        *made = path.to_owned();
+    }
+    row
+}
+
+#[test]
+fn each_open_leftover_gives_back_the_room_it_took_and_no_other() {
+    // One key is granted at a short path, left over, granted again at a much longer path and left
+    // over again. Clearing the first leftover gives back what the first took: the clearance of the
+    // second is still owed, whatever the key's current grant would take.
+    let short = r"C:\a";
+    let long = format!(r"C:\{}", "b".repeat(limits::NAME_BYTES * 3));
+    let mut driver = Driver::new(400_000);
+    driver.put_ok(begin());
+    driver.put_ok(grant_at(1, short));
+    driver.put_ok(worst_leftover(short.to_owned(), LeftoverClass::Tree, None));
+    driver.put_ok(grant_at(1, &long));
+    driver.put_ok(worst_leftover(long.clone(), LeftoverClass::Tree, None));
+    driver.put_ok(Row::LeftoverCleared {
+        key: short.to_owned(),
+    });
+
+    let mut alone = Driver::new(400_000);
+    alone.put_ok(begin());
+    alone.put_ok(grant_at(1, &long));
+    alone.put_ok(worst_leftover(long.clone(), LeftoverClass::Tree, None));
+    assert_eq!(
+        driver.tracker.budget().1,
+        alone.tracker.budget().1,
+        "the room kept for the long path's clearance is what it took, with the short one's cleared"
+    );
+}
+
+/// The file's bytes with each record written as indented text, which a reader takes as it takes
+/// the compact text that this build writes.
+fn file_with_loose_records(rows: &[Row]) -> Vec<u8> {
+    rows.iter()
+        .flat_map(|row| framing::encode(&serde_json::to_vec_pretty(row).unwrap()).unwrap())
+        .collect()
+}
+
+#[test]
+fn the_reader_counts_the_bytes_that_are_really_in_the_file() {
+    let rows = vec![begin(), grant(1), grant(2), grant(3)];
+    let loose = file_with_loose_records(&rows);
+    assert!(
+        loose.len() > file_of(&rows).len(),
+        "the records are longer than the build writes them"
+    );
+    let found = invocation(&loose, BOOT);
+    assert_eq!(found.damage, None);
+    assert_eq!(found.valid_len, loose.len());
+    assert_eq!(
+        found.tracker.bytes(),
+        found.valid_len,
+        "the tracker counts what is in the file, not what it would write"
+    );
+}
+
+#[test]
+fn a_root_is_not_begun_in_a_resumed_file_without_room_for_the_rows_that_record_it() {
+    // A file of the most a correct writer makes, less a little: the intent alone would fit the
+    // native bound, but the rows that record the root made and removed would not. (A file of this
+    // length is counted by the size its record has: the case does not write 400 megabytes.)
+    let mut reader = Tracker::reading();
+    reader.apply(&begin()).unwrap();
+    reader
+        .apply_framed(
+            &snapshot(1, SnapshotKind::Initial),
+            limits::MAX_FILE - 4 * limits::ROOT_MAX,
+        )
+        .unwrap();
+    assert!(
+        reader.bytes() + framing::FRAME_BYTES + limits::ROOT_MAX < limits::MAX_FILE,
+        "the intent fits the file's bound on its own"
+    );
+    let mut writer = reader.into_writer();
+    let refused = writer.apply(&Row::RootIntent { name: root_name(1) });
+    assert!(
+        matches!(refused, Err(OrderError::NoRoom(_))),
+        "a root whose made and removed rows cannot fit is not begun: {refused:?}"
+    );
+}
+
 #[test]
 fn a_writer_that_resumes_a_file_counts_the_bytes_that_are_in_it_and_what_it_still_owes() {
     // An earlier writer made ten snapshot rows of the size the framing allows. The reader takes
@@ -2039,9 +2126,15 @@ fn a_repeated_row_with_other_content_is_not_already_recorded() {
         Ok(Applied::Written)
     );
     let size = tracker.bytes();
+    // The same row again says what the journal says; the same person at another time is another
+    // row, whose time the journal does not hold.
+    assert_eq!(
+        tracker.apply(&accepted("S-1-5-21-1", 5)),
+        Ok(Applied::AlreadyRecorded)
+    );
     assert_eq!(
         tracker.apply(&accepted("S-1-5-21-1", 9)),
-        Ok(Applied::AlreadyRecorded)
+        Ok(Applied::Differs)
     );
     assert_eq!(
         tracker.apply(&accepted("S-1-5-21-2", 9)),

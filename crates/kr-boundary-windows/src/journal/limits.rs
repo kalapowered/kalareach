@@ -184,8 +184,10 @@ const _: () = assert!(CLOSING < 16 * 1024 * 1024);
 const _: () = assert!(MAX_FILE == WRITER_LIMIT + CLOSING);
 const _: () = assert!(PATH_JSON_BYTES < GRANT_MAX && PATH_JSON_BYTES < LEFTOVER_MAX);
 
-/// A text cut to at most `max` bytes at a character boundary. A reason or an outcome that a writer
-/// builds goes through this, so that the row is never refused for the length of a message.
+/// A text cut to at most `max` bytes of its own, at a character boundary. The cut counts the text's
+/// own bytes and not the bytes the text takes once written in a row, where a backslash, a quote and
+/// a control character take more: a text that a row carries is cut by [`short`], which counts the
+/// written bytes, so that the row is never refused for the length of a message.
 #[must_use]
 pub fn cut(text: &str, max: usize) -> String {
     if text.len() <= max {

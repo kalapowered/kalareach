@@ -98,6 +98,10 @@ pub struct OpenLeftover {
     pub snapshot: Option<u32>,
     /// The granted object whose room paid for it, if one did.
     owner: Option<FileKey>,
+    /// What the leftover took of its owner's room for its clearance, which the clearance gives
+    /// back: the room the owner's grant at the time kept for it, whatever a later grant of the same
+    /// key would keep.
+    room: usize,
 }
 
 /// A row that was refused, and why. A refused row changes nothing.
@@ -266,8 +270,8 @@ pub struct Tracker {
     /// the rows that are not an object's.
     open_unowned: usize,
     snapshots: Vec<u32>,
-    /// The snapshot last accepted, and the person who accepted it.
-    accepted: Option<(u32, String)>,
+    /// The snapshot last accepted, the person who accepted it and when.
+    accepted: Option<(u32, String, u64)>,
     /// The reason of the end check that left the end unproved.
     uncertain_reason: Option<String>,
     /// How many objects the standing verification says it covered.
@@ -445,10 +449,22 @@ impl Tracker {
     /// Returns the reason the row is out of order or, for a writer's tracker, over a cap or past
     /// the journal's budget or a count.
     pub fn apply(&mut self, row: &Row) -> Result<Applied, OrderError> {
+        let framed = row.to_bytes().len() + framing::FRAME_BYTES;
+        self.apply_framed(row, framed)
+    }
+
+    /// Takes the next row as it stands in a file, where `framed` is the bytes it takes there: its
+    /// record as it was written, which may be longer than this build writes the row, and its frame.
+    /// The reader counts a file by these, so that what the tracker believes the file holds is what
+    /// is in it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Tracker::apply`].
+    pub fn apply_framed(&mut self, row: &Row, framed: usize) -> Result<Applied, OrderError> {
         if self.enforce {
             row.check_caps().map_err(OrderError::TooLarge)?;
         }
-        let framed = row.to_bytes().len() + framing::FRAME_BYTES;
         let applied = self.accept(row, framed)?;
         if applied == Applied::Written {
             self.bytes += framed;
@@ -497,6 +513,14 @@ impl Tracker {
                 }
                 if self.root != RootState::Absent {
                     return wrong("a second private root is begun");
+                }
+                // The root's made and removed rows must fit the file too, or the intent would
+                // name a directory that the journal can never record as made or removed.
+                if self.enforce && self.ceiling() > limits::MAX_FILE {
+                    return Err(OrderError::NoRoom(
+                        "the journal has no room left for the rows that record a private root as made and removed, so no root is begun"
+                            .to_owned(),
+                    ));
                 }
                 self.root = RootState::IntentOnly(name.clone());
                 Ok(Applied::Written)
@@ -774,6 +798,7 @@ impl Tracker {
                     _ if owner.is_none() => self.counts.other += 1,
                     _ => {}
                 }
+                let mut room = 0;
                 if let Some(key) = owner
                     && let Some(mut account) = self.keys.get(&key).cloned()
                 {
@@ -784,7 +809,8 @@ impl Tracker {
                         account.owed_result = limits::released_room();
                     }
                     account.stage = Stage::Settled;
-                    account.owed_clear += account.cleared_room;
+                    room = account.cleared_room;
+                    account.owed_clear += room;
                     self.spent += framed;
                     self.set_account(key, account);
                 } else {
@@ -804,6 +830,7 @@ impl Tracker {
                     class: *class,
                     snapshot: *snapshot,
                     owner,
+                    room,
                 });
                 if class.holds_the_slot() {
                     self.release_verified = false;
@@ -811,7 +838,9 @@ impl Tracker {
                 Ok(Applied::Written)
             }
             Row::AcceptedState {
-                snapshot, person, ..
+                snapshot,
+                person,
+                time,
             } => {
                 let named = self.leftovers.iter().any(|leftover| {
                     leftover.class == LeftoverClass::Repository
@@ -821,12 +850,12 @@ impl Tracker {
                     return wrong("a state is accepted that no repository leftover names");
                 }
                 if self.enforce {
-                    // The same person's repeat, at any time, says what the journal says; another
-                    // person's acceptance of the same state is not recorded here.
-                    if let Some((accepted, by)) = &self.accepted
+                    // The same row again says what the journal says; the same state accepted by
+                    // another person or at another time is a row the journal does not hold.
+                    if let Some((accepted, by, at)) = &self.accepted
                         && accepted == snapshot
                     {
-                        return Ok(if by == person {
+                        return Ok(if by == person && at == time {
                             Applied::AlreadyRecorded
                         } else {
                             Applied::Differs
@@ -839,29 +868,28 @@ impl Tracker {
                     }
                 }
                 self.counts.accepted += 1;
-                self.accepted = Some((*snapshot, person.clone()));
+                self.accepted = Some((*snapshot, person.clone(), *time));
                 Ok(Applied::Written)
             }
             Row::LeftoverCleared { key } => {
-                let cleared: Vec<Option<FileKey>> = self
+                let cleared: Vec<(Option<FileKey>, usize)> = self
                     .leftovers
                     .iter()
                     .filter(|leftover| &leftover.object == key)
-                    .map(|leftover| leftover.owner)
+                    .map(|leftover| (leftover.owner, leftover.room))
                     .collect();
                 if cleared.is_empty() {
                     return wrong("a leftover is cleared that was not open");
                 }
                 self.leftovers.retain(|leftover| &leftover.object != key);
                 let mut paid = false;
-                for owner in &cleared {
+                for (owner, room) in &cleared {
                     let Some(owner) = owner else {
                         self.open_unowned = self.open_unowned.saturating_sub(1);
                         continue;
                     };
                     if let Some(mut account) = self.keys.get(owner).cloned() {
-                        account.owed_clear =
-                            account.owed_clear.saturating_sub(account.cleared_room);
+                        account.owed_clear = account.owed_clear.saturating_sub(*room);
                         self.set_account(*owner, account);
                         paid = true;
                     }
@@ -953,7 +981,7 @@ impl Tracker {
     /// The snapshot the person accepted as the tree's baseline, if any.
     #[must_use]
     pub fn accepted_snapshot(&self) -> Option<u32> {
-        self.accepted.as_ref().map(|(snapshot, _)| *snapshot)
+        self.accepted.as_ref().map(|(snapshot, _, _)| *snapshot)
     }
 
     /// The boot marker the invocation began with.
@@ -1038,7 +1066,8 @@ pub fn read_file_limited(id: &str, bytes: &[u8], current_boot: &str, limit: usiz
                 break;
             }
         };
-        if let Err(error) = tracker.apply(&row) {
+        // The file is counted by what is in it: a record may be longer than this build writes it.
+        if let Err(error) = tracker.apply_framed(&row, record.len() + framing::FRAME_BYTES) {
             damage = Some(format!("record {index}: {error}"));
             break;
         }
