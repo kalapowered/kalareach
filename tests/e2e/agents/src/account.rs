@@ -32,6 +32,12 @@ const LOCK_WAIT: Duration = Duration::from_secs(20);
 /// The turns charged to one budget, kept in a file across runs, so retries, controls and runs that
 /// stopped part way all count. Parts run one at a time; a lock file keeps two charges apart all
 /// the same.
+///
+/// The file is the operator's, made on purpose and never by a charge: a JSON object whose
+/// `budgets` member is an object holding, for the budget, an array of the turns charged to it. The
+/// first, empty ledger is `{"budgets": {"<budget>": []}}` written to the file `KR_AGENTS_TURNS`
+/// names. A file that is not there, or is not of that shape, is refused before anything is
+/// submitted, since a ledger read as empty gives back the whole allowance.
 #[derive(Clone, Debug)]
 pub struct Ledger {
     path: PathBuf,
@@ -46,8 +52,9 @@ impl Ledger {
     ///
     /// # Panics
     ///
-    /// Panics when [`TURNS_VARIABLE`] names no file: a part that spends turns does not run without a
-    /// ledger to charge them to.
+    /// Panics when [`TURNS_VARIABLE`] names no file, or the file is not there or is not a ledger
+    /// that holds an array for `budget` ([`Ledger::at`]): a part that spends turns does not run
+    /// without a ledger to charge them to, and nothing is submitted.
     #[must_use]
     pub fn from_environment(budget: &str, limit: u64) -> Self {
         let path = std::env::var_os(TURNS_VARIABLE)
@@ -56,12 +63,42 @@ impl Ledger {
             .unwrap_or_else(|| {
                 panic!("{TURNS_VARIABLE} names no ledger, and a part that spends turns needs one")
             });
-        Self {
+        Self::at(path, budget, limit).unwrap_or_else(|why| panic!("{why}"))
+    }
+
+    /// The ledger in the file at `path`, for `budget`, which allows `limit` turns.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the ledger is refused: the file is not there, cannot be read, is not JSON, or does
+    /// not hold an array for the budget. The text says how the first, empty ledger is made.
+    pub fn at(path: PathBuf, budget: &str, limit: u64) -> Result<Self, String> {
+        let ledger = Self {
             path,
             budget: budget.to_owned(),
             limit,
             charged: std::sync::Arc::default(),
-        }
+        };
+        let _ = ledger.entries(&read_ledger(&ledger.path, budget)?)?;
+        Ok(ledger)
+    }
+
+    /// The turns the budget holds in `ledger`, as an array.
+    fn entries(&self, ledger: &Value) -> Result<Vec<Value>, String> {
+        ledger
+            .get("budgets")
+            .and_then(|budgets| budgets.get(&self.budget))
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "the ledger {} holds no array of turns for the {} budget, so what is left of \
+                     it is not known; {}",
+                    self.path.display(),
+                    self.budget,
+                    how_to_make_a_ledger(&self.budget)
+                )
+            })
     }
 
     /// How many turns this run has charged so far.
@@ -78,11 +115,8 @@ impl Ledger {
     /// Returns why the ledger could not be written.
     pub fn charge_found(&self, part: &str, what: &str, count: u64) -> Result<u64, String> {
         let _lock = LedgerLock::take(&self.path)?;
-        let mut ledger = read_ledger(&self.path)?;
-        let mut entries = ledger["budgets"][&self.budget]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let mut ledger = read_ledger(&self.path, &self.budget)?;
+        let mut entries = self.entries(&ledger)?;
         for _ in 0..count {
             entries.push(json!({ "at_ms": now_ms(), "part": part, "what": what }));
         }
@@ -98,10 +132,8 @@ impl Ledger {
     ///
     /// Returns why the ledger could not be read: an unreadable ledger is not an empty one.
     pub fn spent(&self) -> Result<u64, String> {
-        let ledger = read_ledger(&self.path)?;
-        let entries = ledger["budgets"][&self.budget]
-            .as_array()
-            .map_or(0, Vec::len);
+        let ledger = read_ledger(&self.path, &self.budget)?;
+        let entries = self.entries(&ledger)?.len();
         Ok(u64::try_from(entries).unwrap_or(u64::MAX))
     }
 
@@ -120,11 +152,8 @@ impl Ledger {
     /// not be written.
     pub fn charge(&self, part: &str, what: &str) -> Result<u64, String> {
         let _lock = LedgerLock::take(&self.path)?;
-        let mut ledger = read_ledger(&self.path)?;
-        let entries = ledger["budgets"][&self.budget]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let mut ledger = read_ledger(&self.path, &self.budget)?;
+        let entries = self.entries(&ledger)?;
         let spent = u64::try_from(entries.len()).unwrap_or(u64::MAX);
         if spent >= self.limit {
             return Err(format!(
@@ -164,12 +193,25 @@ fn write_ledger(path: &Path, ledger: &Value) -> Result<(), String> {
         .map_err(failed)
 }
 
-/// Reads the ledger, or an empty one where there is no file yet.
-fn read_ledger(path: &Path) -> Result<Value, String> {
+/// How the operator makes the first, empty ledger for `budget`, on purpose.
+fn how_to_make_a_ledger(budget: &str) -> String {
+    format!(
+        "make the first, empty ledger on purpose, a file holding exactly \
+         {{\"budgets\": {{\"{budget}\": []}}}}, and name it in {TURNS_VARIABLE}"
+    )
+}
+
+/// Reads the ledger. A file that is not there is not an empty ledger: it is an error, which says
+/// how the first one is made.
+fn read_ledger(path: &Path, budget: &str) -> Result<Value, String> {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map_err(|error| format!("the ledger {}: {error}", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(json!({ "budgets": {} })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "the ledger {} is not there, and a charge makes no ledger of its own; {}",
+            path.display(),
+            how_to_make_a_ledger(budget)
+        )),
         Err(error) => Err(format!("the ledger {}: {error}", path.display())),
     }
 }
@@ -1377,17 +1419,23 @@ mod tests {
         }
     }
 
+    /// The ledger at `path` for `budget`, in a file made as the operator makes the first one: with
+    /// an explicit empty array for each of `budgets`.
+    fn made(path: &Path, budgets: &[&str], budget: &str, limit: u64) -> Ledger {
+        let empty: serde_json::Map<String, Value> = budgets
+            .iter()
+            .map(|name| ((*name).to_owned(), json!([])))
+            .collect();
+        std::fs::write(path, json!({ "budgets": empty }).to_string()).expect("a first ledger");
+        Ledger::at(path.to_path_buf(), budget, limit).expect("a ledger")
+    }
+
     /// A second process reads the ledger the moment a charge returns, and finds the charge.
     #[test]
     fn a_charge_is_in_the_file_another_process_reads_when_the_charge_returns() {
         let scratch = Scratch::new("durable");
         let path = scratch.0.join("turns.json");
-        let ledger = Ledger {
-            path: path.clone(),
-            budget: "agent".to_owned(),
-            limit: 3,
-            charged: std::sync::Arc::default(),
-        };
+        let ledger = made(&path, &["agent"], "agent", 3);
         for expected in 1..=2_u64 {
             assert_eq!(ledger.charge("1", "a prompt"), Ok(expected));
             let read = std::process::Command::new("/bin/cat")
@@ -1413,19 +1461,9 @@ mod tests {
     fn a_ledger_charges_up_to_its_limit_across_instances_and_refuses_the_next() {
         let scratch = Scratch::new("ledger");
         let path = scratch.0.join("turns.json");
-        let ledger = Ledger {
-            path: path.clone(),
-            budget: "agent".to_owned(),
-            limit: 2,
-            charged: std::sync::Arc::default(),
-        };
+        let ledger = made(&path, &["agent", "another"], "agent", 2);
         assert_eq!(ledger.charge("1", "first"), Ok(1));
-        let again = Ledger {
-            path,
-            budget: "agent".to_owned(),
-            limit: 2,
-            charged: std::sync::Arc::default(),
-        };
+        let again = Ledger::at(path, "agent", 2).expect("the same ledger");
         assert_eq!(again.charge("1", "second"), Ok(2));
         assert!(
             again.charge("1", "third").is_err(),
@@ -1442,12 +1480,7 @@ mod tests {
     #[test]
     fn the_turns_a_run_charged_are_counted_and_those_found_spent_are_charged_beyond_the_limit() {
         let scratch = Scratch::new("found");
-        let ledger = Ledger {
-            path: scratch.0.join("turns.json"),
-            budget: "agent".to_owned(),
-            limit: 2,
-            charged: std::sync::Arc::default(),
-        };
+        let ledger = made(&scratch.0.join("turns.json"), &["agent"], "agent", 2);
         let clone = ledger.clone();
         assert_eq!(ledger.charged_here(), 0);
         assert_eq!(clone.charge("1", "first"), Ok(1));
@@ -1469,6 +1502,58 @@ mod tests {
             2,
             "what was found was not charged by the run"
         );
+    }
+
+    /// A ledger that is not there, or whose budget is not an array, gives back no allowance: it is
+    /// refused before anything is submitted, and a charge never overwrites what it refused.
+    #[test]
+    fn a_ledger_that_is_missing_or_of_the_wrong_shape_is_refused_and_never_overwritten() {
+        let scratch = Scratch::new("shape");
+        let path = scratch.0.join("turns.json");
+        // Not there: no ledger is made by asking for one, and the text says how to make one.
+        let why = Ledger::at(path.clone(), "agent", 3).expect_err("a missing ledger");
+        assert!(
+            why.contains(r#"{"budgets": {"agent": []}}"#) && why.contains(TURNS_VARIABLE),
+            "{why}"
+        );
+        assert!(!path.exists(), "asking for a ledger makes none");
+        for wrong in [
+            "{}",
+            r#"{"budgets": []}"#,
+            r#"{"budgets": {"agent": 21}}"#,
+            r#"{"budgets": {"agent": {"spent": 0}}}"#,
+            r#"{"budgets": {"another": []}}"#,
+            "[]",
+            "{ not json",
+        ] {
+            std::fs::write(&path, wrong).expect("a wrong ledger");
+            assert!(
+                Ledger::at(path.clone(), "agent", 3).is_err(),
+                "{wrong} is refused"
+            );
+            // A ledger that became wrong after it was accepted takes no charge and is left alone.
+            let ledger = made(&scratch.0.join("good.json"), &["agent"], "agent", 3);
+            let ledger = Ledger {
+                path: path.clone(),
+                ..ledger
+            };
+            assert!(
+                ledger.charge("1", "first").is_err(),
+                "{wrong} takes no charge"
+            );
+            assert!(ledger.charge_found("1", "found", 1).is_err());
+            assert!(ledger.spent().is_err());
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("the ledger"),
+                wrong,
+                "a refused charge leaves the ledger as it was"
+            );
+            assert_eq!(ledger.charged_here(), 0);
+        }
+        // The explicit empty ledger is accepted and charges.
+        let ledger = made(&path, &["agent"], "agent", 3);
+        assert_eq!(ledger.spent(), Ok(0));
+        assert_eq!(ledger.charge("1", "first"), Ok(1));
     }
 
     #[test]
