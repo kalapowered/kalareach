@@ -67,6 +67,21 @@ pub const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6
 /// owner cannot change.
 pub const DEVICE_OPEN_DRAFTS: u64 = 64;
 
+/// How many uploads one paired device may keep staged.
+///
+/// An upload is staged from `upload.begin` until it ends: while it receives chunks, while it is
+/// published, and until the attachment it made expires. An attachment that a prompt has sent to a
+/// session follows that session's retention instead and stops counting, as a draft a prompt has
+/// sent does. A device frees a place by cancelling an upload that is still receiving, or by sending
+/// a file or letting it expire, which an unused file does after seven days; a published file cannot
+/// be cancelled. The bytes of every upload are bounded by the environment's own limit, so this
+/// bounds what bytes do not: the rows and the files of no bytes a device leaves. The page makes a
+/// draft of up to eight files and a device holds at most [`DEVICE_OPEN_DRAFTS`] drafts open, which
+/// is about 512 files, so the bound leaves that much again for what is waiting to be sent. The
+/// person at this machine has no bound; the limit is a constant of this host, which an owner cannot
+/// change.
+pub const DEVICE_STAGED_UPLOADS: u64 = 1_024;
+
 /// What a transfer call answers with: the method's result, or the refusal the service decided.
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
 

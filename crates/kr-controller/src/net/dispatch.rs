@@ -452,6 +452,9 @@ mod a_copy_from_a_services_record;
 mod a_data_stream_output;
 
 #[cfg(test)]
+mod a_device_upload;
+
+#[cfg(test)]
 mod a_draft_a_device_writes;
 
 #[cfg(test)]
