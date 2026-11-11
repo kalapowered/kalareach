@@ -240,9 +240,10 @@ pub(crate) const fn described_in(method: Method) -> Section {
         | Method::AgentApprovalRespond
         | Method::AgentApprovalInspect => at(METHOD_REFERENCE, "The agent methods"),
 
-        Method::DraftCreate | Method::DraftUpdate | Method::AgentDraftAddAttachment => {
-            at(TRANSFER, "Attachments, drafts and insertion")
-        }
+        Method::DraftCreate
+        | Method::DraftUpdate
+        | Method::DraftDiscard
+        | Method::AgentDraftAddAttachment => at(TRANSFER, "Attachments, drafts and insertion"),
         Method::UploadBegin
         | Method::UploadStatus
         | Method::UploadChunk

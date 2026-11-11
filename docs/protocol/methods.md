@@ -209,6 +209,7 @@ document.
 | --- | --- | --- | --- | --- |
 | `draft.create` | write | `local_ipc`, `paired_device` | Create a device-owned draft that survives attachment replacement. | [Transfer: Attachments, drafts and insertion](../transfer/README.md) |
 | `draft.update` | write | `local_ipc`, `paired_device` | Update a draft at its exact revision. A draft is never submitted automatically. | [Transfer: Attachments, drafts and insertion](../transfer/README.md) |
+| `draft.discard` | write | `local_ipc`, `paired_device` | End a draft of the caller's own and release the places it holds. A draft a prompt named, or one an attachment of which the agent was offered, is refused and kept until its session ends. Uploads the draft bound are not changed. | [Transfer: Attachments, drafts and insertion](../transfer/README.md) |
 | `agent.draft.add_attachment` | write | `local_ipc`, `paired_device` | Bind a completed attachment handle to a draft. A manual terminal workflow needs no declaration; any other insertion path needs one from the session's integration. | [Transfer: Attachments, drafts and insertion](../transfer/README.md) |
 | `upload.begin` | write | `local_ipc`, `paired_device`, `workflow` | Reserve the declared size and return an upload identifier, chunk size and expiry. | [Transfer: The seven methods](../transfer/README.md) |
 | `upload.status` | read | `local_ipc`, `paired_device`, `workflow` | Report verified chunk status so an interrupted transfer resumes without republishing. | [Transfer: The seven methods](../transfer/README.md) |

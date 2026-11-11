@@ -155,6 +155,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         "agent.approval.respond",
         "draft.create",
         "draft.update",
+        "draft.discard",
         "agent.draft.add_attachment",
         "upload.begin",
         "upload.status",

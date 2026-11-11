@@ -103,6 +103,7 @@ impl DeviceWrite {
             Method::DeviceKeysComplete => Self::KeysComplete,
             Method::DraftCreate
             | Method::DraftUpdate
+            | Method::DraftDiscard
             | Method::AgentDraftAddAttachment
             | Method::UploadBegin
             | Method::UploadFinish

@@ -2857,6 +2857,8 @@ export interface KalaReachProtocol {
   download_placement?: DownloadPlacement
   draft_create_params?: DraftCreateParams
   draft_create_result?: DraftCreateResult
+  draft_discard_params?: DraftDiscardParams
+  draft_discard_result?: DraftDiscardResult
   draft_record?: DraftRecord2
   draft_update_params?: DraftUpdateParams
   draft_update_result?: DraftUpdateResult
@@ -14810,6 +14812,29 @@ export interface DraftRecord1 {
   updated_at_ms: string
 }
 /**
+ * Parameters of `draft.discard`.
+ *
+ * No revision is expected: the caller that most needs to end a draft is one that has lost the
+ * revision it last saw.
+ */
+export interface DraftDiscardParams {
+  /**
+   * One durable device-owned draft, independent of an attachment.
+   */
+  draft_id: string
+}
+/**
+ * The result of `draft.discard`.
+ *
+ * It names the draft that was ended. A repeat of the same action is answered with it again.
+ */
+export interface DraftDiscardResult {
+  /**
+   * One durable device-owned draft, independent of an attachment.
+   */
+  draft_id: string
+}
+/**
  * A durable device-owned draft.
  *
  * A draft outlives the attachment that displays it: losing a connection removes the association,
@@ -19382,6 +19407,7 @@ export interface MethodEntry {
     | 'agent.approval.respond'
     | 'draft.create'
     | 'draft.update'
+    | 'draft.discard'
     | 'agent.draft.add_attachment'
     | 'upload.begin'
     | 'upload.status'
@@ -28512,6 +28538,7 @@ export interface ServiceRequestPayload {
     | 'agent.approval.respond'
     | 'draft.create'
     | 'draft.update'
+    | 'draft.discard'
     | 'agent.draft.add_attachment'
     | 'upload.begin'
     | 'upload.status'

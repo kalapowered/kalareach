@@ -1118,6 +1118,27 @@ pub struct DraftUpdateResult {
     pub draft: DraftRecord,
 }
 
+/// Parameters of `draft.discard`.
+///
+/// No revision is expected: the caller that most needs to end a draft is one that has lost the
+/// revision it last saw.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DraftDiscardParams {
+    /// The draft to end.
+    pub draft_id: DraftId,
+}
+
+/// The result of `draft.discard`.
+///
+/// It names the draft that was ended. A repeat of the same action is answered with it again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DraftDiscardResult {
+    /// The draft that was ended.
+    pub draft_id: DraftId,
+}
+
 /// Parameters of `agent.draft.add_attachment`.
 ///
 /// This binds a completed handle to a draft and records what the adapter reported. It never
