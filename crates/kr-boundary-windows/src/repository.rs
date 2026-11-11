@@ -3,4 +3,5 @@
 //! everywhere, and each refuses by naming a rule.
 
 pub mod attributes;
+pub mod config;
 pub mod head;
