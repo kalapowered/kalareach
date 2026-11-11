@@ -223,6 +223,33 @@ fn a_quoted_pattern_is_read_as_git_unquotes_it() {
 }
 
 #[test]
+fn a_quoted_pattern_unquotes_exactly_the_escapes_git_knows() {
+    // With no blank after the closing quotation mark, the attribute is read only when Git
+    // unquotes the pattern: the other reading takes the whole line as one pattern.
+    for escape in [
+        r"\a", r"\b", r"\f", r"\n", r"\r", r"\t", r"\v", r"\\", r#"\""#, r"\000", r"\101", r"\177",
+        r"\377",
+    ] {
+        let line = format!("\"p{escape}q\"filter=lfs\n");
+        assert_eq!(rule(&line), RULE_FILTER, "{line:?}");
+    }
+    for escape in [
+        r"\q", r"\x", r"\0", r"\00", r"\18", r"\400", r"\777", r"\8", r"\3x7",
+    ] {
+        let line = format!("\"p{escape}q\"filter=lfs\n");
+        allowed(&line);
+    }
+    // An escape cut by the end of the quoted text is no escape, and a quoted text that is not
+    // closed is no pattern.
+    allowed("\"p\\\"filter=lfs\n");
+    allowed("\"p\\1\"filter=lfs\n");
+    allowed("\"p\\\n");
+    // An empty quoted pattern is a pattern; what follows it is an attribute.
+    assert_eq!(rule("\"\"filter=lfs\n"), RULE_FILTER);
+    allowed("\"p\"\n");
+}
+
+#[test]
 fn a_refusal_names_the_rule_and_the_line_and_never_what_the_file_held() {
     let text = "# first\n* text=auto\nsecret/path/name.dat -text filter=secretdriver\nlater\n";
     let refusal = scan_attributes(text.as_bytes()).unwrap_err();
