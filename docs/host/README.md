@@ -3305,8 +3305,9 @@ device that may not read the session's receipts is told `OUTCOME_UNKNOWN`.
 
 A device holds at most 64 open drafts. A draft is open until a prompt sends it to a session or the
 session it targets closes: the closure of a session queues, on a task of its own, the write that
-orphans its drafts, and a device at its bound has the closures the registry holds written first, so
-a draft stops counting when its session is recorded closed. A `draft.create` past the bound is
+orphans its drafts, and each `draft.create` first writes the end of the sessions its device's open
+drafts target that the registry holds closed, so a draft stops counting when its session is
+recorded closed. A `draft.create` past the bound is
 refused `QUOTA_EXCEEDED` with the bound in the message, only after the service has asked the
 admission again, so a device whose authority has gone learns no count. The host keeps that refusal
 as the action's outcome, as it keeps every refusal of a service, so the same action asked again is

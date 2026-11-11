@@ -789,6 +789,64 @@ async fn a_draft_stops_counting_when_the_registry_holds_its_session_closed() {
     world.serving.abort();
 }
 
+/// KR-REQ-23.41: the bound refuses a create only for drafts that are open, whatever else the device
+/// is creating. The device here holds one place fewer than its bound by the registry's account, which
+/// records the closure of the session one of its drafts targets while the transfer service has not
+/// been told. Two creates that run together are both served: the one stopped inside the service,
+/// after it has been through the door, is not refused for a draft the other made while it waited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_creates_together_beside_a_closure_not_yet_written_are_both_served() {
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::closure_of;
+
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    let (connection, _) = paired_connection(controller, 43, EVERY_RIGHT);
+    let device = connection.device.principal();
+    a_draft_for(&world, &device, Some(world.session_id));
+    for _ in 1..DEVICE_OPEN_DRAFTS - 1 {
+        a_draft_for(&world, &device, None);
+    }
+    controller
+        .registry
+        .lock()
+        .await
+        .record_closure(&closure_of(world.session_id))
+        .expect("the registry records the closure");
+
+    let (arrived, release) = controller.transfer().pause_after_the_outer_check();
+    let first = connection.answer_now(ControlFrame::Mutation(Box::new(a_create_for_no_session(
+        &world,
+        &connection,
+        1,
+    ))));
+    tokio::pin!(first);
+    let waiting = tokio::task::spawn_blocking(move || arrived.recv_timeout(WAIT_BOUND));
+    tokio::pin!(waiting);
+    tokio::select! {
+        arrived = &mut waiting => {
+            arrived
+                .expect("the waiting thread finishes")
+                .expect("the first create reaches the service");
+        }
+        early = &mut first => panic!("the first create was answered before the service: {early:?}"),
+    }
+    let (first, second) = tokio::join!(first, async {
+        let second = connection
+            .answer_now(ControlFrame::Mutation(Box::new(a_create_for_no_session(
+                &world,
+                &connection,
+                2,
+            ))))
+            .await;
+        release.send(()).expect("the first create goes on");
+        second
+    });
+    for answered in [first, second] {
+        let _: DraftCreateResult = result_of(answered.expect("the create is answered").frame());
+    }
+    world.serving.abort();
+}
+
 /// KR-REQ-23.41 and KR-REQ-09.09: a `draft.create` whose deadline passes after the door's own check
 /// and before the service writes is refused for its deadline and writes nothing, and the refusal is
 /// not the action's record: the same action under an admission that stands is a first admission and
