@@ -1781,7 +1781,7 @@ async fn a_page_is_written_whole_under_the_privacy_state_it_was_read_in_and_hold
         .await
         .expect("an answer");
     assert!(
-        connection.write_answer(answer).await,
+        connection.write_answer(connection.output(), answer).await,
         "the connection stands"
     );
     let written: HistoryPageResult = answered(kept.frames()[0].clone());
@@ -1816,17 +1816,20 @@ async fn a_page_a_worker_answered_is_withheld_when_privacy_mode_starts_before_it
         .await
         .expect("an answer");
     let turn = connection.output.hold_the_turn().await;
-    let (stands, ()) = tokio::join!(connection.write_answer(answer), async {
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            while connection.output.writes_queued() < 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the answer is waiting for the writer");
-        privacy_mode_is_turned_on(controller).await;
-        drop(turn);
-    });
+    let (stands, ()) = tokio::join!(
+        connection.write_answer(connection.output(), answer),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while connection.output.writes_queued() < 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the answer is waiting for the writer");
+            privacy_mode_is_turned_on(controller).await;
+            drop(turn);
+        }
+    );
     assert!(stands, "the connection stands");
     let withheld: HistoryPageResult = answered(kept.frames()[0].clone());
     assert!(
@@ -1863,7 +1866,7 @@ async fn a_page_read_before_the_worker_is_told_of_privacy_mode_is_withheld() {
         .await
         .expect("an answer");
     assert!(
-        connection.write_answer(answer).await,
+        connection.write_answer(connection.output(), answer).await,
         "the connection stands"
     );
     let written: HistoryPageResult = answered(kept.frames()[0].clone());
@@ -6026,7 +6029,7 @@ async fn a_workers_refusal_that_names_the_hosts_files_reaches_a_device_without_t
         .await
         .expect("an answer");
     assert!(
-        connection.write_answer(answer).await,
+        connection.write_answer(connection.output(), answer).await,
         "the connection stands"
     );
     let told = error_of(&kept.frames()[0]).clone();

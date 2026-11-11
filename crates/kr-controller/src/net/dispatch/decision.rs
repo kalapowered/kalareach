@@ -18,7 +18,7 @@ use crate::grants::policy::HeldBound;
 use crate::service::net::lifetimes::GrantStanding;
 
 use super::acting::{Acting, Held};
-use super::output::{Answers, RELAY_DECISIONS, ReadUnder, Written};
+use super::output::{Answers, RELAY_DECISIONS, ReadUnder, RemoteOutput, Written};
 use super::{RemoteConnection, failure};
 
 /// One request of this connection's as the host decided it: what was asked, and the decision,
@@ -130,8 +130,11 @@ fn without_its_output(frame: &ControlFrame) -> ControlFrame {
 }
 
 impl RemoteConnection {
-    /// Writes one answer under the time bounds its request was decided under, and returns whether
-    /// the connection goes on.
+    /// Writes one answer to `output` under the time bounds its request was decided under, and
+    /// returns whether the stream it is written on goes on.
+    ///
+    /// `output` is the control stream's, or a data stream's when the request arrived on one: both
+    /// are held to this connection's one authority.
     ///
     /// Each bound is read from its cell as it stands when the answer is written, so a renewal
     /// published while the answer waited lets it go. When one has ended before any of the answer
@@ -140,13 +143,13 @@ impl RemoteConnection {
     /// organisation-mediated response is refused, while the transport stays connected. The
     /// refusal is the decision's own, so a lapse the clock decided is stated only once the floor
     /// it stood on is on record.
-    pub async fn write_answer(&self, answered: Answered) -> bool {
+    pub async fn write_answer(&self, output: &RemoteOutput, answered: Answered) -> bool {
         let Answered { frame, asked } = answered;
         let Some(mut asked) = asked else {
-            return self.output.send(&frame).await;
+            return output.send(&frame).await;
         };
         let Some(request_id) = answered_request(&frame) else {
-            return self.output.send(&frame).await;
+            return output.send(&frame).await;
         };
         for _ in 0..RELAY_DECISIONS {
             // What the answer shows is the decision's it is written under, as its bounds are.
@@ -200,7 +203,7 @@ impl RemoteConnection {
                 // not for a device that may not read it.
                 Err(error) => {
                     let error = asked.answers().refusing(&frame, error);
-                    return self.output.send(&failure(request_id, error)).await;
+                    return output.send(&failure(request_id, error)).await;
                 }
             }
         }
@@ -208,7 +211,7 @@ impl RemoteConnection {
         // not written, and what the device is told follows what the answer leaves open, as for a
         // decision that refuses.
         let error = asked.answers().refusing(&frame, authority_kept_moving());
-        self.output.send(&failure(request_id, error)).await
+        output.send(&failure(request_id, error)).await
     }
 
     /// The session a read is decided over: the one it names, or, for an `action.read` that names an
