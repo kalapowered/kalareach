@@ -17,7 +17,7 @@
 //! | [`events`] | What the platform's application-control log says about a program it refused |
 //! | [`frame`] | The broker's pipe protocol: framed messages with limits, and the requests and answers |
 //! | [`journal`] | The framing of the journal's records: a length, the bytes and a checksum, with a torn tail dropped |
-//! | [`repository`] | What the broker reads of a repository before it starts Git, from bytes alone: its `HEAD`, its attributes and its configuration listing |
+//! | [`repository`] | What the broker reads of a repository before it starts Git, from bytes alone: its `HEAD`, its attributes, its configuration listing and the output of the five readers it runs |
 //! | [`refusal`] | The refusal those readers give: a kind, the rule's name and a short text |
 //! | [`names`] | The grammar of the branch names and object identifiers the broker admits |
 //! | [`operation`] | The eight commands a request may name: their argument tables, the settings every command runs with and the one rule for line endings |
