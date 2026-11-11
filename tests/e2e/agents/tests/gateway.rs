@@ -2348,16 +2348,7 @@ fn ends(
     }
     // What a probe that moved the working directory left beside the run's root, outside the run.
     if let (Route::Real(_), Some(root)) = (&route, &root) {
-        let (moved, holds_something) = removes_the_moved_work_directory(root);
-        evidence["moved_work_directory"] = serde_json::json!(moved);
-        if holds_something {
-            stops.push((
-                "moved_work_directory_left",
-                format!(
-                    "{moved}: what it holds is outside the run, so the key scan did not cover it"
-                ),
-            ));
-        }
+        tells_the_moved_work_directory(root, &mut evidence, &mut stops);
     }
     // The person's files once more, after the run's directory went: a removal that reached them
     // would show here.
@@ -2407,6 +2398,23 @@ fn ends(
             }
             std::panic::resume_unwind(panic);
         }
+    }
+}
+
+/// What the end does with the directory a probe moved beside the run's root: removes it where it is
+/// empty, says what was found in the outcome's evidence, and adds the stop where it holds something.
+fn tells_the_moved_work_directory(
+    root: &Path,
+    evidence: &mut serde_json::Value,
+    stops: &mut Vec<Stop>,
+) {
+    let (moved, holds_something) = removes_the_moved_work_directory(root);
+    evidence["moved_work_directory"] = serde_json::json!(moved);
+    if holds_something {
+        stops.push((
+            "moved_work_directory_left",
+            format!("{moved}: what it holds is outside the run, so the key scan did not cover it"),
+        ));
     }
 }
 
@@ -3866,6 +3874,25 @@ fn the_directory_a_move_probe_leaves_beside_the_run_is_removed_only_where_it_is_
     let (said, stops) = removes_the_moved_work_directory(&root);
     assert!(said.contains("not a directory") && !stops, "{said}");
     assert!(elsewhere.is_dir() && moved.is_symlink());
+    // What the end does with it: the outcome says what was found, and a directory that holds
+    // something adds the stop; an empty one adds none.
+    std::fs::remove_file(&moved).expect("the link removed");
+    let (mut evidence, mut stops) = (serde_json::json!({}), Vec::new());
+    tells_the_moved_work_directory(&root, &mut evidence, &mut stops);
+    assert!(stops.is_empty(), "nothing beside the run: {stops:?}");
+    std::fs::create_dir(&moved).expect("a moved directory");
+    std::fs::write(moved.join("theirs"), "kept").expect("a file");
+    tells_the_moved_work_directory(&root, &mut evidence, &mut stops);
+    assert_eq!(
+        stops.iter().map(|stop| stop.0).collect::<Vec<_>>(),
+        vec!["moved_work_directory_left"]
+    );
+    assert!(
+        evidence["moved_work_directory"]
+            .as_str()
+            .is_some_and(|said| said.contains("holds something")),
+        "{evidence}"
+    );
     let _ = std::fs::remove_dir_all(&base);
 }
 
