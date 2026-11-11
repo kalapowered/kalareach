@@ -563,8 +563,8 @@ stream. A lookup it makes for that runs under the admission deadline, which the 
 `AuthorisedSession::deadlines`.
 
 `StreamRegistry::accept_pending` and `PendingStream::open` are the two steps the listener's task is
-made of, for a caller that takes streams itself. `StreamRegistry::accept` runs both for one stream
-and accepts every kind.
+made of, for a caller that takes streams itself: each stream is opened on a task of its own, so that
+one with half a header does not hold the next.
 
 A stream the host hands on is scheduled as its kind is: an attachment stream's frames and answers go
 out at the bulk priority, behind control and receipts, on the host's side as on the device's.
@@ -652,9 +652,8 @@ names no kind, or never reads, never raises the limit, so its devices can open n
 control stream.
 
 An endpoint that only dials (`bind_dialer`) starts at none, because a host opens no stream to a
-client. `StreamRegistry::accept` on a client's connection, which kr-client's
-`NetworkTransport::accept_stream` calls, therefore waits until the connection ends and then
-returns an error. A caller that accepts connections itself, with `bind_listener` and
+client. `StreamRegistry::accept_pending` on a client's connection therefore waits until the
+connection ends and then returns an error. A caller that accepts connections itself, with `bind_listener` and
 `handshake::accept`, has one stream per connection until it raises the limit with the same
 library call.
 

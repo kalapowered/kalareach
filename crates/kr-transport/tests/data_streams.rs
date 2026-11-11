@@ -1287,7 +1287,8 @@ async fn a_host_opens_no_stream_to_a_device() {
 
     let device = Arc::clone(&harness.device);
     let connection = harness.connection.clone();
-    let accepting = tokio::spawn(async move { device.accept(&connection).await.map(|_| ()) });
+    let accepting =
+        tokio::spawn(async move { device.accept_pending(&connection).await.map(|_| ()) });
     let mut from_the_host = Box::pin(harness.host_connection.open_bi());
     assert!(
         futures::poll!(&mut from_the_host).is_pending(),

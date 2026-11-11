@@ -259,7 +259,7 @@ async fn the_connection_uses_the_priority_each_kind_is_scheduled_at() {
         // Each accepted stream is held for the life of the test, because a closed stream has no
         // priority left to report.
         let mut open = Vec::new();
-        while let Ok(stream) = streams.accept(&connection).await {
+        while let Ok(stream) = support::accept_any(&streams, &connection).await {
             if installed.send((stream.kind(), stream.priority())).is_err() {
                 return;
             }
@@ -392,7 +392,7 @@ async fn every_keystroke_is_answered_while_a_transfer_runs() {
         };
         let streams = registry(authorised.connection_id);
         loop {
-            let Ok(mut stream) = streams.accept(&connection).await else {
+            let Ok(mut stream) = support::accept_any(&streams, &connection).await else {
                 return;
             };
             let kind = stream.kind();

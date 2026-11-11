@@ -1076,8 +1076,7 @@ async fn a_data_stream_does_not_survive_the_control_stream() {
         panic!("a paired endpoint is authorised");
     };
     let host_registry = registry(host_side.connection_id, SendLimits::default());
-    let mut host_stream = host_registry
-        .accept(&host_connection)
+    let mut host_stream = support::accept_any(&host_registry, &host_connection)
         .await
         .expect("a data stream");
     assert_eq!(host_stream.kind(), StreamKind::TerminalOutput);
@@ -1202,8 +1201,7 @@ async fn an_empty_frame_is_refused_before_it_damages_the_stream() {
         panic!("a paired endpoint is authorised");
     };
     let host_registry = registry(host_side.connection_id, SendLimits::default());
-    let mut host_stream = host_registry
-        .accept(&host_connection)
+    let mut host_stream = support::accept_any(&host_registry, &host_connection)
         .await
         .expect("a data stream");
 
@@ -1372,8 +1370,7 @@ async fn a_stream_header_from_another_connection_is_refused() {
         .await
         .expect("the header was sent");
 
-    let error = host_registry
-        .accept(&host_connection)
+    let error = support::accept_any(&host_registry, &host_connection)
         .await
         .expect_err("a header for another connection is refused");
     assert!(matches!(error, TransportError::Handshake(_)));

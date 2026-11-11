@@ -935,24 +935,6 @@ impl StreamRegistry {
         }
     }
 
-    /// Accepts a data stream the peer opened and reads its header, for a caller that takes one
-    /// stream at a time and wants every kind.
-    ///
-    /// A host that takes streams from its peer on a connection uses [`StreamRegistry::accept_pending`]
-    /// and opens each one on a task of its own, so that one stream with half a header does not hold
-    /// the next.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TransportError::ControlLost`] once the control stream has ended, and a handshake
-    /// failure when the header does not belong to this connection or the stream carried early data.
-    pub async fn accept(&self, connection: &Connection) -> Result<DataStream> {
-        self.accept_pending(connection)
-            .await?
-            .open(StreamKind::ALL)
-            .await
-    }
-
     /// Takes the next stream the peer opened from the connection, without reading it.
     ///
     /// It waits for one of [`MAX_PENDING_HEADERS`] places first, so a connection never has more

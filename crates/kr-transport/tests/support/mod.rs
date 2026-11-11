@@ -18,12 +18,27 @@ use std::sync::Arc;
 use iroh::{Endpoint, EndpointAddr};
 use kr_crypto::connect::{ChallengeLedger, PairedPeer};
 use kr_crypto::keys::DeviceKeys;
+use kr_protocol::frame::StreamKind;
 use kr_protocol::ids::{BootEpoch, BuildId, ClockEpoch, DeviceId, DeviceKeyRevision};
 use kr_protocol::scalars::{EndpointKey, Uuid};
 use kr_transport::clock::{ContinuousClock, ManualClock};
 use kr_transport::config::EndpointConfig;
 use kr_transport::handshake::{HostEpochs, LocalIdentity, PairedDirectory};
+use kr_transport::streams::{DataStream, StreamRegistry};
 use kr_transport::window::{ActionWindowIssuer, MAX_WINDOW_VALIDITY};
+
+/// Takes the next stream the peer opened from `connection`, of any kind, and reads its header, as
+/// the host's task for a connection does for each stream it takes.
+pub async fn accept_any(
+    streams: &StreamRegistry,
+    connection: &iroh::endpoint::Connection,
+) -> kr_transport::error::Result<DataStream> {
+    streams
+        .accept_pending(connection)
+        .await?
+        .open(StreamKind::ALL)
+        .await
+}
 
 /// Lets the peer of a connection that a test accepted by hand open the streams a host that takes
 /// data streams allows.

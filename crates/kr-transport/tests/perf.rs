@@ -196,7 +196,7 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
         };
         let streams = registry(authorised.connection_id);
         loop {
-            let Ok(mut stream) = streams.accept(&connection).await else {
+            let Ok(mut stream) = support::accept_any(&streams, &connection).await else {
                 return;
             };
             tokio::spawn(async move {
@@ -521,7 +521,7 @@ async fn a_reconnect_reaches_usable_state_within_two_seconds() {
                     return;
                 };
                 let streams = registry(authorised.connection_id);
-                let Ok(mut stream) = streams.accept(&connection).await else {
+                let Ok(mut stream) = support::accept_any(&streams, &connection).await else {
                     return;
                 };
                 let _ = stream.read_payload().await;
