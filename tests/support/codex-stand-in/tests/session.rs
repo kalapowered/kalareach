@@ -27,13 +27,13 @@ fn server(variants: &str, command: Option<&str>) -> Child {
     let mut server = Command::new(PROGRAM);
     server
         .args(["app-server", "--listen", "stdio://"])
-        .env("KR_STAND_IN", variants)
+        .env("STAND_IN", variants)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     if let Some(command) = command {
-        server.env("KR_STAND_IN_COMMAND", command);
+        server.env("STAND_IN_COMMAND", command);
     }
     server.spawn().expect("the server starts")
 }
@@ -463,7 +463,7 @@ async fn relay(variants: &str, environment: &[(&str, &str)], drop_after: Option<
         .arg("--remote")
         .arg(format!("unix://{}", socket.display()))
         .arg("hello")
-        .env("KR_STAND_IN", variants)
+        .env("STAND_IN", variants)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -565,7 +565,7 @@ async fn the_terminal_and_the_server_complete_a_turn_through_a_relay() {
     assert_eq!(run.status, Some(0), "{}", run.screen);
     assert!(run.screen.contains("turn/completed"), "{}", run.screen);
 
-    let run = relay("login", &[("KR_STAND_IN_API_KEY", "not-a-key")], None).await;
+    let run = relay("login", &[("STAND_IN_API_KEY", "not-a-key")], None).await;
     assert_eq!(run.status, Some(0), "{}", run.screen);
     assert!(
         run.written
@@ -580,7 +580,7 @@ async fn the_terminal_and_the_server_complete_a_turn_through_a_relay() {
     assert_eq!(run.origin.as_deref(), Some("http://example.test"));
 
     // The request to start a turn is exactly as long as it was asked to be.
-    let run = relay("", &[("KR_STAND_IN_PAD", "5000")], None).await;
+    let run = relay("", &[("STAND_IN_PAD", "5000")], None).await;
     assert_eq!(run.status, Some(0), "{}", run.screen);
     assert!(
         run.written

@@ -134,7 +134,7 @@ impl Server {
         }
     }
 
-    /// Writes one notification once the file `KR_STAND_IN_SPEAK` names exists, and leaves a file
+    /// Writes one notification once the file `STAND_IN_SPEAK` names exists, and leaves a file
     /// beside it that says whether the write went; a write that fails ends the server's commands,
     /// as every write that fails does.
     async fn speak(&mut self, release: &std::path::Path) {
@@ -250,7 +250,7 @@ impl Server {
         }
     }
 
-    /// Appends one line about a frame the terminal wrote to the file `KR_STAND_IN_RECEIVED` names,
+    /// Appends one line about a frame the terminal wrote to the file `STAND_IN_RECEIVED` names,
     /// where a test that wants to know what reached the server reads it.
     fn note_received(what: &str) {
         use std::io::Write as _;

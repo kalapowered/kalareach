@@ -36,12 +36,9 @@ fn kr_req_12_17_the_app_server_and_the_native_remote_run_through_the_gateway_on_
         &answer,
         "pinned",
         &[
-            ("KR_STAND_IN", "answer-when-released"),
-            ("KR_STAND_IN_COMMAND", COMMAND),
-            (
-                "KR_STAND_IN_RELEASE",
-                release.to_str().expect("a text path"),
-            ),
+            ("STAND_IN", "answer-when-released"),
+            ("STAND_IN_COMMAND", COMMAND),
+            ("STAND_IN_RELEASE", release.to_str().expect("a text path")),
         ],
     );
     launched.prints("TUI: the server asks for item/commandExecution/requestApproval");
