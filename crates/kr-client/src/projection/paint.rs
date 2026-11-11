@@ -313,6 +313,15 @@ const INSERT_MODE: u16 = 4;
 /// presses and releases (1000), those and a move with a button held (1002), and every move (1003).
 const MOUSE_TRACKING_MODES: &[u16] = &[1000, 1002, 1003];
 
+/// The DEC private modes that choose how a destination spells a mouse position, and that a screen
+/// carries: UTF-8 coordinates (1005) and SGR coordinates (1006).
+const MOUSE_ENCODING_MODES: &[u16] = &[1005, 1006];
+
+/// The four modes xterm names for the encoding of a mouse position: the two a screen carries, and
+/// URXVT coordinates (1015) and SGR coordinates in pixels (1016). Resetting all four returns any
+/// destination to the default encoding, whichever of them it had been set to.
+const MOUSE_ENCODING_FAMILY: &[u16] = &[1005, 1006, 1015, 1016];
+
 /// The modes that are the buffer selection under another spelling.
 ///
 /// Setting one of them here would clear the buffer this frame is about to paint. Which buffer is
@@ -549,10 +558,23 @@ impl<'a> Writer<'a> {
         // Whether the screen tracks the mouse at all, and the widest tracking it has on.
         let mut tracked = false;
         let mut tracking = None;
+        // The same for the encoding of a mouse position, which is one setting in a destination too.
+        let mut encoded = false;
+        let mut encoding = None;
         for ((spelling, mode), enabled) in self.screen.modes.clone() {
             let Ok(number) = u16::try_from(mode) else {
                 continue;
             };
+            if spelling == super::ProjectedModeSpelling::Dec
+                && MOUSE_ENCODING_MODES.contains(&number)
+            {
+                // Written once, below, after a reset of every mode of the family.
+                encoded = true;
+                if enabled {
+                    encoding = encoding.max(Some(number));
+                }
+                continue;
+            }
             if spelling == super::ProjectedModeSpelling::Dec
                 && MOUSE_TRACKING_MODES.contains(&number)
             {
@@ -584,6 +606,9 @@ impl<'a> Writer<'a> {
         }
         if tracked {
             self.mouse_tracking(tracking);
+        }
+        if encoded {
+            self.mouse_encoding(encoding);
         }
         // The keypad's own mode is carried twice by a screen; this is the spelling a terminal
         // takes, and it is written whichever way the modes above spelled it.
@@ -670,6 +695,33 @@ impl<'a> Writer<'a> {
             self.mode_of(super::ProjectedModeSpelling::Dec, *mode, false);
         }
         if let Some(mode) = tracking {
+            self.mode_of(super::ProjectedModeSpelling::Dec, mode, true);
+        }
+    }
+
+    /// Installs the encoding of a mouse position the screen holds, as the one setting a destination
+    /// keeps.
+    ///
+    /// A session holds the encoding as one state, so at most one of modes 1005 and 1006 is on in a
+    /// screen. A destination keeps one encoding too, the last one it was given, and a reset of any
+    /// mode of the family returns the default one, so writing the two in the screen's order would
+    /// leave 1006 in force for a screen that holds 1005, and the default for a screen that holds
+    /// 1006. All four modes xterm names are reset first, because the destination's own encoding is
+    /// not known here and xterm resets only the one that is in force, and the one that is on is set
+    /// last.
+    ///
+    /// A screen read from a worker of an earlier build can have both flags on, and the order they
+    /// were set in is lost; a delta from such a worker carries only the mode that changed, so it can
+    /// leave both on as well. 1006 is taken, as the last word of the earlier worker's own frame was.
+    /// Remove the choice when no worker of an earlier build can still be running: when the lowest
+    /// package version `check_build` accepts in `kr-cli`'s `attach.rs` is at or above the first
+    /// release that holds the one-state encoding in `kr-term`'s `ModeState`; a screen then holds at
+    /// most one of the two.
+    fn mouse_encoding(&mut self, encoding: Option<u16>) {
+        for mode in MOUSE_ENCODING_FAMILY {
+            self.mode_of(super::ProjectedModeSpelling::Dec, *mode, false);
+        }
+        if let Some(mode) = encoding {
             self.mode_of(super::ProjectedModeSpelling::Dec, mode, true);
         }
     }
@@ -3322,6 +3374,79 @@ mod safety {
             }
         }
         tracking
+    }
+
+    /// KR-REQ-01.11: the mouse encoding is installed as the one setting a terminal keeps.
+    #[test]
+    fn a_frame_leaves_the_destination_in_the_mouse_encoding_the_application_asked_for() {
+        let encoding_after = |modes: [(u64, bool); 2]| {
+            let mut screen = screen("plain", "text", None);
+            for (mode, enabled) in modes {
+                screen
+                    .modes
+                    .insert((super::super::ProjectedModeSpelling::Dec, mode), enabled);
+            }
+            let painted = install(&screen, Window::of(&screen), Keyboard::EVERYTHING);
+            // The destination was in another encoding before the frame: a screen with none on must
+            // put it back to the default, and the four modes xterm names must all be reset first.
+            let stream = [b"\x1b[?1015h".as_slice(), &painted.bytes].concat();
+            (
+                mouse_encoding(&stream),
+                mouse_encoding_writes(&painted.bytes),
+            )
+        };
+        let resets_then = |on: Option<u16>| {
+            let mut expected = vec![(1005, false), (1006, false), (1015, false), (1016, false)];
+            expected.extend(on.map(|mode| (mode, true)));
+            expected
+        };
+        assert_eq!(
+            encoding_after([(1005, true), (1006, false)]),
+            (Some(1005), resets_then(Some(1005)))
+        );
+        assert_eq!(
+            encoding_after([(1005, false), (1006, true)]),
+            (Some(1006), resets_then(Some(1006)))
+        );
+        assert_eq!(
+            encoding_after([(1005, false), (1006, false)]),
+            (None, resets_then(None))
+        );
+        // A screen from a worker of an earlier build can have both on, in an order that is lost: it
+        // is read as 1006, the later number, which is what an earlier frame's last word was.
+        assert_eq!(
+            encoding_after([(1005, true), (1006, true)]),
+            (Some(1006), resets_then(Some(1006)))
+        );
+    }
+
+    /// The mouse encoding a stream leaves a terminal in, as a terminal keeps it: setting 1005, 1006,
+    /// 1015 or 1016 replaces the one in force, and resetting any of them returns the default.
+    fn mouse_encoding(stream: &[u8]) -> Option<u16> {
+        // Every write replaces the state: a set makes its mode the one in force, a reset the default.
+        mouse_encoding_writes(stream)
+            .last()
+            .and_then(|(mode, set)| set.then_some(*mode))
+    }
+
+    /// Every set and reset of the four mouse encoding modes in a stream, in order.
+    fn mouse_encoding_writes(stream: &[u8]) -> Vec<(u16, bool)> {
+        let mut writes = Vec::new();
+        let mut rest = stream;
+        while let Some(at) = rest.windows(3).position(|window| window == b"\x1b[?") {
+            rest = &rest[at + 3..];
+            let digits = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
+            let mode = std::str::from_utf8(&rest[..digits])
+                .ok()
+                .and_then(|text| text.parse::<u16>().ok());
+            if let (Some(mode), Some(last)) = (mode, rest.get(digits))
+                && matches!(mode, 1005 | 1006 | 1015 | 1016)
+                && matches!(last, b'h' | b'l')
+            {
+                writes.push((mode, *last == b'h'));
+            }
+        }
+        writes
     }
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {

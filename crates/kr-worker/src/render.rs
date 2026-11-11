@@ -93,7 +93,9 @@
 
 use kr_term::grid::Link;
 use kr_term::grid::{Blink, Colour, GridRow, Rendition, Run, UnderlineStyle, VerticalPosition};
-use kr_term::modes::{ALTERNATE_BUFFER_MODES, MOUSE_TRACKING_MODES};
+use kr_term::modes::{
+    ALTERNATE_BUFFER_MODES, MOUSE_ENCODING_FAMILY, MOUSE_ENCODING_MODES, MOUSE_TRACKING_MODES,
+};
 use kr_term::palette::Rgb;
 use kr_term::sideeffect::{
     ClipboardSelection, NotificationDisplay, NotificationUrgency, Progress, SideEffectKind,
@@ -302,6 +304,30 @@ pub fn render(
                 .map(|entry| entry.mode),
         );
     }
+    // The mouse encoding is one state in the same way (at most one of 1005 and 1006 is on), found
+    // here and written where the first of the two is reached. The later number is taken if a screen
+    // holds both, which this build's engine does not produce.
+    let encoding_entries: Vec<_> = operations
+        .iter()
+        .filter_map(|operation| match operation {
+            RestoreOp::SetMode { entry }
+                if entry.kind == kr_term::modes::ModeKind::Dec
+                    && MOUSE_ENCODING_MODES.contains(&entry.mode) =>
+            {
+                Some(entry)
+            }
+            _ => None,
+        })
+        .collect();
+    if !encoding_entries.is_empty() {
+        writer.mouse_encoding = Some(
+            encoding_entries
+                .iter()
+                .filter(|entry| entry.enabled)
+                .map(|entry| entry.mode)
+                .max(),
+        );
+    }
     for operation in operations {
         writer.apply(operation);
     }
@@ -373,6 +399,10 @@ struct Writer {
     /// `Some(None)` is tracking off, and `None` is nothing to write (no tracking mode is carried,
     /// or it has been written).
     mouse_tracking: Option<Option<u16>>,
+    /// The mouse encoding to install, held until the first of the two encoding modes is reached:
+    /// `Some(None)` is the default encoding, and `None` is nothing to write (no encoding mode is
+    /// carried, or it has been written).
+    mouse_encoding: Option<Option<u16>>,
     carried: Carried,
 }
 
@@ -395,6 +425,7 @@ impl Writer {
             autowrap: true,
             reverse_video: false,
             mouse_tracking: None,
+            mouse_encoding: None,
             keyboard,
             carried: Carried::default(),
         }
@@ -489,6 +520,24 @@ impl Writer {
                                 self.csi(format!("?{mode}l").as_bytes());
                             }
                             if let Some(mode) = tracking {
+                                self.csi(format!("?{mode}h").as_bytes());
+                            }
+                        }
+                        return;
+                    }
+                    // The mouse encoding modes are one setting on a terminal too: the last one set
+                    // is in force and a reset returns the default. They are written together, where
+                    // the first of them is reached, as a reset of the four modes xterm names (a
+                    // terminal's own encoding is not known at this point, and xterm resets only the
+                    // one that is in force) and then the one that is on. Written one by one in the
+                    // order they are carried, 1006 would come after 1005 whichever of them the
+                    // application set last.
+                    if MOUSE_ENCODING_MODES.contains(&entry.mode) {
+                        if let Some(encoding) = self.mouse_encoding.take() {
+                            for mode in MOUSE_ENCODING_FAMILY {
+                                self.csi(format!("?{mode}l").as_bytes());
+                            }
+                            if let Some(mode) = encoding {
                                 self.csi(format!("?{mode}h").as_bytes());
                             }
                         }
@@ -1869,6 +1918,61 @@ mod tests {
         assert_eq!(tracking_after([false, true, false]), Some(1002));
         assert_eq!(tracking_after([false, false, true]), Some(1003));
         assert_eq!(tracking_after([false, false, false]), None);
+    }
+
+    /// KR-REQ-01.11: a restoration leaves a terminal in the mouse encoding the screen holds.
+    ///
+    /// Read as Terminal.app and iTerm keep it, the encoding is one state: a set of 1005 or 1006
+    /// replaces it and a reset of either returns the default. The two entries of a screen are carried
+    /// in numeric order, so writing them one by one would leave 1006 in force for a screen that holds
+    /// 1005, and the default for a screen that holds 1006. The four modes xterm names are all reset
+    /// first, then the one that is on is set.
+    #[test]
+    fn a_restoration_leaves_the_terminal_in_the_mouse_encoding_the_screen_holds() {
+        let written_after = |flags: [bool; 2]| {
+            let operations: Vec<RestoreOp> = [1005_u16, 1006]
+                .into_iter()
+                .zip(flags)
+                .map(|(mode, enabled)| RestoreOp::SetMode {
+                    entry: ModeEntry {
+                        kind: kr_term::modes::ModeKind::Dec,
+                        mode,
+                        enabled,
+                    },
+                })
+                .collect();
+            let rendered = render(
+                &operations,
+                viewport(24, 80),
+                Keyboard::Install,
+                Scope::WholeScreen,
+            );
+            // The terminal was in another encoding before the restoration: a screen with none on
+            // must put it back to the default.
+            let mut encoding = Some(1015);
+            let mut written = Vec::new();
+            for (_, mode, set) in dec_switches(&rendered.bytes) {
+                if matches!(mode, 1005 | 1006 | 1015 | 1016) {
+                    encoding = set.then_some(mode);
+                    written.push((mode, set));
+                }
+            }
+            (encoding, written)
+        };
+        let resets_then = |on: Option<u16>| {
+            let mut expected = vec![(1005, false), (1006, false), (1015, false), (1016, false)];
+            expected.extend(on.map(|mode| (mode, true)));
+            expected
+        };
+        assert_eq!(
+            written_after([true, false]),
+            (Some(1005), resets_then(Some(1005)))
+        );
+        assert_eq!(
+            written_after([false, true]),
+            (Some(1006), resets_then(Some(1006)))
+        );
+        assert_eq!(written_after([false, false]), (None, resets_then(None)));
     }
 
     #[test]

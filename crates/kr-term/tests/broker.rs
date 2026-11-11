@@ -962,3 +962,66 @@ fn the_mouse_tracking_is_one_state_as_a_terminal_keeps_it() {
         .collect();
     assert_eq!(held, [(1000, false), (1002, true), (1003, false)]);
 }
+
+/// KR-REQ-01.11: the mouse encoding is one state, as the terminals this product runs in keep it.
+///
+/// A set of 1005 or 1006 makes that one the encoding in force and clears the other, and a reset of
+/// either returns the default encoding, also when it names the one that is not in force. What the
+/// session answers a mode query with, what a snapshot holds and what a delta carries all follow, so
+/// that a terminal that is drawn the screen is put where the application's own terminal would be.
+#[test]
+fn the_mouse_encoding_is_one_state_as_a_terminal_keeps_it() {
+    let encoding_after = |input: &[u8]| {
+        let mut engine = engine();
+        engine.feed(input, 0);
+        [1005_u16, 1006].map(|mode| engine.modes().is_set(ModeKind::Dec, mode))
+    };
+    // The application's own history, and the one state its terminal would hold after it.
+    assert_eq!(encoding_after(b"\x1b[?1006h\x1b[?1005h"), [true, false]);
+    assert_eq!(encoding_after(b"\x1b[?1005h\x1b[?1006h"), [false, true]);
+    assert_eq!(encoding_after(b"\x1b[?1005h\x1b[?1006l"), [false; 2]);
+    assert_eq!(encoding_after(b"\x1b[?1006h\x1b[?1005l"), [false; 2]);
+    assert_eq!(encoding_after(b"\x1b[?1006h\x1b[?1006l"), [false; 2]);
+    // The answer to a mode query says the same: only the encoding in force is set.
+    let mut engine = engine();
+    engine.feed(b"\x1b[?1006h\x1b[?1005h", 0);
+    assert_eq!(
+        replies(&mut engine, b"\x1b[?1005$p\x1b[?1006$p", 0),
+        [b"\x1b[?1005;1$y".to_vec(), b"\x1b[?1006;2$y".to_vec()]
+    );
+    engine.feed(b"\x1b[?1006h\x1b[?1005l", 0);
+    assert_eq!(
+        replies(&mut engine, b"\x1b[?1005$p\x1b[?1006$p", 0),
+        [b"\x1b[?1005;2$y".to_vec(), b"\x1b[?1006;2$y".to_vec()]
+    );
+    // A delta carries every flag the change cleared, and a snapshot holds the one state, so a client
+    // that applies either is not left holding a flag the session no longer has.
+    let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+    engine.feed(b"\x1b[?1006h", 0);
+    let base = (engine.output_cursor(), engine.projection_generation());
+    engine.feed(b"\x1b[?1005h", 0);
+    let delta = engine.delta(base.0, base.1).expect("inside the window");
+    let carried: Vec<(u16, bool)> = delta
+        .modes
+        .iter()
+        .filter(|entry| matches!(entry.mode, 1005 | 1006))
+        .map(|entry| (entry.mode, entry.enabled))
+        .collect();
+    assert_eq!(carried, [(1005, true), (1006, false)]);
+    let (snapshot, _) = engine.snapshot(
+        Viewport {
+            top_row: 0,
+            rows: engine.grid().size().rows,
+            left_col: 0,
+            cols: engine.grid().size().cols,
+        },
+        0,
+    );
+    let held: Vec<(u16, bool)> = snapshot
+        .modes
+        .iter()
+        .filter(|entry| matches!(entry.mode, 1005 | 1006))
+        .map(|entry| (entry.mode, entry.enabled))
+        .collect();
+    assert_eq!(held, [(1005, true), (1006, false)]);
+}
