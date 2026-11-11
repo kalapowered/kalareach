@@ -2154,18 +2154,32 @@ fn still_running(identity: &ProcessStartIdentity, what: &str) -> Result<bool, St
 }
 
 /// Whether the command line `command` names the directory `root`: one of its words, or the part of
-/// one after an `=`, is `root` or a path below it, compared by path components, or is the address of
-/// a socket at such a path (`unix://<path>`, as the agent's terminal is given the gateway's). A
-/// directory whose name merely begins with the text of `root`'s is not named, so another host's run
-/// directory `<root>-other` is not this run's.
+/// one after an `=` that follows an option's or a variable's name, is `root` or a path below it,
+/// compared by path components, or is the address of a socket at such a path (`unix://<path>`, as
+/// the agent's terminal is given the gateway's). A directory whose name merely begins with the text
+/// of `root`'s is not named, so another host's run directory `<root>-other` is not this run's, and
+/// an address inside another word's query (`https://host/?next=unix://<path>`) is not the run's.
 #[must_use]
 pub fn names_the_root(command: &str, root: &Path) -> bool {
     command.split_whitespace().any(|word| {
         is_below(word, root)
-            || word
-                .split_once('=')
-                .is_some_and(|(_, value)| is_below(value, root))
+            || word.split_once('=').is_some_and(|(name, value)| {
+                is_an_option_or_variable_name(name) && is_below(value, root)
+            })
     })
+}
+
+/// Whether `text` is the name of an option (`-o`, `--remote`) or of a variable (`E2E_RUN_MARK`), as
+/// it stands before an `=`: letters, digits and `_`, and `-` in an option's.
+fn is_an_option_or_variable_name(text: &str) -> bool {
+    let (name, option) = text
+        .strip_prefix("--")
+        .or_else(|| text.strip_prefix('-'))
+        .map_or((text, false), |name| (name, true));
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || (option && c == '-'))
 }
 
 /// Whether `text`, a path or the address of a socket at a path (`unix://<path>`), is `root` or lies
@@ -2700,6 +2714,8 @@ mod root_tests {
             "codex --remote=unix:///tmp/krm-0a1b2c3d/s/gw.sock",
             "tool --dir=/tmp/krm-0a1b2c3d/x",
             "tool unix:///tmp/krm-0a1b2c3d",
+            "tool -o=/tmp/krm-0a1b2c3d/x --some-option=unix:///tmp/krm-0a1b2c3d/s",
+            "E2E_RUN_DIR=/tmp/krm-0a1b2c3d/x tool",
         ] {
             assert!(names_the_root(command, root), "{command}");
         }
@@ -2714,6 +2730,11 @@ mod root_tests {
             "tool a=b=/tmp/krm-0a1b2c3d/x",
             // The scheme is taken once.
             "tool unix://unix:///tmp/krm-0a1b2c3d/s",
+            // A socket address inside another address's query is not the run's.
+            "tool https://example.invalid/?next=unix:///tmp/krm-0a1b2c3d/s/gw.sock",
+            "tool a/b=/tmp/krm-0a1b2c3d/x",
+            "tool a.b=/tmp/krm-0a1b2c3d/x",
+            "tool path-with-dash=/tmp/krm-0a1b2c3d/x",
         ] {
             assert!(!names_the_root(command, root), "{command}");
         }
