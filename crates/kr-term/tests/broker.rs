@@ -883,3 +883,82 @@ fn two_capability_answers_are_never_collapsed_into_one() {
     let answers = replies(&mut engine, request.as_bytes(), 0);
     assert_eq!(answers.len(), 2, "one answer stood in for the other");
 }
+
+/// KR-REQ-01.11: the mouse tracking is one state, as xterm and Terminal.app keep it.
+///
+/// A set of 1000, 1002 or 1003 makes that one the tracking and clears the other two, and a reset of
+/// any of the three turns tracking off whichever of them had set it. What the session answers a
+/// mode query with, what a snapshot holds and what a delta carries all follow, so that a terminal
+/// that is drawn the screen is put where the application's own terminal would be.
+#[test]
+fn the_mouse_tracking_is_one_state_as_a_terminal_keeps_it() {
+    let tracking_after = |input: &[u8]| {
+        let mut engine = engine();
+        engine.feed(input, 0);
+        [1000_u16, 1002, 1003].map(|mode| engine.modes().is_set(ModeKind::Dec, mode))
+    };
+    // The application's own history, and the one state its terminal would hold after it.
+    assert_eq!(
+        tracking_after(b"\x1b[?1000h\x1b[?1002h"),
+        [false, true, false]
+    );
+    assert_eq!(
+        tracking_after(b"\x1b[?1003h\x1b[?1000h"),
+        [true, false, false]
+    );
+    assert_eq!(tracking_after(b"\x1b[?1002h\x1b[?1000l"), [false; 3]);
+    assert_eq!(
+        tracking_after(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1003l"),
+        [false; 3]
+    );
+    // The answer to a mode query says the same: only the tracking in force is set.
+    let mut engine = engine();
+    engine.feed(b"\x1b[?1000h\x1b[?1002h", 0);
+    assert_eq!(
+        replies(&mut engine, b"\x1b[?1000$p\x1b[?1002$p\x1b[?1003$p", 0),
+        [
+            b"\x1b[?1000;2$y".to_vec(),
+            b"\x1b[?1002;1$y".to_vec(),
+            b"\x1b[?1003;2$y".to_vec()
+        ]
+    );
+    engine.feed(b"\x1b[?1002h\x1b[?1000l", 0);
+    assert_eq!(
+        replies(&mut engine, b"\x1b[?1000$p\x1b[?1002$p\x1b[?1003$p", 0),
+        [
+            b"\x1b[?1000;2$y".to_vec(),
+            b"\x1b[?1002;2$y".to_vec(),
+            b"\x1b[?1003;2$y".to_vec()
+        ]
+    );
+    // A delta carries every flag the change cleared, and a snapshot holds the one state, so a client
+    // that applies either is not left holding a flag the session no longer has.
+    let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+    engine.feed(b"\x1b[?1000h", 0);
+    let base = (engine.output_cursor(), engine.projection_generation());
+    engine.feed(b"\x1b[?1002h", 0);
+    let delta = engine.delta(base.0, base.1).expect("inside the window");
+    let carried: Vec<(u16, bool)> = delta
+        .modes
+        .iter()
+        .filter(|entry| matches!(entry.mode, 1000 | 1002 | 1003))
+        .map(|entry| (entry.mode, entry.enabled))
+        .collect();
+    assert_eq!(carried, [(1000, false), (1002, true), (1003, false)]);
+    let (snapshot, _) = engine.snapshot(
+        Viewport {
+            top_row: 0,
+            rows: engine.grid().size().rows,
+            left_col: 0,
+            cols: engine.grid().size().cols,
+        },
+        0,
+    );
+    let held: Vec<(u16, bool)> = snapshot
+        .modes
+        .iter()
+        .filter(|entry| matches!(entry.mode, 1000 | 1002 | 1003))
+        .map(|entry| (entry.mode, entry.enabled))
+        .collect();
+    assert_eq!(held, [(1000, false), (1002, true), (1003, false)]);
+}

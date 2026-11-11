@@ -648,12 +648,16 @@ impl<'a> Writer<'a> {
 
     /// Installs which mouse events the destination reports, as the one setting a terminal keeps.
     ///
-    /// The screen holds modes 1000, 1002 and 1003 as three settings and the widest one that is on
-    /// is what the application asked for. Terminal.app and xterm hold one tracking state: setting any of them
-    /// replaces the one in force, and resetting any of them turns tracking off whichever was on.
-    /// Written one by one in the screen's order, with the ones that are off among them, the last
-    /// reset would leave the destination reporting nothing, so all three are reset first and the
-    /// widest one that is on is set last.
+    /// A session holds the tracking as one state, so at most one of modes 1000, 1002 and 1003 is on
+    /// in a screen. Written one by one in the screen's order, the reset of the ones that are off
+    /// would turn off the one that is on, because on Terminal.app and xterm a reset of any of the
+    /// three turns tracking off: all three are reset first and the one that is on is set last. The
+    /// resets are written for a screen with none on too, because the destination's own tracking is
+    /// not known here.
+    ///
+    /// A screen read from a worker of an earlier build can have more than one on, and the order they
+    /// were set in is lost. The widest is taken: the history that leaves two on is an application
+    /// asking for a narrower tracking and then a wider one.
     fn mouse_tracking(&mut self, tracking: Option<u16>) {
         for mode in MOUSE_TRACKING_MODES {
             self.mode_of(super::ProjectedModeSpelling::Dec, *mode, false);
@@ -3266,8 +3270,10 @@ mod safety {
             let painted = install(&screen, Window::of(&screen), Keyboard::EVERYTHING);
             mouse_tracking(&painted.bytes)
         };
-        // The screen holds three settings; a terminal holds one, and any reset of the three turns
-        // it off, so which of them is written last decides what a click reaches the application as.
+        // A session holds one tracking, and a terminal holds one, so which of the three is written
+        // last decides what a click reaches the application as. A screen from a worker of an
+        // earlier build can have two on, in an order that is lost: the widest is what is installed,
+        // as an application that asks for a narrower tracking and then a wider one leaves.
         assert_eq!(
             tracking_after([(1000, true), (1002, true), (1003, false)]),
             Some(1002)
