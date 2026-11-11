@@ -1,46 +1,46 @@
 //! How a run of the stand-in misbehaves, when a test asks it to.
 //!
-//! The variants are named in `KR_STAND_IN`, separated by commas. Without any, the stand-in behaves
+//! The variants are named in `STAND_IN`, separated by commas. Without any, the stand-in behaves
 //! as the pinned release was measured to: its commands lead a session and a process group of their
 //! own, it ends them and exits when its input ends or when it is asked to terminate, and a
 //! hang-up kills it at once and leaves its commands behind.
 
 /// The variable that names the variants.
-pub const VARIABLE: &str = "KR_STAND_IN";
+pub const VARIABLE: &str = "STAND_IN";
 
 /// The command the server starts when a turn begins, as a JSON array of the program and its
 /// arguments. The agent's tool commands are what this stands in for.
-pub const COMMAND_VARIABLE: &str = "KR_STAND_IN_COMMAND";
+pub const COMMAND_VARIABLE: &str = "STAND_IN_COMMAND";
 
 /// The size, in bytes, the frames a test wants large are padded to: the terminal's request to start
 /// a turn and the server's notification of what the agent said.
-pub const PAD_VARIABLE: &str = "KR_STAND_IN_PAD";
+pub const PAD_VARIABLE: &str = "STAND_IN_PAD";
 
 /// The file a server under `write-when-released` waits for before it writes. It then writes the
 /// same name with `.spoke` added to say it has, and whether the write failed.
-pub const SPEAK_VARIABLE: &str = "KR_STAND_IN_SPEAK";
+pub const SPEAK_VARIABLE: &str = "STAND_IN_SPEAK";
 
 /// The key the terminal signs in with under the `login` variant.
-pub const KEY_VARIABLE: &str = "KR_STAND_IN_API_KEY";
+pub const KEY_VARIABLE: &str = "STAND_IN_API_KEY";
 
 /// The file a terminal under `answer-when-released` waits for before it answers the approval, one
 /// under `wait-to-connect` waits for before it connects, and one under `request-when-released` or
 /// `ping-when-released` waits for before it asks its question.
-pub const RELEASE_VARIABLE: &str = "KR_STAND_IN_RELEASE";
+pub const RELEASE_VARIABLE: &str = "STAND_IN_RELEASE";
 
 /// The file the server appends one line to when it starts (`server started`) and one for each
 /// frame it reads from the terminal: `request`, `response` or `notification`, the identifier or
 /// method, and the method of a request.
-pub const RECEIVED_VARIABLE: &str = "KR_STAND_IN_RECEIVED";
+pub const RECEIVED_VARIABLE: &str = "STAND_IN_RECEIVED";
 
 /// The saved conversations the server holds when it starts, separated by commas: a thread
 /// identifier, or `name=identifier` for one that has a name too. A terminal started with
 /// `resume <word>` can resume one by either.
-pub const SAVED_VARIABLE: &str = "KR_STAND_IN_SAVED";
+pub const SAVED_VARIABLE: &str = "STAND_IN_SAVED";
 
 /// The program the terminal runs once, before it connects, under the `leave-a-host` variant: what an
 /// agent that rewrites the host's state in the account it runs in does.
-pub const LEAVE_VARIABLE: &str = "KR_STAND_IN_LEAVE";
+pub const LEAVE_VARIABLE: &str = "STAND_IN_LEAVE";
 
 /// The ways a run can differ from the default.
 #[derive(Clone, Debug, Default)]
@@ -73,7 +73,7 @@ pub struct Variants {
     pub decline: bool,
     /// The terminal stays connected after the turn completes, until the connection ends.
     pub stay: bool,
-    /// The terminal sends the key in `KR_STAND_IN_API_KEY` to sign in, before its turn.
+    /// The terminal sends the key in `STAND_IN_API_KEY` to sign in, before its turn.
     pub login: bool,
     /// The terminal's upgrade request carries an `Origin` header, as a browser's does.
     pub origin: bool,
@@ -83,28 +83,28 @@ pub struct Variants {
     pub idle: bool,
     /// The terminal stops reading once its turn is running, as a terminal that is stopped does.
     pub stop_reading: bool,
-    /// The terminal writes the line `TUI: tick N` once the file `KR_STAND_IN_RELEASE` names, with
+    /// The terminal writes the line `TUI: tick N` once the file `STAND_IN_RELEASE` names, with
     /// `.tickN` added, exists, for N from 1 on and in order, so that a test decides when its
     /// output happens.
     pub tick: bool,
-    /// The terminal, once its turn is complete, waits for the file `KR_STAND_IN_RELEASE` names and
+    /// The terminal, once its turn is complete, waits for the file `STAND_IN_RELEASE` names and
     /// then asks the server who the account is.
     pub request_when_released: bool,
     /// The terminal, once its turn is complete, asks the server who the account is again and says
     /// when the answer arrives (`TUI: the server answered after the turn`), taking nothing else
     /// from it, so that a test knows the server has read everything the terminal sent before.
     pub ping_when_released: bool,
-    /// The server, once the file `KR_STAND_IN_SPEAK` names exists, writes a notification, whoever
+    /// The server, once the file `STAND_IN_SPEAK` names exists, writes a notification, whoever
     /// is reading, and says whether the write failed. A server whose write fails ends its commands.
     pub write_when_released: bool,
-    /// The terminal does not answer the approval until the file `KR_STAND_IN_RELEASE` names exists.
+    /// The terminal does not answer the approval until the file `STAND_IN_RELEASE` names exists.
     pub answer_when_released: bool,
-    /// The terminal says it is waiting, and does not connect until the file `KR_STAND_IN_RELEASE`
+    /// The terminal says it is waiting, and does not connect until the file `STAND_IN_RELEASE`
     /// names exists.
     pub wait_to_connect: bool,
     /// The server asks a second approval once the first is answered, and finishes the turn when
     /// the second is answered. A terminal under `answer-when-released` waits for the file named
-    /// `KR_STAND_IN_RELEASE` with `.second` added before it answers the second.
+    /// `STAND_IN_RELEASE` with `.second` added before it answers the second.
     pub two_approvals: bool,
     /// The terminal reads the second approval and does not answer it.
     pub leave_second_unanswered: bool,
@@ -118,10 +118,10 @@ pub struct Variants {
     /// server killed under a prompt a device sent after the terminal's own turn.
     pub die_on_second_turn: bool,
     /// The terminal, once the server has answered what it asked about the account, says so and
-    /// waits for the file `KR_STAND_IN_RELEASE` names with `.thread` added before it starts a
+    /// waits for the file `STAND_IN_RELEASE` names with `.thread` added before it starts a
     /// thread.
     pub hold_before_thread: bool,
-    /// The terminal runs the program `KR_STAND_IN_LEAVE` names once, before it connects, and goes
+    /// The terminal runs the program `STAND_IN_LEAVE` names once, before it connects, and goes
     /// on when it has ended.
     pub leave_a_host: bool,
 }
@@ -177,7 +177,7 @@ impl Variants {
         variants
     }
 
-    /// Runs the program `KR_STAND_IN_LEAVE` names, and waits for it.
+    /// Runs the program `STAND_IN_LEAVE` names, and waits for it.
     ///
     /// # Panics
     ///

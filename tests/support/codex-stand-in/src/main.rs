@@ -15,7 +15,7 @@
 //!
 //! Every frame either side writes or reads is checked against the schemas that release publishes
 //! (see `contract`), so a gateway that makes a frame the pinned release would not write is caught.
-//! A test makes a run misbehave by naming variants in `KR_STAND_IN` (see `variants`).
+//! A test makes a run misbehave by naming variants in `STAND_IN` (see `variants`).
 //!
 //! The release's terminal reaches a gateway over a socket in a file and its server starts commands
 //! in process groups, so the program is built for Unix; elsewhere it only says so.

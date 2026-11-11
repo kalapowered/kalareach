@@ -46,7 +46,7 @@ fn kr_req_12_07_a_plain_launch_of_a_terminal_with_a_server_is_served_by_a_gatewa
     let mut launched = shell.launch(
         &answer,
         "plain",
-        &[("KR_STAND_IN", "stay"), ("KR_STAND_IN_COMMAND", COMMAND)],
+        &[("STAND_IN", "stay"), ("STAND_IN_COMMAND", COMMAND)],
     );
     // The program's whole session runs through the gateway: it signs in, starts a turn, is asked
     // to approve a command, and the turn completes.
@@ -97,12 +97,9 @@ fn kr_req_07_67_closing_an_attachment_leaves_a_gateway_served_session_running() 
         &answer,
         "attachment",
         &[
-            ("KR_STAND_IN", "stay,answer-when-released"),
-            ("KR_STAND_IN_COMMAND", COMMAND),
-            (
-                "KR_STAND_IN_RELEASE",
-                release.to_str().expect("a text path"),
-            ),
+            ("STAND_IN", "stay,answer-when-released"),
+            ("STAND_IN_COMMAND", COMMAND),
+            ("STAND_IN_RELEASE", release.to_str().expect("a text path")),
         ],
     );
     launched.prints("TUI: the server asks for item/commandExecution/requestApproval");
@@ -201,16 +198,10 @@ fn launch_two_approvals(shell: &Gateway, name: &str, variants: &str) -> TwoAppro
         &answer,
         name,
         &[
-            ("KR_STAND_IN", variants),
-            ("KR_STAND_IN_COMMAND", COMMAND),
-            (
-                "KR_STAND_IN_RELEASE",
-                release.to_str().expect("a text path"),
-            ),
-            (
-                "KR_STAND_IN_RECEIVED",
-                received.to_str().expect("a text path"),
-            ),
+            ("STAND_IN", variants),
+            ("STAND_IN_COMMAND", COMMAND),
+            ("STAND_IN_RELEASE", release.to_str().expect("a text path")),
+            ("STAND_IN_RECEIVED", received.to_str().expect("a text path")),
         ],
     );
     TwoApprovals {
@@ -313,7 +304,7 @@ fn kr_req_11_37_a_recovery_that_owes_a_connection_the_terminal_ended_in_the_gap_
     let mut next = shell.launch(
         &again,
         "after",
-        &[("KR_STAND_IN", "stay"), ("KR_STAND_IN_COMMAND", COMMAND)],
+        &[("STAND_IN", "stay"), ("STAND_IN_COMMAND", COMMAND)],
     );
     next.prints("TUI: turn/completed");
 }
@@ -415,7 +406,7 @@ fn kr_req_11_27_an_approval_the_terminal_left_unanswered_is_settled_when_its_con
     let mut next = shell.launch(
         &again,
         "next",
-        &[("KR_STAND_IN", "stay"), ("KR_STAND_IN_COMMAND", COMMAND)],
+        &[("STAND_IN", "stay"), ("STAND_IN_COMMAND", COMMAND)],
     );
     next.prints("TUI: turn/completed");
     let servers = shell.servers();
@@ -615,12 +606,9 @@ fn kr_req_11_32_only_the_registered_process_reaches_the_gateway() {
         &answer,
         "second",
         &[
-            ("KR_STAND_IN", "origin,retry-plain,wait-to-connect"),
-            ("KR_STAND_IN_COMMAND", COMMAND),
-            (
-                "KR_STAND_IN_RELEASE",
-                release.to_str().expect("a text path"),
-            ),
+            ("STAND_IN", "origin,retry-plain,wait-to-connect"),
+            ("STAND_IN_COMMAND", COMMAND),
+            ("STAND_IN_RELEASE", release.to_str().expect("a text path")),
         ],
     );
     // The launch is committed, and the launcher is not yet told: the socket is bound already.
@@ -726,9 +714,9 @@ fn kr_req_12_05_a_launch_of_a_saved_conversation_the_session_already_holds_runs_
     let shell = answering();
     let held = |saved: &'static str| {
         [
-            ("KR_STAND_IN", "stay"),
-            ("KR_STAND_IN_SAVED", saved),
-            ("KR_STAND_IN_COMMAND", COMMAND),
+            ("STAND_IN", "stay"),
+            ("STAND_IN_SAVED", saved),
+            ("STAND_IN_COMMAND", COMMAND),
         ]
     };
     let first = shell
@@ -823,9 +811,9 @@ fn kr_req_12_05_a_conversation_stays_held_until_the_server_that_runs_against_it_
         Gateway::claiming(&shape, claims.root()),
     );
     let stubborn = [
-        ("KR_STAND_IN", "stay,ignore-eof,ignore-term"),
-        ("KR_STAND_IN_SAVED", "thread-9"),
-        ("KR_STAND_IN_COMMAND", STUBBORN),
+        ("STAND_IN", "stay,ignore-eof,ignore-term"),
+        ("STAND_IN_SAVED", "thread-9"),
+        ("STAND_IN_COMMAND", STUBBORN),
     ];
     let answer = first
         .establish(&["codex", "resume", "thread-9"])
@@ -846,7 +834,7 @@ fn kr_req_12_05_a_conversation_stays_held_until_the_server_that_runs_against_it_
         let mut again = second.launch_typed(
             &answer,
             name,
-            &[("KR_STAND_IN", "stay"), ("KR_STAND_IN_SAVED", "thread-9")],
+            &[("STAND_IN", "stay"), ("STAND_IN_SAVED", "thread-9")],
             &["resume", "thread-9"],
         );
         eventually("the launch ran as typed or was served", || {
@@ -910,9 +898,9 @@ fn kr_req_12_05_a_conversation_stays_held_until_the_server_that_runs_against_it_
         &answer,
         "free",
         &[
-            ("KR_STAND_IN", "stay"),
-            ("KR_STAND_IN_SAVED", "thread-9"),
-            ("KR_STAND_IN_COMMAND", COMMAND),
+            ("STAND_IN", "stay"),
+            ("STAND_IN_SAVED", "thread-9"),
+            ("STAND_IN_COMMAND", COMMAND),
         ],
         &["resume", "thread-9"],
     );
@@ -928,9 +916,9 @@ fn kr_req_12_05_a_name_a_launch_resumed_by_is_held_after_the_stream_names_the_th
     let shell = answering();
     let saved = "my-work=thread-7";
     let held = [
-        ("KR_STAND_IN", "stay"),
-        ("KR_STAND_IN_SAVED", saved),
-        ("KR_STAND_IN_COMMAND", COMMAND),
+        ("STAND_IN", "stay"),
+        ("STAND_IN_SAVED", saved),
+        ("STAND_IN_COMMAND", COMMAND),
     ];
     let first = shell
         .establish(&["codex", "resume", "my-work"])
@@ -1087,12 +1075,9 @@ fn kr_req_12_13_an_approval_is_a_pending_resource_before_the_terminal_answers_an
             &answer,
             "approval",
             &[
-                ("KR_STAND_IN", variants),
-                ("KR_STAND_IN_COMMAND", COMMAND),
-                (
-                    "KR_STAND_IN_RELEASE",
-                    release.to_str().expect("a text path"),
-                ),
+                ("STAND_IN", variants),
+                ("STAND_IN_COMMAND", COMMAND),
+                ("STAND_IN_RELEASE", release.to_str().expect("a text path")),
             ],
         );
         launched.prints("TUI: the server asks for item/commandExecution/requestApproval");
@@ -1152,12 +1137,9 @@ fn kr_req_12_06_the_binding_of_a_gateway_served_terminal_is_what_the_servers_mes
         &answer,
         "binding",
         &[
-            ("KR_STAND_IN", "stay,answer-when-released"),
-            ("KR_STAND_IN_COMMAND", COMMAND),
-            (
-                "KR_STAND_IN_RELEASE",
-                release.to_str().expect("a text path"),
-            ),
+            ("STAND_IN", "stay,answer-when-released"),
+            ("STAND_IN_COMMAND", COMMAND),
+            ("STAND_IN_RELEASE", release.to_str().expect("a text path")),
         ],
     );
     launched.prints("TUI: the server asks for item/commandExecution/requestApproval");
@@ -1237,12 +1219,9 @@ fn kr_req_11_30_a_method_the_table_does_not_list_suspends_rich_mutations_until_a
         &answer,
         "unlisted",
         &[
-            ("KR_STAND_IN", "stay,hold-before-thread,leave-unanswered"),
-            ("KR_STAND_IN_COMMAND", COMMAND),
-            (
-                "KR_STAND_IN_RELEASE",
-                release.to_str().expect("a text path"),
-            ),
+            ("STAND_IN", "stay,hold-before-thread,leave-unanswered"),
+            ("STAND_IN_COMMAND", COMMAND),
+            ("STAND_IN_RELEASE", release.to_str().expect("a text path")),
         ],
     );
     launched.prints("TUI: holding before the thread starts");
@@ -1298,12 +1277,9 @@ fn kr_req_11_33_a_rich_answer_to_an_approval_a_gateway_served_terminal_was_asked
         &answer,
         "rich",
         &[
-            ("KR_STAND_IN", "stay,leave-unanswered"),
-            ("KR_STAND_IN_COMMAND", COMMAND),
-            (
-                "KR_STAND_IN_RECEIVED",
-                received.to_str().expect("a text path"),
-            ),
+            ("STAND_IN", "stay,leave-unanswered"),
+            ("STAND_IN_COMMAND", COMMAND),
+            ("STAND_IN_RECEIVED", received.to_str().expect("a text path")),
         ],
     );
     launched.prints("TUI: the server asks for item/commandExecution/requestApproval");
@@ -1387,7 +1363,7 @@ fn kr_req_11_32_a_message_at_the_limit_is_carried_both_ways_through_a_gateway() 
     let mut launched = shell.launch(
         &answer,
         "limit",
-        &[("KR_STAND_IN", "stay"), ("KR_STAND_IN_PAD", "1048576")],
+        &[("STAND_IN", "stay"), ("STAND_IN_PAD", "1048576")],
     );
     launched.prints("TUI: item/agentMessage/delta");
     launched.prints("TUI: the server asks for item/commandExecution/requestApproval");
@@ -1404,7 +1380,7 @@ fn kr_req_11_32_a_message_above_the_limit_ends_the_connection_and_the_server() {
     let mut launched = shell.launch(
         &answer,
         "over",
-        &[("KR_STAND_IN", "stay"), ("KR_STAND_IN_PAD", "1048577")],
+        &[("STAND_IN", "stay"), ("STAND_IN_PAD", "1048577")],
     );
     assert_eq!(launched.ends().code(), Some(1), "{}", launched.printed());
     assert!(
@@ -1432,10 +1408,7 @@ fn kr_req_11_32_a_terminal_that_stops_reading_loses_its_connection_and_its_serve
     let mut launched = shell.launch(
         &answer,
         "stopped",
-        &[
-            ("KR_STAND_IN", "stop-reading"),
-            ("KR_STAND_IN_PAD", "1048576"),
-        ],
+        &[("STAND_IN", "stop-reading"), ("STAND_IN_PAD", "1048576")],
     );
     launched.prints("TUI: a turn is running");
     let servers = shell.servers();
@@ -1462,7 +1435,7 @@ fn kr_req_12_07_a_runtime_directory_with_a_space_is_served_as_any_other() {
         socket.to_string_lossy().contains("with space"),
         "{socket:?}"
     );
-    let mut launched = shell.launch(&answer, "spaced", &[("KR_STAND_IN", "stay")]);
+    let mut launched = shell.launch(&answer, "spaced", &[("STAND_IN", "stay")]);
     launched.prints("TUI: turn/completed");
 }
 
@@ -1480,9 +1453,9 @@ fn kr_req_11_33_a_credential_a_terminal_signs_in_with_is_kept_nowhere() {
         &answer,
         "login",
         &[
-            ("KR_STAND_IN", "stay,login"),
-            ("KR_STAND_IN_COMMAND", COMMAND),
-            ("KR_STAND_IN_API_KEY", KEY),
+            ("STAND_IN", "stay,login"),
+            ("STAND_IN_COMMAND", COMMAND),
+            ("STAND_IN_API_KEY", KEY),
         ],
     );
     // The server answered the sign-in, so the request reached it, and the session went on.
@@ -1572,12 +1545,9 @@ fn kr_req_11_35_a_ledger_fault_in_live_traffic_keeps_the_session_and_fences_rich
         &answer,
         "fault",
         &[
-            ("KR_STAND_IN", "stay,answer-when-released"),
-            ("KR_STAND_IN_COMMAND", COMMAND),
-            (
-                "KR_STAND_IN_RELEASE",
-                release.to_str().expect("a text path"),
-            ),
+            ("STAND_IN", "stay,answer-when-released"),
+            ("STAND_IN_COMMAND", COMMAND),
+            ("STAND_IN_RELEASE", release.to_str().expect("a text path")),
         ],
     );
     launched.prints("TUI: the server asks for item/commandExecution/requestApproval");
@@ -1620,7 +1590,7 @@ fn kr_req_07_60_a_program_that_never_connects_ends_its_instance_and_server_at_th
         .expect("a backend is established");
     // The server is read at the commit, before the bound begins to run.
     let (arrived, go) = shell.backends.pause_before_committing();
-    let mut launched = shell.launch(&answer, "idle", &[("KR_STAND_IN", "idle")]);
+    let mut launched = shell.launch(&answer, "idle", &[("STAND_IN", "idle")]);
     shell.at_the_confirmation(arrived);
     let servers = shell.servers();
     assert_eq!(servers.len(), 1, "the server was started and recorded");
@@ -1681,7 +1651,7 @@ fn kr_req_12_07_a_close_ends_the_instance_before_it_takes_down_the_registration(
     let mut launched = shell.launch(
         &answer,
         "closing",
-        &[("KR_STAND_IN", "stay"), ("KR_STAND_IN_COMMAND", COMMAND)],
+        &[("STAND_IN", "stay"), ("STAND_IN_COMMAND", COMMAND)],
     );
     launched.prints("TUI: turn/completed");
     let instance = shell.announcement().instance.application_instance_id;
@@ -1733,13 +1703,10 @@ fn kr_req_07_60_a_close_ends_the_server_and_what_it_started_after_the_acceptance
         &answer,
         "closure",
         &[
-            (
-                "KR_STAND_IN",
-                "stay,request-when-released,write-when-released",
-            ),
-            ("KR_STAND_IN_COMMAND", &requester),
-            ("KR_STAND_IN_RELEASE", ask.to_str().expect("a text path")),
-            ("KR_STAND_IN_SPEAK", speak.to_str().expect("a text path")),
+            ("STAND_IN", "stay,request-when-released,write-when-released"),
+            ("STAND_IN_COMMAND", &requester),
+            ("STAND_IN_RELEASE", ask.to_str().expect("a text path")),
+            ("STAND_IN_SPEAK", speak.to_str().expect("a text path")),
         ],
     );
     launched.prints("TUI: turn/completed");
@@ -1814,8 +1781,8 @@ fn kr_req_07_60_a_stubborn_server_and_its_command_end_by_force_with_the_program(
         &answer,
         "stubborn",
         &[
-            ("KR_STAND_IN", "stay,ignore-eof,ignore-term"),
-            ("KR_STAND_IN_COMMAND", STUBBORN),
+            ("STAND_IN", "stay,ignore-eof,ignore-term"),
+            ("STAND_IN_COMMAND", STUBBORN),
         ],
     );
     launched.prints("TUI: turn/completed");
@@ -1873,7 +1840,7 @@ fn kr_req_07_61_a_process_the_server_started_is_placed_under_the_programs_instan
     let mut launched = shell.launch(
         &answer,
         "placed",
-        &[("KR_STAND_IN", "stay"), ("KR_STAND_IN_COMMAND", COMMAND)],
+        &[("STAND_IN", "stay"), ("STAND_IN_COMMAND", COMMAND)],
     );
     launched.prints("TUI: turn/completed");
     let instance = shell.announcement().instance.application_instance_id;
@@ -1909,12 +1876,9 @@ fn kr_req_07_60_a_server_that_dies_first_leaves_no_command_behind() {
         &answer,
         "dies",
         &[
-            ("KR_STAND_IN", "die-first,answer-when-released"),
-            ("KR_STAND_IN_COMMAND", COMMAND),
-            (
-                "KR_STAND_IN_RELEASE",
-                release.to_str().expect("a text path"),
-            ),
+            ("STAND_IN", "die-first,answer-when-released"),
+            ("STAND_IN_COMMAND", COMMAND),
+            ("STAND_IN_RELEASE", release.to_str().expect("a text path")),
         ],
     );
     launched.prints("TUI: the server asks for item/commandExecution/requestApproval");
