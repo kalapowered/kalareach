@@ -829,6 +829,127 @@ fn person_home_of(
     }
 }
 
+/// One row of the process listing: the process, its parent, its user and the path of the executable
+/// it runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProcessRow {
+    pid: u32,
+    parent: u32,
+    user: u32,
+    executable: String,
+}
+
+/// The executables, by their own path, of the processes of `user` that run a file called `name` and
+/// that are not the run's: a process is the run's when it or an ancestor of it is one of `marked`,
+/// the processes whose command line names the run's directory. Nothing else of a process is said:
+/// no argument, no directory, no file it has open.
+fn outside_the_run(
+    rows: &[ProcessRow],
+    marked: &BTreeSet<u32>,
+    user: u32,
+    name: &str,
+) -> Vec<String> {
+    let parents: std::collections::BTreeMap<u32, u32> =
+        rows.iter().map(|row| (row.pid, row.parent)).collect();
+    rows.iter()
+        .filter(|row| {
+            row.user == user
+                && Path::new(&row.executable)
+                    .file_name()
+                    .is_some_and(|n| n == name)
+        })
+        .filter(|row| {
+            let mut pid = row.pid;
+            // Far deeper than any lineage; a loop in the table cannot hold the walk.
+            for _ in 0..256 {
+                if marked.contains(&pid) {
+                    return false;
+                }
+                match parents.get(&pid) {
+                    Some(parent) if *parent != pid && *parent != 0 => pid = *parent,
+                    _ => break,
+                }
+            }
+            true
+        })
+        .map(|row| row.executable.clone())
+        .collect()
+}
+
+/// The executables of the processes of this user that run a file called `name` (`codex`) outside
+/// the run whose directory is `run_root`, where there is a run: found by a listing of the processes
+/// by the path of the executable each runs, which reads no file under the person's agent
+/// directory. A process of the run's own, an agent it started among them, is not counted.
+///
+/// # Errors
+///
+/// Returns why the listing is not known: a listing that cannot be read says nothing of which
+/// processes run, so it is never read as none.
+pub fn other_agent_processes(name: &str, run_root: Option<&Path>) -> Result<Vec<String>, String> {
+    let mut ps = std::process::Command::new("/bin/ps");
+    ps.args(["-A", "-ww", "-o", "pid=,ppid=,uid=,comm="])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin");
+    let output = grouped_output(ps, std::time::Duration::from_secs(20))
+        .map_err(|why| format!("the process listing could not be read: ps {why}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "the process listing could not be read: ps ended with {}",
+            output.status
+        ));
+    }
+    let rows: Vec<ProcessRow> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let parent = fields.next()?.parse().ok()?;
+            let user = fields.next()?.parse().ok()?;
+            let executable = fields.collect::<Vec<_>>().join(" ");
+            Some(ProcessRow {
+                pid,
+                parent,
+                user,
+                executable,
+            })
+        })
+        .collect();
+    if rows.is_empty() {
+        return Err("the process listing held no process, which is not a listing".to_owned());
+    }
+    let marked: BTreeSet<u32> = match run_root {
+        Some(root) => kr_e2e_m1b::run::processes_under(root)?
+            .into_iter()
+            .map(|(pid, _)| pid)
+            .collect(),
+        None => BTreeSet::new(),
+    };
+    Ok(outside_the_run(
+        &rows,
+        &marked,
+        rustix::process::geteuid().as_raw(),
+        name,
+    ))
+}
+
+/// What a driver says when processes of the user run the agent's executable outside the run: the
+/// count and each executable's own path, and what to do. The guard over the person's agent
+/// directory compares the whole of it at the end, and cannot tell a write of theirs from one of the
+/// run's agent.
+#[must_use]
+pub fn other_agents_refusal(found: &[String], when: &str) -> String {
+    let mut paths: Vec<&str> = found.iter().map(String::as_str).collect();
+    paths.sort_unstable();
+    paths.dedup();
+    format!(
+        "{} process(es) of this user run the agent's executable outside the run ({}), {when}: a \\
+         write of theirs to the person's agent directory would be taken for the run's, so no turn \\
+         is started or charged while they run; end them, and start again",
+        found.len(),
+        paths.join(", ")
+    )
+}
+
 /// The person's own agent files as their metadata stood before a driver started anything, and the
 /// check that none of them changed. Every entry under each named path is looked at, by `stat` and
 /// directory listing alone: never a file's content, so the person's login and settings stay unread,
@@ -907,14 +1028,14 @@ impl MetaGuard {
     }
 }
 
-/// The member `turn_id` of a JSON line, at any depth, where it has one.
+/// The member `turn_id` of a JSON line, at any depth, where it has one that names a turn: a text
+/// with something in it. An empty or blank one names nothing, and the line is unnamed.
 fn turn_identifier(value: &Value) -> Option<String> {
     match value {
-        Value::Object(members) => members
-            .get("turn_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| members.values().find_map(turn_identifier)),
+        Value::Object(members) => match members.get("turn_id") {
+            Some(Value::String(name)) => (!name.trim().is_empty()).then(|| name.clone()),
+            _ => members.values().find_map(turn_identifier),
+        },
         Value::Array(items) => items.iter().find_map(turn_identifier),
         _ => None,
     }
@@ -931,13 +1052,28 @@ pub struct Recorded {
     pub files: u64,
 }
 
+/// Whether `name` is a UUID in its written form: 8, 4, 4, 4 and 12 hexadecimal digits between
+/// hyphens. A UUID that is random or time-ordered is unique across threads by construction.
+fn is_uuid(name: &str) -> bool {
+    name.len() == 36
+        && name.char_indices().all(|(index, character)| match index {
+            8 | 13 | 18 | 23 => character == '-',
+            _ => character.is_ascii_hexdigit(),
+        })
+}
+
 /// How many turns the model ran, as the agent's own record under `root` holds them: the lines the
-/// entry's turn line marks. A line that names its turn (`turn_id`) counts once for that name,
-/// whichever of the agent's files, a copy of a conversation among them, holds it. A line that names
-/// none counts once for each time it occurs, in any file: nothing offline says that two equal lines
-/// are one turn, and a copy of a conversation written again would count its turns twice, so the
-/// count can be too high and is never too low. [`Recorded::unnamed`] says how many turns stand on
-/// an occurrence. No other member of a line identifies a turn offline.
+/// entry's turn line marks. A line that names its turn (`turn_id`, one with something in it) counts
+/// once for its thread and its name: a name that is a UUID is unique across threads, so it counts
+/// once whichever of the agent's files, a copy of a conversation among them, holds it; any other
+/// name is only known to be unique within its thread, a file of the record, so it counts once for
+/// each file that holds it. A line that names none (no name, an empty one) counts once for each
+/// time it occurs, in any file. A conversation written again, a fork's copy of the one it forked
+/// from where the names are not UUIDs, or unnamed lines in a copy, count their turns twice: the
+/// count is then too high. It is too low only where the record lost lines (an agent that was ended
+/// before it wrote them, or that marks no turn this way), which no count of the lines can show; the
+/// audit stops a case that passed with a charge and finds none. [`Recorded::unnamed`] says how many
+/// turns stand on an occurrence.
 ///
 /// # Errors
 ///
@@ -983,8 +1119,11 @@ pub fn turns_recorded(account: &Account, root: &Path) -> Result<Recorded, String
                         .as_ref()
                         .and_then(turn_identifier);
                     match named {
-                        Some(named) => {
+                        Some(named) if is_uuid(&named) => {
                             turns.insert(named);
+                        }
+                        Some(named) => {
+                            turns.insert(format!("{}\0{named}", path.display()));
                         }
                         None => unnamed += 1,
                     }
@@ -1036,21 +1175,105 @@ pub fn audit_turns(passed: bool, charged: u64, recorded: &Result<Recorded, Strin
     }
 }
 
-/// Runs `command` in a process group of its own and returns its output. The group is ended whole as
-/// soon as its leader has exited or `within` has passed, while the leader is not yet reaped and its
-/// number still names the group, so that nothing the command started outlives it with the
-/// environment it was given, and no signal can reach a group that took the number since. A command
-/// that does not end within `within`, or whose output stays open for five seconds after the group
-/// was ended, is the answer.
+/// The leader of a command's process group, from the moment the command is spawned: until its
+/// leader is reaped, its number still names the group, so ending the group is safe, and dropping
+/// this ends it and reaps the leader. A probe therefore never outlives a failure of its own setup,
+/// a panic included.
+struct Leader {
+    child: std::process::Child,
+    group: rustix::process::Pid,
+    /// Whether the number still names the group: true until the leader is reaped, or found not to
+    /// be this process's to wait for.
+    holds: bool,
+}
+
+impl Leader {
+    /// Ends the group whole, if its number is still the leader's.
+    fn end_group(&self) {
+        if self.holds {
+            let _ = rustix::process::kill_process_group(self.group, rustix::process::Signal::KILL);
+        }
+    }
+
+    /// Reaps the leader, after the group was ended.
+    fn reap(&mut self) -> Result<std::process::ExitStatus, String> {
+        self.holds = false;
+        self.child
+            .wait()
+            .map_err(|error| format!("it could not be reaped: {error}"))
+    }
+}
+
+impl Drop for Leader {
+    fn drop(&mut self) {
+        if self.holds {
+            self.end_group();
+            let _ = self.reap();
+        }
+    }
+}
+
+/// Whether a failed look at the leader still shows it to be an unreaped child of this process, whose
+/// number therefore still names the group. `ECHILD` shows the opposite: there is no such child to
+/// wait for, so the number may name nothing or another process's group, and no signal goes to it.
+fn leader_may_hold_its_number(error: rustix::io::Errno) -> bool {
+    error != rustix::io::Errno::CHILD
+}
+
+/// How a probe's output is collected: a thread that reads `pipe` to its end and sends what it read.
+/// A thread that cannot be made is an error and not a panic.
+fn read_in_a_thread(
+    _stream: &str,
+    pipe: Box<dyn std::io::Read + Send>,
+) -> std::io::Result<std::sync::mpsc::Receiver<Vec<u8>>> {
+    use std::io::Read as _;
+    let (sent, received) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("probe-output".to_owned())
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            let mut pipe = pipe;
+            let _ = pipe.read_to_end(&mut bytes);
+            let _ = sent.send(bytes);
+        })?;
+    Ok(received)
+}
+
+/// Runs `command` in a process group of its own and returns its output. The group is guarded from
+/// the moment it is spawned ([`Leader`]); it is ended whole as soon as its leader has exited or
+/// `within` has passed, while the leader is not yet reaped and its number still names the group, so
+/// that nothing the command started outlives it with the environment it was given, and no signal
+/// can reach a group that took the number since. A command that does not end within `within`, or
+/// whose output stays open for five seconds after the group was ended, is the answer; so is one
+/// whose output cannot be collected, with its group ended all the same.
 ///
 /// # Errors
 ///
 /// Returns why it did not finish.
 pub fn grouped_output(
-    mut command: std::process::Command,
+    command: std::process::Command,
     within: std::time::Duration,
 ) -> Result<std::process::Output, String> {
-    use std::io::Read as _;
+    grouped_output_by(command, within, &mut |stream, pipe| {
+        read_in_a_thread(stream, pipe)
+    })
+}
+
+/// How one of a probe's two output pipes (named) is collected: what the pipe holds, once it has
+/// ended, arrives on the channel returned.
+type OutputReader<'a> = dyn FnMut(
+        &str,
+        Box<dyn std::io::Read + Send>,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<Vec<u8>>>
+    + 'a;
+
+/// [`grouped_output`] with the way each of the two output pipes is collected, which a test
+/// replaces to make collecting fail.
+fn grouped_output_by(
+    mut command: std::process::Command,
+    within: std::time::Duration,
+    readers: &mut OutputReader<'_>,
+) -> Result<std::process::Output, String> {
     use std::os::unix::process::CommandExt as _;
     use std::time::{Duration, Instant};
     command
@@ -1061,36 +1284,34 @@ pub fn grouped_output(
     let mut child = command
         .spawn()
         .map_err(|error| format!("could not start: {error}"))?;
-    let group = i32::try_from(child.id()).map_err(|_| "a process number too large".to_owned())?;
-    let pid = rustix::process::Pid::from_raw(group).ok_or("a process number of zero")?;
-    let read = |pipe: Option<Box<dyn std::io::Read + Send>>| {
-        let (sent, received) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut bytes);
-            }
-            let _ = sent.send(bytes);
-        });
-        received
+    let pipes = (child.stdout.take(), child.stderr.take());
+    let group = i32::try_from(child.id())
+        .ok()
+        .and_then(rustix::process::Pid::from_raw);
+    let Some(group) = group else {
+        // A number that cannot name a group is not signalled: the leader is reaped as it is.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("a process number that cannot name a group".to_owned());
     };
-    let stdout = read(
-        child
-            .stdout
-            .take()
-            .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
-    );
-    let stderr = read(
-        child
-            .stderr
-            .take()
-            .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
-    );
+    // Guarded from here: a failure below ends the group and reaps the leader.
+    let mut leader = Leader {
+        child,
+        group,
+        holds: true,
+    };
+    let (Some(out), Some(error)) = pipes else {
+        return Err("its output pipes were not made".to_owned());
+    };
+    let stdout = readers("stdout", Box::new(out))
+        .map_err(|error| format!("a thread for its output could not be made: {error}"))?;
+    let stderr = readers("stderr", Box::new(error))
+        .map_err(|error| format!("a thread for its output could not be made: {error}"))?;
     let started = Instant::now();
     let ended = loop {
         // Whether the leader has ended, read without reaping it, so its number stays its own.
         let exited = rustix::process::waitid(
-            rustix::process::WaitId::Pid(pid),
+            rustix::process::WaitId::Pid(group),
             rustix::process::WaitIdOptions::EXITED
                 | rustix::process::WaitIdOptions::NOHANG
                 | rustix::process::WaitIdOptions::NOWAIT,
@@ -1101,15 +1322,19 @@ pub fn grouped_output(
                 std::thread::sleep(Duration::from_millis(20));
             }
             Ok(None) => break Err(format!("it did not finish within {within:?}")),
-            Err(error) => break Err(format!("it could not be waited for: {error}")),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => {
+                // A leader that is not this process's child to wait for does not hold its number.
+                leader.holds = leader_may_hold_its_number(error);
+                break Err(format!("it could not be waited for: {error}"));
+            }
         }
     };
     // The group goes whole while its leader is unreaped; only then is the leader reaped.
-    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-    let status = child
-        .wait()
-        .map_err(|error| format!("it could not be reaped: {error}"))?;
+    leader.end_group();
+    let reaped = leader.reap();
     ended?;
+    let status = reaped?;
     let handover = Instant::now() + Duration::from_secs(5);
     let collect = |received: std::sync::mpsc::Receiver<Vec<u8>>| {
         received
@@ -1269,36 +1494,56 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_counts_once_by_its_name_however_many_files_hold_it_and_a_line_with_no_name_counts_each_time()
-     {
+    fn a_turn_counts_once_for_its_thread_and_name_and_a_line_with_no_name_counts_each_time() {
         let root = scratch("turns");
         let line = |id: &str| {
             format!(r#"{{"timestamp":"t","payload":{{"type":"task_started","turn_id":"{id}"}}}}"#)
         };
+        let uuid = |number: u8| format!("019a0000-0000-7000-8000-00000000000{number}");
         std::fs::create_dir_all(root.join("2026/11")).expect("directories");
         std::fs::write(
             root.join("2026/11/a.jsonl"),
-            format!("{}\n{{\"role\":\"user\"}}\n{}\n", line("one"), line("two")),
+            format!(
+                "{}\n{{\"role\":\"user\"}}\n{}\n",
+                line(&uuid(1)),
+                line(&uuid(2))
+            ),
         )
         .expect("a conversation");
-        // A copy of the conversation, as a fork writes it, and one more turn of its own.
+        // A copy of the conversation, as a fork writes it, and one more turn of its own: the names
+        // are UUIDs, which are unique across threads, so the copy adds nothing.
         std::fs::write(
             root.join("2026/11/b.jsonl"),
-            format!("{}\n{}\n{}\n", line("one"), line("two"), line("three")),
+            format!(
+                "{}\n{}\n{}\n",
+                line(&uuid(1)),
+                line(&uuid(2)),
+                line(&uuid(3))
+            ),
         )
         .expect("a copy");
-        // Two equal lines that name no turn are two turns, not one, as are a third that is no JSON.
+        // Names that are not UUIDs are known only within their thread: the same name in two files
+        // is two turns.
+        std::fs::write(root.join("d.jsonl"), format!("{}\n", line("1"))).expect("a thread");
+        std::fs::write(root.join("e.jsonl"), format!("{}\n", line("1"))).expect("a thread");
+        // Two equal lines that name no turn are two turns, as is one that is no JSON.
         std::fs::write(
             root.join("c.jsonl"),
             "{\"type\":\"task_started\"}\n{\"type\":\"task_started\"}\nnot json \"type\":\"task_started\"\n",
         )
         .expect("lines with no name");
+        // An empty or blank name names nothing: two such lines are two turns, not one.
+        std::fs::write(
+            root.join("f.jsonl"),
+            format!("{}\n{}\n{}\n", line(""), line(""), line("  ")),
+        )
+        .expect("lines with an empty name");
         assert_eq!(
             turns_recorded(&account(), &root),
             Ok(Recorded {
-                turns: 6,
-                unnamed: 3,
-                files: 3
+                turns: 3 + 2 + 3 + 3,
+                unnamed: 6,
+                files: 6
             })
         );
         assert_eq!(
@@ -1313,6 +1558,111 @@ mod tests {
         unnamed.turn_line = None;
         assert!(turns_recorded(&unnamed, &root).is_err());
         std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    #[test]
+    fn only_a_process_of_this_user_that_runs_the_executable_outside_the_run_is_another_agent() {
+        let row = |pid, parent, user, executable: &str| ProcessRow {
+            pid,
+            parent,
+            user,
+            executable: executable.to_owned(),
+        };
+        let rows = [
+            row(1, 0, 0, "/sbin/launchd"),
+            // The run's worker, a shell below it and the agent the shell started: the agent is the
+            // pinned file, outside the run's directory, and is the run's by its lineage.
+            row(10, 1, 501, "/tmp/krm-x/b/kr-worker"),
+            row(11, 10, 501, "/bin/zsh"),
+            row(12, 11, 501, "/cache/codex/bin/codex"),
+            row(13, 12, 501, "/cache/codex/bin/codex-code-mode-host"),
+            // Another Codex of this user, with a helper under it; one of another user; a file with
+            // another name; and a lookalike path.
+            row(20, 1, 501, "/opt/homebrew/lib/codex/bin/codex"),
+            row(
+                21,
+                20,
+                501,
+                "/opt/homebrew/lib/codex/bin/codex-code-mode-host",
+            ),
+            row(30, 1, 0, "/usr/local/bin/codex"),
+            row(40, 1, 501, "/usr/bin/vim"),
+            row(50, 1, 501, "/Applications/My Tools/codex-notes/codex"),
+        ];
+        let marked: BTreeSet<u32> = [10].into_iter().collect();
+        assert_eq!(
+            outside_the_run(&rows, &marked, 501, "codex"),
+            vec![
+                "/opt/homebrew/lib/codex/bin/codex".to_owned(),
+                "/Applications/My Tools/codex-notes/codex".to_owned()
+            ],
+            "the run's agent, another user's, the helper and other names are not counted"
+        );
+        // Before a run exists nothing is the run's: the pinned file's process counts too.
+        assert_eq!(
+            outside_the_run(&rows, &BTreeSet::new(), 501, "codex").len(),
+            3
+        );
+        let said = other_agents_refusal(&["/x/codex".to_owned(), "/x/codex".to_owned()], "now");
+        assert!(
+            said.starts_with("2 process(es)") && said.contains("(/x/codex)"),
+            "{said}"
+        );
+    }
+
+    /// The process the listing test starts under the name `codex`: a copy of this test program that
+    /// runs this one test, and waits in it until it is ended.
+    #[test]
+    #[ignore = "started by the listing test as a process of its own, which waits"]
+    fn a_process_that_waits_to_be_listed() {
+        std::thread::sleep(std::time::Duration::from_secs(300));
+    }
+
+    #[test]
+    fn the_process_listing_finds_a_codex_outside_the_run_and_none_inside_it() {
+        // A program called `codex` in a directory of this test's own, run by this user: a copy of
+        // this test program, since a copy of a system program is not run on every system.
+        let directory = scratch("listing");
+        let codex = directory.join("codex");
+        std::fs::copy(std::env::current_exe().expect("this program"), &codex)
+            .expect("a program called codex");
+        let mut running = std::process::Command::new(&codex)
+            .args([
+                "--ignored",
+                "--exact",
+                "held::tests::a_process_that_waits_to_be_listed",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("it starts");
+        let own = std::fs::canonicalize(&codex).expect("its path");
+        // `ps` gives the executable's path where the system keeps one (macOS) and its bare name
+        // where it keeps only that (Linux).
+        let ours = |path: &String| {
+            Path::new(path) == own || Path::new(path) == directory.join("codex") || path == "codex"
+        };
+        let started = std::time::Instant::now();
+        let seen = loop {
+            let seen = other_agent_processes("codex", None).expect("a listing");
+            if seen.iter().any(ours) || started.elapsed() > std::time::Duration::from_secs(20) {
+                break seen;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        // Inside a run whose directory its command line names, it is the run's.
+        let inside = other_agent_processes("codex", Some(&directory)).expect("a listing");
+        running.kill().expect("ended by its own handle");
+        running.wait().expect("reaped");
+        std::fs::remove_dir_all(&directory).expect("clean up");
+        assert!(
+            seen.iter().any(ours),
+            "the listing names the executable: {seen:?}"
+        );
+        assert!(
+            !inside.iter().any(|path| Path::new(path) == own),
+            "a process the run's directory names is the run's: {inside:?}"
+        );
     }
 
     #[test]
@@ -1404,6 +1754,55 @@ mod tests {
         let why = grouped_output(hangs, std::time::Duration::from_millis(300))
             .expect_err("a probe that hangs is ended and refused");
         assert!(why.contains("did not finish"), "{why}");
+    }
+
+    #[test]
+    fn a_probe_whose_output_cannot_be_collected_is_ended_with_its_helpers() {
+        use std::io::Read as _;
+        let mut command = std::process::Command::new("/bin/sh");
+        // The leader waits, and a helper it started holds the group too; the helper's number is
+        // the first line of the output.
+        command
+            .arg("-c")
+            .arg("/bin/sleep 300 & echo $!; /bin/sleep 300");
+        let mut helper = None;
+        let why = grouped_output_by(
+            command,
+            std::time::Duration::from_secs(60),
+            &mut |stream, mut pipe| {
+                if stream == "stdout" {
+                    // Read the helper's number, then fail as a system that cannot make a thread.
+                    let mut number = String::new();
+                    let mut byte = [0_u8; 1];
+                    while pipe.read(&mut byte).expect("a read") == 1 && byte[0] != b'\n' {
+                        number.push(char::from(byte[0]));
+                    }
+                    helper = Some(number.parse::<i32>().expect("the helper's number"));
+                }
+                Err(std::io::Error::other("no thread"))
+            },
+        )
+        .expect_err("a probe whose output cannot be collected is refused");
+        assert!(why.contains("could not be made"), "{why}");
+        let helper = rustix::process::Pid::from_raw(helper.expect("the helper was started"))
+            .expect("a number");
+        let started = std::time::Instant::now();
+        while rustix::process::test_kill_process(helper).is_ok() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the helper of a probe that failed its own setup still runs"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn no_signal_goes_to_a_number_the_process_has_no_child_for() {
+        // `ECHILD` shows no unreaped child of this process holds the number, so it may name
+        // another process's group; any other failure leaves the leader unreaped.
+        assert!(!leader_may_hold_its_number(rustix::io::Errno::CHILD));
+        assert!(leader_may_hold_its_number(rustix::io::Errno::INVAL));
+        assert!(leader_may_hold_its_number(rustix::io::Errno::PERM));
     }
 
     #[test]
