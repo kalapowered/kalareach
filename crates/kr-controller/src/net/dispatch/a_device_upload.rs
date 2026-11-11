@@ -5,10 +5,71 @@
 //! attachment-chunk stream and refused by name on the control stream, and every other upload method
 //! is served on the control stream.
 
-use kr_protocol::method::Method;
+use std::sync::Arc;
 
+use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Request, Response};
+use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::ids::{ActorId, RequestId, TransferId};
+use kr_protocol::method::{Method, MethodVersion};
+use kr_protocol::rights::ActionRight;
+use kr_protocol::scalars::{Bytes, Digest256, Nullable, U64};
+use kr_protocol::transfer::{
+    ChunkDescriptor, UploadBeginParams, UploadChunkParams, UploadStatusParams, UploadStatusResult,
+};
+
+use super::a_copy_from_a_services_record::mutation_of;
 use super::routes::DeviceRead;
+use super::write_boundary::paired_connection;
 use super::writes::DeviceWrite;
+use crate::service::a_close_a_worker_never_answers as fake;
+use crate::service::the_fence_at_every_effect::refused_for_a_fence;
+use crate::transfer::TransferAdmission;
+
+/// How long a case waits for a read to reach the place it is stopped at.
+const WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// An upload of `bytes` begun for `actor` in the transfer service directly.
+fn begun_for(world: &fake::Silent, actor: &ActorId, bytes: &[u8]) -> TransferId {
+    world
+        .controller
+        .transfer()
+        .service()
+        .upload_begin(
+            actor,
+            &UploadBeginParams {
+                environment_id: world.environment_id,
+                session_id: Nullable::null(),
+                device_id: Nullable::null(),
+                declared_byte_len: U64::new(bytes.len() as u64),
+                declared_digest: Digest256::from_bytes(kr_cbor::sha256(bytes)),
+                declared_media_type: "application/octet-stream".to_owned(),
+                original_file_name: "notes.bin".to_owned(),
+            },
+            None,
+        )
+        .expect("the upload begins")
+        .transfer_id
+}
+
+fn status_request(transfer_id: TransferId) -> Request {
+    Request {
+        request_id: RequestId::new(1),
+        method: Method::UploadStatus.into(),
+        method_version: MethodVersion::V1,
+        params: ParamsValue::from_typed(&UploadStatusParams { transfer_id }).expect("encodes"),
+    }
+}
+
+/// The refusal an answer carries, or the result of `UploadStatusResult` it holds.
+fn status_of(answer: &ControlFrame) -> Result<UploadStatusResult, ProtocolError> {
+    let ControlFrame::Response(Response { outcome, .. }) = answer else {
+        panic!("a response was expected: {answer:?}");
+    };
+    match outcome {
+        Outcome::Ok(value) => Ok(value.to_typed().expect("a status")),
+        Outcome::Error(error) => Err(error.clone()),
+    }
+}
 
 /// KR-REQ-23.21 and KR-REQ-23.41: the routing of the walk lists every upload method as served. The
 /// four methods of an upload and the read that tells a device which streams the host takes each
@@ -39,4 +100,132 @@ fn the_walk_serves_the_upload_methods_and_the_reads_that_go_with_them() {
             "{method:?} is served to a paired device: {route:?}"
         );
     }
+}
+
+/// KR-REQ-23.21 and KR-REQ-09.09: a chunk another attempt recorded, which the service finds after
+/// the door's own look for a record, is told as the copy it is and is not given back while this
+/// host owes a fence it could not raise: the end check the serial path makes decides, and the
+/// answer that goes back is withheld. Once the fence is gone the chunk is answered from its record
+/// again, and it was staged all along. The control is the same attempt with nothing owed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chunk_another_attempt_recorded_is_not_given_back_while_a_fence_is_owed() {
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    let (connection, _) = paired_connection(controller, 40, &[ActionRight::FilesUpload]);
+    let actor = connection.device.principal();
+    let bytes = [7_u8; 96];
+    let transfer_id = begun_for(&world, &actor, &bytes);
+    let mutation = mutation_of(
+        &world,
+        &connection,
+        Method::UploadChunk,
+        1,
+        ParamsValue::from_typed(&UploadChunkParams {
+            transfer_id,
+            chunk: ChunkDescriptor {
+                index: U64::ZERO,
+                byte_len: U64::new(bytes.len() as u64),
+                digest: Digest256::from_bytes(kr_cbor::sha256(&bytes)),
+            },
+            bytes: Bytes::new(bytes.to_vec()),
+        })
+        .expect("encodes"),
+    );
+    let admission = fake::admission(controller, world.accepted).await;
+    let attempt = || {
+        controller.transfer().write(
+            &actor,
+            &mutation,
+            Method::UploadChunk,
+            TransferAdmission::new(Arc::clone(controller), admission),
+            None,
+        )
+    };
+
+    attempt()
+        .await
+        .into_answer()
+        .expect("the first attempt stages the chunk");
+    let late = attempt().await;
+    assert!(late.is_copied(), "the late attempt is given the record");
+    late.into_answer()
+        .expect("with nothing owed the late attempt is answered from the record");
+
+    controller.hold_fence(true);
+    let refused = attempt()
+        .await
+        .into_withheld()
+        .expect_err("a fence this host owes stops the retained answer");
+    controller.hold_fence(false);
+    refused_for_a_fence(&refused);
+    attempt()
+        .await
+        .into_answer()
+        .expect("once the fence is gone it is answered again");
+    let status = controller
+        .transfer()
+        .service()
+        .upload_status(&actor, &UploadStatusParams { transfer_id })
+        .expect("the upload's status");
+    assert_eq!(
+        status.received_byte_len.get(),
+        bytes.len() as u64,
+        "the chunk is staged"
+    );
+    world.serving.abort();
+}
+
+/// KR-REQ-23.21 and KR-REQ-09.09: an `upload.status` is a read of recorded state, and it goes
+/// through the end check a recorded answer is owed. A fence this host comes to owe after the
+/// service has read the chunks and before the answer goes back withholds it: the device is told the
+/// answer is not shown, and is not shown which chunks the host holds. The control is the same read
+/// with nothing owed, which is answered with the bitmap. Another principal's upload is unknown to
+/// the device, under the same code as an upload that never existed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_upload_status_is_withheld_while_a_fence_is_owed_before_its_end_check() {
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    let (connection, _) = paired_connection(controller, 41, &[ActionRight::FilesUpload]);
+    let actor = connection.device.principal();
+    let transfer_id = begun_for(&world, &actor, &[7_u8; 96]);
+
+    let shown = status_of(&connection.read(&status_request(transfer_id)).await)
+        .expect("with nothing owed the status is answered");
+    assert_eq!(shown.transfer_id, transfer_id);
+
+    let (arrived, go) = controller.pause_retained_lookup();
+    let request = status_request(transfer_id);
+    let reading = connection.read(&request);
+    tokio::pin!(reading);
+    tokio::select! {
+        arrived = tokio::time::timeout(WAIT_BOUND, arrived) => {
+            arrived
+                .expect("the read reaches its end check")
+                .expect("the pause is armed");
+        }
+        early = &mut reading => panic!("the read was answered before its end check: {early:?}"),
+    }
+    controller.hold_fence(true);
+    go.send(()).expect("the read goes on");
+    let answered = reading.await;
+    controller.hold_fence(false);
+    let told = status_of(&answered).expect_err("the status is withheld");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    assert_eq!(told.message, super::outcome_not_shown().message);
+
+    let owners = ActorId::new("local:test").expect("a principal");
+    let theirs = begun_for(&world, &owners, &[7_u8; 96]);
+    let unknown = status_of(&connection.read(&status_request(theirs)).await)
+        .expect_err("another principal's upload is unknown");
+    let never = status_of(
+        &connection
+            .read(&status_request(TransferId::new(kr_ipc::new_uuid())))
+            .await,
+    )
+    .expect_err("an upload that never existed is unknown");
+    assert_eq!(
+        unknown.code, never.code,
+        "another principal's upload is refused as an upload that never existed is"
+    );
+    world.serving.abort();
 }
