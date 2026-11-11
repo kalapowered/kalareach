@@ -9,7 +9,10 @@
 
 use kr_boundary_windows::filekey::FileKey;
 use kr_boundary_windows::journal::framing;
-use kr_boundary_windows::journal::replay::{self, Reading, RootState, Standing, Tracker};
+use kr_boundary_windows::journal::limits;
+use kr_boundary_windows::journal::replay::{
+    self, Applied, OrderError, Reading, RootState, Standing, Tracker,
+};
 use kr_boundary_windows::journal::rows::{
     DigestedFile, LeftoverClass, RootName, RootNameError, Row, SnapshotKind,
 };
@@ -835,81 +838,708 @@ fn a_root_with_its_intent_alone_can_have_its_removal_recorded_and_no_end_leaves_
     );
 }
 
-#[test]
-fn a_grant_that_would_take_the_journal_past_its_bound_is_refused_before_it_is_written() {
-    use kr_boundary_windows::journal::replay::ROWS_APART_FROM_OBJECTS;
-    use kr_boundary_windows::journal::rows::{Label, Rule};
-    // What a release writes for a granted object under the group rule, and the worst way a failed
-    // release ends: a leftover that names the object by its path, with a long reason.
-    let group_intent = |n: u64| Row::ReleaseIntent {
+/// A path of the longest length a row takes, each unit of three bytes in a row, and a different one
+/// for each `n`.
+fn worst_path(n: u64) -> String {
+    let tail = format!("{n:08}");
+    format!(
+        "{}{tail}",
+        "\u{6f22}".repeat(limits::PATH_UNITS - tail.len())
+    )
+}
+
+/// The longest identifier text a row takes.
+fn worst_sid() -> String {
+    format!("S-1-5-{}", "4294967295-".repeat(15))
+        .trim_end_matches('-')
+        .to_owned()
+}
+
+fn worst_grant(n: u64, list_bytes: usize) -> Row {
+    Row::Grant {
         key: key(n),
-        rule: Rule::Group,
-        new_owner: None,
-        new_dacl_bytes: vec![1, 2, 3, 4],
-        label: Label::Remove,
+        path: worst_path(n),
+        kind: kr_boundary_windows::journal::rows::ObjectKind::File,
+        owner: worst_sid(),
+        dacl_bytes: vec![0xab; list_bytes],
+        control_flags: u16::MAX,
+        protected: true,
+        link_count: u32::MAX,
+        added_ace: "x".repeat(limits::TEXT_BYTES),
+    }
+}
+
+fn worst_intent(n: u64, list_bytes: usize) -> Row {
+    Row::ReleaseIntent {
+        key: key(n),
+        rule: kr_boundary_windows::journal::rows::Rule::Owner,
+        new_owner: Some(worst_sid()),
+        new_dacl_bytes: vec![0xcd; list_bytes],
+        label: kr_boundary_windows::journal::rows::Label::Remove,
         protected_target: true,
+    }
+}
+
+fn worst_released(n: u64) -> Row {
+    Row::ObjectReleased {
+        key: key(n),
+        outcome: "o".repeat(limits::TEXT_BYTES),
+    }
+}
+
+fn worst_leftover(object: String, class: LeftoverClass, snapshot: Option<u32>) -> Row {
+    Row::Leftover {
+        object,
+        reason: "r".repeat(limits::TEXT_BYTES),
+        class,
+        snapshot,
+    }
+}
+
+fn worst_begin() -> Row {
+    Row::Begin {
+        invocation: ID.to_owned(),
+        boot_marker: BOOT.to_owned(),
+        session_luid: u64::MAX,
+        group_sid: worst_sid(),
+        client_sid: worst_sid(),
+        client_pid: u32::MAX,
+        client_creation_time: u64::MAX,
+        chain: (0..limits::CHAIN_KEYS as u64).map(key).collect(),
+        tree_path: worst_path(0),
+    }
+}
+
+fn worst_snapshot(id: u32) -> Row {
+    let file = |n: u64| DigestedFile {
+        name: "n".repeat(limits::NAME_BYTES),
+        key: key(n),
+        size: u64::MAX,
+        sha256: "cd".repeat(32),
     };
-    let failed = |n: u64| Row::Leftover {
-        object: grant_path(n),
-        reason: "x".repeat(256),
-        class: LeftoverClass::Tree,
-        snapshot: None,
-    };
-    // For each bound, grant objects until one is refused. The rows the file then holds, the grants
-    // and the worst release rows of every granted object, stay within what the bound leaves after
-    // the margin for the rows of no object.
-    let mut stopped_at = Vec::new();
-    for room in (0..60).map(|step| step * 2_000) {
-        let limit = ROWS_APART_FROM_OBJECTS + room;
-        let mut tracker = Tracker::bounded(limit);
-        let mut rows = vec![begin()];
+    Row::RepositorySnapshot {
+        id,
+        kind: SnapshotKind::Changed,
+        config_digest: "ab".repeat(32),
+        hooks: (0..limits::HOOKS as u64).map(file).collect(),
+        info_attributes: Some(file(7)),
+        absent_names: vec!["a".repeat(limits::NAME_BYTES); limits::ABSENT_NAMES],
+    }
+}
+
+#[test]
+fn every_row_kind_has_an_enforced_largest_size_and_a_field_over_its_cap_is_refused_with_words() {
+    // Each row at the caps of its fields is within its kind's largest size and is taken.
+    let mut tracker = Tracker::new();
+    for row in [
+        worst_begin(),
+        worst_snapshot(1),
+        Row::RootIntent { name: root_name(1) },
+        worst_grant(1, limits::LIST_BYTES),
+        Row::GrantComplete { count: 1 },
+        started(),
+        Row::EndUncertain {
+            reason: "e".repeat(limits::TEXT_BYTES),
+        },
+        Row::JobEnded,
+        worst_intent(1, limits::LIST_BYTES),
+        worst_released(1),
+        worst_leftover(worst_path(2), LeftoverClass::Root, None),
+    ] {
+        row.check_caps()
+            .unwrap_or_else(|why| panic!("{:?} at its caps: {why}", row.kind()));
+        assert!(
+            row.to_bytes().len() <= row.kind().max_encoded(),
+            "{:?} takes {} bytes, over its largest size {}",
+            row.kind(),
+            row.to_bytes().len(),
+            row.kind().max_encoded()
+        );
+        tracker
+            .apply(&row)
+            .unwrap_or_else(|why| panic!("{:?}: {why}", row.kind()));
+    }
+    // One step over a cap is refused, with words that say which cap, and nothing is changed.
+    let mut long_path = worst_grant(1, 4);
+    if let Row::Grant { path, .. } = &mut long_path {
+        path.push('x');
+    }
+    let begun = |row: Row| {
+        let mut tracker = Tracker::new();
         tracker.apply(&begin()).unwrap();
-        let mut granted = 0;
-        for n in 1..=50 {
+        tracker.apply(&row)
+    };
+    let text = begun(long_path).unwrap_err().to_string();
+    assert!(text.contains("longer than 1024 characters"), "{text}");
+    let text = begun(worst_grant(1, limits::LIST_BYTES + 1))
+        .unwrap_err()
+        .to_string();
+    assert!(text.contains("4096"), "{text}");
+    let text = begun(Row::ObjectReleased {
+        key: key(1),
+        outcome: "o".repeat(limits::TEXT_BYTES + 1),
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(
+        text.contains("an outcome is longer than 256 bytes"),
+        "{text}"
+    );
+    let text = begun(Row::EndUncertain {
+        reason: "e".repeat(limits::TEXT_BYTES + 1),
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(text.contains("a reason is longer than 256 bytes"), "{text}");
+    let text = begun(worst_intent(1, limits::LIST_BYTES + 1))
+        .unwrap_err()
+        .to_string();
+    assert!(text.contains("4096"), "{text}");
+    let mut chain = worst_begin();
+    if let Row::Begin { chain, .. } = &mut chain {
+        chain.push(key(999));
+    }
+    let text = Tracker::new().apply(&chain).unwrap_err().to_string();
+    assert!(text.contains("256 directories"), "{text}");
+    let mut many = worst_snapshot(1);
+    if let Row::RepositorySnapshot { hooks, .. } = &mut many {
+        hooks.push(hooks[0].clone());
+    }
+    let text = begun(many).unwrap_err().to_string();
+    assert!(text.contains("more than 128 hooks"), "{text}");
+    // A path with a control character is not one the journal records.
+    let mut odd = worst_grant(1, 4);
+    if let Row::Grant { path, .. } = &mut odd {
+        *path = "C:\\a\u{7}b".to_owned();
+    }
+    assert!(
+        begun(odd)
+            .unwrap_err()
+            .to_string()
+            .contains("control character")
+    );
+    // What a writer builds goes through the cut, so a long message is never a refusal.
+    let message = "m".repeat(5_000);
+    let row = Row::EndUncertain {
+        reason: limits::short(&message),
+    };
+    row.check_caps().unwrap();
+}
+
+/// A tracker with the rows applied, each of which must be taken.
+fn writer_after(limit: usize, rows: &[Row]) -> Tracker {
+    let mut tracker = Tracker::bounded(limit);
+    for row in rows {
+        tracker
+            .apply(row)
+            .unwrap_or_else(|error| panic!("{:?} is taken: {error}", row.kind()));
+    }
+    tracker
+}
+
+/// The rows a case's writer has had taken, with the tracker that took them, and the check that the
+/// room of the rows of objects is never over its budget.
+struct Driver {
+    tracker: Tracker,
+    rows: Vec<Row>,
+    limit: usize,
+}
+
+impl Driver {
+    fn new(limit: usize) -> Driver {
+        Driver {
+            tracker: Tracker::bounded(limit),
+            rows: Vec::new(),
+            limit,
+        }
+    }
+
+    fn put(&mut self, row: Row) -> Result<Applied, OrderError> {
+        let applied = self.tracker.apply(&row)?;
+        if applied == Applied::Written {
+            self.rows.push(row);
+        }
+        let (spent, kept) = self.tracker.budget();
+        assert!(
+            spent + kept <= self.limit,
+            "the rows of objects ({spent}) and what is kept for them ({kept}) are over the budget {}",
+            self.limit
+        );
+        Ok(applied)
+    }
+
+    fn put_ok(&mut self, row: Row) {
+        let kind = row.kind();
+        self.put(row)
+            .unwrap_or_else(|error| panic!("{kind:?} is taken: {error}"));
+    }
+}
+
+#[test]
+fn a_writer_driven_to_its_limit_with_the_worst_rows_of_every_kind_makes_a_file_that_reads_back() {
+    let mut finished = 0;
+    for limit in [1_500_000_usize, 3_500_000, 6_000_000] {
+        let mut driver = Driver::new(limit);
+        driver.put_ok(worst_begin());
+        for id in 1..=limits::SNAPSHOTS {
+            driver.put_ok(worst_snapshot(id));
+        }
+        driver.put_ok(Row::RootIntent { name: root_name(1) });
+        driver.put_ok(Row::RootMade {
+            name: root_name(1),
+            key: key(9),
+        });
+
+        // Grants of the longest paths, each with a full list or a short one, until the journal has
+        // no room: the grant is refused before it is written, with words for the person.
+        let mut granted = Vec::new();
+        for n in 1_u64.. {
+            let list = if n % 2 == 1 { limits::LIST_BYTES } else { 300 };
+            match driver.put(worst_grant(n, list)) {
+                Ok(_) => granted.push((n, list)),
+                Err(OrderError::NoRoom(words)) => {
+                    assert!(words.contains("too large for the journal"), "{words}");
+                    break;
+                }
+                Err(other) => panic!("{other}"),
+            }
+        }
+        assert!(granted.len() > 8, "{limit}: {} objects", granted.len());
+        driver.put_ok(Row::GrantComplete {
+            count: granted.len() as u64,
+        });
+        driver.put_ok(started());
+        driver.put_ok(Row::JobEnded);
+
+        // Each granted object is released in one of four ways, all at their worst.
+        let mut refused_list = 0;
+        for &(n, list) in &granted {
+            match n % 4 {
+                // A full list released: the intent at the cap, and the longest result.
+                1 => {
+                    driver.put_ok(worst_intent(n, list));
+                    driver.put_ok(worst_released(n));
+                }
+                // A list that grew after its grant, past the room kept for it: the intent is
+                // refused and the object keeps its state, recorded as a leftover that names it by
+                // its path; the retry is a row that starts work and takes room only if there is
+                // room, and a release that then comes is cleared.
+                2 => {
+                    match driver.put(worst_intent(n, list + limits::LIST_GROWTH + 100)) {
+                        Err(OrderError::NoRoom(words)) => {
+                            assert!(words.contains("has grown past the room"), "{words}");
+                            refused_list += 1;
+                        }
+                        other => panic!("an intent over its room was not refused: {other:?}"),
+                    }
+                    driver.put_ok(worst_leftover(worst_path(n), LeftoverClass::Tree, None));
+                    if driver.put(worst_intent(n, list)).is_ok() {
+                        driver.put_ok(worst_released(n));
+                    }
+                }
+                // A release that fails before its intent: a leftover that names the key.
+                3 => {
+                    driver.put_ok(worst_leftover(
+                        key(n).to_string(),
+                        LeftoverClass::Tree,
+                        None,
+                    ));
+                }
+                // A list at the edge of its room.
+                _ => {
+                    driver.put_ok(worst_intent(n, list + limits::LIST_GROWTH));
+                    driver.put_ok(worst_released(n));
+                }
+            }
+        }
+        assert!(refused_list > 0, "a list that grew was refused");
+
+        // Objects the invocation made have no grant row: their intents are paid from what the
+        // grants left, until none is left. Every fifth fails once and is tried again, which
+        // is a row that starts work and takes room only if there is room.
+        let mut made_refused = 0;
+        let mut unresolved = false;
+        for m in 0_u64..10_000 {
+            let n = 1_000_000 + m;
+            match driver.put(worst_intent(n, 600)) {
+                Ok(_) if m % 5 == 0 => {
+                    driver.put_ok(worst_leftover(
+                        key(n).to_string(),
+                        LeftoverClass::Tree,
+                        None,
+                    ));
+                    if driver.put(worst_intent(n, 600)).is_ok() {
+                        driver.put_ok(worst_released(n));
+                        driver.put_ok(Row::LeftoverCleared {
+                            key: key(n).to_string(),
+                        });
+                    } else {
+                        unresolved = true;
+                        made_refused += 1;
+                        break;
+                    }
+                }
+                Ok(_) => driver.put_ok(worst_released(n)),
+                Err(OrderError::NoRoom(words)) => {
+                    assert!(words.contains("no room left"), "{words}");
+                    made_refused += 1;
+                    break;
+                }
+                Err(other) => panic!("{other}"),
+            }
+        }
+        assert_eq!(
+            made_refused, 1,
+            "{limit}: the objects that were made use up the room"
+        );
+        // The release that could not be journalled is one leftover for the tree.
+        driver.put_ok(worst_leftover(worst_path(0), LeftoverClass::Tree, None));
+
+        // Everything open is cleared, the root is removed, and the invocation is verified and ends;
+        // an object whose retry found no room keeps its release unwritten, so the invocation stays
+        // unfinished with its tree blocked, which is what the rows say.
+        let open: Vec<String> = driver
+            .tracker
+            .leftovers()
+            .iter()
+            .map(|leftover| leftover.object.clone())
+            .collect();
+        for object in open {
+            driver.put_ok(Row::LeftoverCleared { key: object });
+        }
+        driver.put_ok(Row::RootRemoved);
+        if unresolved {
+            assert!(driver.put(verified(0)).is_err());
+        } else {
+            driver.put_ok(verified(0));
+            driver.put_ok(Row::End { root_leftovers: 0 });
+            finished += 1;
+        }
+
+        // The file that the writer made is within the bound, and the reader reads it back whole.
+        let file = file_of(&driver.rows);
+        assert!(
+            file.len() <= limit + limits::CLOSING,
+            "{limit}: the file is {} bytes, over its budget and the rows apart from objects",
+            file.len()
+        );
+        assert!(file.len() <= limits::MAX_FILE);
+        let found = invocation(&file, BOOT);
+        assert_eq!(found.damage, None, "{limit}");
+        assert_eq!(
+            found.standing,
+            if unresolved {
+                Standing::Unfinished
+            } else {
+                Standing::Finished
+            },
+            "{limit}"
+        );
+        assert_eq!(found.rows.len(), driver.rows.len());
+    }
+    assert!(finished > 0, "a journal at its limit still reaches its end");
+}
+
+#[test]
+fn a_refused_grant_changes_nothing_and_more_room_never_grants_fewer_objects() {
+    let mut counts = Vec::new();
+    for limit in (0..40).map(|step| step * 40_000_usize) {
+        let mut tracker = Tracker::bounded(limit);
+        tracker.apply(&begin()).unwrap();
+        let mut granted = 0_u64;
+        for n in 1..=200 {
             if tracker.apply(&grant(n)).is_err() {
                 break;
             }
-            rows.push(grant(n));
             granted += 1;
         }
-        stopped_at.push(granted);
-        let complete = Row::GrantComplete { count: granted };
-        tracker.apply(&complete).unwrap();
-        rows.push(complete);
-        // The way through: every granted object released, verified and ended.
-        for n in 1..=granted {
-            for row in [group_intent(n), released(n)] {
-                tracker.apply(&row).unwrap();
-            }
-        }
-        for row in [verified(granted), Row::End { root_leftovers: 0 }] {
-            tracker.apply(&row).unwrap();
-        }
-        // The worst way: each release fails with the longest leftover.
-        for n in 1..=granted {
-            rows.push(group_intent(n));
-            rows.push(failed(n));
-        }
-        assert!(
-            file_of(&rows).len() <= room + 4096,
-            "{granted} objects with their worst release rows are {} bytes, over what a bound of {limit} leaves ({room})",
-            file_of(&rows).len()
-        );
+        counts.push(granted);
+        // The refusal left the tracker as it was: the grant is complete with what was granted.
+        tracker
+            .apply(&Row::GrantComplete { count: granted })
+            .unwrap();
     }
-    assert!(
-        stopped_at.contains(&0),
+    assert_eq!(
+        counts[0], 0,
         "a bound too small for any object stops the grant"
     );
-    assert!(stopped_at.contains(&50), "a roomy bound stops nothing");
+    assert_eq!(*counts.last().unwrap(), 200, "a roomy bound stops nothing");
     assert!(
-        stopped_at.windows(2).all(|pair| pair[0] <= pair[1]),
-        "more room never grants fewer objects: {stopped_at:?}"
+        counts.windows(2).all(|pair| pair[0] <= pair[1]),
+        "more room never grants fewer objects: {counts:?}"
     );
-    // A refused grant changed nothing: the same tracker takes a row that fits.
-    let mut tracker = Tracker::bounded(ROWS_APART_FROM_OBJECTS);
+}
+
+#[test]
+fn a_tree_over_the_most_objects_the_journal_records_is_refused_with_words() {
+    let mut tracker = Tracker::bounded(usize::MAX / 2);
     tracker.apply(&begin()).unwrap();
-    assert!(tracker.apply(&grant(1)).is_err());
-    tracker.apply(&Row::GrantComplete { count: 0 }).unwrap();
+    let small = |n: u64| Row::Grant {
+        key: key(n),
+        path: "p".to_owned(),
+        kind: kr_boundary_windows::journal::rows::ObjectKind::File,
+        owner: "S-1-5-18".to_owned(),
+        dacl_bytes: vec![],
+        control_flags: 0,
+        protected: false,
+        link_count: 1,
+        added_ace: String::new(),
+    };
+    for n in 1..=limits::OBJECTS_PER_TREE as u64 {
+        tracker.apply(&small(n)).unwrap();
+    }
+    let refusal = tracker
+        .apply(&small(limits::OBJECTS_PER_TREE as u64 + 1))
+        .unwrap_err();
+    assert!(matches!(&refusal, OrderError::NoRoom(words) if words.contains("100000 objects")));
+}
+
+#[test]
+fn the_reader_takes_a_file_with_rows_above_the_writers_caps_by_order_and_gates_alone() {
+    // A journal of an earlier form: a path of 10,000 characters, a list of 60,000 bytes, a reason of
+    // 5,000, twenty end checks, ten snapshots and more leftovers than the writer takes.
+    let long_path = "p".repeat(10_000);
+    let mut rows = vec![begin()];
+    rows.extend((1..=10).map(|id| snapshot(id, SnapshotKind::Changed)));
+    rows.push(Row::Grant {
+        key: key(1),
+        path: long_path.clone(),
+        kind: kr_boundary_windows::journal::rows::ObjectKind::File,
+        owner: "S-1-5-18".to_owned(),
+        dacl_bytes: vec![7; 60_000],
+        control_flags: 0,
+        protected: false,
+        link_count: 1,
+        added_ace: "a".repeat(2_000),
+    });
+    rows.push(Row::GrantComplete { count: 1 });
+    rows.push(started());
+    for _ in 0..20 {
+        rows.push(Row::EndUncertain {
+            reason: "u".repeat(5_000),
+        });
+        rows.push(Row::JobEnded);
+    }
+    rows.push(Row::ReleaseIntent {
+        key: key(1),
+        rule: kr_boundary_windows::journal::rows::Rule::Group,
+        new_owner: None,
+        new_dacl_bytes: vec![9; 60_000],
+        label: kr_boundary_windows::journal::rows::Label::Keep,
+        protected_target: false,
+    });
+    rows.push(Row::ObjectReleased {
+        key: key(1),
+        outcome: "o".repeat(5_000),
+    });
+    for n in 0..30 {
+        rows.push(Row::Leftover {
+            object: format!("left{n}"),
+            reason: "l".repeat(5_000),
+            class: LeftoverClass::Root,
+            snapshot: None,
+        });
+    }
+    for repeat in 0..20 {
+        rows.push(verified(repeat));
+        rows.push(Row::EndUncertain {
+            reason: "again".to_owned(),
+        });
+        rows.push(Row::JobEnded);
+    }
+    // The writer refuses what the file holds; the reader takes every row.
+    let refused = rows
+        .iter()
+        .filter(|row| Tracker::new().apply(row).is_err())
+        .count();
+    assert!(refused > 0);
+    let mut writer = Tracker::new();
+    assert!(
+        rows.iter().any(|row| writer.apply(row).is_err()),
+        "the writer's tracker stops at one of these rows"
+    );
+    let found = invocation(&file_of(&rows), BOOT);
+    assert_eq!(
+        found.damage, None,
+        "the reader refuses no row for a cap or a count"
+    );
+    assert_eq!(found.rows.len(), rows.len());
+    assert_eq!(found.standing, Standing::Unfinished);
+    // Taken up for writing, the same tracker holds what was read to the writer's caps: a leftover
+    // is cleared, which is the work that ends.
+    let mut resumed = found.tracker.clone().into_writer();
+    resumed
+        .apply(&Row::LeftoverCleared {
+            key: "left3".to_owned(),
+        })
+        .unwrap();
+    assert!(
+        resumed
+            .apply(&Row::EndUncertain {
+                reason: "x".to_owned()
+            })
+            .is_err()
+    );
+}
+
+#[test]
+fn the_next_row_over_a_count_is_not_lost_in_silence() {
+    let start = [begin(), grant_done(), started()];
+    let words = |error: OrderError| match error {
+        OrderError::NoRoom(words) => words,
+        other => panic!("{other:?}"),
+    };
+    // JobEnded and EndUncertain repeat what the journal already says: not written, and the caller
+    // is told it is already recorded.
+    let mut tracker = writer_after(limits::WRITER_LIMIT, &start);
+    assert_eq!(tracker.apply(&uncertain()), Ok(Applied::Written));
+    assert_eq!(tracker.apply(&uncertain()), Ok(Applied::AlreadyRecorded));
+    assert_eq!(tracker.apply(&Row::JobEnded), Ok(Applied::Written));
+    assert_eq!(tracker.apply(&Row::JobEnded), Ok(Applied::AlreadyRecorded));
+    assert_eq!(tracker.apply(&verified(0)), Ok(Applied::Written));
+    assert_eq!(tracker.apply(&verified(0)), Ok(Applied::AlreadyRecorded));
+
+    // Sixteen end checks and sixteen proofs, and the seventeenth of either that changes the state
+    // is refused with words; the caller records a leftover of class `Uncertain` for the tree.
+    let mut tracker = writer_after(limits::WRITER_LIMIT, &start);
+    for _ in 0..limits::END_CHECKS {
+        tracker.apply(&uncertain()).unwrap();
+        tracker.apply(&Row::JobEnded).unwrap();
+    }
+    let seventeenth = tracker.apply(&uncertain()).map_err(words).unwrap_err();
+    assert!(seventeenth.contains("at most 16"), "{seventeenth}");
+    // The state is what the last row said: proved. The caller says the end is in doubt with a
+    // leftover, which holds the slot and which a person clears.
+    let leftover = worst_leftover(r"C:\work\tree".to_owned(), LeftoverClass::Uncertain, None);
+    assert_eq!(tracker.apply(&leftover), Ok(Applied::Written));
+    assert!(tracker.holds_the_slot());
+    // The proof side: after sixteen of each, one more proof of the end is refused.
+    let mut tracker = writer_after(limits::WRITER_LIMIT, &start);
+    tracker.apply(&Row::JobEnded).unwrap();
+    for _ in 0..(limits::END_CHECKS - 1) {
+        tracker.apply(&uncertain()).unwrap();
+        tracker.apply(&Row::JobEnded).unwrap();
+    }
+    tracker.apply(&uncertain()).unwrap();
+    let proof = tracker.apply(&Row::JobEnded).map_err(words).unwrap_err();
+    assert!(proof.contains("at most 16"), "{proof}");
+    assert_eq!(
+        tracker.apply(&leftover),
+        Ok(Applied::Written),
+        "the end that cannot be recorded as proved is a leftover"
+    );
+
+    // Sixteen verifications, each voided by a release that began after it; the seventeenth is
+    // refused, and the caller records a leftover for the tree.
+    let mut tracker = writer_after(
+        limits::WRITER_LIMIT,
+        &[begin(), grant_done(), started(), Row::JobEnded],
+    );
+    for n in 0..limits::VERIFICATIONS as u64 {
+        tracker.apply(&release_intent(100 + n)).unwrap();
+        tracker.apply(&released(100 + n)).unwrap();
+        tracker.apply(&verified(n)).unwrap();
+    }
+    tracker.apply(&release_intent(200)).unwrap();
+    tracker.apply(&released(200)).unwrap();
+    let seventeenth = tracker.apply(&verified(0)).map_err(words).unwrap_err();
+    assert!(seventeenth.contains("more than 16 times"), "{seventeenth}");
+    assert_eq!(
+        tracker.apply(&worst_leftover(
+            r"C:\work\tree".to_owned(),
+            LeftoverClass::Tree,
+            None
+        )),
+        Ok(Applied::Written)
+    );
+
+    // Four snapshots, and a fifth is refused with words.
+    let mut tracker = writer_after(limits::WRITER_LIMIT, &[begin()]);
+    for id in 1..=limits::SNAPSHOTS {
+        tracker.apply(&snapshot(id, SnapshotKind::Changed)).unwrap();
+    }
+    let fifth = tracker
+        .apply(&snapshot(5, SnapshotKind::Changed))
+        .map_err(words)
+        .unwrap_err();
+    assert!(fifth.contains("at most 4 snapshots"), "{fifth}");
+
+    // Four leftovers of the repository and four acceptances; the fifth of each is refused, and one
+    // for a state that was already accepted is not written.
+    let repository = |id: u32| Row::Leftover {
+        object: format!("config{id}"),
+        reason: "changed".to_owned(),
+        class: LeftoverClass::Repository,
+        snapshot: Some(id),
+    };
+    let accepted = |id: u32| Row::AcceptedState {
+        snapshot: id,
+        person: "S-1-5-21-1-2-3-1000".to_owned(),
+        time: 5,
+    };
+    let mut tracker = writer_after(limits::WRITER_LIMIT, &[begin()]);
+    for id in 1..=limits::SNAPSHOTS {
+        tracker.apply(&snapshot(id, SnapshotKind::Changed)).unwrap();
+        tracker.apply(&repository(id)).unwrap();
+    }
+    let fifth = tracker
+        .apply(&Row::Leftover {
+            object: "config5".to_owned(),
+            reason: "changed".to_owned(),
+            class: LeftoverClass::Repository,
+            snapshot: Some(1),
+        })
+        .map_err(words)
+        .unwrap_err();
+    assert!(fifth.contains("at most 4 leftovers"), "{fifth}");
+    assert_eq!(tracker.apply(&accepted(1)), Ok(Applied::Written));
+    assert_eq!(tracker.apply(&accepted(1)), Ok(Applied::AlreadyRecorded));
+    for id in [2, 1, 2] {
+        tracker.apply(&accepted(id)).unwrap();
+    }
+    let fifth = tracker.apply(&accepted(1)).map_err(words).unwrap_err();
+    assert!(fifth.contains("at most 4 acceptances"), "{fifth}");
+
+    // Leftovers of the private root: the next one over the count is refused; and leftovers of an
+    // object that nothing reserved room for: the ninth is refused, the eight before are taken.
+    let mut tracker = writer_after(limits::WRITER_LIMIT, &[begin()]);
+    for n in 0..limits::ROOT_LEFTOVERS {
+        tracker
+            .apply(&worst_leftover(
+                format!("held{n}"),
+                LeftoverClass::Root,
+                None,
+            ))
+            .unwrap();
+    }
+    let next = tracker
+        .apply(&worst_leftover(
+            "held-more".to_owned(),
+            LeftoverClass::Root,
+            None,
+        ))
+        .map_err(words)
+        .unwrap_err();
+    assert!(next.contains("at most 1024 leftovers"), "{next}");
+    let mut tracker = writer_after(limits::WRITER_LIMIT, &[begin()]);
+    for n in 0..limits::OTHER_LEFTOVERS {
+        tracker
+            .apply(&worst_leftover(
+                format!("tree{n}"),
+                LeftoverClass::Tree,
+                None,
+            ))
+            .unwrap();
+    }
+    let ninth = tracker
+        .apply(&worst_leftover(
+            "tree9".to_owned(),
+            LeftoverClass::Tree,
+            None,
+        ))
+        .map_err(words)
+        .unwrap_err();
+    assert!(ninth.contains("at most 8 leftovers"), "{ninth}");
 }
 
 #[test]
@@ -1414,7 +2044,7 @@ mod native {
         }
         let path = dir.0.join(file_name(id()));
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        file.set_len(kr_boundary_windows::journal::replay::MAX_FILE as u64 + 4096)
+        file.set_len(kr_boundary_windows::journal::limits::MAX_FILE as u64 + 4096)
             .unwrap();
         drop(file);
         let found = replay_dir(&dir.0, BOOT).unwrap();

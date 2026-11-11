@@ -3,5 +3,6 @@
 //! the file that holds them, written through, is in `win::journal`.
 
 pub mod framing;
+pub mod limits;
 pub mod replay;
 pub mod rows;

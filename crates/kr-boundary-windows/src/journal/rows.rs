@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::filekey::FileKey;
 
+use super::limits;
+
 /// The name of an invocation's private root, one directory directly under the broker's `run`
 /// directory: exactly 32 lowercase hexadecimal digits.
 ///
@@ -320,7 +322,211 @@ pub enum Row {
     },
 }
 
+/// A kind of row, without its fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowKind {
+    /// [`Row::Begin`].
+    Begin,
+    /// [`Row::RepositorySnapshot`].
+    RepositorySnapshot,
+    /// [`Row::RootIntent`].
+    RootIntent,
+    /// [`Row::RootMade`].
+    RootMade,
+    /// [`Row::Grant`].
+    Grant,
+    /// [`Row::GrantComplete`].
+    GrantComplete,
+    /// [`Row::ProcessStarted`].
+    ProcessStarted,
+    /// [`Row::JobEnded`].
+    JobEnded,
+    /// [`Row::EndUncertain`].
+    EndUncertain,
+    /// [`Row::ReleaseIntent`].
+    ReleaseIntent,
+    /// [`Row::ObjectReleased`].
+    ObjectReleased,
+    /// [`Row::ReleaseVerified`].
+    ReleaseVerified,
+    /// [`Row::RootRemoved`].
+    RootRemoved,
+    /// [`Row::Leftover`].
+    Leftover,
+    /// [`Row::AcceptedState`].
+    AcceptedState,
+    /// [`Row::LeftoverCleared`].
+    LeftoverCleared,
+    /// [`Row::End`].
+    End,
+}
+
+impl RowKind {
+    /// The most bytes a row of this kind takes encoded, before it is framed.
+    #[must_use]
+    pub const fn max_encoded(self) -> usize {
+        match self {
+            RowKind::Begin => limits::BEGIN_MAX,
+            RowKind::RepositorySnapshot => limits::SNAPSHOT_MAX,
+            RowKind::RootIntent | RowKind::RootMade | RowKind::RootRemoved => limits::ROOT_MAX,
+            RowKind::Grant => limits::GRANT_MAX,
+            RowKind::GrantComplete
+            | RowKind::ProcessStarted
+            | RowKind::JobEnded
+            | RowKind::ReleaseVerified
+            | RowKind::End => limits::SMALL_MAX,
+            RowKind::EndUncertain => limits::UNCERTAIN_MAX,
+            RowKind::ReleaseIntent => limits::INTENT_MAX,
+            RowKind::ObjectReleased => limits::RELEASED_MAX,
+            RowKind::Leftover => limits::LEFTOVER_MAX,
+            RowKind::AcceptedState => limits::ACCEPTED_MAX,
+            RowKind::LeftoverCleared => limits::CLEARED_MAX,
+        }
+    }
+}
+
 impl Row {
+    /// What kind of row this is.
+    #[must_use]
+    pub fn kind(&self) -> RowKind {
+        match self {
+            Row::Begin { .. } => RowKind::Begin,
+            Row::RepositorySnapshot { .. } => RowKind::RepositorySnapshot,
+            Row::RootIntent { .. } => RowKind::RootIntent,
+            Row::RootMade { .. } => RowKind::RootMade,
+            Row::Grant { .. } => RowKind::Grant,
+            Row::GrantComplete { .. } => RowKind::GrantComplete,
+            Row::ProcessStarted { .. } => RowKind::ProcessStarted,
+            Row::JobEnded => RowKind::JobEnded,
+            Row::EndUncertain { .. } => RowKind::EndUncertain,
+            Row::ReleaseIntent { .. } => RowKind::ReleaseIntent,
+            Row::ObjectReleased { .. } => RowKind::ObjectReleased,
+            Row::ReleaseVerified { .. } => RowKind::ReleaseVerified,
+            Row::RootRemoved => RowKind::RootRemoved,
+            Row::Leftover { .. } => RowKind::Leftover,
+            Row::AcceptedState { .. } => RowKind::AcceptedState,
+            Row::LeftoverCleared { .. } => RowKind::LeftoverCleared,
+            Row::End { .. } => RowKind::End,
+        }
+    }
+
+    /// Whether every field is within the caps of the journal, with the words for the person when
+    /// one is not. A row that fails is never written. The caps limit what may be added: the reader
+    /// does not apply them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first field over its cap, or the row over its kind's largest size.
+    pub fn check_caps(&self) -> Result<(), String> {
+        use limits::{
+            ABSENT_NAMES, CHAIN_KEYS, HOOKS, NAME_BYTES, PATH_JSON_BYTES, SID_BYTES, TEXT_BYTES,
+            check_list, check_path, check_text,
+        };
+        let digested =
+            |file: &DigestedFile| check_text("a name in a snapshot", &file.name, NAME_BYTES);
+        match self {
+            Row::Begin {
+                invocation,
+                boot_marker,
+                group_sid,
+                client_sid,
+                chain,
+                tree_path,
+                ..
+            } => {
+                check_text("an invocation's identifier", invocation, TEXT_BYTES)?;
+                check_text("the boot marker", boot_marker, TEXT_BYTES)?;
+                check_text("a group's identifier", group_sid, SID_BYTES)?;
+                check_text("an account's identifier", client_sid, SID_BYTES)?;
+                if chain.len() > CHAIN_KEYS {
+                    return Err(format!(
+                        "the tree is more than {CHAIN_KEYS} directories below the volume's root, which the journal does not record"
+                    ));
+                }
+                check_path(tree_path)?;
+            }
+            Row::RepositorySnapshot {
+                config_digest,
+                hooks,
+                info_attributes,
+                absent_names,
+                ..
+            } => {
+                check_text("a digest", config_digest, 128)?;
+                if hooks.len() > HOOKS {
+                    return Err(format!(
+                        "the repository has more than {HOOKS} hooks, which the journal does not record"
+                    ));
+                }
+                for hook in hooks {
+                    digested(hook)?;
+                }
+                if let Some(file) = info_attributes {
+                    digested(file)?;
+                }
+                if absent_names.len() > ABSENT_NAMES {
+                    return Err(format!(
+                        "a snapshot names more than {ABSENT_NAMES} absent names, which the journal does not record"
+                    ));
+                }
+                for name in absent_names {
+                    check_text("a name in a snapshot", name, NAME_BYTES)?;
+                }
+            }
+            Row::Grant {
+                path,
+                owner,
+                dacl_bytes,
+                added_ace,
+                ..
+            } => {
+                check_path(path)?;
+                check_text("an owner's identifier", owner, SID_BYTES)?;
+                check_list("an object's permission list", dacl_bytes)?;
+                check_text("the entry the grant adds", added_ace, TEXT_BYTES)?;
+            }
+            Row::EndUncertain { reason } => check_text("a reason", reason, TEXT_BYTES)?,
+            Row::ReleaseIntent {
+                new_owner,
+                new_dacl_bytes,
+                ..
+            } => {
+                if let Some(owner) = new_owner {
+                    check_text("an owner's identifier", owner, SID_BYTES)?;
+                }
+                check_list("the permission list a release would write", new_dacl_bytes)?;
+            }
+            Row::ObjectReleased { outcome, .. } => check_text("an outcome", outcome, TEXT_BYTES)?,
+            Row::Leftover { object, reason, .. } => {
+                check_text("the name of an object", object, PATH_JSON_BYTES)?;
+                check_text("a reason", reason, TEXT_BYTES)?;
+            }
+            Row::AcceptedState { person, .. } => {
+                check_text("a person's identifier", person, SID_BYTES)?;
+            }
+            Row::LeftoverCleared { key } => {
+                check_text("the name of an object", key, PATH_JSON_BYTES)?;
+            }
+            Row::RootIntent { .. }
+            | Row::RootMade { .. }
+            | Row::GrantComplete { .. }
+            | Row::ProcessStarted { .. }
+            | Row::JobEnded
+            | Row::ReleaseVerified { .. }
+            | Row::RootRemoved
+            | Row::End { .. } => {}
+        }
+        let size = self.to_bytes().len();
+        if size > self.kind().max_encoded() {
+            return Err(format!(
+                "a {:?} row takes {size} bytes, more than the {} bytes the journal allows one",
+                self.kind(),
+                self.kind().max_encoded()
+            ));
+        }
+        Ok(())
+    }
+
     /// The row as the bytes that are framed.
     ///
     /// # Panics

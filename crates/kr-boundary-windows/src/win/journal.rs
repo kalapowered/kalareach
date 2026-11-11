@@ -16,7 +16,8 @@ use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_WRITE_THROUGH, FILE_SHAR
 
 use crate::filekey::FileKey;
 use crate::journal::framing::{self, FramingError};
-use crate::journal::replay::{self, Invocation, MAX_FILE, OrderError, Reading, Standing, Tracker};
+use crate::journal::limits::MAX_FILE;
+use crate::journal::replay::{self, Applied, Invocation, OrderError, Reading, Standing, Tracker};
 use crate::journal::rows::{RootName, Row};
 
 use super::launch::{InvocationId, ResumePermit, SuspendedChild};
@@ -57,6 +58,10 @@ pub enum JournalError {
     /// The child belongs to another invocation than this journal's.
     #[error("the child belongs to another invocation than this journal's")]
     OtherChild,
+    /// The journal already says what the row says, so the row was not written. This is not a
+    /// failure: the caller goes on.
+    #[error("the journal already says this, so the row was not written")]
+    AlreadyRecorded,
     /// An earlier write failed, so no row is written until the file is taken up again.
     #[error("an earlier row could not be written, so the journal takes no more")]
     Closed,
@@ -166,7 +171,7 @@ impl Journal {
             file,
             path,
             invocation,
-            tracker: found.tracker.clone(),
+            tracker: found.tracker.clone().into_writer(),
             rows: found.rows.len(),
             closed: false,
         };
@@ -197,8 +202,9 @@ impl Journal {
     ///
     /// # Errors
     ///
-    /// Returns an error, and writes nothing, when the row may not come now; and an error, with the
-    /// journal closed, when the write or the flush fails.
+    /// Returns an error, and writes nothing, when the row may not come now, is over a cap or would
+    /// pass the file's budget (the caller then records a leftover), or is already recorded; and an
+    /// error, with the journal closed, when the write or the flush fails.
     pub fn append(&mut self, row: &Row) -> Result<DurableRow, JournalError> {
         if self.closed {
             return Err(JournalError::Closed);
@@ -206,14 +212,16 @@ impl Journal {
         if let Row::Begin { invocation, .. } = row
             && *invocation != hex::encode(self.invocation.0)
         {
-            return Err(OrderError("the row begins another invocation".to_owned()).into());
+            return Err(OrderError::Order("the row begins another invocation".to_owned()).into());
         }
         let framed = framing::encode(&row.to_bytes())?;
         // The tracker is not copied for each row: a refused row changes nothing, and a row that
         // was applied and then not written closes the journal, which is taken up again from the
         // file before any row is written (the tracker of a closed journal may be ahead of the file
         // by that one row).
-        self.tracker.apply(row)?;
+        if self.tracker.apply(row)? == Applied::AlreadyRecorded {
+            return Err(JournalError::AlreadyRecorded);
+        }
         #[cfg(feature = "testing")]
         let injected = testing::take_failure();
         #[cfg(not(feature = "testing"))]
