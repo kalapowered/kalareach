@@ -80,6 +80,9 @@ pub enum LaunchError {
     /// A standard handle was not usable. Nothing was started.
     #[error("a standard handle is not usable: {0}")]
     Handle(&'static str),
+    /// The deadline had passed before the program was started. Nothing was started.
+    #[error("the deadline passed before the program was started")]
+    DeadlinePassed,
     /// The process was made but is not in the job. It was ended.
     #[error("the new process was not in its job and was ended")]
     NotInJob,
@@ -306,6 +309,7 @@ pub mod testing {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     static SKIP_NEXT_TERMINATION: AtomicBool = AtomicBool::new(false);
+    static FAIL_NEXT_LAUNCH_AFTER_CREATION: AtomicBool = AtomicBool::new(false);
 
     /// Makes the next dropped suspended child skip its call to end the process, as if the platform
     /// had refused it: the child stays, and its drop must report that it was not seen to end.
@@ -316,34 +320,49 @@ pub mod testing {
     pub(super) fn take_skip() -> bool {
         SKIP_NEXT_TERMINATION.swap(false, Ordering::SeqCst)
     }
+
+    /// Makes the next launch fail after its process was made, as if a call that comes after the
+    /// creation had failed: the child is dropped, which ends it and waits for it.
+    pub fn fail_next_launch_after_creation() {
+        FAIL_NEXT_LAUNCH_AFTER_CREATION.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn take_fail_after_creation() -> bool {
+        FAIL_NEXT_LAUNCH_AFTER_CREATION.swap(false, Ordering::SeqCst)
+    }
 }
 
 /// How long a dropped suspended child is waited for.
 const END_WAIT_MS: u32 = 5_000;
 
+/// Ends a child that never ran and waits for it, up to [`END_WAIT_MS`]. A child that is not seen to
+/// end is reported to the job's owner, whatever the call to end it said: no release or removal may
+/// rest on this child's end. The drop of a suspended child and the launch's own error path both end
+/// a child this way.
+fn end_unresumed(process: &Handle, pid: u32, reports: &Reports) {
+    #[cfg(feature = "testing")]
+    let skipped = testing::take_skip();
+    #[cfg(not(feature = "testing"))]
+    let skipped = false;
+    // SAFETY: the process handle is open and the process is the caller's own child.
+    let terminated = !skipped && unsafe { TerminateProcess(process.raw(), 1) } != 0;
+    let terminate_error = (!terminated).then(|| last("ending a suspended child"));
+    // SAFETY: as above.
+    let waited = unsafe { WaitForSingleObject(process.raw(), END_WAIT_MS) };
+    if waited != WAIT_OBJECT_0 {
+        let call = terminate_error.map_or_else(
+            || "the call succeeded".to_owned(),
+            |error| error.to_string(),
+        );
+        reports.add(format!(
+            "the suspended child (process {pid}) was not seen to end within {END_WAIT_MS} ms ({call})"
+        ));
+    }
+}
+
 impl Drop for SuspendedChild {
     fn drop(&mut self) {
-        #[cfg(feature = "testing")]
-        let skipped = testing::take_skip();
-        #[cfg(not(feature = "testing"))]
-        let skipped = false;
-        // SAFETY: the process handle is open and the process is this value's own child.
-        let terminated = !skipped && unsafe { TerminateProcess(self.process.raw(), 1) } != 0;
-        let terminate_error = (!terminated).then(|| last("ending a suspended child"));
-        // SAFETY: as above.
-        let waited = unsafe { WaitForSingleObject(self.process.raw(), END_WAIT_MS) };
-        if waited != WAIT_OBJECT_0 {
-            // The end is not proved, whatever the call said: the job's owner is told, and no
-            // release or removal may rest on this child's end.
-            let call = terminate_error.map_or_else(
-                || "the call succeeded".to_owned(),
-                |error| error.to_string(),
-            );
-            self.reports.add(format!(
-                "the suspended child (process {}) was not seen to end within {} ms ({call})",
-                self.pid, END_WAIT_MS
-            ));
-        }
+        end_unresumed(&self.process, self.pid, &self.reports);
     }
 }
 
@@ -383,11 +402,17 @@ impl SuspendedChild {
             });
         }
         let this = ManuallyDrop::new(self);
-        // SAFETY: `this` is never used or dropped again, so each handle is moved out once and the
-        // platform sees the child resumed, not ended.
-        let (process, thread) =
-            unsafe { (std::ptr::read(&this.process), std::ptr::read(&this.thread)) };
+        // SAFETY: `this` is never used or dropped again, so each handle and the reference to the
+        // job's reports are moved out once and the platform sees the child resumed, not ended.
+        let (process, thread, reports) = unsafe {
+            (
+                std::ptr::read(&this.process),
+                std::ptr::read(&this.thread),
+                std::ptr::read(&this.reports),
+            )
+        };
         drop(thread);
+        drop(reports);
         Ok(Child {
             process,
             pid: this.pid,
@@ -704,10 +729,9 @@ pub fn launch(spec: ChildSpec<'_>) -> Result<SuspendedChild, LaunchError> {
     let thread = match Handle::new(created.hThread, "the started process's thread") {
         Ok(thread) => thread,
         Err(error) => {
-            // SAFETY: the process handle is open and the process is this function's own child.
-            unsafe {
-                TerminateProcess(process.raw(), 1);
-            }
+            // The child is ended and waited for as a dropped one is, and reported when it is not
+            // seen to end: the caller reads the job's reports on its way out.
+            end_unresumed(&process, created.dwProcessId, &spec.job.reports());
             return Err(error.into());
         }
     };
@@ -724,6 +748,13 @@ pub fn launch(spec: ChildSpec<'_>) -> Result<SuspendedChild, LaunchError> {
     };
     // From here a failure drops `child`, which ends it.
     child.creation_time = time_of(&child.process)?;
+    #[cfg(feature = "testing")]
+    if testing::take_fail_after_creation() {
+        return Err(LaunchError::Platform(ffi::error(
+            0,
+            "a failure after the process was made, asked for by a case",
+        )));
+    }
     match spec.job.contains(&child.process) {
         Ok(true) => child.in_job_checked = true,
         Ok(false) => return Err(LaunchError::NotInJob),
@@ -751,12 +782,19 @@ pub struct Piped {
 /// Reads a pipe to its end or to a deadline, whichever comes first, keeping up to a limit of what
 /// it holds. The end comes when every writer has closed its handle, which for a child's output
 /// means the child and everything it started has ended. The reader looks at what the pipe holds
-/// before it reads, so no call waits on a writer that never closes.
+/// before it reads, so no call waits on a writer that never closes, and it looks at the clock on
+/// every pass, so a writer that keeps the pipe supplied does not keep the reader past the deadline.
 #[must_use]
 pub fn read_pipe(pipe: &Handle, deadline: Instant) -> Piped {
     let mut kept = Vec::new();
     let mut chunk = vec![0_u8; 64 * 1024];
     loop {
+        if Instant::now() >= deadline {
+            return Piped {
+                bytes: kept,
+                ended: false,
+            };
+        }
         let mut available = 0_u32;
         // SAFETY: the pipe is open and only the available-bytes out-parameter is used.
         let peeked = unsafe {
@@ -778,13 +816,7 @@ pub fn read_pipe(pipe: &Handle, deadline: Instant) -> Piped {
             return Piped { bytes: kept, ended };
         }
         if available == 0 {
-            if Instant::now() >= deadline {
-                return Piped {
-                    bytes: kept,
-                    ended: false,
-                };
-            }
-            std::thread::sleep(PIPE_POLL);
+            std::thread::sleep(PIPE_POLL.min(deadline.saturating_duration_since(Instant::now())));
             continue;
         }
         let mut read = 0_u32;
