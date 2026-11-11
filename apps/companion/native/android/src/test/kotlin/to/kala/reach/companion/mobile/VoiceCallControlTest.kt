@@ -430,7 +430,14 @@ class VoiceCallControlTest {
         assertFalse(switchesLater.deviceEverOn || switchesLater.microphoneEverOn)
     }
 
-    /** KR-REQ-15.34: the call's end is scheduled at the deadline itself, and ends everything. */
+    /**
+     * KR-REQ-13.24: a call's audio is started, held and ended by the native control alone, with no
+     * page in the case: the microphone carries speech once the service and the recorder say so,
+     * and the control's own timer ends the call at its deadline, with the microphone, focus and
+     * service all given back.
+     *
+     * KR-REQ-15.34: the call's end is scheduled at the deadline itself, and ends everything.
+     */
     @Test
     fun the_call_ends_at_its_deadline() {
         val (control, platform, switches) = running(seconds = 30)
