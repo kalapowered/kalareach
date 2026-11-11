@@ -191,7 +191,6 @@ impl ResumePermit {
 
     /// The permit of an invocation's child, for the journal to make once the child's process row
     /// is durable.
-    #[cfg_attr(not(feature = "testing"), allow(dead_code))]
     pub(crate) fn for_invocation(invocation: InvocationId, child: &SuspendedChild) -> ResumePermit {
         ResumePermit::bound_to(Some(invocation), child)
     }
@@ -258,7 +257,7 @@ pub struct SuspendedChild {
     /// Whether the launcher asked the platform, before returning, whether the process is in the
     /// job and was told it is. A child that is not in the job is never returned.
     pub in_job_checked: bool,
-    /// Whether the child was made suspended: always, but when a case took that back.
+    /// Whether the child was made suspended.
     suspended: bool,
 }
 

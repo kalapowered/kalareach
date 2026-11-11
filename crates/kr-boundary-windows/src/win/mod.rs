@@ -17,6 +17,7 @@
 //! | `applocker` | PowerShell's application-control cmdlets and the event log |
 //! | `privilege` | The backup and restore privileges, held by one thread for one privileged action |
 //! | `root` | An invocation's private root: its creation and its removal |
+//! | `journal` | The journal's file: each row written through before the step it protects, and read back after a crash |
 //! | `walk` | The anchored walk: objects reached by identifier from a held directory |
 //! | `pipe` | The broker's local pipe |
 //! | `proof` | The proof that the boundary is in force, and that it was released |
@@ -32,6 +33,7 @@ pub mod broker;
 pub mod ffi;
 pub mod install;
 pub mod job;
+pub mod journal;
 pub mod launch;
 pub mod pipe;
 pub mod privilege;

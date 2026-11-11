@@ -19,7 +19,7 @@
 //! | [`frame`] | The broker's pipe protocol: framed messages with limits, and the requests and answers |
 //! | [`env`] | The environment of every child, built from a fixed table and nothing of the caller's |
 //! | [`quote`] | A child's command line, quoted so that the platform's own splitting gives back its parts |
-//! | [`journal`] | The framing of the journal's records: a length, the bytes and a checksum, with a torn tail dropped |
+//! | [`journal`] | The journal's records: their framing (a length, the bytes and a checksum, with a torn tail dropped), their rows and the order the rows may come in |
 //! | [`repository`] | What the broker reads of a repository before it starts Git, from bytes alone: its `HEAD`, its attributes and its configuration listing |
 //! | [`refusal`] | The refusal those readers give: a kind, the rule's name and a short text |
 //! | [`names`] | The grammar of the branch names and object identifiers the broker admits |
