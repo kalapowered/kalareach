@@ -637,7 +637,10 @@ fn gives_a_record(paths: &Paths, dir: &Path, name: &OsStr) -> bool {
 /// record it names the owner and the list to correct; for any other name, and for what is in
 /// `staging`, it names the entry to remove. Either way the manifest and the journal stay.
 fn entry_refusal(paths: &Paths, dir: &Path, name: &OsStr, why: &str) -> Error {
-    let remedy = if gives_a_record(paths, dir, name) {
+    // With no manifest there is no installation whose records these could be: what is left is
+    // content to remove, and a text that says to correct it cannot be done.
+    let has_manifest = std::fs::symlink_metadata(&paths.manifest).is_ok();
+    let remedy = if has_manifest && gives_a_record(paths, dir, name) {
         Remedy::Correct
     } else {
         Remedy::Remove
@@ -1293,14 +1296,47 @@ enum Scope {
     Program,
 }
 
+/// What cures a refusal of an entry in the program directory: each reason has a remedy that a
+/// person can do, and a change of owner or list is the remedy only of the first.
+#[derive(Clone, Copy)]
+enum Cure {
+    /// The owner or the list is wrong: correct them.
+    OwnerAndList,
+    /// The entry is not something the installation makes there (a link, a second name for a file,
+    /// a name it does not give, a directory nested deeper than it makes anything): remove that
+    /// entry.
+    RemoveEntry,
+    /// The entry could not be opened to be checked, or the directory is not a plain one: another
+    /// program holds it open or its list forbids the check.
+    Open,
+}
+
 /// The refusal of an entry below a directory of a scope.
-fn within_refusal(paths: &Paths, scope: Scope, dir: &Path, name: &OsStr, why: &str) -> Error {
+fn within_refusal(
+    paths: &Paths,
+    scope: Scope,
+    dir: &Path,
+    name: &OsStr,
+    why: &str,
+    cure: Cure,
+) -> Error {
     match scope {
         Scope::Staging => entry_refusal(paths, dir, name, why),
         Scope::Program => {
             let entry = dir.join(name);
+            let remedy = match cure {
+                Cure::OwnerAndList => "Make the Administrators group, or the system, its owner and leave the system and the Administrators group as the only accounts that may change it, then run the setup program again. Do not remove it: the manifest records it and stays where it is.".to_owned(),
+                Cure::RemoveEntry => format!(
+                    "Remove {}, and nothing else: it is not something that the installation makes there, and a change of its owner or its list does not cure that. A repair makes the program files again. Then run the setup program again.",
+                    entry.display()
+                ),
+                Cure::Open => format!(
+                    "Close the program that holds {} open, or correct who may open it, and if it is a link or not a folder remove that link or entry and nothing else, then run the setup program again. Do not remove the program directory: the manifest records it and stays where it is.",
+                    entry.display()
+                ),
+            };
             Error::Refused(format!(
-                "{} is the boundary's program directory (the program that the service runs as the system). It is refused because of {}: {why}. Whoever owns it, or can change its list, could replace that program. Make the Administrators group, or the system, its owner and leave the system and the Administrators group as the only accounts that may change it, then run the setup program again. Do not remove it: the manifest records it and stays where it is.",
+                "{} is the boundary's program directory (the program that the service runs as the system). It is refused because of {}: {why}. Whoever owns it, or can change its list, could replace that program. {remedy}",
                 paths.program.display(),
                 entry.display(),
             ))
@@ -1325,6 +1361,7 @@ fn check_program_directory(paths: &Paths) -> Result<(), Error> {
                 paths.program.parent().unwrap_or(&paths.program),
                 &program,
                 &refusal.to_string(),
+                Cure::Open,
             ));
         }
     };
@@ -1335,6 +1372,7 @@ fn check_program_directory(paths: &Paths) -> Result<(), Error> {
             paths.program.parent().unwrap_or(&paths.program),
             &program,
             &why,
+            Cure::OwnerAndList,
         ));
     }
     inspect_within(paths, Scope::Program, &paths.program, &held, 1)
@@ -1436,6 +1474,7 @@ fn inspect_within(
                 dir,
                 &shown,
                 "it is nested deeper than the installation makes anything",
+                Cure::RemoveEntry,
             ));
         }
         let opened = match held.open_child(&child, LIST | READ_CONTROL)? {
@@ -1447,11 +1486,19 @@ fn inspect_within(
                     dir,
                     &shown,
                     &format!("it could not be opened to be checked ({lost})"),
+                    Cure::Open,
                 ));
             }
         };
         if opened.kind == Kind::ReparsePoint {
-            return Err(within_refusal(paths, scope, dir, &shown, "it is a link"));
+            return Err(within_refusal(
+                paths,
+                scope,
+                dir,
+                &shown,
+                "it is a link",
+                Cure::RemoveEntry,
+            ));
         }
         if opened.kind == Kind::File && opened.links > 1 {
             return Err(within_refusal(
@@ -1460,10 +1507,18 @@ fn inspect_within(
                 dir,
                 &shown,
                 "it has more than one name",
+                Cure::RemoveEntry,
             ));
         }
         if let Some(why) = check_readable_object(&opened.handle)? {
-            return Err(within_refusal(paths, scope, dir, &shown, &why));
+            return Err(within_refusal(
+                paths,
+                scope,
+                dir,
+                &shown,
+                &why,
+                Cure::OwnerAndList,
+            ));
         }
         if opened.kind == Kind::Directory {
             let inner = DirHandle::from_opened(opened)?;
@@ -2732,21 +2787,53 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
     }
     if failures.is_empty() {
         // The records go last: a failed removal can be run again from them.
-        let _ = fs::remove_dir_all(&paths.staging);
-        let _ = fs::remove_file(&paths.manifest);
-        let _ = fs::remove_file(&paths.prior);
-        let _ = fs::remove_dir(&paths.data);
-        if let Some(parent) = paths.data.parent() {
-            let _ = fs::remove_dir(parent);
+        let stayed = remove_records(paths);
+        if stayed.is_empty() {
+            say("the installation is removed");
+            Ok(())
+        } else {
+            Err(Error::Failed(format!(
+                "the service, the accounts and the policy are removed, but the data directory stays because {} could not be removed. A new installation refuses until they are gone: remove them, then run the setup program again",
+                stayed.join("; ")
+            )))
         }
-        say("the installation is removed");
-        Ok(())
     } else {
         Err(Error::Failed(format!(
             "the removal did not finish and its records are kept: {}",
             failures.join("; ")
         )))
     }
+}
+
+/// Removes the installation's own records, last of all: `staging`, the manifest, the earlier-state
+/// record, any replacement of the manifest that a crash or a failed write left, the data directory
+/// and, when it is empty, the folder above it. Returns each thing that could not be removed, with
+/// the reason; nothing is returned when everything is gone.
+pub fn remove_records(paths: &Paths) -> Vec<String> {
+    let mut stayed = Vec::new();
+    let mut leave = |path: &Path, result: io::Result<()>| {
+        if let Err(error) = result
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            stayed.push(format!("{} ({error})", path.display()));
+        }
+    };
+    leave(&paths.staging, fs::remove_dir_all(&paths.staging));
+    leave(&paths.manifest, fs::remove_file(&paths.manifest));
+    leave(&paths.prior, fs::remove_file(&paths.prior));
+    // A replacement of the manifest that a crash, or a failed write, left has no use.
+    if let Ok(entries) = fs::read_dir(&paths.data) {
+        for entry in entries.flatten() {
+            if is_manifest_replacement(&entry.file_name().to_string_lossy()) {
+                leave(&entry.path(), fs::remove_file(entry.path()));
+            }
+        }
+    }
+    leave(&paths.data, fs::remove_dir(&paths.data));
+    if let Some(parent) = paths.data.parent() {
+        let _ = fs::remove_dir(parent);
+    }
+    stayed
 }
 
 /// Reads the journal and the directory of the private roots and refuses, before anything is
