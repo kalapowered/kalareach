@@ -267,6 +267,23 @@ pub fn policy_applied_after(record: u64, scratch: &Path, env: &EnvBlock) -> Resu
     Ok(!query(&[&filter, "/c:1"], scratch, env)?.is_empty())
 }
 
+/// Whether the log holds the platform's "policy applied" event from the last `milliseconds`.
+///
+/// # Errors
+///
+/// Returns an error when the query fails or its answer cannot be read.
+pub fn policy_applied_within(
+    milliseconds: u64,
+    scratch: &Path,
+    env: &EnvBlock,
+) -> Result<bool, Error> {
+    let filter = format!(
+        "/q:*[System[(EventID={}) and TimeCreated[timediff(@SystemTime) <= {milliseconds}]]]",
+        events::APPLIED
+    );
+    Ok(!query(&[&filter, "/c:1"], scratch, env)?.is_empty())
+}
+
 /// The refusals the log has recorded after a record number.
 ///
 /// # Errors

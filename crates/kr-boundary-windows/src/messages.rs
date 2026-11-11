@@ -1,0 +1,10 @@
+//! Messages of the product whose exact words are fixed: what the installer says while Windows
+//! starts application control, and what the broker answers while its proof has not passed.
+
+/// Said by the installer after it starts the Application Identity service, before it waits for the
+/// platform's first "policy applied" event.
+pub const APPLICATION_CONTROL_STARTING: &str = "Windows needs about two minutes to start application control, so the installation waits for it.";
+
+/// The broker's answer to every request while its proof of the boundary has not passed.
+pub const STILL_STARTING: &str =
+    "Windows is still starting application control after the restart; try again in a few minutes.";

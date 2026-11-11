@@ -39,8 +39,9 @@ use super::token::enable_privilege;
 
 /// The most connections served at once.
 const MAX_CONNECTIONS: usize = 8;
-/// How long a proof may wait for the policy to bind.
-const PROOF_BOUND: Duration = Duration::from_secs(240);
+/// How long a proof may wait for the platform's refusal and for the log's event that names the rule:
+/// the log names it about 170 s after the start of Windows.
+const PROOF_BOUND: Duration = Duration::from_secs(300);
 
 /// The error mode of the broker and, by inheritance, of every child it starts: the system shows no
 /// critical-error box, invokes no Windows Error Reporting for a crash, and shows no open-file box.

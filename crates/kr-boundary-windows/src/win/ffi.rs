@@ -97,6 +97,13 @@ pub fn system_windows_directory() -> Result<String> {
     Ok(String::from_utf16_lossy(&buffer[..length]))
 }
 
+/// How long Windows has been running, in milliseconds.
+#[must_use]
+pub fn uptime_millis() -> u64 {
+    // SAFETY: takes no argument and reads the system's tick count.
+    unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
+}
+
 /// A handle that closes when dropped.
 #[derive(Debug)]
 pub struct Handle(HANDLE);

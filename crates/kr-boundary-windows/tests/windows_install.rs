@@ -21,12 +21,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use kr_boundary_windows::env::{Kind, QualifiedGit, RootPaths, build_env};
+use kr_boundary_windows::frame::{Class, Request, Response};
 use kr_boundary_windows::manifest::{InstallState, Manifest, ObjectKind, Prior};
+use kr_boundary_windows::messages;
 use kr_boundary_windows::policy::{self, Policy, RULE_ALLOW_ALL};
 use kr_boundary_windows::quote::quote_command_line;
 use kr_boundary_windows::win::applocker::Channel;
-use kr_boundary_windows::win::ffi::Sid;
-use kr_boundary_windows::win::install::{CHECKOUT, CONNECT, Paths, SERVICE, STEPS};
+use kr_boundary_windows::win::ffi::{self, Sid};
+use kr_boundary_windows::win::install::{self, CHECKOUT, CONNECT, Paths, SERVICE, STEPS};
 use kr_boundary_windows::win::launch::{Outcome, TokenSpec, VerifiedPath};
 use kr_boundary_windows::win::proof::{Run, run_captured};
 use kr_boundary_windows::win::{account, acl, boot, registry, service, token};
@@ -199,6 +201,36 @@ fn installation_lays_down_and_removal_restores() {
 
     let (code, output) = case.install();
     assert_eq!(code, 0, "the installation succeeds: {output}");
+
+    // The order: the platform's application control is started and reported before the policy is
+    // written, reported again after it, and only then is the unlisted program started.
+    let mut at = 0;
+    for line in [
+        messages::APPLICATION_CONTROL_STARTING,
+        "application control has started",
+        "the policy is written",
+        "the platform has applied the policy",
+        "an unlisted program was refused",
+    ] {
+        let found = output[at..]
+            .find(line)
+            .unwrap_or_else(|| panic!("{line:?} comes next in: {output}"));
+        at += found + line.len();
+    }
+    // The first launch of the proof meets a policy that is in force: it passes within a few launches.
+    for line in output
+        .lines()
+        .filter(|l| l.contains("an unlisted program was refused"))
+    {
+        let launches: u32 = line
+            .split("after ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("the proof line names its launches: {line}"));
+        eprintln!("proof line: {line}");
+        assert!(launches <= 5, "the proof passed at once: {line}");
+    }
 
     // Every object is there, as the manifest says.
     let manifest = Manifest::load(&paths.manifest).unwrap();
@@ -585,4 +617,27 @@ fn entry_states_are_told_apart_and_a_repair_enrols_another_person() {
     let _ = account::delete(&other_name);
     assert_eq!(code, 0, "{output}");
     assert_eq!(snapshot(), before);
+}
+
+/// Run by a startup task after the guest's Windows restarts with the boundary installed: the broker
+/// that the service manager started with Windows proves the boundary inside its bound.
+#[test]
+#[ignore = "runs after a restart of the guest with the boundary installed (see the file's header)"]
+fn after_a_restart_the_brokers_proof_passes_inside_its_bound() {
+    let uptime = std::time::Duration::from_millis(ffi::uptime_millis());
+    let mut session = install::open_session().expect("the broker started with Windows");
+    for class in [Class::Checkout, Class::Connect] {
+        let begun = std::time::Instant::now();
+        match install::ask(&mut session, &Request::Prove { class }).expect("the broker answers") {
+            Response::Proof { ready, detail } => {
+                eprintln!(
+                    "{class:?}: ready {ready} after {:.1} s, asked {:.0} s after the start of Windows: {detail}",
+                    begun.elapsed().as_secs_f32(),
+                    uptime.as_secs_f32()
+                );
+                assert!(ready, "the proof passes: {detail}");
+            }
+            other => panic!("the broker answered a proof with {other:?}"),
+        }
+    }
 }

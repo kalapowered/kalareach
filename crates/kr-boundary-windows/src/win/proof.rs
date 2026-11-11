@@ -38,6 +38,9 @@ use super::pipe::Stop;
 use super::sd::{Principals, SdKind, descriptor};
 use super::token::{boundary_token, new_invocation_group};
 
+/// How long the proof waits between two launches of the unlisted program.
+const LAUNCH_EVERY: Duration = Duration::from_secs(2);
+
 /// The result of a proof.
 pub struct Proof {
     /// Whether every question was answered as the boundary requires.
@@ -163,7 +166,7 @@ fn system_windows_directory() -> Result<String, String> {
 
 /// The environment of a program of the proof, which runs in no repository. The proof's scratch
 /// directory stands for the private root.
-fn proof_environment(git: &GitSet, scratch: &Path) -> Result<EnvBlock, String> {
+pub(super) fn proof_environment(git: &GitSet, scratch: &Path) -> Result<EnvBlock, String> {
     let roots = RootPaths {
         system: system_windows_directory()?,
         boundary: Paths::system().program.display().to_string(),
@@ -284,8 +287,14 @@ pub fn prove(
         Ok(record) => record,
         Err(error) => return fail(error.to_string()),
     };
+    // The platform refuses the program from the first launch, but its log names the rule only some
+    // time after the start of Windows (170 s on the guest, none at all before that), and a refused
+    // launch that the log never names proves nothing about which rule refused it. So the program
+    // is started again, one launch every two seconds, until the refusal and an event of the log
+    // that names this rule, this account and this program are both in hand.
     let started = Instant::now();
     let mut attempts = 0_u32;
+    let mut refused = false;
     let mut last: String;
     loop {
         if stop.is_set() {
@@ -301,7 +310,10 @@ pub fn prove(
             &environment,
             Duration::from_secs(30),
         ) {
-            Err(LaunchError::NotStarted(code)) if code == REFUSED_BY_POLICY => break,
+            Err(LaunchError::NotStarted(code)) if code == REFUSED_BY_POLICY => {
+                refused = true;
+                last = format!("it was refused with {REFUSED_BY_POLICY}");
+            }
             Err(LaunchError::NotStarted(code)) => {
                 return fail(format!(
                     "the unlisted program could not be started for {account}, with error {code} and not the policy's {REFUSED_BY_POLICY}"
@@ -324,39 +336,34 @@ pub fn prove(
             }) => return fail("the unlisted program ran for 30 seconds"),
             Err(error) => return fail(error.to_string()),
         }
+        if refused {
+            match applocker::blocked_after(record, &scratch.0, &environment) {
+                Ok(events) => {
+                    if events.iter().any(|event| {
+                        event.rule_id == rule
+                            && event.user.eq_ignore_ascii_case(&sid)
+                            && same_path(&event.path, &unlisted)
+                    }) {
+                        break;
+                    }
+                }
+                Err(error) => return fail(error.to_string()),
+            }
+        }
         if started.elapsed() >= bound {
             let log = applocker::latest(&scratch.0, &environment)
                 .unwrap_or_else(|error| format!("unreadable: {error}"));
+            let seen = if refused {
+                "refused, but the log named no rule"
+            } else {
+                "not refused"
+            };
             return fail(format!(
-                "the policy did not refuse the unlisted program to {account} in {} seconds ({attempts} launches; the last: {last}; the application-control log last said: {log})",
+                "the policy did not show a refusal of the unlisted program to {account} by rule {rule} in {} seconds ({seen}; {attempts} launches; the last: {last}; the application-control log last said: {log})",
                 bound.as_secs()
             ));
         }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    // The refusal is the policy's only if the log says which rule made it.
-    let named = loop {
-        match applocker::blocked_after(record, &scratch.0, &environment) {
-            Ok(events) => {
-                if events.iter().any(|event| {
-                    event.rule_id == rule
-                        && event.user.eq_ignore_ascii_case(&sid)
-                        && same_path(&event.path, &unlisted)
-                }) {
-                    break true;
-                }
-            }
-            Err(error) => return fail(error.to_string()),
-        }
-        if started.elapsed() >= bound || stop.is_set() {
-            break false;
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    };
-    if !named {
-        return fail(format!(
-            "the unlisted program was refused to {account} but the log does not name the rule {rule}"
-        ));
+        std::thread::sleep(LAUNCH_EVERY);
     }
     let git_exe = Path::new(&git.dir)
         .join("mingw64")

@@ -23,6 +23,7 @@
 //! | [`repository`] | What the broker reads of a repository before it starts Git, from bytes alone: its `HEAD`, its attributes and its configuration listing |
 //! | [`refusal`] | The refusal those readers give: a kind, the rule's name and a short text |
 //! | [`names`] | The grammar of the branch names and object identifiers the broker admits |
+//! | [`messages`] | The product's own messages whose exact words are fixed: the installer's wait for application control, and the broker's answer while its proof has not passed |
 //! | [`state`] | What the doctor says in each state of the installation |
 //!
 //! The calls that touch the machine live in `win`, which builds on Windows only. Everything above
@@ -51,6 +52,7 @@ pub mod filekey;
 pub mod frame;
 pub mod journal;
 pub mod manifest;
+pub mod messages;
 pub mod names;
 pub mod notice;
 pub mod policy;
