@@ -620,29 +620,39 @@ impl TransferModule {
     /// Checks that a transfer mutation's envelope and its parameters name the same subject.
     ///
     /// A transfer names its subject in its parameters, because an action target has no transfer
-    /// field: what the envelope has to agree about is the session an upload or a draft is bound to,
-    /// and that a transfer is never addressed to an application instance.
+    /// field: what the envelope has to agree about is the session an upload or a draft is bound to.
+    /// An upload is never addressed to an application instance. A draft is made for the
+    /// application its parameters name, which its target names as well, and a write of a stored
+    /// draft names in its target the application the draft has, which
+    /// [`TransferModule::check_subject_of_record`] compares with the stored one.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::InvalidArgument`] when the two disagree.
     pub fn check_subject(method: Method, mutation: &MutationRequest) -> Result<()> {
         if mutation.target.application_instance_id.is_present()
-            && !matches!(method, Method::AgentDraftAddAttachment)
+            && !matches!(
+                method,
+                Method::DraftCreate | Method::DraftUpdate | Method::AgentDraftAddAttachment
+            )
         {
             return Err(ControllerError::InvalidArgument(format!(
                 "{} does not act on an application instance",
                 method.as_str()
             )));
         }
-        let (environment_id, session_id) = match method {
+        let (environment_id, session_id, application_instance_id) = match method {
             Method::UploadBegin => {
                 let params: kr_protocol::transfer::UploadBeginParams = parse(&mutation.params)?;
-                (Some(params.environment_id), params.session_id.0)
+                (Some(params.environment_id), params.session_id.0, None)
             }
             Method::DraftCreate => {
                 let params: kr_protocol::transfer::DraftCreateParams = parse(&mutation.params)?;
-                (Some(params.environment_id), params.session_id.0)
+                (
+                    Some(params.environment_id),
+                    params.session_id.0,
+                    params.application_instance_id.0,
+                )
             }
             // The remaining mutations name a transfer or a draft, neither of which the envelope's
             // target can carry. The environment is checked for every mutation before this point,
@@ -651,7 +661,7 @@ impl TransferModule {
             | Method::UploadFinish
             | Method::UploadCancel
             | Method::DraftUpdate
-            | Method::AgentDraftAddAttachment => (None, None),
+            | Method::AgentDraftAddAttachment => (None, None, None),
             _ => {
                 return Err(ControllerError::InvalidArgument(format!(
                     "{} is not a transfer mutation this daemon serves",
@@ -669,6 +679,12 @@ impl TransferModule {
             if session_id != mutation.target.session_id.0 {
                 return Err(ControllerError::InvalidArgument(
                     "the request's target and its parameters name different sessions".to_owned(),
+                ));
+            }
+            if application_instance_id != mutation.target.application_instance_id.0 {
+                return Err(ControllerError::InvalidArgument(
+                    "the request's target and its parameters name different applications"
+                        .to_owned(),
                 ));
             }
         }
@@ -997,6 +1013,10 @@ impl TransferModule {
                 "the request's target and the object it acts on name different sessions",
             ));
         }
+        // The application is held as the session is: a draft made for one is written by a request
+        // whose target names it, and a draft made for none by a request that names none. A target
+        // can name an application only inside a session, which the grant and the connection's
+        // scope were decided for, so naming one reaches nothing the session's own check did not.
         if stored.application_instance_id.is_some()
             && mutation.target.application_instance_id.0 != stored.application_instance_id
         {
