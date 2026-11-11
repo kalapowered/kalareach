@@ -2,7 +2,7 @@
 //! connection.
 //!
 //! The host here plays the host's side of the form and nothing else: it answers `transfer.streams`,
-//! `upload.begin`, `upload.status`, `upload.finish` and `upload.cancel` on the control stream and
+//! `upload.begin`, `upload.status` and `upload.finish` on the control stream and
 //! takes `attachment_chunks` streams, answering each chunk as its script says. What the cases check
 //! is the client's half: it asks before it reserves, it sends nothing on a stream before the host
 //! has said it takes one, every chunk goes on a stream with the connection's window and a request
@@ -39,9 +39,8 @@ use kr_protocol::scalars::{
 };
 use kr_protocol::transfer::{
     AttachmentHandle, ChunkBitmap, ChunkLayout, TransferStreamsResult, UploadBeginParams,
-    UploadBeginResult, UploadCancelParams, UploadCancelResult, UploadChunkParams,
-    UploadChunkResult, UploadFinishParams, UploadFinishResult, UploadState, UploadStatusParams,
-    UploadStatusResult,
+    UploadBeginResult, UploadChunkParams, UploadChunkResult, UploadFinishParams,
+    UploadFinishResult, UploadState, UploadStatusParams, UploadStatusResult,
 };
 use kr_transport::TransportError;
 use kr_transport::clock::{ContinuousClock, ManualClock};
@@ -211,7 +210,6 @@ struct Seen {
     chunks: Vec<SeenChunk>,
     stored: BTreeSet<u64>,
     begins: u64,
-    cancels: Vec<TransferId>,
     status_reads: u64,
     /// The request identifiers of every request and mutation read on the control stream.
     control_ids: Vec<RequestId>,
@@ -512,15 +510,6 @@ fn control_reply(script: &Arc<Script>, frame: ControlFrame) -> Option<ControlFra
                         },
                         already_published: false,
                         preview_unavailable: Nullable::null(),
-                    })
-                }
-                Some(Method::UploadCancel) => {
-                    let params: UploadCancelParams = mutation.params.to_typed().ok()?;
-                    script.record(|seen| seen.cancels.push(params.transfer_id));
-                    typed(&UploadCancelResult {
-                        transfer_id: params.transfer_id,
-                        state: UploadState::Cancelled,
-                        released_byte_len: U64::new(0),
                     })
                 }
                 Some(Method::UploadChunk) => {
@@ -1580,35 +1569,4 @@ async fn a_sign_out_during_the_wait_for_a_window_is_told_with_its_reason() {
     assert_eq!(told.code(), ErrorCode::LeaseLost, "{told}");
     session.close();
     serving.abort();
-}
-
-/// An upload the caller gives up is released with `upload.cancel`.
-#[tokio::test]
-async fn an_upload_the_caller_gives_up_is_cancelled_by_its_transfer() {
-    let pair = pair(Script::new(true)).await;
-    let route = ChunkRoute::network(&pair.session, environment())
-        .await
-        .expect("a route");
-    let mut upload = plan(THREE_CHUNKS);
-    // The send is abandoned at its first chunk: the host holds it.
-    pair.script.will(Chunk::Hold);
-    {
-        let at = target();
-        let progress = unwatched();
-        let sending = uploads::send(&pair.session, &route, &at, &mut upload, TTL, &progress);
-        tokio::pin!(sending);
-        tokio::select! {
-            sent = &mut sending => panic!("a held chunk was answered: {sent:?}"),
-            () = pair.script.until("the held chunk", |seen| !seen.chunks.is_empty()) => {}
-        }
-    }
-    let transfer = *upload.transfer_id().expect("the plan holds a transfer");
-    let cancelled = uploads::cancel(&pair.session, &target(), transfer, TTL)
-        .await
-        .expect("the host cancels it");
-    assert_eq!(cancelled.state, UploadState::Cancelled);
-    assert_eq!(
-        pair.script.seen(|seen| seen.cancels.clone()),
-        vec![transfer]
-    );
 }
