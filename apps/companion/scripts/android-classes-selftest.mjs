@@ -1424,14 +1424,15 @@ function classWithData(params = []) {
     held('a three-byte character the data section holds in full is read', 'read', string([0x01, 0xe2, 0x82, 0xac, 0x00], 5))
   }
   {
-    // A file of a header alone, with no table at all, still has a header that the data section may not
-    // start in.
-    const header = Buffer.alloc(112)
+    // A file of a header and an empty map list, with no table at all, still has a header that the data
+    // section may not start in.
+    const header = Buffer.alloc(116)
     header.write('dex\n035\0', 0, 'latin1')
+    header.writeUInt32LE(112, 0x34)
     const section = (start) => {
       const bytes = Buffer.from(header)
       bytes.writeUInt32LE(start, 0x6c)
-      bytes.writeUInt32LE(112 - start, 0x68)
+      bytes.writeUInt32LE(116 - start, 0x68)
       return readAs(definedClasses, bytes)
     }
     held('a data section that starts inside a header with no tables after it is refused', OVERLAPS, section(0x2c))
@@ -1449,6 +1450,37 @@ function classWithData(params = []) {
     }
     held('a type list whose last entry is outside the data section is refused', PAST_LIST, typeList(7))
     held('a type list the data section holds in full is read', 'read', typeList(8))
+  }
+  // The map list names the sections of the file. The call-site and method-handle tables are not read
+  // here, so a file whose map list says it has one is refused and not accepted as read.
+  {
+    const SITES = 'a dex file with call sites or method handles, which this check does not read'
+    held(
+      'a dex file whose map list names call sites is refused',
+      SITES,
+      readAs(definedClasses, dex({ defined: [FACTORY], callSites: 2 }))
+    )
+    held(
+      'a dex file whose map list names method handles is refused',
+      SITES,
+      readAs(definedNatives, dex({ defined: [FACTORY], methodHandles: 1 }))
+    )
+    // A table of no entries is not a table the file has: the call-site item's size, set to 0.
+    const none = Buffer.from(dex({ defined: [FACTORY], callSites: 1 }))
+    none.writeUInt32LE(0, none.readUInt32LE(0x34) + 20)
+    held('a map list that gives its call-site item no entries is read', 'read', readAs(definedClasses, none))
+    refuses(
+      'a map list outside the data section is refused, and so is a file that has none',
+      definedClasses,
+      (bytes) => bytes.writeUInt32LE(0, 0x34),
+      'a dex file whose map list is outside its data section'
+    )
+    refuses(
+      'a map list that counts more items than the data section holds is refused',
+      definedClasses,
+      (bytes) => bytes.writeUInt32LE(0x7fffffff, bytes.readUInt32LE(0x34)),
+      'a dex file whose map list is past the end of its data section'
+    )
   }
   // A method that is not native is read as far as its own offsets and index, so that a class data
   // item that has gone wrong cannot end where it looks as if it did.

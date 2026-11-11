@@ -53,9 +53,18 @@ export function modifiedUtf8(text) {
  * (`['I', 'Ljava/lang/String;']`). The method table lists them in the opposite order to the classes,
  * so that a reader that took a method's place in a class for its place in the file would answer
  * wrongly. `fields` gives a class that many static and instance fields, `{ 'a.b.C': [1, 2] }`, which
- * come before its methods in its data and which a reader has to step over.
+ * come before its methods in its data and which a reader has to step over. `callSites` and
+ * `methodHandles` make the map list say the file has that many call sites and method handles.
  */
-export function dex({ defined = [], referenced = [], constants = [], methods = {}, fields = {} } = {}) {
+export function dex({
+  defined = [],
+  referenced = [],
+  constants = [],
+  methods = {},
+  fields = {},
+  callSites = 0,
+  methodHandles = 0
+} = {}) {
   const descriptorOf = (name) => `L${name.replaceAll('.', '/')};`
   // Every class the file names. The superclass every real class has comes first, and the merely
   // mentioned ones next, so a class_defs index is never the type index it holds.
@@ -127,6 +136,21 @@ export function dex({ defined = [], referenced = [], constants = [], methods = {
   const classDefs = Buffer.alloc(definedTypeIndex.length * 32)
   const data = []
   let at = dataAt
+  // The map list, which names the sections of the file: a header item, and a call-site or method-handle
+  // item when `callSites` or `methodHandles` says the file has that table (it is not written). It is
+  // first in the data section here, so that the item a case changes at the file's end stays there.
+  const mapItems = [[0x0000, 1]]
+  if (callSites > 0) mapItems.push([0x0007, callSites])
+  if (methodHandles > 0) mapItems.push([0x0008, methodHandles])
+  const map = Buffer.alloc(4 + mapItems.length * 12)
+  map.writeUInt32LE(mapItems.length, 0)
+  mapItems.forEach(([type, size], index) => {
+    map.writeUInt16LE(type, 4 + index * 12)
+    map.writeUInt32LE(size, 8 + index * 12)
+  })
+  header.writeUInt32LE(at, 0x34)
+  data.push(map)
+  at += map.length
   strings.forEach((text, index) => {
     stringIds.writeUInt32LE(at, index * 4)
     const item = Buffer.concat([uleb(text.length), modifiedUtf8(text), Buffer.from([0])])

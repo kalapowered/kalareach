@@ -310,7 +310,8 @@ const DEX_HEADER_SIZE = 112
  * Reads the tables a dex file keeps its strings, types, prototypes, methods and classes in, and
  * answers them with a reader of one string and of one type's descriptor. A table that does not lie
  * within the file is refused, which also refuses a count larger than the data there is to hold it.
- * The data section is refused when it starts before the tables end or reaches past the file.
+ * The data section is refused when it starts before the tables end or reaches past the file, and a
+ * file that has tables this does not read (call sites, method handles) is refused by its map list.
  */
 function reader(dex) {
   requireDex(dex)
@@ -339,6 +340,19 @@ function reader(dex) {
   if (dataAt < tablesEnd) throw new Error('a dex file whose data section overlaps its header or its tables')
   if (dataEnd > dex.length) throw new Error('a dex file whose data section is not within it')
   const inData = (offset) => offset >= dataAt && offset < dataEnd
+  // The map list names the sections of the file. The call-site (0x0007) and method-handle (0x0008)
+  // tables, which a file with invoke-custom code carries after its class table, are not read here, so
+  // a file whose map list names either is refused and not accepted as read.
+  const mapAt = u32(dex, 0x34)
+  if (!inData(mapAt)) throw new Error('a dex file whose map list is outside its data section')
+  const mapSize = u32(dex, mapAt)
+  if (mapAt + 4 + mapSize * 12 > dataEnd) throw new Error('a dex file whose map list is past the end of its data section')
+  for (let item = mapAt + 4; item < mapAt + 4 + mapSize * 12; item += 12) {
+    const type = u16(dex, item)
+    if ((type === 0x0007 || type === 0x0008) && u32(dex, item + 4) !== 0) {
+      throw new Error('a dex file with call sites or method handles, which this check does not read')
+    }
+  }
   const string = (index) => {
     const stringAt = u32(dex, place(strings, index, 4))
     if (!inData(stringAt)) throw new Error('a dex file with string data outside its data section')
