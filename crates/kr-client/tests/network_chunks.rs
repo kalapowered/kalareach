@@ -1035,7 +1035,7 @@ async fn a_host_that_gives_no_stream_credit_ends_the_open_and_returns_its_slot()
         let opening = route.open(transfer);
         let cutting = bounds.fire_when_armed(DeadlineKind::Header);
         let (opened, ()) = tokio::join!(within(opening), cutting);
-        let error = opened.err().expect("the open is cut");
+        let error = opened.expect_err("the open is cut");
         assert_eq!(
             deadline_of(&error),
             Some(DeadlineKind::Header),
@@ -1067,8 +1067,7 @@ async fn a_stream_the_host_refuses_ends_in_the_status_and_is_not_opened_again() 
         &unwatched(),
     ))
     .await
-    .err()
-    .expect("an upload the host ended cannot go on");
+    .expect_err("an upload the host ended cannot go on");
     assert!(ended.to_string().contains("expired"), "{ended}");
     pair.script.seen(|seen| {
         assert_eq!(seen.headers.len(), 1, "the header was not sent again");
@@ -1220,8 +1219,7 @@ async fn a_lane_stops_when_the_transport_says_this_device_ended_the_connection()
     let stopped = lane
         .send_chunk(&target(), &second, TTL)
         .await
-        .err()
-        .expect("the lane stops");
+        .expect_err("the lane stops");
     assert_eq!(stopped.code(), ErrorCode::LeaseLost, "{stopped}");
     assert_eq!(
         script.seen(|seen| seen.chunks.len()),
