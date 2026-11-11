@@ -701,14 +701,41 @@ fn entry_states_are_told_apart_and_a_repair_enrols_another_person() {
 }
 
 /// A folder under `%ProgramData%` as the system's setup leaves it for a new one: with the list it
-/// inherits, which lets ordinary accounts add to it.
+/// inherits, which lets ordinary accounts add to it. The Administrators own it, as they own
+/// everything the installation makes, whichever token the case runs under: a folder owned by the
+/// token's default owner is refused for its owner before its list is read, and a case that expects
+/// the list would pass for the wrong reason.
 fn inherited_folder() -> PathBuf {
     let folder = PathBuf::from(r"C:\ProgramData").join(format!(
         "krparent-{}",
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     ));
-    std::fs::create_dir(&folder).unwrap();
+    owned_dir(&folder);
     folder
+}
+
+/// Makes a folder that the Administrators own, as the installation's own folders are, so that a
+/// refusal of it is for what the case names and not for an owner that the token's default chose.
+fn owned_dir(path: impl AsRef<Path>) {
+    std::fs::create_dir(path.as_ref()).unwrap();
+    give_to(path.as_ref(), "Administrators");
+}
+
+/// Writes a file that the Administrators own, for the same reason as [`owned_dir`].
+#[cfg(feature = "testing")]
+fn owned_file(path: impl AsRef<Path>, bytes: &[u8]) {
+    std::fs::write(path.as_ref(), bytes).unwrap();
+    give_to(path.as_ref(), "Administrators");
+}
+
+/// Gives a file or a directory to another account, as the tool does for a person.
+fn give_to(path: &Path, who: &str) {
+    let done = Command::new("icacls")
+        .arg(path)
+        .args(["/setowner", who])
+        .output()
+        .unwrap();
+    assert!(done.status.success(), "{done:?}");
 }
 
 fn paths_under(folder: &Path) -> Paths {
@@ -741,7 +768,7 @@ fn a_folder_above_the_data_directory_that_others_own_may_write_in_or_have_replac
 
     // The same refusal for a folder that holds the data directory, with its manifest, journals and
     // roots, never says to remove it: it says what to correct.
-    std::fs::create_dir(inherited.join("Boundary")).unwrap();
+    owned_dir(inherited.join("Boundary"));
     let text = install::check_data_parent(&paths_under(&inherited))
         .unwrap_err()
         .to_string();
@@ -1084,7 +1111,9 @@ fn the_data_directory_is_made_with_its_own_protected_list_and_one_that_is_there_
     let folder = inherited_folder();
     acl::set_protected(&folder, &data_parent_descriptor()).unwrap();
     let paths = paths_under(&folder);
-    let holds = install::make_data_directory(&paths).unwrap();
+    // Made under a token whose default owner is the user, so that a descriptor that loses its owner
+    // is caught under the system's own token too.
+    let holds = with_the_users_own_default_owner(|| install::make_data_directory(&paths).unwrap());
     let handle = open_folder(&paths.data, READ_CONTROL);
     let made = sd::summary_of_handle(&handle).unwrap();
     drop(handle);
@@ -1175,7 +1204,7 @@ fn the_data_directory_is_made_with_its_own_protected_list_and_one_that_is_there_
     assert!(refused.to_string().contains("is a link"), "{refused}");
     let _ = std::fs::remove_dir(&paths.data);
     let _ = std::fs::remove_dir_all(&target);
-    std::fs::write(&paths.data, b"not a directory").unwrap();
+    owned_file(&paths.data, b"not a directory");
     assert!(install::make_data_directory(&paths).is_err());
     let _ = std::fs::remove_file(&paths.data);
     let _ = std::fs::remove_dir_all(&folder);
@@ -1238,7 +1267,7 @@ fn the_removal_deletes_a_leftover_replacement_and_names_what_stayed_when_the_dat
     std::fs::remove_dir(&paths.run).unwrap();
     std::fs::remove_dir(&paths.journal).unwrap();
     let replacement = paths.data.join(format!("manifest-{}.new", "ef".repeat(16)));
-    std::fs::write(&replacement, b"half").unwrap();
+    owned_file(&replacement, b"half");
     // Held open and shared with nobody, the replacement cannot be deleted: the removal names it and
     // the data directory that therefore stays.
     let held = std::fs::OpenOptions::new()
@@ -1313,7 +1342,7 @@ fn a_program_directory_refusal_names_the_remedy_for_its_reason_in_a_repair_and_i
 
     // A file with a second name is removed as well.
     let first = paths.program.join("first.exe");
-    std::fs::write(&first, b"x").unwrap();
+    owned_file(&first, b"x");
     std::fs::hard_link(&first, paths.program.join("second.exe")).unwrap();
     for text in both("a second name") {
         assert!(text.contains("more than one name"), "{text}");
@@ -1325,15 +1354,137 @@ fn a_program_directory_refusal_names_the_remedy_for_its_reason_in_a_repair_and_i
 
     // An owner that is not the installation's is corrected, and the directory is not removed.
     let name = format!("krowner{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
-    account::create(&name).unwrap();
+    let owner = account::create(&name).unwrap();
     give_to(&paths.program, &name);
     for text in both("an account-owned program directory") {
+        assert!(
+            text.contains(&owner.to_text()),
+            "the refusal is for the owner: {text}"
+        );
         assert!(text.contains("Make the Administrators group"), "{text}");
         assert!(text.contains("Do not remove it"), "{text}");
     }
     give_to(&paths.program, "Administrators");
     let _ = account::delete(&name);
     let _ = std::fs::remove_dir_all(&target);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// The program directory holds the names the installation gives it, each of its own kind: the two
+/// programs are files; Git's settings are a directory with an empty configuration and two empty
+/// directories. A name that is not given, a name of the wrong kind and a configuration that holds
+/// anything are refused in a repair and in a removal alike, with the entry to remove and nothing
+/// else; the complete layout, with an empty configuration, is accepted.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_program_directory_holds_only_the_names_the_installation_gives_each_of_its_kind_and_an_empty_configuration()
+ {
+    use kr_boundary_windows::win::fresh;
+    use kr_boundary_windows::win::sd::{Principals, SdKind};
+    let folder = inherited_folder();
+    acl::set_protected(&folder, &data_parent_descriptor()).unwrap();
+    let paths = paths_in(&folder);
+    installed_data_directory(&paths);
+    let readable = Principals {
+        users_may_read: true,
+        ..Principals::default()
+    };
+    fresh::directory_all(&paths.program, SdKind::AdminDir, &readable).unwrap();
+    let both = |what: &str| -> [String; 2] {
+        [
+            install::entry(&paths).err().expect(what).to_string(),
+            install::remove(&paths, true).expect_err(what).to_string(),
+        ]
+    };
+    let refused = |what: &str, why: &str| {
+        for text in both(what) {
+            assert!(text.contains(why), "{what}: {text}");
+            assert!(text.contains("Remove "), "{what}: {text}");
+            assert!(
+                !text.contains("Make the Administrators group"),
+                "a change of owner or list does not cure it: {text}"
+            );
+        }
+    };
+    // Whatever else the check of the directory finds, it finds nothing in the names.
+    let accepted = |what: &str| {
+        for text in [
+            install::entry(&paths).err().map(|error| error.to_string()),
+            install::remove(&paths, true)
+                .err()
+                .map(|error| error.to_string()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(
+                !text.contains("boundary's program directory"),
+                "{what}: {text}"
+            );
+        }
+    };
+    let broker = paths.program.join("kr-boundary-broker.exe");
+    let credential = paths.program.join("kr-boundary-credential.exe");
+    let config = paths.git.join("config");
+    let hooks = paths.git.join("hooks");
+    accepted("an empty program directory");
+
+    // A name that the installation does not give there.
+    let stray = paths.program.join("stray.txt");
+    owned_file(&stray, b"x");
+    refused("a name that is not given", "does not give that name there");
+    std::fs::remove_file(&stray).unwrap();
+
+    // A program that is a directory, and Git's directory that is a file.
+    owned_dir(&broker);
+    refused(
+        "a program that is a directory",
+        "it is a directory, not a file",
+    );
+    std::fs::remove_dir(&broker).unwrap();
+    owned_file(&paths.git, b"x");
+    refused(
+        "Git's directory that is a file",
+        "it is a file, not a directory",
+    );
+    std::fs::remove_file(&paths.git).unwrap();
+
+    // The complete layout, with an empty configuration, is accepted.
+    owned_file(&broker, b"x");
+    owned_file(&credential, b"x");
+    fresh::directory_at(&paths.git, SdKind::AdminDir, &readable).unwrap();
+    fresh::directory_at(&hooks, SdKind::AdminDir, &readable).unwrap();
+    fresh::directory_at(&paths.git.join("template"), SdKind::AdminDir, &readable).unwrap();
+    drop(fresh::file_at(&config, SdKind::ProgramFile, true).unwrap());
+    accepted("the complete layout");
+
+    // A configuration that holds anything is not the empty one the manifest records.
+    std::fs::write(&config, b"[core]\n").unwrap();
+    refused("a configuration that holds settings", "it holds settings");
+    std::fs::write(&config, b"").unwrap();
+    accepted("the configuration emptied again");
+
+    // The configuration that is a directory, and the hooks that are a file.
+    std::fs::remove_file(&config).unwrap();
+    owned_dir(&config);
+    refused(
+        "a configuration that is a directory",
+        "it is a directory, not a file",
+    );
+    std::fs::remove_dir(&config).unwrap();
+    drop(fresh::file_at(&config, SdKind::ProgramFile, true).unwrap());
+    std::fs::remove_dir(&hooks).unwrap();
+    owned_file(&hooks, b"x");
+    refused("hooks that are a file", "it is a file, not a directory");
+    std::fs::remove_file(&hooks).unwrap();
+    fresh::directory_at(&hooks, SdKind::AdminDir, &readable).unwrap();
+
+    // The empty directories hold nothing.
+    owned_file(hooks.join("pre-commit"), b"x");
+    refused("a hook", "does not give that name there");
+    std::fs::remove_file(hooks.join("pre-commit")).unwrap();
+    accepted("the hooks emptied again");
     let _ = std::fs::remove_dir_all(&folder);
 }
 
@@ -1450,7 +1601,7 @@ fn with_no_manifest_the_refusal_of_leftover_content_says_to_remove_it() {
     installed_data_directory(&paths);
     let first = paths.data.join(format!("manifest-{}.new", "ab".repeat(16)));
     let second = paths.data.join(format!("manifest-{}.new", "cd".repeat(16)));
-    std::fs::write(&first, b"x").unwrap();
+    owned_file(&first, b"x");
     std::fs::hard_link(&first, &second).unwrap();
     // With the manifest, the file that has two names is a record to correct.
     let text = install::make_data_directory(&paths)
@@ -1633,7 +1784,9 @@ fn the_channel_hands_the_policy_to_powershell_in_a_new_file_of_the_administrator
     let setting = {
         let channel = Channel::new(&folder);
         let xml = xml.clone();
-        std::thread::spawn(move || channel.set(&xml))
+        // Under a token whose default owner is the user, so that a file that names no owner is
+        // caught under the system's own token too.
+        std::thread::spawn(move || with_the_users_own_default_owner(|| channel.set(&xml)))
     };
     let mut seen = BTreeMap::new();
     while !setting.is_finished() {
@@ -1708,24 +1861,44 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
     let folder = inherited_folder();
     acl::set_protected(&folder, &data_parent_descriptor()).unwrap();
     let paths = paths_in(&folder);
-    let refused_with = |words: &str| {
+    // Whatever is refused, what the person does leaves the manifest and the journal in place, and
+    // the text says one remedy: an entry that the layout does not give is to be removed; a record
+    // that the layout gives is to be corrected, and is never to be removed.
+    let refusal = |words: &str| {
         let refused = install::make_data_directory(&paths).expect_err("the directory is refused");
         let text = refused.to_string();
         assert!(text.contains(words), "{text}");
-        // Whatever is refused, what the person does leaves the manifest and the journal in place.
+        assert!(text.contains("stay where they are"), "{text}");
+        text
+    };
+    let removal_text = |text: &str| {
         assert!(
-            text.to_lowercase()
-                .contains("the manifest and the journal stay where they are"),
+            text.contains("Remove ") && text.contains("and nothing else"),
             "{text}"
         );
+        assert!(!text.contains("Do not remove"), "{text}");
     };
+    let correction_text = |text: &str| {
+        assert!(text.contains("Correct what the reason names"), "{text}");
+        assert!(text.contains("Do not remove"), "{text}");
+        assert!(!text.contains("Remove "), "{text}");
+    };
+    let refused_with = |words: &str| {
+        let text = refusal(words);
+        assert!(
+            text.contains("Remove ") != text.contains("Do not remove"),
+            "one remedy: {text}"
+        );
+    };
+    let removal_with = |words: &str| removal_text(&refusal(words));
+    let correction_with = |words: &str| correction_text(&refusal(words));
 
     // A directory that the installation made is accepted, with journal files of an earlier run in
     // it, and each of its directories is made with its own protected list in the creating call and
     // is held: nothing renames or deletes it while the installation works in it.
     installed_data_directory(&paths);
     let journal_file = paths.journal.join(format!("{}.journal", "ab".repeat(16)));
-    std::fs::write(&journal_file, b"rows").unwrap();
+    owned_file(&journal_file, b"rows");
     let mut holds = install::make_data_directory(&paths).expect("an installation's own directory");
     for path in [&paths.staging, &paths.journal, &paths.run] {
         let made = summary_of(path);
@@ -1761,7 +1934,7 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
     let child = paths
         .staging
         .join(format!("policy-{}.xml", "cd".repeat(16)));
-    std::fs::write(&child, b"policy").unwrap();
+    owned_file(&child, b"policy");
     let child_before = summary_of(&child);
     let mut holds = install::make_data_directory(&paths).unwrap();
     holds.directory(DataChild::Staging).unwrap();
@@ -1801,13 +1974,13 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
         .output()
         .unwrap();
     assert!(owned.status.success(), "{owned:?}");
-    refused_with("S-1-5-32-545");
+    correction_with("S-1-5-32-545");
     let _ = Command::new("icacls")
         .arg(&journal_file)
         .args(["/setowner", "Administrators"])
         .output();
-    std::fs::write(paths.journal.join("notes.txt"), b"x").unwrap();
-    refused_with("notes.txt");
+    owned_file(paths.journal.join("notes.txt"), b"x");
+    removal_with("notes.txt");
     std::fs::remove_file(paths.journal.join("notes.txt")).unwrap();
 
     // A link at a child's name is refused, and the tree it leads to keeps its list.
@@ -1821,18 +1994,18 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
         .output()
         .unwrap();
     assert!(made.status.success(), "{made:?}");
-    refused_with("it is a link");
+    correction_with("it is a link");
     assert_eq!(summary_of(&target), targets_list);
     std::fs::remove_dir(&paths.run).unwrap();
     let _ = std::fs::remove_dir_all(&target);
     installed_data_directory(&paths);
 
     // An entry that the installation did not make is refused, whatever it is.
-    std::fs::write(paths.data.join("stray.txt"), b"x").unwrap();
-    refused_with("stray.txt");
+    owned_file(paths.data.join("stray.txt"), b"x");
+    removal_with("stray.txt");
     std::fs::remove_file(paths.data.join("stray.txt")).unwrap();
-    std::fs::create_dir(paths.data.join("stray")).unwrap();
-    refused_with("stray");
+    owned_dir(paths.data.join("stray"));
+    removal_with("stray");
     std::fs::remove_dir(paths.data.join("stray")).unwrap();
 
     // The manifest is a file with one owner and one name, and a link in its place is refused.
@@ -1846,7 +2019,7 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
         .output()
         .unwrap();
     assert!(linked.status.success(), "{linked:?}");
-    refused_with("it is a link");
+    correction_with("it is a link");
     match install::entry(&paths) {
         Err(error) => assert!(error.to_string().contains("it is a link"), "{error}"),
         Ok(_) => panic!("the manifest is read through a link"),
@@ -1870,13 +2043,13 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
     }
     no_staging.save(&paths.manifest).unwrap();
     install::make_data_directory(&paths).expect("an empty directory needs no record");
-    std::fs::write(paths.staging.join("leftover"), b"x").unwrap();
-    refused_with("leftover");
+    owned_file(paths.staging.join("leftover"), b"x");
+    removal_with("leftover");
     std::fs::remove_file(paths.staging.join("leftover")).unwrap();
     let named = paths
         .staging
         .join(format!("policy-{}.xml", "ef".repeat(16)));
-    std::fs::write(&named, b"x").unwrap();
+    owned_file(&named, b"x");
     refused_with("no manifest records");
     std::fs::remove_file(&named).unwrap();
     std::fs::remove_file(&paths.manifest).unwrap();
@@ -1917,18 +2090,20 @@ fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_befo
     let _ = std::fs::remove_dir_all(&folder);
 }
 
-/// Writes a journal file in the directory that names the private root as unfinished work: a begin
-/// row and the root's intent, which is all the installation reads of it.
+/// Writes a journal file in the directory that names the private root: a begin row and the root's
+/// intent, which is all the installation reads of an unfinished invocation. A finished one also
+/// verifies its release and ends with no leftover, and no longer names the root as work. The journal
+/// is the invocation's whose identifier is the byte, repeated. Returns the file's path.
 #[cfg(feature = "testing")]
-fn journal_naming(journals: &Path, root: &str) {
+fn journal_naming(journals: &Path, root: &str, id: u8, finished: bool) -> PathBuf {
     use kr_boundary_windows::filekey::FileKey;
     use kr_boundary_windows::journal::rows::{RootName, Row};
     use kr_boundary_windows::win::journal::Journal;
     use kr_boundary_windows::win::launch::InvocationId;
-    let mut journal = Journal::create(journals, InvocationId([7; 16])).unwrap();
-    journal
-        .append(&Row::Begin {
-            invocation: "07".repeat(16),
+    let mut journal = Journal::create(journals, InvocationId([id; 16])).unwrap();
+    let mut rows = vec![
+        Row::Begin {
+            invocation: format!("{id:02x}").repeat(16),
             boot_marker: "11111111-1111-1111-1111-111111111111".to_owned(),
             session_luid: 7,
             group_sid: "S-1-9-1-2-3-4".to_owned(),
@@ -1937,24 +2112,60 @@ fn journal_naming(journals: &Path, root: &str) {
             client_creation_time: 99,
             chain: vec![FileKey::ntfs(0xabcd, 5)],
             tree_path: r"C:\work\tree".to_owned(),
-        })
-        .unwrap();
-    journal
-        .append(&Row::RootIntent {
+        },
+        Row::RootIntent {
             name: RootName::parse(root).unwrap(),
-        })
-        .unwrap();
+        },
+    ];
+    if finished {
+        rows.push(Row::ReleaseVerified {
+            objects: 0,
+            leftovers: 0,
+        });
+        rows.push(Row::End { root_leftovers: 0 });
+    }
+    for row in &rows {
+        journal.append(row).unwrap();
+    }
+    drop(journal);
+    // The file is made by the journal's own open call, with the token's default owner; the
+    // broker's journals are the Administrators', and a case that names the root must be refused
+    // for the root and not for the file's owner.
+    let file = journals.join(format!("{}.journal", format!("{id:02x}").repeat(16)));
+    give_to(&file, "Administrators");
+    file
 }
 
-/// Gives a file or a directory to another account, as the tool does for a person.
+/// A broker begins an invocation between the installation's two reads of what is in use: it writes
+/// the intent row of its root and makes the root. The installation lists the private roots first
+/// and reads the journal after, so the new root is not in the listing and is not refused; read the
+/// other way round, it would be listed and not named, and a root in use would be refused.
 #[cfg(feature = "testing")]
-fn give_to(path: &Path, who: &str) {
-    let done = Command::new("icacls")
-        .arg(path)
-        .args(["/setowner", who])
-        .output()
-        .unwrap();
-    assert!(done.status.success(), "{done:?}");
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_root_that_a_broker_makes_between_the_listing_of_the_roots_and_the_journal_read_is_not_refused()
+{
+    let folder = inherited_folder();
+    acl::set_protected(&folder, &data_parent_descriptor()).unwrap();
+    let paths = paths_in(&folder);
+    installed_data_directory(&paths);
+    let first = "ab".repeat(16);
+    let second = "cd".repeat(16);
+    // A root that an unfinished journal names is in use, and the journal is read for it.
+    owned_dir(paths.run.join(&first));
+    journal_naming(&paths.journal, &first, 7, false);
+    install::make_data_directory(&paths).expect("a root that a journal names");
+
+    let between = paths.clone();
+    let second_root = second.clone();
+    install::testing::after_the_first_of_the_two_reads(move || {
+        journal_naming(&between.journal, &second_root, 9, false);
+        owned_dir(between.run.join(&second_root));
+    });
+    install::make_data_directory(&paths).expect("a root made between the two reads is in use");
+    assert!(paths.run.join(&second).exists(), "the seam ran");
+    install::make_data_directory(&paths).expect("both roots are named now");
+    let _ = std::fs::remove_dir_all(&folder);
 }
 
 #[cfg(feature = "testing")]
@@ -1992,7 +2203,7 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
     )
     .unwrap();
     let inner = scratch.join("unlisted.exe");
-    std::fs::write(&inner, b"x").unwrap();
+    owned_file(&inner, b"x");
     install::make_data_directory(&paths).expect("the remnants of an installation's own run");
 
     // A file in staging that another account owns is refused before anything is written, and it is
@@ -2035,7 +2246,7 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
 
     // The name an earlier build gave the policy file is not one the installation gives now.
     let legacy = paths.staging.join("policy.xml");
-    std::fs::write(&legacy, b"x").unwrap();
+    owned_file(&legacy, b"x");
     refused_with("policy.xml");
     std::fs::remove_file(&legacy).unwrap();
 
@@ -2055,26 +2266,33 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
     // correct, and one that the administrators own is a private root; nothing is looked at inside
     // it, whatever it holds.
     let root = paths.run.join("ab".repeat(16));
-    std::fs::create_dir(&root).unwrap();
+    owned_dir(&root);
     refused_with("no journal names it");
-    journal_naming(&paths.journal, &"ab".repeat(16));
+    let unfinished = journal_naming(&paths.journal, &"ab".repeat(16), 7, false);
     give_to(&root, &name);
     let text = install::make_data_directory(&paths)
         .expect_err("a root that another account owns")
         .to_string();
     assert!(text.contains(&"ab".repeat(16)), "{text}");
+    assert!(text.contains(&owner.to_text()), "{text}");
     assert!(text.contains("Do not remove"), "{text}");
     give_to(&root, "Administrators");
     std::fs::write(root.join("anything"), b"x").unwrap();
     install::make_data_directory(&paths).expect("a private root the administrators own");
     std::fs::remove_file(root.join("anything")).unwrap();
+
+    // A root that only a finished journal names is no unfinished work: it is refused as one that no
+    // journal names, with the entry to remove.
+    std::fs::remove_file(&unfinished).unwrap();
+    let finished = journal_naming(&paths.journal, &"ab".repeat(16), 8, true);
+    refused_with("no journal names it");
+    std::fs::remove_file(&finished).unwrap();
     std::fs::remove_dir(&root).unwrap();
-    std::fs::remove_file(paths.journal.join(format!("{}.journal", "07".repeat(16)))).unwrap();
 
     // A proof directory holds the unlisted program and nothing else: another name, even a file
     // that is as protected as the program, is refused.
     let stray = scratch.join("notes.txt");
-    std::fs::write(&stray, b"x").unwrap();
+    owned_file(&stray, b"x");
     refused_with("notes.txt");
     std::fs::remove_file(&stray).unwrap();
     install::make_data_directory(&paths).expect("the proof directory holds only its program");
@@ -2166,9 +2384,12 @@ fn a_file_that_another_program_reads_by_path_is_made_new_and_owned_by_the_admini
     let folder = inherited_folder();
 
     // The file's owner, its protected flag and its two entries are those of the creating call.
-    let (mut file, path) = fresh::named_file(&folder, "policy", ".xml", SdKind::AdminFile).unwrap();
-    file.write_all(b"policy").unwrap();
-    drop(file);
+    let path = with_the_users_own_default_owner(|| {
+        let (mut file, path) =
+            fresh::named_file(&folder, "policy", ".xml", SdKind::AdminFile).unwrap();
+        file.write_all(b"policy").unwrap();
+        path
+    });
     let made = summary_of(&path);
     assert_eq!(made.owner, ADMINISTRATORS);
     assert!(made.protected);
@@ -2197,16 +2418,18 @@ fn a_file_that_another_program_reads_by_path_is_made_new_and_owned_by_the_admini
     assert_eq!(std::fs::read(&target).unwrap(), b"x");
 
     // A directory is made with the same owner and its own list in the call.
-    let directory = fresh::directory(
-        &folder,
-        "proof",
-        SdKind::AdminDir,
-        &Principals {
-            users_may_read: true,
-            ..Principals::default()
-        },
-    )
-    .unwrap();
+    let directory = with_the_users_own_default_owner(|| {
+        fresh::directory(
+            &folder,
+            "proof",
+            SdKind::AdminDir,
+            &Principals {
+                users_may_read: true,
+                ..Principals::default()
+            },
+        )
+        .unwrap()
+    });
     let scratch = summary_of(&directory);
     assert_eq!(scratch.owner, ADMINISTRATORS);
     assert!(scratch.protected);
@@ -2279,7 +2502,9 @@ fn the_proofs_program_and_the_program_files_give_their_readers_read_and_run_and_
             .collect()
     };
     let proof = folder.join("unlisted.exe");
-    drop(fresh::file_with(&proof, SdKind::ProofProgram, &named, true).unwrap());
+    with_the_users_own_default_owner(|| {
+        drop(fresh::file_with(&proof, SdKind::ProofProgram, &named, true).unwrap());
+    });
     assert_eq!(
         entries(&proof),
         [
@@ -2289,7 +2514,9 @@ fn the_proofs_program_and_the_program_files_give_their_readers_read_and_run_and_
         ]
     );
     let program = folder.join("program.exe");
-    drop(fresh::file_at(&program, SdKind::ProgramFile, true).unwrap());
+    with_the_users_own_default_owner(|| {
+        drop(fresh::file_at(&program, SdKind::ProgramFile, true).unwrap());
+    });
     assert_eq!(
         entries(&program),
         [
@@ -2310,7 +2537,7 @@ fn the_installation_stops_before_it_lays_anything_down_when_the_parent_folder_is
         !parent.exists(),
         "the guest has no such folder to begin with"
     );
-    std::fs::create_dir(&parent).unwrap();
+    owned_dir(&parent);
     let before = snapshot();
     let (code, output) = case.install();
     let _ = std::fs::remove_dir_all(&parent);
@@ -2411,7 +2638,7 @@ fn the_removal_reads_the_journal_and_the_private_roots_first_and_refuses_with_no
         .unwrap();
     drop(journal);
     let root = paths.run.join("0123456789abcdef0123456789abcdef");
-    std::fs::create_dir(&root).unwrap();
+    owned_dir(&root);
     let (code, output) = setup(&["remove"], "yes\n", &[]);
     assert_ne!(code, 0, "{output}");
     assert!(
