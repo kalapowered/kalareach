@@ -2676,6 +2676,8 @@ fn shell_quoted(text: &str) -> String {
 /// The application turns the mouse modes on once, before any attachment, as an editor does. With
 /// `KR_HOLD_MOUSE_AGAIN=1` it turns them on again after every byte it reads, so that a click can be
 /// shown to pass through the attachment whatever the attachment did with the modes it was given.
+/// With `KR_HOLD_MOUSE=off` it never turns them on, so that a terminal's own handling of a link and
+/// of the mouse is what a person shows.
 ///
 /// It writes `env.sh` into `KR_HOLD_DIR` (a directory only this account can write to), which names the
 /// environment `kr attach 1` runs in, the `TERM` to use and the `kr` to run, prints `KR_HOLD_READY`,
@@ -2713,7 +2715,12 @@ async fn a_session_is_held_for_a_person_at_a_terminal() {
     }
     std::fs::write(&read_log, b"").expect("an empty record of the application's input");
 
-    let modes = "printf '\\033[?1000h\\033[?1002h\\033[?1006h'";
+    let mouse_off = std::env::var("KR_HOLD_MOUSE").as_deref() == Ok("off");
+    let modes = if mouse_off {
+        "true"
+    } else {
+        "printf '\\033[?1000h\\033[?1002h\\033[?1006h'"
+    };
     let again = if std::env::var("KR_HOLD_MOUSE_AGAIN").as_deref() == Ok("1") {
         format!("{modes}; ")
     } else {
