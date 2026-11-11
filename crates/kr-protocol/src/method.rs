@@ -1295,6 +1295,12 @@ methods! {
     confirmation: None, idempotency: READ,
     doc: "Read one chunk of the same snapshot. Read authority is checked on every request.";
 
+    TransferStreams = "transfer.streams", DraftsAndMedia,
+    effect: Read, ingress: [PairedDevice], rights: [], selectors: [Host],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "The stream kinds this host takes from a paired device. A device asks it before it begins an upload, because a host that takes no attachment-chunk stream could never receive the upload's chunks.";
+
     // ----- Project repositories -------------------------------------------------------------
     ProjectList = "project.list", ProjectRepositories,
     effect: Read, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(SessionView)],

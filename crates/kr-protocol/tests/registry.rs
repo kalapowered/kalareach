@@ -163,6 +163,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         "upload.cancel",
         "download.begin",
         "download.chunk",
+        "transfer.streams",
         "project.list",
         "project.read",
         "project.init",

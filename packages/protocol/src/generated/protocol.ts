@@ -2574,6 +2574,15 @@ export type NetworkHint = string
  */
 export type SyncRevisionId = string
 /**
+ * What one stream carries.
+ *
+ * Control and receipts, terminal output, terminal input, semantic updates and attachment chunks
+ * use distinct streams so the host's scheduler can prioritise control and receipts over bulk
+ * transfers.
+ */
+export type StreamKind =
+  'control' | 'terminal_output' | 'terminal_input' | 'semantic_updates' | 'attachment_chunks'
+/**
  * A class of content the default context excludes and a person may select.
  *
  * File contents and attachment bytes are excluded from every call and cannot be selected: nothing
@@ -3290,6 +3299,8 @@ export interface KalaReachProtocol {
   test_reports_result?: TestReportsResult
   time_adapter_reading?: TimeAdapterReading1
   time_checkpoint?: TimeCheckpoint
+  transfer_streams_params?: TransferStreamsParams
+  transfer_streams_result?: TransferStreamsResult
   upload_begin_params?: UploadBeginParams
   upload_begin_result?: UploadBeginResult
   upload_cancel_params?: UploadCancelParams
@@ -19376,6 +19387,7 @@ export interface MethodEntry {
     | 'upload.cancel'
     | 'download.begin'
     | 'download.chunk'
+    | 'transfer.streams'
     | 'project.list'
     | 'project.read'
     | 'project.init'
@@ -28502,6 +28514,7 @@ export interface ServiceRequestPayload {
     | 'upload.cancel'
     | 'download.begin'
     | 'download.chunk'
+    | 'transfer.streams'
     | 'project.list'
     | 'project.read'
     | 'project.init'
@@ -30955,6 +30968,25 @@ export interface TimeAdapterReading2 {
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   wall_clock_ms: string
+}
+/**
+ * Parameters of `transfer.streams`, which take none.
+ */
+export interface TransferStreamsParams {}
+/**
+ * The result of `transfer.streams`: the stream kinds this host takes from a paired device.
+ *
+ * A device that sends an upload's chunks on a stream of their own asks this first, so that no
+ * reservation is made on a host that could not receive them. A host that lists
+ * `attachment_chunks` takes that stream from every paired device that holds the
+ * right to upload; the host decides the right when the stream is opened, not here.
+ */
+export interface TransferStreamsResult {
+  /**
+   * The stream kinds a paired device may open on a connection to this host, besides the control
+   * stream it already holds.
+   */
+  accepted_streams: StreamKind[]
 }
 /**
  * Parameters of `upload.begin`.

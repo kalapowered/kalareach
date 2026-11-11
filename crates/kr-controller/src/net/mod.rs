@@ -43,6 +43,7 @@
 //! depend on that lease, because neither is remote dispatch.
 
 pub(crate) mod arrivals;
+mod chunks;
 pub mod clock_trust;
 pub mod config;
 mod device_errors;
@@ -1633,6 +1634,8 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
     );
     config.send_limits = setup.settings.send_limits;
     config.preauth_limits = setup.settings.preauth_limits;
+    // The streams this host reads from a device, which `transfer.streams` tells a device too.
+    config.accepted_kinds = chunks::ACCEPTED_STREAMS.to_vec();
     if let Some(validity) = setup.settings.action_window_validity {
         config.action_window_validity = validity.min(kr_transport::window::MAX_WINDOW_VALIDITY);
     }

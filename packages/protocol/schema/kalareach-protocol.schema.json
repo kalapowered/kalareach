@@ -23079,6 +23079,11 @@
           "type": "string"
         },
         {
+          "const": "transfer.streams",
+          "description": "The stream kinds this host takes from a paired device. A device asks it before it begins an upload, because a host that takes no attachment-chunk stream could never receive the upload's chunks.",
+          "type": "string"
+        },
+        {
           "const": "project.list",
           "description": "List environment-local repositories as scoped metadata.",
           "type": "string"
@@ -39871,6 +39876,28 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "TransferStreamsParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `transfer.streams`, which take none.",
+      "type": "object"
+    },
+    "TransferStreamsResult": {
+      "additionalProperties": false,
+      "description": "The result of `transfer.streams`: the stream kinds this host takes from a paired device.\n\nA device that sends an upload's chunks on a stream of their own asks this first, so that no\nreservation is made on a host that could not receive them. A host that lists\n`attachment_chunks` takes that stream from every paired device that holds the\nright to upload; the host decides the right when the stream is opened, not here.",
+      "properties": {
+        "accepted_streams": {
+          "description": "The stream kinds a paired device may open on a connection to this host, besides the control\nstream it already holds.",
+          "items": {
+            "$ref": "#/$defs/StreamKind"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "accepted_streams"
+      ],
+      "type": "object"
+    },
     "Transport": {
       "description": "How the two ends of a connection reached each other.",
       "oneOf": [
@@ -45985,6 +46012,12 @@
     },
     "time_checkpoint": {
       "$ref": "#/$defs/TimeCheckpoint"
+    },
+    "transfer_streams_params": {
+      "$ref": "#/$defs/TransferStreamsParams"
+    },
+    "transfer_streams_result": {
+      "$ref": "#/$defs/TransferStreamsResult"
     },
     "upload_begin_params": {
       "$ref": "#/$defs/UploadBeginParams"
