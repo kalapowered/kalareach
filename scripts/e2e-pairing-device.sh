@@ -67,6 +67,8 @@
 # through it, so a port that already answers would move another emulator's.
 # KR_IOS_PACKAGES names an absolute folder that the iOS test build keeps the Swift packages in, so
 # that builds share one copy instead of fetching one each (see scripts/lib/xcode.sh).
+# The driving test's result bundle is written to the artefacts folder and removed once the run has
+# been read; KR_KEEP_XCRESULT=1 keeps it.
 #
 # The phone's logs are searched for every form of an invitation's text and secret. The folders this run
 # writes into (the output folder and the screenshots) are for the account that runs it alone, made before
@@ -530,12 +532,17 @@ run_ios() {
     presence_pid=$!
 
     say "driving the application"
-    local out="$artefacts/xcodebuild.log" status=0
+    local out="$artefacts/xcodebuild.log" status=0 result_bundle="$artefacts/driving-test.xcresult"
+    # xcodebuild refuses a result bundle that is already there.
+    /bin/rm -rf "${result_bundle:?}"
     TEST_RUNNER_KR_PAIRING_DIR="$harness" TEST_RUNNER_KR_PAIRING_SHOTS="$shots" TEST_RUNNER_KR_PAIRING_MARKER="$run_marker" \
         xcodebuild test-without-building -xctestrun "$plan" \
         -destination "platform=iOS Simulator,id=$udid" -only-testing:KalaReachUITests/PairingTests \
+        -resultBundlePath "$result_bundle" \
         >"$out" 2>&1 || status=$?
     grep -E "Test Case .* (passed|failed)|error:|XCTAssert|PAIRING" "$out" | sed 's/^/    /' | tee -a "$log"
+    # The run is read from the log; the bundle is kept only when asked.
+    [ -n "${KR_KEEP_XCRESULT:-}" ] || /bin/rm -rf "${result_bundle:?}"
     xcrun simctl terminate "$udid" "$app_id" >/dev/null 2>&1
     # Every level (the default, info and debug lines), from before the run began: its length and a margin
     # of five minutes, never a fixed window. A line of the application's own process reads

@@ -42,6 +42,8 @@
 # KR_PUSH_SHOTS is where the screenshots go (default /tmp/kr-push-phone).
 # KR_IOS_PACKAGES names an absolute folder that the iOS test build keeps the Swift packages in, so
 # that builds share one copy instead of fetching one each (see scripts/lib/xcode.sh).
+# The driving test's result bundle is written to the artefacts folder and removed once the run has
+# been read; KR_KEEP_XCRESULT=1 keeps it.
 #
 # Exit codes: 0 every check passed, 2 bad usage or a failed check, 3 the device is not available.
 set -uo pipefail
@@ -1021,9 +1023,12 @@ run_ios() {
     write_request "$support/kr-probe/push-request.json" "$run" \
         "$(python3 -c 'import json,sys; print(json.dumps({"invitation": open(sys.argv[1]).read().strip(), "enable": True}))' "$harness/invitation.txt")"
     say "driving the application, run $run"
-    local out="$artefacts/xcodebuild.log" test_status=0
+    local out="$artefacts/xcodebuild.log" test_status=0 result_bundle="$artefacts/driving-test.xcresult"
+    # xcodebuild refuses a result bundle that is already there.
+    /bin/rm -rf "${result_bundle:?}"
     ( TEST_RUNNER_KR_PUSH_DIR="$harness" xcodebuild test-without-building -xctestrun "$plan" \
         -destination "platform=iOS Simulator,id=$udid" -only-testing:KalaReachUITests/PushDeviceTests \
+        -resultBundlePath "$result_bundle" \
         >"$out" 2>&1; echo $? >"$harness/test-status" ) &
     : >"$harness/go-app"
 
@@ -1050,6 +1055,11 @@ run_ios() {
     done
     grep -E "Test Case .* (passed|failed)|error:|XCTAssert|KR-" "$out" | sed 's/^/    /' | tee -a "$log"
     [ "$(cat "$harness/test-status" 2>/dev/null)" = 0 ] || { say "check=the driving test passed ok=0"; test_status=2; }
+    # The run is read from the log and the test's status; the bundle is kept only when asked, and
+    # never while xcodebuild may still be writing it.
+    if [ -z "${KR_KEEP_XCRESULT:-}" ] && [ -e "$harness/test-status" ]; then
+        /bin/rm -rf "${result_bundle:?}"
+    fi
     cp "$harness/ios.log" "$artefacts/application.log" 2>/dev/null
     search_ios_log "$udid" || test_status=2
     local status=$test_status line
