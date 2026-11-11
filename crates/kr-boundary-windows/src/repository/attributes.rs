@@ -6,9 +6,11 @@
 //! place of the content. The danger is that silence, so a file that selects a driver this release
 //! cannot run is refused before Git starts.
 //!
-//! The scan reads text. It cuts a line into the pieces Git could take for an attribute, at any
-//! byte up to the space and at every quotation mark, and looks at each piece after the pattern, so
-//! a spelling Git would read differently can only make it refuse more, never less.
+//! The scan reads a line as Git does. The blanks are a space, a tab, a carriage return and a line
+//! feed and no other byte. The pattern is a quoted string that unquotes, or else the text up to the
+//! first blank; every token after it is an attribute, up to the next blank, and a value is all of
+//! the token after its first `=`, quotation marks included. A byte the scan does not model, a NUL
+//! for one, is an ordinary byte, so the scan can only read more of a line than Git does, never less.
 
 use crate::frame::invocation::RefusedKind;
 use crate::refusal::Refusal;
@@ -60,34 +62,104 @@ pub fn scan_attributes(bytes: &[u8]) -> Result<(), Refusal> {
         ));
     }
     for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
-        let line = line.trim_ascii_start();
+        let line = skip_blanks(line);
         if line.is_empty() || line.starts_with(b"#") {
             continue;
         }
         let at = index + 1;
-        if line.starts_with(MACRO_PREFIX) {
+        let (pattern, attributes) = read_pattern(line);
+        if pattern.starts_with(MACRO_PREFIX) {
             return Err(line_refusal(
                 RULE_MACRO,
                 "defines an attribute macro, which this release does not support",
                 at,
             ));
         }
-        // The first piece is the pattern, unless it opens with a quotation mark: Git may or may
-        // not read such a pattern as quoted, and an attribute may follow its closing quotation
-        // mark with no space between, so a quotation mark ends a piece and every piece of such a
-        // line is looked at.
-        let skip = usize::from(!line.starts_with(b"\""));
-        for piece in line
-            .split(|byte| *byte <= b' ' || *byte == 0x7f || *byte == b'"')
-            .filter(|piece| !piece.is_empty())
-            .skip(skip)
+        // Every token after the pattern is an attribute, up to the next blank, and a value is
+        // everything after the first `=` of its token.
+        for token in attributes
+            .split(|byte| is_blank(*byte))
+            .filter(|token| !token.is_empty())
         {
-            if let Some((rule, detail)) = selects_driver(piece) {
+            if let Some((rule, detail)) = selects_driver(token) {
                 return Err(line_refusal(rule, detail, at));
             }
         }
     }
     Ok(())
+}
+
+/// The bytes Git separates a pattern and its attributes by, and the only ones: a space, a tab, a
+/// carriage return and a line feed. A form feed, a control byte and DEL are ordinary bytes.
+const fn is_blank(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+fn skip_blanks(line: &[u8]) -> &[u8] {
+    let start = line
+        .iter()
+        .position(|byte| !is_blank(*byte))
+        .unwrap_or(line.len());
+    &line[start..]
+}
+
+/// Splits a line, with its leading blanks gone, into its pattern and the rest, as Git does. A
+/// pattern that opens with a quotation mark and unquotes ends at the closing one, and its
+/// attributes may follow with no blank between. Any other pattern, and one that does not unquote,
+/// is the text up to the first blank.
+fn read_pattern(line: &[u8]) -> (Vec<u8>, &[u8]) {
+    if line.starts_with(b"\"")
+        && let Some((pattern, end)) = unquote(line)
+    {
+        return (pattern, &line[end..]);
+    }
+    let end = line
+        .iter()
+        .position(|byte| is_blank(*byte))
+        .unwrap_or(line.len());
+    (line[..end].to_vec(), &line[end..])
+}
+
+/// Unquotes a string that opens with a quotation mark, as Git's C-style unquoting does: `\a`, `\b`,
+/// `\f`, `\n`, `\r`, `\t`, `\v`, `\\`, `\"` and three octal digits that start with 0 to 3. Returns
+/// the bytes and where the text after the closing quotation mark begins, or `None` for an escape
+/// Git does not know and for a string that is not closed.
+fn unquote(line: &[u8]) -> Option<(Vec<u8>, usize)> {
+    let mut bytes = Vec::new();
+    let mut at = 1;
+    loop {
+        match *line.get(at)? {
+            b'"' => return Some((bytes, at + 1)),
+            b'\\' => {
+                at += 1;
+                let unescaped = match *line.get(at)? {
+                    b'a' => 0x07,
+                    b'b' => 0x08,
+                    b'f' => 0x0c,
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'v' => 0x0b,
+                    escaped @ (b'\\' | b'"') => escaped,
+                    first @ b'0'..=b'3' => {
+                        let (second, third) = (*line.get(at + 1)?, *line.get(at + 2)?);
+                        if !matches!(second, b'0'..=b'7') || !matches!(third, b'0'..=b'7') {
+                            return None;
+                        }
+                        at += 2;
+                        ((first - b'0') << 6) | ((second - b'0') << 3) | (third - b'0')
+                    }
+                    _ => return None,
+                };
+                bytes.push(unescaped);
+                at += 1;
+            }
+            byte => {
+                bytes.push(byte);
+                at += 1;
+            }
+        }
+    }
 }
 
 /// The start of a line that defines a macro.
