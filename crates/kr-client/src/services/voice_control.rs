@@ -973,10 +973,49 @@ enum Input {
 
 /// How an attempt to attach failed.
 enum Attempt {
-    /// Try again later.
-    Retry,
+    /// Try again later, for the reason given.
+    Retry(Retry),
     /// Do not.
     End(ControlEnd),
+}
+
+/// Why an attempt to attach failed in a way that is tried again. Each is written down once, by its
+/// words alone, so that a recorded call can say which of them stood between the phone and the
+/// voice service; none carries anything of the exchange.
+#[derive(Clone, Copy)]
+enum Retry {
+    /// The account service that gives the voice token could not be reached.
+    TokenService,
+    /// The voice service's socket could not be opened.
+    Unreachable,
+    /// The service answered the opening of the socket with something other than an upgrade.
+    NotAnUpgrade,
+    /// The service refused the socket with 408.
+    RequestTimeout,
+    /// The service refused the socket with 429.
+    RateLimited,
+    /// The service refused the socket with a 5xx status.
+    ServerError,
+    /// The socket closed, or ended, before the service said `ready`.
+    ClosedBeforeReady,
+    /// The service did not say `ready` in time.
+    NoReadyInTime,
+}
+
+impl Retry {
+    /// The attempt's kind, in words that hold nothing but the kind.
+    fn words(self) -> &'static str {
+        match self {
+            Self::TokenService => "token service unavailable",
+            Self::Unreachable => "socket unreachable",
+            Self::NotAnUpgrade => "not an upgrade",
+            Self::RequestTimeout => "status 408",
+            Self::RateLimited => "status 429",
+            Self::ServerError => "status 5xx",
+            Self::ClosedBeforeReady => "closed before ready",
+            Self::NoReadyInTime => "no ready in time",
+        }
+    }
 }
 
 /// What the owner went away from.
@@ -1065,7 +1104,9 @@ impl Driver {
                 Err(_) => return Some(ControlEnd::Unreachable),
                 Ok(Ok(attached)) => attached,
                 Ok(Err(Attempt::End(end))) => return Some(end),
-                Ok(Err(Attempt::Retry)) => {
+                Ok(Err(Attempt::Retry(why))) => {
+                    // One line for each failed attempt, by its kind alone.
+                    tracing::warn!(kind = why.words(), "a voice control attempt failed");
                     if !detached_told {
                         detached_told = true;
                         if self.tell(ControlNews::Detached).await.is_err() {
@@ -1621,7 +1662,7 @@ async fn attach(
             // outcome is not: the refresh may have rotated the token, and asking again presents
             // the one it replaced. Not having an account, or a token for the scope, is not either.
             return Err(if error.code() == ErrorCode::UpstreamUnavailable {
-                Attempt::Retry
+                Attempt::Retry(Retry::TokenService)
             } else {
                 Attempt::End(ControlEnd::NoToken)
             });
@@ -1649,20 +1690,21 @@ async fn attach(
         Failure::Refused {
             status: 403 | 404, ..
         } => Attempt::End(ControlEnd::NoSuchCall),
-        Failure::Refused { status, .. } if status == 408 || status == 429 || status >= 500 => {
-            Attempt::Retry
-        }
+        Failure::Refused { status: 408, .. } => Attempt::Retry(Retry::RequestTimeout),
+        Failure::Refused { status: 429, .. } => Attempt::Retry(Retry::RateLimited),
+        Failure::Refused { status, .. } if status >= 500 => Attempt::Retry(Retry::ServerError),
         Failure::Refused { status, .. } => Attempt::End(ControlEnd::Refused(status)),
         Failure::Configuration(_) => Attempt::End(ControlEnd::Misconfigured),
-        Failure::Unreachable(_) | Failure::NotAnUpgrade(_) => Attempt::Retry,
+        Failure::Unreachable(_) => Attempt::Retry(Retry::Unreachable),
+        Failure::NotAnUpgrade(_) => Attempt::Retry(Retry::NotAnUpgrade),
     })?;
     let ready = tokio::time::timeout(timings.ready_within, async {
         loop {
             let Some(Ok(message)) = socket.next().await else {
-                return Err(Attempt::Retry);
+                return Err(Attempt::Retry(Retry::ClosedBeforeReady));
             };
             if message.is_close() {
-                return Err(Attempt::Retry);
+                return Err(Attempt::Retry(Retry::ClosedBeforeReady));
             }
             let event = message
                 .as_text()
@@ -1683,7 +1725,7 @@ async fn attach(
         }
     })
     .await
-    .map_err(|_| Attempt::Retry)??;
+    .map_err(|_| Attempt::Retry(Retry::NoReadyInTime))??;
     Ok((socket, ready))
 }
 

@@ -1015,6 +1015,114 @@ async fn no_account_token_ends_the_control_and_a_service_that_is_down_does_not()
     assert_eq!(tokens.scopes().len(), 3);
 }
 
+/// What was written through `tracing` while this was in place: every record's fields, and the
+/// kind each record of this crate names.
+#[derive(Clone, Default)]
+struct Written {
+    everything: Arc<Mutex<String>>,
+    kinds: Arc<Mutex<Vec<String>>>,
+}
+
+#[derive(Default)]
+struct Fields {
+    text: String,
+    kind: Option<String>,
+}
+
+impl tracing::field::Visit for Fields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write as _;
+        let _ = write!(self.text, " {}={value:?}", field.name());
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "kind" {
+            self.kind = Some(value.to_owned());
+        }
+        self.record_debug(field, &value);
+    }
+}
+
+impl Written {
+    fn keep(&self, target: &str, fields: &Fields) {
+        use std::fmt::Write as _;
+        let _ = write!(
+            self.everything.lock().expect("the record"),
+            " {target}:{}",
+            fields.text
+        );
+        if target.starts_with("kr_client") {
+            self.kinds.lock().expect("the record").push(
+                fields
+                    .kind
+                    .clone()
+                    .unwrap_or_else(|| "(no kind)".to_owned()),
+            );
+        }
+    }
+}
+
+impl tracing::Subscriber for Written {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        let mut fields = Fields::default();
+        span.record(&mut fields);
+        self.keep(span.metadata().target(), &fields);
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+        let mut fields = Fields::default();
+        values.record(&mut fields);
+        self.keep("recorded", &fields);
+    }
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        self.keep(event.metadata().target(), &fields);
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// A call that needs several attempts to attach leaves one line for each failed attempt, naming
+/// its kind (here a token service that cannot be reached, and a service that answers 503) and
+/// nothing else: nothing the exchange carried, not the token, the address or the call.
+#[tokio::test]
+async fn each_failed_attempt_leaves_one_line_naming_its_kind_and_nothing_else() {
+    let written = Written::default();
+    let guard = tracing::subscriber::set_default(written.clone());
+    let route = ControlRoute::start().await;
+    let tokens = Tokens::new();
+    tokens.fail_with(&[ErrorCode::UpstreamUnavailable]);
+    route.refuse_next(&[503]);
+    let (_control, mut news) = open(&route, &tokens);
+    assert!(matches!(next(&mut news).await, ControlNews::Detached));
+    attached(&mut news).await;
+    drop(guard);
+
+    assert_eq!(
+        *written.kinds.lock().expect("the record"),
+        ["token service unavailable", "status 5xx"],
+        "one line for each failed attempt, and none for the attempt that attached"
+    );
+    let everything = written.everything.lock().expect("the record").clone();
+    for secret in [TOKEN, route.origin(), PATH, CALL] {
+        assert!(
+            !everything.contains(secret),
+            "{secret} was written down: {everything}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_token_that_never_comes_ends_the_control_when_the_absent_window_passes() {
     let route = ControlRoute::start().await;
