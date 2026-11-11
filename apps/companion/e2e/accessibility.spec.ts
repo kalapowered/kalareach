@@ -127,3 +127,128 @@ test.describe('the attachment controls', () => {
     await expect(page.getByTestId('draft-attachments')).toContainText('notes.txt')
   })
 })
+
+/** What a finger meets, in CSS pixels: 44 points on iOS and 48 dp on Android. */
+const FINGER = { ios: 44, android: 48 } as const
+
+interface Box {
+  readonly left: number
+  readonly top: number
+  readonly width: number
+  readonly height: number
+}
+
+interface LinkReading {
+  readonly label: string
+  readonly width: number
+  readonly height: number
+  /** The points inside the link's own words that another link took the press at. */
+  readonly stolen: readonly string[]
+}
+
+interface LinksReading {
+  /** What moved when the links' reach was taken away: the same page without it is the control. */
+  readonly moved: readonly string[]
+  readonly links: readonly LinkReading[]
+  /** The ancestors of a link that scroll or clip its content sideways, and have more of it than they show. */
+  readonly overflowing: readonly string[]
+}
+
+// KR-REQ-13.19: a link inside a message is a button that is one line tall, and the box that a
+// finger, TalkBack and VoiceOver find for it is the size the platform asks for all the same. The box
+// is read from the page, which is what the platforms' trees are built from. Taking the reach away
+// shows the words stay where they were. Links on the next line and beside it, one of them a single
+// character, show that a press on a link's own words is that link's, and a link as wide as the line
+// shows the screen does not scroll sideways for the reach.
+test.describe('a link inside a message', () => {
+  for (const surface of ['ios', 'android'] as const) {
+    test(`is a full touch target on ${surface} and leaves the text where it was`, async ({ page }) => {
+      await openSession(page, surface)
+      await page.getByRole('button', { name: 'the reconnect notes' }).scrollIntoViewIfNeeded()
+      const reading = await page.evaluate((): LinksReading | null => {
+        const first = document.querySelector<HTMLElement>('.m-node .md-link')
+        const paragraph = first?.parentElement
+        const node = first?.closest<HTMLElement>('.m-node')
+        if (!first || !paragraph || !node) return null
+
+        const wordsOf = (link: HTMLElement): Range => {
+          const range = document.createRange()
+          range.selectNodeContents(link.querySelector('.md-link-label') ?? link)
+          return range
+        }
+        const boxOf = (box: DOMRect): Box => ({ left: box.left, top: box.top, width: box.width, height: box.height })
+        const places = (): Record<string, Box> => ({
+          'the line': boxOf(paragraph.getBoundingClientRect()),
+          'the message': boxOf(node.getBoundingClientRect()),
+          'the link’s words': boxOf(wordsOf(first).getBoundingClientRect())
+        })
+
+        // The control: the same page with the link's reach taken away.
+        const before = places()
+        const bare = document.createElement('style')
+        bare.textContent = [
+          '.m-pane { padding-inline: 0 !important; margin-inline: 0 !important }',
+          '.m-node .md-link { padding: 0 !important; margin: 0 !important; min-inline-size: 0 !important }'
+        ].join(' ')
+        document.head.append(bare)
+        const without = places()
+        bare.remove()
+        const moved = Object.keys(before).filter((name) =>
+          (['left', 'top', 'width', 'height'] as const).some(
+            (side) => Math.abs((before[name]?.[side] ?? 0) - (without[name]?.[side] ?? 0)) > 0.5
+          )
+        )
+
+        // More links of the kinds a message can carry: on the next line, beside the first with one
+        // space between, a single character, and one as long as the line.
+        const another = (text: string): HTMLElement => {
+          const link = first.cloneNode(true) as HTMLElement
+          const label = link.querySelector('.md-link-label') ?? link
+          label.textContent = text
+          return link
+        }
+        const second = another('a second link')
+        const third = another('1')
+        const wide = another('a link whose words run the whole width of the line and on to the next ')
+        const longer = document.createElement('p')
+        longer.append(wide)
+        paragraph.append(document.createElement('br'), second, ' ', third)
+        paragraph.after(longer)
+
+        const links = [first, second, third, wide].map((link): LinkReading => {
+          const box = link.getBoundingClientRect()
+          const words = wordsOf(link).getClientRects()
+          const stolen: string[] = []
+          for (const rect of [words[0], words[words.length - 1]]) {
+            if (!rect) continue
+            const points: [string, number, number][] = [
+              ['the top', rect.left + rect.width / 2, rect.top + 2],
+              ['the bottom', rect.left + rect.width / 2, rect.bottom - 2],
+              ['the start', rect.left + 1, rect.top + rect.height / 2],
+              ['the end', rect.right - 1, rect.top + rect.height / 2]
+            ]
+            for (const [where, x, y] of points) {
+              if (document.elementFromPoint(x, y)?.closest('.md-link') !== link) stolen.push(where)
+            }
+          }
+          return { label: link.textContent ?? '', width: box.width, height: box.height, stolen }
+        })
+
+        const overflowing: string[] = []
+        for (let each: HTMLElement | null = wide; each; each = each.parentElement) {
+          const holds = each === document.documentElement || getComputedStyle(each).overflowX !== 'visible'
+          if (holds && each.scrollWidth > each.clientWidth + 1) overflowing.push(each.className || each.tagName)
+        }
+        return { moved, links, overflowing }
+      })
+      if (!reading) throw new Error('the conversation shows no link')
+      expect(reading.moved, 'what moved when the reach was taken away').toEqual([])
+      for (const link of reading.links) {
+        expect(link.width, `the width of "${link.label}"`).toBeGreaterThanOrEqual(FINGER[surface] - 0.5)
+        expect(link.height, `the height of "${link.label}"`).toBeGreaterThanOrEqual(FINGER[surface] - 0.5)
+        expect(link.stolen, `where a press on "${link.label}" went to another link`).toEqual([])
+      }
+      expect(reading.overflowing, 'the ancestors that scroll sideways').toEqual([])
+    })
+  }
+})
