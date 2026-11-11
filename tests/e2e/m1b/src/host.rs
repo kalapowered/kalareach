@@ -32,7 +32,7 @@ use serde_json::Value;
 use crate::LIVENESS;
 use crate::run::{
     HARNESS_PROGRAM, Run, binary_place, ended_within, output_within, processes_under,
-    read_tail_below, running, signal, socket_below,
+    read_tail_below, running, signal, socket_below, worker_session,
 };
 
 /// The daemon's log, in the run's directory.
@@ -586,42 +586,22 @@ impl<'r> Host<'r> {
     }
 
     /// The identity of the worker process that serves `session_id`: the process running this run's
-    /// copy of `kr-worker` for that session, recorded with the run once its start holds the number
-    /// the process table gave.
+    /// copy of `kr-worker` for that session ([`Run::worker_of`]).
     ///
     /// # Panics
     ///
     /// Panics when no such process is in the process table within [`LIVENESS`].
     #[must_use]
     pub fn worker_of(&self, session_id: &str) -> ProcessStartIdentity {
-        let started = Instant::now();
-        let session = format!("--session {session_id}");
-        loop {
-            if let Some(identity) = crate::run::processes_under(self.run.root())
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|(_, command)| command.contains("kr-worker") && command.contains(&session))
-                .find_map(|(pid, _)| {
-                    self.run
-                        .record_named(pid, "the session's worker", &["kr-worker", &session])
-                })
-            {
-                return identity;
-            }
-            assert!(
-                started.elapsed() < LIVENESS,
-                "no worker for session {session_id} is in the process table"
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        self.run.worker_of(session_id)
     }
 
     /// Records every worker this host started, with everything that runs beneath it, by start
     /// identity.
     ///
-    /// A worker is found in the process table by its command line, which names this run's
-    /// directory and the session it serves, and is recorded like any other process this run
-    /// learns of ([`Run::record_named`]). That needs nothing of the host, so a leg that stops part
+    /// A worker is found in the process table by its command line, whose program is exactly the
+    /// worker this run placed and which names the session it serves, and is recorded as the run's
+    /// own only then ([`Run::record_worker`]). That needs nothing of the host, so a leg that stops part
     /// way still reaches the sessions it made, their shells and what runs in them, whether or not
     /// the daemon still answers, and no file of the host's is opened. A search that does not finish
     /// is kept with the run, whose closing check then fails rather than report a search that did
@@ -650,12 +630,13 @@ impl<'r> Host<'r> {
         // service manager is asked about at the close.
         self.run
             .propose_jobs_from(table.iter().map(|(_, command)| command.as_str()));
+        let program = self.run.binary("kr-worker");
         for (pid, command) in table {
-            let Some(session) = worker_session(&command) else {
+            let Some(session) = worker_session(&command, &program) else {
                 continue;
             };
             let what = format!("the worker of session {session}");
-            match self.run.record_named(pid, &what, &["--session"]) {
+            match self.run.record_worker(pid, &what, session) {
                 Some(identity) => self
                     .run
                     .record_descendants(&identity, &format!("under {what}"))?,
@@ -980,16 +961,6 @@ impl Drop for Host<'_> {
             let _ = self.stop_daemon();
         }
     }
-}
-
-/// The session a command line is the worker of: the program is `kr-worker` and `--session` names it.
-fn worker_session(command: &str) -> Option<&str> {
-    let mut words = command.split_whitespace();
-    let program = words.next()?;
-    if Path::new(program).file_name()? != "kr-worker" {
-        return None;
-    }
-    words.skip_while(|word| *word != "--session").nth(1)
 }
 
 /// How many times a host with a stable address is given a port before the daemon's refusal of it is
@@ -1370,6 +1341,117 @@ mod shutdown_tests {
         drop(run);
         std::fs::remove_dir_all(&root).expect("clean up");
         std::fs::remove_dir_all(&theirs).expect("clean up");
+    }
+
+    /// A command line names a run's directory only by its path components, and a worker is a run's
+    /// only by its exact program: another host's directory whose name begins with this one's is not
+    /// this one, and nor is a worker whose program is another file.
+    #[test]
+    fn a_command_line_names_the_run_by_path_components_and_a_worker_by_its_exact_program() {
+        use crate::run::names_the_root;
+        let root = Path::new("/tmp/kr-a");
+        assert!(names_the_root("/tmp/kr-a/b/kr-worker --session 1", root));
+        assert!(names_the_root(
+            "kr-controller --state-dir=/tmp/kr-a/s",
+            root
+        ));
+        assert!(names_the_root("/tmp/kr-a --x", root));
+        assert!(!names_the_root(
+            "/tmp/kr-a-other/b/kr-worker --session 1",
+            root
+        ));
+        assert!(!names_the_root(
+            "kr-controller --state-dir=/tmp/kr-ab/s",
+            root
+        ));
+        assert!(!names_the_root("/tmp/kr-a-other", root));
+        let program = Path::new("/tmp/kr-a/b/kr-worker");
+        assert_eq!(
+            worker_session(
+                "/tmp/kr-a/b/kr-worker -c x --session s1 --reservation r",
+                program
+            ),
+            Some("s1")
+        );
+        assert_eq!(
+            worker_session("/tmp/kr-a-other/b/kr-worker --session s1", program),
+            None
+        );
+        assert_eq!(
+            worker_session("/tmp/kr-a/b/kr-worker-2 --session s1", program),
+            None
+        );
+        assert_eq!(worker_session("/tmp/kr-a/b/kr-worker", program), None);
+    }
+
+    /// A worker of a second host of the case's own, whose run directory's name begins with this
+    /// run's directory's name, is not found in this run's process table, is not recorded, and is
+    /// left running when this run's host stops and again when it is dropped; this run's own worker
+    /// is found and recorded.
+    #[test]
+    fn a_worker_of_a_host_whose_directory_name_begins_with_this_ones_is_kept_when_this_host_ends() {
+        use std::os::unix::process::CommandExt as _;
+        let root = scratch("prefix");
+        let other = PathBuf::from(format!("{}-other", root.display()));
+        std::fs::create_dir_all(&other).expect("the second host's directory");
+        let run = Run::over(&root);
+        let standing_for = |directory: &Path, session: &str| {
+            Command::new("/bin/sh")
+                .arg0(directory.join("b/kr-worker"))
+                .args(["-c", "/bin/sleep 30; true", "--session", session])
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("a process standing for a worker")
+        };
+        let (own_session, foreign_session) = (
+            kr_ipc::new_uuid().to_string(),
+            kr_ipc::new_uuid().to_string(),
+        );
+        let mut foreign = standing_for(&other, &foreign_session);
+        let mut own = standing_for(&root, &own_session);
+        let host = host_over(&run);
+        let started = Instant::now();
+        loop {
+            host.record_workers();
+            if run.owned().len() >= 2 || started.elapsed() > Duration::from_secs(10) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let names: Vec<String> = run.owned().into_iter().map(|owned| owned.what).collect();
+        assert!(
+            names.contains(&format!("the worker of session {own_session}")),
+            "this run's own worker is recorded: {names:?}"
+        );
+        assert!(
+            names.iter().all(|what| !what.contains(&foreign_session)),
+            "the other host's worker is not recorded: {names:?}"
+        );
+        assert!(
+            processes_under(&root)
+                .expect("the process table")
+                .iter()
+                .all(|(pid, _)| *pid != foreign.id()),
+            "the other host's worker does not run out of this run's directory"
+        );
+        host.agent_starts();
+        let stopped = host.stop();
+        assert!(stopped.is_ok(), "the host stopped: {stopped:?}");
+        assert!(
+            foreign.try_wait().expect("the other worker").is_none(),
+            "the other host's worker still runs after this run's host stopped"
+        );
+        drop(host);
+        assert!(
+            foreign.try_wait().expect("the other worker").is_none(),
+            "the other host's worker still runs after this run's host was dropped"
+        );
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+        let _ = own.wait();
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+        std::fs::remove_dir_all(&other).expect("clean up");
     }
 
     /// What an agent under test can leave in the run's state before the host is stopped: the

@@ -1110,7 +1110,7 @@ pub fn open_session(
         .clone()
         .expect("the session names its root shell");
     run.record(root_shell.clone(), &format!("the root shell of {what}"));
-    let worker = worker_of(run, &session_id.to_string());
+    let worker = run.worker_of(&session_id.to_string());
     Session {
         window,
         session_id,
@@ -1141,30 +1141,6 @@ pub fn events_snapshot(
             },
         ))
         .unwrap_or_else(|error| panic!("events.snapshot: {error}"))
-}
-
-/// The identity of the worker that serves `session_id`: the process running this run's copy of
-/// `kr-worker` for that session, recorded while its start holds the number the table gave.
-fn worker_of(run: &Run, session_id: &str) -> ProcessStartIdentity {
-    let started = Instant::now();
-    let session = format!("--session {session_id}");
-    loop {
-        if let Some(identity) = kr_e2e_m1b::run::processes_under(run.root())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(_, command)| command.contains("kr-worker") && command.contains(&session))
-            .find_map(|(pid, _)| {
-                run.record_named(pid, "the session's worker", &["kr-worker", &session])
-            })
-        {
-            return identity;
-        }
-        assert!(
-            started.elapsed() < LIVENESS,
-            "no worker for session {session_id} is in the process table"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
 }
 
 /// One process an agent runs as.
