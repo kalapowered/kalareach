@@ -1243,7 +1243,7 @@ async fn a_fifth_connection_of_a_device_withdraws_its_oldest() {
         )
         .await;
     assert!(
-        matches!(&repeated, Ok(_))
+        repeated.is_ok()
             || matches!(&repeated, Err(error) if error.code == ErrorCode::OutcomeUnknown),
         "the same action on the fifth connection settles: {repeated:?}"
     );
