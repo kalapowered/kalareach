@@ -33,12 +33,13 @@ const BYTE_LOCALE: &str = "C";
 /// A static list keyed by thread and not a `thread_local!`: the conformance report reads this
 /// module for the functions a case calls, and a macro it does not know in a module makes it
 /// distrust every call it cannot prove, which would drop the keyed tests that reach the cases
-/// through here. A thread id has no order and a hash map cannot be built in a static, so a list of
-/// the few threads that run a case at once is what this holds.
+/// through here. A thread id has no order to key a tree by, and the few threads that run a case at
+/// once are found as well in a list as in a map.
 static IN_FORCE: Mutex<Vec<(ThreadId, String)>> = Mutex::new(Vec::new());
 
-/// The runs in force. A case that panics holds no lock, and a poisoned list is as good as any
-/// other.
+/// The runs in force. The lock is held for one lookup, insertion or removal at a time and the list
+/// is never left half changed, so a list poisoned by a panic that held the lock (the refusal of a
+/// nested run) is read as it is.
 fn runs() -> MutexGuard<'static, Vec<(ThreadId, String)>> {
     IN_FORCE.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -206,7 +207,8 @@ fn say(line: &str) {
 }
 
 /// Runs `body` once under each locale this platform has, and says in the log which locale each run
-/// used and which one the platform lacks. Every shell the body starts runs in that run's locale.
+/// used and which one the platform lacks. Every shell the body starts on its own thread runs in
+/// that run's locale.
 ///
 /// A platform without a UTF-8 locale gets no run under it, and the log says so by the platform's
 /// name, unless `KR_REQUIRE_UTF8_LOCALE=1` is set, which makes it a failure; a case that stays
