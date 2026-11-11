@@ -1948,8 +1948,18 @@ async fn a_registration_the_runtime_holds_is_named_in_the_workers_account_with_i
     )
     .await;
 
+    // The runtime ends, and its replacement is the daemon's doing. The case goes on until the
+    // replacement has both bindings registered, so that the tree does not end while it starts.
     kill(&host);
     ended(&host).await;
+    until("a replacement runtime to be published", || async {
+        world
+            .published_host()
+            .filter(|published| *published != host)
+    })
+    .await;
+    world.registering(2).await;
+    world.components_are(2, ComponentState::Registered).await;
 }
 
 /// KR-REQ-05.07: a plugin runtime that keeps ending is not started without end, and the workers
