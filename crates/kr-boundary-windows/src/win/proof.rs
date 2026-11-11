@@ -326,17 +326,17 @@ fn same_path(left: &str, right: &Path) -> bool {
     left.eq_ignore_ascii_case(&right.display().to_string())
 }
 
-/// A scratch directory that only administrators can write and every account can read and enter,
-/// removed when dropped.
 /// Makes the unlisted program as a new file with its own descriptor (owned by the administrators,
-/// run and read by every account, changed by none) and copies a system program into it.
-fn make_unlisted(source: &Path, target: &Path) -> std::io::Result<()> {
+/// read and run through the invocation's group that the proof's token carries, changed by none)
+/// and copies a system program into it. The file holds the bytes of that system program and no
+/// secret.
+fn make_unlisted(source: &Path, target: &Path, group: &Sid) -> std::io::Result<()> {
     let mut from = std::fs::File::open(source)?;
     let mut to = fresh::file_with(
         target,
-        SdKind::AdminFile,
+        SdKind::ProofProgram,
         &Principals {
-            users_may_read: true,
+            group: Some(group.clone()),
             ..Principals::default()
         },
         true,
@@ -345,6 +345,8 @@ fn make_unlisted(source: &Path, target: &Path) -> std::io::Result<()> {
     to.sync_all()
 }
 
+/// A scratch directory that only administrators can write and every account can read and enter,
+/// removed when dropped.
 struct Scratch(PathBuf);
 
 impl Scratch {
@@ -470,13 +472,19 @@ pub fn prove(
         Ok(system) => PathBuf::from(system),
         Err(reason) => return fail(reason),
     };
+    // The group is the token's own, enabled in it, and the only identifier of the token that the
+    // unlisted program's descriptor can name: the account's identifier is deny-only in the token.
+    let group = new_invocation_group();
     let unlisted = scratch.0.join("unlisted.exe");
-    if let Err(error) = make_unlisted(&system.join("System32").join("hostname.exe"), &unlisted) {
+    if let Err(error) = make_unlisted(
+        &system.join("System32").join("hostname.exe"),
+        &unlisted,
+        &group,
+    ) {
         return fail(format!(
             "copying a system program into the scratch directory: {error}"
         ));
     }
-    let group = new_invocation_group();
     let token = match boundary_token(&account, &group) {
         Ok(token) => token,
         Err(error) => return fail(format!("making the token for {account}: {error}")),
