@@ -228,7 +228,10 @@ PY
 
 # Starts the host, which reaches the phone as `peer`, and waits until it is up.
 start_harness() { # <peer> [<peer of the other service>]
-    KR_HARNESS_DIR="$harness" KR_HARNESS_PEER="$1" KR_HARNESS_SERVICE_PEER="${2:-$1}" KR_HARNESS_SECONDS=2400 \
+    # The host's case is one long function: in a debug build its state is polled on the test thread, and
+    # that thread's default stack (2 MiB) is less than it takes, so the thread is given a larger one.
+    RUST_MIN_STACK=67108864 \
+        KR_HARNESS_DIR="$harness" KR_HARNESS_PEER="$1" KR_HARNESS_SERVICE_PEER="${2:-$1}" KR_HARNESS_SECONDS=2400 \
         "$harness_exe" --ignored --exact a_phone_scans_pairs_and_confirms_against_a_real_host --nocapture \
         >"$artefacts/harness.log" 2>&1 &
     harness_pid=$!
