@@ -17,8 +17,10 @@
 # `aarch64-apple-ios-sim` target (a build phase of the scheme compiles the notification preview
 # library for it), and a network to fetch the Swift packages the project pins. Those are fetched at
 # the versions the project's `Package.resolved` records and never resolved again, so the run leaves
-# the file as it found it. KR_IOS_PACKAGES names an absolute folder to keep them in between runs,
-# in place of a fetch into each run's own directory.
+# the file as it found it. They stay in this run's own directory on the internal disk: the shared
+# package folder that KR_IOS_PACKAGES names for the device scripts is not used here, because a run
+# of these tests with the packages in a folder on an external volume made the simulator's test
+# process query access to that volume, and the same run without it did not.
 #
 # The tests are built with the newest Xcode that is installed under a versioned name
 # (`/Applications/Xcode_<version>.app`, as a hosted runner has them) or is the one selected, by its
@@ -103,15 +105,11 @@ fi
 
 cd "$project_directory"
 derived=(-derivedDataPath "$work/DerivedData")
-# Where KR_IOS_PACKAGES names a folder, every call here finds the packages in it, and none fetches
-# a copy of its own.
-kr_shared_packages
-derived+=(${kr_package_options[@]+"${kr_package_options[@]}"})
 
 # The packages at the versions the project records, fetched into this run's own directory. The
 # destinations are asked for after this, with the same directory and no further resolving, so that
 # nothing resolves the packages to other versions and rewrites the file that pins them.
-kr_with_packages_lock xcodebuild -resolvePackageDependencies -onlyUsePackageVersionsFromResolvedFile \
+xcodebuild -resolvePackageDependencies -onlyUsePackageVersionsFromResolvedFile \
     -project "$project" -scheme "$scheme" "${derived[@]}"
 
 destinations="$(xcodebuild -project "$project" -scheme "$scheme" "${derived[@]}" \
