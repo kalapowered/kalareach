@@ -20,6 +20,7 @@
 //! | [`repository`] | What the broker reads of a repository before it starts Git, from bytes alone: its `HEAD`, its attributes and its configuration listing |
 //! | [`refusal`] | The refusal those readers give: a kind, the rule's name and a short text |
 //! | [`names`] | The grammar of the branch names and object identifiers the broker admits |
+//! | [`operation`] | The eight commands a request may name: their argument tables, the settings every command runs with and the one rule for line endings |
 //! | [`state`] | What the doctor says in each state of the installation |
 //!
 //! The calls that touch the machine live in `win`, which builds on Windows only. Everything above
@@ -39,6 +40,7 @@ pub mod journal;
 pub mod manifest;
 pub mod names;
 pub mod notice;
+pub mod operation;
 pub mod policy;
 pub mod refusal;
 pub mod repository;
