@@ -127,6 +127,46 @@ fn inject(_step: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Records a call that the installation makes on the Application Identity service, in the file
+/// that `KR_BOUNDARY_CALL_LOG` names, for the test build only, so that a case can show what was
+/// asked of the service manager. A build that ships records nothing.
+#[cfg(feature = "testing")]
+fn note_call(call: &str) {
+    if let Some(path) = std::env::var_os("KR_BOUNDARY_CALL_LOG")
+        && let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path)
+    {
+        let _ = writeln!(file, "{call}");
+    }
+}
+
+#[cfg(not(feature = "testing"))]
+fn note_call(_call: &str) {}
+
+/// The calls the installation makes on the Application Identity service, each one recorded in the
+/// test build. A machine-wide control that the machine's owner may have a policy in force through:
+/// the installation starts it where it is stopped and stops it, in the removal, only where the
+/// installation started it.
+struct Identity<'a>(&'a service::Service);
+
+impl Identity<'_> {
+    fn set_automatic(&self) -> Result<(), Error> {
+        note_call("appid set-automatic");
+        Ok(self.0.set_automatic()?)
+    }
+
+    fn start(&self) -> Result<(), Error> {
+        note_call("appid start");
+        self.0.start()?;
+        Ok(self.0.wait_for(false, Duration::from_secs(60))?)
+    }
+
+    fn stop(&self) -> Result<(), Error> {
+        note_call("appid stop");
+        self.0.stop()?;
+        Ok(self.0.wait_for(true, Duration::from_secs(60))?)
+    }
+}
+
 fn io_error(what: impl Into<String>) -> impl FnOnce(io::Error) -> Error {
     let what = what.into();
     move |source| Error::Io { what, source }
@@ -272,18 +312,21 @@ pub fn check_data_parent(paths: &Paths) -> Result<(), Error> {
     };
     const REPARSE_POINT: u32 = 0x400;
     if meta.file_attributes() & REPARSE_POINT != 0 || !meta.is_dir() {
-        return Err(Error::Refused(format!(
-            "{} is a link or not a folder, and the installation does not trust it",
-            parent.display()
-        )));
+        return Err(parent_refusal(parent, "it is a link or not a folder"));
     }
     if let Some(finding) = acl::changeable_by_others(parent, false)? {
-        return Err(Error::Refused(format!(
-            "{} was not made by this installation and {finding}; remove or correct that folder, then install again",
-            parent.display()
-        )));
+        return Err(parent_refusal(parent, &finding));
     }
     Ok(())
+}
+
+/// The refusal of a folder above the data directory: what the folder is, why it is refused and what
+/// to do.
+fn parent_refusal(parent: &Path, why: &str) -> Error {
+    Error::Refused(format!(
+        "{} is the folder that holds the boundary's data (its manifest, its journal and the roots of its operations). It is refused because {why}. Whoever owns that folder, or can write or delete in it, could put data of their own in its place while the broker runs as the system. Remove the folder, or give it to the system with a protected list that only the system and the administrators can change, then install again.",
+        parent.display()
+    ))
 }
 
 /// Makes the folder above the data directory, in one call that carries its protected list, so that
@@ -922,7 +965,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         Some(&format!("start={AUTOMATIC}")),
     )?;
     if appid_start != AUTOMATIC {
-        appid.set_automatic()?;
+        Identity(&appid).set_automatic()?;
     }
     let git = run
         .manifest
@@ -930,30 +973,35 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         .clone()
         .ok_or_else(|| Error::Failed("no Git installation is recorded".to_owned()))?;
     let log_env = proof::proof_environment(&git, &paths.staging).map_err(Error::Failed)?;
-    let before_start = applocker::newest_record(&paths.staging, &log_env, within(QUERY_BOUND))?;
-    // The first event that is waited for is the one of a start that this installation made: a
-    // service that is already running is stopped and started, because an event of an earlier start
-    // of the service, in this boot or before, says nothing about what the current one has applied.
-    if appid.status()?.running() {
-        appid.stop()?;
-        appid.wait_for(true, Duration::from_secs(60))?;
+    // A service that is already running is never stopped. An event of an earlier life of the service
+    // says nothing about what it has applied now, so none is trusted: the policy is written and the
+    // next event after that write is waited for, for as long as a first event may take. A service
+    // that this installation starts is waited for first, because a policy written before it has
+    // applied one is not enforced.
+    let was_running = appid.status()?.running();
+    if was_running {
+        inject("appid")?;
+        say(
+            "the Application Identity service is already running, so the policy is written and the platform's report of it is awaited",
+        );
+    } else {
+        let before_start = applocker::newest_record(&paths.staging, &log_env, within(QUERY_BOUND))?;
+        Identity(&appid).start()?;
+        let first_deadline = within(FIRST_APPLIED_BOUND);
+        inject("appid")?;
+        say(messages::APPLICATION_CONTROL_STARTING);
+        let waited = wait_for_applied(
+            before_start,
+            first_deadline,
+            "the Application Identity service's first \"policy applied\" event",
+            &paths.staging,
+            &log_env,
+        )?;
+        say(&format!(
+            "application control has started, {:.0} s after the service",
+            waited.as_secs_f32()
+        ));
     }
-    appid.start()?;
-    appid.wait_for(false, Duration::from_secs(60))?;
-    let first_deadline = within(FIRST_APPLIED_BOUND);
-    inject("appid")?;
-    say(messages::APPLICATION_CONTROL_STARTING);
-    let waited = wait_for_applied(
-        before_start,
-        first_deadline,
-        "the Application Identity service's first \"policy applied\" event",
-        &paths.staging,
-        &log_env,
-    )?;
-    say(&format!(
-        "application control has started, {:.0} s after the service",
-        waited.as_secs_f32()
-    ));
 
     // The policy, and the platform's next event that says it applied it.
     let wanted = Policy::installed(&sids[0].to_text(), &sids[1].to_text());
@@ -970,7 +1018,11 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     inject("policy")?;
     wait_for_applied(
         before_write,
-        within(NEXT_APPLIED_BOUND),
+        within(if was_running {
+            FIRST_APPLIED_BOUND
+        } else {
+            NEXT_APPLIED_BOUND
+        }),
         "the \"policy applied\" event after the policy was written",
         &paths.staging,
         &log_env,
@@ -1030,7 +1082,8 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
 
 /// How long the installation waits for the platform's first "policy applied" event after it starts
 /// the Application Identity service: the service applies its first policy about two minutes after
-/// it starts.
+/// it starts. The same bound holds for the event after the policy's write when the service was
+/// already running, since it may be in its first minutes.
 const FIRST_APPLIED_BOUND: Duration = Duration::from_secs(300);
 /// How long it waits for the next such event after it has written the policy: the platform applied
 /// the policy within a second of the write in every run of the guest.
@@ -1280,8 +1333,7 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
                     && let Some(appid) = manager.open(APPID)?
                     && appid.status()?.running()
                 {
-                    appid.stop()?;
-                    appid.wait_for(true, Duration::from_secs(60))?;
+                    Identity(&appid).stop()?;
                     say("the Application Identity service is stopped as it was");
                 }
                 Ok(())
