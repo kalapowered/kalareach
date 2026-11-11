@@ -65,7 +65,8 @@ pub fn path(text: &str) -> Result<(), &'static str> {
 const DEVICES: &[&str] = &["con", "prn", "aux", "nul"];
 
 fn component(text: &str) -> bool {
-    if text.is_empty() || text == "." || text == ".." {
+    // `.` and `..` end in a dot and are refused with the names that do.
+    if text.is_empty() {
         return false;
     }
     if text
@@ -128,8 +129,8 @@ pub fn message(text: &str, max_bytes: usize, one_line: bool) -> Result<(), &'sta
 /// A decimal count: digits only, no sign, no leading zero, within the bounds.
 #[must_use]
 pub fn count(text: &str, min: u32, max: u32) -> Option<u32> {
-    let canonical = !text.is_empty()
-        && text.len() <= 10
+    // An empty text has no digits to parse and is refused by the parse below.
+    let canonical = text.len() <= 10
         && text.bytes().all(|b| b.is_ascii_digit())
         && (text == "0" || !text.starts_with('0'));
     if !canonical {
