@@ -540,8 +540,14 @@ async fn a_draft_create_a_service_copied_after_the_door_looked_is_told_as_a_copy
         Some(session),
     );
     let (copied, fresh) = two_copies_stopped_in_the_service(controller, &sighted, &mutation).await;
-    assert!(sighted.write_answer(copied).await, "the connection stands");
-    assert!(sighted.write_answer(fresh).await, "the connection stands");
+    assert!(
+        sighted.write_answer(sighted.output(), copied).await,
+        "the connection stands"
+    );
+    assert!(
+        sighted.write_answer(sighted.output(), fresh).await,
+        "the connection stands"
+    );
     let frames = recording.frames();
     assert!(
         frames.iter().rev().take(2).all(|frame| matches!(

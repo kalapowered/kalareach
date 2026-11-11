@@ -152,6 +152,8 @@ impl RemoteConnection {
             connection_id: session.connection_id,
             expired: AtomicBool::new(false),
             recorded: AtomicBool::new(false),
+            latch: Arc::new(AtomicBool::new(false)),
+            attached: std::sync::Once::new(),
         });
         Self {
             controller,
@@ -234,6 +236,8 @@ impl RemoteConnection {
             connection_id,
             expired: AtomicBool::new(false),
             recorded: AtomicBool::new(false),
+            latch: Arc::new(AtomicBool::new(false)),
+            attached: std::sync::Once::new(),
         });
         let (notifications, _) = tokio::sync::mpsc::channel(1);
         Self {
@@ -442,6 +446,9 @@ mod a_copy_a_service_withheld;
 
 #[cfg(test)]
 mod a_copy_from_a_services_record;
+
+#[cfg(test)]
+mod a_data_stream_output;
 
 #[cfg(test)]
 mod a_draft_a_device_writes;

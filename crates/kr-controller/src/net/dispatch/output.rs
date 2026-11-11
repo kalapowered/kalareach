@@ -39,7 +39,8 @@ pub struct RemoteOutput {
     turn: tokio::sync::Mutex<()>,
     /// Set once nothing more may go on this connection: by [`Self::withdraw`], and by the
     /// connection's registration going, which sets it in the critical section that removes the
-    /// registration ([`Controller::latch_registration`]).
+    /// registration ([`Controller::latch_registration`]). The control stream's output and the
+    /// output of each data stream share it, because the authority is the connection's.
     withdrawn: Arc<AtomicBool>,
     /// How many writes have begun to wait for the turn. Read by this host's own tests, to know a
     /// write is queued behind another.
@@ -361,6 +362,11 @@ pub(super) struct Authorisation {
     pub(super) expired: AtomicBool,
     /// Set once the expiry above has been written down, so it is written once.
     pub(super) recorded: AtomicBool,
+    /// Set once nothing more may go on this connection, on any of its streams: the latch every
+    /// write boundary of the connection reads. It is tied to the registration once, by the first
+    /// boundary built on this authority ([`Controller::latch_registration`]).
+    pub(super) latch: Arc<AtomicBool>,
+    pub(super) attached: std::sync::Once,
 }
 
 impl Authorisation {
@@ -501,10 +507,12 @@ impl RemoteOutput {
         // Tied to the registration before anything can be sent: a withdrawal that removes the
         // registration sets the latch with it, so the fence below needs no read of the connection
         // table, which a poll may not take.
-        let withdrawn = Arc::new(AtomicBool::new(false));
-        authority
-            .controller
-            .latch_registration(authority.connection_id, &withdrawn);
+        let withdrawn = Arc::clone(&authority.latch);
+        authority.attached.call_once(|| {
+            authority
+                .controller
+                .latch_registration(authority.connection_id, &withdrawn);
+        });
         Self {
             turn: tokio::sync::Mutex::new(()),
             withdrawn,

@@ -920,7 +920,8 @@ impl Controller {
     /// Ties the latch of a connection's write boundary to its registration, so that the
     /// registration going sets it ([`AdmittedConnection`]).
     ///
-    /// Done once, when the boundary is built and before anything can be sent on it. A registration
+    /// Done once for a connection, when its first boundary is built and before anything can be sent
+    /// on it: the connection's other boundaries share that latch. A registration
     /// already gone sets the latch at once: the connection was withdrawn before its boundary
     /// existed. The table is held across the attachment, and a registration is removed under the
     /// same lock, so the latch is set either here or by the removal, never by neither.
