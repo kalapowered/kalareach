@@ -388,8 +388,9 @@ cd apps/companion/src-tauri/gen/android && ./gradlew :app:compileUniversalDebugK
 # `base/lib/<abi>/*.so` in an AAB) for the Java classes they find by name, in their type
 # descriptors and in their NUL-ended strings, and fails when the dex does not define one of them
 # under that name. It fails as well when a native method of a class that a library exports natives
-# for has no `Java_` symbol, spelled exactly as the runtime looks it up, in that library's copy in
-# every ABI that carries it, and when one ABI carries a library that another lacks. A class whose
+# for has no `Java_` symbol, spelled exactly as the runtime looks it up, among the libraries of every
+# ABI that carries one of those libraries (a matching symbol in any library of that ABI is accepted),
+# and when one ABI carries a library that another lacks. A class whose
 # natives a library exports in part and registers in part therefore fails, and nothing overrides
 # that. What the check cannot read in full is a failure and never "nothing found": an archive that
 # ends inside a member or gives it another size, a library whose header or symbol table is cut or
@@ -397,12 +398,13 @@ cd apps/companion/src-tauri/gen/android && ./gradlew :app:compileUniversalDebugK
 # removes or renames a class that only native code reaches, and the runtime then aborts the
 # application when the library asks for it, so only a minified package shows this. The classes of
 # the media library are kept whole by `src-tauri/gen/android/app/proguard-rules.pro`.
-# For a minified package the check also reads the merged rules the minifier wrote
+# For a minified package under `app/build/outputs` (one checked from anywhere else has no known
+# variant, and this step is left out) the check also reads the merged rules the minifier wrote
 # (`app/build/outputs/mapping/<variant>/configuration.txt`) and fails when they do not name
 # `proguard-tauri.pro` and `proguard-wry.pro`. The Rust build writes those two files, and they keep
 # the classes the Rust library calls by names it builds as it runs, which the check of the libraries
 # cannot see. The release variant is always minified. A debug build is when `KR_MINIFY_DEBUG=1`
-# asks for it; the Gradle project stops on any other value of that variable.
+# asks for it; an empty value counts as unset, and the Gradle project stops on any other value.
 # `pnpm -C apps/companion android` and `pnpm -C apps/companion ios build` run each build in a
 # temporary directory of its own, given by an absolute path, since the command line tool shares the
 # build's options with Gradle and Xcode through a file there named for the application
