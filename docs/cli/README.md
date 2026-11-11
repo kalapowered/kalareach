@@ -431,6 +431,13 @@ because a session started before an upgrade draws its screen with every tracking
 are off among them, and that screen is read as what the application asked for. A screen the command
 draws resets the three first and then sets the one that is on.
 
+The encoding is one setting too: setting 1005 (UTF-8 coordinates) or 1006 replaces the one in force,
+and resetting either returns the original report, also when it names the one that is not in force.
+The command spells the SGR report while 1006 is the one in force and the original report otherwise,
+which is what it also spells for 1005. A screen the command draws resets the four modes xterm names
+for the encoding (1005, 1006, 1015 and 1016) and then sets the one that is on. A screen of a session
+started before an upgrade that holds both 1005 and 1006 is read as 1006.
+
 While the application asks and this attachment may send input, the command asks the console for
 mouse records, which takes the mouse away from the console's text selection. It gives the mouse back
 when the application stops asking, when the attachment can no longer send input, and when the
@@ -440,11 +447,12 @@ That is a press or release of each button, the wheel a notch at a time (a wheel 
 a notch at a time is counted until it has turned one), a move with a button held in mode 1002, and a
 move with none in mode 1003. A record that is none of the events the application asked for is
 dropped, although the console no longer selects text with the mouse. The command spells the original
-encoding and the SGR encoding (mode 1006) and does not read modes 1005 and 1015, so an application
-that asks for either of them without 1006 is sent the original encoding. A position the original
-encoding has no room for (past column or row 223, with mode 1006 off) is not reported as another
-cell, and a wheel that turns sideways is not reported. Until the application asks, and in an
-attachment that may not send input, the console keeps the mouse and nothing is sent.
+encoding and the SGR encoding (mode 1006) and does not spell UTF-8 coordinates (mode 1005) or mode
+1015, so an application that asks for either of them without 1006 is sent the original encoding. A
+position the original encoding has no room for (past column or row 223, with mode 1006 off) is not
+reported as another cell, and a wheel that turns sideways is not reported. Until the application
+asks, and in an attachment that may not send input, the console keeps the mouse and nothing is
+sent.
 
 Bracketed paste is the one piece of context the command keeps, and it keeps it by watching the
 bytes as they go past rather than by holding any of them: a start delimiter opens a paste and an
