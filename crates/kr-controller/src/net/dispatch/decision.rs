@@ -600,15 +600,24 @@ impl RemoteConnection {
                 ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
             };
             let label = match entry.method {
-                Method::DraftCreate => Some((
-                    "a draft",
-                    mutation
+                Method::DraftCreate => {
+                    let params = mutation
                         .params
                         .to_typed::<kr_protocol::transfer::DraftCreateParams>()
-                        .map_err(invalid)?
-                        .device_id
-                        .0,
-                )),
+                        .map_err(invalid)?;
+                    // Only the end of its session or a prompt that sends it ends a draft, and a
+                    // device holds a bounded number of drafts that neither has ended. A draft that
+                    // names no session would take its place for good, so a device's draft names
+                    // the session it is for. The person at this machine has no bound and may make
+                    // one with none.
+                    if params.session_id.0.is_none() {
+                        return Err(ProtocolError::new(
+                            ErrorCode::InvalidArgument,
+                            "a draft a device makes names the session it is for",
+                        ));
+                    }
+                    Some(("a draft", params.device_id.0))
+                }
                 Method::UploadBegin => Some((
                     "an upload",
                     mutation

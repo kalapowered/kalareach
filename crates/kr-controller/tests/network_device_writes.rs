@@ -38,11 +38,11 @@ fn begin_params(host: &Host) -> UploadBeginParams {
     }
 }
 
-fn draft_params(host: &Host, text: &str) -> DraftCreateParams {
+fn draft_params(host: &Host, session_id: SessionId, text: &str) -> DraftCreateParams {
     DraftCreateParams {
         environment_id: host.environment_id,
         device_id: Nullable::null(),
-        session_id: Nullable::null(),
+        session_id: Nullable::some(session_id),
         application_instance_id: Nullable::null(),
         text: text.to_owned(),
     }
@@ -166,8 +166,9 @@ async fn a_repeat_of_a_draft_create_on_a_replacement_connection_is_answered_from
         net_support::proposal(&[ActionRight::SessionView]),
     )
     .await;
-    let target = on_the_host(&host);
-    let params = draft_params(&host, "made once");
+    let (session_id, _) = an_open_session(&host);
+    let target = on_the_session(&host, session_id);
+    let params = draft_params(&host, session_id, "made once");
 
     let first = RawDevice::connect(&host, &device, &record).await;
     first.claim();
@@ -221,8 +222,11 @@ async fn a_repeat_of_a_draft_create_on_a_replacement_connection_is_answered_from
         .to_typed()
         .expect("a result of the declared shape");
     assert_ne!(second.draft.draft_id, made.draft.draft_id);
-    let session: Option<SessionId> = second.draft.session_id.0;
-    assert_eq!(session, None, "a draft that names no session is the host's");
+    assert_eq!(
+        second.draft.session_id.0,
+        Some(session_id),
+        "a device's draft names the session it is for"
+    );
     again.close();
     host.stop().await;
 }

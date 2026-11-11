@@ -3428,8 +3428,12 @@ door's check writes nothing and is refused as withdrawn. A repeat of a draft wri
 connection is answered from the service's record, under the check any recorded answer is owed: a
 device that may not read the session's receipts is told `OUTCOME_UNKNOWN`.
 
-A device holds at most 64 open drafts. A draft is open until a prompt sends it to a session or the
-session it targets closes: the closure of a session queues, on a task of its own, the write that
+A device holds at most 64 open drafts: its drafts whose session has not closed and that no prompt
+has sent. A device's draft names the session it is for. Only a prompt or the closure of its session
+ends a draft, so a `draft.create` that names no session would take its place for good, and the
+paired door refuses it `INVALID_ARGUMENT` before anything is counted or written. The person at this
+machine has no bound and may make a draft with no session. A draft is open until a prompt sends it
+to a session or the session it targets closes: the closure of a session queues, on a task of its own, the write that
 orphans its drafts, and each `draft.create` first writes the end of the sessions its device's open
 drafts target, and the session it names, that the registry holds closed. A draft of a session
 recorded closed before the create starts then stops counting. A create that names such a session
