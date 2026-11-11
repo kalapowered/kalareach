@@ -254,13 +254,13 @@ function u16(dex, at) {
 
 /**
  * Reads one unsigned LEB128 at `at`, answering the value and the next offset. The format gives a
- * value at most five bytes and 32 bits, so a number that goes on longer, or past the file, is
- * refused.
+ * value at most five bytes and 32 bits, so a number that goes on longer, or past `end` (where the
+ * data section the number lies in ends), is refused.
  */
-function leb128(dex, at) {
+function leb128(dex, at, end) {
   let value = 0
   for (let place = 0; ; place += 1) {
-    if (at >= dex.length) throw new Error('a dex file cut short inside a number')
+    if (at >= end) throw new Error('a dex file with a number that runs past the end of its data section')
     const byte = dex[at]
     at += 1
     // The fifth byte holds the last four bits of a 32-bit value and ends it: a byte that goes on, or
@@ -295,43 +295,54 @@ function place(table, index, size) {
   return table.at + index * size
 }
 
+/** The size of the header, which the tables and the data section lie after. */
+const DEX_HEADER_SIZE = 112
+
 /**
  * Reads the tables a dex file keeps its strings, types, prototypes, methods and classes in, and
  * answers them with a reader of one string and of one type's descriptor. A table that does not lie
  * within the file is refused, which also refuses a count larger than the data there is to hold it.
+ * The data section is refused when it starts before the tables end or reaches past the file.
  */
 function reader(dex) {
   requireDex(dex)
   const table = (what, countAt, offsetAt, size) => {
     const count = u32(dex, countAt)
     const at = u32(dex, offsetAt)
-    if (at + count * size > dex.length) throw new Error(`a dex file whose ${what} table is not within it`)
-    return { count, at }
+    const end = at + count * size
+    if (end > dex.length) throw new Error(`a dex file whose ${what} table is not within it`)
+    return { count, at, end }
   }
   const strings = table('string', 0x38, 0x3c, 4)
   const types = table('type', 0x40, 0x44, 4)
   const protos = table('prototype', 0x48, 0x4c, 12)
+  // Not read, but one of the tables the data section follows.
+  const fields = table('field', 0x50, 0x54, 8)
   const methods = table('method', 0x58, 0x5c, 8)
   const classes = table('class', 0x60, 0x64, 32)
   // The data section holds the string data, type lists, class data and code. An offset that lies in
   // the file and outside it reads whatever else is there (the header's own zero fields, at 0x2c, read
-  // as four empty lists), so every offset into the data is checked against it.
+  // as four empty lists), so every offset into the data is checked against it, and so is the section:
+  // it starts after the header and the last table, and ends in the file. An item is read as far as
+  // the section's end and no further.
   const dataAt = u32(dex, 0x6c)
   const dataEnd = dataAt + u32(dex, 0x68)
+  const tablesEnd = Math.max(DEX_HEADER_SIZE, ...[strings, types, protos, fields, methods, classes].map((each) => each.end))
+  if (dataAt < tablesEnd) throw new Error('a dex file whose data section overlaps its header or its tables')
   if (dataEnd > dex.length) throw new Error('a dex file whose data section is not within it')
   const inData = (offset) => offset >= dataAt && offset < dataEnd
   const string = (index) => {
     const stringAt = u32(dex, place(strings, index, 4))
     if (!inData(stringAt)) throw new Error('a dex file with string data outside its data section')
-    const [length, textAt] = leb128(dex, stringAt)
-    return modifiedUtf8(dex, textAt, length)
+    const [length, textAt] = leb128(dex, stringAt, dataEnd)
+    return modifiedUtf8(dex, textAt, length, dataEnd)
   }
   const descriptor = (typeIndex) => string(u32(dex, place(types, typeIndex, 4)))
-  return { strings, protos, methods, classes, string, descriptor, inData }
+  return { strings, protos, methods, classes, string, descriptor, inData, dataEnd }
 }
 
-/** The text of a string's data at `at`, in UTF-16 units. */
-function modifiedUtf8(dex, at, units) {
+/** The text of a string's data at `at`, in UTF-16 units; the string and its NUL end before `end`. */
+function modifiedUtf8(dex, at, units, end) {
   const text = []
   let chunk = []
   const flush = () => {
@@ -342,19 +353,19 @@ function modifiedUtf8(dex, at, units) {
   // character outside the basic plane is two three-byte groups, and the NUL as a two-byte one; the
   // byte 0 ends the string.
   for (let next = at; ; ) {
-    if (next >= dex.length) throw new Error('a dex file with a string that has no end')
+    if (next >= end) throw new Error('a dex file with a string that has no end')
     const first = dex[next]
     if (first === 0) break
     let unit
     if (first < 0x80) {
       unit = first
       next += 1
-    } else if ((first & 0xe0) === 0xc0 && next + 1 < dex.length && (dex[next + 1] & 0xc0) === 0x80) {
+    } else if ((first & 0xe0) === 0xc0 && next + 1 < end && (dex[next + 1] & 0xc0) === 0x80) {
       unit = ((first & 0x1f) << 6) | (dex[next + 1] & 0x3f)
       next += 2
     } else if (
       (first & 0xf0) === 0xe0 &&
-      next + 2 < dex.length &&
+      next + 2 < end &&
       (dex[next + 1] & 0xc0) === 0x80 &&
       (dex[next + 2] & 0xc0) === 0x80
     ) {
@@ -409,15 +420,16 @@ const ACC_NATIVE = 0x100
  * lists the methods the code merely calls as well as the ones a class declares.
  */
 export function definedNatives(dex) {
-  const { protos, methods, classes, string, descriptor, inData } = reader(dex)
+  const { protos, methods, classes, string, descriptor, inData, dataEnd } = reader(dex)
   /** The argument types of the method at `methodIndex`, from its prototype's type list. */
   const argumentsOf = (methodIndex) => {
     const proto = u16(dex, place(methods, methodIndex, 8) + 2)
     const listAt = u32(dex, place(protos, proto, 12) + 8)
     if (listAt === 0) return ''
     if (!inData(listAt)) throw new Error('a dex file with a type list outside its data section')
+    // The count and the entries it counts both lie in the data section.
     const count = u32(dex, listAt)
-    if (listAt + 4 + count * 2 > dex.length) throw new Error('a dex file with a type list past its end')
+    if (listAt + 4 + count * 2 > dataEnd) throw new Error('a dex file with a type list past the end of its data section')
     let types = ''
     for (let each = 0; each < count; each += 1) {
       types += descriptor(u16(dex, listAt + 4 + each * 2))
@@ -438,24 +450,24 @@ export function definedNatives(dex) {
     let at = dataAt
     const sizes = []
     for (let list = 0; list < 4; list += 1) {
-      const [size, next] = leb128(dex, at)
+      const [size, next] = leb128(dex, at, dataEnd)
       sizes.push(size)
       at = next
     }
     // A field is two numbers and a method three, each at least a byte, so a list that counts more
-    // than the file has left to hold counts what is not there.
-    if ((sizes[0] + sizes[1]) * 2 + (sizes[2] + sizes[3]) * 3 > dex.length - at) {
+    // than the data section has left to hold counts what is not there.
+    if ((sizes[0] + sizes[1]) * 2 + (sizes[2] + sizes[3]) * 3 > dataEnd - at) {
       throw new Error('a dex file whose class data counts more than it holds')
     }
     for (let skipped = 0; skipped < sizes[0] + sizes[1]; skipped += 1) {
-      at = leb128(dex, leb128(dex, at)[1])[1]
+      at = leb128(dex, leb128(dex, at, dataEnd)[1], dataEnd)[1]
     }
     for (const size of [sizes[2], sizes[3]]) {
       let methodIndex = 0
       for (let each = 0; each < size; each += 1) {
-        const [step, afterIndex] = leb128(dex, at)
-        const [flags, afterFlags] = leb128(dex, afterIndex)
-        const [code, afterCode] = leb128(dex, afterFlags)
+        const [step, afterIndex] = leb128(dex, at, dataEnd)
+        const [flags, afterFlags] = leb128(dex, afterIndex, dataEnd)
+        const [code, afterCode] = leb128(dex, afterFlags, dataEnd)
         at = afterCode
         methodIndex += step
         // Every method is read as far as its own index and code offset, native or not: one whose

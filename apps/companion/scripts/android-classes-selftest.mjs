@@ -1204,13 +1204,13 @@ function classWithData(params = []) {
     'a dex file with a number larger than 32 bits'
   )
   refuses(
-    'a number that the end of the file cuts is refused',
+    'a number that the end of the data section cuts is refused',
     definedNatives,
     (bytes, classDef) => {
       bytes[bytes.length - 1] = 0x80
       bytes.writeUInt32LE(bytes.length - 1, classDef + 24)
     },
-    'a dex file cut short inside a number'
+    'a dex file with a number that runs past the end of its data section'
   )
   refuses(
     'a class that counts more fields than the file has room for is refused',
@@ -1252,7 +1252,7 @@ function classWithData(params = []) {
     'a prototype whose type list counts more types than the file holds is refused',
     definedNatives,
     (bytes) => bytes.writeUInt32LE(0x7fffffff, bytes.readUInt32LE(bytes.readUInt32LE(0x4c) + 8)),
-    'a dex file with a type list past its end',
+    'a dex file with a type list past the end of its data section',
     { params: ['I', 'I'] }
   )
   // An offset that lies in the file and not in the data section reads whatever is there: the header's
@@ -1282,6 +1282,157 @@ function classWithData(params = []) {
     'a dex file with a type list outside its data section',
     { params: ['I', 'I'] }
   )
+  // Where the data section may start: not inside the header, and not before the end of the last table
+  // the header places ahead of it. A section that starts there makes the header's own fields, or a
+  // table's entries, items of the data, and class data at 0x2c reads as four empty lists.
+  const OVERLAPS = 'a dex file whose data section overlaps its header or its tables'
+  const startSectionAt = (bytes, start) => {
+    const end = bytes.readUInt32LE(0x6c) + bytes.readUInt32LE(0x68)
+    bytes.writeUInt32LE(start, 0x6c)
+    bytes.writeUInt32LE(end - start, 0x68)
+  }
+  refuses(
+    'a data section that starts at the first byte of the file is refused, with class data at the first zero fields of the header',
+    definedNatives,
+    (bytes, classDef) => {
+      bytes.writeUInt32LE(0x2c, classDef + 24)
+      startSectionAt(bytes, 0)
+    },
+    OVERLAPS
+  )
+  refuses(
+    'a data section that starts inside the header is refused, with class data at the first zero fields of the header',
+    definedNatives,
+    (bytes, classDef) => {
+      bytes.writeUInt32LE(0x2c, classDef + 24)
+      startSectionAt(bytes, 0x2c)
+    },
+    OVERLAPS
+  )
+  refuses(
+    'a data section that starts one byte before the end of the tables is refused',
+    definedNatives,
+    (bytes) => startSectionAt(bytes, bytes.readUInt32LE(0x6c) - 1),
+    OVERLAPS
+  )
+  refuses(
+    'a data section that starts inside the field table is refused, though no field is read',
+    definedNatives,
+    (bytes) => {
+      // Four entries of eight bytes, the last of which ends eight bytes into the data section.
+      bytes.writeUInt32LE(4, 0x50)
+      bytes.writeUInt32LE(bytes.readUInt32LE(0x6c) - 24, 0x54)
+    },
+    OVERLAPS
+  )
+  refuses(
+    'a field table that is not within the file is refused',
+    definedNatives,
+    (bytes) => {
+      bytes.writeUInt32LE(1, 0x50)
+      bytes.writeUInt32LE(bytes.length, 0x54)
+    },
+    'a dex file whose field table is not within it'
+  )
+  // An item is read as far as the data section reaches and not as far as the file does. Each item
+  // below is put after the file's last byte, and the section is made to end `keep` bytes into it, so
+  // that the item starts in the section and runs out of it; the file still holds all of it, and a
+  // reader that stops at the file's end reads it as written.
+  const withTail = (bytes, item, keep) => {
+    const longer = Buffer.concat([bytes, Buffer.from(item)])
+    longer.writeUInt32LE(bytes.readUInt32LE(0x68) + keep, 0x68)
+    return longer
+  }
+  {
+    const NUMBER = 'a dex file with a number that runs past the end of its data section'
+    const { bytes, classDef } = classWithData()
+    const classData = (item, keep) => {
+      const longer = withTail(bytes, item, keep)
+      longer.writeUInt32LE(bytes.length, classDef + 24)
+      return readAs(definedNatives, longer)
+    }
+    held(
+      'class data that starts at the last byte of the data section, with its other counts after it, is refused',
+      NUMBER,
+      classData([0, 0, 0, 0], 1)
+    )
+    held('class data whose counts the data section holds is read', 'read', classData([0, 0, 0, 0], 4))
+    held(
+      'class data that counts more methods than the data section holds, as the file does, is refused',
+      'a dex file whose class data counts more than it holds',
+      classData([0, 0, 0, 1, 0, 0, 0], 4)
+    )
+    held('class data whose methods the data section holds is read', 'read', classData([0, 0, 0, 1, 0, 0, 0], 7))
+    // A number written in more bytes than it needs, so that the counts leave room for it and the
+    // number itself runs out of the section: the second of a field's two, and the last of a method's three.
+    held(
+      'a field whose second number is outside the data section is refused',
+      NUMBER,
+      classData([1, 0, 0, 0, 0x81, 0x00, 0x19], 6)
+    )
+    held('a field the data section holds in full is read', 'read', classData([1, 0, 0, 0, 0x81, 0x00, 0x19], 7))
+    held(
+      'a method whose code offset runs out of the data section is refused',
+      NUMBER,
+      classData([0, 0, 0, 1, 0, 0, 0x80, 0x80, 0x00], 8)
+    )
+    held(
+      'a method the data section holds in full is read',
+      'read',
+      classData([0, 0, 0, 1, 0, 0, 0x80, 0x80, 0x00], 9)
+    )
+    const string = (item, keep) => {
+      const longer = withTail(bytes, item, keep)
+      longer.writeUInt32LE(bytes.length, bytes.readUInt32LE(0x3c))
+      return readAs(definedStrings, longer)
+    }
+    // The length of the string "a" written in two bytes, which the format allows.
+    held(
+      'a string whose length is written across the end of the data section is refused',
+      NUMBER,
+      string([0x81, 0x00, 0x61, 0x00], 1)
+    )
+    held('a string whose length the data section holds is read', 'read', string([0x81, 0x00, 0x61, 0x00], 4))
+    held(
+      'a string whose end is outside the data section is refused',
+      'a dex file with a string that has no end',
+      string([0x01, 0x61, 0x00], 2)
+    )
+    held('a string the data section holds in full is read', 'read', string([0x01, 0x61, 0x00], 3))
+    // A character of two or three bytes whose last byte is outside the section is a character that
+    // does not end in it.
+    const NOT_MODIFIED = 'a dex file with a string that is not modified UTF-8'
+    held('a two-byte character that the data section ends inside is refused', NOT_MODIFIED, string([0x01, 0xc3, 0xa9, 0x00], 2))
+    held('a three-byte character that the data section ends inside is refused', NOT_MODIFIED, string([0x01, 0xe2, 0x82, 0xac, 0x00], 3))
+    held('a three-byte character the data section holds in full is read', 'read', string([0x01, 0xe2, 0x82, 0xac, 0x00], 5))
+  }
+  {
+    // A file of a header alone, with no table at all, still has a header that the data section may not
+    // start in.
+    const header = Buffer.alloc(112)
+    header.write('dex\n035\0', 0, 'latin1')
+    const section = (start) => {
+      const bytes = Buffer.from(header)
+      bytes.writeUInt32LE(start, 0x6c)
+      bytes.writeUInt32LE(112 - start, 0x68)
+      return readAs(definedClasses, bytes)
+    }
+    held('a data section that starts inside a header with no tables after it is refused', OVERLAPS, section(0x2c))
+    held('a data section that starts after the header is read', 'read', section(112))
+  }
+  {
+    const PAST_LIST = 'a dex file with a type list past the end of its data section'
+    const { bytes } = classWithData(['I', 'I'])
+    const listAt = bytes.readUInt32LE(0x4c) + 8
+    const original = bytes.readUInt32LE(listAt)
+    const typeList = (keep) => {
+      const longer = withTail(bytes, bytes.subarray(original, original + 8), keep)
+      longer.writeUInt32LE(bytes.length, listAt)
+      return readAs(definedNatives, longer)
+    }
+    held('a type list whose last entry is outside the data section is refused', PAST_LIST, typeList(7))
+    held('a type list the data section holds in full is read', 'read', typeList(8))
+  }
   // A method that is not native is read as far as its own offsets and index, so that a class data
   // item that has gone wrong cannot end where it looks as if it did.
   const plainMethod = (extra) => {
