@@ -20,10 +20,10 @@ use std::time::Duration;
 
 use kr_client::cursors::StreamCursors;
 use kr_e2e_agents::account::{
-    AppendOnly, Guarded, Ledger, append_only_files, appended_since, borrow_login_keychain, changes,
-    conversation_id, files_holding_any, guarded_files, holds_any, keychain_item_modified,
-    line_identity, now_ms, read_if_there, record_guarded, record_key_scan, record_rewrites,
-    remove_appended_lines, remove_created, reported_rewrites, run_files_holding,
+    AppendOnly, Guarded, Ledger, RunRules, append_only_files, appended_since,
+    borrow_login_keychain, changes, conversation_id, files_holding_any, guarded_files, holds_any,
+    keychain_item_modified, line_identity, now_ms, read_if_there, record_guarded, record_key_scan,
+    record_rewrites, remove_appended_lines, remove_created, reported_rewrites, run_files_holding,
     run_files_holding_any, snapshot, which_hold,
 };
 use kr_e2e_agents::build::{
@@ -59,7 +59,8 @@ use kr_e2e_agents::stage::{
     AgentProcess, Context, Installation, Installed, Keyboard, Owner, PROMPT, Refused, Replacement,
     Session, closed_port, default_keychain_of_a_session, events_snapshot, free_port, inode_of,
     install, kill_daemon, launch, launch_or_refusal, mapped_files, names_a_session_exports,
-    open_session, place_forwarder, prepare_home, runtime, session_variables, text_image,
+    open_session, place_forwarder, prepare_home, runtime, scan_rules, session_variables,
+    text_image,
 };
 use kr_e2e_agents::stub::RequestStub;
 use kr_e2e_agents::transfer::{self, Caller, Transfer};
@@ -1112,7 +1113,12 @@ struct Searched {
 /// data directory the agent writes the run's work to: the run's sessions (the wire files), the
 /// run's history and the logs and indexes and every path the build list reports. The run's
 /// sessions are also searched for a subagent's start. Nothing of a string is printed.
-fn confine_scan(login: &Login, guards: Option<&Guards>, root: &Path) -> Option<Searched> {
+fn confine_scan(
+    login: &Login,
+    guards: Option<&Guards>,
+    root: &Path,
+    rules: &RunRules,
+) -> Option<Searched> {
     let (Some(confinement), Some(setup)) = (&login.account.confinement, &login.setup) else {
         return None;
     };
@@ -1213,7 +1219,7 @@ fn confine_scan(login: &Login, guards: Option<&Guards>, root: &Path) -> Option<S
             && !place.starts_with(data.join("credentials"))
             && !place.starts_with(data.join("oauth"))
     });
-    let in_run = run_files_holding_any(root, &bytes);
+    let in_run = run_files_holding_any(root, rules, &bytes);
     let mut in_data = 0;
     let look_failed = guards.is_some_and(|guards| {
         guards
@@ -2098,6 +2104,12 @@ fn staged(
     });
     let run = Run::start(&format!("part {part}"));
     let root = run.root().to_path_buf();
+    let rules = scan_rules(
+        &run,
+        &inputs.build.prefix,
+        &inputs.build.pinned,
+        &inputs.build.runtime,
+    );
     // An agent that keeps its conversations in a database: the files the part reads are exported from
     // it while the part runs and once more, whole, when everything the part started has ended.
     let mirroring = login
@@ -2243,7 +2255,7 @@ fn staged(
     // cleaned up, so what the cleanup removes was searched.
     let searched = login
         .as_ref()
-        .and_then(|login| confine_scan(login, guards.as_ref(), &root));
+        .and_then(|login| confine_scan(login, guards.as_ref(), &root, &rules));
     // Every string a result is held out of: the login's files' strings, the login's own value
     // where it is a variable, and the values of the other keys the person's shell holds.
     let secret_values: Vec<String> = searched
@@ -2288,7 +2300,12 @@ fn staged(
     let scan = login
         .as_ref()
         .and_then(|login| login.key.as_ref())
-        .map(|(name, value)| (name.clone(), run_files_holding(&root, value.as_bytes())));
+        .map(|(name, value)| {
+            (
+                name.clone(),
+                run_files_holding(&root, &rules, value.as_bytes()),
+            )
+        });
     // The values of the other keys the person's shell holds, searched for in the same directory:
     // no session was given one, so a file that holds one is a leak.
     let others_found = login
@@ -2296,7 +2313,7 @@ fn staged(
         .filter(|login| !login.others.is_empty())
         .map(|login| {
             let values: Vec<&[u8]> = login.others.iter().map(String::as_bytes).collect();
-            run_files_holding_any(&root, &values)
+            run_files_holding_any(&root, &rules, &values)
         });
     // The configuration directory of the run's own goes whatever became of the part, and is
     // checked gone.

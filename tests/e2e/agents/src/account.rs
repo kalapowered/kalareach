@@ -402,6 +402,13 @@ pub struct KeyScan {
     pub held_by: Vec<KeyHolder>,
     /// The entries that could not be read, with why.
     pub unread: Vec<String>,
+    /// The scan met an entry on another file system than its root's, as a mounted volume is: the
+    /// run's directory is then left where it is.
+    #[serde(skip)]
+    pub crossed_a_mount: bool,
+    /// The root of a run's scan is not the directory the run made.
+    #[serde(skip)]
+    pub root_changed: bool,
 }
 
 impl KeyScan {
@@ -438,7 +445,7 @@ pub fn files_holding(root: &Path, value: &[u8]) -> KeyScan {
 /// Panics when a value is shorter than eight bytes, which would find anything.
 #[must_use]
 pub fn files_holding_any(root: &Path, values: &[&[u8]]) -> KeyScan {
-    scan_files(root, values, false)
+    scan_files(root, values, None)
 }
 
 /// [`files_holding`] for a run's own directory, which holds no file with a second name: a file whose
@@ -452,8 +459,8 @@ pub fn files_holding_any(root: &Path, values: &[&[u8]]) -> KeyScan {
 ///
 /// Panics when `value` is shorter than eight bytes, which would find anything.
 #[must_use]
-pub fn run_files_holding(root: &Path, value: &[u8]) -> KeyScan {
-    run_files_holding_any(root, &[value])
+pub fn run_files_holding(root: &Path, rules: &RunRules, value: &[u8]) -> KeyScan {
+    run_files_holding_any(root, rules, &[value])
 }
 
 /// [`files_holding_any`] for a run's own directory ([`run_files_holding`]).
@@ -462,8 +469,94 @@ pub fn run_files_holding(root: &Path, value: &[u8]) -> KeyScan {
 ///
 /// Panics when a value is shorter than eight bytes, which would find anything.
 #[must_use]
-pub fn run_files_holding_any(root: &Path, values: &[&[u8]]) -> KeyScan {
-    scan_files(root, values, true)
+pub fn run_files_holding_any(root: &Path, rules: &RunRules, values: &[&[u8]]) -> KeyScan {
+    scan_files(root, values, Some(rules))
+}
+
+/// What a scan of a run's own directory holds to besides reading: the directory the run made, which
+/// the root must be and everything read must lie beneath; and the links that may be there, which are
+/// the harness's own (the places it made them at) and nothing else.
+#[derive(Clone, Debug)]
+pub struct RunRules {
+    pin: kr_e2e_m1b::run::RootPin,
+    links: Vec<String>,
+    agent: Option<AgentLinks>,
+}
+
+/// The names of the links the pinned build makes in its own home when it starts, each to its own
+/// executable (the helpers of its patch tool and of its command wrapper).
+const AGENT_HELPERS: [&str; 3] = ["apply_patch", "applypatch", "codex-execve-wrapper"];
+
+/// Where the agent makes links in its own home, and what they may name.
+#[derive(Clone, Debug)]
+struct AgentLinks {
+    /// The agent's home, relative to the run's directory.
+    home: String,
+    /// What a link may say: the pinned executable in the run's own installation, by the path the
+    /// run starts it by and by its resolved path.
+    executables: Vec<PathBuf>,
+}
+
+impl RunRules {
+    /// The rules for the run whose directory is `pin`, in which the harness made links at exactly
+    /// the places `links` names, relative to the run's directory and joined by `/`.
+    #[must_use]
+    pub fn new(pin: &kr_e2e_m1b::run::RootPin, links: Vec<String>) -> Self {
+        Self {
+            pin: pin.clone(),
+            links,
+            agent: None,
+        }
+    }
+
+    /// Adds the links the pinned build makes in its own home, `home` relative to the run's
+    /// directory: `home/tmp/arg0/codex-arg0<random>/<helper>` for the helpers it is known to make
+    /// ([`AGENT_HELPERS`]), when the link's own text is one of `executables`, the pinned executable
+    /// in the run's own installation, and nothing else. A link of any other name, in any other
+    /// place, or saying anything else is counted.
+    #[must_use]
+    pub fn with_agent_links(mut self, home: &str, executables: Vec<PathBuf>) -> Self {
+        self.agent = Some(AgentLinks {
+            home: home.to_owned(),
+            executables,
+        });
+        self
+    }
+
+    /// The directory the run made.
+    #[must_use]
+    pub const fn pin(&self) -> &kr_e2e_m1b::run::RootPin {
+        &self.pin
+    }
+
+    /// Whether the link `name` in `directory`, at `place` below the run's directory, is one the
+    /// harness made, or one the pinned build makes in its home and that says nothing but the
+    /// pinned executable: its text is read and never followed.
+    fn allows(&self, directory: &std::os::fd::OwnedFd, name: &std::ffi::CStr, place: &str) -> bool {
+        if self.links.iter().any(|link| link == place) {
+            return true;
+        }
+        let Some(agent) = &self.agent else {
+            return false;
+        };
+        let names: Vec<&str> = place.split('/').collect();
+        let [home, "tmp", "arg0", helper_directory, helper] = names.as_slice() else {
+            return false;
+        };
+        if *home != agent.home
+            || !helper_directory.starts_with("codex-arg0")
+            || !AGENT_HELPERS.contains(helper)
+        {
+            return false;
+        }
+        rustix::fs::readlinkat(directory, name, Vec::new()).is_ok_and(|text| {
+            use std::os::unix::ffi::OsStrExt as _;
+            agent
+                .executables
+                .iter()
+                .any(|executable| executable.as_os_str().as_bytes() == text.to_bytes())
+        })
+    }
 }
 
 /// What the scan tells of an entry it did not read.
@@ -483,7 +576,7 @@ fn scan_directory(
     root: &rustix::fs::Stat,
     relative: &str,
     depth: usize,
-    strict: bool,
+    rules: Option<&RunRules>,
     holds: &dyn Fn(&[u8]) -> bool,
     scan: &mut KeyScan,
 ) {
@@ -537,14 +630,22 @@ fn scan_directory(
         };
         // A volume attached below the root is no link and its files have one name: only the
         // device tells it from the root's own file system, and nothing on it is opened.
+        // The check is for mounts only: the system's own volumes share one device number.
         if looked.st_dev != root.st_dev {
+            scan.crossed_a_mount = true;
             scan.unread
                 .push(format!("{shown}: {}", not_scanned("another file system")));
             continue;
         }
         match FileType::from_raw_mode(looked.st_mode) {
             FileType::Directory => match opened_directory(directory, name.as_c_str(), &looked, 0) {
-                Ok(child) => scan_directory(&child, root, &shown, depth + 1, strict, holds, scan),
+                Ok(child) if rules.is_some_and(|rules| !rules.pin.contains(&child)) => {
+                    scan.unread.push(format!(
+                        "{shown}: {}",
+                        not_scanned("it was moved out of the run while the scan ran")
+                    ));
+                }
+                Ok(child) => scan_directory(&child, root, &shown, depth + 1, rules, holds, scan),
                 Err(unlooked) => scan
                     .unread
                     .push(format!("{shown}: {}", not_scanned(&unlooked.to_string()))),
@@ -555,14 +656,16 @@ fn scan_directory(
                     name.as_c_str(),
                     &looked,
                     &shown,
-                    strict,
+                    rules,
                     holds,
                     scan,
                 );
             }
             // A run holds the links the harness itself makes (the one to the installed build and
             // the ones to its runtimes), which nothing is read through; any other link is counted.
-            FileType::Symlink if strict && !crate::stage::is_an_installation_link(&shown) => {
+            FileType::Symlink
+                if rules.is_some_and(|rules| !rules.allows(directory, name.as_c_str(), &shown)) =>
+            {
                 scan.unread.push(format!(
                     "{shown}: {}",
                     not_scanned("a link the harness did not make")
@@ -584,12 +687,13 @@ fn scan_file(
     name: impl rustix::path::Arg,
     looked: &rustix::fs::Stat,
     shown: &str,
-    strict: bool,
+    rules: Option<&RunRules>,
     holds: &dyn Fn(&[u8]) -> bool,
     scan: &mut KeyScan,
 ) {
     use crate::held::{Class, opening_failed};
     use rustix::fs::{FileType, Mode, OFlags};
+    let strict = rules.is_some();
     if strict && looked.st_nlink != 1 {
         scan.unread.push(format!(
             "{shown}: {}",
@@ -636,6 +740,14 @@ fn scan_file(
         ));
         return;
     }
+    // A file moved into a directory that was moved out of the run is not the run's.
+    if rules.is_some_and(|rules| !rules.pin.contains(&handle)) {
+        scan.unread.push(format!(
+            "{shown}: {}",
+            not_scanned("it is no longer beneath the run's directory")
+        ));
+        return;
+    }
     let mut file = std::fs::File::from(handle);
     let mut bytes = Vec::new();
     if let Err(error) = file.read_to_end(&mut bytes) {
@@ -659,9 +771,14 @@ fn scan_file(
 /// root that is one is followed. A directory is opened and checked to be the one that was looked at,
 /// and walked on its file system; a file is read as any file of the scan is, through the handle that
 /// was checked.
-fn scan_root(root: &Path, strict: bool, holds: &dyn Fn(&[u8]) -> bool, scan: &mut KeyScan) {
+fn scan_root(
+    root: &Path,
+    rules: Option<&RunRules>,
+    holds: &dyn Fn(&[u8]) -> bool,
+    scan: &mut KeyScan,
+) {
     use rustix::fs::{AtFlags, FileType, Mode, OFlags};
-    let (look, open) = if strict {
+    let (look, open) = if rules.is_some() {
         (AtFlags::SYMLINK_NOFOLLOW, OFlags::NOFOLLOW)
     } else {
         (AtFlags::empty(), OFlags::empty())
@@ -690,8 +807,15 @@ fn scan_root(root: &Path, strict: bool, holds: &dyn Fn(&[u8]) -> bool, scan: &mu
                 }
             };
             match rustix::fs::fstat(&directory) {
+                Ok(_) if rules.is_some_and(|rules| !rules.pin.holds(&directory)) => {
+                    scan.root_changed = true;
+                    scan.unread.push(format!(
+                        ": {}",
+                        not_scanned("the run's directory is not the one the run made")
+                    ));
+                }
                 Ok(opened) if (opened.st_dev, opened.st_ino) == (looked.st_dev, looked.st_ino) => {
-                    scan_directory(&directory, &opened, "", 1, strict, holds, scan);
+                    scan_directory(&directory, &opened, "", 1, rules, holds, scan);
                 }
                 Ok(_) => scan.unread.push(format!(
                     ": {}",
@@ -700,8 +824,13 @@ fn scan_root(root: &Path, strict: bool, holds: &dyn Fn(&[u8]) -> bool, scan: &mu
                 Err(error) => scan.unread.push(format!(": {error}")),
             }
         }
+        // A root of a place of the person's own that is a link to a file is looked at through the
+        // link, and the no-follow open then refuses it and tells it with the wrong text, "it became
+        // a link while the scan ran": it was one from the start. It is still refused and still
+        // incomplete; only the wording is off, and only the parts that scan such a place meet it.
+        // A run's own root is never a file.
         FileType::RegularFile => {
-            scan_file(rustix::fs::CWD, root, &looked, &name, strict, holds, scan)
+            scan_file(rustix::fs::CWD, root, &looked, &name, rules, holds, scan)
         }
         _ => scan.unread.push(format!(
             "{name}: {}",
@@ -710,9 +839,10 @@ fn scan_root(root: &Path, strict: bool, holds: &dyn Fn(&[u8]) -> bool, scan: &mu
     }
 }
 
-/// [`files_holding_any`] and [`run_files_holding_any`]: `strict` refuses a file with more than one
-/// name, a root that is a link, and a link the harness did not make.
-fn scan_files(root: &Path, values: &[&[u8]], strict: bool) -> KeyScan {
+/// [`files_holding_any`] and [`run_files_holding_any`]: with `rules`, a run's scan refuses a file
+/// with more than one name, a root that is a link or is not the directory the run made, and a link
+/// the harness did not make.
+fn scan_files(root: &Path, values: &[&[u8]], rules: Option<&RunRules>) -> KeyScan {
     assert!(
         values.iter().all(|value| value.len() >= 8),
         "a key shorter than eight bytes cannot be searched for"
@@ -723,7 +853,7 @@ fn scan_files(root: &Path, values: &[&[u8]], strict: bool) -> KeyScan {
         values.iter().map(memchr::memmem::Finder::new).collect();
     let holds = |bytes: &[u8]| finders.iter().any(|finder| finder.find(bytes).is_some());
     let mut scan = KeyScan::default();
-    scan_root(root, strict, &holds, &mut scan);
+    scan_root(root, rules, &holds, &mut scan);
     scan.held_by
         .sort_by(|left, right| left.path.cmp(&right.path));
     scan
@@ -1732,6 +1862,15 @@ mod tests {
         }
     }
 
+    /// The rules for the scan of `root` as a run's directory (a root that is no directory is
+    /// given its parent as the run's directory), with the harness's links at `links`.
+    fn rules_for(root: &Path, links: &[&str]) -> RunRules {
+        let pin = kr_e2e_m1b::run::RootPin::of(root)
+            .or_else(|_| kr_e2e_m1b::run::RootPin::of(root.parent().expect("a parent")))
+            .expect("a directory to pin");
+        RunRules::new(&pin, links.iter().map(|link| (*link).to_owned()).collect())
+    }
+
     /// The ledger at `path` for `budget`, in a file made as the operator makes the first one: with
     /// an explicit empty array for each of `budgets`.
     fn made(path: &Path, budgets: &[&str], budget: &str, limit: u64) -> Ledger {
@@ -2011,7 +2150,7 @@ mod tests {
         std::fs::write(run.join("a/b/holds-it"), key).expect("a file that holds the key");
         std::fs::write(run.join("a/clean"), b"nothing to find here").expect("a clean file");
         // A clean run: the key is found where it is, and every entry was read.
-        let scan = run_files_holding(&run, key);
+        let scan = run_files_holding(&run, &rules_for(&run, &[]), key);
         assert!(scan.complete(), "{:?}", scan.unread);
         assert_eq!(
             scan.held_by
@@ -2024,7 +2163,7 @@ mod tests {
         // the scan is incomplete and nothing of the file is searched.
         std::fs::write(elsewhere.join("theirs"), key).expect("a file of the person's");
         std::fs::hard_link(elsewhere.join("theirs"), run.join("a/second-name")).expect("a link");
-        let scan = run_files_holding(&run, key);
+        let scan = run_files_holding(&run, &rules_for(&run, &[]), key);
         assert!(!scan.complete());
         assert!(
             scan.unread
@@ -2051,7 +2190,7 @@ mod tests {
         std::os::unix::fs::symlink(elsewhere.join("theirs"), run.join("a/linked-file"))
             .expect("a link");
         std::os::unix::fs::symlink(&elsewhere, run.join("a/linked-directory")).expect("a link");
-        let scan = run_files_holding(&run, key);
+        let scan = run_files_holding(&run, &rules_for(&run, &[]), key);
         assert!(!scan.complete());
         assert_eq!(
             scan.unread
@@ -2088,12 +2227,14 @@ mod tests {
         link(&elsewhere.join("build"), "agent/current");
         link(&elsewhere.join("build/theirs"), "agent/runtime/node");
         // What the harness makes: the scan is whole and reads through neither.
-        let scan = run_files_holding(&run, key);
+        let rules = rules_for(&run, &["agent/current", "agent/runtime/node"]);
+        let scan = run_files_holding(&run, &rules, key);
         assert!(scan.complete(), "{:?}", scan.unread);
         assert!(scan.held_by.is_empty(), "{:?}", scan.held_by);
         // Every other link is counted, whatever it points at and whatever it is called.
         for place in [
             "agent/other",
+            "agent/runtime/unlisted",
             "agent/current-next",
             "agent/runtime/inner/deeper",
             "other/agent/current",
@@ -2103,7 +2244,7 @@ mod tests {
                 std::fs::create_dir_all(run.join(parent)).expect("a directory");
             }
             link(&elsewhere.join("build"), place);
-            let scan = run_files_holding(&run, key);
+            let scan = run_files_holding(&run, &rules, key);
             assert!(!scan.complete(), "{place}");
             assert_eq!(
                 scan.unread
@@ -2132,7 +2273,7 @@ mod tests {
         // The root is a link to a directory that holds the key.
         let linked = scratch.0.join("linked-run");
         std::os::unix::fs::symlink(&elsewhere, &linked).expect("a link");
-        let scan = run_files_holding(&linked, key);
+        let scan = run_files_holding(&linked, &rules_for(&linked, &[]), key);
         assert!(!scan.complete());
         assert!(scan.held_by.is_empty(), "{:?}", scan.held_by);
         let lenient = files_holding(&linked, key);
@@ -2141,13 +2282,13 @@ mod tests {
         // The root is a link to a file that holds the key.
         let linked_file = scratch.0.join("linked-file");
         std::os::unix::fs::symlink(elsewhere.join("inner/theirs"), &linked_file).expect("a link");
-        let scan = run_files_holding(&linked_file, key);
+        let scan = run_files_holding(&linked_file, &rules_for(&linked_file, &[]), key);
         assert!(!scan.complete());
         assert!(scan.held_by.is_empty(), "{:?}", scan.held_by);
         // The root is a file with one name: read, and named by its own name.
         let own = scratch.0.join("own-file");
         std::fs::write(&own, key).expect("a file");
-        let scan = run_files_holding(&own, key);
+        let scan = run_files_holding(&own, &rules_for(&own, &[]), key);
         assert!(scan.complete(), "{:?}", scan.unread);
         assert_eq!(
             scan.held_by
@@ -2160,7 +2301,7 @@ mod tests {
         // read in the scan of a place of theirs.
         let second = scratch.0.join("second-name");
         std::fs::hard_link(elsewhere.join("inner/theirs"), &second).expect("a hard link");
-        let scan = run_files_holding(&second, key);
+        let scan = run_files_holding(&second, &rules_for(&second, &[]), key);
         assert!(!scan.complete());
         assert!(
             scan.unread
@@ -2173,6 +2314,126 @@ mod tests {
         let lenient = files_holding(&second, key);
         assert!(lenient.complete(), "{:?}", lenient.unread);
         assert_eq!(lenient.held_by.len(), 1);
+    }
+
+    /// The helper links the pinned build makes in its own home are skipped only when they are in
+    /// the place and under the names it makes them, and say the pinned executable in the run's own
+    /// installation; every other link is counted.
+    #[test]
+    fn a_run_s_scan_skips_only_the_helper_links_the_pinned_build_makes_in_its_home_to_itself() {
+        let scratch = Scratch::new("scan-agent-links");
+        let run = scratch.0.join("run");
+        let pinned = scratch.0.join("pinned-codex");
+        let other = scratch.0.join("other-file");
+        std::fs::write(&pinned, b"the pinned executable").expect("a file");
+        std::fs::write(&other, b"another file").expect("a file");
+        let current = run.join("agent/current/bin/codex");
+        let key = b"the-key-value-0123456789";
+        let rules = |run: &Path| {
+            rules_for(run, &[])
+                .with_agent_links("agent-config", vec![current.clone(), pinned.clone()])
+        };
+        let link = |target: &Path, place: &str| {
+            let path = run.join(place);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("a directory");
+            std::os::unix::fs::symlink(target, path).expect("a link");
+        };
+        std::fs::create_dir_all(&run).expect("a run");
+        // What the build makes, naming itself by the path the run starts it by and by its own.
+        for (name, target) in [
+            ("apply_patch", &pinned),
+            ("applypatch", &current),
+            ("codex-execve-wrapper", &pinned),
+        ] {
+            link(
+                target,
+                &format!("agent-config/tmp/arg0/codex-arg0abc123/{name}"),
+            );
+        }
+        let scan = run_files_holding(&run, &rules(&run), key);
+        assert!(scan.complete(), "{:?}", scan.unread);
+        // Anything else is counted: another name, another text, another place, another folder name,
+        // another depth, another home.
+        for (place, target) in [
+            (
+                "agent-config/tmp/arg0/codex-arg0abc123/other-helper",
+                &pinned,
+            ),
+            ("agent-config/tmp/arg0/codex-arg0def456/apply_patch", &other),
+            (
+                "agent-config/tmp/other/codex-arg0abc123/apply_patch",
+                &pinned,
+            ),
+            ("agent-config/tmp/arg0/not-arg0/apply_patch", &pinned),
+            (
+                "agent-config/tmp/arg0/codex-arg0abc123/inner/apply_patch",
+                &pinned,
+            ),
+            ("other-home/tmp/arg0/codex-arg0abc123/apply_patch", &pinned),
+        ] {
+            link(target, place);
+            let scan = run_files_holding(&run, &rules(&run), key);
+            assert_eq!(
+                scan.unread
+                    .iter()
+                    .filter(|entry| entry.contains("not scanned: a link the harness did not make"))
+                    .count(),
+                1,
+                "{place}: {:?}",
+                scan.unread
+            );
+            std::fs::remove_file(run.join(place)).expect("removed");
+        }
+    }
+
+    /// A file, or a directory with files in it, that is not beneath the run's directory (it was moved
+    /// out, or into a directory that was) is not read, whatever the walk was given.
+    #[test]
+    fn the_scan_reads_nothing_that_is_no_longer_beneath_the_run() {
+        use rustix::fs::{AtFlags, Mode, OFlags};
+        let scratch = Scratch::new("scan-beneath");
+        let run = scratch.0.join("run");
+        let outside = scratch.0.join("outside");
+        std::fs::create_dir_all(&run).expect("a run");
+        std::fs::create_dir_all(outside.join("inner")).expect("outside");
+        let key = b"the-key-value-0123456789";
+        std::fs::write(outside.join("theirs"), key).expect("a file");
+        std::fs::write(outside.join("inner/theirs"), key).expect("a file");
+        let rules = rules_for(&run, &[]);
+        let finders = [memchr::memmem::Finder::new(key.as_slice())];
+        let holds = |bytes: &[u8]| finders.iter().any(|finder| finder.find(bytes).is_some());
+        let mut scan = KeyScan::default();
+        let path = outside.join("theirs");
+        let looked =
+            rustix::fs::statat(rustix::fs::CWD, &path, AtFlags::SYMLINK_NOFOLLOW).expect("a look");
+        scan_file(
+            rustix::fs::CWD,
+            path.as_path(),
+            &looked,
+            "theirs",
+            Some(&rules),
+            &holds,
+            &mut scan,
+        );
+        let directory = rustix::fs::open(
+            &outside,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("a directory outside the run");
+        let stat = rustix::fs::fstat(&directory).expect("a look");
+        scan_directory(&directory, &stat, "", 1, Some(&rules), &holds, &mut scan);
+        assert!(scan.held_by.is_empty(), "{:?}", scan.held_by);
+        // The subdirectory is refused as itself, before anything in it is looked at, and each file
+        // met directly in the outside directory is refused.
+        assert_eq!(scan.unread.len(), 3, "{:?}", scan.unread);
+        assert!(
+            scan.unread
+                .iter()
+                .any(|entry| entry.starts_with("inner:") && entry.contains("moved out")),
+            "{:?}",
+            scan.unread
+        );
     }
 
     /// A volume attached below the scan's root (a disk image, a network view) is another file
@@ -2193,7 +2454,10 @@ mod tests {
             .unwrap_or_else(|| not_attachable());
         std::fs::write(run.join("a/mounted/theirs"), key)
             .expect("a file with one name, on the volume, that holds the key");
-        let scans = [run_files_holding(&run, key), files_holding(&run, key)];
+        let scans = [
+            run_files_holding(&run, &rules_for(&run, &[]), key),
+            files_holding(&run, key),
+        ];
         volume.detach();
         for scan in scans {
             assert!(!scan.complete());

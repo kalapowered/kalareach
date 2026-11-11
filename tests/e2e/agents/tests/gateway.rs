@@ -104,7 +104,7 @@ use kr_e2e_agents::held::{
     turns_recorded, unchanged_before_the_charge,
 };
 use kr_e2e_agents::outcome::Outcome;
-use kr_e2e_agents::stage::{Installation, closed_port, session_variables};
+use kr_e2e_agents::stage::{Installation, closed_port, scan_rules, session_variables};
 use kr_e2e_agents::stub::RequestStub;
 use kr_e2e_m1b::device::{Device, PairedHost, Remote, RequestError};
 use kr_e2e_m1b::host::{Host, HostOptions, Preparation};
@@ -585,6 +585,7 @@ impl Real {
         let mut text = String::new();
         read_record(
             run.root(),
+            run.pin(),
             &conversations_relative(&self.account),
             &mut |_, content| text.push_str(&String::from_utf8_lossy(content)),
         )?;
@@ -1790,6 +1791,7 @@ fn ends(
             let recorded = turns_recorded(
                 &real.account,
                 run.root(),
+                run.pin(),
                 &conversations_relative(&real.account),
             );
             match audit_turns(result.is_ok(), charged, &recorded) {
@@ -1843,8 +1845,14 @@ fn ends(
                 "forms_of_the_names_that_are_no_uuid": recorded.as_ref().ok().map(|found| found.forms.clone()),
             });
         }
-        if let Some(root) = &root {
-            scan = Some(RunScan::of(root, &real.held));
+        if let Some(run) = &run {
+            let rules = scan_rules(
+                run,
+                &real.build.prefix,
+                &real.build.pinned,
+                &real.build.runtime,
+            );
+            scan = Some(RunScan::of(run.root(), &rules, &real.held));
         }
         secrets = real.held.values();
     }
@@ -1865,6 +1873,16 @@ fn ends(
             }
         );
         evidence["keys"] = scan_evidence;
+    }
+    // The person's files once more, after the run's directory went: a removal that reached them
+    // would show here.
+    if let Route::Real(real) = &route {
+        let (after_the_removal, _) = real.person.compare();
+        for stop in after_the_removal {
+            if !stops.contains(&stop) {
+                stops.push(stop);
+            }
+        }
     }
     let path = std::env::var_os(RESULT_VARIABLE)
         .filter(|value| !value.is_empty())

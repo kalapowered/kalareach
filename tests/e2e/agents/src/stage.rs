@@ -420,19 +420,47 @@ const CURRENT_LINK: &str = "current";
 /// The directory in [`INSTALLATION_DIRECTORY`] that holds a link to each runtime the build needs.
 const RUNTIME_DIRECTORY: &str = "runtime";
 
-/// Whether `place`, the names of an entry below a run's directory joined by `/`, is a link the
-/// harness makes itself when it installs a build ([`Installation::link`]): the link to the installed
-/// build, or a link directly in the directory of the runtimes. A link in any other place is not.
+/// The places, relative to a run's directory and joined by `/`, where [`Installation::link`] makes
+/// links when the build needs the executables `runtime`: the link to the installed build, and one
+/// link in the directory of the runtimes for each executable, under its own name. A link in any
+/// other place is not the harness's.
 #[must_use]
-pub fn is_an_installation_link(place: &str) -> bool {
-    let mut names = place.split('/');
-    match (names.next(), names.next(), names.next(), names.next()) {
-        (Some(INSTALLATION_DIRECTORY), Some(CURRENT_LINK), None, None) => true,
-        (Some(INSTALLATION_DIRECTORY), Some(RUNTIME_DIRECTORY), Some(name), None) => {
-            !name.is_empty()
-        }
-        _ => false,
-    }
+pub fn installation_links(runtime: &[PathBuf]) -> Vec<String> {
+    let mut places = vec![format!("{INSTALLATION_DIRECTORY}/{CURRENT_LINK}")];
+    places.extend(
+        runtime
+            .iter()
+            .filter_map(|executable| executable.file_name())
+            .map(|name| {
+                format!(
+                    "{INSTALLATION_DIRECTORY}/{RUNTIME_DIRECTORY}/{}",
+                    name.to_string_lossy()
+                )
+            }),
+    );
+    places
+}
+
+/// The rules for the scan of `run`'s directory: the directory the run made, the links the harness
+/// makes ([`installation_links`]) and the links the pinned build makes in its own home, which say
+/// the pinned executable `pinned` in the run's installation of the build at `prefix`, by the path
+/// the run starts it by and by its resolved path, and nothing else.
+#[must_use]
+pub fn scan_rules(
+    run: &Run,
+    prefix: &Path,
+    pinned: &str,
+    runtime: &[PathBuf],
+) -> crate::account::RunRules {
+    let mut executables = vec![
+        run.root()
+            .join(INSTALLATION_DIRECTORY)
+            .join(CURRENT_LINK)
+            .join(pinned),
+    ];
+    executables.extend(std::fs::canonicalize(prefix.join(pinned)));
+    crate::account::RunRules::new(run.pin(), installation_links(runtime))
+        .with_agent_links(crate::held::CONFIG_DIRECTORY, executables)
 }
 
 /// The directories a session searches, in order: the run's link to the installed build, the run's
