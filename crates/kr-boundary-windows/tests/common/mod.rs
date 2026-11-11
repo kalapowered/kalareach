@@ -186,7 +186,18 @@ pub fn look_at(path: &Path) -> Outside {
     privileged(|| {
         let metadata = std::fs::symlink_metadata(path).expect("the object is there");
         let bytes = if metadata.is_file() {
-            Some(std::fs::read(path).expect("the file reads"))
+            // The backup privilege reaches an object that refuses the system only for an open that
+            // asks for backup semantics, which the standard library's `read` does not.
+            use std::io::Read as _;
+            use std::os::windows::fs::OpenOptionsExt as _;
+            let mut bytes = Vec::new();
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+                .and_then(|mut file| file.read_to_end(&mut bytes))
+                .expect("the file reads");
+            Some(bytes)
         } else {
             None
         };

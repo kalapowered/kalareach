@@ -195,7 +195,9 @@ fn the_group_reaches_its_root_tmp_and_home_and_a_sibling_and_the_run_directory_d
             let part = part.clone();
             move || std::fs::read_dir(&part).map(|entries| entries.count())
         });
-        assert_eq!(listed.unwrap(), 1, "and lists it");
+        // The root also holds `tmp` and `home`; those two hold only the file made here.
+        let expected = if name == "root" { 3 } else { 1 };
+        assert_eq!(listed.unwrap(), expected, "and lists it");
         let sibling = as_token(&siblings.second, {
             let part = part.clone();
             move || {
