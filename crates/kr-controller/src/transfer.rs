@@ -726,15 +726,16 @@ impl TransferModule {
     }
 
     /// Writes the end of each session the registry holds as closed among the sessions the drafts
-    /// `actor_id` holds open target, before a create is counted against them.
+    /// `actor_id` holds open target, before a create or a binding is counted against them.
     ///
     /// A session's closure queues the write that ends its drafts on a task of its own, so a create
-    /// that follows closely, or a write that failed and waits for the next sweep or start, would
-    /// count drafts of a session that has ended. Every create settles its own principal's sessions
-    /// first, whatever the count is and whatever another create is doing, so a draft stops counting
-    /// when its session is recorded closed and the bound refuses only for drafts that are open. The
-    /// work is bounded by the principal's open drafts, not by the sessions the host has closed. A
-    /// pass that cannot be made does not stop the create: the service counts what it holds.
+    /// or a binding that follows closely, or a write that failed and waits for the next sweep or
+    /// start, would count drafts of a session that has ended. Every create, and every binding,
+    /// settles its own principal's sessions first, whatever the count is and whatever another write
+    /// is doing, so a draft stops counting when its session is recorded closed and the bound refuses
+    /// only for drafts that are open. The work is bounded by the sessions the principal's unsent
+    /// drafts target, not by the sessions the host has closed. A pass that cannot be made does not
+    /// stop the write: the service counts what it holds.
     pub(crate) async fn settle_closures_of_open_drafts(
         &self,
         owner: &Arc<Controller>,

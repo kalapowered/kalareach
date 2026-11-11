@@ -3305,9 +3305,9 @@ device that may not read the session's receipts is told `OUTCOME_UNKNOWN`.
 
 A device holds at most 64 open drafts. A draft is open until a prompt sends it to a session or the
 session it targets closes: the closure of a session queues, on a task of its own, the write that
-orphans its drafts, and each `draft.create` first writes the end of the sessions its device's open
-drafts target that the registry holds closed, so a draft stops counting when its session is
-recorded closed. A `draft.create` past the bound is
+orphans its drafts, and each `draft.create` and each `agent.draft.add_attachment` first writes the
+end of the sessions its device's open drafts target that the registry holds closed, so a draft stops
+counting when its session is recorded closed. A `draft.create` past the bound is
 refused `QUOTA_EXCEEDED` with the bound in the message, only after the service has asked the
 admission again, so a device whose authority has gone learns no count. An
 `agent.draft.add_attachment` that would bring a draft back into the count, because the agent took all
@@ -3335,7 +3335,7 @@ refusal shows nothing of what exists. A draft that a prompt named, or one with a
 because those records show what the agent was offered or took: such a draft is kept.
 While this host cannot yet say that no earlier build's session was sent a draft, a draft that
 targets such a session, or holds an upload of one, is kept too. Attachments `recorded` or `failed`
-go with the draft, since nothing was offered from them. It never
+go with the draft: the agent was given nothing from them. It never
 changes an upload: the bytes, their quota charge, the session an upload was bound to and its expiry
 stay as they are, and only `upload.cancel` of an upload still receiving frees bytes. It is an
 ordinary action write. The same action asked again, on the same connection or a replacement, is

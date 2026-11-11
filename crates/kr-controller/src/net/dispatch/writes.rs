@@ -157,7 +157,10 @@ impl RemoteConnection {
         let mutation = mutation.clone();
         let request_id = mutation.request_id;
         let effect = tokio::spawn(async move {
-            if method == Method::DraftCreate {
+            if matches!(
+                method,
+                Method::DraftCreate | Method::AgentDraftAddAttachment
+            ) {
                 controller
                     .transfer
                     .settle_closures_of_open_drafts(&controller, &actor_id)
