@@ -3272,17 +3272,15 @@ back to the session's start, and otherwise the pin or the metadata title (*Sessi
 descriptions* has the rule). `privacy.status` is answered by the daemon under `host.manage`.
 
 Three reads are refused as `UNSUPPORTED_CAPABILITY`, with the read and the reason in the message:
-`upload.status`, `download.begin` and `download.chunk`, because a transfer's chunks travel on an
-attachment-chunk stream and this host opens none on a network connection. A device that does not
-hold the right the read requires (`files.upload` for the first, `files.read` for the other two) is
-refused `PERMISSION_DENIED` first.
+`upload.status`, `download.begin` and `download.chunk`, because this host does not serve them to a
+paired device. A device that does not hold the right the read requires (`files.upload` for the
+first, `files.read` for the other two) is refused `PERMISSION_DENIED` first.
 
-The four upload writes, `upload.begin`, `upload.chunk`, `upload.finish` and `upload.cancel`, are
-refused `UNSUPPORTED_CAPABILITY` for the same reason. A device's upload could not carry a chunk
-here, so none could finish, and a begin that no chunk can follow would only hold the device's
-reservation until it expired. The refusal of `upload.chunk` names the attachment-chunk stream, and
-the other three say that this host does not serve a device's upload. `terminal.palette.set` is
-refused `UNSUPPORTED_CAPABILITY` too, because no part of this host performs it for a paired device,
+Of the four upload writes, `upload.begin`, `upload.finish` and `upload.cancel` are refused
+`UNSUPPORTED_CAPABILITY` with the words that this host does not serve a device's upload. A device's
+`upload.chunk` is served on a data stream and on no other; on the control stream it is refused
+`UNSUPPORTED_CAPABILITY`, and the refusal names the attachment-chunk stream. `terminal.palette.set`
+is refused `UNSUPPORTED_CAPABILITY` too, because no part of this host performs it for a paired device,
 and `input.write` sent as a mutation is refused `INVALID_ARGUMENT`, because raw input travels as a
 request and carries no action. Each refusal comes after the device's rights are asked, so a device
 without the right is told `PERMISSION_DENIED` first, and before anything is recorded for the
@@ -3290,6 +3288,56 @@ action: it claims no route, no record is looked up and nothing is staged, so a r
 action is refused as the first was. Every other write the method table admits for a paired device
 is performed by a service of this daemon or forwarded to a worker whose own table lists the method;
 none is answered as a method this host does not know.
+
+A device opens an attachment-chunk stream on its authorised connection with a header of kind
+`attachment_chunks` that names the environment and the transfer. The transport reads the header
+under a deadline, and the host then admits the stream in this order. Each refusal resets the stream
+with nothing staged and nothing recorded, so the device sees a reset and no answer.
+
+1. The header's environment is this host's.
+2. The transfer is one of this device's own uploads, still receiving and not expired. An unknown
+   transfer, another principal's, the owner's, a cancelled one and an expired one get the same
+   refusal. The lookup runs under one of two places that the device's principal holds across all
+   its connections, and the wait for a place and the lookup are bounded by the transport's admission
+   deadline. A deadline cannot cancel a lookup that is already reading the store: it resets the
+   stream, and the lookup keeps its place until it ends, whichever connection it came on. Another
+   device's lookups do not wait for these places.
+3. The device may send a chunk of that upload: its rights, the connection's scope and the upload's
+   session are checked as for any `upload.chunk`, and the connection's authority is one the
+   authority feed has not refused. A connection the feed refuses stays up, and it is given no
+   stream.
+4. The stream is the only live stream of its transfer. A newer stream for the same transfer, on any
+   connection of the device, replaces the older, which is reset. A stream already revoked replaces
+   nothing.
+
+A stream carries `upload.chunk` for the transfer its header names and nothing else. A chunk that
+names another transfer is answered `INVALID_ARGUMENT` and any other mutation
+`UNSUPPORTED_CAPABILITY`, and the stream ends after the answer is written. A frame that is not a
+request ends the stream with no answer. `download.chunk` is refused by name, and the stream stays.
+
+Each chunk waits for its transfer's gate, so that at most one chunk of a transfer is inside the
+transfer service across all its streams, and then goes through the admission of any mutation: the
+registration, the grant, the action window, the fence and the action's record. The host writes the
+answer on the stream the chunk came on, never on the control stream, and every write on a data
+stream asks the stream's revoked state at each attempt. A stream that stalls holds nothing on the
+control stream: other requests of the device are answered while it waits. The gate belongs to the
+chunk inside the service, not to its stream, so a chunk keeps it until it leaves even when its
+stream was replaced or its connection dropped, and a replaced stream's chunk leaves the service
+before the newer stream's first chunk enters it.
+
+A stream is revoked when its connection's control stream is lost, when the device is revoked or its
+connection is withdrawn, and when a newer stream replaces it. The host asks the stream's state after
+each wait, before it replaces another stream, after the gate, and at the transfer service's own
+check under the service's lock. A chunk whose stream was revoked before that check stages nothing,
+and a chunk that passed it is committed whatever happens to the stream after. When the service
+refuses a chunk's admission because a fence is owed or the connection's authority has gone, the
+device is told, and the stream is read no further.
+
+A device holds at most four live connections. At a fifth the host serves the new connection and
+withdraws the oldest as a revocation withdraws a device's connections: it is closed, a request in
+flight on it gets no answer, and the device presents the same action on a newer connection and
+settles it as it would after any lost connection. Another device's connections are not touched. An
+owner cannot change the bound.
 
 `draft.create`, `draft.update` and `agent.draft.add_attachment` are performed by the transfer
 service under the device's own principal, which the host derives from the device's identity, so
