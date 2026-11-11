@@ -541,49 +541,292 @@ struct Tree {
     digest: [u8; 32],
 }
 
-/// The tree at `path` as its metadata says it stands now: a file is a tree of one entry, a path that
-/// is not there a tree of none. A symbolic link is an entry and is not followed. Nothing is read of
-/// any file but its metadata, and no file is written.
-fn tree_of(path: &Path) -> Result<Tree, String> {
-    use std::os::unix::fs::MetadataExt as _;
-    let mut lines: Vec<String> = Vec::new();
-    let mut pending = vec![path.to_path_buf()];
-    while let Some(entry) = pending.pop() {
-        let metadata = match std::fs::symlink_metadata(&entry) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && entry == path => {
-                break;
-            }
-            Err(error) => return Err(format!("{}: {error}", entry.display())),
+/// Why a tree could not be looked at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Class {
+    /// The tree's own path is a symbolic link: the guard refuses it and follows nothing.
+    LinkAtRoot,
+    /// An entry was gone between the listing that named it and the look at it.
+    Vanished,
+    /// A directory was another kind of entry when it was opened than when it was looked at.
+    Replaced,
+    /// The system refused a look or a listing.
+    Refused(rustix::io::Errno),
+    /// The tree is deeper than the walk goes.
+    TooDeep,
+}
+
+/// A tree that could not be looked at: the class of the failure and how many entries had been looked
+/// at by then. It says no name, so that nothing under the person's own directory is said.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Unlooked {
+    class: Class,
+    seen: usize,
+}
+
+impl std::fmt::Display for Unlooked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let seen = self.seen;
+        match self.class {
+            Class::LinkAtRoot => write!(formatter, "the directory is a symbolic link"),
+            Class::Vanished => write!(
+                formatter,
+                "an entry disappeared while the tree was looked at (after {seen} entries)"
+            ),
+            Class::Replaced => write!(
+                formatter,
+                "a directory became another kind of entry while the tree was looked at (after \
+                 {seen} entries)"
+            ),
+            Class::Refused(error) => write!(
+                formatter,
+                "the system refused a look or a listing: {error} (after {seen} entries)"
+            ),
+            Class::TooDeep => write!(
+                formatter,
+                "the tree is deeper than {DEEPEST} levels (after {seen} entries)"
+            ),
+        }
+    }
+}
+
+/// The deepest the walk goes: what lies below is not looked at, and that is a failure.
+const DEEPEST: usize = 64;
+
+/// The two moments of the walk at which a test changes the tree under it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Moment {
+    /// A directory was listed, and the entry named has not been looked at yet.
+    Listed,
+    /// The entry named was looked at and is a directory, which is not opened yet.
+    Looked,
+}
+
+/// Opens `name` in `directory` as a directory and follows no link: a name that was made a link, or
+/// any other kind of entry, since it was looked at is refused.
+fn opened_directory(
+    directory: &std::os::fd::OwnedFd,
+    name: &std::ffi::CStr,
+    looked: &rustix::fs::Stat,
+    seen: usize,
+) -> Result<std::os::fd::OwnedFd, Unlooked> {
+    use rustix::fs::{Mode, OFlags};
+    let unlooked = |class| Unlooked { class, seen };
+    let handle = rustix::fs::openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| unlooked(opening_failed(error)))?;
+    let opened = rustix::fs::fstat(&handle).map_err(|error| unlooked(Class::Refused(error)))?;
+    if (opened.st_dev, opened.st_ino) == (looked.st_dev, looked.st_ino) {
+        Ok(handle)
+    } else {
+        Err(unlooked(Class::Replaced))
+    }
+}
+
+/// The class of a failed opening of a name that was a directory when it was looked at.
+fn opening_failed(error: rustix::io::Errno) -> Class {
+    match error {
+        rustix::io::Errno::NOENT => Class::Vanished,
+        // What `O_NOFOLLOW` and `O_DIRECTORY` say of a name that is now a link or another kind.
+        rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => Class::Replaced,
+        other => Class::Refused(other),
+    }
+}
+
+/// One entry's line in the digest: its place in the tree, kind and permissions, identity, size and
+/// times.
+fn described(relative: &[u8], stat: &rustix::fs::Stat) -> Vec<u8> {
+    let mut line = relative.to_vec();
+    line.extend_from_slice(
+        format!(
+            "\0{}\0{}\0{}\0{}.{}\0{}.{}",
+            stat.st_mode,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_ctime,
+            stat.st_ctime_nsec,
+            stat.st_mtime,
+            stat.st_mtime_nsec,
+        )
+        .as_bytes(),
+    );
+    line
+}
+
+/// Looks at every entry of `directory`, and of each directory below it, through handles: an entry
+/// is looked at with `fstatat` on its directory's handle and no link followed, and a directory is
+/// opened with the same handle and no link followed, then checked to be the one that was looked at.
+/// No path is looked up again, so a directory made a link during the walk is refused, not followed.
+fn walk_directory(
+    directory: &std::os::fd::OwnedFd,
+    relative: &[u8],
+    depth: usize,
+    seen: &mut usize,
+    lines: &mut Vec<Vec<u8>>,
+    between: &mut dyn FnMut(Moment, &[u8]),
+) -> Result<(), Unlooked> {
+    use rustix::fs::{AtFlags, FileType};
+    if depth > DEEPEST {
+        return Err(Unlooked {
+            class: Class::TooDeep,
+            seen: *seen,
+        });
+    }
+    let names: Vec<std::ffi::CString> = {
+        let refused = |error| Unlooked {
+            class: Class::Refused(error),
+            seen: *seen,
         };
-        let relative = entry.strip_prefix(path).unwrap_or(&entry);
-        lines.push(format!(
-            "{}\0{}\0{}\0{}\0{}.{}\0{}.{}",
-            relative.display(),
-            metadata.mode() & 0o170_000,
-            metadata.ino(),
-            metadata.len(),
-            metadata.ctime(),
-            metadata.ctime_nsec(),
-            metadata.mtime(),
-            metadata.mtime_nsec(),
-        ));
-        if metadata.is_dir() {
-            let names = std::fs::read_dir(&entry)
-                .map_err(|error| format!("{}: {error}", entry.display()))?;
-            for name in names {
-                pending.push(
-                    name.map_err(|error| format!("{}: {error}", entry.display()))?
-                        .path(),
-                );
+        let listing = rustix::fs::Dir::read_from(directory).map_err(refused)?;
+        let mut names = Vec::new();
+        for entry in listing {
+            let entry = entry.map_err(refused)?;
+            let name = entry.file_name();
+            if name.to_bytes() != b"." && name.to_bytes() != b".." {
+                names.push(name.to_owned());
             }
         }
+        names
+    };
+    for name in names {
+        between(Moment::Listed, name.to_bytes());
+        let looked = rustix::fs::statat(directory, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| Unlooked {
+                class: if error == rustix::io::Errno::NOENT {
+                    Class::Vanished
+                } else {
+                    Class::Refused(error)
+                },
+                seen: *seen,
+            })?;
+        *seen += 1;
+        let mut path = relative.to_vec();
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(name.to_bytes());
+        lines.push(described(&path, &looked));
+        if FileType::from_raw_mode(looked.st_mode) == FileType::Directory {
+            between(Moment::Looked, name.to_bytes());
+            let child = opened_directory(directory, name.as_c_str(), &looked, *seen)?;
+            walk_directory(&child, &path, depth + 1, seen, lines, between)?;
+        }
+    }
+    Ok(())
+}
+
+/// The tree at `path` as its metadata says it stands now: a file is a tree of one entry, a path that
+/// is not there a tree of none, and a symbolic link at `path` itself is refused. A link below it is
+/// an entry and is not followed. Nothing is read of any file but its metadata, and no file is
+/// written. `between` is told of the two moments at which a test changes what is being walked.
+fn walk_tree(path: &Path, between: &mut dyn FnMut(Moment, &[u8])) -> Result<Tree, Unlooked> {
+    use rustix::fs::{FileType, Mode, OFlags};
+    let mut lines: Vec<Vec<u8>> = Vec::new();
+    let mut seen = 0_usize;
+    match rustix::fs::lstat(path) {
+        // A path that is not there is a tree of none.
+        Err(rustix::io::Errno::NOENT) => {}
+        Err(error) => {
+            return Err(Unlooked {
+                class: Class::Refused(error),
+                seen,
+            });
+        }
+        Ok(root) => match FileType::from_raw_mode(root.st_mode) {
+            FileType::Symlink => {
+                return Err(Unlooked {
+                    class: Class::LinkAtRoot,
+                    seen,
+                });
+            }
+            FileType::Directory => {
+                let handle = rustix::fs::open(
+                    path,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|error| Unlooked {
+                    class: opening_failed(error),
+                    seen,
+                })?;
+                let opened = rustix::fs::fstat(&handle).map_err(|error| Unlooked {
+                    class: Class::Refused(error),
+                    seen,
+                })?;
+                if (opened.st_dev, opened.st_ino) != (root.st_dev, root.st_ino) {
+                    return Err(Unlooked {
+                        class: Class::Replaced,
+                        seen,
+                    });
+                }
+                seen = 1;
+                lines.push(described(b"", &opened));
+                walk_directory(&handle, b"", 1, &mut seen, &mut lines, between)?;
+            }
+            _ => lines.push(described(b"", &root)),
+        },
     }
     lines.sort();
     Ok(Tree {
         entries: lines.len(),
-        digest: kr_cbor::sha256(lines.join("\n").as_bytes()),
+        digest: kr_cbor::sha256(&lines.join(&b'\n')),
     })
+}
+
+/// [`walk_tree`] with nothing changing under it.
+fn tree_of(path: &Path) -> Result<Tree, Unlooked> {
+    walk_tree(path, &mut |_, _| {})
+}
+
+/// The person's home directory, as the system's account database names it, for a run whose `HOME`
+/// is `environment`: the guard over the person's own agent files looks under the home that is
+/// theirs, so a driver started with a `HOME` of its own, which would look at a tree that is not
+/// theirs and pass, is refused before anything runs.
+///
+/// # Errors
+///
+/// Returns why the run is refused: the account database names no home for this user, or `HOME` is
+/// another directory than that one. The text names no path.
+pub fn person_home(environment: Option<&std::ffi::OsStr>) -> Result<PathBuf, String> {
+    let record = kr_ipc::paths::passwd_entry().and_then(|entry| entry.home);
+    person_home_of(environment, record.as_deref())
+}
+
+/// [`person_home`] for a given answer of the account database.
+fn person_home_of(
+    environment: Option<&std::ffi::OsStr>,
+    record: Option<&str>,
+) -> Result<PathBuf, String> {
+    let Some(record) = record.filter(|home| !home.is_empty()) else {
+        return Err(
+            "the system's account database names no home directory for this user, so the person's \
+             own files cannot be told from the run's"
+                .to_owned(),
+        );
+    };
+    let home = PathBuf::from(record);
+    let given = environment.map(PathBuf::from);
+    let same = given.as_ref().is_some_and(|given| {
+        given == &home
+            || matches!(
+                (std::fs::canonicalize(given), std::fs::canonicalize(&home)),
+                (Ok(given), Ok(home)) if given == home
+            )
+    });
+    if same {
+        Ok(home)
+    } else {
+        Err(
+            "HOME is not the home directory the system's account database names for this user: \
+             the guard over the person's own files would look at another tree, so the run is \
+             refused before it starts anything"
+                .to_owned(),
+        )
+    }
 }
 
 /// The person's own agent files as their metadata stood before a driver started anything, and the
@@ -591,7 +834,9 @@ fn tree_of(path: &Path) -> Result<Tree, String> {
 /// directory listing alone: never a file's content, so the person's login and settings stay unread,
 /// and nothing is written there. An entry that is added, removed, replaced, resized or touched is a
 /// change. What is kept is a digest and a count; what is said is `changed` or `unchanged` and the
-/// counts. A stat cannot show that a file was read, so this is a tripwire for writes.
+/// counts, and, where a tree cannot be looked at, the class of the failure and a count: never a
+/// name. A symbolic link at a named path is refused, and a directory that becomes a link during the
+/// walk is not followed. A stat cannot show that a file was read, so this is a tripwire for writes.
 #[derive(Clone, Debug)]
 pub struct MetaGuard {
     home: PathBuf,
@@ -603,8 +848,9 @@ impl MetaGuard {
     ///
     /// # Panics
     ///
-    /// Panics when the system refuses an entry's metadata for a reason other than its not being
-    /// there: a tree whose state is not known cannot be shown unchanged.
+    /// Panics when a tree cannot be looked at, for any reason other than its not being there: a
+    /// tree whose state is not known cannot be shown unchanged. The message gives the class of the
+    /// failure and a count, and names no file.
     #[must_use]
     pub fn take(home: &Path, trees: &[&str]) -> Self {
         Self {
@@ -613,7 +859,7 @@ impl MetaGuard {
                 .iter()
                 .map(|relative| {
                     let tree = tree_of(&home.join(relative)).unwrap_or_else(|why| {
-                        panic!("a file of the person's cannot be looked at: {why}")
+                        panic!("the person's directory ~/{relative} cannot be looked at: {why}")
                     });
                     ((*relative).to_owned(), tree)
                 })
@@ -679,18 +925,19 @@ fn turn_identifier(value: &Value) -> Option<String> {
 pub struct Recorded {
     /// How many turns the model ran, as the record counts them.
     pub turns: u64,
-    /// How many of them are counted by the text of their line, because the line names no turn.
+    /// How many of them are counted by occurrence of their line, because the line names no turn.
     pub unnamed: u64,
+    /// How many files of the record were read: none where the record's directory is not there.
+    pub files: u64,
 }
 
 /// How many turns the model ran, as the agent's own record under `root` holds them: the lines the
-/// entry's turn line marks, each turn once, whichever of the agent's files, a copy of a
-/// conversation among them, holds it. A line is the same turn as another where both name the same
-/// turn (`turn_id`), and where a line names none, where the two lines are equal. Such a line holds
-/// the time it was written, so a copy of a conversation that writes its lines again with other times
-/// counts a turn it copies once more: the count is then too high, never too low, and
-/// [`Recorded::unnamed`] says how many turns stand on their text. No other member of a line
-/// identifies a turn offline.
+/// entry's turn line marks. A line that names its turn (`turn_id`) counts once for that name,
+/// whichever of the agent's files, a copy of a conversation among them, holds it. A line that names
+/// none counts once for each time it occurs, in any file: nothing offline says that two equal lines
+/// are one turn, and a copy of a conversation written again would count its turns twice, so the
+/// count can be too high and is never too low. [`Recorded::unnamed`] says how many turns stand on
+/// an occurrence. No other member of a line identifies a turn offline.
 ///
 /// # Errors
 ///
@@ -702,7 +949,8 @@ pub fn turns_recorded(account: &Account, root: &Path) -> Result<Recorded, String
             .to_owned()
     })?;
     let mut turns: BTreeSet<String> = BTreeSet::new();
-    let mut unnamed: BTreeSet<String> = BTreeSet::new();
+    let mut unnamed = 0_u64;
+    let mut files = 0_u64;
     let mut pending = vec![root.to_path_buf()];
     while let Some(path) = pending.pop() {
         let metadata = match std::fs::metadata(&path) {
@@ -712,6 +960,7 @@ pub fn turns_recorded(account: &Account, root: &Path) -> Result<Recorded, String
                 return Ok(Recorded {
                     turns: 0,
                     unnamed: 0,
+                    files: 0,
                 });
             }
             Err(error) => return Err(format!("{}: {error}", path.display())),
@@ -726,6 +975,7 @@ pub fn turns_recorded(account: &Account, root: &Path) -> Result<Recorded, String
         } else {
             let bytes =
                 std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+            files += 1;
             for line in String::from_utf8_lossy(&bytes).lines() {
                 if line.contains(marker) {
                     let named = serde_json::from_str::<Value>(line)
@@ -736,18 +986,140 @@ pub fn turns_recorded(account: &Account, root: &Path) -> Result<Recorded, String
                         Some(named) => {
                             turns.insert(named);
                         }
-                        None => {
-                            unnamed.insert(line.to_owned());
-                        }
+                        None => unnamed += 1,
                     }
                 }
             }
         }
     }
-    // A name and a line's text cannot be the same turn: they are kept apart, and counted together.
+    // A name and an occurrence cannot be the same turn: they are kept apart, and counted together.
     Ok(Recorded {
-        turns: u64::try_from(turns.len() + unnamed.len()).unwrap_or(u64::MAX),
-        unnamed: u64::try_from(unnamed.len()).unwrap_or(u64::MAX),
+        turns: u64::try_from(turns.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(unnamed),
+        unnamed,
+        files,
+    })
+}
+
+/// What the agent's own record says of the turns a case charged, once the case has ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Audit {
+    /// The record holds no more turns than were charged, and at least one where the case passed
+    /// with a charged turn.
+    Agrees,
+    /// The record holds this many turns more than the ledger was charged for.
+    Surplus(u64),
+    /// A case passed with charged turns and the record holds none, in this many files: the count
+    /// that backs the ledger saw nothing, so it cannot be relied on for this entry's record.
+    Blind {
+        /// How many files of the record were read.
+        files: u64,
+    },
+    /// The record could not be counted.
+    Uncountable(String),
+}
+
+/// Judges the agent's record of the turns against the `charged` turns of a case that `passed` or
+/// did not. A case that failed may have charged a turn that never reached the agent, so an empty
+/// record says nothing of it; one that passed ran every turn it charged, and a record that holds none
+/// cannot be the entry's record.
+#[must_use]
+pub fn audit_turns(passed: bool, charged: u64, recorded: &Result<Recorded, String>) -> Audit {
+    match recorded {
+        Err(why) => Audit::Uncountable(why.clone()),
+        Ok(found) if found.turns > charged => Audit::Surplus(found.turns - charged),
+        Ok(found) if passed && charged > 0 && found.turns == 0 => {
+            Audit::Blind { files: found.files }
+        }
+        Ok(_) => Audit::Agrees,
+    }
+}
+
+/// Runs `command` in a process group of its own and returns its output. The group is ended whole as
+/// soon as its leader has exited or `within` has passed, while the leader is not yet reaped and its
+/// number still names the group, so that nothing the command started outlives it with the
+/// environment it was given, and no signal can reach a group that took the number since. A command
+/// that does not end within `within`, or whose output stays open for five seconds after the group
+/// was ended, is the answer.
+///
+/// # Errors
+///
+/// Returns why it did not finish.
+pub fn grouped_output(
+    mut command: std::process::Command,
+    within: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    use std::io::Read as _;
+    use std::os::unix::process::CommandExt as _;
+    use std::time::{Duration, Instant};
+    command
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("could not start: {error}"))?;
+    let group = i32::try_from(child.id()).map_err(|_| "a process number too large".to_owned())?;
+    let pid = rustix::process::Pid::from_raw(group).ok_or("a process number of zero")?;
+    let read = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            let _ = sent.send(bytes);
+        });
+        received
+    };
+    let stdout = read(
+        child
+            .stdout
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
+    );
+    let stderr = read(
+        child
+            .stderr
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
+    );
+    let started = Instant::now();
+    let ended = loop {
+        // Whether the leader has ended, read without reaping it, so its number stays its own.
+        let exited = rustix::process::waitid(
+            rustix::process::WaitId::Pid(pid),
+            rustix::process::WaitIdOptions::EXITED
+                | rustix::process::WaitIdOptions::NOHANG
+                | rustix::process::WaitIdOptions::NOWAIT,
+        );
+        match exited {
+            Ok(Some(_)) => break Ok(()),
+            Ok(None) if started.elapsed() < within => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => break Err(format!("it did not finish within {within:?}")),
+            Err(error) => break Err(format!("it could not be waited for: {error}")),
+        }
+    };
+    // The group goes whole while its leader is unreaped; only then is the leader reaped.
+    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    let status = child
+        .wait()
+        .map_err(|error| format!("it could not be reaped: {error}"))?;
+    ended?;
+    let handover = Instant::now() + Duration::from_secs(5);
+    let collect = |received: std::sync::mpsc::Receiver<Vec<u8>>| {
+        received
+            .recv_timeout(handover.saturating_duration_since(Instant::now()))
+            .map_err(|_| "it ended and its output stayed open past five seconds".to_owned())
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: collect(stdout)?,
+        stderr: collect(stderr)?,
     })
 }
 
@@ -825,7 +1197,80 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_counts_once_however_many_files_hold_it_and_a_line_with_no_name_counts_by_its_text() {
+    fn a_tree_that_cannot_be_looked_at_is_a_class_and_a_count_and_names_no_entry() {
+        let home = scratch("unlooked");
+        let tree = home.join(".agent");
+        std::fs::create_dir_all(tree.join("sessions")).expect("directories");
+        std::fs::write(tree.join("sessions/rollout-name.jsonl"), b"x").expect("a file");
+        std::fs::write(tree.join("login-name.json"), b"x").expect("a file");
+        let home_text = home.to_str().expect("a path of text").to_owned();
+        let names_nothing = |why: &str| {
+            for name in ["rollout-name", "login-name", "sessions", &home_text] {
+                assert!(!why.contains(name), "{why}");
+            }
+        };
+        // An entry that is gone between the listing that named it and the look at it.
+        let why = walk_tree(&tree, &mut |moment, name| {
+            if moment == Moment::Listed && name == b"login-name.json" {
+                std::fs::remove_file(tree.join("login-name.json")).expect("removed");
+            }
+        })
+        .expect_err("an entry that disappears during the walk is a failure");
+        assert_eq!(why.class, Class::Vanished);
+        names_nothing(&why.to_string());
+        // A directory that became a link between the look at it and its opening is refused: the
+        // walk does not go into what the link names.
+        let elsewhere = scratch("elsewhere");
+        std::fs::write(elsewhere.join("outside-name"), b"x").expect("a file");
+        let why = walk_tree(&tree, &mut |moment, name| {
+            if moment == Moment::Looked && name == b"sessions" {
+                std::fs::remove_dir_all(tree.join("sessions")).expect("removed");
+                std::os::unix::fs::symlink(&elsewhere, tree.join("sessions")).expect("a link");
+            }
+        })
+        .expect_err("a directory that became a link is refused");
+        assert_eq!(why.class, Class::Replaced);
+        names_nothing(&why.to_string());
+        // A link at the tree's own path is refused, when the guard is taken and when it looks again.
+        let link = home.join(".linked");
+        std::os::unix::fs::symlink(&elsewhere, &link).expect("a link");
+        assert_eq!(
+            tree_of(&link).expect_err("a link at the root").class,
+            Class::LinkAtRoot
+        );
+        let taken = std::panic::catch_unwind(|| MetaGuard::take(&home, &[".linked"]))
+            .expect_err("a guard over a link is refused");
+        let said = panic_text(&*taken);
+        names_nothing(&said);
+        assert!(said.contains("symbolic link"), "{said}");
+        let guard = MetaGuard::take(&home, &[".agent"]);
+        std::fs::remove_dir_all(&tree).expect("removed");
+        std::os::unix::fs::symlink(&elsewhere, &tree).expect("a link");
+        let (stops, evidence) = guard.compare();
+        assert_eq!(stops.len(), 1, "{stops:?}");
+        assert_eq!(stops[0].0, "person_file_unreadable");
+        names_nothing(&format!("{stops:?}{evidence}"));
+        // A directory the system will not list. A process with every permission lists it.
+        if !rustix::process::geteuid().is_root() {
+            let other = scratch("closed");
+            let closed = other.join("closed-name");
+            std::fs::create_dir_all(&closed).expect("a directory");
+            std::fs::set_permissions(&closed, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+                .expect("closed");
+            let why = tree_of(&other).expect_err("a directory that cannot be listed");
+            assert!(matches!(why.class, Class::Refused(_)), "{why}");
+            assert!(!why.to_string().contains("closed-name"), "{why}");
+            std::fs::set_permissions(&closed, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .expect("opened");
+            std::fs::remove_dir_all(&other).expect("clean up");
+        }
+        std::fs::remove_dir_all(&elsewhere).expect("clean up");
+        std::fs::remove_dir_all(&home).expect("clean up");
+    }
+
+    #[test]
+    fn a_turn_counts_once_by_its_name_however_many_files_hold_it_and_a_line_with_no_name_counts_each_time()
+     {
         let root = scratch("turns");
         let line = |id: &str| {
             format!(r#"{{"timestamp":"t","payload":{{"type":"task_started","turn_id":"{id}"}}}}"#)
@@ -842,29 +1287,123 @@ mod tests {
             format!("{}\n{}\n{}\n", line("one"), line("two"), line("three")),
         )
         .expect("a copy");
+        // Two equal lines that name no turn are two turns, not one, as are a third that is no JSON.
         std::fs::write(
             root.join("c.jsonl"),
-            "{\"type\":\"task_started\"}\nnot json \"type\":\"task_started\"\n",
+            "{\"type\":\"task_started\"}\n{\"type\":\"task_started\"}\nnot json \"type\":\"task_started\"\n",
         )
         .expect("lines with no name");
         assert_eq!(
             turns_recorded(&account(), &root),
             Ok(Recorded {
-                turns: 5,
-                unnamed: 2
+                turns: 6,
+                unnamed: 3,
+                files: 3
             })
         );
         assert_eq!(
             turns_recorded(&account(), &root.join("none")),
             Ok(Recorded {
                 turns: 0,
-                unnamed: 0
+                unnamed: 0,
+                files: 0
             })
         );
         let mut unnamed = account();
         unnamed.turn_line = None;
         assert!(turns_recorded(&unnamed, &root).is_err());
         std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    #[test]
+    fn a_case_that_passed_with_a_charged_turn_stops_when_the_record_holds_no_turn() {
+        let found = |turns, files| {
+            Ok(Recorded {
+                turns,
+                unnamed: 0,
+                files,
+            })
+        };
+        // The record is not there, or holds files with no turn in them: a passed case with a
+        // charge is blind, and says how many files were read.
+        assert_eq!(
+            audit_turns(true, 1, &found(0, 0)),
+            Audit::Blind { files: 0 }
+        );
+        assert_eq!(
+            audit_turns(true, 2, &found(0, 4)),
+            Audit::Blind { files: 4 }
+        );
+        // A case that failed may have charged a turn that never reached the agent; one that
+        // charged nothing has nothing to find.
+        assert_eq!(audit_turns(false, 1, &found(0, 0)), Audit::Agrees);
+        assert_eq!(audit_turns(true, 0, &found(0, 0)), Audit::Agrees);
+        // Fewer turns than were charged is not a surplus: a charged prompt a host refused is no turn.
+        assert_eq!(audit_turns(true, 2, &found(1, 1)), Audit::Agrees);
+        assert_eq!(audit_turns(true, 1, &found(3, 1)), Audit::Surplus(2));
+        assert_eq!(audit_turns(false, 1, &found(3, 1)), Audit::Surplus(2));
+        assert_eq!(
+            audit_turns(true, 1, &Err("unread".to_owned())),
+            Audit::Uncountable("unread".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_run_whose_home_is_not_the_account_databases_is_refused_before_it_starts() {
+        let home = scratch("home");
+        let other = scratch("other-home");
+        let named = home.to_str().expect("a path of text");
+        // The same directory, written two ways.
+        assert_eq!(
+            person_home_of(Some(home.as_os_str()), Some(named)),
+            Ok(home.clone())
+        );
+        assert_eq!(
+            person_home_of(Some(home.join(".").as_os_str()), Some(named)),
+            Ok(home.clone())
+        );
+        // Another directory, no HOME, and an account database that names none.
+        for refused in [
+            person_home_of(Some(other.as_os_str()), Some(named)),
+            person_home_of(None, Some(named)),
+            person_home_of(Some(home.as_os_str()), None),
+            person_home_of(Some(home.as_os_str()), Some("")),
+        ] {
+            let why = refused.expect_err("refused");
+            assert!(
+                !why.contains(named) && !why.contains(other.to_str().expect("text")),
+                "the refusal names no directory: {why}"
+            );
+        }
+        std::fs::remove_dir_all(&home).expect("clean up");
+        std::fs::remove_dir_all(&other).expect("clean up");
+    }
+
+    #[test]
+    fn a_probe_ends_whole_before_its_output_is_returned_and_one_that_hangs_is_ended() {
+        let mut command = std::process::Command::new("/bin/sh");
+        // The leader exits at once and leaves a helper that holds the output open.
+        command.arg("-c").arg("/bin/sleep 300 & echo $!");
+        let output = grouped_output(command, std::time::Duration::from_secs(60))
+            .expect("the group ended whole, so the output closed");
+        let helper: i32 = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .expect("the helper's number");
+        let helper = rustix::process::Pid::from_raw(helper).expect("a number");
+        let started = std::time::Instant::now();
+        while rustix::process::test_kill_process(helper).is_ok() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the helper the probe left still runs"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let mut hangs = std::process::Command::new("/bin/sh");
+        hangs.arg("-c").arg("/bin/sleep 300");
+        let why = grouped_output(hangs, std::time::Duration::from_millis(300))
+            .expect_err("a probe that hangs is ended and refused");
+        assert!(why.contains("did not finish"), "{why}");
     }
 
     #[test]
