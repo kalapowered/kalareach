@@ -8,12 +8,11 @@
 //! can leave the last record cut short, so the reader treats a record that does not complete, a
 //! last record whose checksum is wrong and a tail of zero bytes as a torn tail: it returns the
 //! complete records before it and says how many bytes it dropped. A record that is not the last
-//! and whose checksum is wrong cannot come from a cut write; the reader refuses the whole journal
-//! and names the record. A length over [`MAX_RECORD`] is damage in the same way, since no writer
-//! makes one. A length damaged to a smaller value that still ends before the journal's end fails
-//! its checksum, but one damaged to point past the end reads as a cut record, because a cut record
-//! is exactly a length whose bytes did not all arrive: the damage model is a torn write, not a
-//! flipped bit in the middle of the file.
+//! and whose checksum is wrong cannot come from a cut write, and neither can a length over
+//! [`MAX_RECORD`] or a length that runs past the end of the journal while a valid record follows
+//! it: the reader returns the records before the damage and the damage, so that the invocation's
+//! first rows are still known. A cut record is the last thing in the file, so a valid record found
+//! after a record that does not complete shows the length is damaged and nothing was cut.
 //!
 //! This module knows nothing of what a record means, where the bytes live or when they are
 //! durable.
@@ -30,7 +29,7 @@ pub enum FramingError {
     /// A record to write is longer than [`MAX_RECORD`].
     #[error("a record of {0} bytes is longer than the limit")]
     TooLong(usize),
-    /// A record that is not the last is damaged.
+    /// A record that is not a torn tail is damaged.
     #[error("record {index} of the journal, at byte {offset}, is damaged")]
     Damaged {
         /// The record's position among the journal's records, counted from zero.
@@ -43,18 +42,24 @@ pub enum FramingError {
 /// The records a journal's bytes hold.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Reading<'a> {
-    /// The bytes of each complete record, in order.
+    /// The bytes of each complete record before any damage, in order.
     pub records: Vec<&'a [u8]>,
     /// How many bytes the complete records take. A writer that goes on appending first cuts the
     /// journal to this length.
     pub valid_len: usize,
+    /// The damage that ended the reading, when the bytes after the records are not a torn tail.
+    pub damage: Option<FramingError>,
 }
 
 impl Reading<'_> {
-    /// How many bytes at the end were not a complete record.
+    /// How many bytes at the end were a torn record: none when the journal is damaged.
     #[must_use]
     pub fn torn_len(&self, total: usize) -> usize {
-        total - self.valid_len
+        if self.damage.is_some() {
+            0
+        } else {
+            total - self.valid_len
+        }
     }
 }
 
@@ -108,15 +113,47 @@ pub fn encode(payload: &[u8]) -> Result<Vec<u8>, FramingError> {
     Ok(record)
 }
 
-/// Reads every complete record in a journal's bytes.
+/// Whether a valid record begins after the first record's own length and checksum within `rest`.
 ///
-/// # Errors
+/// It is asked only of bytes that end before the length at their start says they should, so `rest`
+/// is shorter than one record can be and the search is bounded by that: it tries each starting
+/// point whose length is plausible and checks one record's checksum there.
+fn a_valid_record_follows(rest: &[u8]) -> bool {
+    for start in LENGTH_BYTES + CHECKSUM_BYTES..rest.len() {
+        let Some(length) = rest[start..].first_chunk::<LENGTH_BYTES>() else {
+            break;
+        };
+        let length = u32::from_le_bytes(*length) as usize;
+        if length == 0 || length > MAX_RECORD {
+            continue;
+        }
+        let total = LENGTH_BYTES + length + CHECKSUM_BYTES;
+        let Some(record) = rest[start..].get(..total) else {
+            continue;
+        };
+        let stored = u32::from_le_bytes([
+            record[total - 4],
+            record[total - 3],
+            record[total - 2],
+            record[total - 1],
+        ]);
+        if crc32c(&record[..total - CHECKSUM_BYTES]) == stored {
+            return true;
+        }
+    }
+    false
+}
+
+/// Reads every complete record in a journal's bytes, and says how the reading ended.
 ///
-/// Returns [`FramingError::Damaged`] for a record before the tail whose checksum is wrong, or whose
-/// length is over [`MAX_RECORD`].
-pub fn read_all(bytes: &[u8]) -> Result<Reading<'_>, FramingError> {
+/// A torn tail ends the reading with no damage. A record before the tail whose checksum is wrong,
+/// a length over [`MAX_RECORD`] and a length that runs past the end while a valid record follows
+/// it end it with [`FramingError::Damaged`], and the records before that point are returned.
+#[must_use]
+pub fn read_all(bytes: &[u8]) -> Reading<'_> {
     let mut records = Vec::new();
     let mut offset = 0;
+    let mut damage = None;
     while offset < bytes.len() {
         let rest = &bytes[offset..];
         let damaged = FramingError::Damaged {
@@ -132,10 +169,14 @@ pub fn read_all(bytes: &[u8]) -> Result<Reading<'_>, FramingError> {
         };
         let length = u32::from_le_bytes(*length) as usize;
         if length > MAX_RECORD {
-            return Err(damaged);
+            damage = Some(damaged);
+            break;
         }
         let total = LENGTH_BYTES + length + CHECKSUM_BYTES;
         if rest.len() < total {
+            if a_valid_record_follows(rest) {
+                damage = Some(damaged);
+            }
             break;
         }
         let covered = &rest[..LENGTH_BYTES + length];
@@ -146,16 +187,17 @@ pub fn read_all(bytes: &[u8]) -> Result<Reading<'_>, FramingError> {
             rest[total - 1],
         ]);
         if crc32c(covered) != stored {
-            if rest.len() == total {
-                break;
+            if rest.len() != total {
+                damage = Some(damaged);
             }
-            return Err(damaged);
+            break;
         }
         records.push(&covered[LENGTH_BYTES..]);
         offset += total;
     }
-    Ok(Reading {
+    Reading {
         records,
         valid_len: offset,
-    })
+        damage,
+    }
 }
