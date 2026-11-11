@@ -334,7 +334,15 @@ crate carries; a client that seals differently supplies its own.
 `uploads::Upload` is one upload's plan: the content, the layout the host chose and the chunks the
 host has acknowledged. `uploads::send` drives it. The reservation, the status reads and the
 publication go on the session, and every chunk goes on the transfer's attachment-chunk lane, a
-`chunks::ChunkLane` that `chunks::ChunkRoute` opens once the transfer is reserved.
+`chunks::ChunkLane` that `chunks::ChunkRoute` opens once the transfer is reserved. A route is
+`ChunkRoute::local` for a host on this machine and `ChunkRoute::network` for a paired host.
+
+`send` borrows the plan for as long as it runs, so a screen reads the upload from the
+`watch::Sender<Progress>` it is given: the stage (`Starting`, `Sending`, `Resuming`, `Publishing`,
+`Published`), how many chunks the host has acknowledged, and how many the layout has. `Resuming`
+stands from a lane that failed, or a window the host refused, until the next chunk is acknowledged.
+Dropping the `send` future abandons the upload and resets the lane's stream; the transfer stays
+with the host until `uploads::cancel` releases it.
 
 No chunk travels on a control connection, whatever its size. A control frame holds at most 1 MiB and
 a full chunk is 1 MiB of data plus its metadata, so section 23 gives chunks a stream kind of their
@@ -345,9 +353,9 @@ It says hello like any local client and keeps the action window the host gives t
 adopting each renewal. A lane carries one transfer and refuses a chunk of another before it sends
 anything.
 
-- A lane that drops or will not open, and a chunk the host refuses with a transient code, are retried
-  as `RequestClass::TransferChunk`. The budget is three retries, and progress the host confirms
-  restores it. Before it sends again the driver reads `upload.status` and gives the plan the host's
+- A lane that drops or will not open, a chunk the host refuses with a transient code, and a chunk
+  the host answers `OUTCOME_UNKNOWN` are retried as `RequestClass::TransferChunk`. The budget is
+  three retries, and progress the host confirms restores it. Before it sends again the driver reads `upload.status` and gives the plan the host's
   bitmap, so a chunk the host stored after its answer was lost is not sent twice, and the upload
   keeps its identifier.
 - The plan stays with the caller. Calling `send` again with a plan that already holds a transfer
@@ -372,6 +380,43 @@ anything.
 - `ChunkLane::read_chunk` hands back a downloaded chunk only when it is exactly the chunk
   `download.begin` described: its index, its length and its digest. Checking the whole file and
   writing it to a destination belong to whoever publishes the download.
+
+### A paired host
+
+A paired host takes a transfer's chunks on a data stream of the control connection, of kind
+`attachment_chunks`, one stream for each transfer. Before it reserves or opens anything,
+`ChunkRoute::network` asks the host which streams it takes from a device (`transfer.streams`). The
+read is not signalled, so a refusal of it does not start the review of the connection's rights. A
+host of an earlier build refuses the method as one it does not list, `PERMISSION_DENIED` with "the
+method is not available", and a host that does not list `attachment_chunks` answers without it.
+Both become `UNSUPPORTED_CAPABILITY`, "this host does not accept an attachment stream from a device;
+update it". Any other refusal is returned as it is. A session whose transport has no data streams,
+such as one to a host on this machine, is refused `INVALID_ARGUMENT` before the host is asked
+anything.
+
+A lane there is one stream, opened with a header that names the connection, the environment and
+the transfer, and used one frame at a time: the chunk, then its answer on the same stream. The
+stream runs under the connection's registration, grant and windows, so a chunk carries the window
+the control connection's reader last received, chosen by the rule a local lane uses, and its
+request identifier comes from the session's counter, so none repeats one the connection has used.
+The route remembers a window the host refused as not permitted, and the lane that replaces the
+failed one waits for a window with another identifier; if none arrives before the refused one would
+have expired, the lane has none (`NoActionWindow`) and the driver goes on as for any failed lane.
+Before each chunk the lane asks the transport whether this device ended the connection, as a
+sign-out does, and stops with the reason the transport recorded.
+
+The client bounds every wait on the host, because its stream registry holds no deadlines. The open
+of the stream, which waits for the host's stream credit while it holds one of the connection's four
+transfer slots and then writes the header, has thirty seconds. The write of one chunk has two
+minutes, and the wait for its answer one minute. A bound that passes ends the lane, resets its
+stream and gives the slot back, and the driver reads `upload.status` as it does after any lane that
+failed. A host that gives no credit, or reads a chunk and never answers, costs one bound and
+never the upload.
+
+A chunk the host answers `OUTCOME_UNKNOWN` is neither sent nor unsent. The driver reads
+`upload.status` and sends exactly the chunks the bitmap lacks, as it does after a lost answer, and a
+refused stream, such as one for an upload that has expired, ends the same way: the status read says
+what became of the upload, and the header is not sent again blindly.
 
 ## Settings sync
 
