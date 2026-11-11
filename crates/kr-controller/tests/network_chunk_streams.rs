@@ -20,7 +20,7 @@ use kr_crypto::keys::DeviceKeys;
 use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::{StreamHeader, StreamKind, StreamResource};
-use kr_protocol::ids::{ActionId, ActorId, EnvironmentId, SessionId, TransferId};
+use kr_protocol::ids::{ActionId, ActorId, EnvironmentId, RequestId, SessionId, TransferId};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Bytes, Digest256, Nullable, U64};
@@ -1159,5 +1159,128 @@ async fn a_stalled_chunk_stream_holds_nothing_on_the_control_stream() {
     control_calls("held").await;
     drop(stalled);
     release.send(()).expect("the chunk goes on");
+    host.stop().await;
+}
+
+/// Whether a control connection of a device is served: it answers a read.
+async fn is_served(raw: &RawDevice) -> bool {
+    matches!(
+        raw.try_read(Method::HostInfo, &NoParams {}).await,
+        Some(Ok(_))
+    )
+}
+
+/// KR-REQ-23.21: a device holds at most four live connections, and the newest wins. Each of two
+/// devices holds four, which withdraws nobody, and the first device's oldest has a mutation in
+/// flight, held before the service's ask. A fifth connection of the first device is served and its
+/// oldest is withdrawn: that connection ends at the device with no answer to the held request, and
+/// the same action sent on the fifth settles and is made at most once, whether or not the withdrawn
+/// connection's request committed before it was lost. The first device's other three connections
+/// stand, and so do the second device's four until its own fifth withdraws its own oldest only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fifth_connection_of_a_device_withdraws_its_oldest() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let rights = [ActionRight::FilesUpload, ActionRight::SessionView];
+    let device = paired(&host, &owner, &rights).await;
+    let neighbour = paired(&host, &owner, &rights).await;
+    // The first connection of each is the one `paired` opened; three more make four.
+    let mut device_more = Vec::new();
+    let mut neighbour_more = Vec::new();
+    for _ in 0..3 {
+        device_more.push(device.again(&host).await);
+        neighbour_more.push(neighbour.again(&host).await);
+    }
+    // The control: four connections withdraw nobody.
+    for raw in [&device.raw, &neighbour.raw]
+        .into_iter()
+        .chain(&device_more)
+        .chain(&neighbour_more)
+    {
+        assert!(is_served(raw).await, "four connections are all served");
+    }
+
+    // The oldest has a mutation in flight, held before the service's ask.
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let create = kr_protocol::transfer::DraftCreateParams {
+        environment_id: host.environment_id,
+        device_id: Nullable::null(),
+        session_id: Nullable::null(),
+        application_instance_id: Nullable::null(),
+        text: "made once".to_owned(),
+    };
+    let window = device.raw.action_window_id();
+    let (held, release) = host.controller().transfer().pause_after_the_outer_check();
+    let request = device
+        .raw
+        .submit(Method::DraftCreate, action, on_the_host(&host), &create)
+        .await;
+    arrived(held).await;
+
+    // A fifth connects and is served, and the oldest is withdrawn: it ends at the device, and the
+    // held request gets no answer.
+    let fifth = device.again(&host).await;
+    assert!(is_served(&fifth).await, "the fifth connection is served");
+    assert_eq!(
+        device.raw.answered_before_closing(request, WAIT).await,
+        Some(false),
+        "the oldest connection ends with no answer to its held request"
+    );
+    until(|| host.connections_of(&device.record) == 4).await;
+    release.send(()).expect("the held request goes on");
+
+    // The same action on the fifth, presented under the window it was first sent in as a device
+    // does that sends it again on a later connection, settles: it is answered from the record, or
+    // the device is told that its outcome is not reported. Whether the held request committed
+    // before its connection's registration went is for the host to say, and it never makes two.
+    let repeated = fifth
+        .mutate_in(
+            window,
+            Method::DraftCreate,
+            action,
+            on_the_host(&host),
+            &create,
+        )
+        .await;
+    assert!(
+        matches!(&repeated, Ok(_))
+            || matches!(&repeated, Err(error) if error.code == ErrorCode::OutcomeUnknown),
+        "the same action on the fifth connection settles: {repeated:?}"
+    );
+    let drafts = host
+        .controller()
+        .transfer()
+        .service()
+        .open_drafts(&device.actor())
+        .expect("the drafts are counted");
+    assert!(drafts <= 1, "the action made at most one draft: {drafts}");
+
+    // The other three stand, and so do the second device's four.
+    for raw in device_more
+        .iter()
+        .chain([&fifth, &neighbour.raw])
+        .chain(&neighbour_more)
+    {
+        assert!(is_served(raw).await, "no other connection was withdrawn");
+    }
+
+    // The second device's fifth withdraws its own oldest and nothing of the first device's. The
+    // request named is one the connection never made, so that its end is all there is to read.
+    let neighbours_fifth = neighbour.again(&host).await;
+    assert_eq!(
+        neighbour
+            .raw
+            .answered_before_closing(RequestId::new(u64::MAX), WAIT)
+            .await,
+        Some(false),
+        "the second device's oldest connection ends"
+    );
+    for raw in device_more
+        .iter()
+        .chain([&fifth, &neighbours_fifth])
+        .chain(&neighbour_more)
+    {
+        assert!(is_served(raw).await, "no connection but the oldest ended");
+    }
     host.stop().await;
 }
