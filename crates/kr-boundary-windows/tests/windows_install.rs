@@ -1221,6 +1221,152 @@ fn summary_of(path: &Path) -> kr_boundary_windows::win::sd::Summary {
     kr_boundary_windows::win::sd::summary_of_handle(&open_folder(path, READ_CONTROL)).unwrap()
 }
 
+/// The removal's last step deletes the leftover replacement of the manifest with the other records,
+/// and when something cannot be removed it says what stayed, with the reason, instead of reporting
+/// that the installation is removed.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_removal_deletes_a_leftover_replacement_and_names_what_stayed_when_the_data_directory_cannot_go()
+ {
+    use std::os::windows::fs::OpenOptionsExt;
+    let folder = inherited_folder();
+    acl::set_protected(&folder, &data_parent_descriptor()).unwrap();
+    let paths = paths_in(&folder);
+    installed_data_directory(&paths);
+    std::fs::remove_dir(&paths.run).unwrap();
+    std::fs::remove_dir(&paths.journal).unwrap();
+    let replacement = paths.data.join(format!("manifest-{}.new", "ef".repeat(16)));
+    std::fs::write(&replacement, b"half").unwrap();
+    // Held open and shared with nobody, the replacement cannot be deleted: the removal names it and
+    // the data directory that therefore stays.
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&replacement)
+        .unwrap();
+    let stayed = install::remove_records(&paths);
+    let shown = replacement.display().to_string();
+    assert!(
+        stayed.iter().any(|line| line.contains(&shown)),
+        "the replacement is named: {stayed:?}"
+    );
+    assert!(
+        stayed
+            .iter()
+            .any(|line| line.contains(&paths.data.display().to_string())),
+        "the data directory is named: {stayed:?}"
+    );
+    drop(held);
+    // Without the hold the replacement goes with the rest, and nothing is left to name.
+    assert!(install::remove_records(&paths).is_empty());
+    assert!(!paths.data.exists(), "the data directory is gone");
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// A refusal in the program directory names a remedy that cures its reason, in a repair and in a
+/// removal alike: a link or a second name for a file is removed, and only an owner or a list is
+/// corrected. A directory that an account owns is refused in both before anything is changed.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_program_directory_refusal_names_the_remedy_for_its_reason_in_a_repair_and_in_a_removal() {
+    use kr_boundary_windows::win::fresh;
+    use kr_boundary_windows::win::sd::{Principals, SdKind};
+    let folder = inherited_folder();
+    acl::set_protected(&folder, &data_parent_descriptor()).unwrap();
+    let paths = paths_in(&folder);
+    installed_data_directory(&paths);
+    fresh::directory_all(
+        &paths.program,
+        SdKind::AdminDir,
+        &Principals {
+            users_may_read: true,
+            ..Principals::default()
+        },
+    )
+    .unwrap();
+    let both = |what: &str| -> [String; 2] {
+        [
+            install::entry(&paths).err().expect(what).to_string(),
+            install::remove(&paths, true).expect_err(what).to_string(),
+        ]
+    };
+
+    // A link is removed; a change of owner or list does not cure it.
+    let target = inherited_folder();
+    let junction = paths.program.join("linked");
+    let linked = Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(&junction)
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(linked.status.success(), "{linked:?}");
+    for text in both("a link") {
+        assert!(text.contains("it is a link"), "{text}");
+        assert!(text.contains("Remove "), "{text}");
+        assert!(!text.contains("Make the Administrators group"), "{text}");
+    }
+    std::fs::remove_dir(&junction).unwrap();
+
+    // A file with a second name is removed as well.
+    let first = paths.program.join("first.exe");
+    std::fs::write(&first, b"x").unwrap();
+    std::fs::hard_link(&first, paths.program.join("second.exe")).unwrap();
+    for text in both("a second name") {
+        assert!(text.contains("more than one name"), "{text}");
+        assert!(text.contains("Remove "), "{text}");
+        assert!(!text.contains("Make the Administrators group"), "{text}");
+    }
+    std::fs::remove_file(paths.program.join("second.exe")).unwrap();
+    std::fs::remove_file(&first).unwrap();
+
+    // An owner that is not the installation's is corrected, and the directory is not removed.
+    let name = format!("krowner{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
+    account::create(&name).unwrap();
+    give_to(&paths.program, &name);
+    for text in both("an account-owned program directory") {
+        assert!(text.contains("Make the Administrators group"), "{text}");
+        assert!(text.contains("Do not remove it"), "{text}");
+    }
+    give_to(&paths.program, "Administrators");
+    let _ = account::delete(&name);
+    let _ = std::fs::remove_dir_all(&target);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// With no manifest there is no installation whose records a leftover could be: a refusal of what
+/// is left says to remove it, and does not say to correct what cannot be corrected away.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn with_no_manifest_the_refusal_of_leftover_content_says_to_remove_it() {
+    let folder = inherited_folder();
+    acl::set_protected(&folder, &data_parent_descriptor()).unwrap();
+    let paths = paths_in(&folder);
+    installed_data_directory(&paths);
+    let first = paths.data.join(format!("manifest-{}.new", "ab".repeat(16)));
+    let second = paths.data.join(format!("manifest-{}.new", "cd".repeat(16)));
+    std::fs::write(&first, b"x").unwrap();
+    std::fs::hard_link(&first, &second).unwrap();
+    // With the manifest, the file that has two names is a record to correct.
+    let text = install::make_data_directory(&paths)
+        .expect_err("a file with two names")
+        .to_string();
+    assert!(text.contains("more than one name"), "{text}");
+    assert!(text.contains("Do not remove"), "{text}");
+    // Without it, there is nothing the file could be a record of.
+    std::fs::remove_file(&paths.manifest).unwrap();
+    let text = install::make_data_directory(&paths)
+        .expect_err("a file with two names")
+        .to_string();
+    assert!(text.contains("more than one name"), "{text}");
+    assert!(text.contains("Remove "), "{text}");
+    assert!(!text.contains("Do not remove"), "{text}");
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
 /// Runs `work` on a thread that impersonates a copy of this process's token whose default owner is
 /// the token's own user. Under the guest's usual token, the system's, an object made with no owner
 /// in its descriptor is owned by the Administrators group anyway; under the copy it is owned by the
