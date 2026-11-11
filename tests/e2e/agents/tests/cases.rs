@@ -4225,21 +4225,13 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
         // before it: a probe whose whole answer is that is started again, a few times, through the
         // same guards each time.
         let output = started_again(3, Duration::from_secs(3), || {
-            let mut command = std::process::Command::new("/bin/sh");
-            command
-                .arg("-c")
-                .arg("exec \"$0\" \"$@\"")
-                .arg(&stage.build.command)
-                .args(&arguments)
-                .args(&switches)
-                .env_clear()
-                .envs(
-                    variables
-                        .iter()
-                        .map(|(name, value)| (name.as_str(), value.as_str())),
-                )
-                .current_dir(stage.run.work())
-                .stdin(std::process::Stdio::null());
+            let command = kr_e2e_agents::stage::login_probe(
+                stage.build,
+                &arguments,
+                &switches,
+                variables,
+                &stage.run.work(),
+            );
             probe_output(stage, command)
         })?;
         let accepted = match &probe.accepted {
