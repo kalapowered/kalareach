@@ -16,9 +16,10 @@
 
 #![allow(unsafe_code)]
 
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead as _, Read as _, Write as _};
-use std::os::windows::ffi::OsStrExt as _;
+use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -26,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest as _, Sha256};
 
+use crate::filekey::FileKey;
 use crate::frame::{self, Class, Request, Response};
 use crate::manifest::{
     GitSet, Image, InstallState, Manifest, ObjectKind, Prior, STORE_VERSION, StoreError,
@@ -36,8 +38,8 @@ use crate::policy::{self, Policy};
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_DIRECTORY_FILE, FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
-    FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile, NtSetSecurityObject,
+    FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_IF,
+    FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile, NtSetSecurityObject,
 };
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
@@ -48,9 +50,9 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo, GetFileInformationByHandleEx,
-    OPEN_EXISTING,
+    FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_128, FILE_ID_INFO,
+    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FileAttributeTagInfo, FileIdInfo, GetFileInformationByHandleEx, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -62,6 +64,7 @@ use super::proof;
 use super::registry;
 use super::sd::{self, Principals, SdKind};
 use super::service;
+use super::walk::{DirHandle, Kind, LIST, Opened};
 use super::{account, boot, pipe, token, verify};
 
 /// The broker's service name.
@@ -282,9 +285,14 @@ fn say(line: &str) {
 ///
 /// Returns [`Error::Refused`] naming the foreign object, or the failure of the call that looked.
 pub fn entry(paths: &Paths) -> Result<Entry, Error> {
-    check_data_parent(paths)?;
-    if paths.manifest.exists() {
-        let manifest = Manifest::load(&paths.manifest)?;
+    // What the data directory holds is read on handles before any of it is used: the manifest
+    // decides what a repair or a removal touches, so it is read only after the directory it is in
+    // and everything beside it passed their checks.
+    let inspected = match check_data_parent(paths)? {
+        Some(parent) => inspect_existing_data(paths, &parent)?.map(|(_, inspected)| inspected),
+        None => None,
+    };
+    if let Some(manifest) = inspected.and_then(|inspected| inspected.manifest) {
         return Ok(match manifest.state {
             InstallState::Installed => Entry::Installed(manifest),
             InstallState::InProgress => Entry::Partial(manifest),
@@ -398,15 +406,48 @@ fn parent_refusal(parent: &Path, why: &str) -> Error {
     ))
 }
 
+/// The directories the installation makes directly in its data directory, each with the descriptor
+/// of its own and each recorded in the manifest before it is made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataChild {
+    /// Where a run stages and where the proof's scratch directories are made.
+    Staging,
+    /// The journal's directory, one file for each invocation.
+    Journal,
+    /// The directory every invocation's private root is made under.
+    Run,
+}
+
+impl DataChild {
+    fn path(self, paths: &Paths) -> &Path {
+        match self {
+            DataChild::Staging => &paths.staging,
+            DataChild::Journal => &paths.journal,
+            DataChild::Run => &paths.run,
+        }
+    }
+
+    fn name(self, paths: &Paths) -> OsString {
+        self.path(paths).file_name().unwrap_or_default().to_owned()
+    }
+}
+
 /// The folder above the data directory and the data directory itself, each held open from the check
-/// to the end of the steps that go by path, so that what was checked is what those steps work in.
+/// to the end of the steps that go by path, so that what was checked is what those steps work in,
+/// and the directories directly beneath the data directory, each opened relative to the held
+/// directory and held from the check or the call that made it.
 ///
-/// Neither handle lets another program rename or delete what it holds (they share read and write
-/// only). The data directory's handle has the right to change its list, so the protection goes on
-/// that handle and not on whatever the path names a moment later.
+/// None of these handles lets another program rename or delete what it holds (they share read and
+/// write only). Every list the installation changes in the data directory is changed on one of these
+/// handles and never by path: a path can name another object a moment later, and the platform's
+/// change by path follows a link and rewrites the tree it leads to.
 pub struct DataHolds {
+    paths: Paths,
     _parent: ffi::Handle,
-    data: ffi::Handle,
+    data: DirHandle,
+    staging: Option<DirHandle>,
+    journal: Option<DirHandle>,
+    run: Option<DirHandle>,
 }
 
 impl std::fmt::Debug for DataHolds {
@@ -424,21 +465,61 @@ impl DataHolds {
     ///
     /// Returns the platform's error when the list is refused.
     pub fn protect(&self) -> Result<(), Error> {
-        let descriptor = data_descriptor()?;
-        // SAFETY: the handle is open with the right to change the list, and the descriptor lives
-        // through the call.
-        let status = unsafe {
-            NtSetSecurityObject(
-                self.data.raw(),
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                descriptor.as_ptr(),
-            )
+        protect_handle(
+            self.data.handle(),
+            &data_descriptor()?,
+            "the data directory",
+        )
+    }
+
+    /// Makes the directory beneath the data directory, relative to the held directory and in one
+    /// call that carries its protected list, or takes the one that is there: a directory that is
+    /// there was opened and checked on its own handle (its owner, every entry of its list, no link)
+    /// before this, and now gets the list on that handle. A link at its name is opened as the link,
+    /// refused, and the tree it leads to is not touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Refused`] naming the reason when what is there is not the installation's
+    /// own, and the platform's error when a call fails.
+    pub fn directory(&mut self, which: DataChild) -> Result<(), Error> {
+        let descriptor = sd::descriptor(SdKind::AdminDir, &Principals::default())?;
+        let slot = match which {
+            DataChild::Staging => &mut self.staging,
+            DataChild::Journal => &mut self.journal,
+            DataChild::Run => &mut self.run,
         };
-        if status < 0 {
-            // SAFETY: converts a status the platform just returned.
-            let code = unsafe { RtlNtStatusToDosError(status) };
-            return Err(ffi::error(code, "setting the permissions of the data directory").into());
+        if let Some(held) = slot {
+            return protect_handle(
+                held.handle(),
+                &descriptor,
+                &which.path(&self.paths).display().to_string(),
+            );
         }
+        let name = which.name(&self.paths);
+        let (handle, created) = open_directory_relative(
+            self.data.handle(),
+            &name,
+            FILE_OPEN_IF,
+            Some(&descriptor),
+            LIST | WRITE_DAC,
+        )?
+        .ok_or_else(|| {
+            Error::Failed(format!(
+                "{} was made and is gone again",
+                which.path(&self.paths).display()
+            ))
+        })?;
+        let shown = which.path(&self.paths).display().to_string();
+        require_directory(&handle, &shown)?;
+        if !created {
+            // It appeared between the listing and this call: it is checked like one that was there.
+            if let Some(why) = check_held_object(&handle)? {
+                return Err(child_refusal(&self.paths, &name, &why));
+            }
+            protect_handle(&handle, &descriptor, &shown)?;
+        }
+        *slot = Some(held_directory(handle)?);
         Ok(())
     }
 }
@@ -449,43 +530,507 @@ fn data_descriptor() -> Result<sd::OwnedSd, Error> {
     Ok(sd::descriptor(SdKind::DataParent, &Principals::default())?)
 }
 
+/// The words every refusal of the data directory ends with: what the administrator does.
+const DATA_REMEDY: &str = "Empty the directory, or remove it, then install again: a new installation makes it with its own protected list, and nothing in it that the installation did not make is used.";
+
 /// The refusal of a data directory that is there and is not the installation's own.
 fn data_refusal(paths: &Paths, why: &str) -> Error {
     Error::Refused(format!(
-        "{} is the boundary's data directory (its manifest, its journal and the roots of its operations). It is refused because {why}. Whoever owns it, or can change its list, could put data of their own in it while the broker runs as the system. Remove the directory, or give it to the administrators with a protected list that names only the system and the administrators, then install again.",
+        "{} is the boundary's data directory (its manifest, its journal and the roots of its operations). It is refused because {why}. Whoever owns it, or can change its list, could put data of their own in it while the broker runs as the system. {DATA_REMEDY}",
         paths.data.display()
     ))
 }
 
-/// What the installation's own data directory must be, read on the handle that opened it: the
-/// system's own class owns it and no other account has any right on it, now or by inheritance; and
-/// its owner is the system or the administrators, and every entry of its list names one of the two.
-fn check_data_directory(paths: &Paths, made: &ffi::Handle) -> Result<(), Error> {
+/// The refusal of what is inside the data directory: a child that is not the installation's own, or
+/// is not what the manifest says.
+fn child_refusal(paths: &Paths, name: &OsStr, why: &str) -> Error {
+    Error::Refused(format!(
+        "{} is the boundary's data directory (its manifest, its journal and the roots of its operations). It is refused because of {}: {why}. Whatever is in it that another account made or can change could be read by the broker, running as the system, as its own. {DATA_REMEDY}",
+        paths.data.display(),
+        name.to_string_lossy()
+    ))
+}
+
+/// What an object that is held open must be, read on its own handle: the system's own class owns
+/// it and no other account has any right on it, now or by inheritance; its owner is the system or the
+/// administrators, and every entry of its list names one of the two. Returns the reason when it is
+/// not.
+fn check_held_object(handle: &ffi::Handle) -> Result<Option<String>, Error> {
     const SYSTEM: &str = "S-1-5-18";
     const ADMINISTRATORS: &str = "S-1-5-32-544";
-    if let Some(finding) = acl::changeable_by_others_on(made, false)? {
-        return Err(data_refusal(paths, &finding));
+    if let Some(finding) = acl::changeable_by_others_on(handle, false)? {
+        return Ok(Some(finding));
     }
-    let summary = sd::summary_of_handle(made)?;
+    let summary = sd::summary_of_handle(handle)?;
     if ![SYSTEM, ADMINISTRATORS].contains(&summary.owner.as_str()) {
-        return Err(data_refusal(
-            paths,
-            &format!("it is owned by {}", summary.owner),
-        ));
+        return Ok(Some(format!("it is owned by {}", summary.owner)));
     }
     let Some(entries) = summary.entries else {
-        return Err(data_refusal(paths, "it has no permission list"));
+        return Ok(Some("it has no permission list".to_owned()));
     };
-    if let Some(entry) = entries
+    Ok(entries
         .iter()
         .find(|entry| ![SYSTEM, ADMINISTRATORS].contains(&entry.sid.as_str()))
-    {
-        return Err(data_refusal(
-            paths,
-            &format!("its permission list has an entry for {}", entry.sid),
-        ));
+        .map(|entry| format!("its permission list has an entry for {}", entry.sid)))
+}
+
+/// Gives a held directory the descriptor's protected list, on the handle. Nothing is propagated.
+fn protect_handle(handle: &ffi::Handle, descriptor: &sd::OwnedSd, what: &str) -> Result<(), Error> {
+    // SAFETY: the handle is open with the right to change the list, and the descriptor lives
+    // through the call.
+    let status = unsafe {
+        NtSetSecurityObject(
+            handle.raw(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            descriptor.as_ptr(),
+        )
+    };
+    if status < 0 {
+        // SAFETY: converts a status the platform just returned.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        return Err(ffi::error(code, format!("setting the permissions of {what}")).into());
     }
     Ok(())
+}
+
+/// What the platform says of an open object's attributes.
+fn attributes_of(handle: &ffi::Handle, what: &str) -> Result<u32, Error> {
+    let mut tag = FILE_ATTRIBUTE_TAG_INFO {
+        FileAttributes: 0,
+        ReparseTag: 0,
+    };
+    // SAFETY: the handle is open and the record is the size the class takes.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle.raw(),
+            FileAttributeTagInfo,
+            (&raw mut tag).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(ffi::last(format!("reading {what}")).into());
+    }
+    Ok(tag.FileAttributes)
+}
+
+/// Refuses an open object that is a link or is not a directory.
+fn require_directory(handle: &ffi::Handle, shown: &str) -> Result<(), Error> {
+    let attributes = attributes_of(handle, shown)?;
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(Error::Refused(format!(
+            "{shown} is a link and the installation does not use it"
+        )));
+    }
+    if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return Err(Error::Refused(format!(
+            "{shown} is not a directory and the installation does not use it"
+        )));
+    }
+    Ok(())
+}
+
+/// The identity of an open object.
+fn file_key(handle: &ffi::Handle) -> Result<FileKey, Error> {
+    let mut info = FILE_ID_INFO {
+        VolumeSerialNumber: 0,
+        FileId: FILE_ID_128 {
+            Identifier: [0; 16],
+        },
+    };
+    // SAFETY: the handle is open and the record is the size the class takes.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle.raw(),
+            FileIdInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(ffi::last("reading an object's identity").into());
+    }
+    Ok(FileKey {
+        volume_serial: info.VolumeSerialNumber,
+        file_id: info.FileId.Identifier,
+    })
+}
+
+/// A directory that was opened for listing and for changing its list, as a held directory.
+fn held_directory(handle: ffi::Handle) -> Result<DirHandle, Error> {
+    let key = file_key(&handle)?;
+    let attributes = attributes_of(&handle, "a directory")?;
+    Ok(DirHandle::from_opened(Opened {
+        handle,
+        key,
+        kind: Kind::Directory,
+        attributes,
+        links: 1,
+    })?)
+}
+
+/// Opens, or makes, the directory `name` directly beneath `parent`, relative to the parent's handle
+/// and never through a path, without following a reparse point: a link is opened as itself. With
+/// [`FILE_OPEN_IF`] a directory that is not there is made in the same call with `descriptor` as its
+/// own list, so that it is never there with a list it took from `parent`; with [`FILE_OPEN`] it is
+/// only opened. The handle shares read and write only, so nothing renames or deletes the directory
+/// while it is held. Returns the handle and whether this call made the directory, or none when
+/// [`FILE_OPEN`] found nothing.
+fn open_directory_relative(
+    parent: &ffi::Handle,
+    name: &OsStr,
+    disposition: u32,
+    descriptor: Option<&sd::OwnedSd>,
+    access: u32,
+) -> Result<Option<(ffi::Handle, bool)>, Error> {
+    // The status that says the call made the directory.
+    const FILE_CREATED: usize = 2;
+    let units: Vec<u16> = name.encode_wide().collect();
+    let text = UNICODE_STRING {
+        Length: (units.len() * 2) as u16,
+        MaximumLength: (units.len() * 2) as u16,
+        Buffer: units.as_ptr().cast_mut(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: parent.raw(),
+        ObjectName: &raw const text,
+        Attributes: 0,
+        SecurityDescriptor: descriptor
+            .map_or(std::ptr::null(), |made| made.as_ptr().cast_const().cast()),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut raw: HANDLE = std::ptr::null_mut();
+    let mut status_block = IO_STATUS_BLOCK::default();
+    // SAFETY: the name, the attributes, the descriptor and the status block live through the call,
+    // the parent's handle is open, and the call keeps none of them.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut raw,
+            access | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+            &raw const attributes,
+            &raw mut status_block,
+            std::ptr::null(),
+            FILE_ATTRIBUTE_DIRECTORY,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            disposition,
+            FILE_DIRECTORY_FILE
+                | FILE_OPEN_REPARSE_POINT
+                | FILE_OPEN_FOR_BACKUP_INTENT
+                | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status < 0 {
+        // SAFETY: converts a status the platform just returned.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        if disposition == FILE_OPEN
+            && (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND)
+        {
+            return Ok(None);
+        }
+        return Err(ffi::error(
+            code,
+            format!(
+                "opening {} beneath a held directory",
+                name.to_string_lossy()
+            ),
+        )
+        .into());
+    }
+    let handle = ffi::Handle::new(raw, "opening a directory beneath a held directory")?;
+    Ok(Some((handle, status_block.Information == FILE_CREATED)))
+}
+
+/// What the data directory held that the installation made, read before any step used any of it.
+struct Inspected {
+    /// The manifest, read once everything in the directory had passed its check; none when the
+    /// directory was empty.
+    manifest: Option<Manifest>,
+    staging: Option<DirHandle>,
+    journal: Option<DirHandle>,
+    run: Option<DirHandle>,
+}
+
+/// The names a directory directly in the data directory may have.
+fn data_child_names(paths: &Paths) -> Vec<(OsString, Kind)> {
+    let file = |path: &Path| path.file_name().unwrap_or_default().to_owned();
+    vec![
+        (file(&paths.manifest), Kind::File),
+        // A manifest that was being replaced when a run stopped.
+        (file(&paths.manifest.with_extension("new")), Kind::File),
+        (file(&paths.prior), Kind::File),
+        (file(&paths.staging), Kind::Directory),
+        (file(&paths.journal), Kind::Directory),
+        (file(&paths.run), Kind::Directory),
+    ]
+}
+
+/// Whether a journal's file name is one an invocation's journal has: 32 lowercase hexadecimal
+/// digits and the extension.
+fn is_journal_file_name(name: &str) -> bool {
+    name.strip_suffix(".journal").is_some_and(|stem| {
+        stem.len() == 32
+            && stem
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+/// Reads what the data directory holds, on handles opened relative to the held directory, and
+/// refuses unless every entry in it is one the installation made. An empty directory is accepted
+/// (nothing records it, and nothing is in it). One that holds anything must hold the manifest, and
+/// every entry must be a name the installation lays down: the manifest and the earlier-state
+/// record as files, and the directories the manifest records, each as the kind it is, with no link
+/// at its name, each opened on its own handle and checked there for its owner and every entry of its
+/// list; the journal's directory holds only journal files, each checked the same way, and the
+/// directory of the private roots only directories. The manifest is read last, after everything it
+/// could lead the installation to use has passed, and it must record the data directory and each
+/// directory in it.
+fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, Error> {
+    let listed = data.children()?;
+    let mut inspected = Inspected {
+        manifest: None,
+        staging: None,
+        journal: None,
+        run: None,
+    };
+    if listed.is_empty() {
+        return Ok(inspected);
+    }
+    let names = data_child_names(paths);
+    let expected_manifest = &names[0].0;
+    if !listed
+        .iter()
+        .any(|child| same_name(&child.name, expected_manifest))
+    {
+        return Err(child_refusal(
+            paths,
+            &OsString::from_wide(&listed[0].name),
+            "no manifest records this directory, and a directory that no manifest records must be empty",
+        ));
+    }
+    for child in &listed {
+        let shown = OsString::from_wide(&child.name);
+        let Some((_, expected)) = names.iter().find(|(name, _)| same_name(&child.name, name))
+        else {
+            return Err(child_refusal(
+                paths,
+                &shown,
+                "the installation did not make it",
+            ));
+        };
+        let access = if *expected == Kind::Directory {
+            LIST | WRITE_DAC
+        } else {
+            READ_CONTROL
+        };
+        let opened = match data.open_child(child, access)? {
+            Ok(opened) => opened,
+            Err(lost) => {
+                return Err(child_refusal(
+                    paths,
+                    &shown,
+                    &format!("it could not be opened to be checked ({lost})"),
+                ));
+            }
+        };
+        match (opened.kind, *expected) {
+            (Kind::ReparsePoint, _) => {
+                return Err(child_refusal(paths, &shown, "it is a link"));
+            }
+            (Kind::File, Kind::File) | (Kind::Directory, Kind::Directory) => {}
+            (Kind::Directory, _) => {
+                return Err(child_refusal(
+                    paths,
+                    &shown,
+                    "it is a directory, not a file",
+                ));
+            }
+            (Kind::File, _) => {
+                return Err(child_refusal(
+                    paths,
+                    &shown,
+                    "it is a file, not a directory",
+                ));
+            }
+        }
+        if opened.kind == Kind::File && opened.links > 1 {
+            return Err(child_refusal(paths, &shown, "it has more than one name"));
+        }
+        if let Some(why) = check_held_object(&opened.handle)? {
+            return Err(child_refusal(paths, &shown, &why));
+        }
+        if opened.kind == Kind::Directory {
+            let held = DirHandle::from_opened(opened)?;
+            let slot = if same_name(&child.name, &names[3].0) {
+                &mut inspected.staging
+            } else if same_name(&child.name, &names[4].0) {
+                &mut inspected.journal
+            } else {
+                &mut inspected.run
+            };
+            *slot = Some(held);
+        }
+    }
+    inspect_staging(paths, inspected.staging.as_ref())?;
+    inspect_journal(paths, inspected.journal.as_ref())?;
+    inspect_run(paths, inspected.run.as_ref())?;
+    let manifest = Manifest::load(&paths.manifest)?;
+    let records = |path: &Path| {
+        manifest
+            .find(ObjectKind::Directory, &path.display().to_string())
+            .is_some()
+    };
+    if !records(&paths.data) {
+        return Err(child_refusal(
+            paths,
+            &names[0].0,
+            "its manifest does not record this directory, and a directory that no manifest records must be empty",
+        ));
+    }
+    for (child, path) in [
+        (&inspected.staging, &paths.staging),
+        (&inspected.journal, &paths.journal),
+        (&inspected.run, &paths.run),
+    ] {
+        if let Some(held) = child
+            && !records(path)
+            && !held.children()?.is_empty()
+        {
+            return Err(child_refusal(
+                paths,
+                path.file_name().unwrap_or_default(),
+                "no manifest records this directory, and a directory that no manifest records must be empty",
+            ));
+        }
+    }
+    inspected.manifest = Some(manifest);
+    Ok(inspected)
+}
+
+/// Whether a listed name is the name the installation uses, as the platform compares them: without
+/// regard to case.
+fn same_name(listed: &[u16], name: &OsStr) -> bool {
+    let wanted: Vec<u16> = name.encode_wide().collect();
+    listed.len() == wanted.len()
+        && listed.iter().zip(&wanted).all(|(left, right)| {
+            let fold = |unit: u16| match u8::try_from(unit) {
+                Ok(byte) => u16::from(byte.to_ascii_lowercase()),
+                Err(_) => unit,
+            };
+            fold(*left) == fold(*right)
+        })
+}
+
+/// A link in the staging directory is refused: the installation writes there and removes there by
+/// path.
+fn inspect_staging(paths: &Paths, staging: Option<&DirHandle>) -> Result<(), Error> {
+    let Some(staging) = staging else {
+        return Ok(());
+    };
+    for child in staging.children()? {
+        if child.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(child_refusal(
+                paths,
+                &OsString::from_wide(&child.name),
+                &format!("it is a link in {}", paths.staging.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The journal's directory holds journal files and nothing else, each a file with one name, owned by
+/// the system's own class, with no entry of another account: the broker, running as the system,
+/// reads each as its own.
+fn inspect_journal(paths: &Paths, journal: Option<&DirHandle>) -> Result<(), Error> {
+    let Some(journal) = journal else {
+        return Ok(());
+    };
+    for child in journal.children()? {
+        let shown = OsString::from_wide(&child.name);
+        let text = shown.to_string_lossy().into_owned();
+        if !is_journal_file_name(&text) {
+            return Err(child_refusal(
+                paths,
+                &shown,
+                &format!(
+                    "{} holds journal files only, and the installation did not make it",
+                    paths.journal.display()
+                ),
+            ));
+        }
+        let opened = match journal.open_child(&child, READ_CONTROL)? {
+            Ok(opened) => opened,
+            Err(lost) => {
+                return Err(child_refusal(
+                    paths,
+                    &shown,
+                    &format!("it could not be opened to be checked ({lost})"),
+                ));
+            }
+        };
+        if opened.kind != Kind::File || opened.links > 1 {
+            return Err(child_refusal(
+                paths,
+                &shown,
+                "a journal file is a file with one name",
+            ));
+        }
+        if let Some(why) = check_held_object(&opened.handle)? {
+            return Err(child_refusal(paths, &shown, &why));
+        }
+    }
+    Ok(())
+}
+
+/// The directory of the private roots holds directories and no link: a private root is made there
+/// by the broker.
+fn inspect_run(paths: &Paths, run: Option<&DirHandle>) -> Result<(), Error> {
+    let Some(run) = run else {
+        return Ok(());
+    };
+    for child in run.children()? {
+        if child.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || child.attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        {
+            return Err(child_refusal(
+                paths,
+                &OsString::from_wide(&child.name),
+                &format!(
+                    "{} holds private roots, which are directories",
+                    paths.run.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Opens the data directory beneath the held folder without making it, checks it on its handle, and
+/// reads what it holds. Returns none when the directory is not there.
+fn inspect_existing_data(
+    paths: &Paths,
+    parent: &ffi::Handle,
+) -> Result<Option<(DirHandle, Inspected)>, Error> {
+    let name = paths
+        .data
+        .file_name()
+        .ok_or_else(|| Error::Failed("the data directory has no name".to_owned()))?;
+    let Some((handle, _)) =
+        open_directory_relative(parent, name, FILE_OPEN, None, LIST | WRITE_DAC)?
+    else {
+        return Ok(None);
+    };
+    require_directory(&handle, &paths.data.display().to_string())?;
+    if let Some(why) = check_held_object(&handle)? {
+        return Err(data_refusal(paths, &why));
+    }
+    let data = held_directory(handle)?;
+    let inspected = inspect_data_directory(paths, &data)?;
+    Ok(Some((data, inspected)))
 }
 
 /// Holds the folder above the data directory, made first when it is not there, and makes the data
@@ -493,14 +1038,16 @@ fn check_data_directory(paths: &Paths, made: &ffi::Handle) -> Result<(), Error> 
 /// protected list, so that it is never there with the list it would take from the folder. The
 /// folder is made in one call that carries its protected list, and is then opened and checked like
 /// one that was there. A data directory that is already there is not trusted for being there: its
-/// owner and its list are read on the handle that opened it and must be the installation's own, and
-/// a link is refused. Both handles are returned, so the folder that passed the check is the folder
-/// the data directory is made in and the directory that passed is the one that is protected.
+/// owner and its list are read on the handle that opened it and must be the installation's own, a
+/// link is refused, and every entry in it must be one the installation made, each checked on its
+/// own handle (its owner, every entry of its list, no link, one name for a file). The handles are returned, so the folder that passed
+/// the check is the folder the data directory is made in, the directory that passed is the one
+/// that is protected, and the directories in it that passed are the ones that are protected.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Refused`] naming the reason when the folder or the directory is not the
-/// installation's own, and the platform's error when a call fails.
+/// Returns [`Error::Refused`] naming the reason when the folder, the directory or anything in it is
+/// not the installation's own, and the platform's error when a call fails.
 pub fn make_data_directory(paths: &Paths) -> Result<DataHolds, Error> {
     let held = match check_data_parent(paths)? {
         Some(held) => held,
@@ -518,82 +1065,39 @@ pub fn make_data_directory(paths: &Paths) -> Result<DataHolds, Error> {
         .data
         .file_name()
         .ok_or_else(|| Error::Failed("the data directory has no name".to_owned()))?;
-    let units: Vec<u16> = name.encode_wide().collect();
-    let text = UNICODE_STRING {
-        Length: (units.len() * 2) as u16,
-        MaximumLength: (units.len() * 2) as u16,
-        Buffer: units.as_ptr().cast_mut(),
-    };
     let descriptor = data_descriptor()?;
-    let attributes = OBJECT_ATTRIBUTES {
-        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-        RootDirectory: held.raw(),
-        ObjectName: &raw const text,
-        Attributes: 0,
-        SecurityDescriptor: descriptor.as_ptr().cast_const().cast(),
-        SecurityQualityOfService: std::ptr::null(),
-    };
-    let mut raw: HANDLE = std::ptr::null_mut();
-    let mut status_block = IO_STATUS_BLOCK::default();
-    // SAFETY: the name, the attributes, the descriptor and the status block live through the call,
-    // the folder's handle is open, and the call keeps none of them. A directory that is there is
-    // opened, one that is not is made with the descriptor, and a link is opened as the link and
-    // refused below. The handle may read and change the list, and shares read and write only, so
-    // nothing renames or deletes the directory while it is held.
-    let status = unsafe {
-        NtCreateFile(
-            &raw mut raw,
-            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC | SYNCHRONIZE,
-            &raw const attributes,
-            &raw mut status_block,
-            std::ptr::null(),
-            FILE_ATTRIBUTE_DIRECTORY,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            FILE_OPEN_IF,
-            FILE_DIRECTORY_FILE
-                | FILE_OPEN_REPARSE_POINT
-                | FILE_OPEN_FOR_BACKUP_INTENT
-                | FILE_SYNCHRONOUS_IO_NONALERT,
-            std::ptr::null(),
-            0,
-        )
-    };
-    if status < 0 {
-        // SAFETY: converts a status the platform just returned.
-        let code = unsafe { RtlNtStatusToDosError(status) };
-        return Err(ffi::error(
-            code,
-            format!("making {} beneath the held folder", paths.data.display()),
-        )
-        .into());
+    // A directory that is there is opened, one that is not is made with the descriptor, and a link
+    // is opened as the link and refused below.
+    let (made, created) = open_directory_relative(
+        &held,
+        name,
+        FILE_OPEN_IF,
+        Some(&descriptor),
+        LIST | WRITE_DAC,
+    )?
+    .ok_or_else(|| Error::Failed("the data directory was made and is gone again".to_owned()))?;
+    require_directory(&made, &paths.data.display().to_string())?;
+    if let Some(why) = check_held_object(&made)? {
+        return Err(data_refusal(paths, &why));
     }
-    let made = ffi::Handle::new(raw, "making the data directory")?;
-    let mut tag = FILE_ATTRIBUTE_TAG_INFO {
-        FileAttributes: 0,
-        ReparseTag: 0,
+    let data = held_directory(made)?;
+    let inspected = if created {
+        Inspected {
+            manifest: None,
+            staging: None,
+            journal: None,
+            run: None,
+        }
+    } else {
+        inspect_data_directory(paths, &data)?
     };
-    // SAFETY: the handle is open and the record is the size the class takes.
-    if unsafe {
-        GetFileInformationByHandleEx(
-            made.raw(),
-            FileAttributeTagInfo,
-            (&raw mut tag).cast(),
-            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
-        )
-    } == 0
-    {
-        return Err(ffi::last("reading the data directory").into());
-    }
-    if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(Error::Refused(format!(
-            "{} is a link and the installation does not use it",
-            paths.data.display()
-        )));
-    }
-    check_data_directory(paths, &made)?;
     Ok(DataHolds {
+        paths: paths.clone(),
         _parent: held,
-        data: made,
+        data,
+        staging: inspected.staging,
+        journal: inspected.journal,
+        run: inspected.run,
     })
 }
 
@@ -986,53 +1490,33 @@ pub fn install(paths: &Paths, options: &Options, repair: bool) -> Result<(), Err
 
 fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Error> {
     let paths = run.paths.clone();
-    // The folder and the directory are held, and the directory's list goes on its own handle, until
-    // the directories beneath it are made and protected.
-    let holds = make_data_directory(&paths)?;
+    // The folder, the directory and the directories in it are held, and each list goes on its own
+    // handle, until everything beneath them is made and protected. A directory that is there was
+    // checked on its handle, with every entry of the data directory, before this.
+    let mut holds = make_data_directory(&paths)?;
     holds.protect()?;
-    fs::create_dir_all(&paths.staging).map_err(io_error("making the staging directory"))?;
-    acl::set_protected(
-        &paths.staging,
-        &sd::descriptor(SdKind::AdminDir, &Principals::default())?,
+    run.record(
+        ObjectKind::Directory,
+        &paths.data.display().to_string(),
+        None,
     )?;
-    // The journal and the parent of the private roots: administrators and the system only, so no
-    // boundary token can list, create in or delete from either.
-    for (directory, what) in [
-        (&paths.journal, "the journal directory"),
-        (&paths.run, "the directory of the private roots"),
+    // The staging directory, the journal and the parent of the private roots: administrators and
+    // the system only, so no boundary token can list, create in or delete from any of them. Each is
+    // recorded before it is made.
+    for (which, what) in [
+        (DataChild::Staging, "the staging directory"),
+        (DataChild::Journal, "the journal directory"),
+        (DataChild::Run, "the directory of the private roots"),
     ] {
         run.record(
             ObjectKind::Directory,
-            &directory.display().to_string(),
+            &which.path(&paths).display().to_string(),
             None,
         )?;
-        fs::create_dir_all(directory).map_err(io_error(format!("making {what}")))?;
-        let wanted = sd::descriptor(SdKind::AdminDir, &Principals::default())?;
-        if directory == &paths.run {
-            // The list goes on the directory's own handle and only while it holds nothing: a repair
-            // may run while invocations hold private roots in it, and a change that propagates
-            // would reach them. A directory that is not empty keeps its list, which must already be
-            // the wanted one.
-            match acl::set_protected_when_empty(directory, &wanted)? {
-                acl::Reset::Applied => {}
-                acl::Reset::NotEmpty => {
-                    if let Some(finding) = acl::changeable_by_others(directory, false)? {
-                        return Err(Error::Refused(format!(
-                            "{} holds private roots and {finding}",
-                            directory.display()
-                        )));
-                    }
-                }
-                acl::Reset::Refused(why) => {
-                    return Err(Error::Refused(format!(
-                        "{} is not a directory the installation can use: {why}",
-                        directory.display()
-                    )));
-                }
-            }
-        } else {
-            acl::set_protected(directory, &wanted)?;
-        }
+        holds.directory(which).map_err(|error| match error {
+            Error::Refused(_) => error,
+            other => Error::Failed(format!("making {what}: {other}")),
+        })?;
     }
     drop(holds);
     let channel = Channel::new(&paths.staging);
@@ -1048,13 +1532,6 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     sweep(&paths.staging);
 
     say("reading what is on this computer");
-    if !existing {
-        run.record(
-            ObjectKind::Directory,
-            &paths.data.display().to_string(),
-            None,
-        )?;
-    }
     let (baseline_xml, effective) = if existing {
         let (xml, effective) = channel.effective()?;
         let foreign = effective.foreign_exe_rules();
@@ -1520,7 +1997,11 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
             "run the setup program as an administrator".to_owned(),
         ));
     }
-    check_data_parent(paths)?;
+    if let Some(parent) = check_data_parent(paths)? {
+        // The manifest, the earlier-state record and the journal that the removal reads, and the
+        // directories it removes from, are checked before any of them is used.
+        inspect_existing_data(paths, &parent)?;
+    }
     refuse_while_unfinished(paths)?;
     let manifest = match fs::read(&paths.manifest) {
         Ok(bytes) => Manifest::parse(&bytes)?,

@@ -1166,6 +1166,212 @@ fn the_data_directory_is_made_with_its_own_protected_list_and_one_that_is_there_
     let _ = std::fs::remove_dir_all(&folder);
 }
 
+/// The installation's places, all beneath one folder of the case's own.
+#[cfg(feature = "testing")]
+fn paths_in(folder: &Path) -> Paths {
+    let data = folder.join("Boundary");
+    let program = folder.join("Program");
+    Paths {
+        git: program.join("git"),
+        program,
+        staging: data.join("staging"),
+        journal: data.join("journal"),
+        run: data.join("run"),
+        manifest: data.join("manifest.json"),
+        prior: data.join("prior.json"),
+        data,
+    }
+}
+
+/// A data directory with its manifest and its three directories, as an installation leaves it.
+#[cfg(feature = "testing")]
+fn installed_data_directory(paths: &Paths) {
+    use install::DataChild;
+    let mut holds = install::make_data_directory(paths).unwrap();
+    holds.protect().unwrap();
+    let mut manifest = Manifest::begin();
+    for path in [&paths.data, &paths.staging, &paths.journal, &paths.run] {
+        manifest.record(ObjectKind::Directory, &path.display().to_string(), None);
+    }
+    manifest.save(&paths.manifest).unwrap();
+    for which in [DataChild::Staging, DataChild::Journal, DataChild::Run] {
+        holds.directory(which).unwrap();
+    }
+}
+
+/// The owner and the list of an object, read as another program would read them.
+#[cfg(feature = "testing")]
+fn summary_of(path: &Path) -> kr_boundary_windows::win::sd::Summary {
+    const READ_CONTROL: u32 = 0x0002_0000;
+    kr_boundary_windows::win::sd::summary_of_handle(&open_folder(path, READ_CONTROL)).unwrap()
+}
+
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn what_is_inside_a_data_directory_that_exists_is_checked_on_its_own_handle_before_any_step_uses_it()
+ {
+    use install::DataChild;
+    use kr_boundary_windows::win::sd;
+    const SYSTEM: &str = "S-1-5-18";
+    const ADMINISTRATORS: &str = "S-1-5-32-544";
+    let folder = inherited_folder();
+    acl::set_protected(&folder, &data_parent_descriptor()).unwrap();
+    let paths = paths_in(&folder);
+    let refused_with = |words: &str| {
+        let refused = install::make_data_directory(&paths).expect_err("the directory is refused");
+        let text = refused.to_string();
+        assert!(text.contains(words), "{text}");
+        assert!(text.contains("Empty the directory, or remove it"), "{text}");
+    };
+
+    // A directory that the installation made is accepted, with journal files of an earlier run in
+    // it, and each of its directories is made with its own protected list in the creating call and
+    // is held: nothing renames or deletes it while the installation works in it.
+    installed_data_directory(&paths);
+    let journal_file = paths.journal.join(format!("{}.journal", "ab".repeat(16)));
+    std::fs::write(&journal_file, b"rows").unwrap();
+    let mut holds = install::make_data_directory(&paths).expect("an installation's own directory");
+    for path in [&paths.staging, &paths.journal, &paths.run] {
+        let made = summary_of(path);
+        assert!(made.protected, "{}", path.display());
+        let named: Vec<&str> = made
+            .entries
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.sid.as_str())
+            .collect();
+        assert_eq!(named, [SYSTEM, ADMINISTRATORS], "{}", path.display());
+        assert!(
+            std::fs::rename(path, path.with_extension("moved")).is_err(),
+            "{} is held",
+            path.display()
+        );
+    }
+    holds.directory(DataChild::Journal).unwrap();
+    drop(holds);
+
+    // A directory that is there with a list that passes the check but is not protected is
+    // protected on its handle.
+    let loose = sd::descriptor_from_text("D:AI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)").unwrap();
+    acl::set_protected(&paths.staging, &loose).unwrap();
+    assert!(!summary_of(&paths.staging).protected);
+    let mut holds = install::make_data_directory(&paths).unwrap();
+    holds.directory(DataChild::Staging).unwrap();
+    drop(holds);
+    assert!(summary_of(&paths.staging).protected);
+
+    // A child that another account owns is refused, and its list is as it was.
+    let name = format!("krowner{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
+    let owner = account::create(&name).unwrap();
+    let status = Command::new("icacls")
+        .arg(&paths.journal)
+        .args(["/setowner", &name])
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{status:?}");
+    let before = summary_of(&paths.journal);
+    let refused = install::make_data_directory(&paths).expect_err("a child that is owned");
+    assert!(refused.to_string().contains(&owner.to_text()), "{refused}");
+    assert_eq!(summary_of(&paths.journal).entries, before.entries);
+    let _ = Command::new("icacls")
+        .arg(&paths.journal)
+        .args(["/setowner", "Administrators"])
+        .output();
+    let _ = account::delete(&name);
+    install::make_data_directory(&paths).expect("the owner is back");
+
+    // A journal file that another account owns is refused, as is a file that is not a journal's.
+    let owned = Command::new("icacls")
+        .arg(&journal_file)
+        .args(["/setowner", "Users"])
+        .output()
+        .unwrap();
+    assert!(owned.status.success(), "{owned:?}");
+    refused_with("S-1-5-32-545");
+    let _ = Command::new("icacls")
+        .arg(&journal_file)
+        .args(["/setowner", "Administrators"])
+        .output();
+    std::fs::write(paths.journal.join("notes.txt"), b"x").unwrap();
+    refused_with("notes.txt");
+    std::fs::remove_file(paths.journal.join("notes.txt")).unwrap();
+
+    // A link at a child's name is refused, and the tree it leads to keeps its list.
+    let target = inherited_folder();
+    let targets_list = summary_of(&target);
+    std::fs::remove_dir(&paths.run).unwrap();
+    let made = Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(&paths.run)
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+    refused_with("it is a link");
+    assert_eq!(summary_of(&target), targets_list);
+    std::fs::remove_dir(&paths.run).unwrap();
+    let _ = std::fs::remove_dir_all(&target);
+    installed_data_directory(&paths);
+
+    // An entry that the installation did not make is refused, whatever it is.
+    std::fs::write(paths.data.join("stray.txt"), b"x").unwrap();
+    refused_with("stray.txt");
+    std::fs::remove_file(paths.data.join("stray.txt")).unwrap();
+    std::fs::create_dir(paths.data.join("stray")).unwrap();
+    refused_with("stray");
+    std::fs::remove_dir(paths.data.join("stray")).unwrap();
+
+    // The manifest is a file with one owner and one name, and a link in its place is refused.
+    let copy = folder.join("copy.json");
+    std::fs::copy(&paths.manifest, &copy).unwrap();
+    std::fs::remove_file(&paths.manifest).unwrap();
+    let linked = Command::new("cmd")
+        .args(["/c", "mklink"])
+        .arg(&paths.manifest)
+        .arg(&copy)
+        .output()
+        .unwrap();
+    assert!(linked.status.success(), "{linked:?}");
+    refused_with("it is a link");
+    match install::entry(&paths) {
+        Err(error) => assert!(error.to_string().contains("it is a link"), "{error}"),
+        Ok(_) => panic!("the manifest is read through a link"),
+    }
+    std::fs::remove_file(&paths.manifest).unwrap();
+    std::fs::copy(&copy, &paths.manifest).unwrap();
+    std::fs::remove_file(&copy).unwrap();
+
+    // A directory that no manifest records must be empty: the manifest, when it names the
+    // directory's children and not the directory, is refused; with no manifest, only an empty
+    // directory is accepted.
+    let mut unrecorded = Manifest::begin();
+    for path in [&paths.staging, &paths.journal, &paths.run] {
+        unrecorded.record(ObjectKind::Directory, &path.display().to_string(), None);
+    }
+    unrecorded.save(&paths.manifest).unwrap();
+    refused_with("no manifest records");
+    let mut no_staging = Manifest::begin();
+    for path in [&paths.data, &paths.journal, &paths.run] {
+        no_staging.record(ObjectKind::Directory, &path.display().to_string(), None);
+    }
+    no_staging.save(&paths.manifest).unwrap();
+    install::make_data_directory(&paths).expect("an empty directory needs no record");
+    std::fs::write(paths.staging.join("leftover"), b"x").unwrap();
+    refused_with("no manifest records");
+    std::fs::remove_file(paths.staging.join("leftover")).unwrap();
+    std::fs::remove_file(&paths.manifest).unwrap();
+    refused_with("no manifest records");
+    std::fs::remove_file(&journal_file).unwrap();
+    for which in [&paths.staging, &paths.journal, &paths.run] {
+        std::fs::remove_dir(which).unwrap();
+    }
+    let _ = std::fs::remove_file(paths.data.join("manifest.new"));
+    install::make_data_directory(&paths).expect("an empty directory needs no manifest");
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_installation_stops_before_it_lays_anything_down_when_the_parent_folder_is_not_its_own() {

@@ -24,6 +24,10 @@ use windows_sys::Win32::Security::{
     GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorDacl, IsValidSid,
     OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
 };
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING,
+};
 
 use super::ffi::{Result, Sid, error, from_wide, last, wide_path};
 use super::sd::OwnedSd;
@@ -98,6 +102,7 @@ pub enum Reset {
 }
 
 const WRITE_DAC: u32 = 0x0004_0000;
+const READ_CONTROL: u32 = 0x0002_0000;
 
 /// Replaces a directory's list with a descriptor's list and stops it inheriting, on the directory's
 /// own handle and only when the directory has no child.
@@ -232,93 +237,35 @@ fn system_class(sid: &Sid) -> bool {
 
 /// Says which account other than the system's own can change a path, or `None` when none can.
 ///
-/// With `replacement_only` the check is for a directory above something that must not be swapped:
-/// only the rights that delete or take over the path count, since adding a sibling beside it
-/// changes nothing it holds. Without it, every right that changes a file or what a directory
-/// holds counts. The owner must be the system's own class either way. An entry that allows is
-/// counted even where another entry denies, so the answer errs towards refusing.
+/// The path is opened, following a link as the platform does, and the owner and the list are read
+/// on that handle by [`changeable_by_others_on`], so the answer has its rules: an entry that only a
+/// child inherits counts when it carries an inheritance flag, the rights to write attributes count,
+/// and an entry that is malformed or of a type the check does not read is a finding. It is for
+/// objects that the installation does not make and cannot hold open (the Git installation's
+/// directory); a directory that the installation makes is held and checked on its handle.
 ///
 /// # Errors
 ///
-/// Returns the platform's error when the path's permissions cannot be read.
+/// Returns the platform's error when the path cannot be opened or its permissions cannot be read.
 pub fn changeable_by_others(path: &Path, replacement_only: bool) -> Result<Option<String>> {
-    let path_text = wide_path(path);
-    let mut descriptor: *mut c_void = null_mut();
-    let mut owner: *mut c_void = null_mut();
-    let mut dacl: *mut ACL = null_mut();
-    // SAFETY: the path is NUL-terminated; the outputs are out-parameters, and the descriptor is
-    // freed below after everything borrowed from it has been read.
-    unsafe {
-        let status = GetNamedSecurityInfoW(
-            path_text.as_ptr(),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-            &raw mut owner,
+    let wide = wide_path(path);
+    // SAFETY: the path is NUL-terminated; the call keeps nothing of it.
+    let raw = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
             null_mut(),
-            &raw mut dacl,
-            null_mut(),
-            &raw mut descriptor,
-        );
-        if status != 0 {
-            return Err(error(
-                status,
-                format!("reading the permissions of {}", path.display()),
-            ));
-        }
-        let mut finding = None;
-        if !owner.is_null() {
-            let owner_sid = Sid::from_ptr(owner);
-            if !system_class(&owner_sid) {
-                finding = Some(format!("it is owned by {}", owner_sid.to_text()));
-            }
-        }
-        if finding.is_none() && dacl.is_null() {
-            finding = Some("it has no permission list, so anyone may change it".to_owned());
-        }
-        if finding.is_none() {
-            let mut information = ACL_SIZE_INFORMATION {
-                AceCount: 0,
-                AclBytesInUse: 0,
-                AclBytesFree: 0,
-            };
-            GetAclInformation(
-                dacl,
-                (&raw mut information).cast(),
-                size_of::<ACL_SIZE_INFORMATION>() as u32,
-                AclSizeInformation,
-            );
-            let mask_of_interest = if replacement_only {
-                REPLACES
-            } else {
-                CHANGES_CONTENT
-            };
-            for index in 0..information.AceCount {
-                let mut entry: *mut c_void = null_mut();
-                if GetAce(dacl, index, &raw mut entry) == 0 {
-                    continue;
-                }
-                let allowed = entry.cast::<ACCESS_ALLOWED_ACE>();
-                let header = (*allowed).Header;
-                if header.AceType != ACCESS_ALLOWED_ACE_TYPE
-                    || header.AceFlags & INHERIT_ONLY_ACE != 0
-                {
-                    continue;
-                }
-                let sid = Sid::from_ptr((&raw mut (*allowed).SidStart).cast());
-                let mask = (*allowed).Mask;
-                if mask & mask_of_interest != 0 && !system_class(&sid) {
-                    finding = Some(format!(
-                        "{} is allowed rights 0x{:x} on it",
-                        sid.to_text(),
-                        mask & mask_of_interest
-                    ));
-                    break;
-                }
-            }
-        }
-        LocalFree(descriptor);
-        Ok(finding)
-    }
+        )
+    };
+    let handle = super::ffi::Handle::new(
+        raw,
+        &format!("opening {} to read its permissions", path.display()),
+    )?;
+    changeable_by_others_on(&handle, replacement_only)
 }
 
 /// As [`changeable_by_others`], for an object that is already open: the owner and the list are read
