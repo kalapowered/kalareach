@@ -33,7 +33,7 @@ use std::ptr::null;
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_COMPLETE_IF_OPLOCKED, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN,
+    FILE_COMPLETE_IF_OPLOCKED, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_BY_FILE_ID,
     FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
     FileFsDeviceInformation, NtCreateFile, NtQueryVolumeInformationFile,
 };
@@ -42,14 +42,12 @@ use windows_sys::Win32::Foundation::{
     GetLastError, HANDLE, RtlNtStatusToDosError, STATUS_OPLOCK_BREAK_IN_PROGRESS, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, ExtendedFileIdType, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_128,
-    FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO,
-    FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo,
-    FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, FileIdInfo, FileStandardInfo,
-    GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
-    OPEN_EXISTING, OpenFileById, VOLUME_NAME_NT,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+    FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY,
+    FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileIdExtdDirectoryInfo,
+    FileIdExtdDirectoryRestartInfo, FileIdInfo, FileStandardInfo, GetFileInformationByHandleEx,
+    GetFinalPathNameByHandleW, GetFullPathNameW, GetVolumeInformationByHandleW, VOLUME_NAME_NT,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -295,6 +293,11 @@ impl Opened {
     #[must_use]
     pub fn links(&self) -> u32 {
         self.links
+    }
+
+    /// Gives the handle up, for the removal to hand to the call that deletes through it.
+    pub(super) fn into_handle(self) -> Handle {
+        self.handle
     }
 }
 
@@ -575,29 +578,66 @@ fn is_beneath(directory: &[u16], path: &[u16], name: &[u16]) -> bool {
 
 /// Opens an object on the volume of `hint` by its identifier, without following a reparse point.
 /// The handle is not held against a rename and cannot be deleted through; the caller compares the
-/// whole key on it.
+/// whole key on it. Like every open of an existing object it completes at once where a lock break
+/// is owed, and then reports a sharing violation.
 fn open_by_key(hint: &Handle, key: &FileKey, access: u32, share: u32) -> Result<Handle> {
-    let descriptor = FILE_ID_DESCRIPTOR {
-        dwSize: size_of::<FILE_ID_DESCRIPTOR>() as u32,
-        Type: ExtendedFileIdType,
-        Anonymous: FILE_ID_DESCRIPTOR_0 {
-            ExtendedFileId: FILE_ID_128 {
-                Identifier: key.file_id,
-            },
-        },
-    };
-    // SAFETY: the hint is open on the volume, the descriptor is complete and the call keeps neither.
-    let raw = unsafe {
-        OpenFileById(
-            hint.raw(),
-            &raw const descriptor,
-            access,
-            share,
-            null(),
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-        )
-    };
-    Handle::new(raw as HANDLE, "opening an object by its identifier")
+    // The identifier is the name of the open: 16 bytes, as 8 units.
+    let units: Vec<u16> = key
+        .file_id
+        .chunks_exact(2)
+        .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+        .collect();
+    nt_create(
+        hint.raw(),
+        &units,
+        access,
+        share,
+        FILE_OPEN,
+        FILE_OPEN_BY_FILE_ID,
+        None,
+    )
+}
+
+/// An absolute path as the NT name that opens it, which is the one form a call that is not
+/// `CreateFileW` takes. Only local paths are accepted.
+fn nt_path(path: &Path) -> Result<Vec<u16>> {
+    let wide = wide_path(path);
+    let mut full = vec![0_u16; 512];
+    loop {
+        // SAFETY: the path is NUL-terminated and the buffer length is passed.
+        let length = unsafe {
+            GetFullPathNameW(
+                wide.as_ptr(),
+                full.len() as u32,
+                full.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if length == 0 {
+            return Err(last("making a path absolute"));
+        }
+        if (length as usize) < full.len() {
+            full.truncate(length as usize);
+            break;
+        }
+        full.resize(length as usize + 1, 0);
+    }
+    let slash = u16::from(b'\\');
+    let question = u16::from(b'?');
+    if full.len() > 4 && full[..4] == [slash, slash, question, slash] {
+        // `\\?\C:\x` is `\??\C:\x` in the NT space.
+        full[1] = question;
+        return Ok(full);
+    }
+    if full.len() > 2 && full[0] == slash && full[1] == slash {
+        return Err(error(
+            ERROR_INVALID_PARAMETER,
+            "only a path on a local drive can be opened",
+        ));
+    }
+    let mut nt = vec![slash, question, question, slash];
+    nt.extend(full);
+    Ok(nt)
 }
 
 /// Checks an open directory the way every anchor and every recorded directory is checked: the
@@ -655,20 +695,15 @@ impl DirHandle {
         access: u32,
     ) -> Result<std::result::Result<DirHandle, AnchorRefusal>> {
         require_holding(access)?;
-        let wide = wide_path(path);
-        // SAFETY: the path is NUL-terminated; the call keeps nothing of it.
-        let raw = unsafe {
-            CreateFileW(
-                wide.as_ptr(),
-                access,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                null(),
-                OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-                std::ptr::null_mut(),
-            )
-        };
-        let handle = Handle::new(raw, "opening the directory a walk starts from")?;
+        let handle = nt_create(
+            std::ptr::null_mut(),
+            &nt_path(path)?,
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_OPEN,
+            0,
+            None,
+        )?;
         DirHandle::checked(handle)
     }
 
@@ -678,6 +713,12 @@ impl DirHandle {
             key: checked.key,
             path: checked.path,
         }))
+    }
+
+    /// Gives the directory's handle up, for the removal to hand to the call that deletes through
+    /// it.
+    pub(super) fn into_handle(self) -> Handle {
+        self.handle
     }
 
     /// The directory's identity.
@@ -1041,85 +1082,109 @@ impl DirHandle {
     ) -> Result<Handle> {
         #[cfg(feature = "testing")]
         testing::note_open(&self.path, name);
-        let bytes = name.len() * 2;
-        if bytes > usize::from(u16::MAX) {
-            return Err(error(
-                ERROR_FILE_NOT_FOUND,
-                "a name too long for the platform",
-            ));
-        }
-        let mut units = name.to_vec();
-        let text = UNICODE_STRING {
-            Length: bytes as u16,
-            MaximumLength: bytes as u16,
-            Buffer: units.as_mut_ptr(),
-        };
-        let attributes = OBJECT_ATTRIBUTES {
-            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-            RootDirectory: self.handle.raw(),
-            ObjectName: &raw const text,
-            // The flag that makes a lookup ignore case is not set, but the lookup in a directory
-            // that does not tell names apart by case still matches a name that differs only by
-            // case. Names come from a listing, so the open may reach another object with such a
-            // name; the identity compared on the handle is what catches it.
-            Attributes: 0,
-            SecurityDescriptor: descriptor.map_or(null(), |sd| sd.as_ptr().cast_const().cast()),
-            SecurityQualityOfService: null(),
-        };
-        let mut raw: HANDLE = std::ptr::null_mut();
-        let mut status_block = IO_STATUS_BLOCK::default();
         let share =
             FILE_SHARE_READ | FILE_SHARE_WRITE | if share_delete { FILE_SHARE_DELETE } else { 0 };
-        // A lock that another process holds on an existing object is broken by an open, and a
-        // synchronous open waits inside the call for the holder to acknowledge, where no limit of
-        // the caller counts. The open asks to complete at once instead.
-        let complete_if_oplocked = if disposition == FILE_OPEN {
-            FILE_COMPLETE_IF_OPLOCKED
-        } else {
-            0
-        };
-        let file_attributes = if options & FILE_DIRECTORY_FILE != 0 {
-            FILE_ATTRIBUTE_DIRECTORY
-        } else {
-            0
-        };
-        // SAFETY: the name, the attributes, the descriptor and the status block live through the
-        // call, the directory handle is open, and the call keeps none of them.
-        let status = unsafe {
-            NtCreateFile(
-                &raw mut raw,
-                access | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-                &raw const attributes,
-                &raw mut status_block,
-                null(),
-                file_attributes,
-                share,
-                disposition,
-                options
-                    | FILE_OPEN_REPARSE_POINT
-                    | FILE_OPEN_FOR_BACKUP_INTENT
-                    | FILE_SYNCHRONOUS_IO_NONALERT
-                    | complete_if_oplocked,
-                null(),
-                0,
-            )
-        };
-        if status < 0 {
-            return Err(nt_error(status, "opening a name beneath a held directory"));
-        }
-        let handle = Handle::new(raw, "opening a name beneath a held directory")?;
-        if status == STATUS_OPLOCK_BREAK_IN_PROGRESS {
-            // Another process holds an opportunistic lock on the object and has been asked to give
-            // it up. The open did not wait for it to answer, so no limit on a wait is lost inside
-            // the call; the object is in use, and the caller's bounded retries apply.
-            drop(handle);
-            return Err(error(
-                ERROR_SHARING_VIOLATION,
-                "the object is held by a lock that is being broken",
-            ));
-        }
-        Ok(handle)
+        nt_create(
+            self.handle.raw(),
+            name,
+            access,
+            share,
+            disposition,
+            options,
+            descriptor,
+        )
     }
+}
+
+/// Makes or opens the object `name` names, relative to the directory `root` (or an NT path when
+/// `root` is null), with one call that never follows a reparse point.
+///
+/// A lock that another process holds on an existing object is broken by an open, and a synchronous
+/// open waits inside the call for the holder to acknowledge, where no limit of the caller counts.
+/// An open of an existing object asks to complete at once instead, and an answer that a break is
+/// in progress is an object in use: the handle is closed and the error is a sharing violation.
+fn nt_create(
+    root: HANDLE,
+    name: &[u16],
+    access: u32,
+    share: u32,
+    disposition: u32,
+    options: u32,
+    descriptor: Option<&OwnedSd>,
+) -> Result<Handle> {
+    let bytes = name.len() * 2;
+    if bytes > usize::from(u16::MAX) {
+        return Err(error(
+            ERROR_FILE_NOT_FOUND,
+            "a name too long for the platform",
+        ));
+    }
+    let mut units = name.to_vec();
+    let text = UNICODE_STRING {
+        Length: bytes as u16,
+        MaximumLength: bytes as u16,
+        Buffer: units.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: root,
+        ObjectName: &raw const text,
+        // The flag that makes a lookup ignore case is not set, but the lookup in a directory that
+        // does not tell names apart by case still matches a name that differs only by case. Names
+        // come from a listing, so the open may reach another object with such a name; the
+        // identity compared on the handle is what catches it.
+        Attributes: 0,
+        SecurityDescriptor: descriptor.map_or(null(), |sd| sd.as_ptr().cast_const().cast()),
+        SecurityQualityOfService: null(),
+    };
+    let mut raw: HANDLE = std::ptr::null_mut();
+    let mut status_block = IO_STATUS_BLOCK::default();
+    let complete_if_oplocked = if disposition == FILE_OPEN {
+        FILE_COMPLETE_IF_OPLOCKED
+    } else {
+        0
+    };
+    let file_attributes = if options & FILE_DIRECTORY_FILE != 0 {
+        FILE_ATTRIBUTE_DIRECTORY
+    } else {
+        0
+    };
+    // SAFETY: the name, the attributes, the descriptor and the status block live through the
+    // call, the directory handle (when there is one) is open, and the call keeps none of them.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut raw,
+            access | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            &raw const attributes,
+            &raw mut status_block,
+            null(),
+            file_attributes,
+            share,
+            disposition,
+            options
+                | FILE_OPEN_REPARSE_POINT
+                | FILE_OPEN_FOR_BACKUP_INTENT
+                | FILE_SYNCHRONOUS_IO_NONALERT
+                | complete_if_oplocked,
+            null(),
+            0,
+        )
+    };
+    if status < 0 {
+        return Err(nt_error(status, "opening an object"));
+    }
+    let handle = Handle::new(raw, "opening an object")?;
+    if status == STATUS_OPLOCK_BREAK_IN_PROGRESS {
+        // Another process holds an opportunistic lock on the object and has been asked to give it
+        // up. The open did not wait for it to answer, so no limit on a wait is lost inside the
+        // call; the object is in use, and the caller's bounded retries apply.
+        drop(handle);
+        return Err(error(
+            ERROR_SHARING_VIOLATION,
+            "the object is held by a lock that is being broken",
+        ));
+    }
+    Ok(handle)
 }
 
 impl DirHandle {

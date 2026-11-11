@@ -25,9 +25,10 @@
 
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::os::windows::io::AsRawHandle as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use windows_sys::Wdk::Storage::FileSystem::{
@@ -36,7 +37,8 @@ use windows_sys::Wdk::Storage::FileSystem::{
     FileDispositionInformationEx, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_OPERATION_ABORTED, ERROR_SHARING_VIOLATION, HANDLE,
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_OPERATION_ABORTED,
+    ERROR_SHARING_VIOLATION, HANDLE,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
@@ -44,9 +46,10 @@ use windows_sys::Win32::Security::Cryptography::{
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
 };
-use windows_sys::Win32::System::IO::{CancelIoEx, IO_STATUS_BLOCK};
+use windows_sys::Win32::System::IO::{CancelSynchronousIo, IO_STATUS_BLOCK};
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-use super::ffi::{Handle, Sid, error};
+use super::ffi::{Handle, Sid, error, last};
 use super::privilege::PrivGuard;
 use super::sd::{self, Principals, SdKind};
 use super::walk::{Bounds, Child, DELETE, DirHandle, Kind, LIST, Lost, ROOT_BOUNDS};
@@ -55,12 +58,18 @@ use crate::journal::rows::RootName;
 
 const READ_CONTROL: u32 = 0x0002_0000;
 const RETRY_EVERY: Duration = Duration::from_millis(100);
-/// How often the watch over a delete call looks at it.
-const WATCH_EVERY: Duration = Duration::from_millis(50);
-/// What a delete call is given at least, once the waits for the whole root are spent: an ordinary
-/// delete takes a few milliseconds, and one that is still waiting after this long is held by a
-/// lock that nobody answers.
+/// A delete call that takes no longer than this is an ordinary one and costs the root's waits
+/// nothing: a delete is a metadata change that takes well under a millisecond, a few milliseconds
+/// beside a scanner that reads the file, so 50 ms is ten times what a busy disk and a scanner give
+/// and still short enough that no lock holder answering at its limit goes uncounted. Counting every
+/// ordinary delete would spend the total on a tree of thousands of files.
+const DELETE_GRACE: Duration = Duration::from_millis(50);
+/// What a delete call is given at least, once the waits for the whole root are spent: one such
+/// call is made, and the removal stops when it ends by its bound.
 const DELETE_FLOOR: Duration = Duration::from_millis(500);
+/// How long the removal waits for a delete call after it has asked the system to cancel it. A
+/// call that has not ended by then is given up.
+const CANCEL_GRACE: Duration = Duration::from_secs(2);
 
 /// The figures a removal works within, stated once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,13 +77,14 @@ pub struct Limits {
     /// The most objects a root may hold and the deepest it may be nested. More is one
     /// `too large` leftover for the root.
     pub bounds: Bounds,
-    /// How long the removal waits for one object that another process has open, and how long the
-    /// delete call on an opened object may take before it is cancelled and the object is a
-    /// leftover.
+    /// How long the removal waits for one object that another process has open, and how long a
+    /// delete call on an opened object may take before the system is asked to cancel it.
     pub wait_each: Duration,
-    /// How long the removal waits for objects in use in all, for one root, the time of cancelled
-    /// delete calls included. Past it, an object in use is a leftover at once, and a delete call
-    /// is given [`DELETE_FLOOR`].
+    /// How long the removal waits for objects in use in all, for one root: the waits to open
+    /// them, and the time of every delete call that takes longer than a few milliseconds
+    /// whatever its result. Past it, an object in use is a leftover at once, a delete call is
+    /// given [`DELETE_FLOOR`], and a delete call that ends by its bound stops the removal's
+    /// delete calls for the root.
     pub wait_total: Duration,
 }
 
@@ -321,77 +331,139 @@ pub fn remove_root_within(
     limits: Limits,
     rows: &mut dyn RootRows,
 ) -> Result<Vec<Leftover>, RootError> {
-    let watch = Watch::default();
-    std::thread::scope(|scope| {
-        scope.spawn(|| watch.run());
-        // The watch ends when the removal does, by a panic too.
-        let _end = EndWatch(&watch.finished);
-        remove_root_watched(root, limits, &watch, rows)
-    })
-}
-
-struct EndWatch<'a>(&'a AtomicBool);
-
-impl Drop for EndWatch<'_> {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
-    }
-}
-
-fn remove_root_watched(
-    root: &PrivateRoot,
-    limits: Limits,
-    watch: &Watch,
-    rows: &mut dyn RootRows,
-) -> Result<Vec<Leftover>, RootError> {
     let mut state = Removal {
         limits,
         listed: 0,
         waited: Duration::ZERO,
         too_large: false,
+        stopped: false,
         leftovers: Vec::new(),
-        watch,
+        deleter: Deleter::start(root.name.as_str())?,
         #[cfg(feature = "testing")]
         root: root.name.as_str().to_owned(),
     };
     state.empty(&root.dir, "", 1);
     if state.leftovers.is_empty() {
-        match delete(root.dir.handle()) {
-            Ok(()) => rows.removed()?,
-            Err(failure) => state.leftovers.push(Leftover {
-                path: String::new(),
-                reason: format!("the root itself could not be removed ({})", failure.code),
-            }),
+        // The root's own delete is made on the same thread and within the same bound, through a
+        // copy of its handle, which the caller keeps.
+        state.remove(duplicate(root.dir.handle())?, "");
+        if state.leftovers.is_empty() {
+            rows.removed()?;
         }
     }
     Ok(state.leftovers)
 }
 
-/// A delete call that is under way, as the watch over it sees it.
-#[derive(Default)]
-struct Watch {
-    /// The handle of the delete call in progress, when it began and how long it may take.
-    current: Mutex<Option<(usize, Instant, Duration)>>,
-    finished: AtomicBool,
+/// A second handle to the same object, with the same access.
+fn duplicate(handle: &Handle) -> Result<Handle, super::ffi::Error> {
+    let mut copy: HANDLE = std::ptr::null_mut();
+    // SAFETY: the handle is open in this process, and the call writes one handle to the local.
+    let done = unsafe {
+        let me = GetCurrentProcess();
+        DuplicateHandle(
+            me,
+            handle.raw(),
+            me,
+            &raw mut copy,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if done == 0 {
+        return Err(last("duplicating a handle"));
+    }
+    Handle::new(copy, "duplicating a handle")
 }
 
-impl Watch {
-    /// Cancels the delete call in progress once it has taken longer than it may. An object that
-    /// another process holds by a lock it does not give up makes the call wait for an answer that
-    /// never comes, and no wait of the caller counts inside it; the cancelled call fails and the
-    /// object is a leftover.
-    fn run(&self) {
-        while !self.finished.load(Ordering::Acquire) {
-            std::thread::sleep(WATCH_EVERY);
-            let current = self.current.lock().unwrap();
-            if let Some((raw, since, limit)) = *current
-                && since.elapsed() >= limit
-            {
-                // SAFETY: the removal clears `current` under this lock before it lets go of the
-                // handle, so the handle is open while the lock is held with it set. The call only
-                // cancels requests that are pending on it.
-                unsafe { CancelIoEx(raw as HANDLE, std::ptr::null()) };
-            }
+/// One object to delete through, which the thread that deletes owns until its call returns.
+struct Job {
+    handle: Handle,
+    #[cfg(feature = "testing")]
+    root: String,
+}
+
+/// How a delete call ended.
+enum Call {
+    /// It returned inside its limit.
+    Ended(Result<(), super::ffi::Error>),
+    /// It returned after the system was asked to cancel it.
+    Cancelled(Result<(), super::ffi::Error>),
+    /// It did not return, even after the cancel and a wait.
+    DidNotEnd,
+}
+
+/// The one thread that makes a removal's delete calls, so that the removal's own thread never
+/// waits in one. An object that another process holds by a lock it does not give up makes the
+/// call wait for an answer that never comes, and no wait of the caller counts inside it. The
+/// removal waits for the call's limit, asks the system to cancel it, waits a short while more, and
+/// then gives the call up: the thread keeps the handle and closes it when its call returns, and
+/// the removal makes no further call, so at most one such thread stays for a root.
+struct Deleter {
+    jobs: Sender<Job>,
+    answers: Receiver<Result<(), super::ffi::Error>>,
+    thread: JoinHandle<()>,
+    #[cfg(feature = "testing")]
+    root: String,
+}
+
+impl Deleter {
+    fn start(root: &str) -> Result<Deleter, RootError> {
+        let (jobs, work) = std::sync::mpsc::channel::<Job>();
+        let (reply, answers) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("private-root-delete".to_owned())
+            .spawn(move || {
+                // A delete through an open handle needs no privilege and no impersonation. The
+                // loop ends when the removal lets go of its end, and a closed answer ends it too.
+                while let Ok(job) = work.recv() {
+                    #[cfg(feature = "testing")]
+                    testing::wait_while_held(&job.root);
+                    let result = delete(&job.handle);
+                    drop(job.handle);
+                    if reply.send(result).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|failure| {
+                error(
+                    failure.raw_os_error().map_or(0, |code| code as u32),
+                    "starting the thread that deletes",
+                )
+            })?;
+        let _ = root;
+        Ok(Deleter {
+            jobs,
+            answers,
+            thread,
+            #[cfg(feature = "testing")]
+            root: root.to_owned(),
+        })
+    }
+
+    fn call(&self, handle: Handle, limit: Duration) -> Call {
+        let job = Job {
+            handle,
+            #[cfg(feature = "testing")]
+            root: self.root.clone(),
+        };
+        if self.jobs.send(job).is_err() {
+            return Call::DidNotEnd;
+        }
+        match self.answers.recv_timeout(limit) {
+            Ok(result) => return Call::Ended(result),
+            Err(RecvTimeoutError::Disconnected) => return Call::DidNotEnd,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        #[cfg(feature = "testing")]
+        testing::note_cancel(&self.root);
+        // SAFETY: the thread's handle is open while its join handle lives, and the call only asks
+        // the system to cancel the synchronous request that thread has pending, if it has one.
+        unsafe { CancelSynchronousIo(self.thread.as_raw_handle()) };
+        match self.answers.recv_timeout(CANCEL_GRACE) {
+            Ok(result) => Call::Cancelled(result),
+            Err(_) => Call::DidNotEnd,
         }
     }
 }
@@ -400,7 +472,7 @@ impl Watch {
 /// of what it named, and between that open and the deletion, where a sibling's change would land.
 #[cfg(feature = "testing")]
 pub mod testing {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
 
     use crate::journal::rows::RootName;
 
@@ -455,9 +527,118 @@ pub mod testing {
             hook(event);
         }
     }
+
+    type Gate = Arc<(Mutex<bool>, Condvar)>;
+
+    static HOLDS: Mutex<Vec<(String, Gate)>> = Mutex::new(Vec::new());
+    static CANCELS: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
+
+    /// Holds the thread that makes the delete calls of the removal of the root named `root`
+    /// before each call, until the guard is dropped. A held thread has no request pending in the
+    /// system, so a cancel does not reach it: it stands for a delete call that cannot be
+    /// cancelled.
+    #[must_use]
+    pub fn hold_deletes(root: &RootName) -> DeleteHold {
+        let gate: Gate = Arc::new((Mutex::new(true), Condvar::new()));
+        let mut holds = HOLDS.lock().unwrap();
+        holds.retain(|(name, _)| name != root.as_str());
+        holds.push((root.as_str().to_owned(), gate.clone()));
+        DeleteHold {
+            gate,
+            root: root.as_str().to_owned(),
+        }
+    }
+
+    /// The hold on a root's delete thread, released when it is dropped.
+    pub struct DeleteHold {
+        gate: Gate,
+        root: String,
+    }
+
+    impl Drop for DeleteHold {
+        fn drop(&mut self) {
+            HOLDS.lock().unwrap().retain(|(name, _)| *name != self.root);
+            *self.gate.0.lock().unwrap() = false;
+            self.gate.1.notify_all();
+        }
+    }
+
+    static DELAYS: Mutex<Vec<(String, std::time::Duration)>> = Mutex::new(Vec::new());
+
+    /// Makes the thread that makes the delete calls of the removal of the root named `root` wait
+    /// `delay` before each call, until the guard is dropped. The wait is no request pending in the
+    /// system, so a cancel does not shorten it: it stands for a delete call that ends by itself
+    /// after a wait.
+    #[must_use]
+    pub fn delay_deletes(root: &RootName, delay: std::time::Duration) -> DeleteDelay {
+        let mut delays = DELAYS.lock().unwrap();
+        delays.retain(|(name, _)| name != root.as_str());
+        delays.push((root.as_str().to_owned(), delay));
+        DeleteDelay {
+            root: root.as_str().to_owned(),
+        }
+    }
+
+    /// The delay on a root's delete thread, removed when it is dropped.
+    pub struct DeleteDelay {
+        root: String,
+    }
+
+    impl Drop for DeleteDelay {
+        fn drop(&mut self) {
+            DELAYS
+                .lock()
+                .unwrap()
+                .retain(|(name, _)| *name != self.root);
+        }
+    }
+
+    pub(super) fn wait_while_held(root: &str) {
+        let delay = DELAYS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(name, _)| name == root)
+            .map(|(_, delay)| *delay);
+        if let Some(delay) = delay {
+            std::thread::sleep(delay);
+        }
+        let gate = HOLDS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(name, _)| name == root)
+            .map(|(_, gate)| gate.clone());
+        if let Some(gate) = gate {
+            let mut held = gate.0.lock().unwrap();
+            while *held {
+                held = gate.1.wait(held).unwrap();
+            }
+        }
+    }
+
+    pub(super) fn note_cancel(root: &str) {
+        let mut cancels = CANCELS.lock().unwrap();
+        match cancels.iter_mut().find(|(name, _)| name == root) {
+            Some((_, count)) => *count += 1,
+            None => cancels.push((root.to_owned(), 1)),
+        }
+    }
+
+    /// How many times the removals of the root named `root` asked the system to cancel a delete
+    /// call.
+    #[must_use]
+    pub fn cancels(root: &RootName) -> usize {
+        CANCELS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(name, _)| name == root.as_str())
+            .map_or(0, |(_, count)| *count)
+    }
 }
 
-struct Removal<'a> {
+struct Removal {
     limits: Limits,
     /// The children listed so far, in every directory: the objects the root has used.
     listed: usize,
@@ -465,9 +646,12 @@ struct Removal<'a> {
     waited: Duration,
     /// Whether the one `too large` leftover was made.
     too_large: bool,
+    /// Whether the removal makes no further delete call: one ended by its bound with the waits
+    /// spent, or one that did not end.
+    stopped: bool,
     leftovers: Vec<Leftover>,
-    /// The watch over the delete calls.
-    watch: &'a Watch,
+    /// The thread that makes the delete calls.
+    deleter: Deleter,
     /// The root's name, which the cases' functions are set by.
     #[cfg(feature = "testing")]
     root: String,
@@ -481,7 +665,7 @@ fn joined(at: &str, child: &Child) -> String {
     }
 }
 
-impl Removal<'_> {
+impl Removal {
     fn leave(&mut self, path: &str, reason: impl Into<String>) {
         self.leftovers.push(Leftover {
             path: path.to_owned(),
@@ -527,6 +711,9 @@ impl Removal<'_> {
             self.leave_too_large();
         }
         for child in &listing.children {
+            if self.stopped {
+                break;
+            }
             let path = joined(at, child);
             self.remove_child(dir, child, &path, depth);
         }
@@ -561,7 +748,7 @@ impl Removal<'_> {
         #[cfg(feature = "testing")]
         testing::fire(&self.root, &testing::Event::Opened { path });
         match opened.kind() {
-            Kind::File | Kind::ReparsePoint => self.remove(opened.handle(), path),
+            Kind::File | Kind::ReparsePoint => self.remove(opened.into_handle(), path),
             Kind::Directory if !listed_directory => {
                 // The listing said a link and the object now reads as an ordinary directory:
                 // it was opened for deletion alone and is not entered.
@@ -586,6 +773,9 @@ impl Removal<'_> {
                 };
                 let before = self.leftovers.len();
                 self.empty(&held, path, depth + 1);
+                if self.stopped {
+                    return;
+                }
                 match held.children(1) {
                     Err(failure) => self.leave(
                         path,
@@ -599,7 +789,7 @@ impl Removal<'_> {
                             self.leave(path, "not empty after its contents were removed");
                         }
                     }
-                    Ok(_) => self.remove(held.handle(), path),
+                    Ok(_) => self.remove(held.into_handle(), path),
                 }
             }
         }
@@ -630,29 +820,72 @@ impl Removal<'_> {
         }
     }
 
-    /// Deletes the object behind `handle`, which was opened and checked, and makes a leftover of
-    /// it when it cannot be. The open of every name completes at once on a lock that is not given
-    /// up, so no delete call is reached on a handle that was opened while a break was owed; a
-    /// break that the delete itself owes is the one a lock can still make it wait for, and the
-    /// watch cancels the call after the wait the removal allows, which makes the object one that
-    /// is in use.
-    fn remove(&mut self, handle: &Handle, path: &str) {
+    /// Deletes through `handle`, which was opened and checked, on the delete thread and within
+    /// the removal's bound, and makes a leftover of the object at `path` (the root when empty)
+    /// when it cannot be. The open of every name completes at once on a lock that is not given
+    /// up, so no delete call is reached on a handle that was opened while a break was owed; the
+    /// break that the delete itself owes is the one a lock can still make it wait for. The call
+    /// has `wait_each` or what is left of the total, and at least [`DELETE_FLOOR`]. The time of a
+    /// call that takes longer than [`DELETE_GRACE`] is counted against the total whatever its
+    /// result. A call that does not end, or one that takes longer than the grace once the total is
+    /// spent, stops the removal's delete calls for this root: what is left stays, under one
+    /// leftover for the root.
+    fn remove(&mut self, handle: Handle, path: &str) {
+        if self.stopped {
+            return;
+        }
         let remaining = self.limits.wait_total.saturating_sub(self.waited);
         let limit = remaining.min(self.limits.wait_each).max(DELETE_FLOOR);
         let started = Instant::now();
-        *self.watch.current.lock().unwrap() = Some((handle.raw() as usize, started, limit));
-        let result = delete(handle);
-        *self.watch.current.lock().unwrap() = None;
-        match result {
-            Ok(()) => {}
-            Err(failure) if failure.code == ERROR_OPERATION_ABORTED => {
-                self.waited += started.elapsed();
-                self.leave(path, "in use");
+        let call = self.deleter.call(handle, limit);
+        let elapsed = started.elapsed();
+        if elapsed > DELETE_GRACE {
+            self.waited += elapsed;
+        }
+        match call {
+            Call::Ended(Ok(())) | Call::Cancelled(Ok(())) => {}
+            Call::Ended(Err(failure)) => self.leave_not_removed(path, failure.code),
+            Call::Cancelled(Err(failure)) => {
+                if failure.code == ERROR_OPERATION_ABORTED {
+                    self.leave(path, "in use");
+                } else {
+                    self.leave_not_removed(path, failure.code);
+                }
             }
-            Err(failure) => self.leave(
+            Call::DidNotEnd => {
+                self.leave(path, "the delete call did not end");
+                self.stop("a delete call did not end");
+            }
+        }
+        if elapsed > DELETE_GRACE && self.waited >= self.limits.wait_total {
+            self.stop("the waits for objects in use are spent");
+        }
+    }
+
+    fn leave_not_removed(&mut self, path: &str, code: u32) {
+        if path.is_empty() {
+            self.leave(
                 path,
-                format!("not removed (Windows error {})", failure.code),
-            ),
+                format!("the root itself could not be removed (Windows error {code})"),
+            );
+        } else {
+            self.leave(path, format!("not removed (Windows error {code})"));
+        }
+    }
+
+    /// Ends the removal's delete calls for this root, with one leftover for the root that says why
+    /// (none besides the root's own when the root's delete is the one that ended).
+    fn stop(&mut self, reason: &str) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
+        if self
+            .leftovers
+            .last()
+            .is_none_or(|last| !last.path.is_empty())
+        {
+            self.leave("", reason);
         }
     }
 }
@@ -697,8 +930,11 @@ pub fn check_disposition(dir: &DirHandle) -> Result<(), RootError> {
     let units: Vec<u16> = name.encode_utf16().collect();
     let handle = dir.create_file_named(&units, DELETE)?;
     delete(&handle)?;
+    // The name is probed while the handle is still open: with POSIX semantics it is gone at once,
+    // and a delete that waited for the last close would still show it.
+    let exists = dir.name_exists(&units)?;
     drop(handle);
-    if dir.name_exists(&units)? {
+    if exists {
         return Err(RootError::Refused(
             "the platform's delete with POSIX semantics left the scratch file".to_owned(),
         ));

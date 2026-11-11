@@ -38,7 +38,9 @@ use kr_boundary_windows::win::root::{
     create_root, create_root_named, remove_root, remove_root_within,
 };
 use kr_boundary_windows::win::sd::{self, Principals, SdKind};
-use kr_boundary_windows::win::walk::{AnchorRefusal, Bounds, testing as walking};
+use kr_boundary_windows::win::walk::{
+    AnchorRefusal, Bounds, DirHandle, RecordedDir, testing as walking,
+};
 use kr_boundary_windows::win::{account, broker, token};
 
 use common::{Outside, Rows, Scratch, group, hostile_dir, hostile_file, look_at, run, run_dir};
@@ -1497,16 +1499,22 @@ const LOCK_WRITE: u32 = 4;
 impl Lock {
     /// Takes a lock of the given levels (read, handle and write caching, alone or together).
     fn take(path: &Path, levels: u32) -> Lock {
+        Lock::take_sharing(path, levels, 7)
+    }
+
+    /// As [`Lock::take`], with the sharing the holder's own open allows (read 1, write 2 and
+    /// delete 4).
+    fn take_sharing(path: &Path, levels: u32, share: u32) -> Lock {
         let wide = wide_path(path);
         // SAFETY: the path is NUL-terminated and the call keeps nothing of it.
         let raw = unsafe {
             CreateFileW(
                 wide.as_ptr(),
                 GENERIC_READ | GENERIC_WRITE,
-                7,
+                share,
                 std::ptr::null(),
                 OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_BACKUP_SEMANTICS,
                 std::ptr::null_mut(),
             )
         };
@@ -1559,58 +1567,84 @@ impl Lock {
     }
 }
 
-#[test]
-#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
-fn an_object_held_by_a_lock_that_is_not_given_up_is_a_leftover_within_the_waits_and_not_a_hang() {
-    let scratch = Scratch::new();
-    let (_run, root, _owner) = made_root(&scratch);
-    let held = root.tmp().join("locked.txt");
-    std::fs::write(&held, b"locked").unwrap();
-    let lock = Lock::take(&held, LOCK_READ | LOCK_HANDLE | LOCK_WRITE);
-    let guard = privilege::enter().unwrap();
-    let mut rows = Rows::default();
-    let started = Instant::now();
-    let leftovers = remove_root_within(
-        &root,
-        &guard,
-        Limits {
-            wait_each: Duration::from_secs(1),
-            wait_total: Duration::from_secs(2),
-            ..ROOT_LIMITS
-        },
-        &mut rows,
-    )
-    .unwrap();
-    let spent = started.elapsed();
-    drop(guard);
-    assert!(
-        lock.break_was_asked_for(),
-        "the removal's open owed the lock a break, or the case shows nothing"
-    );
-    assert!(
-        spent < Duration::from_secs(20),
-        "the removal did not wait inside an open for the lock's break, which nobody answers: {spent:?}"
-    );
-    assert_eq!(
-        leftovers,
-        [Leftover {
-            path: "tmp\\locked.txt".to_owned(),
-            reason: "in use".to_owned()
-        }]
-    );
-    assert!(held.exists(), "the object is as it was");
-    drop(lock);
-    let (rest, _) = remove_with_the_walks_privileges(&root);
-    assert!(
-        rest.is_empty(),
-        "once the lock is gone the next removal finishes: {rest:?}"
-    );
-    assert!(common::is_gone(root), "the root is gone");
+/// The waits the lock and delete cases give a removal.
+const LIMITS: Limits = Limits {
+    wait_each: Duration::from_secs(1),
+    wait_total: Duration::from_secs(2),
+    ..ROOT_LIMITS
+};
+/// The longest a removal within [`LIMITS`] may take: the total, the half second a delete call is
+/// given once the total is spent, the two seconds it is waited for after a cancel, and a second.
+const AT_MOST: Duration = Duration::from_millis(2000 + 500 + 2000 + 1000);
+
+/// Runs `body` on a thread and fails the case when it has not returned within `deadline`.
+fn on_a_thread<T: Send + 'static>(
+    deadline: Duration,
+    body: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = send.send(body());
+    });
+    receive
+        .recv_timeout(deadline)
+        .unwrap_or_else(|_| panic!("the call did not return within {deadline:?}"))
+}
+
+/// What a removal that ran on a thread of its own gave back.
+struct Removed {
+    root: PrivateRoot,
+    leftovers: Vec<Leftover>,
+    log: Vec<String>,
+    spent: Duration,
+}
+
+/// Runs the removal on a thread with the walk's privileges and fails the case when it has not
+/// returned within `deadline`, so that a call that waits for ever is a failed assertion and not a
+/// program that never ends.
+fn remove_on_a_thread(root: PrivateRoot, limits: Limits, deadline: Duration) -> Removed {
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let guard = privilege::enter().unwrap();
+        let mut rows = Rows::default();
+        let started = Instant::now();
+        let leftovers = remove_root_within(&root, &guard, limits, &mut rows).unwrap();
+        let spent = started.elapsed();
+        drop(guard);
+        let _ = send.send(Removed {
+            root,
+            leftovers,
+            log: rows.log,
+            spent,
+        });
+    });
+    receive
+        .recv_timeout(deadline)
+        .unwrap_or_else(|_| panic!("the removal did not return within {deadline:?}"))
+}
+
+/// Waits until `condition` holds, and fails the case when it does not within ten seconds.
+fn wait_until(what: &str, condition: impl Fn() -> bool) {
+    let until = Instant::now() + Duration::from_secs(10);
+    while !condition() {
+        assert!(Instant::now() < until, "{what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn names_in(directory: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
 }
 
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
-fn an_object_held_by_a_lock_of_any_kind_is_removed_or_a_leftover_and_no_call_waits_without_end() {
+fn a_file_held_by_a_lock_that_is_not_given_up_is_removed_or_in_use_within_the_waits_for_every_kind()
+{
     for (levels, kind) in [
         (LOCK_READ, "read"),
         (LOCK_READ | LOCK_HANDLE, "read and handle"),
@@ -1625,29 +1659,24 @@ fn an_object_held_by_a_lock_of_any_kind_is_removed_or_a_leftover_and_no_call_wai
         let held = root.tmp().join("locked.txt");
         std::fs::write(&held, b"locked").unwrap();
         let lock = Lock::take(&held, levels);
-        let guard = privilege::enter().unwrap();
-        let mut rows = Rows::default();
-        let started = Instant::now();
-        let leftovers = remove_root_within(
-            &root,
-            &guard,
-            Limits {
-                wait_each: Duration::from_secs(1),
-                wait_total: Duration::from_secs(2),
-                ..ROOT_LIMITS
-            },
-            &mut rows,
-        )
-        .unwrap();
-        let spent = started.elapsed();
-        drop(guard);
+        let name = root.name().clone();
+        let done = remove_on_a_thread(root, LIMITS, Duration::from_secs(30));
         let asked = lock.break_was_asked_for();
-        println!("lock of {kind}: break asked for {asked}, {leftovers:?}, {spent:?}");
-        assert!(
-            spent < Duration::from_secs(20),
-            "{kind}: no call of the removal waited for the lock's break: {spent:?}"
+        let cancels = removal::cancels(&name);
+        println!(
+            "lock of {kind}: break asked for {asked}, cancels {cancels}, {:?}, {:?}",
+            done.leftovers, done.spent
         );
-        match leftovers.as_slice() {
+        assert!(
+            done.spent <= AT_MOST,
+            "{kind}: no call of the removal waited for the lock's break: {:?}",
+            done.spent
+        );
+        assert!(
+            cancels <= 1,
+            "{kind}: one delete call at most was cancelled"
+        );
+        match done.leftovers.as_slice() {
             [] => assert!(!held.exists(), "{kind}: removed means gone"),
             [one] => {
                 assert_eq!(
@@ -1655,15 +1684,249 @@ fn an_object_held_by_a_lock_of_any_kind_is_removed_or_a_leftover_and_no_call_wai
                     ("tmp\\locked.txt", "in use"),
                     "{kind}: a lock that is not given up makes the object one in use"
                 );
+                assert!(
+                    asked,
+                    "{kind}: the lock was asked to give up, or nothing held the object"
+                );
+                assert!(
+                    done.spent >= LIMITS.wait_each,
+                    "{kind}: the removal waited for the object as long as it may: {:?}",
+                    done.spent
+                );
                 assert!(held.exists(), "{kind}: the object is as it was");
             }
             more => panic!("{kind}: {more:?}"),
         }
+        if levels == LOCK_READ | LOCK_WRITE | LOCK_HANDLE {
+            // Shown in a guest: the open of an object with a lock of every level owes it a break,
+            // so the open is refused and no delete call is made.
+            assert_eq!(cancels, 0, "{kind}: the open refused the object");
+            assert_eq!(done.leftovers.len(), 1, "{kind}: and it is a leftover");
+        }
         drop(lock);
-        let (rest, _) = remove_with_the_walks_privileges(&root);
+        let (rest, _) = remove_with_the_walks_privileges(&done.root);
         assert!(rest.is_empty(), "{kind}: once the lock is gone: {rest:?}");
-        assert!(common::is_gone(root), "{kind}: the root is gone");
+        assert!(common::is_gone(done.root), "{kind}: the root is gone");
     }
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_roots_own_delete_under_a_lock_on_the_root_directory_is_removed_or_in_use_within_the_waits() {
+    let scratch = Scratch::new();
+    let (_run, root, _owner) = made_root(&scratch);
+    let lock = Lock::take(root.path(), LOCK_READ | LOCK_HANDLE);
+    let path = root.path().to_owned();
+    let name = root.name().clone();
+    let done = remove_on_a_thread(root, LIMITS, Duration::from_secs(30));
+    let asked = lock.break_was_asked_for();
+    let cancels = removal::cancels(&name);
+    println!(
+        "lock on the root directory: break asked for {asked}, cancels {cancels}, {:?}, {:?}",
+        done.leftovers, done.spent
+    );
+    assert!(done.spent <= AT_MOST, "{:?}", done.spent);
+    match done.leftovers.as_slice() {
+        [] => {
+            assert!(!path.exists(), "removed means gone");
+            assert_eq!(done.log, ["removed"]);
+        }
+        [one] => {
+            assert_eq!(
+                (one.path.as_str(), one.reason.as_str()),
+                ("", "in use"),
+                "the leftover is the root's"
+            );
+            assert!(asked, "the lock was asked to give up");
+            assert_eq!(cancels, 1, "the one delete call that waited was cancelled");
+            assert!(done.spent >= LIMITS.wait_each, "{:?}", done.spent);
+            assert!(path.exists() && done.log.is_empty());
+        }
+        more => panic!("{more:?}"),
+    }
+    drop(lock);
+    let (rest, _) = remove_with_the_walks_privileges(&done.root);
+    assert!(rest.is_empty(), "once the lock is gone: {rest:?}");
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_roots_own_delete_goes_through_the_same_thread_and_a_call_that_does_not_end_is_given_up() {
+    let scratch = Scratch::new();
+    let (_run, root, _owner) = made_root(&scratch);
+    let name = root.name().clone();
+    let path = root.path().to_owned();
+    // The root is made empty first, so that its own delete is the removal's first call.
+    std::fs::remove_dir(root.tmp()).unwrap();
+    std::fs::remove_dir(root.home()).unwrap();
+    // The held thread has no request pending in the system, which no cancel reaches: it stands for
+    // a delete call that cannot be cancelled.
+    let hold = removal::hold_deletes(&name);
+    let done = remove_on_a_thread(root, LIMITS, Duration::from_secs(30));
+    assert_eq!(
+        done.leftovers,
+        [Leftover {
+            path: String::new(),
+            reason: "the delete call did not end".to_owned()
+        }],
+        "one leftover, the root's: the root's delete was made on the thread that is held"
+    );
+    assert_eq!(
+        removal::cancels(&name),
+        1,
+        "the system was asked to cancel the call once"
+    );
+    assert!(
+        done.spent >= LIMITS.wait_each && done.spent <= AT_MOST,
+        "the removal waited for the limit and the grace and then returned: {:?}",
+        done.spent
+    );
+    assert!(done.log.is_empty(), "no removed row");
+    assert!(
+        path.exists(),
+        "the root is still there while the call is held"
+    );
+    drop(hold);
+    wait_until("the held call ran and removed the root", || !path.exists());
+    drop(done.root);
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_delete_call_that_does_not_end_is_given_up_and_no_further_call_is_made_for_the_root() {
+    let scratch = Scratch::new();
+    let (_run, root, _owner) = made_root(&scratch);
+    let tmp = root.tmp();
+    for file in ["a.txt", "b.txt"] {
+        std::fs::write(tmp.join(file), b"x").unwrap();
+    }
+    let name = root.name().clone();
+    let hold = removal::hold_deletes(&name);
+    let done = remove_on_a_thread(root, LIMITS, Duration::from_secs(30));
+    assert_eq!(done.leftovers.len(), 2, "{:?}", done.leftovers);
+    let object = &done.leftovers[0];
+    assert!(
+        ["tmp\\a.txt", "tmp\\b.txt"].contains(&object.path.as_str())
+            && object.reason == "the delete call did not end",
+        "the object whose call was given up: {object:?}"
+    );
+    assert_eq!(
+        done.leftovers[1],
+        Leftover {
+            path: String::new(),
+            reason: "a delete call did not end".to_owned()
+        },
+        "and one leftover for the root"
+    );
+    assert_eq!(removal::cancels(&name), 1);
+    assert!(
+        done.spent >= LIMITS.wait_each && done.spent <= AT_MOST,
+        "{:?}",
+        done.spent
+    );
+    assert_eq!(
+        names_in(&tmp),
+        ["a.txt", "b.txt"],
+        "no further delete call was made, and the held one has not run"
+    );
+    drop(hold);
+    wait_until("the held call ran", || names_in(&tmp).len() == 1);
+    let (rest, _) = remove_with_the_walks_privileges(&done.root);
+    assert!(rest.is_empty(), "the next removal finishes: {rest:?}");
+    assert!(common::is_gone(done.root), "the root is gone");
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn delete_calls_that_each_end_just_inside_their_limit_spend_the_total_and_stop_the_removal() {
+    let scratch = Scratch::new();
+    let (_run, root, _owner) = made_root(&scratch);
+    let tmp = root.tmp();
+    for index in 0..5 {
+        std::fs::write(tmp.join(format!("f{index}.txt")), b"x").unwrap();
+    }
+    let name = root.name().clone();
+    // Each call waits 0.9 seconds and then succeeds, inside the one second a call is given, as a
+    // lock holder answers just before the limit. Two calls leave a fifth of the total.
+    let delay = removal::delay_deletes(&name, Duration::from_millis(900));
+    let done = remove_on_a_thread(root, LIMITS, Duration::from_secs(30));
+    assert_eq!(
+        done.leftovers,
+        [Leftover {
+            path: String::new(),
+            reason: "the waits for objects in use are spent".to_owned()
+        }],
+        "the third call took longer than the half second it was given with the total spent, and the removal made no call after it"
+    );
+    assert!(
+        done.spent >= LIMITS.wait_total && done.spent <= AT_MOST,
+        "{:?}",
+        done.spent
+    );
+    assert_eq!(
+        names_in(&tmp).len(),
+        2,
+        "three of the five went and two stayed: {:?}",
+        names_in(&tmp)
+    );
+    assert!(done.log.is_empty());
+    drop(delay);
+    let (rest, _) = remove_with_the_walks_privileges(&done.root);
+    assert!(rest.is_empty(), "the next removal finishes: {rest:?}");
+    assert!(common::is_gone(done.root), "the root is gone");
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_repairs_open_and_the_recorded_directorys_open_complete_at_once_under_a_lock() {
+    let scratch = Scratch::new();
+    let directory = scratch.path("locked-dir");
+    std::fs::create_dir(&directory).unwrap();
+    let hint_dir = scratch.path("hint");
+    std::fs::create_dir(&hint_dir).unwrap();
+    let key = DirHandle::open_anchor(&directory)
+        .unwrap()
+        .expect("the directory is accepted")
+        .key();
+    let hint = DirHandle::open_anchor(&hint_dir)
+        .unwrap()
+        .expect("the hint is accepted");
+    // The holder shares write and delete but not read, so that the two opens, which ask to list,
+    // conflict with it; the platform then owes it a break of its handle-caching lock first.
+    let lock = Lock::take_sharing(&directory, LOCK_READ | LOCK_HANDLE, 2 | 4);
+    let started = Instant::now();
+    let repaired = {
+        let directory = directory.clone();
+        on_a_thread(Duration::from_secs(30), move || {
+            let wanted = sd::descriptor(SdKind::AdminDir, &Principals::default()).unwrap();
+            acl::set_protected_when_empty(&directory, &wanted)
+        })
+    };
+    let repair_spent = started.elapsed();
+    let recorded = on_a_thread(Duration::from_secs(30), move || {
+        let started = Instant::now();
+        let opened = RecordedDir::open(hint.handle(), &key);
+        (opened.map(|_| ()), started.elapsed())
+    });
+    println!(
+        "lock of read and handle: the repair {repaired:?} in {repair_spent:?}, the recorded open {recorded:?}"
+    );
+    assert_eq!(
+        repaired.unwrap_err().code,
+        32,
+        "the repair's open meets a sharing violation and does not wait for the lock"
+    );
+    assert!(repair_spent < Duration::from_secs(5), "{repair_spent:?}");
+    assert_eq!(
+        recorded.0.unwrap_err().code,
+        32,
+        "the recorded directory's open meets a sharing violation and does not wait for the lock"
+    );
+    assert!(recorded.1 < Duration::from_secs(5), "{:?}", recorded.1);
+    assert!(
+        lock.break_was_asked_for(),
+        "the lock was asked to give up, or the case shows nothing"
+    );
 }
 
 #[test]
@@ -1717,12 +1980,12 @@ fn a_child_made_between_the_empty_check_and_the_change_is_reported_and_not_hidde
     std::fs::create_dir(&directory).unwrap();
     {
         let directory = directory.clone();
-        acl::testing::set_after_check(move || {
+        acl::testing::set_after_check(&directory.clone(), move || {
             std::fs::write(directory.join("late.txt"), b"made in the window").unwrap();
         });
     }
     let result = acl::set_protected_when_empty(&directory, &wanted).unwrap();
-    acl::testing::clear();
+    acl::testing::clear(&directory);
     assert_eq!(
         result,
         Reset::NotEmpty,

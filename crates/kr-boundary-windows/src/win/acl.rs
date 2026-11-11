@@ -90,7 +90,8 @@ pub enum Reset {
     /// The directory holds something. Either it held a child before the call, and its list was
     /// not changed, or a child appeared between the check and the change, and the list was set.
     /// A child made before the set keeps the entries it inherited from the old list. The caller
-    /// verifies what the directory holds before it trusts it.
+    /// reads the directory's list to tell the two apart, and verifies what the directory holds
+    /// before it trusts it.
     NotEmpty,
     /// The path is not a directory that a walk may anchor on: a reparse point, something that is
     /// not a directory, or a volume that is not accepted. Nothing was changed.
@@ -142,7 +143,7 @@ pub fn set_protected_when_empty(path: &Path, descriptor: &OwnedSd) -> Result<Res
         return Ok(Reset::NotEmpty);
     }
     #[cfg(feature = "testing")]
-    testing::after_check();
+    testing::after_check(path);
     // SAFETY: the handle is open with the right to change the list and the descriptor lives
     // through the call.
     let status = unsafe {
@@ -169,25 +170,38 @@ pub fn set_protected_when_empty(path: &Path, descriptor: &OwnedSd) -> Result<Res
 /// What the cases use to make a creator act where a real one could.
 #[cfg(feature = "testing")]
 pub mod testing {
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
     type Hook = Arc<dyn Fn() + Send + Sync>;
 
-    static AFTER_CHECK: Mutex<Option<Hook>> = Mutex::new(None);
+    static AFTER_CHECK: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
 
-    /// Sets the function called after [`super::set_protected_when_empty`] has found its directory
-    /// empty and before it changes the list, until [`clear`].
-    pub fn set_after_check(hook: impl Fn() + Send + Sync + 'static) {
-        *AFTER_CHECK.lock().unwrap() = Some(Arc::new(hook));
+    /// Sets the function called after [`super::set_protected_when_empty`] has found the directory
+    /// at `path` empty and before it changes the list, until [`clear`]. A repair of another
+    /// directory does not call it, so cases that run side by side do not meet each other's
+    /// function.
+    pub fn set_after_check(path: &Path, hook: impl Fn() + Send + Sync + 'static) {
+        let mut hooks = AFTER_CHECK.lock().unwrap();
+        hooks.retain(|(wanted, _)| wanted != path);
+        hooks.push((path.to_owned(), Arc::new(hook)));
     }
 
-    /// Removes the function.
-    pub fn clear() {
-        *AFTER_CHECK.lock().unwrap() = None;
+    /// Removes the function of the directory at `path`.
+    pub fn clear(path: &Path) {
+        AFTER_CHECK
+            .lock()
+            .unwrap()
+            .retain(|(wanted, _)| wanted != path);
     }
 
-    pub(super) fn after_check() {
-        let hook = AFTER_CHECK.lock().unwrap().clone();
+    pub(super) fn after_check(path: &Path) {
+        let hook = AFTER_CHECK
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(wanted, _)| wanted == path)
+            .map(|(_, hook)| hook.clone());
         if let Some(hook) = hook {
             hook();
         }
