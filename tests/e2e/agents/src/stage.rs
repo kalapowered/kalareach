@@ -2088,7 +2088,10 @@ mod tests {
             let program = directory.join("bin/codex");
             std::fs::write(
                 &program,
-                format!("#!/bin/sh\necho {name} >> '{}'\n", base.join("ran").display()),
+                format!(
+                    "#!/bin/sh\necho {name} >> '{}'\n",
+                    base.join("ran").display()
+                ),
             )
             .expect("a program");
             std::fs::set_permissions(
