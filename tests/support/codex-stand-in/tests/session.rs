@@ -439,6 +439,116 @@ async fn the_server_ends_with_a_status_on_a_frame_it_cannot_answer() {
     assert!(refused.get("error").is_some(), "{refused}");
 }
 
+/// A request to start a turn with `text` as its input.
+fn turn_asking(id: u64, thread: &str, text: &str) -> Value {
+    json!({"id":id,"method":"turn/start","params":{
+        "threadId":thread,"input":[{"type":"text","text":text,"text_elements":[]}]}})
+}
+
+/// Reads frames until the turn completes, answering its approval, and returns the text of each
+/// message the agent wrote in it.
+async fn messages_of_the_turn<R: tokio::io::AsyncBufRead + Unpin>(
+    stdin: &mut ChildStdin,
+    lines: &mut tokio::io::Lines<R>,
+) -> Vec<String> {
+    let mut messages = Vec::new();
+    loop {
+        let frame = next(lines).await;
+        match frame["method"].as_str() {
+            Some("item/agentMessage/delta") => messages.push(
+                frame["params"]["delta"]
+                    .as_str()
+                    .expect("a text")
+                    .to_owned(),
+            ),
+            Some("item/commandExecution/requestApproval") => {
+                write(
+                    stdin,
+                    &json!({"id":frame["id"],"result":{"decision":"accept"}}),
+                )
+                .await;
+            }
+            Some("turn/completed") => return messages,
+            _ => {}
+        }
+    }
+}
+
+/// Under `answer-the-sum`, a turn whose input asks `What is A plus B?` is answered with the sum,
+/// worked out from the input, as a message of the turn before it ends, whether the turn is the
+/// first or one somebody else started; an input that asks no such thing is answered with nothing,
+/// and so is every turn where the variant is not named.
+#[tokio::test]
+async fn the_server_answers_the_sum_a_turn_asks_for_only_under_the_variant() {
+    let question = |first: u64, second: u64| {
+        format!("(mark) What is {first} plus {second}? Reply with only the number.")
+    };
+    for (variants, first_text, second_text, first_answer, second_answer) in [
+        (
+            "answer-the-sum",
+            question(612, 1034),
+            question(777, 1999),
+            vec!["1646"],
+            vec!["2776"],
+        ),
+        (
+            "answer-the-sum",
+            "go".to_owned(),
+            "What is 12 plus x? Reply with only the number.".to_owned(),
+            vec![],
+            vec![],
+        ),
+        ("", question(612, 1034), question(777, 1999), vec![], vec![]),
+    ] {
+        let mut child = server(variants, Some(COMMAND));
+        let mut stdin = child.stdin.take().expect("stdin");
+        let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
+        write(&mut stdin, &initialize()).await;
+        assert_eq!(next(&mut lines).await["id"], "initialize");
+        assert_eq!(
+            next(&mut lines).await["method"],
+            "remoteControl/status/changed"
+        );
+        write(&mut stdin, &json!({"method":"initialized"})).await;
+        write(
+            &mut stdin,
+            &json!({"id":2,"method":"thread/start","params":{}}),
+        )
+        .await;
+        assert!(next(&mut lines).await["result"]["thread"]["id"].is_string());
+        assert_eq!(next(&mut lines).await["method"], "thread/started");
+        write(&mut stdin, &turn_asking(3, "thread-1", &first_text)).await;
+        assert_eq!(
+            messages_of_the_turn(&mut stdin, &mut lines).await,
+            first_answer,
+            "the first turn, variants {variants:?}, asked {first_text:?}"
+        );
+        write(&mut stdin, &turn_asking(4, "thread-1", &second_text)).await;
+        assert_eq!(
+            messages_of_the_turn(&mut stdin, &mut lines).await,
+            second_answer,
+            "a later turn, variants {variants:?}, asked {second_text:?}"
+        );
+    }
+}
+
+/// The terminal writes the message of a turn as a row of its own under `answer-the-sum`, and no
+/// such row where the variant is not named.
+#[tokio::test]
+async fn the_terminal_writes_the_answer_to_the_sum_as_a_row_of_its_own_only_under_the_variant() {
+    let prompt = "What is 612 plus 1034? Reply with only the number.";
+    let run = relay_asking("answer-the-sum", &[], None, prompt).await;
+    assert_eq!(run.status, Some(0), "{}", run.screen);
+    assert!(
+        run.screen.lines().any(|row| row == "TUI: 1646"),
+        "{}",
+        run.screen
+    );
+    let run = relay_asking("", &[], None, prompt).await;
+    assert_eq!(run.status, Some(0), "{}", run.screen);
+    assert!(!run.screen.contains("1646"), "{}", run.screen);
+}
+
 /// What a terminal run came to, against a gateway that relays.
 struct Relayed {
     status: Option<i32>,
@@ -452,8 +562,22 @@ struct Relayed {
 /// Runs a terminal against a gateway that relays each message to and from a server of the
 /// stand-in's own (or, with `drop_after`, drops the connection after that many messages).
 async fn relay(variants: &str, environment: &[(&str, &str)], drop_after: Option<usize>) -> Relayed {
-    let directory =
-        std::env::temp_dir().join(format!("kr-si-{}-{}", std::process::id(), variants.len()));
+    relay_asking(variants, environment, drop_after, "hello").await
+}
+
+/// [`relay`] with the terminal's own prompt `prompt`.
+async fn relay_asking(
+    variants: &str,
+    environment: &[(&str, &str)],
+    drop_after: Option<usize>,
+    prompt: &str,
+) -> Relayed {
+    static RELAYS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let directory = std::env::temp_dir().join(format!(
+        "kr-si-{}-{}",
+        std::process::id(),
+        RELAYS.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
     std::fs::create_dir_all(&directory).expect("a directory");
     let socket = directory.join(format!("{}.sock", drop_after.map_or(0, |n| n + 1)));
     let _ = std::fs::remove_file(&socket);
@@ -462,7 +586,7 @@ async fn relay(variants: &str, environment: &[(&str, &str)], drop_after: Option<
     terminal
         .arg("--remote")
         .arg(format!("unix://{}", socket.display()))
-        .arg("hello")
+        .arg(prompt)
         .env("STAND_IN", variants)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
