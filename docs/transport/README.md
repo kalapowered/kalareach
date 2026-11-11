@@ -545,13 +545,20 @@ and a stream that arrives afterwards is reset as it is accepted. The queue is on
 one lock, so a stream is either queued before the receiver goes, and is reset with the rest, or is
 refused after and reset by the task that tried to queue it; none is left in a queue nobody reads.
 `DataStreams::recv` resets and skips a stream that was revoked while it waited, because its
-connection lost its control stream, so a host is never handed a stream whose connection has gone,
-but a stream it is handed can be revoked after `recv` returns. A host that never calls `recv`
-leaves its device at the control stream (see "Stream limits"). A host that reads once and stops
-holds at most four streams for a device that opens them, each with a bulk slot, a registry entry
-and its flow-control credit, until the connection ends, and resets the rest. The four places in
-the queue are the connection's bulk slots and not four streams beyond them: a queued stream already
-holds its slot. What a header names beyond this, the environment, the transfer and the
+connection lost its control stream. That is the only check it makes: a connection that has closed
+but whose cleanup has not yet run has revoked nothing, and a stream it returns can be revoked
+afterwards, so a host asks `is_revoked()` again where it relies on a stream. A host that never
+calls `recv` leaves its device at the control stream (see "Stream limits"), and the first call
+raises the limit, so a host calls it only after its own check of the device: the listener cannot
+know when that is, and a read task that starts with `serve` gives the device the credit for nine
+streams while the check runs. A host that reads once and stops holds at most four streams in the
+queue for a device that opens them, each with a registry entry and its flow-control credit, until
+the connection ends, and resets the rest. An attachment stream also holds one of the connection's
+bulk slots, which the queue's places share with every other attachment stream and do not add to.
+A stream of a live kind holds no bulk slot, so a host that accepts one can hold more streams than
+the queue's four: as many as the stream limit allows beside the control stream, 9 with the
+defaults, of which at most four are attachment streams. What a header names beyond this, the
+environment, the transfer and the
 right to use it, is the host's to decide when it receives the stream. A lookup it makes for that runs
 under the admission deadline, which the session carries as `AuthorisedSession::deadlines`.
 
@@ -628,16 +635,19 @@ could otherwise hold them, so bidirectional streams are limited in two steps.
 A listening endpoint starts every connection with room for one bidirectional stream: the one the
 handshake runs on, which is the control stream once the connection is authorised. A peer that opens
 a second one waits for credit the host does not give. The limit is raised the first time the host
-calls `DataStreams::recv`, which is after the host's own check of the device and not when the
-listener authorises the connection, and only for a host that takes data streams
+calls `DataStreams::recv`, and not when the listener authorises the connection, and only for a host
+that takes data streams
 (`ListenerConfig::accepted_kinds` names a kind). The raise uses the library's
 `Connection::set_max_concurrent_bi_streams`, to the control stream, the bulk streams the host
 allows, the places for streams that are waiting for their headers and one more: 10 with the default
 of four bulk streams. The library grants the difference at once, and a stream the peer was waiting
 to open is opened when the credit arrives. A host that raises `SendLimits::max_bulk_streams` raises
 the bound with it. Until the first `recv` the accept task waits in the connection's accept for a
-stream the device has no credit to open, so it queues nothing and holds nothing. A host that names
-no kind, or never reads, never raises the limit, so its devices can open no stream but the control
+stream the device has no credit to open, so it queues nothing and holds nothing. When that first
+read comes, relative to the host's own check of the device, is the host's to arrange, and a host
+that wants the check first calls `recv` only after it. When the host drops its receiver the limit
+goes back to one: the credit the device already has stays with it, and the streams that end give
+it no more. A host that names no kind, or never reads, never raises the limit, so its devices can open no stream but the control
 stream.
 
 An endpoint that only dials (`bind_dialer`) starts at none, because a host opens no stream to a
@@ -658,7 +668,8 @@ bytes (a decoded frame can take more):
 - as many streams' receive windows as the raised limit, 10, each up to the library's per-stream
   receive window of 1.25 MB: 12.5 MB;
 - one decoded frame of 1 MiB + 4 KiB for each stream whose frame is being read: the control stream
-  and the streams a host holds, which are at most four;
+  and the streams a host holds, which are at most the stream limit beside it, 9 with the defaults
+  (at most four of them attachment streams);
 - the control queue, up to `listener::CONTROL_QUEUE_DEPTH` (64) decoded control frames of up to
   1 MiB + 4 KiB each, about 64 MiB when a host falls behind;
 - the send queue of up to 8 MiB (`MAX_SEND_QUEUE_BYTES`);
