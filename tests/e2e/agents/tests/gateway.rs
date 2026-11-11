@@ -1445,26 +1445,15 @@ impl Person {
             tag += 1;
         }
         let mut exported: Vec<String> = Vec::new();
+        let mut said = None;
         loop {
             let rows =
                 self.types_the_check(expected, &Expected::exported_line(exported.len(), tag), tag)?;
-            let (names, total) = session_environment::read_exported(tag, &rows)?;
+            let (names, total) = session_environment::read_exported(tag, &exported, said, &rows)?;
             tag += 1;
-            if names.is_empty() && exported.len() < total {
-                return Err(format!(
-                    "{} the shell says it exports {total} names and a part of them shows none",
-                    session_environment::NOT_READ_WHOLE
-                ));
-            }
+            said = Some(total);
             exported.extend(names);
-            if exported.len() >= total {
-                if exported.len() != total {
-                    return Err(format!(
-                        "{} the shell says it exports {total} names and the parts show {}",
-                        session_environment::NOT_READ_WHOLE,
-                        exported.len()
-                    ));
-                }
+            if exported.len() == total {
                 break;
             }
         }
