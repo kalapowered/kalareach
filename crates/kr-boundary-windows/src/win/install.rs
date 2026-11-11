@@ -42,17 +42,18 @@ use windows_sys::Wdk::Storage::FileSystem::{
     FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile, NtSetSecurityObject,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
-    GetLastError, HANDLE, RtlNtStatusToDosError, UNICODE_STRING,
+    ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER, ERROR_PATH_NOT_FOUND,
+    ERROR_SHARING_VIOLATION, GetLastError, HANDLE, RtlNtStatusToDosError, UNICODE_STRING,
 };
 use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_128, FILE_ID_INFO,
-    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileAttributeTagInfo, FileIdInfo, GetFileInformationByHandleEx, OPEN_EXISTING,
+    FILE_ATTRIBUTE_TAG_INFO, FILE_CASE_SENSITIVE_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_128,
+    FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FileAttributeTagInfo, FileCaseSensitiveInfo, FileIdInfo, GetFileInformationByHandleEx,
+    OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -60,6 +61,7 @@ use super::acl;
 use super::applocker::{self, Channel};
 use super::broker::PROOF_BOUND;
 use super::ffi::{self, Sid};
+use super::fresh;
 use super::proof;
 use super::registry;
 use super::sd::{self, Principals, SdKind};
@@ -292,6 +294,9 @@ pub fn entry(paths: &Paths) -> Result<Entry, Error> {
         Some(parent) => inspect_existing_data(paths, &parent)?.map(|(_, inspected)| inspected),
         None => None,
     };
+    // A data directory that passed its inspection is the installation's own: with no manifest it is
+    // an empty one, which a new installation takes as it is.
+    let data_accepted = inspected.is_some();
     if let Some(manifest) = inspected.and_then(|inspected| inspected.manifest) {
         return Ok(match manifest.state {
             InstallState::Installed => Entry::Installed(manifest),
@@ -310,8 +315,8 @@ pub fn entry(paths: &Paths) -> Result<Entry, Error> {
             "a service named {SERVICE} exists and this installation did not make it"
         )));
     }
-    for directory in [&paths.program, &paths.data] {
-        if directory.exists() {
+    for (directory, accepted) in [(&paths.program, false), (&paths.data, data_accepted)] {
+        if directory.exists() && !accepted {
             return Err(Error::Refused(format!(
                 "{} exists and this installation did not make it",
                 directory.display()
@@ -432,10 +437,13 @@ impl DataChild {
     }
 }
 
-/// The folder above the data directory and the data directory itself, each held open from the check
-/// to the end of the steps that go by path, so that what was checked is what those steps work in,
-/// and the directories directly beneath the data directory, each opened relative to the held
-/// directory and held from the check or the call that made it.
+/// The folder above the data directory, the data directory itself and the directories directly
+/// beneath it, each opened relative to the held directory. Each is held from the check, or from the
+/// call that made it, until the steps that give the directories their lists are done. The steps
+/// that follow go by path in those directories, where only the system and the administrators may
+/// add, rename or delete anything: a file that another program reads by path is made new there,
+/// with its descriptor in the call that makes it, and every other entry was checked on its own
+/// handle before.
 ///
 /// None of these handles lets another program rename or delete what it holds (they share read and
 /// write only). Every list the installation changes in the data directory is changed on one of these
@@ -530,8 +538,9 @@ fn data_descriptor() -> Result<sd::OwnedSd, Error> {
     Ok(sd::descriptor(SdKind::DataParent, &Principals::default())?)
 }
 
-/// The words every refusal of the data directory ends with: what the administrator does.
-const DATA_REMEDY: &str = "Empty the directory, or remove it, then install again: a new installation makes it with its own protected list, and nothing in it that the installation did not make is used.";
+/// The words the refusal of the data directory itself ends with: what the administrator does.
+/// Nothing the installation recorded is removed.
+const DATA_REMEDY: &str = "Make the Administrators group its owner and leave the system and the Administrators group as the only entries of its list, then run the setup program again. The manifest and the journal stay where they are. A directory that no installation made can be emptied or removed instead.";
 
 /// The refusal of a data directory that is there and is not the installation's own.
 fn data_refusal(paths: &Paths, why: &str) -> Error {
@@ -544,11 +553,64 @@ fn data_refusal(paths: &Paths, why: &str) -> Error {
 /// The refusal of what is inside the data directory: a child that is not the installation's own, or
 /// is not what the manifest says.
 fn child_refusal(paths: &Paths, name: &OsStr, why: &str) -> Error {
+    entry_refusal(paths, &paths.data, name, why)
+}
+
+/// The refusal of one entry in a directory of the installation: it names the entry to remove, and
+/// says that the manifest and the journal stay.
+fn entry_refusal(paths: &Paths, dir: &Path, name: &OsStr, why: &str) -> Error {
+    let entry = dir.join(name);
     Error::Refused(format!(
-        "{} is the boundary's data directory (its manifest, its journal and the roots of its operations). It is refused because of {}: {why}. Whatever is in it that another account made or can change could be read by the broker, running as the system, as its own. {DATA_REMEDY}",
+        "{} is the boundary's data directory (its manifest, its journal and the roots of its operations). It is refused because of {}: {why}. Whatever is in it that another account made or can change could be read by the broker, running as the system, as its own. Remove {}, and nothing else, then run the setup program again: the manifest and the journal stay where they are.",
         paths.data.display(),
-        name.to_string_lossy()
+        entry.display(),
+        entry.display()
     ))
+}
+
+const SYSTEM: &str = "S-1-5-18";
+const ADMINISTRATORS: &str = "S-1-5-32-544";
+
+/// The reason the installation cannot compare a directory's names as it does: the directory takes
+/// two names that differ only by case for two entries, and the listing and the checks here take
+/// them for one. A platform that has no such flag has no such directory.
+fn case_sensitive_reason(handle: &ffi::Handle) -> Result<Option<String>, Error> {
+    let mut info = FILE_CASE_SENSITIVE_INFO { Flags: 0 };
+    // SAFETY: the handle is open and the record is the size the class takes.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle.raw(),
+            FileCaseSensitiveInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_CASE_SENSITIVE_INFO>() as u32,
+        )
+    } == 0
+    {
+        // SAFETY: reads the calling thread's last error.
+        let code = unsafe { GetLastError() };
+        if code == ERROR_INVALID_PARAMETER {
+            return Ok(None);
+        }
+        return Err(ffi::error(
+            code,
+            "reading whether the data directory separates names by case",
+        )
+        .into());
+    }
+    // The flag that says the directory separates names that differ only by case.
+    const CASE_SENSITIVE_DIRECTORY: u32 = 1;
+    Ok((info.Flags & CASE_SENSITIVE_DIRECTORY != 0).then(|| {
+        "it separates names that differ only by case, and the installation compares names without regard to case".to_owned()
+    }))
+}
+
+/// What the data directory itself must be on its handle: a directory that compares names without
+/// regard to case, and the installation's own.
+fn check_data_object(handle: &ffi::Handle) -> Result<Option<String>, Error> {
+    if let Some(why) = case_sensitive_reason(handle)? {
+        return Ok(Some(why));
+    }
+    check_held_object(handle)
 }
 
 /// What an object that is held open must be, read on its own handle: the system's own class owns
@@ -556,8 +618,6 @@ fn child_refusal(paths: &Paths, name: &OsStr, why: &str) -> Error {
 /// administrators, and every entry of its list names one of the two. Returns the reason when it is
 /// not.
 fn check_held_object(handle: &ffi::Handle) -> Result<Option<String>, Error> {
-    const SYSTEM: &str = "S-1-5-18";
-    const ADMINISTRATORS: &str = "S-1-5-32-544";
     if let Some(finding) = acl::changeable_by_others_on(handle, false)? {
         return Ok(Some(finding));
     }
@@ -874,9 +934,19 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
             *slot = Some(held);
         }
     }
-    inspect_staging(paths, inspected.staging.as_ref())?;
-    inspect_journal(paths, inspected.journal.as_ref())?;
-    inspect_run(paths, inspected.run.as_ref())?;
+    inspect_layout(
+        paths,
+        &paths.staging,
+        inspected.staging.as_ref(),
+        Layout::Staging,
+    )?;
+    inspect_layout(
+        paths,
+        &paths.journal,
+        inspected.journal.as_ref(),
+        Layout::Journal,
+    )?;
+    inspect_layout(paths, &paths.run, inspected.run.as_ref(), Layout::Run)?;
     let manifest = Manifest::load(&paths.manifest)?;
     let records = |path: &Path| {
         manifest
@@ -924,86 +994,201 @@ fn same_name(listed: &[u16], name: &OsStr) -> bool {
         })
 }
 
-/// A link in the staging directory is refused: the installation writes there and removes there by
-/// path.
-fn inspect_staging(paths: &Paths, staging: Option<&DirHandle>) -> Result<(), Error> {
-    let Some(staging) = staging else {
-        return Ok(());
-    };
-    for child in staging.children()? {
-        if child.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(child_refusal(
-                paths,
-                &OsString::from_wide(&child.name),
-                &format!("it is a link in {}", paths.staging.display()),
-            ));
-        }
-    }
-    Ok(())
+/// What a directory beneath the data directory holds, by the layout the installation lays down.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    /// An invocation's journal files, each a file with one name.
+    Journal,
+    /// The files that a step hands to another program by path (the policy, the program files
+    /// before they are copied on) and the directories of the proof's scratch space.
+    Staging,
+    /// The private roots of the invocations, directories the broker made.
+    Run,
 }
 
-/// The journal's directory holds journal files and nothing else, each a file with one name, owned by
-/// the system's own class, with no entry of another account: the broker, running as the system,
-/// reads each as its own.
-fn inspect_journal(paths: &Paths, journal: Option<&DirHandle>) -> Result<(), Error> {
-    let Some(journal) = journal else {
+/// Whether the text is 32 lowercase hexadecimal digits.
+fn is_hex32(text: &str) -> bool {
+    text.len() == 32
+        && text
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The kind of entry the layout names at a name, or none when the layout names nothing there.
+fn layout_kind(layout: Layout, name: &str) -> Option<Kind> {
+    let between = |prefix: &str, suffix: &str| {
+        name.strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(suffix))
+            .is_some_and(is_hex32)
+    };
+    match layout {
+        Layout::Journal => is_journal_file_name(name).then_some(Kind::File),
+        Layout::Staging => {
+            if between("policy-", ".xml") || between("payload-", ".exe") {
+                Some(Kind::File)
+            } else if between("proof-", "") {
+                Some(Kind::Directory)
+            } else {
+                None
+            }
+        }
+        Layout::Run => is_hex32(name).then_some(Kind::Directory),
+    }
+}
+
+/// How many directories deep an entry below a directory of the layout may be checked.
+const WITHIN_DEPTH: usize = 8;
+
+/// The reason an object is not the installation's own by its owner alone: the system or the
+/// administrators own what the installation or the broker made.
+fn check_owner(handle: &ffi::Handle) -> Result<Option<String>, Error> {
+    let summary = sd::summary_of_handle(handle)?;
+    Ok(
+        (![SYSTEM, ADMINISTRATORS].contains(&summary.owner.as_str()))
+            .then(|| format!("it is owned by {}", summary.owner)),
+    )
+}
+
+/// The reason an object that every account may read is not the installation's own: another account
+/// may change it, or the system and the administrators do not own it. The proof's scratch space is
+/// made readable by every account, and what is made in it takes that list.
+fn check_readable_object(handle: &ffi::Handle) -> Result<Option<String>, Error> {
+    if let Some(finding) = acl::changeable_by_others_on(handle, false)? {
+        return Ok(Some(finding));
+    }
+    check_owner(handle)
+}
+
+/// Reads every entry of a directory beneath the data directory on its own handle, opened relative
+/// to the held directory: each must be one the layout names, of the kind it names, with no link at
+/// its name and one name for a file, and owned and listed as the installation's own. Anything else
+/// refuses the directory, and the refusal names the entry. A directory of the staging layout is
+/// read to its depth, every entry in it checked the same way; a private root is only checked for its
+/// owner, since its list names the invocation's own group.
+fn inspect_layout(
+    paths: &Paths,
+    dir: &Path,
+    held: Option<&DirHandle>,
+    layout: Layout,
+) -> Result<(), Error> {
+    let Some(held) = held else {
         return Ok(());
     };
-    for child in journal.children()? {
+    for child in held.children()? {
         let shown = OsString::from_wide(&child.name);
         let text = shown.to_string_lossy().into_owned();
-        if !is_journal_file_name(&text) {
-            return Err(child_refusal(
+        let Some(expected) = layout_kind(layout, &text) else {
+            return Err(entry_refusal(
                 paths,
+                dir,
                 &shown,
-                &format!(
-                    "{} holds journal files only, and the installation did not make it",
-                    paths.journal.display()
-                ),
+                "the installation does not give that name there",
             ));
-        }
-        let opened = match journal.open_child(&child, READ_CONTROL)? {
+        };
+        let access = if expected == Kind::Directory {
+            LIST | READ_CONTROL
+        } else {
+            READ_CONTROL
+        };
+        let opened = match held.open_child(&child, access)? {
             Ok(opened) => opened,
             Err(lost) => {
-                return Err(child_refusal(
+                return Err(entry_refusal(
                     paths,
+                    dir,
                     &shown,
                     &format!("it could not be opened to be checked ({lost})"),
                 ));
             }
         };
-        if opened.kind != Kind::File || opened.links > 1 {
-            return Err(child_refusal(
+        match (opened.kind, expected) {
+            (Kind::ReparsePoint, _) => {
+                return Err(entry_refusal(paths, dir, &shown, "it is a link"));
+            }
+            (Kind::File, Kind::File) | (Kind::Directory, Kind::Directory) => {}
+            (Kind::Directory, _) => {
+                return Err(entry_refusal(
+                    paths,
+                    dir,
+                    &shown,
+                    "it is a directory, not a file",
+                ));
+            }
+            (Kind::File, _) => {
+                return Err(entry_refusal(
+                    paths,
+                    dir,
+                    &shown,
+                    "it is a file, not a directory",
+                ));
+            }
+        }
+        if opened.kind == Kind::File && opened.links > 1 {
+            return Err(entry_refusal(
                 paths,
+                dir,
                 &shown,
-                "a journal file is a file with one name",
+                "it has more than one name",
             ));
         }
-        if let Some(why) = check_held_object(&opened.handle)? {
-            return Err(child_refusal(paths, &shown, &why));
+        let why = match (layout, opened.kind) {
+            (Layout::Run, _) => check_owner(&opened.handle)?,
+            (Layout::Staging, Kind::Directory) => check_readable_object(&opened.handle)?,
+            _ => check_held_object(&opened.handle)?,
+        };
+        if let Some(why) = why {
+            return Err(entry_refusal(paths, dir, &shown, &why));
+        }
+        if layout == Layout::Staging && opened.kind == Kind::Directory {
+            let inner = DirHandle::from_opened(opened)?;
+            inspect_within(paths, &dir.join(&shown), &inner, 1)?;
         }
     }
     Ok(())
 }
 
-/// The directory of the private roots holds directories and no link: a private root is made there
-/// by the broker.
-fn inspect_run(paths: &Paths, run: Option<&DirHandle>) -> Result<(), Error> {
-    let Some(run) = run else {
-        return Ok(());
-    };
-    for child in run.children()? {
-        if child.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || child.attributes & FILE_ATTRIBUTE_DIRECTORY == 0
-        {
-            return Err(child_refusal(
+/// Reads every entry below a directory of the staging layout, whatever its name, on its own
+/// handle: no link, one name for a file, the installation's own owner, and no right for another
+/// account to change it.
+fn inspect_within(paths: &Paths, dir: &Path, held: &DirHandle, depth: usize) -> Result<(), Error> {
+    for child in held.children()? {
+        let shown = OsString::from_wide(&child.name);
+        if depth > WITHIN_DEPTH {
+            return Err(entry_refusal(
                 paths,
-                &OsString::from_wide(&child.name),
-                &format!(
-                    "{} holds private roots, which are directories",
-                    paths.run.display()
-                ),
+                dir,
+                &shown,
+                "it is nested deeper than the installation makes anything",
             ));
+        }
+        let opened = match held.open_child(&child, LIST | READ_CONTROL)? {
+            Ok(opened) => opened,
+            Err(lost) => {
+                return Err(entry_refusal(
+                    paths,
+                    dir,
+                    &shown,
+                    &format!("it could not be opened to be checked ({lost})"),
+                ));
+            }
+        };
+        if opened.kind == Kind::ReparsePoint {
+            return Err(entry_refusal(paths, dir, &shown, "it is a link"));
+        }
+        if opened.kind == Kind::File && opened.links > 1 {
+            return Err(entry_refusal(
+                paths,
+                dir,
+                &shown,
+                "it has more than one name",
+            ));
+        }
+        if let Some(why) = check_readable_object(&opened.handle)? {
+            return Err(entry_refusal(paths, dir, &shown, &why));
+        }
+        if opened.kind == Kind::Directory {
+            let inner = DirHandle::from_opened(opened)?;
+            inspect_within(paths, &dir.join(&shown), &inner, depth + 1)?;
         }
     }
     Ok(())
@@ -1025,7 +1210,7 @@ fn inspect_existing_data(
         return Ok(None);
     };
     require_directory(&handle, &paths.data.display().to_string())?;
-    if let Some(why) = check_held_object(&handle)? {
+    if let Some(why) = check_data_object(&handle)? {
         return Err(data_refusal(paths, &why));
     }
     let data = held_directory(handle)?;
@@ -1077,7 +1262,7 @@ pub fn make_data_directory(paths: &Paths) -> Result<DataHolds, Error> {
     )?
     .ok_or_else(|| Error::Failed("the data directory was made and is gone again".to_owned()))?;
     require_directory(&made, &paths.data.display().to_string())?;
-    if let Some(why) = check_held_object(&made)? {
+    if let Some(why) = check_data_object(&made)? {
         return Err(data_refusal(paths, &why));
     }
     let data = held_directory(made)?;
@@ -1330,8 +1515,12 @@ fn stage_payload(payload: &Path, staging: &Path) -> Result<Vec<Staged>, Error> {
             .read_to_end(&mut bytes)
             .map_err(io_error(format!("reading {}", source.display())))?;
         drop(handle);
-        let path = staging.join(name);
-        fs::write(&path, &bytes).map_err(io_error(format!("staging {}", path.display())))?;
+        let (mut made, path) = fresh::named_file(staging, "payload", ".exe", SdKind::AdminFile)
+            .map_err(io_error(format!("staging {name}")))?;
+        made.write_all(&bytes)
+            .and_then(|()| made.sync_all())
+            .map_err(io_error(format!("staging {}", path.display())))?;
+        drop(made);
         let checked = OpenOptions::new()
             .read(true)
             .share_mode(0)
@@ -1520,11 +1709,19 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
     }
     drop(holds);
     let channel = Channel::new(&paths.staging);
+    // What an earlier run left in staging was checked as the layout names it; it is removed.
     let sweep = |staging: &Path| {
         if let Ok(entries) = fs::read_dir(staging) {
             for entry in entries.flatten() {
-                if entry.file_name().to_string_lossy().starts_with("proof-") {
-                    let _ = fs::remove_dir_all(entry.path());
+                let name = entry.file_name().to_string_lossy().into_owned();
+                match layout_kind(Layout::Staging, &name) {
+                    Some(Kind::Directory) => {
+                        let _ = fs::remove_dir_all(entry.path());
+                    }
+                    Some(_) => {
+                        let _ = fs::remove_file(entry.path());
+                    }
+                    None => {}
                 }
             }
         }
@@ -1637,6 +1834,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
                 file.name
             )));
         }
+        let _ = fs::remove_file(&file.path);
     }
 
     inject("payload")?;
