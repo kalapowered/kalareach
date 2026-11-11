@@ -37,7 +37,7 @@ use super::ffi::{self, Sid};
 use super::registry;
 use super::sd::{self, Principals, SdKind};
 use super::service;
-use super::{account, pipe, token, verify};
+use super::{account, boot, pipe, token, verify};
 
 /// The broker's service name.
 pub const SERVICE: &str = "KalaReachBoundary";
@@ -50,12 +50,15 @@ const DISPLAY: &str = "KalaReach repository boundary";
 const BROKER: &str = "kr-boundary-broker.exe";
 const CREDENTIAL: &str = "kr-boundary-credential.exe";
 /// The privileges the broker uses and no others.
-const BROKER_PRIVILEGES: [&str; 5] = [
+const BROKER_PRIVILEGES: [&str; 7] = [
     "SeTcbPrivilege",
     "SeAssignPrimaryTokenPrivilege",
     "SeIncreaseQuotaPrivilege",
     "SeImpersonatePrivilege",
     "SeChangeNotifyPrivilege",
+    // Held disabled, and enabled only on the token of the thread that walks a tree (privilege.rs).
+    "SeBackupPrivilege",
+    "SeRestorePrivilege",
 ];
 const APPID: &str = "AppIDSvc";
 const APPID_KEY: &str = r"SYSTEM\CurrentControlSet\Services\AppIDSvc";
@@ -130,8 +133,18 @@ fn io_error(what: impl Into<String>) -> impl FnOnce(io::Error) -> Error {
 pub struct Paths {
     /// The program directory: the broker and the credential helper.
     pub program: PathBuf,
-    /// The data directory: the manifest, the earlier-state record and the staging directories.
+    /// The data directory: the manifest, the earlier-state record, the journal and the staging
+    /// directories.
     pub data: PathBuf,
+    /// The journal's directory, one file for each invocation. Only administrators and the system
+    /// can reach it.
+    pub journal: PathBuf,
+    /// The directory every invocation's private root is made under. No boundary account can list,
+    /// create in or delete from it.
+    pub run: PathBuf,
+    /// What the broker points Git's global file, hooks path and template directory at: an empty
+    /// `config`, an empty `hooks` and an empty `template`, which every account may read.
+    pub git: PathBuf,
     /// The directory a run stages in, only administrators and the system can write.
     pub staging: PathBuf,
     /// The manifest.
@@ -151,11 +164,15 @@ impl Paths {
         let data = PathBuf::from(program_data)
             .join("KalaReach")
             .join("Boundary");
+        let program = PathBuf::from(program_files)
+            .join("KalaReach")
+            .join("Boundary");
         Paths {
-            program: PathBuf::from(program_files)
-                .join("KalaReach")
-                .join("Boundary"),
+            git: program.join("git"),
+            program,
             staging: data.join("staging"),
+            journal: data.join("journal"),
+            run: data.join("run"),
             manifest: data.join("manifest.json"),
             prior: data.join("prior.json"),
             data,
@@ -597,6 +614,23 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         &paths.staging,
         &sd::descriptor(SdKind::AdminDir, &Principals::default())?,
     )?;
+    // The journal and the parent of the private roots: administrators and the system only, so no
+    // boundary token can list, create in or delete from either.
+    for (directory, what) in [
+        (&paths.journal, "the journal directory"),
+        (&paths.run, "the directory of the private roots"),
+    ] {
+        run.record(
+            ObjectKind::Directory,
+            &directory.display().to_string(),
+            None,
+        )?;
+        fs::create_dir_all(directory).map_err(io_error(format!("making {what}")))?;
+        acl::set_protected(
+            directory,
+            &sd::descriptor(SdKind::AdminDir, &Principals::default())?,
+        )?;
+    }
     let channel = Channel::new(&paths.staging);
     let sweep = |staging: &Path| {
         if let Ok(entries) = fs::read_dir(staging) {
@@ -688,6 +722,26 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
             },
         )?,
     )?;
+    // What the broker points Git's global file, hooks path and template directory at: empty, and
+    // readable by every account, never writable by one.
+    run.record(
+        ObjectKind::Directory,
+        &paths.git.display().to_string(),
+        None,
+    )?;
+    fs::create_dir_all(&paths.git)
+        .map_err(io_error("making the directory of Git's empty settings"))?;
+    for part in ["hooks", "template"] {
+        fs::create_dir_all(paths.git.join(part))
+            .map_err(io_error(format!("making the empty {part} directory")))?;
+    }
+    let empty_config = paths.git.join("config");
+    run.record(
+        ObjectKind::File,
+        &empty_config.display().to_string(),
+        Some(&hex::encode(Sha256::digest(b""))),
+    )?;
+    fs::write(&empty_config, b"").map_err(io_error("making the empty global configuration"))?;
     for file in &staged {
         let target = paths.program.join(file.name);
         run.record(
@@ -1034,6 +1088,8 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
                     service.stop()?;
                     service.wait_for(true, Duration::from_secs(60))?;
                 }
+                // The marker is a volatile key under the service's own key: it goes first.
+                boot::remove()?;
                 if service.marked_for_deletion()? {
                     say(
                         "the broker's service is already deleted and goes when the last program that holds it lets go",
@@ -1075,6 +1131,20 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
         );
         if let Some(parent) = paths.program.parent() {
             let _ = fs::remove_dir(parent);
+        }
+    }
+    // The journal and the private roots' parent go only when empty: a journal row or a root that
+    // is still there means a release is not finished, and the records that describe it stay.
+    for directory in [&paths.run, &paths.journal] {
+        if directory.exists() {
+            keep(
+                fs::remove_dir(directory).map_err(io_error(format!(
+                    "removing {}, which still holds an unfinished invocation",
+                    directory.display()
+                ))),
+                "removing the journal or the private roots",
+                &mut failures,
+            );
         }
     }
     if let Some(prior) = &prior {
