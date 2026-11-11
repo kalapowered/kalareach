@@ -77,10 +77,10 @@ pub enum Tracking {
 /// It reads the output as a terminal reads it, a byte at a time, so a mode setting cut in two
 /// between one write and the next is read whole.
 ///
-/// The three tracking modes are three settings of their own, as the session's screen keeps them,
-/// and what the application asked for is the widest of those that are set. A frame drawn from the
-/// screen writes every mode it tracks, the ones that are off among them, so a mode that is reset
-/// says nothing of the others. A full reset of the terminal (`ESC c`) turns all of them off.
+/// The tracking is one setting, as a terminal and the session's screen keep it: setting one of the
+/// three tracking modes replaces the one in force, and resetting any of them turns tracking off. A
+/// frame drawn from the screen resets the three and then sets the one that is on. A full reset of
+/// the terminal (`ESC c`) turns tracking off.
 #[derive(Debug, Default)]
 pub struct MouseReporting {
     clicks: bool,
@@ -243,9 +243,13 @@ impl MouseReporting {
         let set = last == b'h';
         for &mode in &control.parameters {
             match mode {
-                1000 => self.clicks = set,
-                1002 => self.drag = set,
-                1003 => self.motion = set,
+                // One tracking state: a set replaces the one in force, and a reset of any of the
+                // three turns it off, whichever of them had set it.
+                1000 | 1002 | 1003 => {
+                    self.clicks = set && mode == 1000;
+                    self.drag = set && mode == 1002;
+                    self.motion = set && mode == 1003;
+                }
                 1006 => self.sgr = set,
                 _ => {}
             }
@@ -569,9 +573,9 @@ mod tests {
         for (output, tracking) in [
             (&b"\x1b[?1002h"[..], Tracking::Drag),
             (b"\x1b[?1003h", Tracking::Motion),
-            (b"\x1b[?1003l", Tracking::Drag),
-            (b"\x1b[?1000h", Tracking::Drag),
-            (b"\x1b[?1002l", Tracking::Clicks),
+            (b"\x1b[?1000h", Tracking::Clicks),
+            (b"\x1b[?1003l", Tracking::Off),
+            (b"\x1b[?1002h", Tracking::Drag),
             (b"\x1b[?1000l", Tracking::Off),
         ] {
             reporting.observe(output);
@@ -583,16 +587,21 @@ mod tests {
         assert_eq!(reporting.encoding(), kr_keys::MouseEncoding::X10);
     }
 
-    /// A frame drawn from the session's screen writes every mouse mode it tracks, the ones that are
-    /// off after the one that is on, and the application has still asked for what it set.
+    /// The tracking is one state, as a terminal keeps it: a reset of any of the three modes after a
+    /// set turns it off, and a frame drawn from the session's screen resets the three before it
+    /// sets the one that is on.
     #[test]
-    fn a_mode_that_is_reset_after_one_that_is_set_leaves_what_was_asked_for() {
+    fn a_reset_of_any_tracking_mode_after_a_set_turns_the_tracking_off() {
         let mut reporting = MouseReporting::default();
         reporting.observe(b"\x1b[?1000h\x1b[?1002l\x1b[?1003l\x1b[?1006h\x1b[?2004l");
-        assert_eq!(reporting.tracking(), Tracking::Clicks);
+        assert_eq!(reporting.tracking(), Tracking::Off);
         assert_eq!(reporting.encoding(), kr_keys::MouseEncoding::Sgr);
-        reporting.observe(b"\x1b[?1000l\x1b[?1002h\x1b[?1003l");
+        reporting.observe(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1002h");
         assert_eq!(reporting.tracking(), Tracking::Drag);
+        reporting.observe(b"\x1b[?1000h\x1b[?1002h");
+        assert_eq!(reporting.tracking(), Tracking::Drag);
+        reporting.observe(b"\x1b[?1002h\x1b[?1000l");
+        assert_eq!(reporting.tracking(), Tracking::Off);
     }
 
     /// A full reset of the terminal turns the mouse's modes off, however the write is cut, and what
