@@ -16,6 +16,7 @@
 
 pub mod grammar;
 pub mod settings;
+pub mod state;
 pub mod tables;
 
 use self::grammar::{MAX_PATHS, is_control};
