@@ -1211,6 +1211,33 @@ pub fn launch(
     }
 }
 
+/// The staged parts start only the test's own stand-in: the program a launch must run (`expected`)
+/// is checked to be this build's `agent-stand-in` by its digest, before anything is typed or
+/// started. A part's live route, with the pinned build and its login, is closed until the parts'
+/// own round, since the parts run `kr` after the agent has started, in a run's state that the agent
+/// can change.
+///
+/// # Errors
+///
+/// Returns the refusal, which says that nothing was started.
+pub fn closed_route(expected: &Expected, stand_in: &Path) -> Result<(), String> {
+    let digest = std::fs::read(stand_in).map(|bytes| {
+        kr_cbor::sha256(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    });
+    if digest.is_ok_and(|digest| digest == expected.sha256) {
+        Ok(())
+    } else {
+        Err(
+            "the staged parts' live route is closed until their own round: the program this launch \
+             must run is not the test's own stand-in, so nothing was started"
+                .to_owned(),
+        )
+    }
+}
+
 /// An agent's start that reached no first screen because the agent refused to run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refused {
@@ -1253,6 +1280,9 @@ pub fn launch_or_refusal(
     expected: &Expected,
     between: &dyn Fn(),
 ) -> std::result::Result<Vec<AgentProcess>, Refused> {
+    // The first statement: nothing is typed or started for a program that is not the stand-in.
+    closed_route(expected, &built_directory().join("agent-stand-in"))
+        .unwrap_or_else(|why| panic!("{why}"));
     assert!(
         !session
             .window
@@ -1867,6 +1897,36 @@ impl std::fmt::Display for InputRefusal {
 mod tests {
     use super::*;
     use crate::provenance::exported_clear;
+
+    /// A part asked for a program that is not the test's own stand-in is refused, with the closed
+    /// route named and nothing started; the stand-in itself is let through, and a stand-in file that
+    /// is not there refuses too.
+    #[test]
+    fn a_part_asked_for_the_pinned_build_is_refused_before_anything_is_started() {
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .expect("the temporary directory")
+            .join(format!("kr-closed-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&base).expect("a scratch directory");
+        let stand_in = base.join("agent-stand-in");
+        std::fs::write(&stand_in, b"the stand-in").expect("a stand-in");
+        let digest: String = kr_cbor::sha256(b"the stand-in")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let expected = |sha256: &str| Expected {
+            file: stand_in.clone(),
+            sha256: sha256.to_owned(),
+            launch: crate::build::Launch::Native,
+            prefix: base.clone(),
+        };
+        closed_route(&expected(&digest), &stand_in).expect("the stand-in is let through");
+        let said = closed_route(&expected(&"0".repeat(64)), &stand_in)
+            .expect_err("the pinned build is refused");
+        assert!(said.contains("live route is closed"), "{said}");
+        assert!(said.contains("nothing was started"), "{said}");
+        assert!(closed_route(&expected(&digest), &base.join("missing")).is_err());
+        std::fs::remove_dir_all(&base).expect("clean up");
+    }
 
     /// An installation whose `bin/codex` is a script that appends `name` to `mark`.
     fn installation(base: &Path, name: &str, mark: &Path) -> PathBuf {
