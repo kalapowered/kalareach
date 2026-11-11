@@ -1097,9 +1097,9 @@ impl Store {
         Ok(uploads.saturating_add(snapshots))
     }
 
-    /// Returns how many drafts one principal holds open: the ones no prompt has sent to a session
-    /// and whose target session has not ended, which is what [`Self::insert_draft`] counts against
-    /// a bound.
+    /// Returns how many drafts one principal holds open: the ones no prompt has sent to a session,
+    /// whose target session has not ended and whose files the agent has not all taken, which is what
+    /// [`Self::insert_draft`] counts against a bound.
     ///
     /// # Errors
     ///
@@ -2439,8 +2439,10 @@ impl Store {
                 // create leaves no record and no draft.
                 return Err(TransferError::QuotaExceeded {
                     detail: format!(
-                        "this device holds {open} of the {limit} drafts it may keep open: a draft \
-                         stops counting when a prompt sends it or its session ends"
+                        "this device holds {open} of the {limit} drafts it may keep open: end a \
+                         draft it no longer uses (draft.discard); a draft also stops counting when \
+                         a prompt sends it, when the agent has taken all its files, or when its \
+                         session ends"
                     ),
                 });
             }
@@ -2552,6 +2554,80 @@ impl Store {
         record_event(&transaction, "draft.updated", &draft_id.to_string(), at_ms)?;
         transaction.commit().map_err(TransferError::store)?;
         Ok(Some(DraftRevision::new(expected.get().saturating_add(1))))
+    }
+
+    /// Ends a draft: deletes it with its attachment and prompt records, and revokes the read
+    /// grants of its attachments, in one transaction.
+    ///
+    /// A draft a prompt named, or one with an attachment `inserting`, `accepted_by_agent` or
+    /// `unknown`, is refused and nothing is written: those records are what the agent was offered
+    /// or took. The check is made inside the transaction, so a prompt or a claim cannot come between
+    /// it and the delete. No upload row is touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::DraftConflict`] for a draft in use, [`TransferError::UnknownDraft`]
+    /// when the draft is not there, and [`TransferError::StoreUnavailable`] when the write fails.
+    pub fn discard_draft(
+        &mut self,
+        draft_id: DraftId,
+        action: Option<&RetainedAction>,
+    ) -> Result<ActionOutcome> {
+        let transaction = self.begin()?;
+        if claim_action(&transaction, action)? == ActionOutcome::AlreadyPerformed {
+            return Ok(ActionOutcome::AlreadyPerformed);
+        }
+        let draft = uuid_sql(draft_id.get());
+        let sent: bool = transaction
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM draft_prompts WHERE draft_id = ?1)",
+                params![draft],
+                |row| row.get(0),
+            )
+            .map_err(TransferError::store)?;
+        if sent {
+            return Err(TransferError::DraftConflict {
+                detail:
+                    "a prompt sent this draft to a session, so it stays until that session ends"
+                        .to_owned(),
+            });
+        }
+        let offered: bool = transaction
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM draft_attachments
+                                 WHERE draft_id = ?1
+                                   AND state IN ('inserting', 'accepted_by_agent', 'unknown'))",
+                params![draft],
+                |row| row.get(0),
+            )
+            .map_err(TransferError::store)?;
+        if offered {
+            return Err(TransferError::DraftConflict {
+                detail: "an attachment of this draft was offered to the agent, so it stays until \
+                         its session ends"
+                    .to_owned(),
+            });
+        }
+        transaction
+            .execute(
+                "UPDATE grants SET revoked = 1
+                  WHERE grant_id IN (SELECT grant_id FROM draft_attachments
+                                      WHERE draft_id = ?1 AND grant_id IS NOT NULL)
+                     OR grant_id IN (SELECT claim_grant FROM draft_attachments
+                                      WHERE draft_id = ?1 AND claim_grant IS NOT NULL)",
+                params![draft],
+            )
+            .map_err(TransferError::store)?;
+        let deleted = transaction
+            .execute("DELETE FROM drafts WHERE draft_id = ?1", params![draft])
+            .map_err(TransferError::store)?;
+        if deleted != 1 {
+            return Err(TransferError::UnknownDraft {
+                draft: draft_id.to_string(),
+            });
+        }
+        transaction.commit().map_err(TransferError::store)?;
+        Ok(ActionOutcome::Committed)
     }
 
     /// Advances a draft's revision without changing its text.
@@ -3318,17 +3394,24 @@ fn refuse_ended_session(
     }
 }
 
-/// How many drafts an actor holds open: the ones no prompt has sent to a session and whose target
-/// session has not ended. A sent draft belongs to its session from then on, and a draft whose
-/// target ended is orphaned in the same transaction that records the end, so neither can be
-/// written to again and neither takes a place.
+/// How many drafts an actor holds open: the ones no prompt has sent to a session, whose target
+/// session has not ended and whose files the agent has not all taken. A sent draft belongs to its
+/// session from then on, a draft whose target ended is orphaned in the same transaction that
+/// records the end, and a draft whose every binding is `accepted_by_agent` (there is at least one)
+/// has nothing left to offer, retry or bind, so none of them can be written to again and none takes
+/// a place. A binding `inserting` or `unknown` may still be reported on, and its draft counts.
 fn open_drafts(connection: &Connection, actor_id: &ActorId) -> Result<u64> {
     let open: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM drafts
               WHERE actor_id = ?1 AND state <> 'orphaned'
                 AND NOT EXISTS (SELECT 1 FROM draft_prompts
-                                 WHERE draft_prompts.draft_id = drafts.draft_id)",
+                                 WHERE draft_prompts.draft_id = drafts.draft_id)
+                AND NOT (EXISTS (SELECT 1 FROM draft_attachments
+                                  WHERE draft_attachments.draft_id = drafts.draft_id)
+                         AND NOT EXISTS (SELECT 1 FROM draft_attachments
+                                          WHERE draft_attachments.draft_id = drafts.draft_id
+                                            AND draft_attachments.state <> 'accepted_by_agent'))",
             params![actor_id.as_str()],
             |row| row.get(0),
         )
