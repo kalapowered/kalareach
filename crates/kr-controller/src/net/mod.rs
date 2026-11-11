@@ -410,6 +410,45 @@ impl Network {
         self.guard.host.reconnects.serving(device)
     }
 
+    /// Returns when the host last heard from each connection of `device`, oldest connection first,
+    /// in nanoseconds on the host's clock, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn heard_from_of(&self, device: DeviceId) -> Vec<u64> {
+        self.guard
+            .host
+            .device_connections
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&device)
+            .map(|connections| connections.iter().map(|held| held.heard.last()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Makes the connections of `device` at these places, counting the oldest as the first, stand
+    /// in for connections whose packets no longer arrive: the host has never heard from them and
+    /// hears from them no more, for this host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn silence_connections_of(&self, device: DeviceId, places: std::ops::Range<usize>) {
+        let table = self
+            .guard
+            .host
+            .device_connections
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for held in table
+            .get(&device)
+            .into_iter()
+            .flatten()
+            .skip(places.start)
+            .take(places.len())
+        {
+            held.heard.silence();
+        }
+    }
+
     /// Returns the host's pairing service.
     #[must_use]
     pub fn pairing(&self) -> &Arc<PairingHost> {
@@ -522,12 +561,20 @@ pub const DEVICE_CONNECTIONS_IN_USE: usize = 32;
 /// How many live connections one paired device may hold on this host at once.
 ///
 /// A device that loses a link opens a new connection while the host still holds the old one, for
-/// as long as the transport's idle timeout, so each connection in use
-/// ([`DEVICE_CONNECTIONS_IN_USE`]) may linger once beside its replacement, which makes the bound
-/// twice that number. A device that opened connections without end would hold the host's memory,
-/// the streams of each connection and its lookups. At the first connection above the bound the
-/// host serves the new connection and withdraws the device's oldest, so a phone that reconnects
-/// while an old connection lingers is never refused. An owner cannot change the bound.
+/// as long as the transport's idle timeout, and a link that is replaced more than once in that time
+/// leaves a copy for each replacement. A device that opened connections without end would hold the
+/// host's memory, the streams of each connection and its lookups. The bound is twice the number in
+/// use ([`DEVICE_CONNECTIONS_IN_USE`]), which is room for most of the copies a lossy path leaves,
+/// though not for all of them. At the first connection above the bound the host serves the new
+/// connection and withdraws the device's connection that it has heard from least recently (the
+/// oldest of those, when two were heard from at the same moment), so a phone that reconnects while
+/// old connections linger is never refused, and the copies of a device that has gone are withdrawn
+/// before a connection that is still answering. A connection is heard from when the transport
+/// receives a packet from the device on it, and the device sends one at least every
+/// [`kr_protocol::limits::KEEPALIVE_INTERVAL`] while it is live. Every connection of a live device
+/// sends them, including a link it has left and that still waits for replies, so the host cannot
+/// tell that link from one in use: only the device can keep its own count below the bound. An
+/// owner cannot change the bound.
 pub const DEVICE_LIVE_CONNECTIONS: usize = 2 * DEVICE_CONNECTIONS_IN_USE;
 
 /// The connections this host serves for each device, oldest first.
@@ -536,14 +583,118 @@ struct DeviceConnections(
     std::sync::Mutex<std::collections::BTreeMap<DeviceId, Vec<HeldConnection>>>,
 );
 
-/// One connection of a device, and whether the device has opened more connections than the bound
-/// allows beside it.
+/// One connection of a device, when its device was last heard from on it, and whether the device
+/// has opened more connections than the bound allows beside it.
 struct HeldConnection {
     connection_id: ConnectionId,
+    heard: Arc<Heard>,
     withdrawn_for_the_bound: Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// A connection counted among its device's from its admission until it ends.
+/// How often the host reads what its transport has received on a connection, to date the last
+/// packet. It is a fraction of the interval at which a live device sends one, so a connection is
+/// dated to within a tenth of it.
+const HEARD_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// When the host last heard from a connection's device: the time, on the host's continuous clock,
+/// at which the transport was last seen to have received an authenticated packet from the device
+/// on the connection. The clock is the host's own, which a person cannot set.
+///
+/// The transport keeps counters of the frames it has received and no time. A task of its own reads
+/// them for the connection once a [`HEARD_SAMPLE_INTERVAL`] and writes the time of the reading
+/// when they have moved ([`follow_the_device`]); the task that admits another connection of the
+/// same device reads the stamp under the table's lock. It is one atomic, so neither side waits for
+/// the other, and the request path of the connection touches nothing of it. A read beside a write
+/// returns the stamp from just before or just after the write, and each is true of the connection
+/// at some moment of the read: the choice of the connection to withdraw can then rest on a stamp
+/// that is one reading old, which makes a connection look older by one interval at most.
+struct Heard {
+    /// Nanoseconds since the host clock's anchor.
+    last: std::sync::atomic::AtomicU64,
+    /// Set by a case that stands in for a path that lost every packet of the connection.
+    #[cfg(feature = "testing")]
+    silenced: std::sync::atomic::AtomicBool,
+}
+
+impl Heard {
+    /// A connection heard from at `at`, which is when the host admitted it.
+    fn at(at: ContinuousInstant) -> Self {
+        Self {
+            last: std::sync::atomic::AtomicU64::new(Self::nanoseconds(at)),
+            #[cfg(feature = "testing")]
+            silenced: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn nanoseconds(at: ContinuousInstant) -> u64 {
+        u64::try_from(at.since_anchor().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// Records that a packet reached the host by `at`.
+    fn hear(&self, at: ContinuousInstant) {
+        #[cfg(feature = "testing")]
+        if self.silenced.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        self.last
+            .fetch_max(Self::nanoseconds(at), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn last(&self) -> u64 {
+        self.last.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Makes the connection one that was never heard from, and stays so.
+    #[cfg(feature = "testing")]
+    fn silence(&self) {
+        self.silenced
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.last.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// How many frames the transport has received from the device on a connection, which only grows.
+///
+/// The counters are the transport's own, kept for frames after the packet that carried them was
+/// authenticated. They hold the frames of a live idle device: its keepalive, and the
+/// acknowledgements of the host's own keepalives and replies. Reading them takes the connection's
+/// state lock for the copy of its statistics, which the transport's packet handling also takes;
+/// nothing on a connection's request path does.
+fn frames_received(connection: &iroh::endpoint::Connection) -> u64 {
+    let received = connection.stats().frame_rx;
+    [
+        received.ping,
+        received.acks,
+        received.path_acks,
+        received.stream,
+        received.datagram,
+    ]
+    .into_iter()
+    .fold(0, u64::saturating_add)
+}
+
+/// Dates the packets a connection's device sends: stamps `heard` with the time of each reading at
+/// which the transport had received more than at the reading before. It runs until its task is
+/// ended with the connection.
+async fn follow_the_device(
+    connection: iroh::endpoint::Connection,
+    clock: Arc<dyn kr_transport::clock::ContinuousClock>,
+    heard: Arc<Heard>,
+) {
+    let mut interval = tokio::time::interval(HEARD_SAMPLE_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut seen = frames_received(&connection);
+    loop {
+        interval.tick().await;
+        let now = frames_received(&connection);
+        if now != seen {
+            seen = now;
+            heard.hear(clock.now());
+        }
+    }
+}
+
+/// A connection counted among its device's from the last check that can refuse it until it ends.
 struct Counted {
     table: Arc<DeviceConnections>,
     device_id: DeviceId,
@@ -553,7 +704,7 @@ struct Counted {
 
 impl Counted {
     /// Whether the device opened more connections than the bound allows beside this one, so that
-    /// this one, the oldest, is to end.
+    /// this one, the one heard from least recently, is to end.
     fn is_withdrawn_for_the_bound(&self) -> bool {
         self.withdrawn_for_the_bound
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -699,12 +850,8 @@ impl NetworkHost {
     ///
     /// The two have to be one step. Validating first and registering afterwards leaves a gap in
     /// which authority can be withdrawn, and a connection registered in that gap would pass every
-    /// later check. The registry lock is taken first and the connection table second, which is the
-    /// order a revocation uses, so neither can interleave with the other.
-    async fn admit(
-        &self,
-        session: &AuthorisedSession,
-    ) -> Result<(DeviceRecord, Arc<Controller>, Counted)> {
+    /// later check.
+    async fn admit(&self, session: &AuthorisedSession) -> Result<(DeviceRecord, Arc<Controller>)> {
         let controller = self.daemon()?;
         #[cfg(feature = "testing")]
         controller.before_a_connection_is_registered.wait().await;
@@ -747,42 +894,64 @@ impl NetworkHost {
                 .under(record.grant.clone()),
         );
         drop(admitted);
-        // Counted here, under the registry's lock, where a revocation also acts: a device cannot
-        // open connections faster than the host withdraws its oldest.
-        let counted = self.count_connection(record.device_id, session.connection_id);
         drop(registry);
-        Ok((record, controller, counted))
+        Ok((record, controller))
     }
 
-    /// Counts a connection among its device's, and withdraws the device's oldest when it now holds
-    /// more than [`DEVICE_LIVE_CONNECTIONS`]. The oldest is withdrawn as a revocation withdraws a
-    /// device's connections, and it leaves the count at once, so the next connection is not counted
-    /// against it. An oldest that has not yet reached the table of connections being served is
-    /// withdrawn when it gets there ([`Counted::is_withdrawn_for_the_bound`]).
-    fn count_connection(&self, device_id: DeviceId, connection_id: ConnectionId) -> Counted {
+    /// Counts a connection among its device's, and withdraws the device's connection that the host
+    /// has heard from least recently when the device now holds more than
+    /// [`DEVICE_LIVE_CONNECTIONS`]. Two connections heard from at the same moment are told apart
+    /// by their age: the older one is withdrawn, and the new connection never is. The one withdrawn
+    /// is withdrawn as a revocation withdraws a device's connections, and it leaves the count at
+    /// once, so the next connection is not counted against it. One that has not yet reached the
+    /// table of connections being served is withdrawn when it gets there
+    /// ([`Counted::is_withdrawn_for_the_bound`]).
+    ///
+    /// Called once the last check that can refuse the new connection has passed, because a
+    /// withdrawal cannot be taken back.
+    fn count_connection(
+        &self,
+        device_id: DeviceId,
+        connection_id: ConnectionId,
+        heard: Arc<Heard>,
+    ) -> Counted {
         let withdrawn_for_the_bound = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let oldest = {
+        let withdrawn = {
             let mut table = self
                 .device_connections
                 .0
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let connections = table.entry(device_id).or_default();
+            // The table is in the order of admission, and the first of equal minimums is the
+            // older, so the oldest of the connections heard from least recently is chosen. The
+            // new connection is not in the table yet, so it cannot be chosen.
+            let least_recent = (connections.len() >= DEVICE_LIVE_CONNECTIONS)
+                .then(|| {
+                    connections
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, held)| held.heard.last())
+                        .map(|(index, _)| index)
+                })
+                .flatten();
+            let withdrawn = least_recent.map(|index| connections.remove(index));
             connections.push(HeldConnection {
                 connection_id,
+                heard,
                 withdrawn_for_the_bound: Arc::clone(&withdrawn_for_the_bound),
             });
-            (connections.len() > DEVICE_LIVE_CONNECTIONS).then(|| connections.remove(0))
+            withdrawn
         };
-        if let Some(oldest) = oldest {
-            oldest
+        if let Some(withdrawn) = withdrawn {
+            withdrawn
                 .withdrawn_for_the_bound
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             let live = self
                 .live
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&oldest.connection_id)
+                .get(&withdrawn.connection_id)
                 .and_then(Weak::upgrade);
             if let Some(remote) = live {
                 remote.output().withdraw();
@@ -814,7 +983,7 @@ impl NetworkHost {
             self.reconnects
                 .arrived(device_id, arrived_at, transport, MetricOutcome::Refused)
         };
-        let (device, controller, counted) = match self.admit(&session).await {
+        let (device, controller) = match self.admit(&session).await {
             Ok(admitted) => admitted,
             Err(error) => {
                 refused();
@@ -849,6 +1018,12 @@ impl NetworkHost {
                 return;
             }
         };
+        // Counted after the last check that can refuse this connection. Counting can withdraw
+        // another connection of the device, and a connection refused after that would have cost it
+        // one for nothing. Counted before the connection is recorded as live and before the
+        // withdrawal flag is read below, which is what lets one of the two see the other.
+        let heard = Arc::new(Heard::at(clock.now()));
+        let counted = self.count_connection(device_id, connection_id, Arc::clone(&heard));
         let remote = Arc::new(RemoteConnection::new(
             Arc::clone(&controller),
             self.records(),
@@ -879,6 +1054,7 @@ impl NetworkHost {
             relay: None,
             watch: None,
             chunks: None,
+            heard: None,
         };
         // A device that opened more connections than the bound allows had this one, its oldest,
         // withdrawn while it was on its way to the table above, where the withdrawal did not find
@@ -906,6 +1082,17 @@ impl NetworkHost {
                     remote.release().await;
                 }
             })
+            .abort_handle(),
+        );
+        // What the transport receives from the device is dated by a task of its own, which the
+        // guard ends with the connection: the stamp is what the host chooses a connection to
+        // withdraw by, when the device holds more than the bound allows.
+        guard.heard = Some(
+            tokio::spawn(follow_the_device(
+                session.connection.clone(),
+                Arc::clone(&session.clock),
+                heard,
+            ))
             .abort_handle(),
         );
         // The guard owns the relay's abort handle, so a handler the transport drops still stops it.
@@ -1647,10 +1834,15 @@ struct ConnectionGuard {
     watch: Option<tokio::task::AbortHandle>,
     /// Takes the connection's data streams. Ending it ends the task of every stream with it.
     chunks: Option<tokio::task::AbortHandle>,
+    /// Dates the packets of the device ([`follow_the_device`]).
+    heard: Option<tokio::task::AbortHandle>,
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
+        if let Some(heard) = self.heard.take() {
+            heard.abort();
+        }
         if let Some(relay) = self.relay.take() {
             relay.abort();
         }
