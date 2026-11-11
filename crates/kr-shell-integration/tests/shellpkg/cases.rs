@@ -4699,21 +4699,25 @@ pub fn a_revocation_in_the_same_read_binds_the_launch(kind: ShellKind) {
                 reason: LaunchRejectionReason::Timeout,
             });
             std::thread::sleep(Duration::from_millis(200));
-            let before_typing = session.written();
-            session.type_bytes(b"kr-typed");
+            // The person types most of a command that prints a word from two pieces, a revocation
+            // for the finished transaction arrives, and the rest of the line follows. The terminal
+            // echoes what is typed, so the text on the screen cannot say it survived the
+            // revocation; the command running can, since the rest of the line alone is no
+            // command and prints nothing.
+            let command = print_assembled(kind, "kr-typed-survived");
+            let rest_at = command
+                .rfind("survived")
+                .expect("the second piece is there");
+            let (typed, rest) = command.split_at(rest_at);
+            session.type_bytes(typed.as_bytes());
             std::thread::sleep(Duration::from_millis(200));
             session.write_frame(&BridgeFrame::LaunchRevoked {
                 transaction,
                 reason: LaunchRejectionReason::Timeout,
             });
             std::thread::sleep(Duration::from_millis(200));
-            session.type_line("");
-            // The editor drawing the person's text is what says it survived, which is a display
-            // observation: nothing here claims a command ran.
             assert!(
-                session
-                    .drew_after(before_typing, "kr-typed", REPLY)
-                    .was_drawn(),
+                session.finish_line(typed, rest, "kr-typed-survived"),
                 "a revocation for a finished transaction took the person's own text out:\n{}",
                 session.terminal_output()
             );
