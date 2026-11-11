@@ -1,8 +1,10 @@
 //! The anchored walk: how the broker reaches an object under a directory it holds.
 //!
 //! Nothing here acts on a path string. A walk starts from a directory that is already open and has
-//! been checked, lists its children with their identifiers, and opens each child by that identifier
-//! from the held directory, without following a reparse point. Before it hands a child to its
+//! been checked, lists its children with their identifiers, and opens each child by the name it was listed under,
+//! relative to the held directory, without following a reparse point (an object opened by its
+//! identifier is not held against a rename, so the name is how the handle is bound). Before it
+//! hands a child to its
 //! caller it reads the child back from the open handle: the identifier is the one listed, the
 //! child's final path is the directory's own path plus exactly one component, and its link count
 //! and attributes are known. A child that fails any of these is a lost containment proof: the
@@ -391,6 +393,10 @@ impl DirHandle {
     }
 
     fn checked(handle: Handle) -> Result<std::result::Result<DirHandle, AnchorRefusal>> {
+        // The volume first: a remote file system does not answer the attribute query that follows.
+        if let Err(refusal) = check_volume(&handle)? {
+            return Ok(Err(AnchorRefusal::Volume(refusal)));
+        }
         let tag: FILE_ATTRIBUTE_TAG_INFO = query(
             &handle,
             FileAttributeTagInfo,
@@ -401,9 +407,6 @@ impl DirHandle {
         }
         if tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
             return Ok(Err(AnchorRefusal::NotADirectory));
-        }
-        if let Err(refusal) = check_volume(&handle)? {
-            return Ok(Err(AnchorRefusal::Volume(refusal)));
         }
         let key = key_of(&handle)?;
         let path = final_path(&handle)?;
@@ -490,14 +493,17 @@ impl DirHandle {
         }
     }
 
-    /// Opens one listed child by its identifier, from this directory, for the access given plus
-    /// the right to read its attributes, and reads it back.
+    /// Opens one listed child by its name, relative to this directory's handle, for the access given
+    /// plus the right to read its attributes, checks that it is the object the listing named, and
+    /// reads it back.
     ///
-    /// The handle is not open for delete sharing, so while it is held the child cannot be renamed
-    /// or removed by anyone else. A directory, or a file with one name, must have a final path
-    /// that is this directory's plus exactly the listed name. A file with more than one name may
-    /// show any of them as its final path, so its place is not shown that way and the caller reads
-    /// `links` and decides.
+    /// The child is opened by name, and not by identifier, because the platform lets an object
+    /// that was opened by identifier be renamed or deleted whatever the handle's sharing says, and
+    /// holds one that was opened through its name. The handle is not open for delete sharing, so
+    /// while it is held the child cannot be renamed or removed by anyone else. A directory, or a
+    /// file with one name, must have a final path that is this directory's plus exactly the listed
+    /// name. A file with more than one name may show any of them as its final path, so its place is
+    /// not shown that way and the caller reads `links` and decides.
     ///
     /// # Errors
     ///
@@ -507,12 +513,7 @@ impl DirHandle {
         child: &Child,
         access: u32,
     ) -> Result<std::result::Result<Opened, Lost>> {
-        let handle = match open_by_key(
-            &self.handle,
-            &child.key,
-            access | FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-        ) {
+        let handle = match self.nt_open_name(&child.name, access, false, FILE_OPEN) {
             Ok(handle) => handle,
             Err(failure)
                 if failure.code == ERROR_FILE_NOT_FOUND || failure.code == ERROR_PATH_NOT_FOUND =>
@@ -521,6 +522,16 @@ impl DirHandle {
             }
             Err(failure) => return Ok(Err(Lost::Refused(failure.code))),
         };
+        self.read_child(handle, child)
+    }
+
+    /// Reads back an opened child: that it is the listed object, what kind it is, how many names it
+    /// has, and that its place is this directory's plus the listed name.
+    fn read_child(
+        &self,
+        handle: Handle,
+        child: &Child,
+    ) -> Result<std::result::Result<Opened, Lost>> {
         if key_of(&handle)? != child.key {
             return Ok(Err(Lost::IdentityChanged));
         }

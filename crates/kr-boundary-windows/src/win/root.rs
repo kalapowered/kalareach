@@ -11,9 +11,11 @@
 //! The removal works from the bottom up, from handles, on the walk's primitives. A reparse point,
 //! and a file with more than one name, is removed by its name, opened relative to its parent's
 //! handle and never through its target, so a link's target and a hard link's other names stay as
-//! they were. Every other object is opened by its identifier from the held directory, with the
+//! they were. Every other object is opened by its name relative to the held directory, with the
 //! right to delete it and the backup and restore privileges that the guard on this thread holds,
-//! and is deleted with the platform's POSIX semantics, which ignore the read-only attribute. An
+//! checked against the identity its listing gave (the platform refuses a deletion through a
+//! handle opened by identifier, and does not hold such a handle's object against a rename), and is deleted with the platform's POSIX semantics, which ignore
+//! the read-only attribute. An
 //! object that still cannot be opened, or stays in use for five seconds, is a leftover: its
 //! reason and path are returned, and nothing on it is changed.
 
