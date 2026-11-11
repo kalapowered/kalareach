@@ -420,7 +420,7 @@ pub fn absent_paths(
         }
         seen
     };
-    account
+    let mut paths: Vec<PathBuf> = account
         .absent
         .iter()
         .filter(|path| which != Absent::Ancestors || path.contains("{ancestors}"))
@@ -445,7 +445,15 @@ pub fn absent_paths(
                 vec![expand(path)]
             }
         })
-        .collect()
+        .collect();
+    if which == Absent::All {
+        // The agent reads command rules from a `rules` directory of its configuration directory
+        // (the vendor documents it, and the agent's own help for checking a command against rule
+        // files shows the feature): a rule there lets a command run with no prompt, so the
+        // directory is known absent whatever the entry lists.
+        paths.push(PathBuf::from(&config).join("rules"));
+    }
+    paths
 }
 
 /// Whether nothing is at `path`, looked at with no link followed at its last component: "not found"
