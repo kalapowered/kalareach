@@ -362,7 +362,7 @@ pub async fn sign_out(selector: &EnvironmentSelector, json: bool, storage: bool)
 ///
 /// A host has a storage account when its daemon answers `account.storage_status`. One that is
 /// refused as `HOST_NOT_CONFIGURED` has none, and one of a release before storage accounts does not
-/// list the method and cannot have one ([`read_storage_status`] tells it from a caller that is
+/// list the method and cannot have one (`read_storage_status` tells it from a caller that is
 /// refused, whose refusal is returned).
 ///
 /// # Errors
