@@ -2041,6 +2041,46 @@ fn a_root_is_not_begun_in_a_resumed_file_without_room_for_the_rows_that_record_i
     );
 }
 
+/// The bound that decides a root is the ceiling with the root's three rows counted: a file with
+/// room for everything but the made and removed rows of the root refuses the intent, and a file
+/// with room for all three does not. The ceiling grows one for one with the bytes in the file, so
+/// the case puts it first exactly on the file's bound and then one byte over it.
+#[test]
+fn a_root_is_begun_only_when_the_file_has_room_for_every_row_that_records_it() {
+    let resumed = |snapshot_bytes: usize| {
+        let mut reader = Tracker::reading();
+        reader.apply(&begin()).unwrap();
+        reader
+            .apply_framed(&snapshot(1, SnapshotKind::Initial), snapshot_bytes)
+            .unwrap();
+        reader.into_writer()
+    };
+    let probe = 1_000;
+    let below = limits::MAX_FILE
+        .checked_sub(resumed(probe).ceiling())
+        .expect("a small file is within the bound");
+    let at_the_bound = probe + below;
+
+    let mut fits = resumed(at_the_bound);
+    assert_eq!(fits.ceiling(), limits::MAX_FILE, "the file is on its bound");
+    fits.apply(&Row::RootIntent { name: root_name(1) })
+        .expect("room for the intent and for the made and removed rows");
+
+    let mut over = resumed(at_the_bound + 1);
+    assert!(
+        matches!(
+            over.apply(&Row::RootIntent { name: root_name(1) }),
+            Err(OrderError::NoRoom(_))
+        ),
+        "a byte short of room for the root's rows: no root is begun"
+    );
+    // Once the intent is written, the two rows still to come keep their room.
+    assert!(
+        fits.ceiling() <= limits::MAX_FILE,
+        "the file's ceiling stays within its bound after the intent"
+    );
+}
+
 #[test]
 fn a_writer_that_resumes_a_file_counts_the_bytes_that_are_in_it_and_what_it_still_owes() {
     // An earlier writer made ten snapshot rows of the size the framing allows. The reader takes
