@@ -3071,6 +3071,10 @@ jobs:
   # it is the longest job of the run, and its limits add up to 344 of its 355 minutes. This job
   # holds one runner for the length of its own steps and takes nothing from that budget. Every
   # step has a limit of its own, and the limits add up to less than the job's.
+  #
+  # A red job here stops a landing: a landing needs the conclusion of the whole run at the top
+  # commit to be a success, so no branch rule has to name the job, and a pull request's merge is
+  # stopped by it only where a branch rule does.
   macos-shell-packages:
     name: macos-shell-packages
     # Skipped, and shown as skipped, only in a manual run started with the macOS jobs turned off.
