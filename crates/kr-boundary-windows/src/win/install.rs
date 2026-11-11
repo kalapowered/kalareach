@@ -54,7 +54,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_TAG_INFO, FILE_CASE_SENSITIVE_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_128,
     FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, FileAttributeTagInfo, FileCaseSensitiveInfo, FileIdInfo,
-    GetFileInformationByHandleEx, OPEN_EXISTING,
+    GetFileInformationByHandleEx, GetFileSizeEx, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -79,6 +79,8 @@ pub const CONNECT: &str = "krb-connect";
 
 const DISPLAY: &str = "KalaReach repository boundary";
 const BROKER: &str = "kr-boundary-broker.exe";
+/// The name of Git's global configuration in the directory of its empty settings.
+const GIT_CONFIG: &str = "config";
 const CREDENTIAL: &str = "kr-boundary-credential.exe";
 /// The privileges the broker uses and no others: the service manager gives the service's token
 /// these and takes away every other.
@@ -172,6 +174,34 @@ fn note_call(call: &str) {
 
 #[cfg(not(feature = "testing"))]
 fn note_call(_call: &str) {}
+
+/// Seams for the test build only: a function that a case hands over runs where another program
+/// would act, so that the case shows what the installation does then. A build that ships has none.
+#[cfg(feature = "testing")]
+pub mod testing {
+    use std::sync::{Mutex, PoisonError};
+
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    static AFTER_A_READ: Mutex<Option<Hook>> = Mutex::new(None);
+
+    /// Runs the function once, right after the first of the two reads that decide which private
+    /// roots are in use: the listing of `run` and the read of the journal. A broker that begins an
+    /// invocation then writes its intent row and makes its root between the two reads.
+    pub fn after_the_first_of_the_two_reads(hook: impl FnOnce() + Send + 'static) {
+        *AFTER_A_READ.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+    }
+
+    pub(super) fn after_a_read() {
+        let hook = AFTER_A_READ
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
 
 /// The calls the installation makes on the Application Identity service, each one recorded in the
 /// test build. A machine-wide control that the machine's owner may have a policy in force through:
@@ -1188,11 +1218,18 @@ fn inspect_layout(
         return Ok(());
     };
     let children = held.children()?;
+    #[cfg(feature = "testing")]
+    testing::after_a_read();
     // The roots are listed first and the journal is read after: the broker writes the intent row
     // before it makes a root, so a root that the listing shows is named by the journal read next,
-    // also when the broker began its invocation between the two reads.
+    // also when the broker began its invocation between the two reads. Read the other way round, a
+    // root made between the two reads would be listed and not named, and a root in use would be
+    // refused.
     let named_roots = if layout == Layout::Run && !children.is_empty() {
-        roots_named_by_the_journal(paths)?
+        let named = roots_named_by_the_journal(paths)?;
+        #[cfg(feature = "testing")]
+        testing::after_a_read();
+        named
     } else {
         BTreeSet::new()
     };
@@ -1556,6 +1593,57 @@ fn roots_named_by_the_journal(paths: &Paths) -> Result<BTreeSet<String>, Error> 
     Ok(named)
 }
 
+/// What the installation makes in the program directory under a name: the two programs are files;
+/// the directory of Git's empty settings is a directory, and in it the configuration is a file and
+/// the hooks and the template are directories that hold nothing. Any other name is none.
+fn program_kind(paths: &Paths, dir: &Path, name: &str) -> Option<Kind> {
+    let is = |given: &str| name.eq_ignore_ascii_case(given);
+    if dir
+        .as_os_str()
+        .eq_ignore_ascii_case(paths.program.as_os_str())
+    {
+        let git = paths.git.file_name().map(|git| git.to_string_lossy());
+        if is(BROKER) || is(CREDENTIAL) {
+            Some(Kind::File)
+        } else if git.is_some_and(|git| is(&git)) {
+            Some(Kind::Directory)
+        } else {
+            None
+        }
+    } else if dir.as_os_str().eq_ignore_ascii_case(paths.git.as_os_str()) {
+        if is(GIT_CONFIG) {
+            Some(Kind::File)
+        } else if is("hooks") || is("template") {
+            Some(Kind::Directory)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+/// Whether the entry is Git's global configuration that the broker points Git at, which the
+/// installation makes empty and records with the digest of nothing.
+fn is_git_config(paths: &Paths, dir: &Path, name: &str) -> bool {
+    dir.as_os_str().eq_ignore_ascii_case(paths.git.as_os_str())
+        && name.eq_ignore_ascii_case(GIT_CONFIG)
+}
+
+/// The size of an open file, read on its handle.
+fn file_size(handle: &ffi::Handle) -> Result<u64, Error> {
+    let mut size = 0_i64;
+    // SAFETY: the handle is open with the right to read its attributes and the pointer is to a
+    // local that lives through the call.
+    if unsafe { GetFileSizeEx(handle.raw(), &raw mut size) } == 0 {
+        return Err(Error::Failed(format!(
+            "reading the size of a file: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    Ok(u64::try_from(size).unwrap_or(0))
+}
+
 /// Reads every entry below a directory of the staging layout, whatever its name, on its own
 /// handle: no link, one name for a file, the installation's own owner, and no right for another
 /// account to change it.
@@ -1610,6 +1698,34 @@ fn inspect_within(
                 "it has more than one name",
                 Cure::RemoveEntry,
             ));
+        }
+        if matches!(scope, Scope::Program) {
+            let name = shown.to_string_lossy();
+            let reason = match program_kind(paths, dir, &name) {
+                None => Some("the installation does not give that name there"),
+                Some(Kind::File) if opened.kind != Kind::File => {
+                    Some("it is a directory, not a file")
+                }
+                Some(Kind::Directory) if opened.kind != Kind::Directory => {
+                    Some("it is a file, not a directory")
+                }
+                // The configuration is recorded with the digest of nothing, so what is there must
+                // be nothing: a repair makes it again once it is removed.
+                Some(_) if is_git_config(paths, dir, &name) && file_size(&opened.handle)? != 0 => {
+                    Some("it holds settings, and the installation's own configuration is empty")
+                }
+                Some(_) => None,
+            };
+            if let Some(why) = reason {
+                return Err(within_refusal(
+                    paths,
+                    scope,
+                    dir,
+                    &shown,
+                    why,
+                    Cure::RemoveEntry,
+                ));
+            }
         }
         if let Some(why) = check_readable_object(&opened.handle)? {
             return Err(within_refusal(
@@ -2254,7 +2370,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
             &format!("making the empty {part} directory"),
         )?;
     }
-    let empty_config = paths.git.join("config");
+    let empty_config = paths.git.join(GIT_CONFIG);
     run.record(
         ObjectKind::File,
         &empty_config.display().to_string(),
