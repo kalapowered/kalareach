@@ -170,49 +170,39 @@ fn own_variable_exists() -> String {
         .split(' ')
         .map(|name| format!("${{+parameters[{name}]}}"))
         .collect();
-    format!("\"{}\" == *1*", tests.join(""))
+    format!("\"{}\" == *'1'*", tests.join(""))
+}
+
+/// The words of the typed lines that an alias can stand for, in the order they are read: a shell
+/// that has an alias with one of these names, or with the name of the program that digests a
+/// value, gives the line another command to run.
+const WORDS_OF_THE_LINES: &str =
+    r"if|then|else|fi|for|in|do|done|always|print|builtin|unset|\{|\}|\[\[|\]\]";
+
+/// The kinds of what a refusal names, each written `<kind>:<name>`.
+const REFUSED_KINDS: [&str; 5] = ["function", "alias", "global-alias", "trap", "variable"];
+
+/// Whether `word` is one a refusal row holds: a kind of [`REFUSED_KINDS`], a colon and a name.
+fn is_a_refusal_word(word: &str) -> bool {
+    word.split_once(':')
+        .is_some_and(|(kind, name)| REFUSED_KINDS.contains(&kind) && !name.is_empty())
 }
 
 /// The parts of a typed line that refuse a shell before any value is expanded, which put in
 /// `krenv_r` what the shell has that would give a value to something other than the digest
-/// program: a function or an alias named `builtin`, a function named for an executable the digest
-/// program runs through, a global alias (which applies to any word), and a `DEBUG` or `ZERR` trap
-/// (which runs between commands). Parameter expansions alone, but for the list of traps, which the
-/// `trap` builtin gives once `builtin` is known not to be a function.
+/// program: a function named `builtin` or for an executable the digest program runs through, an
+/// alias named `builtin`, for a word the line is made of, or for such an executable, a global alias
+/// (which applies to any word), and a `DEBUG`, `ZERR` or `ERR` trap (which runs between commands).
+/// The tests are parameter expansions alone and their literal words are quoted, so that no command
+/// is run before they are done; the trap builtin's list is read only where `builtin` is known not
+/// to be a function or an alias, and no other state has been found.
 fn refusal_checks() -> String {
     let [env, shasum] = digest_executables();
-    let mut checks = String::from("krenv_r=; ");
-    for (test, word) in [
-        (
-            "${+functions[builtin]} == 1".to_owned(),
-            "function:builtin".to_owned(),
-        ),
-        (
-            "${+aliases[builtin]} == 1".to_owned(),
-            "alias:builtin".to_owned(),
-        ),
-        (
-            format!("${{+functions[{env}]}} == 1"),
-            format!("function:{env}"),
-        ),
-        (
-            format!("${{+functions[{shasum}]}} == 1"),
-            format!("function:{shasum}"),
-        ),
-        (
-            "${#galiases} != 0".to_owned(),
-            "global-alias:${(j:,:k)galiases}".to_owned(),
-        ),
-    ] {
-        checks.push_str(&format!("[[ {test} ]] && krenv_r=\"$krenv_r {word}\"; "));
-    }
-    for signal in ["DEBUG", "ZERR"] {
-        checks.push_str(&format!(
-            "[[ ${{+functions[TRAP{signal}]}} == 1 || -n ${{(M)${{(f)\"$(builtin trap)\"}}:#* {signal}}} ]] \
-             && krenv_r=\"$krenv_r trap:{signal}\"; "
-        ));
-    }
-    checks
+    let template = r#"krenv_r=; krenv_r="$krenv_r ${(j: :)${(@)${(@M)${(@k)functions}:#(builtin|@ENV@|@SHASUM@)}/#/function:}}"; krenv_r="$krenv_r ${(j: :)${(@)${(@M)${(@k)aliases}:#(@WORDS@|@ENV@|@SHASUM@)}/#/alias:}}"; [[ ${+functions[TRAPDEBUG]} == '1' ]] && krenv_r="$krenv_r trap:DEBUG"; [[ ${+functions[TRAPZERR]} == '1' ]] && krenv_r="$krenv_r trap:ZERR"; [[ ${+functions[TRAPERR]} == '1' ]] && krenv_r="$krenv_r trap:ERR"; [[ ${#galiases} != '0' ]] && krenv_r="$krenv_r global-alias:${(j:,:k)galiases}"; if [[ -z ${krenv_r// /} ]]; then krenv_r="$krenv_r ${(j: :)${(@)${(@M)${(@f)"$(builtin trap)"}:#* (DEBUG|ZERR|ERR)}/#* /trap:}}"; fi; "#;
+    template
+        .replace("@WORDS@", WORDS_OF_THE_LINES)
+        .replace("@ENV@", env)
+        .replace("@SHASUM@", shasum)
 }
 
 /// What the harness expects of the session's shell: the list it handed to `kr new`, less the names
@@ -322,12 +312,18 @@ impl Expected {
     /// names and the digest program, and no value.
     ///
     /// Before any value is expanded it refuses a shell that has a variable of the line's own names,
-    /// a function or an alias named `builtin`, a function named for the digest program's
-    /// executables, a global alias, or a `DEBUG` or `ZERR` trap, and says what it found
-    /// ([`SHELL_REFUSED`]). Otherwise it calls the shell's builtins by their explicit form, so that
-    /// a function or an alias named `printf` or `print` is not called with a value, turns tracing
-    /// and echo off before any value is expanded, and, in an `always` block, sets back the options
-    /// that were on and unsets its own variables, also where it stops part way.
+    /// a function named `builtin` or for the digest program's executables, an alias named `builtin`,
+    /// for a word of the line or for those executables, a global alias, or a `DEBUG`, `ZERR` or `ERR`
+    /// trap, and says what it found ([`SHELL_REFUSED`]); no command is run before those tests are
+    /// done, but for the trap builtin's list once none of the others was found. Otherwise it calls
+    /// the shell's builtins by their explicit form, so that a function or an alias named `printf`
+    /// or `print` is not called with a value, turns tracing and echo off before any value is
+    /// expanded, and, in an `always` block, sets back the options that were on and unsets its own
+    /// variables, also where it stops part way. Its assignments are all in the block that the
+    /// `always` block follows.
+    ///
+    /// An alias named for a word of the line takes effect when the shell reads the line, before any
+    /// test is run: the lines refuse what the shell has and cannot show a state that changed them.
     #[must_use]
     pub fn value_line(&self, part: usize, tag: usize) -> String {
         let names: Vec<&str> = self
@@ -335,7 +331,7 @@ impl Expected {
             .iter()
             .map(|(name, _)| name.as_str())
             .collect();
-        let template = r#"if [[ @EXISTS@ ]]; then print -r -- "@ROW@ refused variable:krenv"; print -r -- "@ROW@ end @TAG@"; else @CHECKS@if [[ -n $krenv_r ]]; then print -r -- "@ROW@ refused$krenv_r"; print -r -- "@ROW@ end @TAG@"; unset krenv_r; else krenv_t=; [[ -o xtrace ]] && krenv_t=x; [[ -o verbose ]] && krenv_t=${krenv_t}v; builtin unsetopt xtrace verbose; { for krenv_n in @NAMES@; do if [[ ${parameters[$krenv_n]} == *export* ]]; then krenv_d=$(builtin printf '%s\0%s\0%s' "${@MARKER@}" "$krenv_n" "${(P)krenv_n}" | @PROGRAM@); builtin print -r -- "@ROW@ value $krenv_n ${krenv_d[1,@DIGITS@]}"; else builtin print -r -- "@ROW@ value $krenv_n missing"; fi; done; } always { [[ $krenv_t == *x* ]] && builtin setopt xtrace; [[ $krenv_t == *v* ]] && builtin setopt verbose; builtin unset krenv_d krenv_n krenv_t krenv_r; }; builtin print -r -- "@ROW@ end @TAG@"; fi; fi"#;
+        let template = r#"if [[ @EXISTS@ ]]; then print -r -- "@ROW@ refused variable:krenv"; print -r -- "@ROW@ end @TAG@"; else { @CHECKS@if [[ -n ${krenv_r// /} ]]; then print -r -- "@ROW@ refused$krenv_r"; print -r -- "@ROW@ end @TAG@"; else krenv_t=; [[ -o xtrace ]] && krenv_t=x; [[ -o verbose ]] && krenv_t=${krenv_t}v; builtin unsetopt xtrace verbose; for krenv_n in @NAMES@; do if [[ ${parameters[$krenv_n]} == *'export'* ]]; then krenv_d=$(builtin printf '%s\0%s\0%s' "${@MARKER@}" "$krenv_n" "${(P)krenv_n}" | @PROGRAM@); builtin print -r -- "@ROW@ value $krenv_n ${krenv_d[1,@DIGITS@]}"; else builtin print -r -- "@ROW@ value $krenv_n missing"; fi; done; builtin print -r -- "@ROW@ end @TAG@"; fi; } always { [[ ${krenv_t-} == *'x'* ]] && builtin setopt xtrace; [[ ${krenv_t-} == *'v'* ]] && builtin setopt verbose; builtin unset krenv_d krenv_n krenv_t krenv_r; }; fi"#;
         template
             .replace("@EXISTS@", &own_variable_exists())
             .replace("@CHECKS@", &refusal_checks())
@@ -351,14 +347,15 @@ impl Expected {
     /// list on, whose end row carries `tag`: each row carries the name's position in the shell's
     /// list, one row says how many names the shell exports, and one carries a digest of the whole
     /// sorted list, so that the parts are read as one snapshot ([`Snapshot`]). It holds no value,
-    /// refuses a shell that has a variable of the line's own names, and unsets its own variables
-    /// also where it stops part way.
+    /// refuses a shell in the states the value line refuses ([`refusal_checks`]), and unsets its own
+    /// variables also where it stops part way.
     #[must_use]
     pub fn exported_line(skipped: usize, tag: usize) -> String {
         let (first, last) = (skipped + 1, skipped + PART_NAMES);
-        let template = r#"if [[ @EXISTS@ ]]; then print -r -- "@ROW@ refused variable:krenv"; print -r -- "@ROW@ end @TAG@"; else krenv_e=(${(ko)parameters[(R)*export*]}); krenv_i=@SKIPPED@; { for krenv_n in ${krenv_e[@FIRST@,@LAST@]}; do krenv_i=$((krenv_i+1)); builtin print -r -- "@ROW@ exported $krenv_i $krenv_n"; done; builtin print -r -- "@ROW@ total ${#krenv_e}"; krenv_d=$(builtin print -rl -- "${(@)krenv_e}" | @PROGRAM@); builtin print -r -- "@ROW@ snapshot ${krenv_d[1,@DIGITS@]}"; } always { builtin unset krenv_e krenv_i krenv_n krenv_d; }; builtin print -r -- "@ROW@ end @TAG@"; fi"#;
+        let template = r#"if [[ @EXISTS@ ]]; then print -r -- "@ROW@ refused variable:krenv"; print -r -- "@ROW@ end @TAG@"; else { @CHECKS@if [[ -n ${krenv_r// /} ]]; then print -r -- "@ROW@ refused$krenv_r"; print -r -- "@ROW@ end @TAG@"; else krenv_e=(${(ko)parameters[(R)*export*]}); krenv_i=@SKIPPED@; for krenv_n in ${krenv_e[@FIRST@,@LAST@]}; do krenv_i=$((krenv_i+1)); builtin print -r -- "@ROW@ exported $krenv_i $krenv_n"; done; builtin print -r -- "@ROW@ total ${#krenv_e}"; krenv_d=$(builtin print -rl -- "${(@)krenv_e}" | @PROGRAM@); builtin print -r -- "@ROW@ snapshot ${krenv_d[1,@DIGITS@]}"; builtin print -r -- "@ROW@ end @TAG@"; fi; } always { builtin unset krenv_e krenv_i krenv_n krenv_d krenv_r; }; fi"#;
         template
             .replace("@EXISTS@", &own_variable_exists())
+            .replace("@CHECKS@", &refusal_checks())
             .replace("@SKIPPED@", &skipped.to_string())
             .replace("@FIRST@", &first.to_string())
             .replace("@LAST@", &last.to_string())
@@ -676,7 +673,11 @@ fn rows_before_the_end(rows: &[String], tag: usize) -> Result<Vec<Row<'_>>, Stri
                     answer.push(Row::Exported(position, name));
                 }
             }
-            [first, REFUSED, found @ ..] if *first == ROW => {
+            [first, REFUSED, found @ ..]
+                if *first == ROW
+                    && !found.is_empty()
+                    && found.iter().all(|word| is_a_refusal_word(word)) =>
+            {
                 answer.push(Row::Refused(found.to_vec()))
             }
             [first, "snapshot", digest] if *first == ROW => answer.push(Row::Snapshot(digest)),
@@ -1101,8 +1102,10 @@ mod tests {
         found
     }
 
-    /// What `zsh -f` writes on its output and its error output when it runs `prelude`, then `line`,
-    /// then `after`, each on lines of their own, with `environment` and nothing else.
+    /// What `zsh -f` writes on its output and its error output when it runs `prelude`, then `line`
+    /// through `eval` (so that the aliases and functions of the prelude are in effect when the line
+    /// is read, as a shell's start-up files leave them), then `after`, each on lines of their own,
+    /// with `environment` and nothing else.
     fn zsh_runs(
         zsh: &str,
         environment: &[(String, String)],
@@ -1113,8 +1116,10 @@ mod tests {
         let output = std::process::Command::new(zsh)
             .args(["-f", "-c"])
             .arg(format!(
-                "zmodload zsh/parameter; {prelude}\n{line}\n{after}"
+                "zmodload zsh/parameter; {prelude}\neval \"$1\"\n{after}"
             ))
+            .arg("zsh")
+            .arg(line)
             .env_clear()
             .envs(environment.iter().cloned())
             .output()
@@ -1143,6 +1148,25 @@ mod tests {
         for (prelude, found) in [
             ("function builtin { \"$@\"; }", "function:builtin"),
             ("alias builtin=echo", "alias:builtin"),
+            // A function named `builtin` that is called in a command substitution says so, and the
+            // line must refuse before any is run.
+            (
+                "function builtin { print -r -- \"BUILTIN-CALLED-IN-SUBSHELL-$ZSH_SUBSHELL\" >&2; }",
+                "function:builtin",
+            ),
+            (&format!("alias {env}=cat"), &format!("alias:{env}")),
+            (&format!("alias {shasum}=cat"), &format!("alias:{shasum}")),
+            ("alias then='then print ALIAS-RAN;'", "alias:then"),
+            ("alias do='do print ALIAS-RAN;'", "alias:do"),
+            ("alias print='builtin print'", "alias:print"),
+            ("alias unset='builtin unset'", "alias:unset"),
+            ("alias '{'='{ :;'", "alias:{"),
+            ("TRAPERR() { :; }", "trap:ERR"),
+            // A global alias named for a literal word of a test does not change the test.
+            ("alias -g 0=1", "global-alias:0"),
+            ("TRAPDEBUG() { :; }; alias -g 1=2", "trap:DEBUG"),
+            ("krenv_t=1; alias -g 1=2", "variable:krenv"),
+            ("krenv_t=1; alias -g '*1*'='*2*'", "variable:krenv"),
             (
                 &format!("function {env} {{ cat; }}"),
                 &format!("function:{env}"),
@@ -1167,6 +1191,31 @@ mod tests {
             assert!(
                 why.starts_with(SHELL_REFUSED) && why.contains(found),
                 "{prelude}: {why}"
+            );
+            assert!(
+                !error.contains("BUILTIN-CALLED-IN-SUBSHELL-1"),
+                "{prelude}: a command substitution ran before the tests for `builtin` were done"
+            );
+            for (name, value) in &given {
+                assert!(
+                    value.len() < SHORTEST_VALUE_CHECKED
+                        || !(shown.contains(value.as_str()) || error.contains(value.as_str())),
+                    "{prelude}: the value of {name} was shown"
+                );
+            }
+            // The line for the exported names refuses the same states, and shows no value either.
+            let (shown, error) = zsh_runs(zsh, &given, prelude, &Expected::exported_line(0, 0), "");
+            let rows: Vec<String> = shown.lines().map(str::to_owned).collect();
+            let why = read_exported(0, &[], None, &rows).expect_err(&format!(
+                "{prelude}: the shell is refused for its exported names"
+            ));
+            assert!(
+                why.starts_with(SHELL_REFUSED) && why.contains(found),
+                "{prelude}: {why}"
+            );
+            assert!(
+                !error.contains("BUILTIN-CALLED-IN-SUBSHELL-1"),
+                "{prelude}: a command substitution ran before the tests for `builtin` were done"
             );
             for (name, value) in &given {
                 assert!(
@@ -1199,6 +1248,9 @@ mod tests {
         // Where a line stops part way, its own variables are unset and the options that were on are
         // set back by the block that follows its try block, which runs whatever stops the try
         // block: that block holds the setting back and the unsetting, and the try block holds neither.
+        // The line's assignments are all in the block that the `always` block follows.
+        assert!(line.contains("; else { krenv_r=; "), "{line}");
+        assert!(Expected::exported_line(0, 0).contains("; else { krenv_r=; "));
         let (_, after) = line.split_once("} always {").expect("an always block");
         let (tried, _) = line.split_once("} always {").expect("an always block");
         assert!(
@@ -1209,6 +1261,69 @@ mod tests {
         let (tried, after) = names.split_once("} always {").expect("an always block");
         assert!(after.contains("builtin unset krenv_e krenv_i krenv_n krenv_d"));
         assert!(!tried.contains("builtin unset"));
+        // And by a run: an error in the try block, here an assignment to a read-only variable after
+        // the line's own variables are set, still has the next block set the options back and unset
+        // the variables, and nothing after the error in the line runs.
+        let stopped = "(( ${+parameters[krenv_t]} + ${+parameters[krenv_d]} + ${+parameters[krenv_n]} \
+             + ${+parameters[krenv_r]} + ${+parameters[krenv_e]} + ${+parameters[krenv_i]} )) \
+             && builtin print -r -- LEFT-VARIABLE; [[ -o verbose ]] && builtin print -r -- VERBOSE-IS-ON; \
+             [[ -o xtrace ]] && builtin print -r -- XTRACE-IS-ON";
+        for (typed, anchor) in [
+            (line.clone(), "builtin print -r -- \"KRENV value"),
+            (
+                Expected::exported_line(0, 0),
+                "builtin print -r -- \"KRENV exported",
+            ),
+        ] {
+            let broken = typed.replacen(
+                anchor,
+                &format!("typeset -r krenv_stopped=1; krenv_stopped=2; {anchor}"),
+                1,
+            );
+            assert_ne!(broken, typed, "the error is put into the try block");
+            let (shown, error) = zsh_runs(zsh, &given, "setopt verbose xtrace", &broken, stopped);
+            assert!(
+                error.contains("read-only variable: krenv_stopped"),
+                "the try block stopped: {error}"
+            );
+            assert!(
+                !shown.contains(" end "),
+                "nothing ran after the error: {shown}"
+            );
+            assert!(
+                shown.contains("VERBOSE-IS-ON") && shown.contains("XTRACE-IS-ON"),
+                "the options that were on are set back: {shown}"
+            );
+            assert!(
+                !shown.contains("LEFT-VARIABLE"),
+                "the variables are unset: {shown}"
+            );
+        }
+    }
+
+    /// A row that begins as a refusal but whose words are not of the kinds the line prints is not
+    /// read as one: the echo of the typed line can wrap so that its text begins a row.
+    #[test]
+    fn a_row_that_begins_as_a_refusal_with_other_words_is_not_one() {
+        let expected = expected(&[], &[]);
+        for words in [
+            "refused",
+            "refused variable",
+            "refused made-up:thing",
+            "refused variable:",
+        ] {
+            let rows = vec![format!("{ROW} {words}"), format!("{ROW} end 0")];
+            let why = expected
+                .read_values(0, 0, &rows)
+                .expect_err("an answer with no values is refused");
+            assert!(!why.starts_with(SHELL_REFUSED), "{words}: {why}");
+        }
+        let rows = vec![
+            format!("{ROW} refused variable:krenv alias:if"),
+            format!("{ROW} end 0"),
+        ];
+        let why = expected.read_values(0, 0, &rows).expect_err("a refusal");
+        assert!(why.starts_with(SHELL_REFUSED), "{why}");
     }
 
     #[test]
@@ -1307,7 +1422,9 @@ mod tests {
             let ask = |line: &str| -> Vec<String> {
                 let output = std::process::Command::new(zsh)
                     .args(["-f", "-c"])
-                    .arg(format!("zmodload zsh/parameter; {prelude}\n{line}"))
+                    .arg(format!("zmodload zsh/parameter; {prelude}\neval \"$1\""))
+                    .arg("zsh")
+                    .arg(line)
                     .env_clear()
                     .envs(environment.iter().cloned())
                     .output()
