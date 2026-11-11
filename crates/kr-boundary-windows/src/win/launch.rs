@@ -266,8 +266,7 @@ pub struct ChildSpec<'a> {
     /// The descriptor of the child's primary thread.
     pub thread_descriptor: &'a OwnedSd,
     /// The caller's absolute deadline. A child that is ended on an error path, before it ran, is
-    /// waited for no longer than this (with a floor of [`END_FLOOR_MS`]); none waits for as long
-    /// as [`END_WAIT_MS`].
+    /// waited for no longer than this (with a floor of 100 ms); none waits for five seconds.
     pub deadline: Option<Instant>,
 }
 
