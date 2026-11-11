@@ -601,6 +601,16 @@ impl RemoteConnection {
                     .map_err(|error| {
                         ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
                     })?;
+                // Only the end of its session or a prompt that sends it ends a draft, and a device
+                // holds a bounded number of drafts that neither has ended. A draft that names no
+                // session would take its place for good, so a device's draft names the session it
+                // is for. The person at this machine has no bound and may make one with none.
+                if params.session_id.0.is_none() {
+                    return Err(ProtocolError::new(
+                        ErrorCode::InvalidArgument,
+                        "a draft a device makes names the session it is for",
+                    ));
+                }
                 if params
                     .device_id
                     .0

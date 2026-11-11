@@ -3,9 +3,10 @@
 //!
 //! The transfer service performs each under the device's own principal, so a draft the device makes
 //! is the device's and nobody else's, and the owner's drafts are unknown to it. A draft bound to a
-//! session is written only by a request that names that session, a device labels what it makes
-//! with its own identity or none, and the drafts a device holds open are bounded: a draft stops
-//! counting when a prompt sends it to a session or the session it targets closes. The answer the
+//! session is written only by a request that names that session, a device's draft names the
+//! session it is for, a device labels what it makes with its own identity or none, and the drafts
+//! a device holds open are bounded: a draft stops counting when a prompt sends it to a session or
+//! the session it targets closes. The answer the
 //! service reads from its own record of an earlier submission is told to a device as a copy.
 
 use kr_protocol::envelope::{ActionTarget, ControlFrame, MutationRequest, Outcome, ParamsValue};
@@ -22,9 +23,7 @@ use kr_protocol::transfer::{
     DraftCreateParams, DraftCreateResult, DraftUpdateParams, DraftUpdateResult, InsertionMethod,
 };
 
-use super::a_copy_from_a_services_record::{
-    EVERY_RIGHT, a_result_copied_from_the_record_is_held_as_kept, mutation_of, written,
-};
+use super::a_copy_from_a_services_record::{EVERY_RIGHT, mutation_of, two_copies, written};
 use super::write_boundary::paired_connection;
 use crate::service::a_close_a_worker_never_answers as fake;
 use crate::transfer::DEVICE_OPEN_DRAFTS;
@@ -180,6 +179,7 @@ async fn a_device_makes_and_updates_drafts_of_its_own_and_reaches_none_of_the_ow
     let world = fake::fake_worker(None).await;
     let controller = &world.controller;
     let service = controller.transfer().service();
+    let session = world.session_id;
     let owner = the_owner();
     let owners = a_draft_for(&world, &owner, None);
     let (connection, _) = paired_connection(controller, 31, &[ActionRight::SessionView]);
@@ -192,8 +192,8 @@ async fn a_device_makes_and_updates_drafts_of_its_own_and_reaches_none_of_the_ow
                 &connection,
                 Method::DraftCreate,
                 1,
-                &create_params(&world, None, None, "first"),
-                None,
+                &create_params(&world, Some(session), None, "first"),
+                Some(session),
             ))
             .await,
     );
@@ -212,7 +212,7 @@ async fn a_device_makes_and_updates_drafts_of_its_own_and_reaches_none_of_the_ow
                 Method::DraftUpdate,
                 2,
                 &update_of(id, created.draft.revision, "second"),
-                None,
+                Some(session),
             ))
             .await,
     );
@@ -224,7 +224,7 @@ async fn a_device_makes_and_updates_drafts_of_its_own_and_reaches_none_of_the_ow
             Method::DraftUpdate,
             3,
             &update_of(id, created.draft.revision, "stale"),
-            None,
+            Some(session),
         ))
         .await;
     assert_eq!(
@@ -623,6 +623,72 @@ async fn a_target_that_names_an_application_reaches_nothing_its_connection_does_
     world.serving.abort();
 }
 
+/// KR-REQ-23.41: a draft a device makes names the session it is for, because only the end of its
+/// session or a prompt that sends it ends a draft and a device holds a bounded number. A create
+/// that names no session is refused `INVALID_ARGUMENT` before anything is counted or written, and
+/// leaves no record: the same action identifier then carries a create that names a session, which
+/// is served. The control is the person at this machine, who has no bound and makes a draft with
+/// none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_makes_no_draft_that_names_no_session() {
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    let session = world.session_id;
+    let (connection, _) = paired_connection(controller, 46, EVERY_RIGHT);
+    let device = connection.device.principal();
+    let service = controller.transfer().service();
+
+    let sessionless = write_naming(
+        &world,
+        &connection,
+        Method::DraftCreate,
+        1,
+        &create_params(&world, None, None, "no session"),
+        None,
+    );
+    let refused = connection.mutate(&sessionless).await;
+    assert_eq!(
+        super::tests::error_of(&refused).code,
+        ErrorCode::InvalidArgument
+    );
+    assert_eq!(service.open_drafts(&device).expect("counts"), 0);
+
+    let mut named = write_naming(
+        &world,
+        &connection,
+        Method::DraftCreate,
+        2,
+        &create_params(&world, Some(session), None, "for a session"),
+        Some(session),
+    );
+    named.action_id = sessionless.action_id;
+    let made: DraftCreateResult = result_of(&connection.mutate(&named).await);
+    assert_eq!(made.draft.session_id.0, Some(session));
+    assert_eq!(service.open_drafts(&device).expect("counts"), 1);
+
+    let admission = fake::admission(controller, world.accepted).await;
+    let window = controller
+        .windows
+        .issue(admission.connection_id, controller.boot_epoch)
+        .expect("a window");
+    let mut local = mutation_of(
+        &world,
+        &connection,
+        Method::DraftCreate,
+        3,
+        ParamsValue::from_typed(&create_params(&world, None, None, "the owner's"))
+            .expect("encodes"),
+    );
+    local.action_window_id = window.action_window_id;
+    let owners: DraftCreateResult = result_of(
+        &controller
+            .perform(&the_owner(), admission.connection_id, None, local)
+            .await,
+    );
+    assert_eq!(owners.draft.session_id.0, None);
+    world.serving.abort();
+}
+
 /// The contribution a manual terminal workflow declares: no declaration from the session's
 /// integration is needed for it.
 fn manual_contribution(handle: &kr_protocol::transfer::AttachmentHandle) -> AttachmentContribution {
@@ -751,8 +817,8 @@ async fn a_device_labels_its_drafts_with_its_own_identity_or_none() {
             &connection,
             Method::DraftCreate,
             request_id,
-            &create_params(&world, None, label, "labelled"),
-            None,
+            &create_params(&world, Some(world.session_id), label, "labelled"),
+            Some(world.session_id),
         )
     };
 
@@ -774,10 +840,45 @@ async fn a_device_labels_its_drafts_with_its_own_identity_or_none() {
 /// its lock is taken.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_draft_create_read_from_the_record_is_held_as_kept() {
-    a_result_copied_from_the_record_is_held_as_kept(Method::DraftCreate, 86, |world| {
-        ParamsValue::from_typed(&create_params(world, None, None, "once")).expect("encodes")
-    })
-    .await;
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    let session = world.session_id;
+    let (connection, _) = paired_connection(controller, 86, EVERY_RIGHT);
+    let mutation = write_naming(
+        &world,
+        &connection,
+        Method::DraftCreate,
+        91,
+        &create_params(&world, Some(session), None, "once"),
+        Some(session),
+    );
+
+    let (copied, fresh) = two_copies(controller, &connection, &mutation).await;
+    for answered in [&copied, &fresh] {
+        assert!(
+            matches!(
+                answered.frame(),
+                ControlFrame::Response(kr_protocol::envelope::Response {
+                    outcome: Outcome::Ok(_),
+                    ..
+                })
+            ),
+            "the create is performed once and answered to both copies: {:?}",
+            answered.frame()
+        );
+    }
+    assert!(
+        copied
+            .asked
+            .as_ref()
+            .is_some_and(super::decision::Asked::is_kept),
+        "the copy that read the result from the record is held as a kept answer"
+    );
+    assert!(
+        fresh.asked.as_ref().is_some_and(|asked| !asked.is_kept()),
+        "the copy that performed is a fresh answer"
+    );
+    world.serving.abort();
 }
 
 /// Serves `mutation` twice at once, the first copy stopped inside the transfer service, once it
@@ -896,7 +997,7 @@ async fn a_device_holds_at_most_the_bound_of_open_drafts_and_the_owner_is_held_t
     let device = connection.device.principal();
     let mut sent = Vec::new();
     for _ in 1..DEVICE_OPEN_DRAFTS {
-        sent.push(a_draft_for(&world, &device, None).draft_id);
+        sent.push(a_draft_for(&world, &device, Some(world.session_id)).draft_id);
     }
     let create = |request_id: u64| {
         write_naming(
@@ -904,8 +1005,8 @@ async fn a_device_holds_at_most_the_bound_of_open_drafts_and_the_owner_is_held_t
             &connection,
             Method::DraftCreate,
             request_id,
-            &create_params(&world, None, None, "one more"),
-            None,
+            &create_params(&world, Some(world.session_id), None, "one more"),
+            Some(world.session_id),
         )
     };
 
@@ -982,7 +1083,7 @@ async fn a_create_at_the_bound_whose_registration_is_withdrawn_is_told_nothing_o
     let (connection, _) = paired_connection(controller, 40, EVERY_RIGHT);
     let device = connection.device.principal();
     for _ in 0..DEVICE_OPEN_DRAFTS {
-        a_draft_for(&world, &device, None);
+        a_draft_for(&world, &device, Some(world.session_id));
     }
     let create = |request_id: u64| {
         write_naming(
@@ -990,8 +1091,8 @@ async fn a_create_at_the_bound_whose_registration_is_withdrawn_is_told_nothing_o
             &connection,
             Method::DraftCreate,
             request_id,
-            &create_params(&world, None, None, "one past the bound"),
-            None,
+            &create_params(&world, Some(world.session_id), None, "one past the bound"),
+            Some(world.session_id),
         )
     };
 
@@ -1033,19 +1134,20 @@ fn at_the_bound_for_a_session(world: &fake::Silent, byte: u8) -> super::RemoteCo
     connection
 }
 
-/// The create such a device sends for no session, once the session is closed.
-fn a_create_for_no_session(
+/// The create such a device sends for another session than the one its drafts are bound to.
+fn a_create_for_another_session(
     world: &fake::Silent,
     connection: &super::RemoteConnection,
     request_id: u64,
 ) -> MutationRequest {
+    let another = SessionId::new(Uuid::from_bytes([9; 16]));
     write_naming(
         world,
         connection,
         Method::DraftCreate,
         request_id,
-        &create_params(world, None, None, "after the closure"),
-        None,
+        &create_params(world, Some(another), None, "for another session"),
+        Some(another),
     )
 }
 
@@ -1061,7 +1163,7 @@ async fn a_draft_stops_counting_when_its_session_closes() {
     let controller = &world.controller;
     let connection = at_the_bound_for_a_session(&world, 41);
     let refused = connection
-        .mutate(&a_create_for_no_session(&world, &connection, 1))
+        .mutate(&a_create_for_another_session(&world, &connection, 1))
         .await;
     assert_eq!(
         super::tests::error_of(&refused).code,
@@ -1075,7 +1177,7 @@ async fn a_draft_stops_counting_when_its_session_closes() {
         .expect("the session closes");
     let _: DraftCreateResult = result_of(
         &connection
-            .mutate(&a_create_for_no_session(&world, &connection, 2))
+            .mutate(&a_create_for_another_session(&world, &connection, 2))
             .await,
     );
     world.serving.abort();
@@ -1093,7 +1195,7 @@ async fn a_draft_stops_counting_when_the_registry_holds_its_session_closed() {
     let controller = &world.controller;
     let connection = at_the_bound_for_a_session(&world, 42);
     let refused = connection
-        .mutate(&a_create_for_no_session(&world, &connection, 1))
+        .mutate(&a_create_for_another_session(&world, &connection, 1))
         .await;
     assert_eq!(
         super::tests::error_of(&refused).code,
@@ -1109,7 +1211,7 @@ async fn a_draft_stops_counting_when_the_registry_holds_its_session_closed() {
         .expect("the registry records the closure");
     let _: DraftCreateResult = result_of(
         &connection
-            .mutate(&a_create_for_no_session(&world, &connection, 2))
+            .mutate(&a_create_for_another_session(&world, &connection, 2))
             .await,
     );
     world.serving.abort();
@@ -1142,11 +1244,9 @@ async fn two_creates_together_beside_a_closure_not_yet_written_are_both_served()
         .expect("the registry records the closure");
 
     let (arrived, release) = controller.transfer().pause_after_the_outer_check();
-    let first = connection.answer_now(ControlFrame::Mutation(Box::new(a_create_for_no_session(
-        &world,
-        &connection,
-        1,
-    ))));
+    let first = connection.answer_now(ControlFrame::Mutation(Box::new(
+        a_create_for_another_session(&world, &connection, 1),
+    )));
     tokio::pin!(first);
     let waiting = tokio::task::spawn_blocking(move || arrived.recv_timeout(WAIT_BOUND));
     tokio::pin!(waiting);
@@ -1160,11 +1260,9 @@ async fn two_creates_together_beside_a_closure_not_yet_written_are_both_served()
     }
     let (first, second) = tokio::join!(first, async {
         let second = connection
-            .answer_now(ControlFrame::Mutation(Box::new(a_create_for_no_session(
-                &world,
-                &connection,
-                2,
-            ))))
+            .answer_now(ControlFrame::Mutation(Box::new(
+                a_create_for_another_session(&world, &connection, 2),
+            )))
             .await;
         release.send(()).expect("the first create goes on");
         second
@@ -1262,11 +1360,9 @@ async fn a_create_is_tried_again_after_a_second_settle_before_a_refusal_at_the_b
         .expect("the registry records the closure");
 
     let (arrived, release) = controller.transfer().pause_after_the_outer_check();
-    let create = connection.answer_now(ControlFrame::Mutation(Box::new(a_create_for_no_session(
-        &world,
-        &connection,
-        1,
-    ))));
+    let create = connection.answer_now(ControlFrame::Mutation(Box::new(
+        a_create_for_another_session(&world, &connection, 1),
+    )));
     tokio::pin!(create);
     let waiting = tokio::task::spawn_blocking(move || arrived.recv_timeout(WAIT_BOUND));
     tokio::pin!(waiting);

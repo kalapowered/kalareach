@@ -116,9 +116,12 @@ paired device's actor is that device, and a local caller's actor is the operatin
 `device_id` a request carries is recorded as metadata and confers nothing, because a caller that
 could change it per request would give itself another allowance.
 
-A paired device's open drafts are bounded as well, at 64 for each device. A draft is open until a
-prompt sends it to a session, which is how a device frees its place, or the session it targets
-closes, and a draft no longer open takes no place. `draft.create` counts the device's open drafts and
+A paired device's open drafts are bounded as well, at 64 for each device: its drafts whose session
+has not closed and that no prompt has sent. A draft is open until a prompt sends it to a session,
+which is how a device frees its place, or the session it targets closes, and a draft no longer open
+takes no place. A device's draft names the session it is for, because nothing else would end it:
+the host refuses a device's `draft.create` that names none, `INVALID_ARGUMENT`, before it counts or
+writes anything. `draft.create` counts the device's open drafts and
 writes the new one in one transaction under the journal's write lock, so two creates that each find
 one place left cannot both take it, and it asks the host's admission again before it counts, so a
 device whose authority has gone is never told how many it holds. Past the bound the refusal is
@@ -132,7 +135,8 @@ the number is a constant of the host that an owner cannot change.
 A device cannot end a draft itself, because this level has no method that discards one. Sent and
 orphaned drafts stay in the journal, and each `draft.update` adds a row to the journal's events,
 which nothing removes, and a receipt that holds the updated draft until the de-duplication window
-ends. A draft that names no session is freed only by a prompt that sends it.
+ends. A draft that names no session, which only the person at this machine makes, is freed only by
+a prompt that sends it.
 
 Bytes stay charged until the payload they name is actually gone. Closing an upload's row marks it
 for cleanup and keeps its reservation; removing the file releases it. A removal that fails, or a
