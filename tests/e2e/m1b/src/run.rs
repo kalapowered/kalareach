@@ -18,7 +18,7 @@
 //!
 //! The closing check asks four questions, and a run that leaves anything behind fails on it:
 //! whether any recorded process still runs, whether any process at all still runs out of this
-//! run's directory, whether the service manager still holds a job this run's daemon defined, and
+//! run's directory, whether the service manager still holds a job of this run's workers, and
 //! whether every search for the processes a leg's host started finished. A search that did not
 //! finish fails the check for good: a later one that finished cannot show what the earlier one
 //! missed.
@@ -68,6 +68,13 @@ pub struct Run {
     /// A closing check that did not look for everything has not shown that nothing is left, so
     /// while this holds anything the check fails. Nothing clears it.
     undiscovered: Mutex<Vec<String>>,
+    /// The service-manager labels the command lines of this run's workers propose, `kr-worker-` and
+    /// the reservation each was started with: a command line only proposes a label, and a job is
+    /// this run's only when the service manager itself says it runs this run's worker program.
+    job_labels: Mutex<Vec<String>>,
+    /// The proposed labels whose job, as the service manager prints it, is not a worker program of
+    /// this run. They are left alone: nothing is asked of the service manager about them again.
+    jobs_left_alone: Mutex<Vec<String>>,
     /// Set once the closing check has passed, so the directory can go.
     passed: Mutex<bool>,
 }
@@ -114,6 +121,8 @@ impl Run {
             owned: Mutex::new(Vec::new()),
             system_programs: Mutex::new(Vec::new()),
             undiscovered: Mutex::new(Vec::new()),
+            job_labels: Mutex::new(Vec::new()),
+            jobs_left_alone: Mutex::new(Vec::new()),
             passed: Mutex::new(false),
         };
         // A start that fails here has started nothing and holds nothing but the binaries copied so
@@ -152,6 +161,8 @@ impl Run {
             owned: Mutex::new(Vec::new()),
             system_programs: Mutex::new(Vec::new()),
             undiscovered: Mutex::new(Vec::new()),
+            job_labels: Mutex::new(Vec::new()),
+            jobs_left_alone: Mutex::new(Vec::new()),
             passed: Mutex::new(false),
         }
     }
@@ -323,7 +334,7 @@ impl Run {
     /// # Errors
     ///
     /// Returns what is still running: a recorded process, a process running out of this run's
-    /// directory, or a service-manager job this run's daemon defined.
+    /// directory, or a service-manager job of this run's workers.
     pub fn closing_check(&self) -> Result<String, String> {
         let checked = self.nothing_running()?;
         *self.passed.lock().unwrap_or_else(PoisonError::into_inner) = true;
@@ -383,71 +394,186 @@ impl Run {
                 .map(|why| format!("not every process could be found: {why}")),
         );
         if left.is_empty() {
+            let alone = self.jobs_left_alone().len();
             Ok(format!(
                 "none of the {} processes this run started is running, no process runs out of \
-                 its directory and no job it defined is loaded",
-                owned.len()
+                 its directory and no job of its workers is loaded{}",
+                owned.len(),
+                if alone == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        " ({alone} job label(s) a process proposed were left alone: the job is not \
+                         a worker program of this run)"
+                    )
+                }
             ))
         } else {
             Err(left.join("; "))
         }
     }
 
-    /// The service-manager jobs this run's daemon defined that are still loaded.
+    /// The service-manager jobs of this run's workers that are still loaded.
     ///
-    /// On macOS the daemon writes a definition for each worker's launchd job into its
-    /// environment's jobs directory, and removes it once the job has gone. Every other supervisor
-    /// leaves no job of this kind behind, so elsewhere this is always empty. A job `launchctl` gave
-    /// no clear answer about is listed as loaded, with the answer it gave.
+    /// On macOS the daemon starts each worker as a launchd job named `kr-worker-` and the worker's
+    /// reservation. The labels asked about are the ones the command lines of this run's own workers
+    /// proposed ([`Run::learn_jobs`]), and never a listing of a directory: a job that the service
+    /// manager prints as running a program other than this run's worker is left alone. Every other
+    /// supervisor leaves no job of this kind behind, so elsewhere this is always empty. A job
+    /// `launchctl` gave no clear answer about is listed as loaded, with the answer it gave.
     ///
     /// # Errors
     ///
-    /// Returns why the definitions could not be read, which says nothing about which jobs are
-    /// loaded.
+    /// Returns why the run's workers could not be looked for, which says nothing about which jobs
+    /// are loaded.
     pub fn loaded_jobs(&self) -> Result<Vec<String>, String> {
         if !cfg!(target_os = "macos") {
             return Ok(Vec::new());
         }
-        let labels = self.defined_jobs().map_err(|why| {
-            format!("the jobs this run's daemon defined could not be listed: {why}")
-        })?;
+        self.learn_jobs()?;
+        let held = self.held_jobs_asking(&mut launchctl);
+        Ok(held.verified.into_iter().chain(held.unclear).collect())
+    }
+
+    /// Removes every launchd job of this run's workers that is still loaded and that the service
+    /// manager prints as running this run's worker program.
+    ///
+    /// For a run that failed part way: launchd ends whatever still runs inside a job it removes.
+    /// A job that was not shown to be this run's, and one that gave no clear answer, is not removed.
+    pub fn remove_loaded_jobs(&self) {
+        if !cfg!(target_os = "macos") || self.learn_jobs().is_err() {
+            // Which jobs to remove is not known; the closing check says why.
+            return;
+        }
+        self.remove_jobs_asking(&mut launchctl);
+    }
+
+    fn remove_jobs_asking(
+        &self,
+        ask: &mut dyn FnMut(&[&str]) -> Result<std::process::Output, String>,
+    ) {
+        for target in self.held_jobs_asking(ask).verified {
+            let _ = ask(&["bootout", &target]);
+        }
+    }
+
+    /// Asks the service manager, through `ask`, about each label the run proposed, in each domain.
+    fn held_jobs_asking(
+        &self,
+        ask: &mut dyn FnMut(&[&str]) -> Result<std::process::Output, String>,
+    ) -> HeldJobs {
+        let labels = self
+            .job_labels
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         let uid = rustix::process::getuid().as_raw();
-        let mut loaded = Vec::new();
+        let mut held = HeldJobs::default();
         for label in labels {
+            if self
+                .jobs_left_alone
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&label)
+            {
+                continue;
+            }
             for domain in [format!("gui/{uid}"), format!("user/{uid}")] {
                 let target = format!("{domain}/{label}");
-                let mut print = std::process::Command::new("/bin/launchctl");
-                print.args(["print", &target]);
-                let answer = output_within(print, SERVICE_MANAGER_BOUND);
+                let answer = ask(&["print", &target]);
                 match answer.as_ref().map(|output| output.status.code()) {
                     // 112 is a domain that is not there and 113 a job the domain does not have.
                     Ok(Some(112 | 113)) => {}
-                    Ok(Some(0)) => loaded.push(target),
-                    Ok(other) => {
-                        loaded.push(format!("{target} (launchctl print answered {other:?})"))
+                    Ok(Some(0)) => {
+                        let printed = String::from_utf8_lossy(
+                            &answer
+                                .as_ref()
+                                .map(|output| output.stdout.clone())
+                                .unwrap_or_default(),
+                        )
+                        .into_owned();
+                        if self.runs_this_runs_worker(&printed) {
+                            held.verified.push(target);
+                        } else {
+                            let mut left = self
+                                .jobs_left_alone
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner);
+                            if !left.contains(&label) {
+                                left.push(label.clone());
+                            }
+                        }
                     }
-                    Err(why) => loaded.push(format!("{target} (launchctl print {why})")),
+                    Ok(other) => held
+                        .unclear
+                        .push(format!("{target} (launchctl print answered {other:?})")),
+                    Err(why) => held
+                        .unclear
+                        .push(format!("{target} (launchctl print {why})")),
                 }
             }
         }
-        Ok(loaded)
+        held
     }
 
-    /// Removes every launchd job this run's daemon defined and still has loaded.
+    /// Whether a job as `launchctl print` shows it runs this run's own worker program: its `program`
+    /// is the file `kr-worker` below this run's directory.
+    fn runs_this_runs_worker(&self, printed: &str) -> bool {
+        printed
+            .lines()
+            .find_map(|line| line.trim_start().strip_prefix("program = "))
+            .map(Path::new)
+            .is_some_and(|program| {
+                program.starts_with(&self.root)
+                    && program.file_name().is_some_and(|name| name == "kr-worker")
+            })
+    }
+
+    /// Records the labels the command lines of this run's workers propose, now ([`Run::propose_jobs_from`]): each process whose
+    /// command line names this run's directory, runs `kr-worker` and gives `--reservation` a
+    /// reservation in the form of a UUID proposes `kr-worker-` and that reservation.
     ///
-    /// For a run that failed part way: launchd ends whatever still runs inside a job it removes,
-    /// and each job is named by the label this run's own daemon gave it.
-    pub fn remove_loaded_jobs(&self) {
-        let Ok(targets) = self.loaded_jobs() else {
-            // Which jobs to remove is not known; the closing check says why.
-            return;
-        };
-        for target in targets {
-            let target = target.split(' ').next().unwrap_or_default().to_owned();
-            let mut bootout = std::process::Command::new("/bin/launchctl");
-            bootout.args(["bootout", &target]);
-            let _ = output_within(bootout, SERVICE_MANAGER_BOUND);
+    /// # Errors
+    ///
+    /// Returns why the process table could not be read.
+    pub fn learn_jobs(&self) -> Result<(), String> {
+        let commands: Vec<String> = processes_under(&self.root)?
+            .into_iter()
+            .map(|(_, command)| command)
+            .collect();
+        self.propose_jobs_from(commands.iter().map(String::as_str));
+        Ok(())
+    }
+
+    /// Records the label each command line proposes ([`proposed_label`]).
+    pub fn propose_jobs_from<'a>(&self, commands: impl IntoIterator<Item = &'a str>) {
+        let mut labels = self
+            .job_labels
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for label in commands.into_iter().filter_map(proposed_label) {
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
         }
+    }
+
+    /// The labels the run's workers' command lines proposed.
+    #[cfg(test)]
+    pub(crate) fn proposed_labels(&self) -> Vec<String> {
+        self.job_labels
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The labels left alone, which the closing check says.
+    #[must_use]
+    pub fn jobs_left_alone(&self) -> Vec<String> {
+        self.jobs_left_alone
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Records every process that runs beneath `ancestor` now, by its start identity, so the
@@ -544,52 +670,46 @@ impl Run {
             reasons.push(why.to_owned());
         }
     }
+}
 
-    /// The labels of every job definition this run's daemon wrote.
-    ///
-    /// # Errors
-    ///
-    /// Returns why a directory of definitions could not be read. A directory the daemon never
-    /// made holds none; one that could not be read has not said which it holds.
-    fn defined_jobs(&self) -> Result<Vec<String>, String> {
-        let unread = |directory: &Path, error: std::io::Error| {
-            format!("{} could not be read: {error}", directory.display())
-        };
-        let environments = self.root.join("s").join("environments");
-        let entries = match std::fs::read_dir(&environments) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(unread(&environments, error)),
-        };
-        let mut labels = Vec::new();
-        for environment in entries {
-            let environment = environment.map_err(|error| unread(&environments, error))?;
-            let is_directory = environment
-                .file_type()
-                .map_err(|error| unread(&environment.path(), error))?
-                .is_dir();
-            if !is_directory {
-                continue;
-            }
-            let directory = environment.path().join("jobs");
-            let jobs = match std::fs::read_dir(&directory) {
-                Ok(jobs) => jobs,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(unread(&directory, error)),
-            };
-            for job in jobs {
-                let path = job.map_err(|error| unread(&directory, error))?.path();
-                if path
-                    .extension()
-                    .is_some_and(|extension| extension == "plist")
-                    && let Some(label) = path.file_stem().and_then(|stem| stem.to_str())
-                {
-                    labels.push(label.to_owned());
-                }
-            }
-        }
-        Ok(labels)
+/// What the service manager still holds of this run's workers.
+#[derive(Default)]
+struct HeldJobs {
+    /// Jobs shown to run this run's worker program: the targets that may be removed.
+    verified: Vec<String>,
+    /// Jobs the service manager gave no clear answer about.
+    unclear: Vec<String>,
+}
+
+/// Asks the service manager one question, with the answer bounded in time.
+fn launchctl(arguments: &[&str]) -> Result<std::process::Output, String> {
+    let mut command = std::process::Command::new("/bin/launchctl");
+    command.args(arguments);
+    output_within(command, SERVICE_MANAGER_BOUND)
+}
+
+/// Whether `text` is in the form of a UUID: eight, four, four, four and twelve lower-case
+/// hexadecimal digits.
+fn has_uuid_form(text: &str) -> bool {
+    let parts: Vec<&str> = text.split('-').collect();
+    parts.len() == 5
+        && [8, 4, 4, 4, 12].iter().zip(&parts).all(|(length, part)| {
+            part.len() == *length
+                && part
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        })
+}
+
+/// The job label a command line proposes: where the program is `kr-worker` and `--reservation`
+/// gives a UUID, `kr-worker-` and that UUID, which is the label the daemon gives the worker's job.
+fn proposed_label(command: &str) -> Option<String> {
+    let mut words = command.split_whitespace();
+    if Path::new(words.next()?).file_name()? != "kr-worker" {
+        return None;
     }
+    let reservation = words.skip_while(|word| *word != "--reservation").nth(1)?;
+    has_uuid_form(reservation).then(|| format!("kr-worker-{reservation}"))
 }
 
 /// Makes the run's own directory below `base`, with a name `names` gives (eight characters of it),
@@ -1186,7 +1306,7 @@ impl Drop for Run {
             return;
         }
         // A leg that failed part way. What it started is ended through the record, the jobs its
-        // daemon defined are removed, and what the closing check still finds is said. The
+        // workers have are removed, and what the closing check still finds is said. The
         // directory is kept: a process that outlived the leg may be reading it, and what the
         // daemon and the sessions wrote is the evidence.
         self.end_everything();
@@ -1781,6 +1901,130 @@ mod root_tests {
         );
         std::fs::remove_dir_all(&base).expect("clean up");
         std::fs::remove_dir_all(&images).expect("clean up");
+    }
+
+    /// A `jobs` entry that is a link, to a directory of the person's that holds a property list
+    /// with a label of its own, is never read, and the service manager is never asked about that
+    /// label: the labels come only from the run's own record of what it started.
+    #[test]
+    fn a_jobs_link_to_a_directory_of_the_persons_is_never_read_and_none_of_its_labels_is_asked_about()
+     {
+        let root = scratch("jobs");
+        let theirs = scratch("jobs-theirs");
+        let personal = "com.example.the-persons-own-service";
+        std::fs::write(
+            theirs.join(format!("{personal}.plist")),
+            b"a service of the person's",
+        )
+        .expect("a property list of the person's");
+        let environment = root.join("s/environments/00000000-0000-4000-8000-000000000000");
+        std::fs::create_dir_all(&environment).expect("an environment's directory");
+        std::os::unix::fs::symlink(&theirs, environment.join("jobs")).expect("a link at jobs");
+        let run = Run::over(&root);
+        let mut asked: Vec<String> = Vec::new();
+        let _ = run.held_jobs_asking(&mut |arguments| {
+            asked.push(arguments.join(" "));
+            Err("nothing is asked in this case".to_owned())
+        });
+        assert!(
+            asked.iter().all(|line| !line.contains(personal)),
+            "the service manager was asked about a label of the person's: {asked:?}"
+        );
+        std::fs::remove_dir_all(&root).expect("clean up");
+        std::fs::remove_dir_all(&theirs).expect("clean up");
+    }
+
+    /// A command line only proposes a label: one whose reservation is not in the form of a UUID, or
+    /// whose program is not `kr-worker`, proposes none; a job that the service manager prints as
+    /// running another program is left alone and never booted out; one that it gives no clear answer
+    /// about is listed and not booted out; only a job that runs this run's own worker program is.
+    #[test]
+    fn a_command_line_only_proposes_a_label_and_only_a_job_that_runs_this_runs_worker_is_removed() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let root = scratch("jobs-record");
+        let run = Run::over(&root);
+        let uuid = |n: u8| format!("{n:08x}-0000-4000-8000-{n:012x}");
+        let worker = format!("{}/b/kr-worker", root.display());
+        let line = |program: &str, reservation: &str| {
+            format!("{program} --reservation {reservation} --session s")
+        };
+        let (own, foreign, unclear, gone) = (uuid(1), uuid(2), uuid(3), uuid(4));
+        run.propose_jobs_from(
+            [
+                line(&worker, &own),
+                line(&worker, &foreign),
+                line(&worker, &unclear),
+                line(&worker, &gone),
+                line(&worker, "not-a-uuid"),
+                line(&worker, "ABCDEF01-0000-4000-8000-000000000001"),
+                line("/usr/bin/other", &uuid(5)),
+                "kr-worker --reservation".to_owned(),
+            ]
+            .iter()
+            .map(String::as_str),
+        );
+        let labels: Vec<String> = [&own, &foreign, &unclear, &gone]
+            .iter()
+            .map(|id| format!("kr-worker-{id}"))
+            .collect();
+        assert_eq!(*run.job_labels.lock().expect("the labels"), labels);
+        let uid = rustix::process::getuid().as_raw();
+        let answer = |code: i32, text: String| {
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: text.into_bytes(),
+                stderr: Vec::new(),
+            })
+        };
+        // What `launchctl print` says of a loaded job, as the service manager prints it.
+        let printed = |target: &str, program: &str| {
+            format!(
+                "{target} = {{\n\tactive count = 1\n\tpath = {}/s/jobs/x.plist\n\ttype = LaunchAgent\n\
+                 \tstate = xpcproxy\n\n\tprogram = {program}\n\targuments = {{\n\t\t{program}\n\
+                 \t\t--reservation\n\t}}\n}}\n",
+                root.display()
+            )
+        };
+        let mut asked: Vec<String> = Vec::new();
+        let mut ask = |arguments: &[&str]| {
+            asked.push(arguments.join(" "));
+            let [verb, target] = arguments else {
+                return Err("unexpected".to_owned());
+            };
+            if *verb == "bootout" {
+                return answer(0, String::new());
+            }
+            if target.starts_with("user/") || target.ends_with(&gone) {
+                return answer(113, String::new());
+            }
+            if target.ends_with(&own) {
+                answer(0, printed(target, &worker))
+            } else if target.ends_with(&foreign) {
+                answer(0, printed(target, "/usr/bin/the-persons-own-program"))
+            } else {
+                answer(5, String::new())
+            }
+        };
+        let held = run.held_jobs_asking(&mut ask);
+        assert_eq!(held.verified, [format!("gui/{uid}/kr-worker-{own}")]);
+        assert_eq!(held.unclear.len(), 1, "{:?}", held.unclear);
+        assert!(held.unclear[0].contains(&unclear), "{:?}", held.unclear);
+        assert_eq!(run.jobs_left_alone(), [format!("kr-worker-{foreign}")]);
+        let mut asked_again: Vec<String> = Vec::new();
+        run.remove_jobs_asking(&mut |arguments| {
+            asked_again.push(arguments.join(" "));
+            ask(arguments)
+        });
+        let bootouts: Vec<&String> = asked_again
+            .iter()
+            .filter(|line| line.starts_with("bootout"))
+            .collect();
+        assert_eq!(bootouts, [&format!("bootout gui/{uid}/kr-worker-{own}")]);
+        assert!(
+            asked_again.iter().all(|line| !line.contains(&foreign)),
+            "a job left alone is not asked about again: {asked_again:?}"
+        );
+        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     /// A file below the run is opened only as a regular file of the run with one name: a link at the

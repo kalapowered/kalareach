@@ -544,7 +544,12 @@ impl<'r> Host<'r> {
     }
 
     fn discover_workers(&self) -> Result<(), String> {
-        for (pid, command) in processes_under(self.run.root())? {
+        let table = processes_under(self.run.root())?;
+        // The job each worker runs as is learned while the worker runs: its label is the one the
+        // service manager is asked about at the close.
+        self.run
+            .propose_jobs_from(table.iter().map(|(_, command)| command.as_str()));
+        for (pid, command) in table {
             let Some(session) = worker_session(&command) else {
                 continue;
             };
@@ -1015,10 +1020,18 @@ mod shutdown_tests {
         let place = host.environment().registry_database();
         std::os::unix::fs::symlink(&database, &place).expect("a link at the registry");
         let session = kr_ipc::new_uuid().to_string();
+        let reservation = kr_ipc::new_uuid().to_string();
         // A process that runs as this run's worker for a session, with a child beneath it.
         let mut worker = Command::new("/bin/sh")
             .arg0(run.root().join("b/kr-worker"))
-            .args(["-c", "/bin/sleep 30; true", "--session", &session])
+            .args([
+                "-c",
+                "/bin/sleep 30; true",
+                "--session",
+                &session,
+                "--reservation",
+                &reservation,
+            ])
             .stdin(Stdio::null())
             .spawn()
             .expect("a process standing for a worker");
@@ -1033,6 +1046,11 @@ mod shutdown_tests {
         };
         run.end_everything();
         let _ = worker.wait();
+        assert!(
+            run.proposed_labels()
+                .contains(&format!("kr-worker-{reservation}")),
+            "the label the worker's job has is learned from its command line"
+        );
         assert_eq!(
             std::fs::read(&database).expect("theirs"),
             b"",
