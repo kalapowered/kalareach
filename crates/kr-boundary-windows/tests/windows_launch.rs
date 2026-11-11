@@ -1025,6 +1025,8 @@ fn the_journal_makes_no_permit_and_writes_nothing_for_a_child_of_another_invocat
         tree_path: String::new(),
     })
     .unwrap();
+    own.append(&kr_boundary_windows::journal::rows::Row::GrantComplete { count: 0 })
+        .unwrap();
     let permit = own
         .append_process_started(&child)
         .expect("the child's own journal makes its permit");

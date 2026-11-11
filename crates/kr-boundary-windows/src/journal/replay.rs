@@ -7,18 +7,26 @@
 //! mistaken for a complete one: a row out of order marks the invocation unreadable, which keeps its
 //! tree blocked and is reported.
 //!
-//! The order is this. A process that started, or an end that was reported uncertain, leaves the end
-//! unproved until a row says the job ended; no release, no verification, no removal of the root and
-//! no end comes while the end is unproved. A release that begins after a verification makes the
-//! verification void. Nothing follows the end but the clearing of a leftover of the private root
-//! and the removal of the root itself.
+//! The order is this. The grant's rows come first and the grant is complete before a process starts.
+//! A process that started, or an end that was reported uncertain, leaves the end unproved until a row
+//! says the job ended; no release, no verification, no removal of the root and no end comes while the
+//! end is unproved. A verification needs every granted object released (or named by a leftover of the
+//! tree), and once it was written no grant, no process and no root begins: a release that begins
+//! after it makes it void, and the verification is written again. An end needs the private root
+//! removed, or a leftover of the root that says what remains of it. Nothing follows the end but the
+//! clearing of a leftover of the private root and the removal of the root itself, which a recovery
+//! may record for a root whose intent is all that was written.
+//!
+//! A grant row is also refused where it, the rows that release it and a margin for the rows of no
+//! object would pass the journal file's bound, so that a grant stops before it changes anything and
+//! never leaves a journal that cannot be read back.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::filekey::FileKey;
 
 use super::framing;
-use super::rows::{LeftoverClass, RootName, Row};
+use super::rows::{Label, LeftoverClass, RootName, Row, Rule};
 
 /// Where an invocation stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,17 +85,23 @@ pub struct Tracker {
     root: RootState,
     grants: u64,
     grant_complete: bool,
+    granted: BTreeMap<FileKey, String>,
     pending_releases: BTreeMap<FileKey, ()>,
-    released: u64,
+    released_keys: BTreeSet<FileKey>,
+    tree_objects: BTreeSet<String>,
     process: Option<(u32, u64)>,
     job_ended: bool,
     unproved: bool,
     uncertain: bool,
     release_verified: bool,
+    verified_once: bool,
     ended: bool,
     leftovers: Vec<OpenLeftover>,
     snapshots: Vec<u32>,
     accepted: Option<u32>,
+    bytes: usize,
+    reserved: usize,
+    limit: usize,
 }
 
 impl Default for Tracker {
@@ -97,9 +111,16 @@ impl Default for Tracker {
 }
 
 impl Tracker {
-    /// A tracker that has seen no row.
+    /// A tracker that has seen no row, for a journal file of at most [`MAX_FILE`] bytes.
     #[must_use]
     pub fn new() -> Tracker {
+        Tracker::bounded(MAX_FILE)
+    }
+
+    /// A tracker that has seen no row, for a journal file of at most `limit` bytes: a grant row that
+    /// would take the file past it, with the rows that release it, is refused.
+    #[must_use]
+    pub fn bounded(limit: usize) -> Tracker {
         Tracker {
             began: false,
             boot_marker: String::new(),
@@ -107,17 +128,23 @@ impl Tracker {
             root: RootState::Absent,
             grants: 0,
             grant_complete: false,
+            granted: BTreeMap::new(),
             pending_releases: BTreeMap::new(),
-            released: 0,
+            released_keys: BTreeSet::new(),
+            tree_objects: BTreeSet::new(),
             process: None,
             job_ended: false,
             unproved: false,
             uncertain: false,
             release_verified: false,
+            verified_once: false,
             ended: false,
             leftovers: Vec::new(),
             snapshots: Vec::new(),
             accepted: None,
+            bytes: 0,
+            reserved: 0,
+            limit,
         }
     }
 
@@ -136,9 +163,17 @@ impl Tracker {
     ///
     /// # Errors
     ///
-    /// Returns the reason the row is out of order.
-    #[allow(clippy::too_many_lines)]
+    /// Returns the reason the row is out of order, or that a grant would take the journal past its
+    /// bound.
     pub fn apply(&mut self, row: &Row) -> Result<(), OrderError> {
+        let framed = row.to_bytes().len() + framing::FRAME_BYTES;
+        self.accept(row, framed)?;
+        self.bytes += framed;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn accept(&mut self, row: &Row, framed: usize) -> Result<(), OrderError> {
         if !self.began {
             return match row {
                 Row::Begin {
@@ -167,6 +202,9 @@ impl Tracker {
                 Ok(())
             }
             Row::RootIntent { name } => {
+                if self.verified_once {
+                    return wrong("a private root is begun after the release was verified");
+                }
                 if self.root != RootState::Absent {
                     return wrong("a second private root is begun");
                 }
@@ -174,20 +212,39 @@ impl Tracker {
                 Ok(())
             }
             Row::RootMade { name, key } => match &self.root {
+                _ if self.verified_once => {
+                    wrong("a private root is recorded as made after the release was verified")
+                }
                 RootState::IntentOnly(intended) if intended == name => {
                     self.root = RootState::Made(name.clone(), *key);
                     Ok(())
                 }
                 _ => wrong("the root is recorded as made without its intent"),
             },
-            Row::Grant { .. } => {
+            Row::Grant { key, path, .. } => {
+                if self.verified_once {
+                    return wrong("an object is granted after the release was verified");
+                }
                 if self.grant_complete {
                     return wrong("an object is granted after the grant was complete");
                 }
+                let reserve = release_reserve(row);
+                if self.bytes + self.reserved + framed + reserve + ROWS_APART_FROM_OBJECTS
+                    > self.limit
+                {
+                    return wrong(
+                        "the journal would pass its bound with this object's rows and the rows that release it",
+                    );
+                }
                 self.grants += 1;
+                self.granted.insert(*key, path.clone());
+                self.reserved += reserve;
                 Ok(())
             }
             Row::GrantComplete { count } => {
+                if self.verified_once {
+                    return wrong("the grant is complete after the release was verified");
+                }
                 if self.grant_complete {
                     return wrong("the grant is complete twice");
                 }
@@ -201,6 +258,12 @@ impl Tracker {
                 Ok(())
             }
             Row::ProcessStarted { pid, creation_time } => {
+                if !self.grant_complete {
+                    return wrong("a process starts before the grant is complete");
+                }
+                if self.verified_once {
+                    return wrong("a process starts after the release was verified");
+                }
                 if self.process.is_some() {
                     return wrong("a second primary process is recorded");
                 }
@@ -235,7 +298,7 @@ impl Tracker {
                 if self.pending_releases.remove(key).is_none() {
                     return wrong("an object is released without its intent");
                 }
-                self.released += 1;
+                self.released_keys.insert(*key);
                 Ok(())
             }
             Row::ReleaseVerified { leftovers, .. } => {
@@ -250,15 +313,25 @@ impl Tracker {
                 if self.slot_leftovers() != 0 || *leftovers != 0 {
                     return wrong("the release is verified while a leftover is open");
                 }
+                if let Some(key) = self.granted.iter().find_map(|(key, path)| {
+                    let named = self.tree_objects.contains(&key.to_string())
+                        || self.tree_objects.contains(path);
+                    (!self.released_keys.contains(key) && !named).then_some(key)
+                }) {
+                    return wrong(format!(
+                        "the release is verified while the granted object {key} is neither released nor named by a leftover"
+                    ));
+                }
                 self.release_verified = true;
+                self.verified_once = true;
                 Ok(())
             }
             Row::RootRemoved => {
                 if self.unproved {
                     return wrong("the root is removed while the end is not proved");
                 }
-                if !matches!(self.root, RootState::Made(..)) {
-                    return wrong("a root is removed that was not made");
+                if !matches!(self.root, RootState::IntentOnly(_) | RootState::Made(..)) {
+                    return wrong("a root is removed that was never begun");
                 }
                 self.root = RootState::Removed;
                 Ok(())
@@ -280,6 +353,9 @@ impl Tracker {
                     class: *class,
                     snapshot: *snapshot,
                 });
+                if *class == LeftoverClass::Tree {
+                    self.tree_objects.insert(object.clone());
+                }
                 if class.holds_the_slot() {
                     self.release_verified = false;
                 }
@@ -313,6 +389,13 @@ impl Tracker {
                 }
                 // A leftover that holds the slot clears `release_verified`, so an end with one open is
                 // refused above.
+                if matches!(self.root, RootState::IntentOnly(_) | RootState::Made(..))
+                    && self.root_leftovers() == 0
+                {
+                    return wrong(
+                        "the invocation ends while its private root stands and no leftover says what is left of it",
+                    );
+                }
                 if self.root_leftovers() as u64 != u64::from(*root_leftovers) {
                     return wrong("the end counts other root leftovers than the rows hold");
                 }
@@ -441,6 +524,47 @@ pub const BYTES_PER_OBJECT: usize = 4096;
 /// its tree stays blocked and its first rows are kept, as for any damage.
 pub const MAX_FILE: usize = OBJECTS_PER_TREE * BYTES_PER_OBJECT;
 
+/// What a grant leaves free in the file for every row that is not an object's: the first row with
+/// its chain, the snapshots of the repository, the rows of the private root, of the process and of
+/// the job, the verification and the end. They number a few dozen and each takes a few kilobytes at
+/// most (a snapshot lists the hooks and is itself bounded), so this is generous.
+pub const ROWS_APART_FROM_OBJECTS: usize = 1024 * 1024;
+
+/// The longest reason a leftover that a failed release writes may carry, for the reserve.
+const RESULT_REASON_BYTES: usize = 256;
+
+/// What the rows that release one granted object take in the file, framed: the release intent,
+/// which carries a list no longer than the grant's (the group rule only removes entries), and the
+/// row that says how the release ended, taken as a leftover that names the object by its path and
+/// gives a reason of up to [`RESULT_REASON_BYTES`], which is longer than a row that says it was
+/// released. A grant is refused unless the file has room for both.
+fn release_reserve(grant: &Row) -> usize {
+    let Row::Grant {
+        key,
+        path,
+        dacl_bytes,
+        ..
+    } = grant
+    else {
+        return 0;
+    };
+    let intent = Row::ReleaseIntent {
+        key: *key,
+        rule: Rule::Group,
+        new_owner: None,
+        new_dacl_bytes: dacl_bytes.clone(),
+        label: Label::Remove,
+        protected_target: true,
+    };
+    let result = Row::Leftover {
+        object: path.clone(),
+        reason: "x".repeat(RESULT_REASON_BYTES),
+        class: LeftoverClass::Tree,
+        snapshot: None,
+    };
+    intent.to_bytes().len() + result.to_bytes().len() + 2 * framing::FRAME_BYTES
+}
+
 /// What a file turned out to be.
 #[derive(Debug)]
 pub enum Reading {
@@ -467,7 +591,7 @@ pub fn read_file_limited(id: &str, bytes: &[u8], current_boot: &str, limit: usiz
     let too_long = bytes.len() > limit;
     let bytes = &bytes[..bytes.len().min(limit)];
     let reading = framing::read_all(bytes);
-    let mut tracker = Tracker::new();
+    let mut tracker = Tracker::bounded(limit);
     let mut rows = Vec::new();
     let mut damage = None;
     for (index, record) in reading.records.iter().enumerate() {

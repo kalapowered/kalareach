@@ -288,7 +288,8 @@ pub enum Row {
     RootRemoved,
     /// Something could not be finished. It is durable before any row that says the invocation ended.
     Leftover {
-        /// The object, as a path or an identity in text.
+        /// The object, as a path or an identity in text. A `Tree` leftover for an object that a
+        /// `Grant` row recorded names it by that row's path or by its key as the key prints.
         object: String,
         /// Why.
         reason: String,
