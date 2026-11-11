@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use kr_boundary_windows::window::{bound, search_is_over};
+use kr_boundary_windows::window::{bound, may_ask_the_log, search_is_over};
 
 #[test]
 fn a_run_given_the_windows_end_has_it_as_its_deadline_and_says_so() {
@@ -72,4 +72,19 @@ fn a_run_that_failed_otherwise_never_ends_the_search_whatever_bound_it_had() {
             "a failure to start, a pipe error or a bad exit is the proof's failure"
         );
     }
+}
+
+#[test]
+fn the_log_is_asked_after_a_refusal_only_while_the_search_has_time_left() {
+    let end = Instant::now() + Duration::from_secs(60);
+    let second = Duration::from_secs(1);
+    assert!(may_ask_the_log(end - second, end));
+    assert!(
+        !may_ask_the_log(end, end),
+        "a refusal that returns at the end has no query left"
+    );
+    assert!(
+        !may_ask_the_log(end + second, end),
+        "a refusal that returns after the end is the end of the search, and no event log error"
+    );
 }
