@@ -1206,6 +1206,234 @@ fn summary_of(path: &Path) -> kr_boundary_windows::win::sd::Summary {
     kr_boundary_windows::win::sd::summary_of_handle(&open_folder(path, READ_CONTROL)).unwrap()
 }
 
+/// Runs `work` on a thread that impersonates a copy of this process's token whose default owner is
+/// the token's own user. Under the guest's usual token, the system's, an object made with no owner
+/// in its descriptor is owned by the Administrators group anyway; under the copy it is owned by the
+/// user, so a descriptor that loses its owner fails a case without any setting of the guest's.
+#[cfg(feature = "testing")]
+fn with_the_users_own_default_owner<T: Send>(work: impl FnOnce() -> T + Send) -> T {
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Security::{
+        DuplicateTokenEx, ImpersonateLoggedOnUser, RevertToSelf, SecurityImpersonation,
+        SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_OWNER, TOKEN_QUERY,
+        TokenImpersonation, TokenOwner,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let user = token::current_user().unwrap();
+    let mut process: HANDLE = std::ptr::null_mut();
+    // SAFETY: the call opens this process's own token for the two rights named; the handle is
+    // owned below.
+    let opened = unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_DUPLICATE | TOKEN_QUERY,
+            &raw mut process,
+        )
+    };
+    assert_ne!(opened, 0, "this process's token is opened");
+    let process = ffi::Handle::new(process, "this process's token").unwrap();
+    let mut copy: HANDLE = std::ptr::null_mut();
+    // SAFETY: the source token is open for duplication; the copy is owned below.
+    let duplicated = unsafe {
+        DuplicateTokenEx(
+            process.raw(),
+            TOKEN_ALL_ACCESS,
+            std::ptr::null(),
+            SecurityImpersonation,
+            TokenImpersonation,
+            &raw mut copy,
+        )
+    };
+    assert_ne!(duplicated, 0, "the token is copied");
+    let copy = ffi::Handle::new(copy, "the copy of the token").unwrap();
+    let owner = TOKEN_OWNER {
+        Owner: user.as_ptr(),
+    };
+    // SAFETY: the copy is open with the right to change it, and the structure names an identifier
+    // that outlives the call.
+    let set = unsafe {
+        SetTokenInformation(
+            copy.raw(),
+            TokenOwner,
+            (&raw const owner).cast(),
+            size_of::<TOKEN_OWNER>() as u32,
+        )
+    };
+    assert_ne!(set, 0, "the token's default owner is its own user");
+    let token = copy.raw() as usize;
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                // SAFETY: the copy outlives the thread, which the scope joins.
+                let began = unsafe { ImpersonateLoggedOnUser(token as HANDLE) };
+                assert_ne!(began, 0, "the copy is impersonated");
+                let result = work();
+                // SAFETY: ends the impersonation this thread began.
+                unsafe {
+                    RevertToSelf();
+                }
+                result
+            })
+            .join()
+            .unwrap()
+    })
+}
+
+/// Every object the installation makes names the Administrators group as its owner in the call that
+/// makes it. Under a token whose default owner is not that group, an object whose descriptor lost
+/// its owner would be owned by the user, and this case fails; under the system's own token it would
+/// pass whatever the descriptor says, because that token's default owner is the Administrators.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated session in a disposable Windows guest (see the file's header)"]
+fn every_object_the_installation_makes_names_the_administrators_as_owner_under_a_token_that_does_not()
+ {
+    use kr_boundary_windows::win::fresh;
+    use kr_boundary_windows::win::sd::{Principals, SdKind};
+    const ADMINISTRATORS: &str = "S-1-5-32-544";
+    let user = token::current_user().unwrap().to_text();
+    assert_ne!(user, ADMINISTRATORS, "the user is not the group");
+    let folder = inherited_folder();
+    acl::set_protected(&folder, &data_parent_descriptor()).unwrap();
+    let paths = paths_under(&folder);
+    let group = Sid::parse("S-1-5-21-1111-2222-3333-1001").unwrap();
+    let readable = Principals {
+        users_may_read: true,
+        ..Principals::default()
+    };
+    with_the_users_own_default_owner(|| {
+        // The control: with no owner given, the object is the user's, so the check below can fail.
+        let plain = folder.join("plain.txt");
+        std::fs::write(&plain, b"x").unwrap();
+        assert_eq!(
+            summary_of(&plain).owner,
+            user,
+            "under this token an object that names no owner is the user's"
+        );
+        let owner_of = |path: &Path, what: &str| {
+            assert_eq!(summary_of(path).owner, ADMINISTRATORS, "{what}");
+        };
+        for kind in [SdKind::AdminFile, SdKind::ProgramFile] {
+            let (file, path) = fresh::named_file(&folder, "kind", ".bin", kind).unwrap();
+            drop(file);
+            owner_of(&path, &format!("a file of kind {kind:?}"));
+        }
+        let unlisted = folder.join("unlisted.exe");
+        drop(
+            fresh::file_with(
+                &unlisted,
+                SdKind::ProofProgram,
+                &Principals {
+                    group: Some(group.clone()),
+                    ..Principals::default()
+                },
+                true,
+            )
+            .unwrap(),
+        );
+        owner_of(&unlisted, "the proof's program");
+        let record = folder.join("record.json");
+        drop(fresh::record_file(&record, true).unwrap());
+        owner_of(&record, "a record");
+        let named = fresh::directory(&folder, "dir", SdKind::AdminDir, &readable).unwrap();
+        owner_of(&named, "a directory made at a random name");
+        let at = folder.join("at");
+        fresh::directory_at(&at, SdKind::AdminDir, &readable).unwrap();
+        owner_of(&at, "a directory made at a path");
+        let all = folder.join("all").join("below");
+        fresh::directory_all(&all, SdKind::AdminDir, &readable).unwrap();
+        owner_of(&all, "a directory made with its parents");
+        owner_of(
+            all.parent().unwrap(),
+            "the parent of a directory made with its parents",
+        );
+        let held = install::make_data_directory(&paths).unwrap();
+        held.protect().unwrap();
+        owner_of(&paths.data, "the data directory");
+    });
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// `Channel::set` hands the policy to PowerShell in a file that did not exist: a random name in the
+/// channel's directory, owned by the administrators, with a protected list of the system and the
+/// administrators alone. The case reads the file while PowerShell has it. When the call is over,
+/// whether PowerShell took the policy or refused it, nothing is left in the directory.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_channel_hands_the_policy_to_powershell_in_a_new_file_of_the_administrators_and_removes_it() {
+    use std::collections::BTreeMap;
+    const SYSTEM: &str = "S-1-5-18";
+    const ADMINISTRATORS: &str = "S-1-5-32-544";
+    let folder = inherited_folder();
+    let (xml, in_force) = channel().effective().unwrap();
+    let setting = {
+        let channel = Channel::new(&folder);
+        let xml = xml.clone();
+        std::thread::spawn(move || channel.set(&xml))
+    };
+    let mut seen = BTreeMap::new();
+    while !setting.is_finished() {
+        if let Ok(entries) = std::fs::read_dir(&folder) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if seen.contains_key(&name) {
+                    continue;
+                }
+                // A file that is gone by the time it is opened is not seen on this round.
+                let path = entry.path();
+                if let Ok(summary) = std::panic::catch_unwind(|| summary_of(&path)) {
+                    seen.insert(name, summary);
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    setting.join().unwrap().expect("the policy is set");
+    assert!(
+        !seen.is_empty(),
+        "the file was there while PowerShell had it"
+    );
+    for (name, summary) in &seen {
+        assert!(
+            name.strip_prefix("policy-")
+                .and_then(|rest| rest.strip_suffix(".xml"))
+                .is_some_and(|hex| hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit())),
+            "the name is `policy-` and 32 hexadecimal digits: {name}"
+        );
+        assert_eq!(summary.owner, ADMINISTRATORS, "{name}'s owner");
+        assert!(
+            summary.protected,
+            "{name}'s list takes nothing from the folder"
+        );
+        let sids: Vec<&str> = summary
+            .entries
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.sid.as_str())
+            .collect();
+        assert_eq!(sids, [SYSTEM, ADMINISTRATORS], "{name}'s entries");
+    }
+    assert_eq!(
+        std::fs::read_dir(&folder).unwrap().count(),
+        0,
+        "nothing is left in the directory"
+    );
+    assert_eq!(channel().effective().unwrap().1, in_force);
+
+    // PowerShell refuses what is not a policy, and the file it was given is gone all the same.
+    Channel::new(&folder)
+        .set("this is not a policy")
+        .expect_err("a text that is not a policy is refused");
+    assert_eq!(
+        std::fs::read_dir(&folder).unwrap().count(),
+        0,
+        "a refused policy leaves nothing in the directory"
+    );
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
 #[cfg(feature = "testing")]
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
@@ -1518,6 +1746,30 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
     assert_eq!(summary_of(&policy), before);
     give_to(&policy, "Administrators");
 
+    // A file whose owner is right but whose list names another account, with a right to read only,
+    // is refused the same way and is as it was.
+    let clean = summary_of(&policy);
+    let granted = Command::new("icacls")
+        .arg(&policy)
+        .args(["/grant", &format!("{name}:R")])
+        .output()
+        .unwrap();
+    assert!(granted.status.success(), "{granted:?}");
+    let listed = summary_of(&policy);
+    assert_ne!(listed, clean, "the list now names the account");
+    refused_with(&shown);
+    let refused = install::make_data_directory(&paths).expect_err("a list that names an account");
+    assert!(refused.to_string().contains(&owner.to_text()), "{refused}");
+    assert_eq!(std::fs::read(&policy).unwrap(), b"policy");
+    assert_eq!(summary_of(&policy), listed, "the file is as it was");
+    let removed = Command::new("icacls")
+        .arg(&policy)
+        .args(["/remove:g", &name])
+        .output()
+        .unwrap();
+    assert!(removed.status.success(), "{removed:?}");
+    assert_eq!(summary_of(&policy), clean, "the list is as it began");
+
     // The name an earlier build gave the policy file is not one the installation gives now.
     let legacy = paths.staging.join("policy.xml");
     std::fs::write(&legacy, b"x").unwrap();
@@ -1580,8 +1832,34 @@ fn what_is_below_staging_and_run_is_checked_on_its_own_handle_and_what_is_foreig
         .to_string();
     assert!(text.contains("manifest.json"), "{text}");
     assert!(!text.contains("Remove "), "{text}");
+    // The text names the account that owns it and the correction to make, and says not to remove
+    // the record.
+    assert!(text.contains(&owner.to_text()), "{text}");
+    assert!(text.contains("Correct what the reason names"), "{text}");
+    assert!(text.contains("Do not remove"), "{text}");
     give_to(&paths.manifest, "Administrators");
     install::make_data_directory(&paths).expect("the records are the administrators' again");
+
+    // The manifest's replacement that a crash left has a name the layout gives, so it is refused as
+    // a record is when another account owns it, and what is there is not removed.
+    let replacement = paths.data.join(format!("manifest-{}.new", "ef".repeat(16)));
+    std::fs::write(&replacement, b"half").unwrap();
+    give_to(&replacement, "Administrators");
+    install::make_data_directory(&paths).expect("a replacement the administrators own");
+    give_to(&replacement, &name);
+    let text = install::make_data_directory(&paths)
+        .expect_err("a replacement that is owned")
+        .to_string();
+    assert!(
+        text.contains(&format!("manifest-{}.new", "ef".repeat(16))),
+        "{text}"
+    );
+    assert!(!text.contains("Remove "), "{text}");
+    assert!(text.contains("Correct what the reason names"), "{text}");
+    assert_eq!(std::fs::read(&replacement).unwrap(), b"half");
+    give_to(&replacement, "Administrators");
+    std::fs::remove_file(&replacement).unwrap();
+    install::make_data_directory(&paths).expect("the replacement is gone");
 
     // A link at a scratch directory's name is refused, and the tree it leads to keeps its list.
     let target = inherited_folder();
