@@ -21,10 +21,10 @@ use std::time::Duration;
 use kr_client::cursors::StreamCursors;
 use kr_e2e_agents::account::{
     AppendOnly, Guarded, Ledger, append_only_files, appended_since, borrow_login_keychain, changes,
-    conversation_id, files_holding, files_holding_any, guarded_files, holds_any,
-    keychain_item_modified, line_identity, now_ms, read_if_there, record_guarded, record_key_scan,
-    record_rewrites, remove_appended_lines, remove_created, reported_rewrites, snapshot,
-    which_hold,
+    conversation_id, files_holding_any, guarded_files, holds_any, keychain_item_modified,
+    line_identity, now_ms, read_if_there, record_guarded, record_key_scan, record_rewrites,
+    remove_appended_lines, remove_created, reported_rewrites, run_files_holding,
+    run_files_holding_any, snapshot, which_hold,
 };
 use kr_e2e_agents::build::{
     Account, AccountHome, Action, Build, Confinement, Inputs, InstallSwitch, Launch, quote,
@@ -1213,7 +1213,7 @@ fn confine_scan(login: &Login, guards: Option<&Guards>, root: &Path) -> Option<S
             && !place.starts_with(data.join("credentials"))
             && !place.starts_with(data.join("oauth"))
     });
-    let in_run = files_holding_any(root, &bytes);
+    let in_run = run_files_holding_any(root, &bytes);
     let mut in_data = 0;
     let look_failed = guards.is_some_and(|guards| {
         guards
@@ -2288,7 +2288,7 @@ fn staged(
     let scan = login
         .as_ref()
         .and_then(|login| login.key.as_ref())
-        .map(|(name, value)| (name.clone(), files_holding(&root, value.as_bytes())));
+        .map(|(name, value)| (name.clone(), run_files_holding(&root, value.as_bytes())));
     // The values of the other keys the person's shell holds, searched for in the same directory:
     // no session was given one, so a file that holds one is a leak.
     let others_found = login
@@ -2296,7 +2296,7 @@ fn staged(
         .filter(|login| !login.others.is_empty())
         .map(|login| {
             let values: Vec<&[u8]> = login.others.iter().map(String::as_bytes).collect();
-            files_holding_any(&root, &values)
+            run_files_holding_any(&root, &values)
         });
     // The configuration directory of the run's own goes whatever became of the part, and is
     // checked gone.

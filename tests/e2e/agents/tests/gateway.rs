@@ -305,8 +305,12 @@ impl Route {
         let ledger = Ledger::from_environment(&account.budget, account.turns);
         // The guard over the person's directory compares the whole of it at the end, and cannot
         // tell a write of another agent process of theirs from the run's: none runs at the start.
-        let others = other_agent_processes(&executable_name(&build.command), None)
-            .unwrap_or_else(|why| panic!("{why}"));
+        let others = other_agent_processes(
+            &executable_name(&build.command),
+            None,
+            Some(&home.join(PERSON_TREES[0])),
+        )
+        .unwrap_or_else(|why| panic!("{why}"));
         assert!(
             others.is_empty(),
             "{}",
@@ -559,8 +563,12 @@ impl Real {
     /// files since (by a process the listing missed, or any other writer), stops the case here with
     /// no turn charged or spent.
     fn charge(&self, run: &Run, case: &str, what: &str) {
-        let others = other_agent_processes(&executable_name(&self.build.command), Some(run.root()))
-            .unwrap_or_else(|why| panic!("no turn is charged: {why}"));
+        let others = other_agent_processes(
+            &executable_name(&self.build.command),
+            Some(run.root()),
+            Some(&self.home.join(PERSON_TREES[0])),
+        )
+        .unwrap_or_else(|why| panic!("no turn is charged: {why}"));
         assert!(
             others.is_empty(),
             "{}",
