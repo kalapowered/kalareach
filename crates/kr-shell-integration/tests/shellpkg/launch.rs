@@ -322,8 +322,8 @@ $ExecutionContext.InvokeCommand.CommandNotFoundAction = {
                 assert_eq!(
                     asked.len(),
                     1,
-                    "a launch of a command the handler answers for was asked about {} times with the hook \
-             {hook:?}: {asked:?}",
+                    "a launch of a command the handler answers for was asked about {} times with \
+                     the hook {hook:?}: {asked:?}",
                     asked.len()
                 );
                 assert_eq!(asked[0].argv, ["kr-probe", "one", "two words"]);

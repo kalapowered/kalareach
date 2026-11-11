@@ -1729,8 +1729,8 @@ pub fn each_line_reports_its_block_with_status_duration_and_directory(kind: Shel
             let start = session.written();
             session.type_line(&format!("kr-probe joined {continuation}"));
             if kind == ShellKind::PowerShell {
-                // The editor draws its own continuation prompt, and what is typed there is typed to the
-                // editor, which has not drawn the prompt a case waits for.
+                // The editor draws its own continuation prompt, and what is typed there is typed to
+                // the editor, which has not drawn the prompt a case waits for.
                 assert!(
                     session.drew_after(start, ">> ", REPLY).was_drawn(),
                     "the editor drew no continuation prompt:\n{}",
@@ -1770,11 +1770,11 @@ pub fn each_line_reports_its_block_with_status_duration_and_directory(kind: Shel
             // An empty line runs nothing and reports nothing: the next block is the next command's.
             let reported = session.commands.blocks.len();
             if dialect(kind).types_at_the_prompt {
-                // A return typed before this editor reads the terminal arrives through the terminal's own
-                // line discipline as a line feed, and whether the editor takes that for the empty line
-                // depends on the shell and on what the person bound to it. The line before has finished,
-                // which says nothing of whether the editor is reading again, so this waits for that as
-                // every other line does.
+                // A return typed before this editor reads the terminal arrives through the
+                // terminal's own line discipline as a line feed, and whether the editor takes that
+                // for the empty line depends on the shell and on what the person bound to it. The
+                // line before has finished, which says nothing of whether the editor is reading
+                // again, so this waits for that as every other line does.
                 assert!(
                     session.wait_for_prompt(),
                     "the shell drew no prompt to type the empty line at:\n{}",
@@ -1801,8 +1801,8 @@ pub fn each_line_reports_its_block_with_status_duration_and_directory(kind: Shel
             );
 
             // Input a running command reads through the editor is that command's, not a line of its
-            // own: the line that asked for it is the one block. This editor has no reader of that kind: a
-            // prompt a running line opens is the nested one the cases of its own drive.
+            // own: the line that asked for it is the one block. This editor has no reader of that
+            // kind: a prompt a running line opens is the nested one the cases of its own drive.
             if kind == ShellKind::PowerShell {
                 return controls_for_what_a_shell_cannot_see(&mut session, kind, &probes);
             }
@@ -1810,10 +1810,10 @@ pub fn each_line_reports_its_block_with_status_duration_and_directory(kind: Shel
             let entries = session.commands.entries.len();
             let reading = reading_through_the_editor(kind);
             session.type_line(reading);
-            // What is typed goes in once the reader the line starts is reading. Before that it goes to a
-            // terminal that is not that reader's yet: a shell may throw away what it finds there when it
-            // takes the terminal for the reader, or leave it queued with the reader that was reading
-            // before.
+            // What is typed goes in once the reader the line starts is reading. Before that it goes
+            // to a terminal that is not that reader's yet: a shell may throw away what it finds
+            // there when it takes the terminal for the reader, or leave it queued with the reader
+            // that was reading before.
             session.until("the reader the line starts", |commands| {
                 commands.entries[entries..]
                     .iter()

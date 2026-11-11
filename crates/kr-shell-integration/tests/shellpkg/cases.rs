@@ -2534,8 +2534,8 @@ pub fn a_read_with_no_key_of_the_modules_own_reports_idle_only_once_its_editor_h
             let recalled = session.written();
             session.type_bytes(PREVIOUS_HISTORY);
             session.type_bytes(PREVIOUS_HISTORY);
-            // The editor draws a line in colours, so the recalled line is not one run of text: the end of
-            // its first entry is.
+            // The editor draws a line in colours, so the recalled line is not one run of text: the
+            // end of its first entry is.
             assert!(
                 session.drew_after(recalled, "aa1'", REPLY).was_drawn(),
                 "the history did not recall the first line:\n{}",
@@ -2550,13 +2550,14 @@ pub fn a_read_with_no_key_of_the_modules_own_reports_idle_only_once_its_editor_h
                 "the editor asked the terminal nothing at the prompt after the recalled line:\n{}",
                 session.terminal_output()
             );
-            // A report from the read's entry comes before the editor asks, so it is on the endpoint by now.
+            // A report from the read's entry comes before the editor asks, so it is on the endpoint
+            // by now.
             session.take_in_what_has_arrived();
             assert!(
                 !session.events.waiting().contains(&"reader_idle"),
-                "the reader reported itself idle before any key had run in a read the module queued no key \
-         for, which is before its editor had the reply to its question about the cursor: \
-         {:?}\n{}",
+                "the reader reported itself idle before any key had run in a read the module \
+                 queued no key for, which is before its editor had the reply to its question \
+                 about the cursor: {:?}\n{}",
                 session.events.waiting(),
                 session.terminal_output()
             );
@@ -2667,23 +2668,23 @@ pub fn a_history_search_goes_on_across_a_line_accepted_with_accept_and_get_next(
             let package = Package::built(kind);
             let mut session = Session::start(&package);
             session.first_prompt();
-            // The case gives the reader no step. A step is a key, and any key the editor runs between the
-            // search and the acceptance, or ahead of the next search, ends the very thing the case looks
-            // at: the editor forgets the recalled line's place in the history after the first, and the
-            // search chain after the second.
+            // The case gives the reader no step. A step is a key, and any key the editor runs
+            // between the search and the acceptance, or ahead of the next search, ends the very
+            // thing the case looks at: the editor forgets the recalled line's place in the history
+            // after the first, and the search chain after the second.
             session.stepping = false;
             let bound = "kr-chain-bound";
             assert!(
-        session.run(
-            &format!(
-                "Set-PSReadLineKeyHandler -Chord Ctrl+l -Function HistorySearchBackward; {}",
-                print_assembled(kind, bound)
+            session.run(
+                &format!(
+                    "Set-PSReadLineKeyHandler -Chord Ctrl+l -Function HistorySearchBackward; {}",
+                    print_assembled(kind, bound)
+                ),
+                bound
             ),
-            bound
-        ),
-        "the search key was not bound:\n{}",
-        session.terminal_output()
-    );
+            "the search key was not bound:\n{}",
+            session.terminal_output()
+        );
             for entry in ["aaa1", "bbb2", "aaa3", "ccc4"] {
                 let marker = format!("kr-chain-{entry}");
                 assert!(
@@ -2693,8 +2694,8 @@ pub fn a_history_search_goes_on_across_a_line_accepted_with_accept_and_get_next(
                 );
             }
 
-            // The first and the third entry begin with the prefix typed here, and the search recalls the
-            // later of them, the third.
+            // The first and the third entry begin with the prefix typed here, and the search
+            // recalls the later of them, the third.
             assert!(
                 session.wait_for_prompt() && session.wait_for_editor_reading(),
                 "the shell drew no prompt to search at:\n{}",
@@ -2703,8 +2704,8 @@ pub fn a_history_search_goes_on_across_a_line_accepted_with_accept_and_get_next(
             let searched = session.written();
             session.type_bytes(b"Write-Output ('kr-chain-' + 'a");
             session.type_bytes(SEARCH_BACKWARD);
-            // The editor draws the prefix a search started from in a colour of its own, so the recalled
-            // line is not one run of text: the end of its third entry is.
+            // The editor draws the prefix a search started from in a colour of its own, so the
+            // recalled line is not one run of text: the end of its third entry is.
             assert!(
                 session.drew_after(searched, "aa3'", REPLY).was_drawn(),
                 "the search did not recall the third entry:\n{}",
@@ -2744,8 +2745,8 @@ pub fn a_history_search_goes_on_across_a_line_accepted_with_accept_and_get_next(
             let shown = shown_since(&session, continued);
             assert!(
                 shown.contains("kr-chain-aaa3") && !shown.contains("kr-chain-ccc4"),
-                "the search at the next prompt began again from the line the editor loaded, so something \
-         ended the chain the accepted line left:\n{shown}"
+                "the search at the next prompt began again from the line the editor loaded, so \
+                 something ended the chain the accepted line left:\n{shown}"
             );
         },
     );
@@ -3048,9 +3049,9 @@ pub fn an_unattributable_gesture_is_consumed_with_one_hint_per_prompt(kind: Shel
             assert!(session.answered("kr-ready"));
             let enter = session.next_prompt();
 
-            // What the hint is, is what the screen shows, so this is a display observation and carries no
-            // claim that anything ran. The boundary is taken before the key, so a hint an earlier prompt
-            // printed is not this one's.
+            // What the hint is, is what the screen shows, so this is a display observation and
+            // carries no claim that anything ran. The boundary is taken before the key, so a hint
+            // an earlier prompt printed is not this one's.
             let before_first = session.written();
             session.type_bytes(CTRL_D);
             let (_, first) = session.expect_event("pre_eof_consumed", |event| {
@@ -3309,9 +3310,9 @@ pub fn an_unbound_gesture_key_does_what_the_editor_does_with_an_unbound_key(kind
             session.type_bytes(CTRL_D);
             let before_return = session.written();
             session.type_bytes(b"\r");
-            // What the editor does with an unbound key is to insert the character the key carries, so the
-            // line runs with four characters. The operation the module used to run in its place deleted
-            // the last one, which left two.
+            // What the editor does with an unbound key is to insert the character the key carries,
+            // so the line runs with four characters. The operation the module used to run in its
+            // place deleted the last one, which left two.
             assert!(
                 session
                     .drew_after(before_return, "kr-length-4", REPLY)
@@ -3347,17 +3348,18 @@ pub fn the_key_that_promotes_a_changed_gesture_runs_what_was_bound_to_it(kind: S
             );
             session.first_prompt();
 
-            // No command runs before the key itself: the change takes effect at the first gesture key the
-            // prompt sees, and a command run first would have the next prompt take it on entry.
+            // No command runs before the key itself: the change takes effect at the first gesture
+            // key the prompt sees, and a command run first would have the next prompt take it on
+            // entry.
             assert!(session.wait_for_prompt());
             assert!(session.wait_for_editor_reading());
             let start = session.written();
             session.type_bytes(b"kr-length abc");
             assert!(session.wait_for_editor(start));
             session.type_bytes(b"\x1b[D");
-            // The old gesture key, which the editor binds to deleting the character under the cursor, so
-            // the line runs with two characters. The new one is bound to going to the end of the line,
-            // which would leave three.
+            // The old gesture key, which the editor binds to deleting the character under the
+            // cursor, so the line runs with two characters. The new one is bound to going to the
+            // end of the line, which would leave three.
             session.type_bytes(CTRL_D);
             let before_return = session.written();
             session.type_bytes(b"\r");
@@ -4001,13 +4003,13 @@ pub fn a_launch_is_installed_and_accepted_on_the_reader_thread(kind: ShellKind) 
 
             let (enter, fence) = session.fenced_prompt(8);
             let transaction = LaunchTransactionId::new(Uuid::from_bytes([0x71; 16]));
-            // An argument vector no interpolation could survive: a word with a space in it, which a split
-            // would break into two, and a word that is a command substitution, which an unquoted install
-            // would run. `printf` prints each argument followed by a bar, so the exact vector that ran is
-            // visible in the output.
+            // An argument vector no interpolation could survive: a word with a space in it, which a
+            // split would break into two, and a word that is a command substitution, which an
+            // unquoted install would run. `printf` prints each argument followed by a bar, so the
+            // exact vector that ran is visible in the output.
             let substitution = match kind {
-                // Each shell's own way of writing a command substitution, so an unquoted install would run
-                // something rather than print it.
+                // Each shell's own way of writing a command substitution, so an unquoted install
+                // would run something rather than print it.
                 ShellKind::Fish => "(echo substituted)".to_owned(),
                 _ => "$(echo substituted)".to_owned(),
             };
@@ -4049,9 +4051,9 @@ pub fn a_launch_is_installed_and_accepted_on_the_reader_thread(kind: ShellKind) 
             );
             assert_eq!(accepted.prompt_generation, enter.prompt_generation);
 
-            // This editor completes an acceptance at its own next step, so the session gives it one. The
-            // acceptance is already in the editor's own queue, which is drained before anything the
-            // terminal has, so it is the installed line that runs.
+            // This editor completes an acceptance at its own next step, so the session gives it
+            // one. The acceptance is already in the editor's own queue, which is drained before
+            // anything the terminal has, so it is the installed line that runs.
             session.nudge();
 
             // The accepted line is reported from the reader, inside the fence, before the leave.
@@ -4182,11 +4184,12 @@ pub fn a_launch_is_quoted_for_its_own_shell_and_never_evaluated(kind: ShellKind)
                 ShellKind::Fish => "(echo substituted)",
                 _ => "$(echo substituted)",
             };
-            // PowerShell reads five characters as a single quote: the ASCII one and the four typographic
-            // ones, so a word holding any of them must keep it inside the string. The first launch is one
-            // word that ends its string early in a reader that doubles only the ASCII quote, and what
-            // follows the word then runs as a command of its own. The second holds every quote character,
-            // and every other character a shell treats as more than itself.
+            // PowerShell reads five characters as a single quote: the ASCII one and the four
+            // typographic ones, so a word holding any of them must keep it inside the string. The
+            // first launch is one word that ends its string early in a reader that doubles only the
+            // ASCII quote, and what follows the word then runs as a command of its own. The second
+            // holds every quote character, and every other character a shell treats as more than
+            // itself.
             let injected = "x\u{2019}; Write-Output kr-injected; \u{2019}";
             launch_prints_what_was_named(&mut session, &program, &[injected], 19, 0x74);
             launch_prints_what_was_named(
@@ -4643,8 +4646,8 @@ pub fn a_revocation_in_the_same_read_binds_the_launch(kind: ShellKind) {
             let transaction = LaunchTransactionId::new(Uuid::from_bytes([0x74; 16]));
             let id = RequestId::new(9001);
 
-            // The launch first, its revocation second, in one write, which has to reach the bridge: a
-            // write that found it gone would leave this check asserting nothing at all.
+            // The launch first, its revocation second, in one write, which has to reach the bridge:
+            // a write that found it gone would leave this check asserting nothing at all.
             let delivery = session.write_frames(&[
                 BridgeFrame::Request {
                     id,
@@ -4904,8 +4907,8 @@ pub fn a_lost_bridge_does_not_restore_a_native_empty_prompt_end_of_file(kind: Sh
             assert!(session.answered("kr-ready"));
             let before = session.terminal_output().matches(DETACH_HINT).count();
 
-            // The worker goes. Nothing can attribute a gesture any more, which is exactly when turning one
-            // into a native end of file would close somebody's shell.
+            // The worker goes. Nothing can attribute a gesture any more, which is exactly when
+            // turning one into a native end of file would close somebody's shell.
             session.close_endpoint();
             std::thread::sleep(Duration::from_millis(300));
 
@@ -4952,8 +4955,8 @@ pub fn a_gesture_typed_while_the_editor_waits_for_the_terminal_is_still_a_gestur
             let before_command = session.written();
             assert!(session.answered("kr-ready"));
             let enter = session.next_prompt();
-            // The prompt after the command asks the terminal where the cursor is and what it is, and the
-            // editor waits for the answer to the last of those.
+            // The prompt after the command asks the terminal where the cursor is and what it is,
+            // and the editor waits for the answer to the last of those.
             assert!(
                 session
                     .drew_after(before_command, "\x1b[0c", REPLY)
@@ -4964,8 +4967,8 @@ pub fn a_gesture_typed_while_the_editor_waits_for_the_terminal_is_still_a_gestur
 
             let before_key = session.written();
             session.type_bytes(CTRL_D);
-            // The editor's own report of its queue says when it has the key: asking is an exchange the
-            // editor answers while it waits for the terminal.
+            // The editor's own report of its queue says when it has the key: asking is an exchange
+            // the editor answers while it waits for the terminal.
             let deadline = session.deadline_for(REPLY);
             loop {
                 let held = session.fence_exchange_before(&enter, fence_id(41), deadline.0);
@@ -5044,9 +5047,9 @@ pub fn a_gesture_a_binding_hands_back_is_the_editors_own_input(kind: ShellKind) 
                 );
             }
 
-            // From here the editor either consumes the replayed gesture and says so with its hint, or
-            // leaves it to its own handling, which at an empty prompt ends the shell: the first of the two
-            // to happen is the answer.
+            // From here the editor either consumes the replayed gesture and says so with its hint,
+            // or leaves it to its own handling, which at an empty prompt ends the shell: the first
+            // of the two to happen is the answer.
             session.release_terminal_answers();
             let deadline = session.deadline_for(REPLY);
             let hinted = session.expecting_the_bridge_to_go(|session| {
@@ -5738,8 +5741,9 @@ pub fn a_startup_prompt_reads_its_answer_and_readiness_waits_for_the_profile(kin
                     ..Profile::ORDINARY
                 },
             );
-            // Authenticated and ABI-checked: the handshake this returns from is the worker's own decision
-            // over the hello, and the reader it declared is the one the package's record names.
+            // Authenticated and ABI-checked: the handshake this returns from is the worker's own
+            // decision over the hello, and the reader it declared is the one the package's record
+            // names.
             assert_eq!(
                 session.hello.shell.editor_abi,
                 package.record["shell"]["editor_abi"]
@@ -5757,8 +5761,8 @@ pub fn a_startup_prompt_reads_its_answer_and_readiness_waits_for_the_profile(kin
             assert!(!phase.reports_ready());
             assert!(!phase.permits_launch());
 
-            // The prompt is on the terminal, waiting, and the profile that asked has not finished, so the
-            // activation that follows it cannot have come.
+            // The prompt is on the terminal, waiting, and the profile that asked has not finished,
+            // so the activation that follows it cannot have come.
             assert!(
                 session.drew_after(0, "ASK>", REPLY).was_drawn(),
                 "the startup prompt was not drawn:\n{}",
@@ -5782,7 +5786,8 @@ pub fn a_startup_prompt_reads_its_answer_and_readiness_waits_for_the_profile(kin
                 session.terminal_output()
             );
 
-            // The profile has finished, so the activation comes, and then the first reader of the shell.
+            // The profile has finished, so the activation comes, and then the first reader of the
+            // shell.
             let entry = session.first_prompt();
             assert!(
                 phase.qualified(),
