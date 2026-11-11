@@ -7953,9 +7953,9 @@ async fn is_served(raw: &RawDevice) -> bool {
     )
 }
 
-/// Waits until `condition` holds, polling it.
-async fn until_it_holds(condition: impl Fn() -> bool) {
-    tokio::time::timeout(Duration::from_secs(60), async {
+/// Waits until `condition` holds, polling it, for at most `patience`.
+async fn until_it_holds(patience: Duration, condition: impl Fn() -> bool) {
+    tokio::time::timeout(patience, async {
         while !condition() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -7964,13 +7964,18 @@ async fn until_it_holds(condition: impl Fn() -> bool) {
     .expect("the condition came to hold");
 }
 
+/// How long a case waits for what the host does at once while the feed is held: the held read ends
+/// by itself after about ten seconds, and the connections that wait are released with it, so a host
+/// that acted only then is told by a case that waits for less.
+const SOON: Duration = Duration::from_secs(5);
+
 /// KR-REQ-23.21: a connection that waits for the feed is counted from the moment it is admitted,
 /// and it ends at once when it is the one the host heard from least recently. With the feed held
 /// and a device at its bound, a new connection waits and one of the device's other connections ends
 /// at the new connection's count; the waiting connection's device sends a request, and the host
 /// dates it during the wait; and when the waiting connection is the least recent, the next
-/// connection above the bound closes it while the feed is still held, and not when its wait for the
-/// feed ends.
+/// connection above the bound closes it while the feed is held, and not when its wait for the feed
+/// ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_connection_that_waits_for_the_feed_counts_and_is_withdrawn_at_once() {
     let rig = Rig::start().await;
@@ -7998,7 +8003,7 @@ async fn a_connection_that_waits_for_the_feed_counts_and_is_withdrawn_at_once() 
 
     // It is counted while it waits: one of the connections that were served ends, and the waiting
     // one is not served yet.
-    until_it_holds(|| rig.host.connections_of(&record) == bound - 1).await;
+    until_it_holds(SOON, || rig.host.connections_of(&record) == bound - 1).await;
     let mut alive = Vec::new();
     for raw in &connections {
         if is_served(raw).await {
@@ -8025,7 +8030,10 @@ async fn a_connection_that_waits_for_the_feed_counts_and_is_withdrawn_at_once() 
         waiting.try_read(Method::HostInfo, &NoParams {}),
     )
     .await;
-    until_it_holds(|| rig.host.heard_from_of(&record)[DEVICE_LIVE_CONNECTIONS - 1] > before).await;
+    until_it_holds(SOON, || {
+        rig.host.heard_from_of(&record)[DEVICE_LIVE_CONNECTIONS - 1] > before
+    })
+    .await;
 
     // The waiting connection is the one heard from least recently: the others answer after it was
     // last heard from. The next connection above the bound closes it at once.
@@ -8037,19 +8045,13 @@ async fn a_connection_that_waits_for_the_feed_counts_and_is_withdrawn_at_once() 
         assert!(is_served(raw).await, "the others answer");
     }
     let second = connected_again(&rig, &phone, &record).await;
+    // A connection closed at once ends long before the held read does.
     assert_eq!(
         waiting
-            .answered_before_closing(RequestId::new(u64::MAX), Duration::from_secs(20))
+            .answered_before_closing(RequestId::new(u64::MAX), SOON)
             .await,
         Some(false),
-        "the waiting connection ends"
-    );
-    // It ended while the feed is still held: the connection that waits beside it is not served
-    // yet. Were it the end of their wait that closed the first, both would be past it.
-    assert_eq!(
-        rig.host.connections_of(&record),
-        bound - 1,
-        "the waiting connection ended before the feed answered"
+        "the waiting connection ends while the feed is held, not when its wait ends"
     );
 
     // The feed answers: the connection that waited last is served, and no other was withdrawn.
