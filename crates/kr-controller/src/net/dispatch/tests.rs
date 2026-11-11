@@ -3219,6 +3219,7 @@ fn bound_to_a_draft(
                 },
             },
             None,
+            None,
         )
         .expect("binds the attachment");
     controller

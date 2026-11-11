@@ -60,7 +60,8 @@ pub const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6
 ///
 /// A draft is open until a prompt sends it to a session, its target session ends, the agent has
 /// taken every file bound to it or the device ends it, and the service counts it against the
-/// device's own principal. The page makes one draft for each session
+/// device's own principal. A file bound to a draft whose files the agent took makes it count again,
+/// so that binding is asked the bound as a create is. The page makes one draft for each session
 /// it attaches files in, and another for each eight files, so the bound is several times what a
 /// person works in at once; a device holds at most this many open drafts, each of up to
 /// [`kr_protocol::transfer::MAX_TRANSFER_RESULT_BYTES`] of text. The person at this machine has
@@ -1056,7 +1057,9 @@ impl TransferModule {
     /// commit that makes one durable ([`TransferAdmission`]).
     ///
     /// `draft_limit` is how many open drafts the caller may hold, which only a paired device is
-    /// held to: `None` is the person at this machine, whose drafts have no bound.
+    /// held to: `None` is the person at this machine, whose drafts have no bound. A create asks it,
+    /// and so does a binding that brings a draft the agent has taken every file of back into the
+    /// count.
     ///
     /// The answer says whether the service read it from the record of an earlier submission of the
     /// action. A copy goes back only under the authority this attempt arrived under, asked once the
@@ -1209,7 +1212,12 @@ impl TransferModule {
                         require_declared_path(params.contribution.insertion_method)?;
                         encode(
                             &service
-                                .draft_add_attachment(&actor, &params, Some(&performed))
+                                .draft_add_attachment(
+                                    &actor,
+                                    &params,
+                                    Some(&performed),
+                                    draft_limit,
+                                )
                                 .map_err(&told)?,
                         )
                     }

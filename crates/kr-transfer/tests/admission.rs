@@ -634,6 +634,7 @@ fn a_draft_write_the_host_refuses_inside_the_lock_changes_nothing() {
                 b"bind",
                 &host,
             )),
+            None,
         );
         assert_not_admitted(bound, refuses, &host);
 
@@ -728,6 +729,7 @@ fn a_draft_holding_an_attachment(harness: &Harness) -> kr_protocol::transfer::Dr
                     model_media_capability: false,
                 },
             },
+            None,
             None,
         )
         .expect("binds the attachment")

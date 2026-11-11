@@ -2166,19 +2166,27 @@ impl TransferService {
     /// or, once a prompt has sent it to one, that session, and an attachment bound to a draft that
     /// was sent is held by the session from then on.
     ///
+    /// `open_limit` is how many open drafts `actor` may hold, `None` for an actor with no bound. A
+    /// draft whose every file the agent took does not count, and a new binding makes it count
+    /// again: that binding is refused when `actor` already holds `open_limit` open drafts, in the
+    /// same words as a create. A binding to a draft that already counts, or that a prompt sent,
+    /// changes no count and is not asked.
+    ///
     /// # Errors
     ///
     /// Returns [`TransferError::DraftConflict`] for a stale revision,
     /// [`TransferError::IdConflict`] when the action identifier carried another payload,
     /// [`TransferError::WrongState`] when the attachment is not published,
     /// [`TransferError::SessionEnded`] when the session of the draft or of the attachment has
-    /// ended, and [`TransferError::InvalidArgument`] when the declared contribution does not admit
-    /// it.
+    /// ended, [`TransferError::QuotaExceeded`] when the binding would bring a draft back into the
+    /// count and `actor` already holds `open_limit` open drafts, and
+    /// [`TransferError::InvalidArgument`] when the declared contribution does not admit it.
     pub fn draft_add_attachment(
         &self,
         actor: &ActorId,
         params: &AgentDraftAddAttachmentParams,
         action: Option<&Action>,
+        open_limit: Option<u64>,
     ) -> Result<AgentDraftAddAttachmentResult> {
         let now = self.clock.now_ms();
         let mut store = self.locked()?;
@@ -2360,6 +2368,7 @@ impl TransferService {
                 retained.as_ref(),
                 session_for_attachment,
                 submitted_at,
+                open_limit,
             )
         })? {
             Some(_) => Ok(result),
@@ -2578,7 +2587,7 @@ impl TransferService {
             expires_at_ms: grant.expires_at_ms,
         };
         store
-            .bind_attachment(&claimed, row.revision, Some(&grant), None, None, None)?
+            .bind_attachment(&claimed, row.revision, Some(&grant), None, None, None, None)?
             .ok_or_else(|| TransferError::DraftConflict {
                 detail: "this draft's revision moved while the claim was written".to_owned(),
             })?;
@@ -2722,7 +2731,7 @@ impl TransferService {
         store
             // The outcome changes the binding's state and nothing about which session owns the
             // attachment.
-            .bind_attachment(&settled, row.revision, None, None, None, None)?
+            .bind_attachment(&settled, row.revision, None, None, None, None, None)?
             .ok_or_else(|| TransferError::DraftConflict {
                 detail: "this draft's revision moved while the outcome was written".to_owned(),
             })?;

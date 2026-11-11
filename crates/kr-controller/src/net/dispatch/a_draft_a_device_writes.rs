@@ -299,7 +299,9 @@ async fn a_draft_bound_to_a_session_is_written_only_by_a_request_that_names_that
 
 /// The contribution a manual terminal workflow declares: no declaration from the session's
 /// integration is needed for it.
-fn manual_contribution(handle: &kr_protocol::transfer::AttachmentHandle) -> AttachmentContribution {
+pub(super) fn manual_contribution(
+    handle: &kr_protocol::transfer::AttachmentHandle,
+) -> AttachmentContribution {
     AttachmentContribution {
         operation_id: "attach".to_owned(),
         accepted_media_types: vec![handle.declared_media_type.clone()],

@@ -3309,15 +3309,18 @@ orphans its drafts, and each `draft.create` first writes the end of the sessions
 drafts target that the registry holds closed, so a draft stops counting when its session is
 recorded closed. A `draft.create` past the bound is
 refused `QUOTA_EXCEEDED` with the bound in the message, only after the service has asked the
-admission again, so a device whose authority has gone learns no count. The host keeps that refusal
+admission again, so a device whose authority has gone learns no count. An
+`agent.draft.add_attachment` that would bring a draft back into the count, because the agent took all
+its files and the binding adds another, is refused in the same way when the device already holds the
+bound; a binding to a draft that already counts is not asked. The host keeps that refusal
 as the action's outcome, as it keeps every refusal of a service, so the same action asked again is
 given the same refusal even when a place is free, and a device that has freed a place takes a new
 action for its new attempt. The bound is one constant of this host, which an owner cannot change,
 and the person at this machine is held to none. A place is freed in four ways: a prompt sends the
 draft, its session ends, the agent takes every file bound to it, or the device ends it with
 `draft.discard`. A draft whose attachments are all `accepted_by_agent`, and that has at least one,
-stops counting; a draft with an attachment `inserting` or `unknown` goes on counting, because a
-retry or a report may still come for it. The bound's refusal names the ways that are the device's to
+stops counting until a file is bound to it again; a draft with an attachment `inserting` or
+`unknown` goes on counting, because a retry or a report may still come for it. The bound's refusal names the ways that are the device's to
 take or wait for. Sent and orphaned drafts stay in the journal, and each `draft.update` adds one row
 to the journal's events and a receipt that holds the updated draft for the de-duplication window.
 

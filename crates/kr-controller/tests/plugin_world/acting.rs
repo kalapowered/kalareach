@@ -1178,6 +1178,7 @@ impl Acting {
                     },
                 },
                 None,
+                None,
             )
             .expect("binds the attachment")
             .draft

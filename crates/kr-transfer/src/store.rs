@@ -2389,14 +2389,7 @@ impl Store {
             if open >= limit {
                 // Dropping the transaction takes the action's claim back with it, so a refused
                 // create leaves no record and no draft.
-                return Err(TransferError::QuotaExceeded {
-                    detail: format!(
-                        "this device holds {open} of the {limit} drafts it may keep open: end a \
-                         draft it no longer uses (draft.discard); a draft also stops counting when \
-                         a prompt sends it, when the agent has taken all its files, or when its \
-                         session ends"
-                    ),
-                });
+                return Err(open_bound_refusal(open, limit));
             }
         }
         transaction
@@ -2614,10 +2607,19 @@ impl Store {
     ///
     /// Binding an attachment is a change to the draft, so it takes a revision like any other.
     ///
+    /// `open_limit` is how many open drafts the draft's owner may hold, `None` for an owner with no
+    /// bound. A draft whose every file the agent took does not count, and a new binding makes it
+    /// count again, so that binding is asked the bound as a create is, in the same transaction as
+    /// the count. A binding to a draft that already counts, or that a prompt sent, changes no count
+    /// and is not asked.
+    ///
     /// # Errors
     ///
     /// Returns [`TransferError::SessionEnded`] when the session of the draft, or of the upload,
-    /// has ended, and [`TransferError::StoreUnavailable`] when the write fails.
+    /// has ended, [`TransferError::QuotaExceeded`] when the binding would bring a draft back into
+    /// the count and the owner already holds `open_limit` open drafts, and
+    /// [`TransferError::StoreUnavailable`] when the write fails.
+    #[allow(clippy::too_many_arguments)]
     pub fn bind_attachment(
         &mut self,
         binding: &BindingRow,
@@ -2626,6 +2628,7 @@ impl Store {
         action: Option<&RetainedAction>,
         session_id: Option<SessionId>,
         submitted_at: Option<TimestampMs>,
+        open_limit: Option<u64>,
     ) -> Result<Option<DraftRevision>> {
         let transaction = self.begin()?;
         if claim_action(&transaction, action)? == ActionOutcome::AlreadyPerformed {
@@ -2637,6 +2640,15 @@ impl Store {
             Some(binding.transfer_id),
             session_id,
         )?;
+        if let Some(limit) = open_limit
+            && draft_stopped_counting(&transaction, binding.draft_id)?
+        {
+            let open = open_drafts_beside(&transaction, binding.draft_id)?;
+            if open >= limit {
+                // As for a create, the refusal takes the action's claim back with the transaction.
+                return Err(open_bound_refusal(open, limit));
+            }
+        }
         // An attachment uploaded without a session becomes that session's when it is bound to a
         // draft for one, in the same transaction as the binding. Recorded here rather than at
         // submission, so a second draft for another session finds the session already set and is
@@ -3374,29 +3386,81 @@ fn refuse_ended_session(
     }
 }
 
-/// How many drafts an actor holds open: the ones no prompt has sent to a session, whose target
-/// session has not ended and whose files the agent has not all taken. A sent draft belongs to its
-/// session from then on, a draft whose target ended is orphaned in the same transaction that
-/// records the end, and a draft whose every binding is `accepted_by_agent` (there is at least one)
-/// has nothing left to offer, retry or bind, so none of them can be written to again and none takes
-/// a place. A binding `inserting` or `unknown` may still be reported on, and its draft counts.
+/// The drafts a prompt has not sent and whose target session has not ended. A sent draft belongs
+/// to its session from then on, and a draft whose target ended is orphaned in the same transaction
+/// that records the end.
+const DRAFT_IS_LIVE: &str = "drafts.state <> 'orphaned'
+     AND NOT EXISTS (SELECT 1 FROM draft_prompts
+                      WHERE draft_prompts.draft_id = drafts.draft_id)";
+
+/// The drafts whose every binding is `accepted_by_agent` (there is at least one): nothing in them
+/// is left to offer or retry. A binding `inserting` or `unknown` may still be reported on, and its
+/// draft is not spent.
+const DRAFT_IS_SPENT: &str = "(EXISTS (SELECT 1 FROM draft_attachments
+                         WHERE draft_attachments.draft_id = drafts.draft_id)
+      AND NOT EXISTS (SELECT 1 FROM draft_attachments
+                       WHERE draft_attachments.draft_id = drafts.draft_id
+                         AND draft_attachments.state <> 'accepted_by_agent'))";
+
+/// How many drafts an actor holds open: the live drafts that are not spent. A spent draft takes no
+/// place, since none of its files can be offered again; a new binding makes it count again, and
+/// [`Store::bind_attachment`] asks the bound for it.
 fn open_drafts(connection: &Connection, actor_id: &ActorId) -> Result<u64> {
     let open: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM drafts
-              WHERE actor_id = ?1 AND state <> 'orphaned'
-                AND NOT EXISTS (SELECT 1 FROM draft_prompts
-                                 WHERE draft_prompts.draft_id = drafts.draft_id)
-                AND NOT (EXISTS (SELECT 1 FROM draft_attachments
-                                  WHERE draft_attachments.draft_id = drafts.draft_id)
-                         AND NOT EXISTS (SELECT 1 FROM draft_attachments
-                                          WHERE draft_attachments.draft_id = drafts.draft_id
-                                            AND draft_attachments.state <> 'accepted_by_agent'))",
+            &format!(
+                "SELECT COUNT(*) FROM drafts
+                  WHERE actor_id = ?1 AND {DRAFT_IS_LIVE} AND NOT {DRAFT_IS_SPENT}"
+            ),
             params![actor_id.as_str()],
             |row| row.get(0),
         )
         .map_err(TransferError::store)?;
     Ok(from_i64(open))
+}
+
+/// How many drafts the owner of `draft_id` holds open, counted as [`open_drafts`] counts them.
+fn open_drafts_beside(connection: &Connection, draft_id: DraftId) -> Result<u64> {
+    let open: i64 = connection
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM drafts
+                  WHERE actor_id = (SELECT actor_id FROM drafts WHERE draft_id = ?1)
+                    AND {DRAFT_IS_LIVE} AND NOT {DRAFT_IS_SPENT}"
+            ),
+            params![uuid_sql(draft_id.get())],
+            |row| row.get(0),
+        )
+        .map_err(TransferError::store)?;
+    Ok(from_i64(open))
+}
+
+/// Whether a draft is one that takes no place against the bound because the agent took every file
+/// bound to it, and no prompt has sent it and its session has not ended: a binding made to it now
+/// would make it count.
+fn draft_stopped_counting(connection: &Connection, draft_id: DraftId) -> Result<bool> {
+    connection
+        .query_row(
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM drafts
+                                 WHERE draft_id = ?1 AND {DRAFT_IS_LIVE} AND {DRAFT_IS_SPENT})"
+            ),
+            params![uuid_sql(draft_id.get())],
+            |row| row.get(0),
+        )
+        .map_err(TransferError::store)
+}
+
+/// The refusal for a device that already holds the bound of open drafts, in words that name the
+/// bound and the ways a place is freed.
+fn open_bound_refusal(open: u64, limit: u64) -> TransferError {
+    TransferError::QuotaExceeded {
+        detail: format!(
+            "this device holds {open} of the {limit} drafts it may keep open: end a draft it no \
+             longer uses (draft.discard); a draft also stops counting when a prompt sends it, when \
+             the agent has taken all its files, or when its session ends"
+        ),
+    }
 }
 
 /// Whether a session a draft targets, was sent to, or whose upload it holds has ended.

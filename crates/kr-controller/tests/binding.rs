@@ -585,6 +585,7 @@ impl Hosted {
                     },
                 },
                 None,
+                None,
             )
             .expect("binds the attachment");
         let grant = bound

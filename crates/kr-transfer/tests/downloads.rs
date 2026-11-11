@@ -1138,6 +1138,7 @@ fn an_upload_stays_outside_repositories_and_is_reached_through_a_narrow_grant() 
                 },
             },
             None,
+            None,
         )
         .expect("binds the attachment");
     let grant = bound
@@ -1176,6 +1177,7 @@ fn an_upload_stays_outside_repositories_and_is_reached_through_a_narrow_grant() 
                     model_media_capability: false,
                 },
             },
+            None,
             None,
         )
         .expect("binds the second attachment");
