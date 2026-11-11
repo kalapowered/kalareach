@@ -31,6 +31,10 @@
 //! smaller figure. A process is scanned at most [`ATTEMPTS`] times in all, and again only when its
 //! mappings changed while it was scanned.
 //!
+//! The figure is exact for a group whose processes do not run during the read, because the reader
+//! reads one process after another; the case's group is the product's own idle processes, whose
+//! processor time the same case bounds.
+//!
 //! The reader runs in a child copy of the test's own program (`read_in_child`), because the
 //! controller is the process being read: a reader inside it would allocate its own page set in the
 //! process it is counting. The child needs the processes of the group to stay dumpable by their own

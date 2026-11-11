@@ -136,6 +136,10 @@ against 512,000 KiB:
   not to a file other processes share, are counted for each process.
 - The root shell of each session is counted with the workers and the daemon.
 
+The figure is exact for a group whose processes do not run during the read, since the reader reads
+one process after another; the group here is the product's own idle processes, whose processor time
+the same measurement bounds.
+
 The reader runs in a child copy of the test's own program, because the daemon runs in the test
 process and a reader inside it would put its own pages into the figure. It needs each process of
 the group to stay dumpable by its own user, since the kernel shows a page map only to a reader that
