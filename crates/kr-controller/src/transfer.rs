@@ -120,6 +120,13 @@ pub struct TransferModule {
     /// is what refuses it. Compiled only with the `testing` feature.
     #[cfg(feature = "testing")]
     after_the_outer_check: Arc<crate::attention::Pause>,
+    /// Where this host's own tests stop a device's create between its first try, which the bound
+    /// refused, and its second, and how many second tries have been made. Compiled only with the
+    /// `testing` feature.
+    #[cfg(feature = "testing")]
+    between_the_tries: Arc<crate::attention::Pause>,
+    #[cfg(feature = "testing")]
+    second_tries: Arc<std::sync::atomic::AtomicU64>,
     /// The point a repeat that arrived with no usable window stops at once the claim of its action
     /// has been asked about, before it looks for the record. Compiled only with the `testing`
     /// feature.
@@ -162,8 +169,9 @@ pub struct TransferAdmission {
     /// Whether the service asked this admission where it begins an effect. A draft write does so
     /// only once it has found no record of the action, as a draft whose revision an earlier attempt
     /// moved on is refused, or answered from its record, before it asks. Each upload write looks
-    /// for its record under the store's lock before it first asks; `upload.finish` lets go of the
-    /// lock to verify the file and asks again without looking again.
+    /// for its record under the store's lock before it first asks; `upload.finish` and
+    /// `upload.cancel` let go of the lock after that look (`upload.finish` to verify the file) and
+    /// ask without looking again. A create's second try clears the mark before its call.
     reached: AtomicBool,
 }
 
@@ -409,6 +417,10 @@ impl TransferModule {
             #[cfg(feature = "testing")]
             after_the_outer_check: Arc::new(crate::attention::Pause::default()),
             #[cfg(feature = "testing")]
+            between_the_tries: Arc::new(crate::attention::Pause::default()),
+            #[cfg(feature = "testing")]
+            second_tries: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "testing")]
             after_the_claim_is_asked_about: Arc::new(crate::attention::Pause::default()),
             #[cfg(feature = "testing")]
             after_a_read: Arc::new(crate::attention::Pause::default()),
@@ -432,6 +444,24 @@ impl TransferModule {
         std::sync::mpsc::SyncSender<()>,
     ) {
         self.after_the_outer_check.arm()
+    }
+
+    /// Arms the pause a device's create stops at between its first try, which the bound refused,
+    /// and its second. It fires once; the ends are as for [`Self::pause_after_the_outer_check`].
+    #[cfg(feature = "testing")]
+    pub fn pause_between_the_tries(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.between_the_tries.arm()
+    }
+
+    /// How many times a device's create has been tried a second time, after a refusal at the bound.
+    #[cfg(feature = "testing")]
+    pub fn second_tries(&self) -> u64 {
+        self.second_tries.load(Ordering::Acquire)
     }
 
     /// Arms the pause a repeat that arrived with no usable window stops at once the claim of its
@@ -728,15 +758,18 @@ impl TransferModule {
     /// that follows closely, or a write that failed and waits for the next sweep or start, would
     /// count drafts of a session that has ended, or add one for it. Each create settles, before its
     /// count, the closed sessions its principal's open drafts target and the one it names, whatever
-    /// the count is: a draft of a session recorded closed before then stops counting, and a create
-    /// that names one is refused as the service refuses any draft for an ended session. A refusal
-    /// at the bound is kept only after a second settle and a second count ([`Self::write`]). What
-    /// remains possible is a refusal for a draft whose session closes between the registry read
-    /// and another create's insert, at the first settle and again at the second. The registry is
-    /// read once for each of those sessions, at most one more than the principal holds open
-    /// drafts; the store's reads and writes are as they are for any such write. A pass that cannot
-    /// be made leaves a line in the log and does not stop the create: the service counts what it
-    /// holds.
+    /// the count is: a draft of a session recorded closed before then stops counting without a
+    /// second try, and a create that names one is refused as the service refuses any draft for an
+    /// ended session, unless the bound speaks first. A refusal at the bound is kept only after a
+    /// second settle and a second count ([`Self::write`]). What remains possible is a refusal for a
+    /// draft whose session another create's own registry read missed and then closed, at the first
+    /// settle and again at the second, or one after a settle that failed in both passes. The
+    /// registry is read once for each of those sessions in a pass, at most 65 key reads under its
+    /// lock (the principal's open drafts at the bound, and the create's own session); a create at
+    /// the bound makes two passes, so up to 130 key reads and two scans of the drafts, besides the
+    /// store's other reads and writes, which are as they are for any such write. A pass that
+    /// cannot be made leaves a line in the log and does not stop the create: the service counts
+    /// what it holds.
     pub(crate) async fn settle_closures_of_open_drafts(
         &self,
         owner: &Arc<Controller>,
@@ -1066,6 +1099,10 @@ impl TransferModule {
         let name = method.as_str();
         #[cfg(feature = "testing")]
         let after_the_outer_check = Arc::clone(&self.after_the_outer_check);
+        #[cfg(feature = "testing")]
+        let between_the_tries = Arc::clone(&self.between_the_tries);
+        #[cfg(feature = "testing")]
+        let second_tries = Arc::clone(&self.second_tries);
         let answer = blocking(move || {
             // A look at the record that cannot read it says a record exists, so what it answers is
             // a copy whichever way it is told. The other places this work cannot read or write a
@@ -1179,6 +1216,15 @@ impl TransferModule {
                                 &actor,
                                 params.session_id.0,
                             );
+                            // The second call can be answered from a record another copy of this
+                            // action wrote since the first, without asking the admission: what it
+                            // finds is then a copy's, so the first try's mark is cleared.
+                            admission.reached.store(false, Ordering::Release);
+                            #[cfg(feature = "testing")]
+                            {
+                                second_tries.fetch_add(1, Ordering::AcqRel);
+                                between_the_tries.wait();
+                            }
                             made = service.draft_create(
                                 &actor,
                                 &params,
@@ -1276,10 +1322,11 @@ impl TransferModule {
                 // own action in the transaction that performs it, and hold the journal's lock from
                 // the look that decides whether they begin (the record for a create, the draft's
                 // revision for the other two, which an earlier attempt's success has moved on) to
-                // that commit, so once the service has reached the place it begins an effect, a
-                // record that an attempt finds after its own success is its own. The upload writes
-                // let go of the lock while they verify a file, so another copy can record in
-                // between: any record read for them, and for every other method, is a copy.
+                // that commit, so once that call has reached the place it begins an effect, a record
+                // that it finds after its own success is its own. A create's second try is a call of
+                // its own, and the mark is cleared before it. The upload writes let go of the lock
+                // after their look at the record, so another copy can record in between: any record
+                // read for them, and for every other method, is a copy.
                 Some(retained) => {
                     let performed_here = outcome.is_ok()
                         && admission.reached()

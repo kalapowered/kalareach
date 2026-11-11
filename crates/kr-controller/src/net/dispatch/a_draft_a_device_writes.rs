@@ -846,6 +846,11 @@ async fn two_creates_together_beside_a_closure_not_yet_written_are_both_served()
     for answered in [first, second] {
         let _: DraftCreateResult = result_of(answered.expect("the create is answered").frame());
     }
+    assert_eq!(
+        controller.transfer().second_tries(),
+        0,
+        "both creates were served by their first try: the door's settle made the place"
+    );
     world.serving.abort();
 }
 
@@ -953,6 +958,139 @@ async fn a_create_is_tried_again_after_a_second_settle_before_a_refusal_at_the_b
     release.send(()).expect("the create goes on");
     let answered = create.await.expect("the create is answered");
     let _: DraftCreateResult = result_of(answered.frame());
+    assert_eq!(
+        controller.transfer().second_tries(),
+        1,
+        "the create was served by its second try"
+    );
+    world.serving.abort();
+}
+
+/// Two copies of one `draft.create` on a device at its bound. The first is refused by the count, is
+/// stopped between its two tries, and the second copy commits while it waits: a session whose
+/// draft makes the device's last place closes in the registry after the first copy's door settle,
+/// and the first copy's own second settle ends it. Returns what each copy was answered with.
+async fn a_copy_stopped_between_its_tries_while_another_commits(
+    world: &fake::Silent,
+    connection: &super::RemoteConnection,
+    closed: SessionId,
+    request_id: u64,
+) -> (super::Answered, super::Answered) {
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::closure_of;
+
+    let controller = &world.controller;
+    let device = connection.device.principal();
+    for _ in 1..DEVICE_OPEN_DRAFTS {
+        a_draft_for(world, &device, None);
+    }
+    a_draft_for(world, &device, Some(closed));
+    let mutation = write_naming(
+        world,
+        connection,
+        Method::DraftCreate,
+        request_id,
+        &create_params(world, Some(world.session_id), None, "the same action twice"),
+        Some(world.session_id),
+    );
+    let (arrived, release) = controller.transfer().pause_after_the_outer_check();
+    let (between, go_on) = controller.transfer().pause_between_the_tries();
+    let first = connection.answer_now(ControlFrame::Mutation(Box::new(mutation.clone())));
+    tokio::pin!(first);
+    let waiting = tokio::task::spawn_blocking(move || arrived.recv_timeout(WAIT_BOUND));
+    tokio::pin!(waiting);
+    tokio::select! {
+        arrived = &mut waiting => {
+            arrived
+                .expect("the waiting thread finishes")
+                .expect("the first copy reaches the service");
+        }
+        early = &mut first => panic!("the first copy was answered before the service: {early:?}"),
+    }
+    controller
+        .registry
+        .lock()
+        .await
+        .record_closure(&closure_of(closed))
+        .expect("the registry records the closure");
+    release.send(()).expect("the first copy goes on");
+    let waiting = tokio::task::spawn_blocking(move || between.recv_timeout(WAIT_BOUND));
+    tokio::pin!(waiting);
+    tokio::select! {
+        between = &mut waiting => {
+            between
+                .expect("the waiting thread finishes")
+                .expect("the first copy reaches its second try");
+        }
+        early = &mut first => panic!("the first copy was answered before its second try: {early:?}"),
+    }
+    let second = connection
+        .answer_now(ControlFrame::Mutation(Box::new(mutation)))
+        .await
+        .expect("the second copy is answered");
+    go_on.send(()).expect("the first copy goes on");
+    (first.await.expect("the first copy is answered"), second)
+}
+
+/// KR-REQ-23.41 and KR-REQ-09.09: what a create finds in its second try is a copy's. A record the
+/// second copy wrote while the first was between its tries is given back to the first only under
+/// the authority the first arrived under: a device that may not read the session's receipts is told
+/// the outcome is unknown, and one that may is given the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_found_by_the_second_try_is_told_as_a_copy() {
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    controller.transfer().until_a_sweep_has_ended().await;
+
+    let (blind, recording) = paired_connection(controller, 46, &[ActionRight::AgentPrompt]);
+    let (first, second) = a_copy_stopped_between_its_tries_while_another_commits(
+        &world,
+        &blind,
+        SessionId::new(Uuid::from_bytes([7; 16])),
+        1,
+    )
+    .await;
+    let _: DraftCreateResult = result_of(second.frame());
+    assert!(
+        first
+            .asked
+            .as_ref()
+            .is_some_and(super::decision::Asked::is_kept),
+        "the record the second try found is held as a kept answer"
+    );
+    let told = written(&blind, &recording, first).await;
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+
+    // The control: a device that may view the session is given the record.
+    let (sighted, recording) = paired_connection(
+        controller,
+        47,
+        &[ActionRight::AgentPrompt, ActionRight::SessionView],
+    );
+    let (first, second) = a_copy_stopped_between_its_tries_while_another_commits(
+        &world,
+        &sighted,
+        SessionId::new(Uuid::from_bytes([8; 16])),
+        2,
+    )
+    .await;
+    assert!(sighted.write_answer(first).await, "the connection stands");
+    assert!(sighted.write_answer(second).await, "the connection stands");
+    let frames = recording.frames();
+    assert!(
+        frames.iter().rev().take(2).all(|frame| matches!(
+            frame,
+            ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: Outcome::Ok(_),
+                ..
+            })
+        )),
+        "both copies are given the draft: {frames:?}"
+    );
+    assert_eq!(
+        controller.transfer().second_tries(),
+        2,
+        "each first copy was tried a second time"
+    );
     world.serving.abort();
 }
 
