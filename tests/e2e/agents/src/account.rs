@@ -414,21 +414,67 @@ pub struct KeyScan {
     entries: usize,
     #[serde(skip)]
     limits: ScanLimits,
+    /// The bytes the scans that share this budget have read in all.
+    #[serde(skip)]
+    bytes: std::sync::Arc<ScanBytes>,
 }
 
 /// The most bytes of one file that the key scan reads: a file above it is told as not scanned.
 const SCAN_FILE_AT_MOST: u64 = 1 << 30;
 
-/// The most entries that the key scan lists and looks at, in all: it stops there and says so.
+/// The most entries that the key scan lists, in all, counted when each is listed: the names of one
+/// listing are held until its directory is done, so the count bounds what the walk holds. It stops
+/// there and says so.
 const SCAN_ENTRIES_AT_MOST: usize = 1_000_000;
+
+/// The most bytes that the key scans of one run read in all, both scans together: a run's own
+/// directory is under a gigabyte, so this is several times what a real run holds, and many files
+/// that each fit the per-file bound (clones cost no disk) cannot keep the scan reading for days
+/// while the run's directory, and the login's file in it, stays on disk.
+const SCAN_BYTES_AT_MOST: u64 = 8 << 30;
+
+/// The bytes read in all by the key scans that share it, counted when a file is about to be read.
+#[derive(Debug)]
+pub struct ScanBytes {
+    read: std::sync::atomic::AtomicU64,
+    at_most: u64,
+}
+
+impl ScanBytes {
+    /// A budget of `at_most` bytes.
+    #[must_use]
+    pub const fn new(at_most: u64) -> Self {
+        Self {
+            read: std::sync::atomic::AtomicU64::new(0),
+            at_most,
+        }
+    }
+
+    /// Takes `size` bytes from the budget and says whether they were within it. A file that is
+    /// refused still takes its size, so that no later file is read past the bound.
+    fn takes(&self, size: u64) -> bool {
+        let before = self
+            .read
+            .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+        before.saturating_add(size) <= self.at_most
+    }
+}
+
+impl Default for ScanBytes {
+    fn default() -> Self {
+        Self::new(SCAN_BYTES_AT_MOST)
+    }
+}
 
 /// What a key scan reads at most.
 #[derive(Clone, Copy, Debug)]
 struct ScanLimits {
     /// The most bytes of one file.
     file: u64,
-    /// The most entries listed and looked at, in all.
+    /// The most entries listed, in all.
     entries: usize,
+    /// The most bytes read in all by the scans that share a budget.
+    bytes: u64,
 }
 
 impl Default for ScanLimits {
@@ -436,6 +482,7 @@ impl Default for ScanLimits {
         Self {
             file: SCAN_FILE_AT_MOST,
             entries: SCAN_ENTRIES_AT_MOST,
+            bytes: SCAN_BYTES_AT_MOST,
         }
     }
 }
@@ -500,6 +547,42 @@ pub fn run_files_holding(root: &Path, rules: &RunRules, value: &[u8]) -> KeyScan
 #[must_use]
 pub fn run_files_holding_any(root: &Path, rules: &RunRules, values: &[&[u8]]) -> KeyScan {
     scan_files(root, values, Some(rules))
+}
+
+/// [`run_files_holding`] sharing the budget of bytes `bytes` with the other scans of the run.
+///
+/// # Panics
+///
+/// Panics when `value` is shorter than eight bytes, which would find anything.
+#[must_use]
+pub fn run_files_holding_sharing(
+    root: &Path,
+    rules: &RunRules,
+    value: &[u8],
+    bytes: &std::sync::Arc<ScanBytes>,
+) -> KeyScan {
+    run_files_holding_any_sharing(root, rules, &[value], bytes)
+}
+
+/// [`run_files_holding_any`] sharing the budget of bytes `bytes` with the other scans of the run.
+///
+/// # Panics
+///
+/// Panics when a value is shorter than eight bytes, which would find anything.
+#[must_use]
+pub fn run_files_holding_any_sharing(
+    root: &Path,
+    rules: &RunRules,
+    values: &[&[u8]],
+    bytes: &std::sync::Arc<ScanBytes>,
+) -> KeyScan {
+    scan_files_sharing(
+        root,
+        values,
+        Some(rules),
+        ScanLimits::default(),
+        std::sync::Arc::clone(bytes),
+    )
 }
 
 /// What a scan of a run's own directory holds to besides reading: the directory the run made, which
@@ -633,21 +716,22 @@ fn scan_directory(
                 return;
             }
         };
-        let room = scan.limits.entries.saturating_sub(scan.entries);
         let mut names = Vec::new();
         for entry in listing {
             match entry {
                 Ok(entry) => {
                     let name = entry.file_name();
                     if name.to_bytes() != b"." && name.to_bytes() != b".." {
-                        // A directory that lists more than the scan has room for is not listed
-                        // further, and the scan stops.
-                        if names.len() >= room {
-                            scan.entries = scan.limits.entries.saturating_add(1);
-                            scan.unread.push(format!(
-                                "{relative}: {}",
-                                not_scanned("more entries than the scan reads")
-                            ));
+                        // An entry is counted when it is listed, across the whole scan. Told once,
+                        // by the entry that went past the bound; the entries after it only stop.
+                        scan.entries = scan.entries.saturating_add(1);
+                        if scan.entries > scan.limits.entries {
+                            if scan.entries == scan.limits.entries.saturating_add(1) {
+                                scan.unread.push(format!(
+                                    "{relative}: {}",
+                                    not_scanned("more entries than the scan reads")
+                                ));
+                            }
                             return;
                         }
                         names.push(name.to_owned());
@@ -659,15 +743,8 @@ fn scan_directory(
         names
     };
     for name in names {
-        scan.entries = scan.entries.saturating_add(1);
+        // A scan that went past its bound in a directory below this one goes no further.
         if scan.entries > scan.limits.entries {
-            // Told once, by the entry that went past the bound; the entries after it only stop.
-            if scan.entries == scan.limits.entries.saturating_add(1) {
-                scan.unread.push(format!(
-                    "{relative}: {}",
-                    not_scanned("more entries than the scan reads")
-                ));
-            }
             return;
         }
         let shown = place(&name.to_string_lossy());
@@ -807,8 +884,20 @@ fn scan_file(
             not_scanned("it is larger than the scan reads")
         )
     };
-    if u64::try_from(opened.st_size).map_or(true, |size| size > scan.limits.file) {
+    let Some(size) = u64::try_from(opened.st_size)
+        .ok()
+        .filter(|size| *size <= scan.limits.file)
+    else {
         scan.unread.push(too_large());
+        return;
+    };
+    // And no more than the bound in all, by the scans that share the budget: a file that would
+    // take it past the bound is told as unread and not read.
+    if !scan.bytes.takes(size) {
+        scan.unread.push(format!(
+            "{shown}: {}",
+            not_scanned("the scan has read the bytes it reads in all")
+        ));
         return;
     }
     let mut file = std::fs::File::from(handle);
@@ -924,12 +1013,24 @@ fn scan_files(root: &Path, values: &[&[u8]], rules: Option<&RunRules>) -> KeySca
     scan_files_within(root, values, rules, ScanLimits::default())
 }
 
-/// [`scan_files`] within `limits`.
+/// [`scan_files`] within `limits`, with a budget of bytes of its own.
 fn scan_files_within(
     root: &Path,
     values: &[&[u8]],
     rules: Option<&RunRules>,
     limits: ScanLimits,
+) -> KeyScan {
+    let bytes = std::sync::Arc::new(ScanBytes::new(limits.bytes));
+    scan_files_sharing(root, values, rules, limits, bytes)
+}
+
+/// [`scan_files_within`] with the budget of bytes `bytes`, which other scans may share.
+fn scan_files_sharing(
+    root: &Path,
+    values: &[&[u8]],
+    rules: Option<&RunRules>,
+    limits: ScanLimits,
+    bytes: std::sync::Arc<ScanBytes>,
 ) -> KeyScan {
     assert!(
         values.iter().all(|value| value.len() >= 8),
@@ -942,6 +1043,7 @@ fn scan_files_within(
     let holds = |bytes: &[u8]| finders.iter().any(|finder| finder.find(bytes).is_some());
     let mut scan = KeyScan {
         limits,
+        bytes,
         ..KeyScan::default()
     };
     scan_root(root, rules, &holds, &mut scan);
@@ -2242,6 +2344,7 @@ mod tests {
         let limits = ScanLimits {
             file: 1 << 10,
             entries: 100,
+            ..ScanLimits::default()
         };
         let scan = scan_files_within(&run, &[key], Some(&rules_for(&run, &[])), limits);
         assert!(!scan.complete());
@@ -2271,6 +2374,7 @@ mod tests {
         let few = ScanLimits {
             file: 1 << 10,
             entries: 4,
+            ..ScanLimits::default()
         };
         let scan = scan_files_within(&run, &[key], Some(&rules_for(&run, &[])), few);
         assert!(!scan.complete());
@@ -2286,6 +2390,61 @@ mod tests {
         // Within the bounds the same tree is searched whole.
         let whole = scan_files_within(&run, &[key], Some(&rules_for(&run, &[])), limits);
         assert!(whole.complete(), "{:?}", whole.unread);
+    }
+
+    /// Two scans that share a budget of bytes read no more in all than it holds, and the entries of
+    /// a scan are counted when they are listed, across all its levels.
+    #[test]
+    fn the_scans_of_a_run_share_a_budget_of_bytes_and_count_entries_when_listed() {
+        let scratch = Scratch::new("scan-totals");
+        let run = scratch.0.join("run");
+        std::fs::create_dir_all(run.join("a")).expect("a run");
+        for index in 0..6 {
+            std::fs::write(run.join(format!("a/f{index}")), "x".repeat(1000)).expect("a file");
+        }
+        let key = b"the-key-value-0123456789";
+        let limits = ScanLimits {
+            file: 2 << 10,
+            bytes: 3 << 10,
+            ..ScanLimits::default()
+        };
+        let rules = rules_for(&run, &[]);
+        let bytes = std::sync::Arc::new(ScanBytes::new(limits.bytes));
+        let first = scan_files_sharing(&run, &[key], Some(&rules), limits, bytes.clone());
+        let unread = |scan: &KeyScan| {
+            scan.unread
+                .iter()
+                .filter(|entry| entry.contains("the scan has read the bytes it reads in all"))
+                .count()
+        };
+        assert_eq!(unread(&first), 3, "{:?}", first.unread);
+        // The second scan finds the budget spent: every file is told as unread and none is read.
+        let second = scan_files_sharing(&run, &[key], Some(&rules), limits, bytes);
+        assert_eq!(unread(&second), 6, "{:?}", second.unread);
+        // Entries in all: four levels that each list five entries, and a bound of twelve.
+        let deep = scratch.0.join("deep");
+        let mut place = deep.clone();
+        for _ in 0..4 {
+            std::fs::create_dir_all(&place).expect("a level");
+            for file in 0..4 {
+                std::fs::write(place.join(format!("f{file}")), "x").expect("a file");
+            }
+            place = place.join("next");
+        }
+        let few = ScanLimits {
+            entries: 12,
+            ..ScanLimits::default()
+        };
+        let scan = scan_files_within(&deep, &[key], Some(&rules_for(&deep, &[])), few);
+        assert_eq!(
+            scan.unread
+                .iter()
+                .filter(|entry| entry.contains("more entries than the scan reads"))
+                .count(),
+            1,
+            "{:?}",
+            scan.unread
+        );
     }
 
     /// The scan of a run's directory reads through handles and refuses what it must not read: a

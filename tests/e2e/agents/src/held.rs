@@ -20,7 +20,8 @@ use kr_e2e_m1b::run::{Removal, Run, remove_run_directory};
 use serde_json::{Value, json};
 
 use crate::account::{
-    self, KeyScan, RunRules, now_ms, record_key_scan, run_files_holding, run_files_holding_any,
+    self, KeyScan, RunRules, ScanBytes, now_ms, record_key_scan, run_files_holding_any_sharing,
+    run_files_holding_sharing,
 };
 use crate::build::Account;
 use crate::{confine, keys};
@@ -511,15 +512,23 @@ impl RunScan {
     /// `rules`: the directory the run made, and the links the harness made.
     #[must_use]
     pub fn of(root: &Path, rules: &RunRules, held: &HeldKeys) -> Self {
+        Self::of_within(root, rules, held, ScanBytes::default())
+    }
+
+    /// [`RunScan::of`] with a budget of bytes that the two scans read from together, so that they
+    /// are bound together.
+    #[must_use]
+    fn of_within(root: &Path, rules: &RunRules, held: &HeldKeys, budget: ScanBytes) -> Self {
+        let bytes = std::sync::Arc::new(budget);
         let key = held.key.as_ref().map(|(name, value)| {
             (
                 name.clone(),
-                run_files_holding(root, rules, value.as_bytes()),
+                run_files_holding_sharing(root, rules, value.as_bytes(), &bytes),
             )
         });
         let others = (!held.others.is_empty()).then(|| {
             let values: Vec<&[u8]> = held.others.iter().map(String::as_bytes).collect();
-            run_files_holding_any(root, rules, &values)
+            run_files_holding_any_sharing(root, rules, &values, &bytes)
         });
         Self {
             key,
@@ -672,6 +681,9 @@ pub(crate) enum Class {
     TooLarge,
     /// The agent's record lists more entries than the audit walks.
     TooMany,
+    /// The files of the agent's record are more bytes than the audit reads in all: the file that
+    /// would pass the bound was not read.
+    TooMuch,
 }
 
 /// A tree that could not be looked at: the class of the failure and how many entries had been looked
@@ -729,12 +741,16 @@ impl std::fmt::Display for Unlooked {
             ),
             Class::TooLarge => write!(
                 formatter,
-                "a file is larger than the audit reads, and none of it was read (after {seen} \
-                 entries)"
+                "a file is larger than the audit reads: what was read of it is discarded, and none of \
+                 it is counted or kept (after {seen} entries)"
             ),
             Class::TooMany => write!(
                 formatter,
                 "the tree lists more entries than the audit walks (after {seen} entries)"
+            ),
+            Class::TooMuch => write!(
+                formatter,
+                "the files are more bytes than the audit reads in all (after {seen} entries)"
             ),
         }
     }
@@ -747,8 +763,20 @@ pub(crate) const DEEPEST: usize = 64;
 /// size its handle reports or by what is read through it, is left unread.
 pub(crate) const RECORD_FILE_AT_MOST: u64 = 64 << 20;
 
-/// The most entries of the agent's record that the audit lists and looks at, in all.
+/// The most entries of the agent's record that the audit lists, in all, counted when each is
+/// listed: the names of one listing are held until its directory is done, so the count bounds what
+/// the walk holds. A real record is a few files.
 pub(crate) const RECORD_ENTRIES_AT_MOST: usize = 100_000;
+
+/// The most bytes of the agent's record that the audit reads in all. A file whose size would take
+/// the total past it is not read; a real record is a few kilobytes, and many files that each fit
+/// the per-file bound (clones cost no disk) must not make the audit read for hours.
+pub(crate) const RECORD_BYTES_AT_MOST: u64 = 256 << 20;
+
+/// The most turn names the audit keeps in all. Each non-UUID name is kept with its file's place,
+/// about two hundred bytes in two sets, so the sets stay within about forty megabytes; a real
+/// record names a handful.
+pub(crate) const RECORD_NAMES_AT_MOST: usize = 100_000;
 
 /// What the audit's walk of the agent's record reads at most. A walk past either is a failure of
 /// its own ([`Class::TooLarge`], [`Class::TooMany`]): nothing of the file is read, and the audit says
@@ -757,8 +785,12 @@ pub(crate) const RECORD_ENTRIES_AT_MOST: usize = 100_000;
 pub(crate) struct Limits {
     /// The most bytes of one file.
     pub(crate) file: u64,
-    /// The most entries listed and looked at, in all.
+    /// The most entries listed, in all.
     pub(crate) entries: usize,
+    /// The most bytes read, in all.
+    pub(crate) bytes: u64,
+    /// The most turn names kept, in all.
+    pub(crate) names: usize,
 }
 
 impl Limits {
@@ -766,6 +798,8 @@ impl Limits {
     pub(crate) const RECORD: Self = Self {
         file: RECORD_FILE_AT_MOST,
         entries: RECORD_ENTRIES_AT_MOST,
+        bytes: RECORD_BYTES_AT_MOST,
+        names: RECORD_NAMES_AT_MOST,
     };
 }
 
@@ -1288,6 +1322,9 @@ struct Bounds<'a> {
     root: rustix::fs::Stat,
     pin: &'a kr_e2e_m1b::run::RootPin,
     limits: Limits,
+    /// How many entries have been listed so far, and how many bytes read, in the whole walk.
+    listed: std::cell::Cell<usize>,
+    read: std::cell::Cell<u64>,
 }
 
 /// Opens the directory `relative` below `within`, one component at a time, each looked at and opened
@@ -1348,6 +1385,8 @@ fn record_directory<'a>(
             root,
             pin,
             limits: Limits::RECORD,
+            listed: std::cell::Cell::new(0),
+            read: std::cell::Cell::new(0),
         },
     )))
 }
@@ -1382,14 +1421,15 @@ fn read_files(
             seen: *seen,
         };
         let listing = rustix::fs::Dir::read_from(directory).map_err(refused)?;
-        let room = bounds.limits.entries.saturating_sub(*seen);
         let mut names = Vec::new();
         for entry in listing {
             let entry = entry.map_err(refused)?;
             let name = entry.file_name();
             if name.to_bytes() != b"." && name.to_bytes() != b".." {
-                // A directory that lists more than the walk has room for is not listed further.
-                if names.len() >= room {
+                // An entry is counted when it is listed, across the whole walk, and a listing that
+                // takes the count past the bound is not listed further.
+                bounds.listed.set(bounds.listed.get() + 1);
+                if bounds.listed.get() > bounds.limits.entries {
                     return Err(Unlooked {
                         class: Class::TooMany,
                         seen: *seen,
@@ -1415,9 +1455,6 @@ fn read_files(
                 )
             })?;
         *seen += 1;
-        if *seen > bounds.limits.entries {
-            return Err(unlooked(Class::TooMany, seen));
-        }
         // A volume attached below the record is no link and its files have one name: only the
         // device tells it from the run's own (a check for mounts only: the system's own volumes
         // share one device number).
@@ -1471,9 +1508,18 @@ fn read_files(
                 }
                 // The size comes from the handle that will be read, and no more than the bound is
                 // read through it: a file above it, sparse or not, is not read into memory.
-                if u64::try_from(opened.st_size).map_or(true, |size| size > bounds.limits.file) {
+                let Some(size) = u64::try_from(opened.st_size)
+                    .ok()
+                    .filter(|size| *size <= bounds.limits.file)
+                else {
                     return Err(unlooked(Class::TooLarge, seen));
+                };
+                // And no more than the bound in all: a file that would take the bytes read past it
+                // is not read, and what was read before is already handed on.
+                if bounds.read.get().saturating_add(size) > bounds.limits.bytes {
+                    return Err(unlooked(Class::TooMuch, seen));
                 }
+                bounds.read.set(bounds.read.get() + size);
                 let mut bytes = Vec::new();
                 std::fs::File::from(handle)
                     .take(bounds.limits.file.saturating_add(1))
@@ -1544,7 +1590,7 @@ fn read_record_within(
     between: &mut dyn FnMut(Moment, &[u8]),
 ) -> Result<u64, String> {
     let said = |why: Unlooked| {
-        if matches!(why.class, Class::TooLarge | Class::TooMany) {
+        if matches!(why.class, Class::TooLarge | Class::TooMany | Class::TooMuch) {
             format!("{RECORD_BEYOND_THE_BOUNDS}: {why}")
         } else {
             format!("the agent's record cannot be read whole: {why}")
@@ -1648,6 +1694,19 @@ pub fn turns_recorded(
     pin: &kr_e2e_m1b::run::RootPin,
     relative: &Path,
 ) -> Result<Recorded, String> {
+    turns_recorded_within(account, within, pin, relative, Limits::RECORD)
+}
+
+/// [`turns_recorded`] within `limits`: a record beyond the bounds on the bytes read in all, the
+/// entries listed in all, or the turn names kept in all is incomplete ([`RECORD_BEYOND_THE_BOUNDS`]),
+/// and what is said holds the figure and the files read by then, and no content.
+fn turns_recorded_within(
+    account: &Account,
+    within: &Path,
+    pin: &kr_e2e_m1b::run::RootPin,
+    relative: &Path,
+    limits: Limits,
+) -> Result<Recorded, String> {
     let marker = account.turn_line.as_deref().ok_or_else(|| {
         "the entry names no line that marks a turn, so the turns the agent ran cannot be counted"
             .to_owned()
@@ -1657,29 +1716,49 @@ pub fn turns_recorded(
     let mut by_other_name: BTreeSet<String> = BTreeSet::new();
     let mut forms: BTreeSet<String> = BTreeSet::new();
     let mut unnamed = 0_u64;
-    let files = read_record(within, pin, relative, &mut |place, content| {
-        for line in String::from_utf8_lossy(content).lines() {
-            if line.contains(marker) {
-                let named = serde_json::from_str::<Value>(line)
-                    .ok()
-                    .as_ref()
-                    .and_then(turn_identifier);
-                match named {
-                    Some(named) if is_uuid(&named) => {
-                        by_uuid.insert(named.clone());
-                        turns.insert(named);
+    let mut too_many_names = false;
+    let files = read_record_within(
+        within,
+        pin,
+        relative,
+        limits,
+        &mut |place, content| {
+            for line in String::from_utf8_lossy(content).lines() {
+                if line.contains(marker) {
+                    // The names kept in all are bound: past the bound nothing more is kept.
+                    if turns.len() + by_uuid.len() + by_other_name.len() >= limits.names {
+                        too_many_names = true;
+                        return;
                     }
-                    Some(named) => {
-                        let own = format!("{}\0{named}", String::from_utf8_lossy(place));
-                        by_other_name.insert(own.clone());
-                        turns.insert(own);
-                        forms.insert(form_of(&named));
+                    let named = serde_json::from_str::<Value>(line)
+                        .ok()
+                        .as_ref()
+                        .and_then(turn_identifier);
+                    match named {
+                        Some(named) if is_uuid(&named) => {
+                            by_uuid.insert(named.clone());
+                            turns.insert(named);
+                        }
+                        Some(named) => {
+                            let own = format!("{}\0{named}", String::from_utf8_lossy(place));
+                            by_other_name.insert(own.clone());
+                            turns.insert(own);
+                            forms.insert(form_of(&named));
+                        }
+                        None => unnamed += 1,
                     }
-                    None => unnamed += 1,
                 }
             }
-        }
-    })?;
+        },
+        &mut |_, _| {},
+    )?;
+    if too_many_names {
+        return Err(format!(
+            "{RECORD_BEYOND_THE_BOUNDS}: the record names more turns than the audit keeps ({} \
+             names), and the turns were not counted ({files} files read by then, no content kept)",
+            limits.names
+        ));
+    }
     // A name and an occurrence cannot be the same turn: they are kept apart, and counted together.
     Ok(Recorded {
         turns: u64::try_from(turns.len())
@@ -1916,6 +1995,7 @@ pub fn conversations_relative(account: &Account) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::run_files_holding;
 
     /// A directory of this test's own.
     fn scratch(name: &str) -> PathBuf {
@@ -2711,6 +2791,7 @@ mod tests {
         let within = Limits {
             file: 1 << 10,
             entries: 100,
+            ..Limits::RECORD
         };
         let mut read = Vec::new();
         let why = read_record_within(
@@ -2754,6 +2835,7 @@ mod tests {
         let few = Limits {
             file: 1 << 10,
             entries: 4,
+            ..Limits::RECORD
         };
         let mut handed = 0;
         let why = read_record_within(
@@ -2771,6 +2853,7 @@ mod tests {
         let wide = Limits {
             file: 1 << 10,
             entries: 100,
+            ..Limits::RECORD
         };
         assert_eq!(
             read_record_within(
@@ -2783,6 +2866,109 @@ mod tests {
             ),
             Ok(9)
         );
+    }
+
+    #[test]
+    fn the_two_scans_of_a_run_read_from_one_budget_of_bytes() {
+        let run = scratch("scan-budget");
+        for index in 0..6 {
+            std::fs::write(run.join(format!("f{index}")), "x".repeat(1000)).expect("a file");
+        }
+        let rules = RunRules::new(&pinned(&run), Vec::new());
+        let held = HeldKeys {
+            key: Some(("LOGIN".to_owned(), "login-value-0123456789".to_owned())),
+            others: vec!["other-key-value-9876543210".to_owned()],
+        };
+        let scan = RunScan::of_within(&run, &rules, &held, ScanBytes::new(3 << 10));
+        let unread = |scan: &KeyScan| scan.unread.len();
+        // The first scan reads three files of the six; the second finds the budget spent.
+        assert_eq!(scan.key.as_ref().map(|(_, scan)| unread(scan)), Some(3));
+        assert_eq!(scan.others.as_ref().map(unread), Some(6));
+    }
+
+    #[test]
+    fn a_record_of_many_files_that_each_fit_is_incomplete_past_the_totals_in_all() {
+        let run = scratch("record-totals");
+        let sessions = Path::new("agent-config/sessions");
+        let line = |name: &str| format!("{{\"type\":\"task_started\",\"turn_id\":\"{name}\"}}\n");
+        std::fs::create_dir_all(run.join("agent-config/sessions/2026")).expect("a record");
+        // Six files of a little over a kilobyte that each fit a bound of two, and name one turn.
+        for index in 0..6 {
+            std::fs::write(
+                run.join(format!("agent-config/sessions/2026/f{index}.jsonl")),
+                format!("{}{}\n", line("a1"), " ".repeat(1000)),
+            )
+            .expect("a conversation");
+        }
+        // The bytes read in all: with a bound of three kilobytes, the third file is not read.
+        let bytes = Limits {
+            file: 2 << 10,
+            bytes: 3 << 10,
+            ..Limits::RECORD
+        };
+        let mut handed = 0;
+        let why = read_record_within(
+            &run,
+            &pinned(&run),
+            sessions,
+            bytes,
+            &mut |_, _| handed += 1,
+            &mut |_, _| {},
+        )
+        .expect_err("more bytes than the bound in all");
+        assert!(why.starts_with(RECORD_BEYOND_THE_BOUNDS), "{why}");
+        assert!(why.contains("bytes"), "{why}");
+        assert!(handed <= 2, "{handed} files were read");
+        // The turn names kept in all: the same name in six files is six entries, and past the
+        // bound of three the audit stops and says so, with no content.
+        let names = Limits {
+            file: 2 << 10,
+            names: 3,
+            ..Limits::RECORD
+        };
+        let why = turns_recorded_within(&account(), &run, &pinned(&run), sessions, names)
+            .expect_err("more names than the bound in all");
+        assert!(why.starts_with(RECORD_BEYOND_THE_BOUNDS), "{why}");
+        assert!(why.contains("names") && !why.contains("a1"), "{why}");
+        assert_eq!(
+            audit_turns(true, 1, &Err(why.clone())),
+            Audit::Incomplete(why)
+        );
+        // Within the bounds the same record is counted.
+        let whole = Limits {
+            file: 2 << 10,
+            ..Limits::RECORD
+        };
+        assert_eq!(
+            turns_recorded_within(&account(), &run, &pinned(&run), sessions, whole)
+                .map(|found| found.by_other_name),
+            Ok(6)
+        );
+        // Entries in all: four levels that each list five entries are twenty, and the walk stops
+        // at its bound of twelve though no level lists more than the bound.
+        let deep = scratch("record-deep");
+        let mut place = deep.join("agent-config/sessions");
+        for _ in 0..4 {
+            std::fs::create_dir_all(&place).expect("a level");
+            for file in 0..4 {
+                std::fs::write(place.join(format!("f{file}.jsonl")), "{}\n").expect("a file");
+            }
+            place = place.join("next");
+        }
+        let few = Limits {
+            entries: 12,
+            ..Limits::RECORD
+        };
+        let why = read_record_within(
+            &deep,
+            &pinned(&deep),
+            sessions,
+            few,
+            &mut |_, _| {},
+            &mut |_, _| {},
+        )
+        .expect_err("more entries listed in all than the bound");
+        assert!(why.starts_with(RECORD_BEYOND_THE_BOUNDS), "{why}");
     }
 
     #[test]
