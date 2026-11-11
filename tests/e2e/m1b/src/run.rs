@@ -13,8 +13,8 @@
 //! before it is reaped, while its number cannot pass to anyone else ([`Run::record_child`]). A
 //! number learned from a listing or a file is recorded only when, read while one start holds it,
 //! the process is beneath a process this run recorded ([`Run::record_descendants`]) or its command
-//! line names this run's directory, which is new for every run ([`Run::record_named`]). A worker's
-//! identity comes whole from the host's own registry.
+//! line names this run's directory, which is new for every run ([`Run::record_named`]). A worker is
+//! found by its command line in the process table, and no file of the host's is opened for it.
 //!
 //! The closing check asks four questions, and a run that leaves anything behind fails on it:
 //! whether any recorded process still runs, whether any process at all still runs out of this
