@@ -2603,44 +2603,83 @@ async fn a_connection_lost_after_a_refusal_ends_the_attachment_as_a_lost_connect
         .unwrap_or_else(|_| panic!("the session closed within {LIVENESS_DEADLINE:?}"));
 }
 
+/// A shell word that is the text `text`, whatever it holds.
+fn shell_quoted(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
 /// Hosts a session for a person at a real terminal to attach to by hand.
 ///
-/// The session's application turns on mouse reporting, draws one OSC 8 hyperlink and records, byte
-/// for byte and in hexadecimal, what it is read as input, so that the keys, the mouse and the link
-/// a person uses in a terminal application can be shown to reach it and to survive a reconnection
-/// and a resize. It
-/// writes `env.sh` into `KR_HOLD_DIR`, which names the environment `kr attach 1` runs in and the
-/// `kr` to run, prints `KR_HOLD_READY`, and holds until a `stop` file appears there. The application's
-/// input is `application-read.log` in the same directory; `KR_HOLD_LINK` is the address the link
-/// names. Run with `--ignored`.
+/// The session's application turns SGR mouse reporting on, draws one OSC 8 hyperlink and records, byte
+/// for byte and in hexadecimal, what it is read as input, so that the keys and the mouse a person
+/// uses in a terminal application can be shown to reach it, and the link to be drawn again after an
+/// attachment, a reconnection and a resize. That the terminal opens the link is seen by whoever
+/// activates it, not by this record.
+///
+/// The application turns the mouse modes on once, before any attachment, as an editor does. With
+/// `KR_HOLD_MOUSE_AGAIN=1` it turns them on again after every byte it reads, so that a click can be
+/// shown to pass through the attachment whatever the attachment did with the modes it was given.
+///
+/// It writes `env.sh` into `KR_HOLD_DIR` (a directory only this account can write to), which names the
+/// environment `kr attach 1` runs in, the `TERM` to use and the `kr` to run, prints `KR_HOLD_READY`,
+/// and holds until a `stop` file appears there. The application's input is `application-read.log` in
+/// the same directory, emptied at the start; `KR_HOLD_LINK` is the address the link names. Run with
+/// `--ignored --nocapture`, because the marker is printed to standard output.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "holds a session for a person at a terminal until a stop file appears; run by hand with KR_HOLD_DIR and KR_HOLD_LINK set"]
 async fn a_session_is_held_for_a_person_at_a_terminal() {
-    let dir = std::path::PathBuf::from(
-        std::env::var("KR_HOLD_DIR").expect("KR_HOLD_DIR names a directory"),
-    );
+    use std::os::unix::fs::PermissionsExt;
+
     let link =
         std::env::var("KR_HOLD_LINK").expect("KR_HOLD_LINK names the address the link opens");
-    std::fs::create_dir_all(&dir).expect("the directory exists");
+    let requested = std::path::PathBuf::from(
+        std::env::var("KR_HOLD_DIR").expect("KR_HOLD_DIR names a directory"),
+    );
+    std::fs::create_dir_all(&requested).expect("the directory exists");
+    // The application runs in `/`, so every path it is given is an absolute one.
+    let dir = std::path::absolute(&requested).expect("an absolute directory");
+    let mode = std::fs::metadata(&dir)
+        .expect("the directory's metadata")
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o022,
+        0,
+        "{} is writable by others, and a person sources a file from it",
+        dir.display()
+    );
     let read_log = dir.join("application-read.log");
+    let stop = dir.join("stop");
+    let environment_file = dir.join("env.sh");
+    for stale in [&stop, &environment_file] {
+        let _ = std::fs::remove_file(stale);
+    }
+    std::fs::write(&read_log, b"").expect("an empty record of the application's input");
+
+    let modes = "printf '\\033[?1000h\\033[?1002h\\033[?1006h'";
+    let again = if std::env::var("KR_HOLD_MOUSE_AGAIN").as_deref() == Ok("1") {
+        format!("{modes}; ")
+    } else {
+        String::new()
+    };
     let script = format!(
-        "printf '\\033[?1000h\\033[?1002h\\033[?1006h'; \
-         printf 'a link: \\033]8;;{link}\\033\\\\the page on this machine\\033]8;;\\033\\\\\\r\\n'; \
+        "{modes}; \
+         printf 'a link: \\033]8;;%s\\033\\\\the page on this machine\\033]8;;\\033\\\\\\r\\n' {}; \
          stty raw -echo; \
-         while :; do b=$(dd bs=1 count=1 2>/dev/null | od -An -v -tx1); echo \"$b\" >> {}; \
-         printf '\\033[?1000h\\033[?1002h\\033[?1006h'; done",
-        read_log.display()
+         while :; do b=$(dd bs=1 count=1 2>/dev/null | od -An -v -tx1); \
+         echo \"$b\" >> {}; {again}done",
+        shell_quoted(&link),
+        shell_quoted(&read_log.display().to_string()),
     );
     let hosted = hosted(&script).await;
     let environment = format!(
-        "export KR_RUNTIME_DIR='{}'\nexport KR_STATE_DIR='{}'\nexport TERM=xterm-256color\nexport KR='{}'\n",
-        hosted.temp.paths().runtime_root().display(),
-        hosted.temp.paths().state_root().display(),
-        kr().display(),
+        "export KR_RUNTIME_DIR={}\nexport KR_STATE_DIR={}\nexport TERM=xterm-256color\nexport KR={}\n",
+        shell_quoted(&hosted.temp.paths().runtime_root().display().to_string()),
+        shell_quoted(&hosted.temp.paths().state_root().display().to_string()),
+        shell_quoted(&kr().display().to_string()),
     );
-    std::fs::write(dir.join("env.sh"), environment).expect("writes the environment");
-    println!("KR_HOLD_READY {}", dir.join("env.sh").display());
-    let stop = dir.join("stop");
+    std::fs::write(&environment_file, environment).expect("writes the environment");
+    println!("KR_HOLD_READY {}", environment_file.display());
     while !stop.exists() {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
