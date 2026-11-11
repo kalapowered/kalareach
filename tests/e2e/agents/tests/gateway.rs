@@ -1450,18 +1450,20 @@ impl Person {
             tag += 1;
         }
         let mut exported: Vec<String> = Vec::new();
-        let mut said = None;
-        loop {
+        let mut said: Option<session_environment::Snapshot> = None;
+        let snapshot = loop {
             let rows =
                 self.types_the_check(expected, &Expected::exported_line(exported.len(), tag), tag)?;
-            let (names, total) = session_environment::read_exported(tag, &exported, said, &rows)?;
+            let (names, snapshot) =
+                session_environment::read_exported(tag, &exported, said.as_ref(), &rows)?;
             tag += 1;
-            said = Some(total);
             exported.extend(names);
-            if exported.len() == total {
-                break;
+            if exported.len() == snapshot.total {
+                break snapshot;
             }
-        }
+            said = Some(snapshot);
+        };
+        session_environment::checks_the_snapshot(&exported, &snapshot)?;
         self.clears_the_screen_of(session_environment::ROW);
         expected.judge(&readings, &exported)?;
         Ok(expected.passed_line(&exported))
