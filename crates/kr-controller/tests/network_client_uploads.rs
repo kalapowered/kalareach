@@ -41,6 +41,11 @@ const WAIT: Duration = Duration::from_secs(120);
 
 const TTL: DurationMs = DurationMs::new(60_000);
 
+/// How long a case waits for the host to end a stream the client gave up. The host resets a stream
+/// that stands idle for sixty seconds, so a wait that lasted that long would pass for a lane that left
+/// its stream open: the client's own reset reaches the host in well under this.
+const BEFORE_THE_IDLE_RESET: Duration = Duration::from_secs(30);
+
 async fn within<T>(future: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(WAIT, future)
         .await
@@ -557,8 +562,11 @@ async fn a_device_that_may_not_view_a_session_is_not_told_its_finish_and_reads_i
     adopted.stop().await;
 }
 
-/// KR-REQ-14.12: a caller that gives up a send releases the upload with `uploads::cancel`, which names
-/// the transfer the plan holds: the host cancels it and gives back the bytes it reserved.
+/// KR-REQ-14.12: a caller that gives up a send while a chunk is at the host releases the upload with
+/// `uploads::cancel`, which names the transfer the plan holds. The host holds the first chunk after it
+/// took its transfer's gate, so the exchange is under way when the send is dropped. The dropped lane
+/// resets its stream: once the held chunk goes on, the host's task for the stream ends, no chunk is left
+/// in the transfer service, and the host then cancels the upload and gives back the bytes it reserved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_upload_the_caller_gives_up_is_cancelled_by_its_transfer_and_its_bytes_are_released() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -570,21 +578,33 @@ async fn an_upload_the_caller_gives_up_is_cancelled_by_its_transfer_and_its_byte
         .expect("the host takes an attachment stream from a device");
     let bytes = pattern(2 * UPLOAD_CHUNK_LEN + 5_000);
     let mut upload = plan(&host, None, "given-up.bin", &bytes);
-    let (progress, mut watching) = tokio::sync::watch::channel(Progress::default());
+    let (progress, _watching) = tokio::sync::watch::channel(Progress::default());
     let target = on_the_host(&host);
+    let (held, release) = host.network().hold_chunks_after_the_gate();
+    let mut ended = host.network().chunk_tasks_ended();
     {
-        // The send is dropped as soon as the driver says it is sending: the reservation has been
-        // answered, and the chunks are on their way.
+        // The send is dropped while the host holds the first chunk: the chunk is written and its
+        // answer is awaited, so the lane is part way through its call.
         let sending = uploads::send(&session, &route, &target, &mut upload, TTL, &progress);
         tokio::pin!(sending);
         tokio::select! {
             sent = &mut sending => panic!("the upload ended before it was given up: {sent:?}"),
-            told = watching.wait_for(|told| told.stage == Stage::Sending) => {
-                told.expect("the driver goes on");
-            }
+            arrived = held => arrived.expect("the host holds the first chunk"),
         }
     }
     let transfer = *upload.transfer_id().expect("the plan holds the transfer");
+    release.send(()).expect("the held chunk goes on");
+    tokio::time::timeout(BEFORE_THE_IDLE_RESET, ended.wait_for(|ended| *ended >= 1))
+        .await
+        .expect(
+            "the host's task for the dropped lane's stream ends before its idle reset would end it",
+        )
+        .expect("the count stays open");
+    within(
+        host.network()
+            .until_no_chunk_is_in_the_service(record.device_id, transfer),
+    )
+    .await;
 
     let cancelled = within(uploads::cancel(&session, &target, transfer, TTL))
         .await

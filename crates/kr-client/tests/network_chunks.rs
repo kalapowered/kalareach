@@ -1040,7 +1040,8 @@ async fn the_refused_windows_marker_survives_the_lanes_replacement() {
 /// stream opened before the wait is dead when the chunk goes on it and the chunk costs a retry. The
 /// lane has its window first and opens its stream for the chunk. The case lets the host's idle
 /// bound pass during the wait, once the host has read the header of every stream the client has
-/// opened, and the chunk then goes on a stream the bound did not reach.
+/// opened, and renews the window once the host has ended every stream it read, so that a stream
+/// the lane held would be reset by then; the chunk goes on a stream the bound did not reach.
 #[tokio::test]
 async fn a_lane_that_waits_for_a_window_holds_no_stream_for_the_host_to_reset() {
     let script = Script::new(true);
@@ -1081,6 +1082,7 @@ async fn a_lane_that_waits_for_a_window_holds_no_stream_for_the_host_to_reset() 
         })
         .await;
     script.idle_bound_passes();
+    script.until_every_stream_has_ended().await;
     script.renew_to("replacement", session.transport().connection_id());
     within(sending)
         .await
