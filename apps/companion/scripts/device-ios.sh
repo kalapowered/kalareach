@@ -512,7 +512,7 @@ build_app() {
 build_tests() {
   mkdir -p "$work"
   write_local_xcconfig no
-  local derived="$work/tests-$target" unsigned=() packages=()
+  local derived="$work/tests-$target" unsigned=() packages=() lock=()
   # A device build is made with signing off and signed by hand afterwards.
   [ "$target" = device ] && unsigned=(CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO)
   if [ -n "${KR_IOS_PACKAGES:-}" ]; then
@@ -522,8 +522,10 @@ build_tests() {
     esac
     mkdir -p "$KR_IOS_PACKAGES" || die "the folder of the Swift packages could not be made: $KR_IOS_PACKAGES"
     packages=(-clonedSourcePackagesDirPath "$KR_IOS_PACKAGES" -onlyUsePackageVersionsFromResolvedFile)
+    # Builds that fetch into one empty folder at the same time break each other, so one runs at a time.
+    lock=(/usr/bin/lockf -k "${KR_IOS_PACKAGES%/}.lock")
   fi
-  ( cd "$apple" && xcodebuild build-for-testing -project companion-tauri.xcodeproj -scheme "$tests_scheme" -sdk "$(sdk)" \
+  ( cd "$apple" && ${lock[@]+"${lock[@]}"} xcodebuild build-for-testing -project companion-tauri.xcodeproj -scheme "$tests_scheme" -sdk "$(sdk)" \
       -destination "generic/platform=$([ "$target" = device ] && echo iOS || echo 'iOS Simulator')" -derivedDataPath "$derived" \
       ${unsigned[@]+"${unsigned[@]}"} ${packages[@]+"${packages[@]}"} ) \
     > "$work/build-tests-$target.log" 2>&1 || { tail -20 "$work/build-tests-$target.log"; die "the test build failed"; }

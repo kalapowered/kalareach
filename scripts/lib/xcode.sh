@@ -13,6 +13,11 @@
 # a folder. The folder has to be an absolute path. A build that is given it uses the package
 # versions the project's `Package.resolved` records, so the shared folder never moves a pin. Only
 # the build and the tools it starts, which are children of the terminal, read the folder.
+#
+# `kr_with_packages_lock <command...>` runs the command, and while KR_IOS_PACKAGES names a folder it
+# holds that folder's lock for the whole command. Two builds that fetch into one empty folder at the
+# same time break each other (SwiftPM takes no lock of its own there), so a command that may fetch
+# runs under it. The lock is released when the command ends, however it ends.
 
 kr_shared_packages() {
     kr_package_options=()
@@ -29,6 +34,14 @@ kr_shared_packages() {
     mkdir -p "$KR_IOS_PACKAGES" || return 2
     # shellcheck disable=SC2034 # read by the scripts that source this file
     kr_package_options=(-clonedSourcePackagesDirPath "$KR_IOS_PACKAGES" -onlyUsePackageVersionsFromResolvedFile)
+}
+
+kr_with_packages_lock() {
+    if [ -z "${KR_IOS_PACKAGES:-}" ]; then
+        "$@"
+        return
+    fi
+    /usr/bin/lockf -k "${KR_IOS_PACKAGES%/}.lock" "$@"
 }
 
 kr_select_xcode() {

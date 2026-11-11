@@ -968,7 +968,7 @@ run_ios() {
     say "building the tests that drive it"
     local derived="$cache/ios-tests"
     kr_shared_packages || return 2
-    ( cd "$companion/src-tauri/gen/apple" && xcodebuild build-for-testing -project companion-tauri.xcodeproj \
+    ( cd "$companion/src-tauri/gen/apple" && kr_with_packages_lock xcodebuild build-for-testing -project companion-tauri.xcodeproj \
         -scheme KalaReachUITests -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
         -derivedDataPath "$derived" ${kr_package_options[@]+"${kr_package_options[@]}"} ) >"$artefacts/build-tests.log" 2>&1 \
         || { tail -20 "$artefacts/build-tests.log"; say "the tests did not build"; return 2; }

@@ -111,7 +111,7 @@ derived+=(${kr_package_options[@]+"${kr_package_options[@]}"})
 # The packages at the versions the project records, fetched into this run's own directory. The
 # destinations are asked for after this, with the same directory and no further resolving, so that
 # nothing resolves the packages to other versions and rewrites the file that pins them.
-xcodebuild -resolvePackageDependencies -onlyUsePackageVersionsFromResolvedFile \
+kr_with_packages_lock xcodebuild -resolvePackageDependencies -onlyUsePackageVersionsFromResolvedFile \
     -project "$project" -scheme "$scheme" "${derived[@]}"
 
 destinations="$(xcodebuild -project "$project" -scheme "$scheme" "${derived[@]}" \
