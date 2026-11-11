@@ -104,6 +104,7 @@ use kr_e2e_agents::held::{
     read_record, turns_recorded, unchanged_before_the_charge,
 };
 use kr_e2e_agents::outcome::Outcome;
+use kr_e2e_agents::session_environment::{self, Expected};
 use kr_e2e_agents::stage::{
     Installation, PlacedProgram, closed_port, scan_rules, session_variables,
 };
@@ -360,11 +361,16 @@ impl Real {
         (run.root().display().to_string(), work)
     }
 
-    /// The environment a session of the run is created with: the harness's own for a session, its
-    /// closed-port proxy variables included (the entry's provider and the gateway are on loopback,
-    /// which `NO_PROXY` exempts), the entry's variables, its configuration directory with the
-    /// entry's arguments and switches written as the keys of its `config.toml`, and its login, and
-    /// none of the variables the entry clears but the ones it sets itself.
+    /// The list `kr new` is given for a session of the run, which the host's worker keeps but for
+    /// the names the host owns (the reserved `KR_` prefix, the terminal's identity, the desktop's
+    /// names: the host's own state and runtime directories are among them, and are not the
+    /// session's): the harness's own for a session, its closed-port proxy variables included (the
+    /// entry's provider and the gateway are on loopback, which `NO_PROXY` exempts), the entry's
+    /// variables, its configuration directory with the entry's arguments and switches written as
+    /// the keys of its `config.toml`, and its login, and none of the variables the entry clears but
+    /// the ones it sets itself. What the session's shell really holds of it is read at its prompt
+    /// before the first typing ([`Person::reads_the_environment`]), a moment before the agent reads
+    /// it, and nothing later.
     fn variables(&self, host: &Host<'_>, shell: &shells::ManagedShell) -> Vec<(String, String)> {
         let mut variables = session_variables(host, shell, &self.build.environment, closed_port());
         for name in ["USER", "LOGNAME"] {
@@ -924,6 +930,58 @@ impl Context {
         }
     }
 
+    /// The variables the stand-in is given on the stand-in route, in the list every session is
+    /// created with: its variants, the file that releases it, the file its server notes what it
+    /// received in, the program its server starts, and `more` (a case's own). A real agent takes
+    /// none.
+    fn stand_in_variables(&self, variants: &str, more: &[(&str, String)]) -> Vec<(String, String)> {
+        if !matches!(self.route, Route::StandIn) {
+            return Vec::new();
+        }
+        let mut variables = vec![
+            ("STAND_IN".to_owned(), variants.to_owned()),
+            (
+                "STAND_IN_RELEASE".to_owned(),
+                release_of(self).display().to_string(),
+            ),
+            (
+                "STAND_IN_RECEIVED".to_owned(),
+                received_by(self).display().to_string(),
+            ),
+            ("STAND_IN_COMMAND".to_owned(), command(&self.bin)),
+        ];
+        variables.extend(
+            more.iter()
+                .map(|(name, value)| ((*name).to_owned(), value.clone())),
+        );
+        variables
+    }
+
+    /// What the session's shell is expected to hold of `variables`, the list its `kr new` is given
+    /// ([`Person::reads_the_environment`]): the names the host drops by design are the ones the
+    /// harness gives `kr` itself and the terminal's own, and the names the build list clears are
+    /// the ones the shell may not export, those it sets itself apart.
+    fn expects(&self, host: &Host<'_>, variables: &[(String, String)]) -> Expected {
+        let for_the_host: Vec<String> = host
+            .variables()
+            .into_iter()
+            .map(|(name, _)| name)
+            .chain(["TERM".to_owned(), "SHELL".to_owned()])
+            .collect();
+        let (cleared, allowed) = match &self.route {
+            Route::Real(real) => (real.account.cleared.clone(), real.build.names_it_sets()),
+            Route::StandIn => (Vec::new(), Vec::new()),
+        };
+        Expected::new(
+            variables,
+            self.run.mark(),
+            &for_the_host,
+            &cleared,
+            &allowed,
+        )
+        .unwrap_or_else(|why| panic!("{why}"))
+    }
+
     /// `variables` without the login's variable: the login is the agent's session's, and no step of
     /// the host's needs it.
     fn without_login(&self, variables: &[(String, String)]) -> Vec<(String, String)> {
@@ -1238,13 +1296,18 @@ async fn install_codex(
 struct Person {
     window: Window,
     session_id: SessionId,
+    /// What the shell is expected to hold of the list its `kr new` was given.
+    expected: Expected,
 }
 
 impl Person {
-    /// Enters a managed shell with `kr new` on a terminal of its own, and waits for its prompt.
-    fn enters(ctx: &Context, host: &Host<'_>) -> Self {
+    /// Enters a managed shell with `kr new` on a terminal of its own, and waits for its prompt. The
+    /// session is created with the harness's variables and `given`, the case's own.
+    fn enters(ctx: &Context, host: &Host<'_>, given: &[(String, String)]) -> Self {
         let home = ctx.run.home();
-        let variables = ctx.variables(host);
+        let mut variables = ctx.variables(host);
+        variables.extend(given.iter().cloned());
+        let expected = ctx.expects(host, &variables);
         std::fs::write(home.join(".zshrc"), ZSHRC).expect("writes the startup file");
         // The login is the agent's session's alone: `kr shell install` is not given it.
         let mut install = host.command(&["shell", "install", "--json"]);
@@ -1289,7 +1352,11 @@ impl Person {
             .expect("a session identifier")
             .parse()
             .expect("a session identifier");
-        Self { window, session_id }
+        Self {
+            window,
+            session_id,
+            expected,
+        }
     }
 
     /// Types one line and its return.
@@ -1352,6 +1419,108 @@ impl Person {
             assert!(
                 started.elapsed() < LIVENESS,
                 "the shell did not clear its screen in {:?}; it shows:\n{}",
+                started.elapsed(),
+                rows.join("\n")
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Reads the environment the shell holds at its prompt, with no agent run, and compares it with
+    /// what `expected` gives it ([`session_environment`]): one line a part at the prompt, each
+    /// printing names and digests and no value, read from the window's own screen and nowhere in
+    /// the run's tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the shell's environment is not as given, naming each variable and never a
+    /// value, or why the answer could not be read whole.
+    fn reads_the_environment(&self, expected: &Expected) -> Result<(), String> {
+        let mut tag = 0;
+        let mut readings = Vec::new();
+        for part in 0..expected.value_parts() {
+            let rows = self.types_the_check(expected, &expected.value_line(part, tag), tag)?;
+            readings.extend(expected.read_values(part, tag, &rows)?);
+            tag += 1;
+        }
+        let mut exported: Vec<String> = Vec::new();
+        loop {
+            let rows =
+                self.types_the_check(expected, &Expected::exported_line(exported.len(), tag), tag)?;
+            let (names, total) = session_environment::read_exported(tag, &rows)?;
+            tag += 1;
+            if names.is_empty() && exported.len() < total {
+                return Err(format!(
+                    "{} the shell says it exports {total} names and a part of them shows none",
+                    session_environment::NOT_READ_WHOLE
+                ));
+            }
+            exported.extend(names);
+            if exported.len() >= total {
+                if exported.len() != total {
+                    return Err(format!(
+                        "{} the shell says it exports {total} names and the parts show {}",
+                        session_environment::NOT_READ_WHOLE,
+                        exported.len()
+                    ));
+                }
+                break;
+            }
+        }
+        self.clears_the_screen_of(session_environment::ROW);
+        expected.judge(&readings, &exported)
+    }
+
+    /// Types one line of the environment's check on a cleared screen, and returns the screen once
+    /// the row that ends the answer, numbered `tag`, shows.
+    fn types_the_check(
+        &self,
+        expected: &Expected,
+        line: &str,
+        tag: usize,
+    ) -> Result<Vec<String>, String> {
+        self.clears_the_screen_of(session_environment::ROW);
+        self.types(line);
+        let end = tag.to_string();
+        let started = Instant::now();
+        loop {
+            let rows = self.window.screen();
+            if let Some(name) = expected.shown_on(&rows) {
+                return Err(format!(
+                    "{} the screen shows the value of {name}, which no line of the check holds",
+                    session_environment::NOT_AS_GIVEN
+                ));
+            }
+            if rows.iter().any(|row| {
+                row.split_whitespace()
+                    .eq([session_environment::ROW, "end", end.as_str()])
+            }) {
+                return Ok(rows);
+            }
+            if started.elapsed() >= LIVENESS {
+                return Err(format!(
+                    "{} the shell did not end the answer in {LIVENESS:?}; the screen shows {} rows",
+                    session_environment::NOT_READ_WHOLE,
+                    rows.len()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Clears the shell's screen, so that no row of an earlier answer, which holds `needle`, is
+    /// read as this one's.
+    fn clears_the_screen_of(&self, needle: &str) {
+        self.window.type_text(b"\x0c");
+        let started = Instant::now();
+        loop {
+            let rows = self.window.screen();
+            if !rows.iter().any(|row| row.contains(needle)) {
+                return;
+            }
+            assert!(
+                started.elapsed() < LIVENESS,
+                "the shell did not clear its screen of {needle:?} in {:?}; it shows:\n{}",
                 started.elapsed(),
                 rows.join("\n")
             );
@@ -1549,24 +1718,6 @@ impl Person {
                 }
             }
         }
-    }
-
-    /// Exports the stand-in's variables for the next command: its variants, the file that releases
-    /// it, and the file the server notes what it received in.
-    fn exports(&self, ctx: &Context, variants: &str) {
-        self.types(&format!("export KR_STAND_IN={variants}"));
-        self.types(&format!(
-            "export KR_STAND_IN_RELEASE={}",
-            release_of(ctx).display()
-        ));
-        self.types(&format!(
-            "export KR_STAND_IN_RECEIVED={}",
-            received_by(ctx).display()
-        ));
-        self.types(&format!(
-            "export KR_STAND_IN_COMMAND='{}'",
-            command(&ctx.bin)
-        ));
     }
 }
 
@@ -1828,17 +1979,22 @@ struct Session<'a> {
     person: Person,
     _device: Device,
     _paired: PairedHost,
+    /// Whether the shell's environment was read before the agent's first start.
+    environment_read: std::cell::Cell<bool>,
 }
 
 impl<'a> Session<'a> {
     /// Opens the session; `variants` are the stand-in's, and a real agent takes none.
     fn open(ctx: &'a Context, variants: &str) -> Self {
+        Self::open_with(ctx, variants, &[])
+    }
+
+    /// Opens the session as [`Session::open`] does, with `more` variables of the stand-in's given
+    /// in the same list.
+    fn open_with(ctx: &'a Context, variants: &str, more: &[(&str, String)]) -> Self {
         let host = ctx.host();
         let (device, paired, remote) = ctx.pair(&host);
-        let person = Person::enters(ctx, &host);
-        if matches!(ctx.route, Route::StandIn) {
-            person.exports(ctx, variants);
-        }
+        let person = Person::enters(ctx, &host, &ctx.stand_in_variables(variants, more));
         Self {
             ctx,
             host,
@@ -1846,6 +2002,7 @@ impl<'a> Session<'a> {
             person,
             _device: device,
             _paired: paired,
+            environment_read: std::cell::Cell::new(false),
         }
     }
 
@@ -1867,6 +2024,14 @@ impl<'a> Session<'a> {
         not: Option<ApplicationInstanceId>,
         commands: &[Slash],
     ) -> ApplicationInstanceId {
+        // Before anything of the agent runs, the probes of a real route included, the shell's own
+        // environment is read at its prompt: the first start only, since an agent's start can change
+        // what a later read would show.
+        if !self.environment_read.replace(true) {
+            self.person
+                .reads_the_environment(&self.person.expected)
+                .unwrap_or_else(|why| panic!("{why}"));
+        }
         // From here the harness runs no `kr` and ends the host's processes by the identities it
         // recorded: the agent runs in the same account and may leave anything in the run's state.
         self.host.agent_starts();
@@ -2998,10 +3163,11 @@ fn an_agent_leaves_another_host_and_the_host_ends(ending: Ending) {
     std::fs::set_permissions(&leave, std::os::unix::fs::PermissionsExt::from_mode(0o755))
         .expect("executable");
     ctx.place();
-    let session = Session::open(&ctx, "answer-when-released,keep-reading,stay,leave-a-host");
-    session
-        .person
-        .types(&format!("export KR_STAND_IN_LEAVE={}", leave.display()));
+    let session = Session::open_with(
+        &ctx,
+        "answer-when-released,keep-reading,stay,leave-a-host",
+        &[("STAND_IN_LEAVE", leave.display().to_string())],
+    );
     let _ = session.starts_the_agent(&[], None, &[]);
     assert_eq!(
         std::fs::read_to_string(ctx.run.root().join("s/environment-id"))
@@ -3161,10 +3327,11 @@ fn an_agent_leaves_a_change_and_is_started_again(
         std::fs::set_permissions(file, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .expect("executable");
     }
-    let session = Session::open(&ctx, "answer-when-released,keep-reading,stay,leave-a-host");
-    session
-        .person
-        .types(&format!("export KR_STAND_IN_LEAVE={}", leave.display()));
+    let session = Session::open_with(
+        &ctx,
+        "answer-when-released,keep-reading,stay,leave-a-host",
+        &[("STAND_IN_LEAVE", leave.display().to_string())],
+    );
     let first = session.starts_the_agent(&[], None, &[]);
     changed(&ctx, &scratch);
     let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3244,6 +3411,194 @@ fn gateway_a_work_directory_the_agent_moved_out_of_the_run_is_not_started_in_by_
 }
 
 // ---------------------------------------------------------------------------------------------
+// The environment of the session's shell, read at its prompt before the first typing.
+// ---------------------------------------------------------------------------------------------
+
+/// `list` with `change` made to it.
+fn changed(
+    list: &[(String, String)],
+    change: impl FnOnce(&mut Vec<(String, String)>),
+) -> Vec<(String, String)> {
+    let mut changed = list.to_vec();
+    change(&mut changed);
+    changed
+}
+
+/// The managed shell of a session holds what the harness gave `kr new`, the stand-in's own variables
+/// among it, and its screen shows no value of them; a value that differs, a name the shell lacks, an
+/// exported name the build list clears and a name the host would drop are each refused by the
+/// variable's name, with no value in the refusal, and the control is the shell as given.
+#[test]
+fn gateway_the_session_environment_is_read_at_the_prompt_before_the_first_typing() {
+    if std::env::var_os(BUILD_VARIABLE).is_some_and(|value| !value.is_empty()) {
+        // The shell of a real route is read by every case that starts the agent.
+        return;
+    }
+    let shell = match shells::managed_zsh() {
+        Ok(shell) => shell,
+        Err(why) if shells::required() => panic!("the managed shell: {why}"),
+        Err(why) => {
+            eprintln!("skipping: {why}");
+            return;
+        }
+    };
+    let mut ctx = Context::new(
+        shell,
+        Route::StandIn,
+        Run::start("gateway-environment"),
+        runtime(),
+    );
+    ctx.place();
+    // Enough names that the answer comes in several parts, and the exported names in more than one.
+    let padding: Vec<(&str, String)> = [
+        "PADDING_A",
+        "PADDING_B",
+        "PADDING_C",
+        "PADDING_D",
+        "PADDING_E",
+        "PADDING_F",
+        "PADDING_G",
+        "PADDING_H",
+        "PADDING_I",
+        "PADDING_J",
+        "PADDING_K",
+        "PADDING_L",
+        "PADDING_M",
+        "PADDING_N",
+        "PADDING_O",
+        "PADDING_P",
+        "PADDING_Q",
+        "PADDING_R",
+        "PADDING_S",
+        "PADDING_T",
+        "PADDING_U",
+    ]
+    .into_iter()
+    .map(|name| (name, format!("{name}-is-given-to-the-shell")))
+    .collect();
+    let session = Session::open_with(&ctx, "stay", &padding);
+    let list = {
+        let mut list = ctx.variables(&session.host);
+        list.extend(ctx.stand_in_variables("stay", &padding));
+        list
+    };
+    let release = release_of(&ctx).display().to_string();
+    let held = |name: &str| {
+        list.iter()
+            .find(|(held, _)| held == name)
+            .map(|(_, value)| value.clone())
+            .expect("a variable of the list")
+    };
+    // The control: the shell as given.
+    session
+        .person
+        .reads_the_environment(&session.person.expected)
+        .unwrap_or_else(|why| panic!("the shell holds what it was given: {why}"));
+    let refused = |expected: &Expected| {
+        session
+            .person
+            .reads_the_environment(expected)
+            .expect_err("the shell is not as the harness expects it")
+    };
+    let expecting = |list: &[(String, String)], cleared: &[&str]| {
+        let cleared: Vec<String> = cleared.iter().map(|text| (*text).to_owned()).collect();
+        Expected::new(
+            list,
+            ctx.run.mark(),
+            &session
+                .host
+                .variables()
+                .into_iter()
+                .map(|(name, _)| name)
+                .chain(["TERM".to_owned(), "SHELL".to_owned()])
+                .collect::<Vec<_>>(),
+            &cleared,
+            &[],
+        )
+        .unwrap_or_else(|why| panic!("{why}"))
+    };
+    // A value that differs from the one given.
+    let why = refused(&expecting(
+        &changed(&list, |list| {
+            list.iter_mut()
+                .find(|(name, _)| name == "STAND_IN_RELEASE")
+                .expect("the stand-in's variable")
+                .1 = "/not/the/release".to_owned();
+        }),
+        &[],
+    ));
+    assert!(
+        why.contains("STAND_IN_RELEASE")
+            && !why.contains("/not/the/release")
+            && !why.contains(&release),
+        "a value that differs is refused by its name: {why}"
+    );
+    // A name given that the shell does not export.
+    let why = refused(&expecting(
+        &changed(&list, |list| {
+            list.push((
+                "GIVEN_BUT_NOT_TO_THE_SHELL".to_owned(),
+                "not-in-the-shell".to_owned(),
+            ))
+        }),
+        &[],
+    ));
+    assert!(
+        why.contains("GIVEN_BUT_NOT_TO_THE_SHELL") && !why.contains("not-in-the-shell"),
+        "a name the shell lacks is refused by its name: {why}"
+    );
+    // A name the build list clears that the shell exports.
+    let why = refused(&expecting(&list, &["STAND_IN_REC*"]));
+    assert!(
+        why.contains("STAND_IN_RECEIVED") && why.contains("clears"),
+        "an exported name the build list clears is refused by its name: {why}"
+    );
+    assert!(!why.contains(&held("STAND_IN_RECEIVED")), "no value: {why}");
+    // A name of the list that the host would drop, by the harness's own expectation.
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.expects(
+            &session.host,
+            &changed(&list, |list| {
+                list.push(("KR_VARIANTS".to_owned(), "not-for-a-session".to_owned()))
+            }),
+        )
+    }));
+    let said = panic_text(&*dropped.expect_err("a name the host drops is refused"));
+    assert!(
+        said.contains("KR_VARIANTS") && !said.contains("not-for-a-session"),
+        "a name the host drops is refused by its name: {said}"
+    );
+    assert!(
+        session.person.expected.value_parts() >= 3,
+        "the answer was read in several parts: {:?}",
+        session.person.expected
+    );
+    // The start makes the check: a shell that holds another value than the one given is refused
+    // at the first typing, and nothing of the stand-in is typed or run.
+    session
+        .person
+        .types("export STAND_IN_RELEASE=/not/the/release");
+    let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        session.starts_the_agent(&[], None, &[])
+    }));
+    let said = panic_text(&*started.expect_err("the first start is refused"));
+    assert!(
+        said.contains("STAND_IN_RELEASE") && !said.contains("/not/the/release"),
+        "the first start was refused by the variable's name: {said}"
+    );
+    assert!(
+        !session
+            .person
+            .window
+            .screen()
+            .iter()
+            .any(|row| row.contains(RAN_AS_TYPED)),
+        "the stand-in was typed and ran"
+    );
+    ctx.close(&session.host);
+}
+
+// ---------------------------------------------------------------------------------------------
 // A child the agent leaves running outside its process group.
 // ---------------------------------------------------------------------------------------------
 
@@ -3312,10 +3667,11 @@ fn an_agent_leaves_a_child_outside_its_group(keeps_environment: bool) {
     .expect("the program the stand-in runs");
     std::fs::set_permissions(&leave, std::os::unix::fs::PermissionsExt::from_mode(0o755))
         .expect("executable");
-    let session = Session::open(&ctx, "answer-when-released,keep-reading,stay,leave-a-host");
-    session
-        .person
-        .types(&format!("export KR_STAND_IN_LEAVE={}", leave.display()));
+    let session = Session::open_with(
+        &ctx,
+        "answer-when-released,keep-reading,stay,leave-a-host",
+        &[("STAND_IN_LEAVE", leave.display().to_string())],
+    );
     let _ = session.starts_the_agent(&[], None, &[]);
     let child: u32 = std::fs::read_to_string(&started)
         .expect("the child's number")
