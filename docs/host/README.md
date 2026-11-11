@@ -3416,9 +3416,9 @@ sends the others as new actions. A chunk that the service refused at its own ask
 was replaced, left no record: its exact repeat on the same connection is a first attempt and is
 staged.
 
-`draft.create`, `draft.update` and `agent.draft.add_attachment` are performed by the transfer
-service under the device's own principal, which the host derives from the device's identity, so
-a device's drafts are its own and the owner's, and other devices', are unknown to it.
+`draft.create`, `draft.update`, `draft.discard` and `agent.draft.add_attachment` are performed by
+the transfer service under the device's own principal, which the host derives from the device's
+identity, so a device's drafts are its own and the owner's, and other devices', are unknown to it.
 `agent.draft.add_attachment` needs `files.upload` and `agent.prompt` over its session, and binds
 only an upload the same device holds to a draft the same device made. A draft written for a session
 is written only by a request that names that session. A `draft.create` that labels the draft with
@@ -3451,10 +3451,32 @@ takes three creates of one device on separate connections and two closures. The 
 at the bound as the action's outcome, as it keeps every refusal of a service, so the same action asked
 again is given the same refusal even when a place is free, and a device that has freed a place takes a new
 action for its new attempt. The bound is one constant of this host, which an owner cannot change,
-and the person at this machine is held to none. A device cannot end a draft itself: this level has
-no method that discards one, so a prompt that sends it, or the end of its session, is how a place
-is freed. Sent and orphaned drafts stay in the journal, and each `draft.update` adds one row to the
-journal's events and a receipt that holds the updated draft for the de-duplication window.
+and the person at this machine is held to none. A place is freed in four ways: a prompt sends the
+draft, its session ends, the agent takes every file bound to it, or the device ends it with
+`draft.discard`. A draft whose attachments are all `accepted_by_agent`, and that has at least one,
+stops counting; a draft with an attachment `inserting` or `unknown` goes on counting, because a
+retry or a report may still come for it. The bound's refusal names the ways that are the device's to
+take or wait for. Sent and orphaned drafts stay in the journal, and each `draft.update` adds one row
+to the journal's events and a receipt that holds the updated draft for the de-duplication window.
+
+`draft.discard` ends a draft of the device's own that it no longer uses. It names the draft and no
+revision, so a device that has lost the revision it last saw can still end it. One transaction under
+the journal's write lock revokes the read grants of the draft's attachments and deletes the draft,
+which removes its attachment and prompt records with it, and the device's count drops at once, with
+no session end between. Only the draft's own principal may end it: another device's draft, the
+owner's draft and a draft that is gone are all refused `INVALID_ARGUMENT` in the same words, so the
+refusal shows nothing of what exists. A draft that a prompt named, or one with an attachment
+`inserting`, `accepted_by_agent` or `unknown`, is refused `DRAFT_CONFLICT` and nothing is deleted,
+because those records show what the agent was offered or took: such a draft ends with its session.
+Attachments `recorded` or `failed` go with the draft, since nothing was offered from them. It never
+changes an upload: the bytes, their quota charge, the session an upload was bound to and its expiry
+stay as they are, and only `upload.cancel` of an upload still receiving frees bytes. It is an
+ordinary action write. The same action asked again, on the same connection or a replacement, is
+answered from the record and ends nothing twice; a new action for a draft that is gone is refused as
+unknown, which a client reads as already ended; and a repeat asked while this host owes a fence it
+could not raise is told `OUTCOME_UNKNOWN`, as every recorded answer is. The person at this machine
+ends the owner's own drafts the same way and cannot end a device's. A host of an earlier build
+refuses the method by name.
 
 What a device is told of a failure passes one rule, applied where this host's words leave it for a
 device: the write boundary of an authorised connection, the refusal of a connection that is not
