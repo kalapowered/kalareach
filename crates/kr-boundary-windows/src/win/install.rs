@@ -1045,33 +1045,19 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
             *slot = Some(held);
         }
     }
-    let no_roots = BTreeSet::new();
     inspect_layout(
         paths,
         &paths.staging,
         inspected.staging.as_ref(),
         Layout::Staging,
-        &no_roots,
     )?;
     inspect_layout(
         paths,
         &paths.journal,
         inspected.journal.as_ref(),
         Layout::Journal,
-        &no_roots,
     )?;
-    let named = if inspected.run.is_some() {
-        roots_named_by_the_journal(paths)?
-    } else {
-        no_roots
-    };
-    inspect_layout(
-        paths,
-        &paths.run,
-        inspected.run.as_ref(),
-        Layout::Run,
-        &named,
-    )?;
+    inspect_layout(paths, &paths.run, inspected.run.as_ref(), Layout::Run)?;
     let manifest = Manifest::load(&paths.manifest)?;
     let records = |path: &Path| {
         manifest
@@ -1200,12 +1186,20 @@ fn inspect_layout(
     dir: &Path,
     held: Option<&DirHandle>,
     layout: Layout,
-    named_roots: &BTreeSet<String>,
 ) -> Result<(), Error> {
     let Some(held) = held else {
         return Ok(());
     };
-    for child in held.children()? {
+    let children = held.children()?;
+    // The roots are listed first and the journal is read after: the broker writes the intent row
+    // before it makes a root, so a root that the listing shows is named by the journal read next,
+    // also when the broker began its invocation between the two reads.
+    let named_roots = if layout == Layout::Run && !children.is_empty() {
+        roots_named_by_the_journal(paths)?
+    } else {
+        BTreeSet::new()
+    };
+    for child in children {
         let shown = OsString::from_wide(&child.name);
         let text = shown.to_string_lossy().into_owned();
         let Some(expected) = layout_kind(layout, &text) else {
