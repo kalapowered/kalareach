@@ -560,6 +560,11 @@ pub(crate) enum Class {
     Vanished,
     /// A directory was another kind of entry when it was opened than when it was looked at.
     Replaced,
+    /// An entry of the agent's record lies on another file system than the run's directory, as a
+    /// volume attached below it does: no-follow does not refuse a mount, and a file on it has one
+    /// name, so only the device tells it from the run's own. The reading refuses it before anything
+    /// on it is opened.
+    OtherDevice,
     /// The system refused a look or a listing.
     Refused(rustix::io::Errno),
     /// The tree is deeper than the walk goes.
@@ -596,6 +601,11 @@ impl std::fmt::Display for Unlooked {
                 formatter,
                 "a directory became another kind of entry while the tree was looked at (after \
                  {seen} entries)"
+            ),
+            Class::OtherDevice => write!(
+                formatter,
+                "an entry lies on another file system than the run's, which is refused and read \
+                 through by nothing (after {seen} entries)"
             ),
             Class::Refused(error) => write!(
                 formatter,
@@ -1142,14 +1152,16 @@ fn turn_identifier(value: &Value) -> Option<String> {
 }
 
 /// Opens the directory `relative` below `within`, one component at a time, each looked at and opened
-/// with no link followed and checked to be the directory that was looked at, and returns it: `None`
-/// where a component is not there (nothing was written). A component that is a symbolic link, or
-/// is not a directory, is a failure of the look, and nothing is read through it. `within` itself is
-/// opened with no link followed at its last component, as the run's directory it is.
+/// with no link followed and checked to be the directory that was looked at, and returns it with the
+/// look at `within`, the file system the record is read on: `None` where a component is not there
+/// (nothing was written). A component that is a symbolic link, or is not a directory, or lies on
+/// another file system than `within`, is a failure of the look, and nothing is read through it.
+/// `within` itself is opened with no link followed at its last component, as the run's directory it
+/// is.
 fn record_directory(
     within: &Path,
     relative: &Path,
-) -> Result<Option<std::os::fd::OwnedFd>, Unlooked> {
+) -> Result<Option<(std::os::fd::OwnedFd, rustix::fs::Stat)>, Unlooked> {
     use rustix::fs::{AtFlags, FileType, Mode, OFlags};
     let unlooked = |class| Unlooked { class, seen: 0 };
     let mut directory = rustix::fs::open(
@@ -1158,6 +1170,7 @@ fn record_directory(
         Mode::empty(),
     )
     .map_err(|error| unlooked(opening_failed(error)))?;
+    let root = rustix::fs::fstat(&directory).map_err(|error| unlooked(Class::Refused(error)))?;
     for component in relative.components() {
         let std::path::Component::Normal(name) = component else {
             return Err(unlooked(Class::NotAFile));
@@ -1170,6 +1183,9 @@ fn record_directory(
                 Err(rustix::io::Errno::NOENT) => return Ok(None),
                 Err(error) => return Err(unlooked(Class::Refused(error))),
             };
+        if looked.st_dev != root.st_dev {
+            return Err(unlooked(Class::OtherDevice));
+        }
         match FileType::from_raw_mode(looked.st_mode) {
             FileType::Directory => {}
             FileType::Symlink => return Err(unlooked(Class::Link)),
@@ -1177,17 +1193,19 @@ fn record_directory(
         }
         directory = opened_directory(&directory, name.as_c_str(), &looked, 0)?;
     }
-    Ok(Some(directory))
+    Ok(Some((directory, root)))
 }
 
 /// Reads every file of the directory `directory` and below through handles, handing each file's
 /// place (its names from the record's root, joined by `/`) and content to `visit`: an entry is
 /// looked at with `fstatat` and no link followed, a directory is opened with the same handle and no
 /// link followed, and a file is opened with no link followed and nonblocking, then checked to be a
-/// regular file and the one that was looked at, before a byte of it is read. A link, or an entry
-/// that is neither a file nor a directory, is a failure and nothing is read through it.
+/// regular file and the one that was looked at, before a byte of it is read. A link, an entry that
+/// is neither a file nor a directory, and an entry that lies on another file system than `root`,
+/// the look at the record's root, is a failure and nothing is read through it.
 fn read_files(
     directory: &std::os::fd::OwnedFd,
+    root: &rustix::fs::Stat,
     relative: &[u8],
     depth: usize,
     seen: &mut usize,
@@ -1233,6 +1251,11 @@ fn read_files(
                 )
             })?;
         *seen += 1;
+        // A volume attached below the record is no link and its files have one name: only the
+        // device tells it from the run's own.
+        if looked.st_dev != root.st_dev {
+            return Err(unlooked(Class::OtherDevice, seen));
+        }
         let mut path = relative.to_vec();
         if !path.is_empty() {
             path.push(b'/');
@@ -1242,7 +1265,7 @@ fn read_files(
             FileType::Directory => {
                 between(Moment::Looked, name.to_bytes());
                 let child = opened_directory(directory, name.as_c_str(), &looked, *seen)?;
-                read_files(&child, &path, depth + 1, seen, visit, between)?;
+                read_files(&child, root, &path, depth + 1, seen, visit, between)?;
             }
             FileType::RegularFile => {
                 // A file with a second name is the same file under another name, whoever made
@@ -1293,10 +1316,10 @@ fn read_files(
 /// Reads the agent's own record: every file below `relative` in `within`, the run's directory,
 /// through directory handles with no link followed at any step ([`record_directory`],
 /// [`read_files`]), handing each file's place in the record and its content to `visit`, and returns
-/// how many files were read. A record that is not there is none (`Ok(0)`); a link anywhere in it, or
-/// an entry that is neither a file nor a directory, is refused before a byte is read through it,
-/// since the person's own files must never be read, and what is said is a class and a count, never
-/// a name.
+/// how many files were read. A record that is not there is none (`Ok(0)`); a link anywhere in it, an
+/// entry that is neither a file nor a directory, or an entry on another file system than `within`
+/// (a volume attached below the record) is refused before a byte is read through it, since the
+/// person's own files must never be read, and what is said is a class and a count, never a name.
 ///
 /// # Errors
 ///
@@ -1317,13 +1340,14 @@ fn read_record_by(
     between: &mut dyn FnMut(Moment, &[u8]),
 ) -> Result<u64, String> {
     let said = |why: Unlooked| format!("the agent's record cannot be read whole: {why}");
-    let Some(directory) = record_directory(within, relative).map_err(said)? else {
+    let Some((directory, root)) = record_directory(within, relative).map_err(said)? else {
         return Ok(0);
     };
     let mut seen = 0_usize;
     let mut files = 0_u64;
     read_files(
         &directory,
+        &root,
         b"",
         1,
         &mut seen,
@@ -2260,6 +2284,110 @@ mod tests {
         );
         std::fs::remove_dir_all(&run).expect("clean up");
         std::fs::remove_dir_all(&elsewhere).expect("clean up");
+    }
+
+    /// A volume attached below the record (a disk image, a network view) is another file system:
+    /// no-follow does not refuse a mount, and the files on it have one name. It is refused before
+    /// anything on it is opened, as a class and a count, and a volume attached between the look at a
+    /// directory and its opening is refused by the identity check.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_file_system_mounted_below_the_record_is_refused_and_nothing_on_it_is_read() {
+        use kr_ipc::testing::volumes::{Volume, not_attachable};
+        let run = scratch("record-mounted");
+        let images = scratch("record-mounted-images");
+        let line = r#"{"type":"task_started","turn_id":"019a0000-0000-7000-8000-0000000000aa"}"#;
+        let sessions = Path::new("agent-config/sessions");
+        let mount = run.join("agent-config/sessions/2026/11");
+        std::fs::create_dir_all(&mount).expect("a record");
+        std::fs::write(
+            run.join("agent-config/sessions/own-name.jsonl"),
+            format!("{}\n", line.replace("aa", "bb")),
+        )
+        .expect("a conversation of the run's own");
+        let refused = |why: &str| {
+            assert!(why.contains("another file system"), "{why}");
+            for name in [
+                "outside-name",
+                "own-name",
+                "agent-config",
+                "sessions",
+                "2026",
+            ] {
+                assert!(!why.contains(name), "{why}");
+            }
+        };
+        // The record's own directory is the mount point: the look at it, on the way to the record,
+        // gives another file system.
+        let record = run.join("agent-config/sessions");
+        let volume = Volume::attach(&record, &images, "root").unwrap_or_else(|| not_attachable());
+        std::fs::write(record.join("outside-name.jsonl"), format!("{line}\n"))
+            .expect("a file of the person's, with one name, on the volume");
+        let mut read = Vec::new();
+        // The directory is refused before it is opened, not only the entries on it after.
+        let not_opened = matches!(
+            record_directory(&run, sessions),
+            Err(Unlooked {
+                class: Class::OtherDevice,
+                ..
+            })
+        );
+        let said = read_record(&run, sessions, &mut |place, content| {
+            read.push((place.to_vec(), content.to_vec()));
+        });
+        volume.detach();
+        assert!(
+            not_opened,
+            "a directory on another file system is not opened"
+        );
+        refused(&said.expect_err("the record is on a mount"));
+        assert!(read.is_empty(), "nothing on the volume was read");
+        // A directory below the record is the mount point.
+        let volume = Volume::attach(&mount, &images, "record").unwrap_or_else(|| not_attachable());
+        std::fs::write(mount.join("outside-name.jsonl"), format!("{line}\n"))
+            .expect("a file of the person's, with one name, on the volume");
+        let mut read = Vec::new();
+        let said = read_record(&run, sessions, &mut |place, content| {
+            read.push((place.to_vec(), content.to_vec()));
+        });
+        volume.detach();
+        refused(&said.expect_err("a mount below the record"));
+        assert!(
+            read.iter().all(|(place, content)| {
+                !place.ends_with(b"outside-name.jsonl")
+                    && !String::from_utf8_lossy(content).contains("0000aa")
+            }),
+            "nothing on the volume was read"
+        );
+        // A volume attached after the directory was looked at and before it was opened.
+        let mut attached = None;
+        let mut read = Vec::new();
+        let said = read_record_by(
+            &run,
+            sessions,
+            &mut |_, content| read.push(content.to_vec()),
+            &mut |moment, name| {
+                if moment == Moment::Looked && name == b"11" {
+                    let volume =
+                        Volume::attach(&mount, &images, "race").unwrap_or_else(|| not_attachable());
+                    std::fs::write(mount.join("outside-name.jsonl"), format!("{line}\n"))
+                        .expect("a file on the volume");
+                    attached = Some(volume);
+                }
+            },
+        );
+        attached
+            .expect("the volume was attached at the moment")
+            .detach();
+        let why = said.expect_err("a mount made after the look");
+        assert!(!why.contains("outside-name"), "{why}");
+        assert!(
+            read.iter()
+                .all(|content| !String::from_utf8_lossy(content).contains("0000aa")),
+            "nothing on the volume was read"
+        );
+        std::fs::remove_dir_all(&run).expect("clean up");
+        std::fs::remove_dir_all(&images).expect("clean up");
     }
 
     #[test]
