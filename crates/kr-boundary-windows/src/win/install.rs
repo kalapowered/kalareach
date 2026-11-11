@@ -18,6 +18,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead as _, Read as _, Write as _};
+use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -32,6 +33,23 @@ use crate::manifest::{
 use crate::messages;
 use crate::notice::NOTICE;
 use crate::policy::{self, Policy};
+
+use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+use windows_sys::Wdk::Storage::FileSystem::{
+    FILE_DIRECTORY_FILE, FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
+    FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+};
+use windows_sys::Win32::Foundation::{
+    ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
+    GetLastError, HANDLE, RtlNtStatusToDosError, UNICODE_STRING,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateDirectoryW, CreateFileW, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo, GetFileInformationByHandleEx,
+    OPEN_EXISTING,
+};
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 use super::acl;
 use super::applocker::{self, Channel};
@@ -69,6 +87,8 @@ const APPID_KEY: &str = r"SYSTEM\CurrentControlSet\Services\AppIDSvc";
 const AUTOMATIC: u32 = 2;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+const READ_CONTROL: u32 = 0x0002_0000;
+const SYNCHRONIZE: u32 = 0x0010_0000;
 
 /// A failure of the installation, its repair or its removal.
 #[derive(Debug, thiserror::Error)]
@@ -288,36 +308,80 @@ pub fn entry(paths: &Paths) -> Result<Entry, Error> {
     Ok(Entry::Fresh)
 }
 
-/// Refuses a folder above the data directory that the installation did not make safe: one that is a
-/// reparse point, that an account other than the system's own owns, or in which another account may
-/// write, delete or change. Whoever owns or may change that folder can rename the data directory
-/// away and put a manifest, a journal and a directory of private roots of their own in its place,
-/// which the broker, running as the system, would read by path. A folder that is not there is
-/// made with the protected list; a folder that an earlier installation made with an inherited list
-/// is refused the same way, since nothing of the earlier form is kept.
+/// Opens the folder above the data directory once, checks it on that handle and keeps the handle,
+/// or says the folder is not there. The folder is opened without following a reparse point, with a
+/// data right and without sharing the right to delete or rename it, so that nobody who already holds
+/// a handle with that right can swap the folder after the check (the open then fails), and nobody
+/// can begin to hold one while this handle is open. The attributes and the permissions are read from
+/// the handle itself, so they are those of the object the caller holds.
+///
+/// The folder is refused when it is a link or not a folder, when an account other than the system's
+/// own class (the system, the administrators, the installer service and the creator-owner
+/// placeholder) owns it, when another account may write, delete in or change it, when its list has
+/// an entry of a type the check does not read, and when another program holds it open with a right
+/// to delete it. Whoever owns or may change the folder can rename the data directory away and put a
+/// manifest, a journal and a directory of private roots of their own in its place, which the
+/// broker, running as the system, would read by path. A folder that an earlier installation made
+/// with an inherited list is refused the same way, since nothing of the earlier form is kept.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Refused`] naming the reason, or the failure of the call that looked.
-pub fn check_data_parent(paths: &Paths) -> Result<(), Error> {
+pub fn check_data_parent(paths: &Paths) -> Result<Option<ffi::Handle>, Error> {
     let parent = paths.data_parent();
-    let meta = match fs::symlink_metadata(parent) {
-        Ok(meta) => meta,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(io_error("reading the data directory's parent folder")(
-                error,
+    let wide = ffi::wide_path(parent);
+    // SAFETY: the path is NUL-terminated; the call keeps nothing of it.
+    let raw = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_LIST_DIRECTORY | FILE_ADD_SUBDIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    let handle = match ffi::Handle::new(raw, "opening the data directory's parent folder") {
+        Ok(handle) => handle,
+        Err(failure)
+            if failure.code == ERROR_FILE_NOT_FOUND || failure.code == ERROR_PATH_NOT_FOUND =>
+        {
+            return Ok(None);
+        }
+        Err(failure) if failure.code == ERROR_SHARING_VIOLATION => {
+            return Err(parent_refusal(
+                parent,
+                "another program holds it open with a right to delete or rename it",
             ));
         }
+        Err(failure) => return Err(failure.into()),
     };
-    const REPARSE_POINT: u32 = 0x400;
-    if meta.file_attributes() & REPARSE_POINT != 0 || !meta.is_dir() {
+    let mut tag = FILE_ATTRIBUTE_TAG_INFO {
+        FileAttributes: 0,
+        ReparseTag: 0,
+    };
+    // SAFETY: the handle is open and the record is the size the class takes.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle.raw(),
+            FileAttributeTagInfo,
+            (&raw mut tag).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(ffi::last("reading the data directory's parent folder").into());
+    }
+    if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+    {
         return Err(parent_refusal(parent, "it is a link or not a folder"));
     }
-    if let Some(finding) = acl::changeable_by_others(parent, false)? {
+    if let Some(finding) = acl::changeable_by_others_on(&handle, false)? {
         return Err(parent_refusal(parent, &finding));
     }
-    Ok(())
+    Ok(Some(handle))
 }
 
 /// The refusal of a folder above the data directory: what the folder is, why it is refused and what
@@ -329,12 +393,102 @@ fn parent_refusal(parent: &Path, why: &str) -> Error {
     ))
 }
 
-/// Makes the folder above the data directory, in one call that carries its protected list, so that
-/// it is never there with an inherited one. A folder that is there is left as it is: it was
-/// checked.
-fn make_data_parent(parent: &Path) -> Result<(), Error> {
-    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
-    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+/// Holds the folder above the data directory, made first when it is not there, and makes the data
+/// directory beneath it, relative to the held folder. The folder is made in one call that carries
+/// its protected list, so that it is never there with an inherited one, and is then opened and
+/// checked like one that was there. The handle is kept until the data directory exists beneath it,
+/// so the folder that passed the check is the folder the data directory is made in.
+fn make_data_directory(paths: &Paths) -> Result<(), Error> {
+    let held = match check_data_parent(paths)? {
+        Some(held) => held,
+        None => {
+            create_data_parent(paths.data_parent())?;
+            check_data_parent(paths)?.ok_or_else(|| {
+                Error::Failed(format!(
+                    "{} was made and is gone again",
+                    paths.data_parent().display()
+                ))
+            })?
+        }
+    };
+    let name = paths
+        .data
+        .file_name()
+        .ok_or_else(|| Error::Failed("the data directory has no name".to_owned()))?;
+    let units: Vec<u16> = name.encode_wide().collect();
+    let text = UNICODE_STRING {
+        Length: (units.len() * 2) as u16,
+        MaximumLength: (units.len() * 2) as u16,
+        Buffer: units.as_ptr().cast_mut(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: held.raw(),
+        ObjectName: &raw const text,
+        Attributes: 0,
+        SecurityDescriptor: std::ptr::null(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut raw: HANDLE = std::ptr::null_mut();
+    let mut status_block = IO_STATUS_BLOCK::default();
+    // SAFETY: the name, the attributes and the status block live through the call, the folder's
+    // handle is open, and the call keeps none of them. A directory that is there is opened, one that
+    // is not is made, and a link is opened as the link and refused below.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut raw,
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            &raw const attributes,
+            &raw mut status_block,
+            std::ptr::null(),
+            FILE_ATTRIBUTE_DIRECTORY,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_OPEN_IF,
+            FILE_DIRECTORY_FILE
+                | FILE_OPEN_REPARSE_POINT
+                | FILE_OPEN_FOR_BACKUP_INTENT
+                | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status < 0 {
+        // SAFETY: converts a status the platform just returned.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        return Err(ffi::error(
+            code,
+            format!("making {} beneath the held folder", paths.data.display()),
+        )
+        .into());
+    }
+    let made = ffi::Handle::new(raw, "making the data directory")?;
+    let mut tag = FILE_ATTRIBUTE_TAG_INFO {
+        FileAttributes: 0,
+        ReparseTag: 0,
+    };
+    // SAFETY: the handle is open and the record is the size the class takes.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            made.raw(),
+            FileAttributeTagInfo,
+            (&raw mut tag).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(ffi::last("reading the data directory").into());
+    }
+    if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(Error::Refused(format!(
+            "{} is a link and the installation does not use it",
+            paths.data.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Makes the folder above the data directory with the protected list, in one call.
+fn create_data_parent(parent: &Path) -> Result<(), Error> {
     let descriptor = sd::descriptor(SdKind::DataParent, &Principals::default())?;
     let attributes = descriptor.attributes();
     let wide = ffi::wide_path(parent);
@@ -343,24 +497,15 @@ fn make_data_parent(parent: &Path) -> Result<(), Error> {
     if unsafe { CreateDirectoryW(wide.as_ptr(), &raw const attributes) } == 0 {
         // SAFETY: reads the calling thread's last error.
         let code = unsafe { GetLastError() };
-        if code == ERROR_ALREADY_EXISTS {
-            return check_data_parent_of(parent);
+        // A folder that appeared between the look and this call is opened and checked next.
+        if code != ERROR_ALREADY_EXISTS {
+            return Err(Error::Failed(format!(
+                "making {}: Windows error {code}",
+                parent.display()
+            )));
         }
-        return Err(Error::Failed(format!(
-            "making {}: Windows error {code}",
-            parent.display()
-        )));
     }
     Ok(())
-}
-
-/// The check of a folder that appeared between the first look and the call that makes it.
-fn check_data_parent_of(parent: &Path) -> Result<(), Error> {
-    let paths = Paths {
-        data: parent.join("Boundary"),
-        ..Paths::system()
-    };
-    check_data_parent(&paths)
 }
 
 /// Reads the state of every kind of application control and refuses when any is in force. Anything
@@ -731,8 +876,7 @@ pub fn install(paths: &Paths, options: &Options, repair: bool) -> Result<(), Err
 
 fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Error> {
     let paths = run.paths.clone();
-    make_data_parent(paths.data_parent())?;
-    fs::create_dir_all(&paths.data).map_err(io_error("making the data directory"))?;
+    make_data_directory(&paths)?;
     acl::set_protected(
         &paths.data,
         &sd::descriptor(SdKind::AdminDir, &Principals::default())?,
