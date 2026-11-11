@@ -57,10 +57,10 @@ use kr_e2e_agents::provenance::{
 };
 use kr_e2e_agents::stage::{
     AgentProcess, Context, Installation, Installed, Keyboard, Owner, PROMPT, Refused, Replacement,
-    Session, closed_port, default_keychain_of_a_session, events_snapshot, free_port, inode_of,
-    install, kill_daemon, launch, launch_or_refusal, mapped_files, names_a_session_exports,
-    open_session, place_forwarder, prepare_home, runtime, scan_rules, session_variables,
-    text_image,
+    Session, closed_for_all_but_the_stand_in, closed_port, default_keychain_of_a_session,
+    events_snapshot, free_port, inode_of, install, kill_daemon, launch, launch_or_refusal,
+    mapped_files, names_a_session_exports, open_session, place_forwarder, prepare_home, runtime,
+    scan_rules, session_variables, text_image,
 };
 use kr_e2e_agents::stub::RequestStub;
 use kr_e2e_agents::transfer::{self, Caller, Transfer};
@@ -1979,6 +1979,10 @@ fn staged(
     let Some(inputs) = Inputs::from_environment(part) else {
         return;
     };
+    // The first statement after the inputs: every part, with or without a login, is refused here
+    // for a build that is not the test's own stand-in, before it starts a probe, a session or an
+    // agent.
+    closed_for_all_but_the_stand_in(&inputs.build).unwrap_or_else(|why| panic!("{why}"));
     let login = needs_login.then(|| {
         let account = inputs.build.account.clone().unwrap_or_else(|| {
             panic!("part {part} needs a login, and the build list names none for this agent")
