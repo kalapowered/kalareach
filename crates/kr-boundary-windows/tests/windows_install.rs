@@ -756,6 +756,7 @@ fn a_folder_above_the_data_directory_that_others_own_may_write_in_or_have_replac
 
 /// A handle on a folder, opened by the case as another program would: any sharing, and the rights
 /// named.
+#[cfg(feature = "testing")]
 fn open_folder(folder: &Path, access: u32) -> ffi::Handle {
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
@@ -777,6 +778,7 @@ fn open_folder(folder: &Path, access: u32) -> ffi::Handle {
     ffi::Handle::new(raw, "opening a folder").unwrap()
 }
 
+#[cfg(feature = "testing")]
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_parent_folder_is_checked_on_one_handle_that_is_held_and_an_entry_of_an_unknown_type_is_refused()
