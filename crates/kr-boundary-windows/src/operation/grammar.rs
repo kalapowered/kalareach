@@ -5,7 +5,7 @@
 //! that converts to UTF-16 and back without loss; what remains is the characters and the shapes.
 
 use crate::frame::invocation::{MAX_MESSAGE_BYTES, MAX_PATH_BYTES, MAX_REV_BYTES};
-use crate::names::{BRANCH_PREFIX, is_branch_name, is_oid};
+use crate::names::{BRANCH_PREFIX, TAG_PREFIX, is_branch_name, is_oid};
 
 /// The most paths a command takes after `--`.
 pub const MAX_PATHS: usize = 256;
@@ -141,57 +141,58 @@ pub fn count(text: &str, min: u32, max: u32) -> Option<u32> {
         .filter(|value| (min..=max).contains(value))
 }
 
-/// What a revision may start with, for the readers: the qualified forms the broker resolves.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Base {
-    /// What a client writes: `HEAD`, a branch name, an identifier.
-    Client,
-    /// What a reader takes: `HEAD`, `refs/heads/<name>`, `refs/tags/<name>`, an identifier.
-    Qualified,
-}
-
 /// Checks a revision as a client writes it and returns the form the command line carries: `HEAD`
 /// or a branch name or an identifier, followed by at most [`MAX_REVISION_STEPS`] steps of `^`,
 /// `^{commit}`, `~N` and `^N`. A branch name is qualified as `refs/heads/<name>`, so a tag never
 /// answers to it.
 ///
+/// [`MAX_REV_BYTES`] bounds the text as the client writes it, and it is the only bound of a
+/// revision: the prefix this adds is not counted against it, since the readers take the base and
+/// the steps apart ([`split_revision`]).
+///
 /// # Errors
 ///
 /// Returns the rule that refused.
 pub fn revision(text: &str) -> Result<String, &'static str> {
-    revision_of(text, Base::Client)
-}
-
-/// Checks a revision as a reader takes it: like [`revision`], with the base written in full as
-/// `HEAD`, `refs/heads/<name>`, `refs/tags/<name>` or an identifier.
-///
-/// # Errors
-///
-/// Returns the rule that refused.
-pub fn qualified_revision(text: &str) -> Result<(), &'static str> {
-    revision_of(text, Base::Qualified).map(|_| ())
-}
-
-fn revision_of(text: &str, kind: Base) -> Result<String, &'static str> {
     if text.len() > MAX_REV_BYTES {
         return Err(RULE_REVISION_LENGTH);
     }
-    let split = text.find(['^', '~']).unwrap_or(text.len());
-    let (base, steps) = text.split_at(split);
-    let carried = match (kind, base) {
-        (_, "HEAD") => "HEAD".to_owned(),
-        (_, oid) if is_oid(oid) => oid.to_owned(),
-        (Base::Client, name) if is_branch_name(name) => format!("{BRANCH_PREFIX}{name}"),
-        (Base::Qualified, full) if qualified_name(full) => full.to_owned(),
-        _ => return Err(RULE_REVISION),
+    let (base, steps) = split_at_steps(text);
+    let carried = if base == "HEAD" || is_oid(base) {
+        base.to_owned()
+    } else if is_branch_name(base) {
+        format!("{BRANCH_PREFIX}{base}")
+    } else {
+        return Err(RULE_REVISION);
     };
     steps_of(steps)?;
     Ok(format!("{carried}{steps}"))
 }
 
+/// Takes a qualified revision, as [`revision`] returns it or as a reader is given it, apart into
+/// its base and its steps. The base is `HEAD`, an identifier, `refs/heads/<name>` or
+/// `refs/tags/<name>`, and the steps are at most [`MAX_REVISION_STEPS`]; both are bounded by their
+/// own grammars, so this has no bound on the whole.
+///
+/// # Errors
+///
+/// Returns the rule that refused.
+pub fn split_revision(qualified: &str) -> Result<(&str, &str), &'static str> {
+    let (base, steps) = split_at_steps(qualified);
+    if !(base == "HEAD" || is_oid(base) || qualified_name(base)) {
+        return Err(RULE_REVISION);
+    }
+    steps_of(steps)?;
+    Ok((base, steps))
+}
+
+fn split_at_steps(text: &str) -> (&str, &str) {
+    text.split_at(text.find(['^', '~']).unwrap_or(text.len()))
+}
+
 fn qualified_name(text: &str) -> bool {
     text.strip_prefix(BRANCH_PREFIX)
-        .or_else(|| text.strip_prefix("refs/tags/"))
+        .or_else(|| text.strip_prefix(TAG_PREFIX))
         .is_some_and(is_branch_name)
 }
 

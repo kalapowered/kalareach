@@ -4,13 +4,14 @@ use std::time::Duration;
 
 use kr_boundary_windows::frame::invocation::{MAX_REF_NAME_BYTES, RefusedKind};
 use kr_boundary_windows::operation::Writes;
+use kr_boundary_windows::operation::grammar;
 use kr_boundary_windows::repository::readers::{
-    Argument, Entry, MAX_BLOB_BYTES, MAX_BLOB_TOTAL_BYTES, MAX_BLOBS, MAX_LISTING_BYTES,
-    MAX_LISTING_RECORDS, MAX_SYMBOLIC_TARGET_BYTES, MODE_GITLINK, Output, READERS,
-    RULE_READER_ARGUMENT, RULE_READER_BOUNDS, RULE_READER_COUNT, RULE_READER_DEADLINE,
-    RULE_READER_EXIT, RULE_READER_FRAMING, RULE_READER_MISSING, RULE_UNRESOLVED, Reader, Symbolic,
-    attributes_entries, blob_request, form, parse_r1, parse_r2, parse_r3, parse_r4, parse_r5,
-    reader_line,
+    Argument, Base, Entry, Exists, MAX_BLOB_BYTES, MAX_BLOB_TOTAL_BYTES, MAX_BLOBS,
+    MAX_LISTING_BYTES, MAX_LISTING_RECORDS, MAX_SYMBOLIC_TARGET_BYTES, MODE_GITLINK, Output,
+    READERS, RULE_READER_ARGUMENT, RULE_READER_BOUNDS, RULE_READER_COUNT, RULE_READER_DEADLINE,
+    RULE_READER_EXIT, RULE_READER_FRAMING, RULE_READER_MISSING, RULE_UNRESOLVED, Reader,
+    Resolution, Symbolic, attributes_entries, blob_request, form, parse_r1a, parse_r1b, parse_r1c,
+    parse_r2, parse_r3, parse_r4, parse_r5, reader_line, resolution,
 };
 
 const OID: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -42,14 +43,30 @@ fn rule<T: std::fmt::Debug>(
 }
 
 #[test]
-fn the_five_forms_are_these_lines_with_these_deadlines() {
+fn the_seven_forms_are_these_lines_with_these_deadlines() {
     let table = [
         (
-            Reader::R1,
-            "R1",
+            Reader::R1a,
+            "R1a",
+            vec!["show-ref", "--verify", "--end-of-options"],
+            Argument::Reference,
+            vec![0, 128],
+            10,
+        ),
+        (
+            Reader::R1b,
+            "R1b",
             vec!["rev-parse", "--verify", "--end-of-options"],
-            Argument::Revision,
-            vec![0],
+            Argument::Peel,
+            vec![0, 128],
+            10,
+        ),
+        (
+            Reader::R1c,
+            "R1c",
+            vec!["show-ref", "--exists", "--end-of-options"],
+            Argument::Tag,
+            vec![0, 2],
             10,
         ),
         (
@@ -85,7 +102,7 @@ fn the_five_forms_are_these_lines_with_these_deadlines() {
             60,
         ),
     ];
-    assert_eq!(READERS.len(), 5);
+    assert_eq!(READERS.len(), 7);
     for (reader, name, argv, argument, results, seconds) in table {
         let own = form(reader);
         assert_eq!(own.reader, reader);
@@ -117,32 +134,38 @@ fn the_bounds_are_these_numbers() {
 fn a_reader_line_is_its_fixed_words_and_its_argument_and_it_never_writes() {
     for (reader, argument, expected) in [
         (
-            Reader::R1,
+            Reader::R1a,
             Some("HEAD"),
-            vec!["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
+            vec!["show-ref", "--verify", "--end-of-options", "HEAD"],
         ),
         (
-            Reader::R1,
+            Reader::R1a,
             Some("refs/heads/main"),
             vec![
-                "rev-parse",
+                "show-ref",
                 "--verify",
                 "--end-of-options",
-                "refs/heads/main^{commit}",
+                "refs/heads/main",
             ],
         ),
         (
-            Reader::R1,
+            Reader::R1a,
             Some("refs/tags/v1"),
+            vec!["show-ref", "--verify", "--end-of-options", "refs/tags/v1"],
+        ),
+        // A full name that is also a search result for another: the line reads it as it is.
+        (
+            Reader::R1a,
+            Some("refs/heads/refs/heads/ghost"),
             vec![
-                "rev-parse",
+                "show-ref",
                 "--verify",
                 "--end-of-options",
-                "refs/tags/v1^{commit}",
+                "refs/heads/refs/heads/ghost",
             ],
         ),
         (
-            Reader::R1,
+            Reader::R1b,
             Some(OID),
             vec![
                 "rev-parse",
@@ -152,14 +175,19 @@ fn a_reader_line_is_its_fixed_words_and_its_argument_and_it_never_writes() {
             ],
         ),
         (
-            Reader::R1,
-            Some("refs/heads/a~2^"),
+            Reader::R1b,
+            Some(&format!("{OID}~2^")),
             vec![
                 "rev-parse",
                 "--verify",
                 "--end-of-options",
-                "refs/heads/a~2^^{commit}",
+                &format!("{OID}~2^^{{commit}}"),
             ],
+        ),
+        (
+            Reader::R1c,
+            Some("refs/tags/main"),
+            vec!["show-ref", "--exists", "--end-of-options", "refs/tags/main"],
         ),
         (
             Reader::R2,
@@ -189,16 +217,56 @@ fn a_reader_refuses_an_argument_outside_its_form() {
     let at = format!("refs/heads/{}", "n".repeat(MAX_REF_NAME_BYTES - 11));
     assert!(reader_line(Reader::R2, Some(&at)).is_ok());
     let cases: Vec<(Reader, Option<&str>)> = vec![
-        (Reader::R1, None),
-        (Reader::R1, Some("main")),
-        (Reader::R1, Some("")),
-        (Reader::R1, Some("-x")),
-        (Reader::R1, Some("refs/remotes/o/a")),
-        (Reader::R1, Some("refs/heads/")),
-        (Reader::R1, Some("HEAD@{1}")),
-        (Reader::R1, Some("HEAD^^^^^")),
-        (Reader::R1, Some("refs/heads/a..b")),
-        (Reader::R1, Some("0123456789ABCDEF0123456789abcdef01234567")),
+        (Reader::R1a, None),
+        (Reader::R1a, Some("main")),
+        (Reader::R1a, Some("")),
+        (Reader::R1a, Some("-x")),
+        (Reader::R1a, Some("refs/remotes/o/a")),
+        (Reader::R1a, Some("refs/heads/")),
+        (Reader::R1a, Some("refs/tags/")),
+        (Reader::R1a, Some("HEAD@{1}")),
+        (Reader::R1a, Some("refs/heads/a..b")),
+        // The steps are R1b's, and an identifier is not a reference.
+        (Reader::R1a, Some("HEAD^")),
+        (Reader::R1a, Some("refs/heads/a~2")),
+        (Reader::R1a, Some(OID)),
+        (Reader::R1b, None),
+        (Reader::R1b, Some("")),
+        (Reader::R1b, Some("-x")),
+        // A name is never peeled: only the identifier R1a printed is.
+        (Reader::R1b, Some("HEAD")),
+        (Reader::R1b, Some("refs/heads/main")),
+        (Reader::R1b, Some("refs/tags/v1")),
+        (Reader::R1b, Some("main")),
+        (
+            Reader::R1b,
+            Some("0123456789ABCDEF0123456789abcdef01234567"),
+        ),
+        (
+            Reader::R1b,
+            Some("0123456789abcdef0123456789abcdef01234567^^^^^"),
+        ),
+        (
+            Reader::R1b,
+            Some("0123456789abcdef0123456789abcdef01234567@{1}"),
+        ),
+        (
+            Reader::R1b,
+            Some("0123456789abcdef0123456789abcdef01234567~0"),
+        ),
+        (
+            Reader::R1b,
+            Some("0123456789abcdef0123456789abcdef01234567:f"),
+        ),
+        (Reader::R1c, None),
+        (Reader::R1c, Some("main")),
+        (Reader::R1c, Some("")),
+        (Reader::R1c, Some("HEAD")),
+        (Reader::R1c, Some("refs/heads/main")),
+        (Reader::R1c, Some("refs/tags/")),
+        (Reader::R1c, Some("refs/tags/a b")),
+        (Reader::R1c, Some("refs/tags/main^")),
+        (Reader::R1c, Some(OID)),
         (Reader::R2, None),
         (Reader::R2, Some("a")),
         (Reader::R2, Some("HEAD")),
@@ -231,29 +299,134 @@ fn a_reader_refuses_an_argument_outside_its_form() {
 
 // R1
 
-#[test]
-fn r1_answers_one_identifier_and_a_line_feed() {
-    let answer = format!("{OID}\n");
-    assert_eq!(parse_r1(&out(0, answer.as_bytes()), "main").unwrap(), OID);
+fn line_for(reference: &str) -> Vec<u8> {
+    format!("{OID} {reference}\n").into_bytes()
 }
 
 #[test]
-fn r1_refuses_any_exit_code_but_zero_as_an_unresolved_revision_and_names_it() {
-    for code in [1, 2, 128, 255, 3_221_225_781] {
-        let refusal = parse_r1(
-            &out(code, b"fatal: Needed a single revision\n"),
-            "refs/heads/nope",
-        )
-        .unwrap_err();
-        assert_eq!(refusal.rule, RULE_UNRESOLVED, "{code}");
-        assert_eq!(refusal.kind, RefusedKind::Operation);
-        assert_eq!(refusal.detail(), "unresolved refs/heads/nope");
+fn r1a_answers_the_identifier_of_exactly_the_reference_it_was_given() {
+    for reference in [
+        "HEAD",
+        "refs/heads/main",
+        "refs/tags/v1",
+        "refs/heads/refs/heads/ghost",
+        "refs/tags/refs/heads/t2",
+    ] {
+        let line = line_for(reference);
+        assert_eq!(
+            parse_r1a(&out(0, &line), reference).unwrap(),
+            OID,
+            "{reference}"
+        );
     }
 }
 
 #[test]
-fn r1_refuses_a_deadline_and_output_that_is_not_one_identifier() {
-    assert_eq!(rule(parse_r1(&DEADLINE, "main")), RULE_READER_DEADLINE);
+fn r1a_refuses_an_answer_for_another_reference() {
+    // Git's search for a name that is not a reference answers for another one. With no
+    // `refs/heads/ghost`, the reference `refs/heads/refs/heads/ghost` and the tag
+    // `refs/tags/refs/heads/t2` are what the name `refs/heads/ghost` and `refs/heads/t2` find.
+    for (asked, printed) in [
+        ("refs/heads/ghost", "refs/heads/refs/heads/ghost"),
+        ("refs/heads/t2", "refs/tags/refs/heads/t2"),
+        ("refs/heads/main", "refs/heads/main2"),
+        ("refs/heads/main", "refs/heads/main "),
+        ("refs/heads/main", "refs/heads/Main"),
+        ("HEAD", "refs/heads/main"),
+        ("refs/tags/v1", "refs/heads/v1"),
+    ] {
+        let line = line_for(printed);
+        assert_eq!(
+            rule(parse_r1a(&out(0, &line), asked)),
+            RULE_READER_FRAMING,
+            "{asked} {printed}"
+        );
+    }
+}
+
+#[test]
+fn r1a_says_unresolved_for_exit_128_and_refuses_every_other_code_by_its_own_name() {
+    let refusal = parse_r1a(&out(128, b""), "refs/heads/ghost").unwrap_err();
+    assert_eq!(refusal.rule, RULE_UNRESOLVED);
+    assert_eq!(refusal.kind, RefusedKind::Operation);
+    assert_eq!(refusal.detail(), "unresolved refs/heads/ghost");
+    for code in [1, 2, 3, 255, 3_221_225_781] {
+        let line = line_for("refs/heads/main");
+        for stdout in [&b""[..], &line[..]] {
+            let refusal = parse_r1a(&out(code, stdout), "refs/heads/main").unwrap_err();
+            assert_eq!(refusal.rule, RULE_READER_EXIT, "{code}");
+            assert!(refusal.detail().contains("R1a"), "{}", refusal.detail());
+        }
+    }
+    assert_eq!(
+        rule(parse_r1a(&DEADLINE, "refs/heads/main")),
+        RULE_READER_DEADLINE
+    );
+}
+
+#[test]
+fn r1a_refuses_output_that_is_not_one_identifier_and_the_reference() {
+    let good = line_for("refs/heads/main");
+    let cases: Vec<Vec<u8>> = vec![
+        vec![],
+        b"\n".to_vec(),
+        format!("{OID} refs/heads/main").into_bytes(),
+        format!("{OID} refs/heads/main\r\n").into_bytes(),
+        format!("{OID} refs/heads/main\n\n").into_bytes(),
+        format!("{OID} refs/heads/main\n{OID2} refs/heads/main\n").into_bytes(),
+        format!("{OID} refs/heads/main\n{OID2} refs/heads/other\n").into_bytes(),
+        format!("{OID}  refs/heads/main\n").into_bytes(),
+        format!("{OID}\trefs/heads/main\n").into_bytes(),
+        format!("{OID}refs/heads/main\n").into_bytes(),
+        format!("{OID}\n").into_bytes(),
+        format!("{OID} \n").into_bytes(),
+        format!("{} refs/heads/main\n", OID.to_uppercase().replace('0', "A")).into_bytes(),
+        format!("{} refs/heads/main\n", &OID[..39]).into_bytes(),
+        format!("{OID}0 refs/heads/main\n").into_bytes(),
+        format!(" {OID} refs/heads/main\n").into_bytes(),
+        [good.as_slice(), b"\0"].concat(),
+        b"refs/heads/main\n".to_vec(),
+        vec![0xff; 60],
+    ];
+    for stdout in cases {
+        assert_eq!(
+            rule(parse_r1a(&out(0, &stdout), "refs/heads/main")),
+            RULE_READER_FRAMING,
+            "{stdout:?}"
+        );
+    }
+    // The refusal says which reader and never what it printed.
+    let refusal = parse_r1a(&out(0, b"SECRET\n"), "refs/heads/main").unwrap_err();
+    assert!(refusal.detail().contains("R1a"), "{}", refusal.detail());
+    assert!(!refusal.detail().contains("SECRET"));
+}
+
+#[test]
+fn r1b_answers_one_identifier_and_a_line_feed() {
+    let answer = format!("{OID}\n");
+    assert_eq!(parse_r1b(&out(0, answer.as_bytes()), "main").unwrap(), OID);
+}
+
+#[test]
+fn r1b_says_unresolved_for_exit_128_and_refuses_every_other_code_by_its_own_name() {
+    let refusal = parse_r1b(
+        &out(128, b"fatal: Needed a single revision\n"),
+        "refs/heads/nope",
+    )
+    .unwrap_err();
+    assert_eq!(refusal.rule, RULE_UNRESOLVED);
+    assert_eq!(refusal.kind, RefusedKind::Operation);
+    assert_eq!(refusal.detail(), "unresolved refs/heads/nope");
+    for code in [1, 2, 255, 3_221_225_781] {
+        let refusal = parse_r1b(&out(code, b""), "refs/heads/nope").unwrap_err();
+        assert_eq!(refusal.rule, RULE_READER_EXIT, "{code}");
+        assert!(refusal.detail().contains("R1b"), "{}", refusal.detail());
+    }
+}
+
+#[test]
+fn r1b_refuses_a_deadline_and_output_that_is_not_one_identifier() {
+    assert_eq!(rule(parse_r1b(&DEADLINE, "main")), RULE_READER_DEADLINE);
     let good = format!("{OID}\n");
     let cases: Vec<Vec<u8>> = vec![
         vec![],
@@ -273,15 +446,156 @@ fn r1_refuses_a_deadline_and_output_that_is_not_one_identifier() {
     ];
     for stdout in cases {
         assert_eq!(
-            rule(parse_r1(&out(0, &stdout), "main")),
+            rule(parse_r1b(&out(0, &stdout), "main")),
             RULE_READER_FRAMING,
             "{stdout:?}"
         );
     }
     // The refusal says which reader and never what it printed.
-    let refusal = parse_r1(&out(0, b"SECRET\n"), "main").unwrap_err();
-    assert!(refusal.detail().contains("R1"), "{}", refusal.detail());
+    let refusal = parse_r1b(&out(0, b"SECRET\n"), "main").unwrap_err();
+    assert!(refusal.detail().contains("R1b"), "{}", refusal.detail());
     assert!(!refusal.detail().contains("SECRET"));
+}
+
+#[test]
+fn r1c_proves_absence_by_exit_2_alone() {
+    assert_eq!(parse_r1c(&out(2, b"")).unwrap(), Exists::No);
+    assert_eq!(parse_r1c(&out(0, b"")).unwrap(), Exists::Yes);
+    // A crash, a fatal error, a lookup that failed and a code nobody documents are not absence.
+    for code in [1, 3, 128, 255, 3_221_225_781] {
+        let refusal = parse_r1c(&out(code, b"")).unwrap_err();
+        assert_eq!(refusal.rule, RULE_READER_EXIT, "{code}");
+        assert_eq!(refusal.kind, RefusedKind::Operation);
+        assert!(refusal.detail().contains("R1c"), "{}", refusal.detail());
+    }
+    assert_eq!(rule(parse_r1c(&DEADLINE)), RULE_READER_DEADLINE);
+    // Partial output is not an answer, whatever the code.
+    for code in [0, 2] {
+        for stdout in [&b"\n"[..], b"x", b"refs/tags/main\n"] {
+            assert_eq!(
+                rule(parse_r1c(&out(code, stdout))),
+                RULE_READER_FRAMING,
+                "{code} {stdout:?}"
+            );
+        }
+    }
+}
+
+fn resolved(spec: &str) -> Resolution {
+    resolution(spec).unwrap_or_else(|r| panic!("{spec}: {r}"))
+}
+
+#[test]
+fn a_qualified_revision_comes_apart_into_its_base_and_its_steps() {
+    for (spec, base, steps) in [
+        ("HEAD", Base::Reference("HEAD".to_owned()), ""),
+        ("HEAD~2^", Base::Reference("HEAD".to_owned()), "~2^"),
+        (
+            "refs/heads/main",
+            Base::Reference("refs/heads/main".to_owned()),
+            "",
+        ),
+        (
+            "refs/heads/a/b^{commit}~3^2",
+            Base::Reference("refs/heads/a/b".to_owned()),
+            "^{commit}~3^2",
+        ),
+        (
+            "refs/heads/refs/heads/x",
+            Base::Reference("refs/heads/refs/heads/x".to_owned()),
+            "",
+        ),
+        (
+            "refs/tags/v1^",
+            Base::Reference("refs/tags/v1".to_owned()),
+            "^",
+        ),
+        (OID, Base::Identifier(OID.to_owned()), ""),
+        (&format!("{OID}^^"), Base::Identifier(OID.to_owned()), "^^"),
+    ] {
+        let found = resolved(spec);
+        assert_eq!(found.base, base, "{spec}");
+        assert_eq!(found.steps, steps, "{spec}");
+    }
+}
+
+#[test]
+fn a_text_that_is_not_a_qualified_revision_does_not_come_apart() {
+    for spec in [
+        "",
+        "main",
+        "-x",
+        "refs/remotes/o/a",
+        "refs/heads/",
+        "refs/heads/a..b",
+        "HEAD@{1}",
+        "HEAD^^^^^",
+        "HEAD~0",
+        "HEAD:f",
+        "0123456789ABCDEF0123456789abcdef01234567",
+    ] {
+        assert_eq!(
+            resolution(spec).expect_err(spec).rule,
+            RULE_READER_ARGUMENT,
+            "{spec}"
+        );
+    }
+}
+
+#[test]
+fn a_revision_the_grammar_takes_is_read_whole_after_the_prefix_is_added() {
+    // 200 bytes of name and four steps are 236 bytes as written and 247 once qualified: each
+    // reader takes only its own part, so none of them has a bound the other parts exceed.
+    let written = format!("{}{}", "n".repeat(200), "^{commit}".repeat(4));
+    assert_eq!(written.len(), 236);
+    let qualified = grammar::revision(&written).unwrap();
+    assert_eq!(qualified.len(), 247);
+    let parts = resolved(&qualified);
+    let Base::Reference(reference) = &parts.base else {
+        panic!("{parts:?}");
+    };
+    assert_eq!(reference.len(), 211);
+    let first = reader_line(Reader::R1a, Some(reference)).unwrap();
+    assert_eq!(first.argv.last().unwrap(), reference);
+    let peel = parts.peel_argument(Some(OID)).unwrap();
+    assert_eq!(peel, format!("{OID}{}", "^{commit}".repeat(4)));
+    let second = reader_line(Reader::R1b, Some(&peel)).unwrap();
+    assert_eq!(
+        second.argv.last().unwrap(),
+        &format!("{OID}{}^{{commit}}", "^{commit}".repeat(4))
+    );
+}
+
+#[test]
+fn the_identifier_a_reader_printed_is_what_the_steps_follow() {
+    let by_reference = resolved("refs/heads/main~2");
+    assert_eq!(
+        by_reference.peel_argument(Some(OID2)).unwrap(),
+        format!("{OID2}~2")
+    );
+    let by_identifier = resolved(&format!("{OID}^"));
+    assert_eq!(
+        by_identifier.peel_argument(None).unwrap(),
+        format!("{OID}^")
+    );
+    // A reference that was not read, an identifier that was read for no reference, and a
+    // reading that is not an identifier each leave nothing to peel.
+    for (parts, read) in [
+        (&by_reference, None),
+        (&by_reference, Some("main")),
+        (&by_reference, Some("")),
+        (&by_reference, Some(&OID[..39])),
+        (&by_identifier, Some(OID2)),
+    ] {
+        assert_eq!(
+            parts
+                .peel_argument(read)
+                .expect_err(&format!("{read:?}"))
+                .rule,
+            RULE_READER_ARGUMENT,
+            "{read:?}"
+        );
+    }
 }
 
 // R2

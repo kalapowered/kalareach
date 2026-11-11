@@ -7,6 +7,9 @@ use crate::frame::invocation::MAX_NAME_BYTES;
 /// What a reference to a branch starts with.
 pub const BRANCH_PREFIX: &str = "refs/heads/";
 
+/// What a reference to a tag starts with.
+pub const TAG_PREFIX: &str = "refs/tags/";
+
 /// The digits of an object identifier of the only object format the broker admits, SHA-1.
 pub const OID_DIGITS: usize = 40;
 

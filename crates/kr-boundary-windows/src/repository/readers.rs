@@ -1,5 +1,11 @@
-//! The five readers the broker runs against a repository's objects, outside the eight commands of
-//! a request, and the contract every one of them keeps.
+//! The readers the broker runs against a repository's objects, outside the eight commands of a
+//! request, and the contract every one of them keeps.
+//!
+//! A revision resolves in two reads, never by a name alone. Git applies its search for a name to a
+//! full name too, so with no `refs/heads/x` the name `refs/heads/x` can answer from
+//! `refs/heads/refs/heads/x` or from a tag. R1a therefore reads exactly one reference, with no
+//! search, and R1b peels the identifier it printed together with the revision's steps. R1c is the
+//! answer that no tag of a name exists.
 //!
 //! A reader is a fixed argument line, started by the broker with the settings and the environment
 //! of any other command, with the three paths of the repository set as for the operation. Its
@@ -15,10 +21,16 @@
 use std::time::Duration;
 
 use crate::frame::invocation::{MAX_REF_NAME_BYTES, RefusedKind};
-use crate::names::{BRANCH_PREFIX, is_branch_name, is_oid};
-use crate::operation::grammar::qualified_revision;
+use crate::names::{BRANCH_PREFIX, TAG_PREFIX, is_branch_name, is_oid};
+use crate::operation::grammar::split_revision;
 use crate::operation::{OperationLine, Writes};
 use crate::refusal::Refusal;
+
+/// The exit code Git ends with after a fatal error: a reference or object that is absent or cannot
+/// be read, among others.
+const GIT_FATAL: u32 = 128;
+/// The exit code of `show-ref --exists` for a reference that does not exist.
+const EXISTS_MISSING: u32 = 2;
 
 /// The most bytes of the output of a listing reader.
 pub const MAX_LISTING_BYTES: usize = 1_048_576;
@@ -50,11 +62,15 @@ pub const RULE_READER_MISSING: &str = "reader-missing";
 /// A revision that does not resolve to a commit.
 pub const RULE_UNRESOLVED: &str = "reader-unresolved";
 
-/// The five readers.
+/// The readers. R1 is three forms, which resolve a revision in two reads and check a tag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reader {
-    /// Resolves a qualified revision to a commit.
-    R1,
+    /// Reads exactly one reference and prints the identifier it holds.
+    R1a,
+    /// Peels an identifier, with the steps of a revision, to a commit.
+    R1b,
+    /// Says whether a tag of a given name exists.
+    R1c,
     /// Says whether a branch reference is symbolic.
     R2,
     /// Lists every file of a commit's tree.
@@ -70,8 +86,13 @@ pub enum Reader {
 pub enum Argument {
     /// None.
     Nothing,
-    /// A qualified revision or an identifier, which the line carries with `^{commit}` after it.
-    Revision,
+    /// A reference to read exactly: `HEAD`, `refs/heads/<name>` or `refs/tags/<name>`.
+    Reference,
+    /// An identifier followed by the steps of a revision, which the line carries with `^{commit}`
+    /// after it.
+    Peel,
+    /// A full reference name under `refs/tags/`.
+    Tag,
     /// A full reference name under `refs/heads/`.
     RefName,
     /// An object identifier.
@@ -95,14 +116,30 @@ pub struct ReaderForm {
     pub deadline: Duration,
 }
 
-/// The five forms.
-pub const READERS: [ReaderForm; 5] = [
+/// The forms.
+pub const READERS: [ReaderForm; 7] = [
     ReaderForm {
-        reader: Reader::R1,
-        name: "R1",
+        reader: Reader::R1a,
+        name: "R1a",
+        argv: &["show-ref", "--verify", "--end-of-options"],
+        argument: Argument::Reference,
+        results: &[0, GIT_FATAL],
+        deadline: Duration::from_secs(10),
+    },
+    ReaderForm {
+        reader: Reader::R1b,
+        name: "R1b",
         argv: &["rev-parse", "--verify", "--end-of-options"],
-        argument: Argument::Revision,
-        results: &[0],
+        argument: Argument::Peel,
+        results: &[0, GIT_FATAL],
+        deadline: Duration::from_secs(10),
+    },
+    ReaderForm {
+        reader: Reader::R1c,
+        name: "R1c",
+        argv: &["show-ref", "--exists", "--end-of-options"],
+        argument: Argument::Tag,
+        results: &[0, EXISTS_MISSING],
         deadline: Duration::from_secs(10),
     },
     ReaderForm {
@@ -143,12 +180,18 @@ pub const READERS: [ReaderForm; 5] = [
 #[must_use]
 pub const fn form(reader: Reader) -> &'static ReaderForm {
     match reader {
-        Reader::R1 => &READERS[0],
-        Reader::R2 => &READERS[1],
-        Reader::R3 => &READERS[2],
-        Reader::R4 => &READERS[3],
-        Reader::R5 => &READERS[4],
+        Reader::R1a => &READERS[0],
+        Reader::R1b => &READERS[1],
+        Reader::R1c => &READERS[2],
+        Reader::R2 => &READERS[3],
+        Reader::R3 => &READERS[4],
+        Reader::R4 => &READERS[5],
+        Reader::R5 => &READERS[6],
     }
+}
+
+fn unresolved(name: &str) -> Refusal {
+    refuse(RULE_UNRESOLVED, &format!("unresolved {name}"))
 }
 
 fn refuse(rule: &'static str, detail: &str) -> Refusal {
@@ -176,8 +219,29 @@ pub fn reader_line(reader: Reader, argument: Option<&str>) -> Result<OperationLi
     };
     let last = match (form.argument, argument) {
         (Argument::Nothing, None) => None,
-        (Argument::Revision, Some(spec)) if qualified_revision(spec).is_ok() => {
-            Some(format!("{spec}^{{commit}}"))
+        (Argument::Reference, Some(text))
+            if matches!(
+                resolution(text),
+                Ok(Resolution { base: Base::Reference(_), steps }) if steps.is_empty()
+            ) =>
+        {
+            Some(text.to_owned())
+        }
+        (Argument::Peel, Some(text))
+            if matches!(
+                resolution(text),
+                Ok(Resolution {
+                    base: Base::Identifier(_),
+                    ..
+                })
+            ) =>
+        {
+            Some(format!("{text}^{{commit}}"))
+        }
+        (Argument::Tag, Some(text))
+            if text.strip_prefix(TAG_PREFIX).is_some_and(is_branch_name) =>
+        {
+            Some(text.to_owned())
         }
         (Argument::RefName, Some(name))
             if name.len() <= MAX_REF_NAME_BYTES
@@ -219,35 +283,154 @@ fn result_code(form: &ReaderForm, output: &Output<'_>) -> Result<u32, Refusal> {
     }
 }
 
-/// Reads R1's answer: the commit's identifier, as one line of 40 hexadecimal digits.
-///
-/// Any exit code but 0, an unknown name's 128 among them, is a revision that does not resolve,
-/// and the refusal names `name`, the revision as it was asked for.
+/// Where a qualified revision starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Base {
+    /// A reference, which R1a reads first: `HEAD`, `refs/heads/<name>` or `refs/tags/<name>`.
+    Reference(String),
+    /// An object identifier, which R1b peels as it is.
+    Identifier(String),
+}
+
+/// A qualified revision taken apart for the readers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resolution {
+    /// Where the revision starts.
+    pub base: Base,
+    /// The steps after the base: `^`, `^{commit}`, `~N` and `^N`, at most four.
+    pub steps: String,
+}
+
+/// Takes a qualified revision apart.
 ///
 /// # Errors
 ///
-/// Returns a refusal for an unresolved revision, a deadline, or output that is not one line.
-pub fn parse_r1(output: &Output<'_>, name: &str) -> Result<String, Refusal> {
-    let form = form(Reader::R1);
-    match output.exit {
-        None => return Err(failed(form, RULE_READER_DEADLINE, "it did not end in time")),
-        Some(0) => {}
-        Some(_) => {
-            return Err(refuse(RULE_UNRESOLVED, &format!("unresolved {name}")));
-        }
+/// Returns a refusal when the text is not a qualified revision.
+pub fn resolution(spec: &str) -> Result<Resolution, Refusal> {
+    let (base, steps) = split_revision(spec).map_err(|_| {
+        failed(
+            form(Reader::R1a),
+            RULE_READER_ARGUMENT,
+            "the revision is outside its form",
+        )
+    })?;
+    let base = if is_oid(base) {
+        Base::Identifier(base.to_owned())
+    } else {
+        Base::Reference(base.to_owned())
+    };
+    Ok(Resolution {
+        base,
+        steps: steps.to_owned(),
+    })
+}
+
+impl Resolution {
+    /// The argument of R1b: the identifier the base has, then the steps. `read` is the identifier
+    /// R1a printed, and is given exactly when the base is a reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when `read` is missing, is given for an identifier base, or is not an
+    /// identifier.
+    pub fn peel_argument(&self, read: Option<&str>) -> Result<String, Refusal> {
+        let oid = match (&self.base, read) {
+            (Base::Reference(_), Some(oid)) => Some(oid),
+            (Base::Identifier(oid), None) => Some(oid.as_str()),
+            _ => None,
+        };
+        let oid = match oid {
+            Some(oid) if is_oid(oid) => oid,
+            _ => {
+                return Err(failed(
+                    form(Reader::R1b),
+                    RULE_READER_ARGUMENT,
+                    "the identifier to peel does not fit the revision",
+                ));
+            }
+        };
+        Ok(format!("{oid}{}", self.steps))
     }
-    let line = output
+}
+
+/// Reads R1a's answer for `reference`: the identifier it holds, from one line
+/// `<identifier> SP <reference> LF` that names the reference asked for and no other.
+///
+/// # Errors
+///
+/// Returns a refusal for a reference that is absent or cannot be read, an exit code outside the
+/// result set, a deadline, or output that is not that one line.
+pub fn parse_r1a(output: &Output<'_>, reference: &str) -> Result<String, Refusal> {
+    let form = form(Reader::R1a);
+    if result_code(form, output)? == GIT_FATAL {
+        return Err(unresolved(reference));
+    }
+    output
         .stdout
         .strip_suffix(b"\n")
         .and_then(|line| std::str::from_utf8(line).ok())
-        .filter(|line| is_oid(line));
-    line.map(str::to_owned).ok_or_else(|| {
-        failed(
-            form,
-            RULE_READER_FRAMING,
-            "the answer is not one identifier",
-        )
-    })
+        .and_then(|line| line.split_once(' '))
+        .filter(|(oid, name)| is_oid(oid) && *name == reference)
+        .map(|(oid, _)| oid.to_owned())
+        .ok_or_else(|| {
+            failed(
+                form,
+                RULE_READER_FRAMING,
+                "the answer is not one identifier and the reference asked for",
+            )
+        })
+}
+
+/// Reads R1b's answer: the commit's identifier, as one line of 40 hexadecimal digits. Exit 128 is a
+/// revision that does not peel to a commit, and the refusal names `name`, the revision as it was
+/// asked for.
+///
+/// # Errors
+///
+/// Returns a refusal for an unresolved revision, an exit code outside the result set, a deadline,
+/// or output that is not one line.
+pub fn parse_r1b(output: &Output<'_>, name: &str) -> Result<String, Refusal> {
+    let form = form(Reader::R1b);
+    if result_code(form, output)? == GIT_FATAL {
+        return Err(unresolved(name));
+    }
+    output
+        .stdout
+        .strip_suffix(b"\n")
+        .and_then(|line| std::str::from_utf8(line).ok())
+        .filter(|line| is_oid(line))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            failed(
+                form,
+                RULE_READER_FRAMING,
+                "the answer is not one identifier",
+            )
+        })
+}
+
+/// R1c's answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exists {
+    /// The reference exists, whatever object it names.
+    Yes,
+    /// It does not exist: the only answer that proves absence.
+    No,
+}
+
+/// Reads R1c's answer: exit 0 for a reference that exists and exit 2 for one that does not, both
+/// with nothing on the standard output.
+///
+/// # Errors
+///
+/// Returns a refusal for any other exit code, a deadline, or output on the standard output.
+pub fn parse_r1c(output: &Output<'_>) -> Result<Exists, Refusal> {
+    let form = form(Reader::R1c);
+    let code = result_code(form, output)?;
+    if !output.stdout.is_empty() {
+        return Err(failed(form, RULE_READER_FRAMING, "it printed something"));
+    }
+    Ok(if code == 0 { Exists::Yes } else { Exists::No })
 }
 
 /// R2's answer.

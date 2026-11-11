@@ -8,7 +8,7 @@
 use crate::frame::invocation::RefusedKind;
 use crate::refusal::Refusal;
 use crate::repository::head::HeadKind;
-use crate::repository::readers::{RULE_UNRESOLVED, Symbolic};
+use crate::repository::readers::{Exists, Symbolic};
 
 /// The entries of `.git` that say an operation is in progress. A command that writes refuses to
 /// go on while any is there: a cherry-pick state, for one, supplies the author despite the
@@ -95,22 +95,22 @@ pub fn check_not_symbolic(refname: &str, answer: Symbolic) -> Result<(), Refusal
     }
 }
 
-/// Checks R1's answer for `refs/tags/<name>`: a branch is never taken for a tag, so a tag of the
-/// same name makes the name ambiguous. The lookup must fail by finding nothing; a failure of any
-/// other kind, a deadline or a cut answer, is returned as it is.
+/// Checks R1c's answer for `refs/tags/<name>`: a branch is never taken for a tag, so a tag of the
+/// same name makes the name ambiguous. Only the answer that the tag does not exist passes; a
+/// lookup that failed in any other way is returned as it is.
 ///
 /// # Errors
 ///
-/// Returns a refusal that says the name is ambiguous when the tag resolves, and the reader's own
-/// refusal when the lookup failed for another reason than an unresolved name.
-pub fn check_no_tag(name: &str, tag_lookup: &Result<String, Refusal>) -> Result<(), Refusal> {
+/// Returns a refusal that says the name is ambiguous when the tag exists, and the reader's own
+/// refusal when the lookup failed.
+pub fn check_no_tag(name: &str, tag_lookup: &Result<Exists, Refusal>) -> Result<(), Refusal> {
     match tag_lookup {
-        Ok(_) => Err(Refusal::new(
+        Ok(Exists::Yes) => Err(Refusal::new(
             RefusedKind::Operation,
             RULE_AMBIGUOUS_NAME,
             &format!("ambiguous name {name}"),
         )),
-        Err(refusal) if refusal.rule == RULE_UNRESOLVED => Ok(()),
+        Ok(Exists::No) => Ok(()),
         Err(refusal) => Err(refusal.clone()),
     }
 }
