@@ -111,6 +111,12 @@ charges nothing, because those bytes are already counted against the attachment 
 A byte quota is `QUOTA_EXCEEDED`, which nothing retries into. The concurrency ceiling is
 `RESOURCE_UNAVAILABLE`, because it clears when one of the caller's own transfers finishes.
 
+A paired device is shown only what its own principal holds. The `upload.begin` answer reports the
+bytes that principal has staged, this reservation included, and a retained copy of the answer reports
+the same. A byte quota refused to a device names the environment's limit and the size the upload
+declares, and never the total another principal holds. The person at this machine is told the
+environment's total.
+
 The ceiling counts per authenticated principal, which is what identifies a device to this host: a
 paired device's actor is that device, and a local caller's actor is the operating-system user. The
 `device_id` a request carries is recorded as metadata and confers nothing, because a caller that
@@ -128,6 +134,19 @@ as it does any other refusal of the service, so the same action asked again is g
 refusal even when a place is free, and a device that has freed a place takes a new action for its
 new attempt. The person at this machine is held to no bound, and nothing a device sends changes it:
 the number is a constant of the host that an owner cannot change.
+
+A paired device's staged uploads are bounded too, at 1,024 for each device. An upload is staged from
+`upload.begin` until it ends: while it receives chunks, while it is published, and until the
+attachment it made expires, which an unused file does after seven days. An attachment that a prompt
+has sent to a session follows that session's retention instead and stops counting, as a sent draft
+does. `upload.begin` counts the device's staged uploads under the journal's lock, beside the
+concurrency ceiling. Past the bound the refusal is `QUOTA_EXCEEDED`, with the bound in its message
+and the ways to free a place: cancel an upload that is still receiving, send the files that wait to
+a session, or let an unused file expire. A published upload cannot be cancelled. The environment's
+staged bytes already bound the bytes, so this count bounds what they do not: the rows, and the files
+of no bytes. The host keeps the refusal as that action's outcome, as it keeps any refusal of the
+service. The person at this machine is held to no bound; the number is a constant of the host that
+an owner cannot change.
 
 A device cannot end a draft itself, because this level has no method that discards one. Sent and
 orphaned drafts stay in the journal, and each `draft.update` adds a row to the journal's events,
@@ -153,6 +172,13 @@ streams to multiplex, so the daemon listens on a second endpoint beside its cont
 frames that connection at the attachment bound. The handshake, the peer-credential
 authentication and the action windows are the control connection's, unchanged. The frame bound is
 the only difference, and it is why the endpoint exists at all.
+
+A paired device begins, finishes and cancels an upload and reads its status on its control stream,
+and only the chunks travel on a data stream. An exact repeat of `upload.finish` or `upload.cancel` on
+a replacement connection is settled from the action's claim: an open claim is finished, and a
+settled one gives back its answer. An exact repeat of a chunk is not settled there. The host tells
+the device the outcome is unknown, and the device reads `upload.status` and sends the chunks that are
+not staged as new actions.
 
 On the network transport a host takes a paired device's chunks on a data stream of that kind for
 the device's own uploads only, keeps one live stream for each transfer, and answers each chunk on

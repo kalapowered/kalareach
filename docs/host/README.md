@@ -3271,15 +3271,14 @@ filtered for the device: the generated text of a description only when the devic
 back to the session's start, and otherwise the pin or the metadata title (*Session names and
 descriptions* has the rule). `privacy.status` is answered by the daemon under `host.manage`.
 
-Three reads are refused as `UNSUPPORTED_CAPABILITY`, with the read and the reason in the message:
-`upload.status`, `download.begin` and `download.chunk`, because this host does not serve them to a
-paired device. A device that does not hold the right the read requires (`files.upload` for the
-first, `files.read` for the other two) is refused `PERMISSION_DENIED` first.
+Two reads are refused as `UNSUPPORTED_CAPABILITY`, with the read and the reason in the message:
+`download.begin` and `download.chunk`, because this host does not serve them to a paired device. A
+device that does not hold `files.read` is refused `PERMISSION_DENIED` first.
 
-Of the four upload writes, `upload.begin`, `upload.finish` and `upload.cancel` are refused
-`UNSUPPORTED_CAPABILITY` with the words that this host does not serve a device's upload. A device's
-`upload.chunk` is served on a data stream and on no other; on the control stream it is refused
-`UNSUPPORTED_CAPABILITY`, and the refusal names the attachment-chunk stream. `terminal.palette.set`
+A device that holds `files.upload` makes an upload with four methods on its control stream,
+`upload.begin`, `upload.finish`, `upload.cancel` and `upload.status`, and sends the chunks on a data
+stream. A device's `upload.chunk` is served on a data stream and on no other; on the control stream
+it is refused `UNSUPPORTED_CAPABILITY`, and the refusal names the attachment-chunk stream. `terminal.palette.set`
 is refused `UNSUPPORTED_CAPABILITY` too, because no part of this host performs it for a paired device,
 and `input.write` sent as a mutation is refused `INVALID_ARGUMENT`, because raw input travels as a
 request and carries no action. Each refusal comes after the device's rights are asked, so a device
@@ -3341,6 +3340,51 @@ withdraws the oldest as a revocation withdraws a device's connections: it is clo
 flight on it gets no answer, and the device presents the same action on a newer connection and
 settles it as it would after any lost connection. Another device's connections are not touched. An
 owner cannot change the bound.
+
+The transfer service performs a device's uploads under the device's own principal, which the host
+derives from the device's identity. A device sees and ends only its own uploads: another principal's
+upload, an unknown one and an expired one all get the same answer, that the transfer is unknown. An
+`upload.begin` that labels the upload with another device's identity is refused `PERMISSION_DENIED`;
+the label is this device's or none. The answer to `upload.begin` shows the device the bytes its own
+principal has staged, this reservation included, and a retained copy of the answer shows the same.
+`upload.status` is decided as `session.open` is. The host resolves the stored upload's session under
+the device's principal and decides the read as for that session, with its rights, the connection's
+scope and the grant it acts under; an upload with no session is decided under the pairing grant. The
+answer is that the transfer is unknown when the principal has no such row. While the host owes a
+fence it withholds the answer, so a device is not shown the bitmap of staged chunks.
+
+Three bounds hold a device's uploads. A principal has at most two open transfers, and a third
+`upload.begin` is refused `RESOURCE_UNAVAILABLE`. The environment stages at most the bytes its
+owner allows, 8 GiB by default, and a reservation that does not fit is refused `QUOTA_EXCEEDED`; the
+message a device reads names the environment's limit and the size the upload declares, and never
+another principal's total, which only the person at this machine is told. A device keeps at most 1,024 uploads staged, and past that
+`upload.begin` is refused `QUOTA_EXCEEDED` with the bound in the message and the ways a place is
+freed. The count takes the device's uploads that are receiving, publishing or published, and leaves
+out an attachment a prompt has sent to a session, which follows the session's retention. A device
+frees a place by cancelling an upload that is still receiving, by sending the files that wait to a
+session, or by letting an unused file expire, which it does after seven days. A published upload
+cannot be cancelled. The bound is one constant of this host, which an owner cannot change, and the
+person at this machine is held to none. The host keeps each of these refusals as the action's
+outcome, so the same action asked again is given the same refusal even when a place is free, and a
+device that has freed a place takes a new action for its new attempt.
+
+An exact repeat of `upload.finish` or `upload.cancel` on a replacement connection, under the window
+it was first sent in, is settled by what the action's claim says. An open claim is finished and
+nothing else is begun. A settled claim gives back the answer it was settled with, under the check
+any recorded answer is owed. An action with no claim is a first admission, which has no window on
+this connection, and it is refused `PERMISSION_DENIED` for its window. A finish whose answer was lost
+is also read through `upload.status`, which returns the published state and the handle on any
+connection. A device that may not read the session's receipts is told `OUTCOME_UNKNOWN` for the
+answer of its own first finish or cancel of a session's upload, and reads `upload.status` to learn
+the outcome.
+
+A chunk is not settled on a replacement connection. Its exact repeat there carries the window of the
+connection that was lost, and the host refuses it for that window. The refusal is `OUTCOME_UNKNOWN`
+when the host has claimed the action, because a copy may have been carried out, and nothing is
+staged by the repeat. The device reads `upload.status`, which shows the chunks that are staged, and
+sends the others as new actions. A chunk that the service refused at its own ask, because its stream
+was replaced, left no record: its exact repeat on the same connection is a first attempt and is
+staged.
 
 `draft.create`, `draft.update` and `agent.draft.add_attachment` are performed by the transfer
 service under the device's own principal, which the host derives from the device's identity, so
