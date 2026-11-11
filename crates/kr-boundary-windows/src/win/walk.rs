@@ -599,8 +599,9 @@ fn open_by_key(hint: &Handle, key: &FileKey, access: u32, share: u32) -> Result<
 }
 
 /// An absolute path as the NT name that opens it, which is the one form a call that is not
-/// `CreateFileW` takes. Only local paths are accepted.
-fn nt_path(path: &Path) -> Result<Vec<u16>> {
+/// `CreateFileW` takes. A path on another computer has none: the answer is `None`, and the anchor
+/// is refused as a remote volume.
+fn nt_path(path: &Path) -> Result<Option<Vec<u16>>> {
     let wide = wide_path(path);
     let mut full = vec![0_u16; 512];
     loop {
@@ -624,20 +625,29 @@ fn nt_path(path: &Path) -> Result<Vec<u16>> {
     }
     let slash = u16::from(b'\\');
     let question = u16::from(b'?');
-    if full.len() > 4 && full[..4] == [slash, slash, question, slash] {
-        // `\\?\C:\x` is `\??\C:\x` in the NT space.
+    let dot = u16::from(b'.');
+    if full.len() > 4
+        && full[0] == slash
+        && full[1] == slash
+        && (full[2] == question || full[2] == dot)
+        && full[3] == slash
+    {
+        // `\\?\C:\x` and `\\.\C:\x` are `\??\C:\x` in the NT space; the one that names a share,
+        // `\\?\UNC\server\share`, is a path on another computer.
+        let rest = String::from_utf16_lossy(&full[4..]).to_ascii_uppercase();
+        if rest.starts_with("UNC\\") {
+            return Ok(None);
+        }
         full[1] = question;
-        return Ok(full);
+        full[2] = question;
+        return Ok(Some(full));
     }
     if full.len() > 2 && full[0] == slash && full[1] == slash {
-        return Err(error(
-            ERROR_INVALID_PARAMETER,
-            "only a path on a local drive can be opened",
-        ));
+        return Ok(None);
     }
     let mut nt = vec![slash, question, question, slash];
     nt.extend(full);
-    Ok(nt)
+    Ok(Some(nt))
 }
 
 /// Checks an open directory the way every anchor and every recorded directory is checked: the
@@ -695,9 +705,12 @@ impl DirHandle {
         access: u32,
     ) -> Result<std::result::Result<DirHandle, AnchorRefusal>> {
         require_holding(access)?;
+        let Some(nt) = nt_path(path)? else {
+            return Ok(Err(AnchorRefusal::Volume(VolumeRefusal::Remote)));
+        };
         let handle = nt_create(
             std::ptr::null_mut(),
-            &nt_path(path)?,
+            &nt,
             access,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             FILE_OPEN,
@@ -1030,6 +1043,17 @@ fn nt_error(status: i32, what: &str) -> super::ffi::Error {
 }
 
 impl DirHandle {
+    /// Opens the name `name` directly beneath this directory for attributes alone, with every
+    /// sharing, so that the object stays open and in nobody's way, and gives the handle to the
+    /// removal's disposition check, which needs a second, independent open of its scratch file.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error when the name cannot be opened.
+    pub(super) fn open_probe(&self, name: &[u16]) -> Result<Handle> {
+        self.nt_open(name, 0, true, FILE_OPEN, 0, None)
+    }
+
     /// Tells whether the name `name` exists directly beneath this directory. It is a probe and
     /// gives nothing else: the open is relative to this directory's handle, asks for no right but
     /// to read attributes, shares everything and is closed at once, so it holds nothing and

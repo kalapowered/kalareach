@@ -27,7 +27,9 @@ use std::ffi::c_void;
 use std::mem::size_of;
 use std::os::windows::io::AsRawHandle as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -155,7 +157,9 @@ pub enum RootError {
     Refused(String),
 }
 
-/// An object the removal could not remove. Nothing on it was changed.
+/// An object the removal could not remove, or the root itself when the removal stopped. The removal
+/// changes nothing on it, with one exception: when the reason says that a delete call did not end,
+/// that call may still complete later, and whether the object is gone is not known.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Leftover {
     /// Where it is, below the root, with the root's name left out.
@@ -307,7 +311,11 @@ fn make_root(
 ///
 /// Returns what could not be removed. When nothing is left over the root itself is gone and the
 /// `removed` row is written; otherwise the root stays, and so does everything the removal could
-/// not take.
+/// not take. Two cases leave the state uncertain, and the leftovers say so: an object whose delete
+/// call did not end, which that call may still remove, and the objects that a stopped removal did
+/// not reach, which a delete that succeeded may have been the last to spare (the root's leftover
+/// says why it stopped). A removal of a root whose earlier delete call has still not ended makes no
+/// call and no listing and returns one leftover for the root that says so.
 ///
 /// # Errors
 ///
@@ -331,6 +339,12 @@ pub fn remove_root_within(
     limits: Limits,
     rows: &mut dyn RootRows,
 ) -> Result<Vec<Leftover>, RootError> {
+    if call_pending(root.name.as_str()) {
+        return Ok(vec![Leftover {
+            path: String::new(),
+            reason: "a delete call of an earlier removal of this root has not ended".to_owned(),
+        }]);
+    }
     let mut state = Removal {
         limits,
         listed: 0,
@@ -339,8 +353,6 @@ pub fn remove_root_within(
         stopped: false,
         leftovers: Vec::new(),
         deleter: Deleter::start(root.name.as_str())?,
-        #[cfg(feature = "testing")]
-        root: root.name.as_str().to_owned(),
     };
     state.empty(&root.dir, "", 1);
     if state.leftovers.is_empty() {
@@ -403,17 +415,43 @@ struct Deleter {
     jobs: Sender<Job>,
     answers: Receiver<Result<(), super::ffi::Error>>,
     thread: JoinHandle<()>,
-    #[cfg(feature = "testing")]
+    /// Set by the thread when it ends, which it does after the call it is in has returned.
+    ended: Arc<AtomicBool>,
     root: String,
+}
+
+/// The roots whose delete thread was given up in a call that had not returned, with the flag that
+/// says when the thread has ended. While one is pending no removal of the root makes a delete call,
+/// so that at most one thread is ever inside a delete call for a root.
+static ABANDONED: Mutex<Vec<(String, Arc<AtomicBool>)>> = Mutex::new(Vec::new());
+
+/// Whether an earlier removal of the root named `root` gave up a delete call that is still in the
+/// system.
+fn call_pending(root: &str) -> bool {
+    let mut abandoned = ABANDONED.lock().unwrap();
+    abandoned.retain(|(_, ended)| !ended.load(Ordering::Acquire));
+    abandoned.iter().any(|(name, _)| name == root)
+}
+
+/// Sets a flag when it is dropped, by a panic too.
+struct SetOnDrop(Arc<AtomicBool>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 impl Deleter {
     fn start(root: &str) -> Result<Deleter, RootError> {
         let (jobs, work) = std::sync::mpsc::channel::<Job>();
         let (reply, answers) = std::sync::mpsc::channel();
+        let ended = Arc::new(AtomicBool::new(false));
+        let ending = SetOnDrop(ended.clone());
         let thread = std::thread::Builder::new()
             .name("private-root-delete".to_owned())
             .spawn(move || {
+                let _ending = ending;
                 // A delete through an open handle needs no privilege and no impersonation. The
                 // loop ends when the removal lets go of its end, and a closed answer ends it too.
                 while let Ok(job) = work.recv() {
@@ -432,12 +470,11 @@ impl Deleter {
                     "starting the thread that deletes",
                 )
             })?;
-        let _ = root;
         Ok(Deleter {
             jobs,
             answers,
             thread,
-            #[cfg(feature = "testing")]
+            ended,
             root: root.to_owned(),
         })
     }
@@ -463,7 +500,13 @@ impl Deleter {
         unsafe { CancelSynchronousIo(self.thread.as_raw_handle()) };
         match self.answers.recv_timeout(CANCEL_GRACE) {
             Ok(result) => Call::Cancelled(result),
-            Err(_) => Call::DidNotEnd,
+            Err(_) => {
+                ABANDONED
+                    .lock()
+                    .unwrap()
+                    .push((self.root.clone(), self.ended.clone()));
+                Call::DidNotEnd
+            }
         }
     }
 }
@@ -617,6 +660,13 @@ pub mod testing {
         }
     }
 
+    /// Whether a delete call that an earlier removal of the root named `root` gave up is still in
+    /// the system.
+    #[must_use]
+    pub fn call_pending(root: &RootName) -> bool {
+        super::call_pending(root.as_str())
+    }
+
     pub(super) fn note_cancel(root: &str) {
         let mut cancels = CANCELS.lock().unwrap();
         match cancels.iter_mut().find(|(name, _)| name == root) {
@@ -652,9 +702,6 @@ struct Removal {
     leftovers: Vec<Leftover>,
     /// The thread that makes the delete calls.
     deleter: Deleter,
-    /// The root's name, which the cases' functions are set by.
-    #[cfg(feature = "testing")]
-    root: String,
 }
 
 fn joined(at: &str, child: &Child) -> String {
@@ -700,7 +747,7 @@ impl Removal {
         self.listed += listing.children.len();
         #[cfg(feature = "testing")]
         testing::fire(
-            &self.root,
+            &self.deleter.root,
             &testing::Event::Listed {
                 directory: at,
                 names: listing.children.iter().map(Child::display).collect(),
@@ -746,7 +793,7 @@ impl Removal {
             }
         };
         #[cfg(feature = "testing")]
-        testing::fire(&self.root, &testing::Event::Opened { path });
+        testing::fire(&self.deleter.root, &testing::Event::Opened { path });
         match opened.kind() {
             Kind::File | Kind::ReparsePoint => self.remove(opened.into_handle(), path),
             Kind::Directory if !listed_directory => {
@@ -929,11 +976,14 @@ pub fn check_disposition(dir: &DirHandle) -> Result<(), RootError> {
     let name = format!("disposition-check-{}", random_name()?.as_str());
     let units: Vec<u16> = name.encode_utf16().collect();
     let handle = dir.create_file_named(&units, DELETE)?;
+    // A second, independent open keeps the file open after the deleting handle closes. A delete
+    // with POSIX semantics takes the name away when the deleting handle is cleaned up, whatever
+    // else has the file open; one that waits for the last close would leave the name.
+    let other = dir.open_probe(&units)?;
     delete(&handle)?;
-    // The name is probed while the handle is still open: with POSIX semantics it is gone at once,
-    // and a delete that waited for the last close would still show it.
-    let exists = dir.name_exists(&units)?;
     drop(handle);
+    let exists = dir.name_exists(&units)?;
+    drop(other);
     if exists {
         return Err(RootError::Refused(
             "the platform's delete with POSIX semantics left the scratch file".to_owned(),

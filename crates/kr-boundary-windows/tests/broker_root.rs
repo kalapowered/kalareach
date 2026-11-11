@@ -1187,9 +1187,13 @@ fn a_link_or_a_file_with_several_names_stays_held_between_its_check_and_its_dele
         "the other name of the hard link is now the object's only name"
     );
     assert_eq!(
-        (kept_after.bytes, kept_after.summary),
-        (kept_before.bytes, kept_before.summary),
-        "and its data and its descriptor are as they were"
+        (kept_after.bytes, kept_after.summary, kept_after.attributes),
+        (
+            kept_before.bytes,
+            kept_before.summary,
+            kept_before.attributes
+        ),
+        "and its data, its descriptor and its attributes are as they were"
     );
     for name in [
         "away-junction",
@@ -1591,6 +1595,9 @@ fn on_a_thread<T: Send + 'static>(
         .unwrap_or_else(|_| panic!("the call did not return within {deadline:?}"))
 }
 
+/// How long the removal waits for a delete call after it has asked the system to cancel it.
+const GRACE: Duration = Duration::from_secs(2);
+
 /// What a removal that ran on a thread of its own gave back.
 struct Removed {
     root: PrivateRoot,
@@ -1726,11 +1733,9 @@ fn the_roots_own_delete_under_a_lock_on_the_root_directory_is_removed_or_in_use_
         done.leftovers, done.spent
     );
     assert!(done.spent <= AT_MOST, "{:?}", done.spent);
+    let removed = done.leftovers.is_empty();
     match done.leftovers.as_slice() {
-        [] => {
-            assert!(!path.exists(), "removed means gone");
-            assert_eq!(done.log, ["removed"]);
-        }
+        [] => assert_eq!(done.log, ["removed"]),
         [one] => {
             assert_eq!(
                 (one.path.as_str(), one.reason.as_str()),
@@ -1745,8 +1750,13 @@ fn the_roots_own_delete_under_a_lock_on_the_root_directory_is_removed_or_in_use_
         more => panic!("{more:?}"),
     }
     drop(lock);
-    let (rest, _) = remove_with_the_walks_privileges(&done.root);
-    assert!(rest.is_empty(), "once the lock is gone: {rest:?}");
+    if !removed {
+        let (rest, _) = remove_with_the_walks_privileges(&done.root);
+        assert!(rest.is_empty(), "once the lock is gone: {rest:?}");
+    }
+    // The name goes when the root's own handle closes: the delete was made through a copy of it,
+    // and the two share one file object.
+    assert!(common::is_gone(done.root), "the root is gone");
 }
 
 #[test]
@@ -1777,8 +1787,8 @@ fn the_roots_own_delete_goes_through_the_same_thread_and_a_call_that_does_not_en
         "the system was asked to cancel the call once"
     );
     assert!(
-        done.spent >= LIMITS.wait_each && done.spent <= AT_MOST,
-        "the removal waited for the limit and the grace and then returned: {:?}",
+        done.spent >= LIMITS.wait_each + GRACE && done.spent <= AT_MOST,
+        "the removal waited for the limit and the whole grace and then returned: {:?}",
         done.spent
     );
     assert!(done.log.is_empty(), "no removed row");
@@ -1787,8 +1797,10 @@ fn the_roots_own_delete_goes_through_the_same_thread_and_a_call_that_does_not_en
         "the root is still there while the call is held"
     );
     drop(hold);
-    wait_until("the held call ran and removed the root", || !path.exists());
+    // The delete was made through a copy of the root's handle, which shares its file object: the
+    // name goes when the last of the two handles closes.
     drop(done.root);
+    wait_until("the held call ran and removed the root", || !path.exists());
 }
 
 #[test]
@@ -1797,6 +1809,9 @@ fn a_delete_call_that_does_not_end_is_given_up_and_no_further_call_is_made_for_t
     let scratch = Scratch::new();
     let (_run, root, _owner) = made_root(&scratch);
     let tmp = root.tmp();
+    // `home` goes first, so that the removal's first delete call is for a file of `tmp`, whatever
+    // order the platform lists the root in.
+    std::fs::remove_dir(root.home()).unwrap();
     for file in ["a.txt", "b.txt"] {
         std::fs::write(tmp.join(file), b"x").unwrap();
     }
@@ -1820,8 +1835,8 @@ fn a_delete_call_that_does_not_end_is_given_up_and_no_further_call_is_made_for_t
     );
     assert_eq!(removal::cancels(&name), 1);
     assert!(
-        done.spent >= LIMITS.wait_each && done.spent <= AT_MOST,
-        "{:?}",
+        done.spent >= LIMITS.wait_each + GRACE && done.spent <= AT_MOST,
+        "the removal waited for the limit and the whole grace: {:?}",
         done.spent
     );
     assert_eq!(
@@ -1829,11 +1844,30 @@ fn a_delete_call_that_does_not_end_is_given_up_and_no_further_call_is_made_for_t
         ["a.txt", "b.txt"],
         "no further delete call was made, and the held one has not run"
     );
+    assert!(
+        removal::call_pending(&name),
+        "the given-up call is still in the system"
+    );
+    // A second removal of the root, while the first call is still in the system, makes no delete
+    // call, no listing and no cancel, and says why.
+    let cancels = removal::cancels(&name);
+    let again = remove_on_a_thread(done.root, LIMITS, Duration::from_secs(30));
+    assert_eq!(
+        again.leftovers,
+        [Leftover {
+            path: String::new(),
+            reason: "a delete call of an earlier removal of this root has not ended".to_owned()
+        }]
+    );
+    assert!(again.spent < Duration::from_secs(1), "{:?}", again.spent);
+    assert_eq!(removal::cancels(&name), cancels);
+    assert_eq!(names_in(&tmp), ["a.txt", "b.txt"], "nothing was deleted");
     drop(hold);
-    wait_until("the held call ran", || names_in(&tmp).len() == 1);
-    let (rest, _) = remove_with_the_walks_privileges(&done.root);
+    wait_until("the given-up call ended", || !removal::call_pending(&name));
+    assert_eq!(names_in(&tmp).len(), 1, "the held call removed its object");
+    let (rest, _) = remove_with_the_walks_privileges(&again.root);
     assert!(rest.is_empty(), "the next removal finishes: {rest:?}");
-    assert!(common::is_gone(done.root), "the root is gone");
+    assert!(common::is_gone(again.root), "the root is gone");
 }
 
 #[test]
@@ -1842,12 +1876,14 @@ fn delete_calls_that_each_end_just_inside_their_limit_spend_the_total_and_stop_t
     let scratch = Scratch::new();
     let (_run, root, _owner) = made_root(&scratch);
     let tmp = root.tmp();
+    // `home` goes first, so that every delete call the hook slows is for a file of `tmp`.
+    std::fs::remove_dir(root.home()).unwrap();
     for index in 0..5 {
         std::fs::write(tmp.join(format!("f{index}.txt")), b"x").unwrap();
     }
     let name = root.name().clone();
     // Each call waits 0.9 seconds and then succeeds, inside the one second a call is given, as a
-    // lock holder answers just before the limit. Two calls leave a fifth of the total.
+    // lock holder answers just before the limit. Two calls leave a tenth of the total.
     let delay = removal::delay_deletes(&name, Duration::from_millis(900));
     let done = remove_on_a_thread(root, LIMITS, Duration::from_secs(30));
     assert_eq!(
@@ -1870,6 +1906,45 @@ fn delete_calls_that_each_end_just_inside_their_limit_spend_the_total_and_stop_t
         names_in(&tmp)
     );
     assert!(done.log.is_empty());
+    drop(delay);
+    let (rest, _) = remove_with_the_walks_privileges(&done.root);
+    assert!(rest.is_empty(), "the next removal finishes: {rest:?}");
+    assert!(common::is_gone(done.root), "the root is gone");
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_delete_call_just_over_the_grace_is_charged_whole_against_the_total() {
+    let scratch = Scratch::new();
+    let (_run, root, _owner) = made_root(&scratch);
+    let tmp = root.tmp();
+    std::fs::remove_dir(root.home()).unwrap();
+    for index in 0..12 {
+        std::fs::write(tmp.join(format!("f{index}.txt")), b"x").unwrap();
+    }
+    let name = root.name().clone();
+    // Each call takes about 60 milliseconds, ten more than the 50 an ordinary delete is allowed.
+    // Charged whole, about seven of them spend a total of 400 milliseconds; if only what is over
+    // the 50 were charged, twelve would cost about 120 and the total would never be spent.
+    let delay = removal::delay_deletes(&name, Duration::from_millis(60));
+    let limits = Limits {
+        wait_each: Duration::from_secs(1),
+        wait_total: Duration::from_millis(400),
+        ..ROOT_LIMITS
+    };
+    let done = remove_on_a_thread(root, limits, Duration::from_secs(30));
+    assert_eq!(
+        done.leftovers,
+        [Leftover {
+            path: String::new(),
+            reason: "the waits for objects in use are spent".to_owned()
+        }]
+    );
+    let removed = 12 - names_in(&tmp).len();
+    assert!(
+        (4..=8).contains(&removed),
+        "the calls were charged whole: {removed} of twelve went before the total was spent"
+    );
     drop(delay);
     let (rest, _) = remove_with_the_walks_privileges(&done.root);
     assert!(rest.is_empty(), "the next removal finishes: {rest:?}");
