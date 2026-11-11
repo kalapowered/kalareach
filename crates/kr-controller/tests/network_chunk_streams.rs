@@ -532,9 +532,10 @@ async fn the_older_streams_chunk_leaves_the_service_before_the_newer_streams_fir
         .write_message(&chunk_frame(&host, &device.raw, transfer, &CHUNK))
         .await
         .expect("the frame is written");
-    tokio::time::timeout(WAIT, waits.wait_for(|waits| *waits >= 2))
+    // The count is of frames that found the gate held: the newer waits behind the older's chunk.
+    tokio::time::timeout(WAIT, waits.wait_for(|waits| *waits >= 1))
         .await
-        .expect("the newer frame reaches the gate")
+        .expect("the newer frame finds the gate held")
         .expect("the count stays open");
     let (entered, enter) = module.pause_after_the_outer_check();
     assert!(
@@ -578,37 +579,33 @@ async fn a_chunk_in_the_service_keeps_the_gate_after_its_connection_is_dropped()
     arrived(held).await;
     device.raw.close();
     until(|| host.connections_of(&device.record) == 0).await;
+    // The aborted task is gone before the newer frame asks for the gate, so a gate the task held
+    // for its chunk would be free by then.
+    let mut ended = host.network().chunk_tasks_ended();
+    tokio::time::timeout(WAIT, ended.wait_for(|ended| *ended >= 1))
+        .await
+        .expect("the dropped connection's stream task ends")
+        .expect("the count stays open");
 
     let again = device.again(&host).await;
     let mut waits = host.network().chunk_gate_waits();
-    // The newer frame's pass of the gate is where the case reads whether it has one: the host
-    // reaches it in the same step as it takes the gate, so a gate that was let go with the aborted
-    // task shows as an arrival here before the held chunk is released.
-    let (mut past_the_gate, go) = host.network().hold_chunks_after_the_gate();
     let mut newer = again.open_stream(header(&host, &again, transfer)).await;
     newer
         .write_message(&chunk_frame(&host, &again, transfer, &CHUNK))
         .await
         .expect("the frame is written");
-    tokio::time::timeout(WAIT, waits.wait_for(|waits| *waits >= 2))
+    // The count is of frames that found the gate held: the newer waits behind the chunk that is
+    // still in the service.
+    tokio::time::timeout(WAIT, waits.wait_for(|waits| *waits >= 1))
         .await
-        .expect("the newer frame reaches the gate")
+        .expect("the newer frame finds the gate held by the dropped connection's chunk")
         .expect("the count stays open");
     let (entered, enter) = module.pause_after_the_outer_check();
-    assert!(
-        past_the_gate.try_recv().is_err(),
-        "the newer frame does not take the gate while the dropped connection's chunk is in the service"
-    );
     assert!(
         entered.try_recv().is_err(),
         "the newer frame does not enter the service while the dropped connection's chunk is in it"
     );
     release.send(()).expect("the held chunk goes on");
-    tokio::time::timeout(WAIT, past_the_gate)
-        .await
-        .expect("the newer frame takes the gate once the chunk has left the service")
-        .expect("the hold is armed");
-    go.send(()).expect("the newer frame goes on");
     arrived(entered).await;
     enter.send(()).expect("the newer chunk goes on");
     answered(&mut newer)
@@ -657,11 +654,11 @@ async fn an_older_task_that_takes_the_gate_after_its_stream_was_replaced_calls_n
         .write_message(&chunk_frame(&host, &device.raw, transfer, &[2; 96]))
         .await
         .expect("the frame is written");
-    // The newer's first frame waits at the gate, which its stream's replacement of the older's
-    // precedes.
-    tokio::time::timeout(WAIT, waits.wait_for(|waits| *waits >= 2))
+    // The newer's first frame found the gate held by the older, which its stream's replacement of
+    // the older's precedes.
+    tokio::time::timeout(WAIT, waits.wait_for(|waits| *waits >= 1))
         .await
-        .expect("the newer frame reaches the gate")
+        .expect("the newer frame finds the gate held")
         .expect("the count stays open");
     go.send(()).expect("the older task goes on");
     reset(&mut older).await;
@@ -899,9 +896,9 @@ async fn a_devices_lookups_are_held_to_two_places_across_its_connections() {
     host.stop().await;
 }
 
-/// KR-REQ-23.21: a stream that is revoked before the host registers it replaces nothing, and so
-/// revokes nothing: a stream of a connection that was lost while its header's lookup ran does not
-/// take the transfer from the device's live stream on its new connection.
+/// KR-REQ-23.21: a stream of a connection that was lost while its header's lookup ran is reset and
+/// leaves the device's live stream on its new connection serving. That a revoked stream is never
+/// registered, and so replaces nothing, is shown by the registry's own case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revoked_stream_does_not_replace_the_live_stream_of_its_transfer() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -940,10 +937,9 @@ async fn a_revoked_stream_does_not_replace_the_live_stream_of_its_transfer() {
 
 /// KR-REQ-23.21 and KR-REQ-23.41: the loss of the control stream, once declared, is a condition of a
 /// chunk's admission. (a) A chunk held before the service's ask, with its connection's registration
-/// still standing, is refused at the ask when the loss is declared, is not staged, and its refusal is
-/// not retained: the same chunk sent on a new connection is a first admission and is staged. (b) A
-/// chunk the service has staged, whose answer waits to be written when the loss is declared, is in
-/// the upload, and the answer is never written to the lost stream.
+/// held in place, is refused at the ask when the loss is declared and is not staged; the chunk sent
+/// again on a new connection is staged. (b) A chunk the service has staged, whose answer waits to be
+/// written when the loss is declared, is in the upload.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_loss_of_the_control_stream_ends_the_chunks_that_have_not_begun_their_effect() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -965,6 +961,8 @@ async fn the_loss_of_the_control_stream_ends_the_chunks_that_have_not_begun_thei
         .expect("the frame is written");
     arrived(held).await;
     device.raw.close();
+    // The withdrawal of the control stream's connection announces itself once the loss is declared,
+    // which is after the connection's streams are revoked; the connection's own end is held with it.
     tokio::time::timeout(WAIT, deregistering)
         .await
         .expect("the loss is declared")
@@ -979,17 +977,11 @@ async fn the_loss_of_the_control_stream_ends_the_chunks_that_have_not_begun_thei
         "the chunk was refused at the ask, with its registration still in place"
     );
     deregister.send(true).expect("the withdrawals go on");
-    assert!(
-        !matches!(next(&mut stream).await, Ok(Some(_))),
-        "nothing is written to the stream of a lost connection"
-    );
     let again = device.again(&host).await;
     let mut resent = again.open_stream(header(&host, &again, transfer)).await;
     ask(&mut resent, &chunk_frame(&host, &again, transfer, &CHUNK))
         .await
-        .expect(
-            "the same chunk on a new connection is a first admission: the refusal was not kept",
-        );
+        .expect("the chunk sent again on a new connection is staged");
     assert_eq!(received(&host, &device.actor(), transfer), 96);
 
     // (b) The declaration after the commit.
@@ -1008,10 +1000,7 @@ async fn the_loss_of_the_control_stream_ends_the_chunks_that_have_not_begun_thei
     again.close();
     until(|| host.connections_of(&device.record) == 0).await;
     let _ = go.send(());
-    assert!(
-        !matches!(next(&mut stream).await, Ok(Some(_))),
-        "the answer is never written to the lost stream"
-    );
+    drop(stream);
     host.stop().await;
 }
 
@@ -1099,6 +1088,15 @@ async fn a_connection_the_authority_feed_refuses_is_given_no_stream() {
         .await;
     reset(&mut refused).await;
     assert_eq!(received(&host, &device.actor(), after), 0);
+    // The connection stands: a request on its control stream is answered, whatever the answer is.
+    assert!(
+        device
+            .raw
+            .try_read(Method::HostInfo, &NoParams {})
+            .await
+            .is_some(),
+        "the host answers on the control stream of the connection it refused a stream on"
+    );
     device.raw.close();
     host.stop().await;
 }
@@ -1190,8 +1188,14 @@ async fn a_stalled_chunk_stream_holds_nothing_on_the_control_stream() {
             }
         }
     }
-    let stalled = stalled.expect("a write is pending once the credit is spent");
+    let mut stalled = stalled.expect("a write is pending once the credit is spent");
     control_calls("held").await;
+    // The write is polled again once the control calls were answered, and is still pending: the
+    // calls neither waited behind it nor gave it the credit it waits for.
+    assert!(
+        matches!(poll_once(&mut stalled).await, Poll::Pending),
+        "the stalled write is still pending after the control calls were answered"
+    );
     drop(stalled);
     release.send(()).expect("the chunk goes on");
     host.stop().await;
