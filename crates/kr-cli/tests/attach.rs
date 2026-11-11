@@ -2694,7 +2694,9 @@ fn shell_quoted(text: &str) -> String {
 /// `KR_HOLD_MOUSE_AGAIN=1` it turns them on again after every byte it reads, so that a click can be
 /// shown to pass through the attachment whatever the attachment did with the modes it was given.
 /// With `KR_HOLD_MOUSE=off` it never turns them on, so that a terminal's own handling of a link and
-/// of the mouse is what a person shows.
+/// of the mouse is what a person shows. Under the link line the application writes the plain text
+/// address `https://example.invalid/kr-plain`, which a terminal that detects addresses itself offers
+/// to open, so that the two ways a terminal can offer a link are shown beside each other.
 ///
 /// It writes `env.sh` into `KR_HOLD_DIR` (a directory only this account can write to), which names the
 /// environment `kr attach 1` runs in, the `TERM` to use and the `kr` to run, prints `KR_HOLD_READY`,
@@ -2746,6 +2748,7 @@ async fn a_session_is_held_for_a_person_at_a_terminal() {
     let script = format!(
         "{modes}; \
          printf 'a link: \\033]8;;%s\\033\\\\the page on this machine\\033]8;;\\033\\\\\\r\\n' {}; \
+         printf 'plain: https://example.invalid/kr-plain\\r\\n'; \
          stty raw -echo; \
          while :; do b=$(dd bs=1 count=1 2>/dev/null | od -An -v -tx1); \
          echo \"$b\" >> {}; {again}done",
