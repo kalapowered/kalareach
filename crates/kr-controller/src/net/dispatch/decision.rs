@@ -605,11 +605,10 @@ impl RemoteConnection {
                         .params
                         .to_typed::<kr_protocol::transfer::DraftCreateParams>()
                         .map_err(invalid)?;
-                    // Only the end of its session or a prompt that sends it ends a draft, and a
-                    // device holds a bounded number of drafts that neither has ended. A draft that
-                    // names no session would take its place for good, so a device's draft names
-                    // the session it is for. The person at this machine has no bound and may make
-                    // one with none.
+                    // A device holds a bounded number of drafts that no prompt has sent and whose
+                    // session has not ended, so its draft names the session it is for: one with
+                    // none would keep its place until a prompt sends it. The person at this
+                    // machine has no bound and may make one with none.
                     if params.session_id.0.is_none() {
                         return Err(ProtocolError::new(
                             ErrorCode::InvalidArgument,
