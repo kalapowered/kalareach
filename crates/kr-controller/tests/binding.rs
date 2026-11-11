@@ -523,6 +523,7 @@ impl Hosted {
                     original_file_name: "shot.png".to_owned(),
                 },
                 None,
+                None,
             )
             .expect("reserves the upload");
         service

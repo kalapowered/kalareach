@@ -1108,6 +1108,56 @@ impl Store {
         open_drafts(&self.connection, actor_id)
     }
 
+    /// Returns how many uploads one principal keeps staged that live by this service's own
+    /// clocks: the ones receiving chunks, being published or published, that no prompt has sent
+    /// to a session.
+    ///
+    /// An upload a prompt has sent follows its session's retention, which is the archive's and can
+    /// be long, so it is not counted: it stops counting when it is submitted. This is the same
+    /// division the expiry sweep makes between the 24-hour and seven-day clocks and a session's
+    /// retention.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the count cannot be read.
+    pub fn staged_uploads(&self, actor_id: &ActorId) -> Result<u64> {
+        self.count(
+            "SELECT COUNT(*) FROM uploads
+             WHERE state IN ('receiving', 'publishing', 'published') AND actor_id = ?1
+               AND NOT (submitted_at_ms IS NOT NULL AND session_id IS NOT NULL)",
+            params![actor_id.as_str()],
+        )
+    }
+
+    /// Returns how many bytes one principal has staged, counted as [`Self::staged_byte_len`]
+    /// counts the environment's.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the sums cannot be read.
+    pub fn staged_byte_len_of(&self, actor_id: &ActorId) -> Result<u64> {
+        let uploads: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(SUM(reserved_byte_len), 0) FROM uploads
+                 WHERE (state IN ('receiving', 'publishing', 'published')
+                        OR cleanup_pending = 1) AND actor_id = ?1",
+                params![actor_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(TransferError::store)?;
+        let snapshots: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(SUM(reserved_byte_len), 0) FROM snapshots
+                 WHERE (state IN ('reserving', 'open') OR cleanup_pending = 1) AND actor_id = ?1",
+                params![actor_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(TransferError::store)?;
+        Ok(from_i64(uploads).saturating_add(from_i64(snapshots)))
+    }
+
     fn count(&self, sql: &str, parameters: impl rusqlite::Params) -> Result<u64> {
         let count: i64 = self
             .connection

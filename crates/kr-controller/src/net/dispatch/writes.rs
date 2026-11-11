@@ -192,7 +192,7 @@ impl RemoteConnection {
                     &mutation,
                     method,
                     admission,
-                    Some(crate::transfer::DEVICE_OPEN_DRAFTS),
+                    Some(crate::transfer::PAIRED_DEVICE),
                 )
                 .await
         });

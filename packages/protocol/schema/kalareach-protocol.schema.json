@@ -40115,7 +40115,7 @@
         },
         "staged_byte_len": {
           "$ref": "#/$defs/U64",
-          "description": "Bytes now staged in this environment, this reservation included."
+          "description": "Bytes now staged, this reservation included: for a paired device, the bytes its own\nprincipal has staged; for any other caller, the bytes staged in this environment."
         },
         "staged_byte_limit": {
           "$ref": "#/$defs/U64",
