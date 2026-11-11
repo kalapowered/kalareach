@@ -141,6 +141,21 @@ impl Run {
         run
     }
 
+    /// A run over a directory that is already there, for the cases that look at what the run's
+    /// helpers do to a tree of its own: nothing is placed and nothing is started.
+    #[cfg(test)]
+    pub(crate) fn over(root: &Path) -> Self {
+        Self {
+            leg: "test".to_owned(),
+            root: root.to_path_buf(),
+            pin: RootPin::of(root).expect("a pin of the directory"),
+            owned: Mutex::new(Vec::new()),
+            system_programs: Mutex::new(Vec::new()),
+            undiscovered: Mutex::new(Vec::new()),
+            passed: Mutex::new(false),
+        }
+    }
+
     /// The leg this run belongs to.
     #[must_use]
     pub fn leg(&self) -> &str {
@@ -757,6 +772,225 @@ impl RootPin {
     pub fn contains(&self, handle: impl std::os::fd::AsFd) -> bool {
         current_place(handle).is_some_and(|place| place.starts_with(&self.place))
     }
+}
+
+/// Why a path below the run's directory was not opened to be read: a class, and no name, so that
+/// nothing about a place outside the run is said.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The run's directory is not the directory the run made.
+    RootChanged,
+    /// An entry on the way, or the file itself, is a symbolic link.
+    Link,
+    /// An entry is not the kind of entry the path names: a directory on the way, a regular file at
+    /// its end.
+    NotAFile,
+    /// The file has more than one name, so it may be a file of the person's under another one.
+    SecondName,
+    /// An entry lies on another file system than the run's directory, as a mounted volume does.
+    OtherDevice,
+    /// An entry was another one when it was opened than when it was looked at.
+    Replaced,
+    /// An entry that was opened is no longer beneath the run's directory.
+    Moved,
+    /// The system refused a look or an opening.
+    Refused(rustix::io::Errno),
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RootChanged => {
+                formatter.write_str("the run's directory is not the directory the run made")
+            }
+            Self::Link => formatter
+                .write_str("an entry on the way is a symbolic link, which is followed by nothing"),
+            Self::NotAFile => {
+                formatter.write_str("an entry is not the kind of entry the path names")
+            }
+            Self::SecondName => formatter.write_str(
+                "the file has more than one name, which is refused and read through by nothing",
+            ),
+            Self::OtherDevice => {
+                formatter.write_str("an entry lies on another file system than the run's")
+            }
+            Self::Replaced => formatter.write_str(
+                "an entry was another one when it was opened than when it was looked at",
+            ),
+            Self::Moved => formatter.write_str("an entry is no longer beneath the run's directory"),
+            Self::Refused(error) => {
+                write!(
+                    formatter,
+                    "the system refused a look or an opening: {error}"
+                )
+            }
+        }
+    }
+}
+
+/// Looks at `name` in `directory`, following no link, on the file system `device`: `None` where it
+/// is not there.
+fn look_below(
+    directory: &std::os::fd::OwnedFd,
+    name: &std::ffi::CStr,
+    device: rustix::fs::Dev,
+) -> Result<Option<rustix::fs::Stat>, Refusal> {
+    match rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(looked) if looked.st_dev == device => Ok(Some(looked)),
+        // For mounts only: the system's own volumes share one device number.
+        Ok(_) => Err(Refusal::OtherDevice),
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(error) => Err(Refusal::Refused(error)),
+    }
+}
+
+/// Opens the regular file `relative` below the run's directory `root`, through handles only: `root`
+/// must be the directory `pin` names, and each component is looked at with no link followed, on
+/// `root`'s file system, and opened relative to its directory's handle with no link followed, then
+/// checked to be what was looked at and to lie beneath the pinned place. The file must be a regular
+/// file with one name. A link, a second name, another file system, a directory where a file is
+/// named or the reverse is a [`Refusal`] and nothing is opened through it. `Ok(None)` is a path
+/// that is not there.
+///
+/// # Errors
+///
+/// Returns why the path is not a regular file of the run with one name.
+pub fn open_file_below(
+    root: &Path,
+    pin: &RootPin,
+    relative: &Path,
+) -> Result<Option<std::os::fd::OwnedFd>, Refusal> {
+    open_file_below_by(root, pin, relative, &mut |_| {})
+}
+
+/// [`open_file_below`] with the moment before each component is looked at, told its name, at which
+/// a test changes the tree.
+fn open_file_below_by(
+    root: &Path,
+    pin: &RootPin,
+    relative: &Path,
+    before_look: &mut dyn FnMut(&[u8]),
+) -> Result<Option<std::os::fd::OwnedFd>, Refusal> {
+    use rustix::fs::{FileType, Mode, OFlags};
+    let mut directory = open_directory(root).map_err(|error| match error {
+        rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => Refusal::RootChanged,
+        other => Refusal::Refused(other),
+    })?;
+    let device = rustix::fs::fstat(&directory)
+        .map_err(Refusal::Refused)?
+        .st_dev;
+    if !pin.holds(&directory) {
+        return Err(Refusal::RootChanged);
+    }
+    let mut names = Vec::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(Refusal::NotAFile);
+        };
+        names.push(std::ffi::CString::new(name.as_encoded_bytes()).map_err(|_| Refusal::NotAFile)?);
+    }
+    let Some((last, parents)) = names.split_last() else {
+        return Err(Refusal::NotAFile);
+    };
+    let replaced = |error: rustix::io::Errno| match error {
+        rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR | rustix::io::Errno::NOENT => {
+            Refusal::Replaced
+        }
+        other => Refusal::Refused(other),
+    };
+    for name in parents {
+        before_look(name.to_bytes());
+        let Some(looked) = look_below(&directory, name.as_c_str(), device)? else {
+            return Ok(None);
+        };
+        match FileType::from_raw_mode(looked.st_mode) {
+            FileType::Directory => {}
+            FileType::Symlink => return Err(Refusal::Link),
+            _ => return Err(Refusal::NotAFile),
+        }
+        let child = rustix::fs::openat(
+            &directory,
+            name.as_c_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(replaced)?;
+        let opened = rustix::fs::fstat(&child).map_err(Refusal::Refused)?;
+        if (opened.st_dev, opened.st_ino) != (looked.st_dev, looked.st_ino) {
+            return Err(Refusal::Replaced);
+        }
+        if !pin.contains(&child) {
+            return Err(Refusal::Moved);
+        }
+        directory = child;
+    }
+    before_look(last.to_bytes());
+    let Some(looked) = look_below(&directory, last.as_c_str(), device)? else {
+        return Ok(None);
+    };
+    match FileType::from_raw_mode(looked.st_mode) {
+        FileType::RegularFile => {}
+        FileType::Symlink => return Err(Refusal::Link),
+        _ => return Err(Refusal::NotAFile),
+    }
+    // A file with a second name is the same file under another name, whoever made it.
+    if looked.st_nlink != 1 {
+        return Err(Refusal::SecondName);
+    }
+    let file = rustix::fs::openat(
+        &directory,
+        last.as_c_str(),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(replaced)?;
+    let opened = rustix::fs::fstat(&file).map_err(Refusal::Refused)?;
+    if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile
+        || (opened.st_dev, opened.st_ino) != (looked.st_dev, looked.st_ino)
+    {
+        return Err(Refusal::Replaced);
+    }
+    // A name added since the look is a second name too.
+    if opened.st_nlink != 1 {
+        return Err(Refusal::SecondName);
+    }
+    if !pin.contains(&file) {
+        return Err(Refusal::Moved);
+    }
+    Ok(Some(file))
+}
+
+/// How much of the end of a file [`read_tail_below`] reads at most.
+const TAIL_AT_MOST: u64 = 1 << 20;
+
+/// Reads the regular file `relative` below the run's directory as [`open_file_below`] opens it,
+/// from the byte `after` on and at most the last mebibyte of that: `Ok(None)` for a file that is
+/// not there.
+///
+/// # Errors
+///
+/// Returns why the path is not a regular file of the run with one name, or why it was not read.
+pub fn read_tail_below(
+    root: &Path,
+    pin: &RootPin,
+    relative: &Path,
+    after: u64,
+) -> Result<Option<Vec<u8>>, Refusal> {
+    use std::os::unix::fs::FileExt as _;
+    let Some(file) = open_file_below(root, pin, relative)? else {
+        return Ok(None);
+    };
+    let file = std::fs::File::from(file);
+    let refused = |error: std::io::Error| {
+        Refusal::Refused(rustix::io::Errno::from_raw_os_error(
+            error.raw_os_error().unwrap_or(0),
+        ))
+    };
+    let length = file.metadata().map_err(refused)?.len();
+    let from = after.min(length).max(length.saturating_sub(TAIL_AT_MOST));
+    let mut bytes = vec![0; usize::try_from(length - from).unwrap_or(0)];
+    file.read_exact_at(&mut bytes, from).map_err(refused)?;
+    Ok(Some(bytes))
 }
 
 /// Why a run's directory was left where it is.
@@ -1545,6 +1779,92 @@ mod root_tests {
             there && entries == before,
             "nothing was written or removed on the volume"
         );
+        std::fs::remove_dir_all(&base).expect("clean up");
+        std::fs::remove_dir_all(&images).expect("clean up");
+    }
+
+    /// A file below the run is opened only as a regular file of the run with one name: a link at the
+    /// file or on the way, a second name, a directory where a file is named, a run's directory that
+    /// is not the one the run made, and a directory moved out of the run on the way are each a class
+    /// and nothing is read; a file that is not there is none.
+    #[test]
+    fn a_file_below_the_run_is_opened_only_as_a_regular_file_of_the_run_with_one_name() {
+        let base = scratch("below");
+        let theirs = scratch("below-theirs");
+        std::fs::write(theirs.join("personal"), b"a file of the person's").expect("a file");
+        let root = base.join("run");
+        std::fs::create_dir_all(root.join("a/b")).expect("a run");
+        std::fs::write(root.join("a/b/file"), b"the run's own file").expect("a file");
+        let pin = RootPin::of(&root).expect("a pin");
+        let read = |relative: &str| {
+            read_tail_below(&root, &pin, Path::new(relative), 0)
+                .map(|bytes| bytes.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
+        };
+        assert_eq!(read("a/b/file"), Ok(Some("the run's own file".to_owned())));
+        assert_eq!(read("a/b/absent"), Ok(None));
+        assert_eq!(read("a/absent/file"), Ok(None));
+        // A link at the file.
+        std::os::unix::fs::symlink(theirs.join("personal"), root.join("a/b/link")).expect("a link");
+        assert_eq!(read("a/b/link"), Err(Refusal::Link));
+        // A link on the way.
+        std::os::unix::fs::symlink(&theirs, root.join("a/way")).expect("a link");
+        assert_eq!(read("a/way/personal"), Err(Refusal::Link));
+        // A second name for a file of the person's.
+        std::fs::hard_link(theirs.join("personal"), root.join("a/b/second")).expect("a hard link");
+        assert_eq!(read("a/b/second"), Err(Refusal::SecondName));
+        // A directory where a file is named, and a file where a directory is.
+        assert_eq!(read("a/b"), Err(Refusal::NotAFile));
+        assert_eq!(read("a/b/file/deeper"), Err(Refusal::NotAFile));
+        assert_eq!(read("../run/a/b/file"), Err(Refusal::NotAFile));
+        // A directory moved out of the run once it is open, with the file below it still read
+        // through its handle.
+        let moved_to = base.join("moved");
+        std::fs::create_dir(&moved_to).expect("a directory");
+        let mut moved = false;
+        let opened = open_file_below_by(&root, &pin, Path::new("a/b/file"), &mut |name| {
+            if name == b"b" && !moved {
+                moved = true;
+                std::fs::rename(root.join("a"), moved_to.join("a")).expect("moved out");
+            }
+        });
+        assert!(moved);
+        assert_eq!(opened.err(), Some(Refusal::Moved));
+        std::fs::rename(moved_to.join("a"), root.join("a")).expect("moved back");
+        // The run's directory renamed away and another directory with the same file put at its path.
+        std::fs::rename(&root, base.join("away")).expect("renamed away");
+        std::fs::create_dir_all(root.join("a/b")).expect("another directory");
+        std::fs::write(root.join("a/b/file"), b"another directory's file").expect("a file");
+        assert_eq!(read("a/b/file"), Err(Refusal::RootChanged));
+        // The run's directory made a link.
+        std::fs::remove_dir_all(&root).expect("clean up");
+        std::os::unix::fs::symlink(base.join("away"), &root).expect("a link at the root");
+        assert_eq!(read("a/b/file"), Err(Refusal::RootChanged));
+        assert_eq!(
+            std::fs::read(theirs.join("personal")).expect("theirs"),
+            b"a file of the person's"
+        );
+        std::fs::remove_dir_all(&base).expect("clean up");
+        std::fs::remove_dir_all(&theirs).expect("clean up");
+    }
+
+    /// A volume mounted below the run is another file system: a file on it is refused.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_file_on_a_volume_mounted_below_the_run_is_refused() {
+        use kr_ipc::testing::volumes::{Volume, not_attachable};
+        let base = scratch("below-mount");
+        let images = scratch("below-mount-images");
+        let root = base.join("run");
+        std::fs::create_dir_all(root.join("mnt")).expect("a run");
+        let pin = RootPin::of(&root).expect("a pin");
+        let volume =
+            Volume::attach(&root.join("mnt"), &images, "below").unwrap_or_else(|| not_attachable());
+        std::fs::write(root.join("mnt/theirs"), b"a file on the volume").expect("a file");
+        let through = read_tail_below(&root, &pin, Path::new("mnt/theirs"), 0);
+        let at_the_point = read_tail_below(&root, &pin, Path::new("mnt"), 0);
+        volume.detach();
+        assert_eq!(through, Err(Refusal::OtherDevice));
+        assert_eq!(at_the_point, Err(Refusal::OtherDevice));
         std::fs::remove_dir_all(&base).expect("clean up");
         std::fs::remove_dir_all(&images).expect("clean up");
     }

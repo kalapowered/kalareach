@@ -25,7 +25,10 @@ use kr_protocol::ids::EnvironmentId;
 use serde_json::Value;
 
 use crate::LIVENESS;
-use crate::run::{Run, ended_within, output_within, running, signal};
+use crate::run::{Run, ended_within, output_within, read_tail_below, running, signal};
+
+/// The daemon's log, in the run's directory.
+const DAEMON_LOG: &str = "controller.log";
 
 /// How long the daemon is given to stop once it has been interrupted.
 const DAEMON_STOP: Duration = Duration::from_secs(20);
@@ -449,14 +452,24 @@ impl<'r> Host<'r> {
     }
 
     fn daemon_log(&self) -> PathBuf {
-        self.run.root().join("controller.log")
+        self.run.root().join(DAEMON_LOG)
     }
 
     /// What the daemon wrote after its log was `earlier` bytes long, the last forty lines of it.
+    ///
+    /// The log is read through the run's handles ([`read_tail_below`]), so a link or a second name
+    /// left in its place gives a class and no line of the file it names.
     fn daemon_said_since(&self, earlier: u64) -> String {
-        let bytes = std::fs::read(self.daemon_log()).unwrap_or_default();
-        let from = usize::try_from(earlier).map_or(bytes.len(), |earlier| earlier.min(bytes.len()));
-        let text = String::from_utf8_lossy(&bytes[from..]);
+        let bytes = match read_tail_below(
+            self.run.root(),
+            self.run.pin(),
+            Path::new(DAEMON_LOG),
+            earlier,
+        ) {
+            Ok(bytes) => bytes.unwrap_or_default(),
+            Err(why) => return format!("the daemon's log was not read: {why}"),
+        };
+        let text = String::from_utf8_lossy(&bytes);
         let lines: Vec<&str> = text.lines().collect();
         let start = lines.len().saturating_sub(40);
         lines[start..].join("\n")
@@ -465,10 +478,7 @@ impl<'r> Host<'r> {
     /// The last of what the daemon wrote, for a failure message.
     #[must_use]
     pub fn daemon_said(&self) -> String {
-        let text = std::fs::read_to_string(self.daemon_log()).unwrap_or_default();
-        let lines: Vec<&str> = text.lines().collect();
-        let start = lines.len().saturating_sub(40);
-        lines[start..].join("\n")
+        self.daemon_said_since(0)
     }
 
     /// The identity of the worker process that serves `session_id`: the process running this run's
@@ -922,6 +932,100 @@ pub fn quoted(path: &Path) -> String {
         "a quoted path has no quote in it: {text}"
     );
     format!("'{text}'")
+}
+
+/// What the host's shutdown helpers do with a tree that holds links the agent under test left.
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let directory = std::fs::canonicalize(std::env::temp_dir())
+            .expect("the temporary directory")
+            .join(format!("kr-host-{name}-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        directory
+    }
+
+    /// A host over a run's tree with no daemon started.
+    fn host_over(run: &Run) -> Host<'_> {
+        let paths = HostPaths::new(run.root().join("r"), run.root().join("s"))
+            .expect("absolute host roots");
+        let identity = paths
+            .open_environment_id()
+            .expect("the environment's identity");
+        let environment = paths.environment(identity);
+        environment.create().expect("the environment's directories");
+        Host {
+            run,
+            paths,
+            environment,
+            shell_packages: None,
+            daemon: Mutex::new(None),
+        }
+    }
+
+    /// The text the host's stop gives for a daemon that ended with a failure.
+    fn error_of_a_failing_daemon(host: &Host<'_>) -> String {
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("a process to stand for the daemon");
+        let identity = host
+            .run
+            .record_child(child.id(), "the control daemon")
+            .expect("the process's identity");
+        *host.daemon.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(Daemon { child, identity });
+        host.stop_daemon()
+            .expect_err("a daemon that ended by the interrupt did not end well")
+    }
+
+    /// A link, or a second name, left at the daemon's log is a class in the error and none of the
+    /// file it names; the control is a log of the run's own, whose last lines the error gives.
+    #[test]
+    fn a_link_or_a_second_name_at_the_daemons_log_is_a_class_and_none_of_the_file_it_names() {
+        let root = scratch("log");
+        let theirs = scratch("log-theirs");
+        let personal = theirs.join("personal.txt");
+        std::fs::write(
+            &personal,
+            "a line of the person's\nanother line of the person's\n",
+        )
+        .expect("a file of the person's");
+        let run = Run::over(&root);
+        let host = host_over(&run);
+        let log = root.join("controller.log");
+
+        std::os::unix::fs::symlink(&personal, &log).expect("a link at the log");
+        let said = error_of_a_failing_daemon(&host);
+        assert!(!said.contains("of the person's"), "{said}");
+        assert!(said.contains("symbolic link"), "a class is said: {said}");
+        std::fs::remove_file(&log).expect("the link goes");
+
+        std::fs::hard_link(&personal, &log).expect("a second name for the file");
+        let said = error_of_a_failing_daemon(&host);
+        assert!(!said.contains("of the person's"), "{said}");
+        assert!(
+            said.contains("more than one name"),
+            "a class is said: {said}"
+        );
+        std::fs::remove_file(&log).expect("the second name goes");
+
+        std::fs::write(&log, "the daemon's own last line\n").expect("the run's own log");
+        let said = error_of_a_failing_daemon(&host);
+        assert!(said.contains("the daemon's own last line"), "{said}");
+        assert_eq!(
+            std::fs::read_to_string(&personal).expect("theirs"),
+            "a line of the person's\nanother line of the person's\n",
+            "the file the link named is unchanged"
+        );
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+        std::fs::remove_dir_all(&theirs).expect("clean up");
+    }
 }
 
 #[cfg(test)]
