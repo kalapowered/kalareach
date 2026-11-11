@@ -54,6 +54,19 @@ pub const OPENED_LIMIT: usize = 8;
 /// The most ambient links held at once.
 pub const AMBIENT_LIMIT: usize = 4;
 
+/// The most connections this computer holds to one host at once, as the one device it is there.
+///
+/// * the main connection: one;
+/// * the opened links: one for each opened session, at most [`OPENED_LIMIT`];
+/// * a raw terminal view for each opened session, at most [`OPENED_LIMIT`]: native code holds the
+///   raw views of an opening to no number, and this counts one for each opened session;
+/// * the ambient links, at most [`AMBIENT_LIMIT`];
+/// * the owner's confirmations: two, a review beside the cycle of visits;
+/// * a revocation reading: two, a view beside a revoke or in a second window, which native code
+///   holds to no number;
+/// * the push registration: one.
+pub const HOST_CONNECTIONS: usize = 1 + OPENED_LIMIT + OPENED_LIMIT + AMBIENT_LIMIT + 2 + 2 + 1;
+
 /// How long an ambient link may sit idle before it is let go.
 const AMBIENT_IDLE: Duration = Duration::from_secs(60);
 

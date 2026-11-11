@@ -507,18 +507,25 @@ impl Network {
     }
 }
 
+/// How many connections one paired device may use on this host at once.
+///
+/// The companion uses up to 26 by its own count: its main link, a link for each of at most eight
+/// open sessions, a terminal view for each of those, up to four ambient links, and the connections
+/// of the owner's confirmations, the revocation readings and the push registration. This crate
+/// cannot see that count: a case in the companion's suite holds the two together. The host allows
+/// more, so that a kind the count misses does not at once cost a connection in use.
+pub const DEVICE_CONNECTIONS_IN_USE: usize = 32;
+
 /// How many live connections one paired device may hold on this host at once.
 ///
-/// The companion holds one connection for its main link and one for each session it has open, and
-/// it opens at most eight sessions, so it uses nine at once. A device that loses a link opens a new
-/// connection while the host still holds the old one, for as long as the transport's idle timeout,
-/// so each of the nine may linger once beside its replacement, which makes the bound twice nine.
-/// This crate cannot see the companion's figure: a case in the companion's suite holds the two
-/// together. A device that opened connections without end would hold the host's memory, the
-/// streams of each connection and its lookups. At the first connection above the bound the host
-/// serves the new connection and withdraws the device's oldest, so a phone that reconnects while
-/// an old connection lingers is never refused. An owner cannot change the bound.
-pub const DEVICE_LIVE_CONNECTIONS: usize = 18;
+/// A device that loses a link opens a new connection while the host still holds the old one, for
+/// as long as the transport's idle timeout, so each connection in use
+/// ([`DEVICE_CONNECTIONS_IN_USE`]) may linger once beside its replacement, which makes the bound
+/// twice that number. A device that opened connections without end would hold the host's memory,
+/// the streams of each connection and its lookups. At the first connection above the bound the
+/// host serves the new connection and withdraws the device's oldest, so a phone that reconnects
+/// while an old connection lingers is never refused. An owner cannot change the bound.
+pub const DEVICE_LIVE_CONNECTIONS: usize = 2 * DEVICE_CONNECTIONS_IN_USE;
 
 /// The connections this host serves for each device, oldest first.
 #[derive(Default)]
