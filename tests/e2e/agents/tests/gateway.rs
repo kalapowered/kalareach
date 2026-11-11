@@ -684,6 +684,9 @@ struct Context {
     executable: PathBuf,
     /// The directory the shell's search path names first.
     bin: PathBuf,
+    /// The run's working directory as it was when the agent was placed, before the session's shell
+    /// was started in it.
+    work: Option<PlacedDirectory>,
 }
 
 impl Context {
@@ -702,6 +705,7 @@ impl Context {
             route,
             executable: PathBuf::new(),
             bin: PathBuf::new(),
+            work: None,
         }
     }
 
@@ -709,6 +713,10 @@ impl Context {
     /// failure of the case, which ends as every case does.
     fn place(&mut self) {
         let run = &self.run;
+        // Recorded before the session's shell is started in it: the shell's current directory is this
+        // object for as long as the shell runs.
+        let work = PlacedDirectory::record(run.root(), run.pin(), Path::new("w"))
+            .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
         run.place_built("kr-hook", &run.binary("kr-hook"), &["--version"]);
         // The launcher the worker gives the shell is run by every typed launch.
         run.note_placed(&binary_place("kr-hook"))
@@ -744,8 +752,7 @@ impl Context {
                     &real.build.runtime,
                     &real.build.command,
                     &real.build.pinned,
-                    PlacedDirectory::record(run.root(), run.pin(), Path::new("w"))
-                        .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}")),
+                    work.clone(),
                 )
                 .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
                 if real.build.launch == build::Launch::Native {
@@ -763,15 +770,25 @@ impl Context {
         };
         self.executable = executable;
         self.bin = bin;
+        self.work = Some(work);
     }
 
     /// Fails the case unless each executable the run placed that a typed launch runs is still the
-    /// file that was placed, right before the launch is typed: the launcher the worker gives the
+    /// file that was placed, and the run's working directory is still the object the session's
+    /// shell was started in, right before the launch is typed: the launcher the worker gives the
     /// shell, and, on the stand-in route, the stand-in the shell finds by name. The agent that an
     /// earlier start ran may have replaced either by a link or another file, and the shell would run
-    /// it with the session's variables. The real route's own program is checked by
-    /// [`Real::checks_the_route`].
+    /// it with the session's variables; and a probe that has ended may have moved the directory out
+    /// of the run and put an empty one in its place, which leaves the shell's current directory the
+    /// moved object, where the typed launch would start. The directory at the pinned place is
+    /// reached by the walk that follows no link and must be the recorded object. The real route's
+    /// own program is checked by [`Real::checks_the_route`].
     fn checks_the_placed_files(&self) {
+        self.work
+            .as_ref()
+            .expect("the work directory is recorded when the agent is placed")
+            .place_for_a_start(self.run.root(), self.run.pin())
+            .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
         let mut files = vec![binary_place("kr-hook")];
         if matches!(self.route, Route::StandIn) {
             files.push(PathBuf::from(STAND_IN_PLACE));
@@ -2953,6 +2970,38 @@ fn gateway_an_agent_that_rewrote_the_hosts_state_is_not_obeyed_when_the_host_is_
 /// whether the case's program ever ran. The first start is the control: it went through the same
 /// check over the files as they were placed.
 fn an_agent_replaces_a_placed_file_and_is_started_again(replaced: &str) -> (String, bool) {
+    an_agent_leaves_a_change_and_is_started_again(
+        &|ctx, program, _| {
+            let place = ctx.run.root().join(replaced);
+            format!(
+                "#!/bin/sh\n/bin/rm -f '{}'\n/bin/ln -s '{}' '{}'\n",
+                place.display(),
+                program.display(),
+                place.display()
+            )
+        },
+        &|ctx, _| {
+            assert!(
+                std::fs::symlink_metadata(ctx.run.root().join(replaced))
+                    .expect("the link the stand-in made")
+                    .file_type()
+                    .is_symlink(),
+                "the stand-in replaced {replaced} by a link"
+            );
+        },
+    )
+}
+
+/// A stand-in agent that, once it has started, runs the program `script` writes (given the context,
+/// the case's own program that leaves a mark, and the case's scratch directory outside the run);
+/// `changed` then asserts that the program did its change; the host is asked to start the agent
+/// again, as a line typed again is. Returns the text the second start ended in, and whether the
+/// case's program ever ran. The first start is the control: it went through the same checks over
+/// the run as it was placed.
+fn an_agent_leaves_a_change_and_is_started_again(
+    script: &dyn Fn(&Context, &Path, &Path) -> String,
+    changed: &dyn Fn(&Context, &Path),
+) -> (String, bool) {
     if std::env::var_os(BUILD_VARIABLE).is_some_and(|value| !value.is_empty()) {
         // The stand-in is the agent here; a real agent is never asked to replace the run's files.
         return (String::new(), false);
@@ -2984,17 +3033,8 @@ fn an_agent_replaces_a_placed_file_and_is_started_again(replaced: &str) -> (Stri
     );
     ctx.place();
     let leave = scratch.join("leave.sh");
-    let place = ctx.run.root().join(replaced);
-    std::fs::write(
-        &leave,
-        format!(
-            "#!/bin/sh\n/bin/rm -f '{}'\n/bin/ln -s '{}' '{}'\n",
-            place.display(),
-            program.display(),
-            place.display()
-        ),
-    )
-    .expect("the program the stand-in runs");
+    std::fs::write(&leave, script(&ctx, &program, &scratch))
+        .expect("the program the stand-in runs");
     for file in [&program, &leave] {
         std::fs::set_permissions(file, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .expect("executable");
@@ -3004,13 +3044,7 @@ fn an_agent_replaces_a_placed_file_and_is_started_again(replaced: &str) -> (Stri
         .person
         .types(&format!("export KR_STAND_IN_LEAVE={}", leave.display()));
     let first = session.starts_the_agent(&[], None, &[]);
-    assert!(
-        std::fs::symlink_metadata(&place)
-            .expect("the link the stand-in made")
-            .file_type()
-            .is_symlink(),
-        "the stand-in replaced {replaced} by a link"
-    );
+    changed(&ctx, &scratch);
     let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         session.starts_the_agent(&[], Some(first), &[])
     }));
@@ -3053,6 +3087,38 @@ fn gateway_a_stand_in_the_agent_replaced_is_not_run_by_the_next_start() {
         "the next start was refused as a replaced file: {said}"
     );
     assert!(!ran, "the program the replaced stand-in names ran");
+}
+
+/// A probe that has ended and moved the run's working directory out of the run, leaving an empty
+/// directory at its place, leaves the session's shell in the moved directory: the next typing is
+/// refused before a byte is typed, though every placed file is as it was placed and the new
+/// directory holds nothing that an absence check looks for.
+#[test]
+fn gateway_a_work_directory_the_agent_moved_out_of_the_run_is_not_started_in_by_the_next_start() {
+    let (said, _) = an_agent_leaves_a_change_and_is_started_again(
+        &|ctx, _, scratch| {
+            let work = ctx.run.work();
+            format!(
+                "#!/bin/sh\n/bin/mv '{}' '{}'\n/bin/mkdir '{}'\n",
+                work.display(),
+                scratch.join("moved").display(),
+                work.display()
+            )
+        },
+        &|ctx, scratch| {
+            assert!(
+                scratch.join("moved").is_dir() && ctx.run.work().is_dir(),
+                "the stand-in moved the work directory out and left another in its place"
+            );
+        },
+    );
+    if said.is_empty() {
+        return;
+    }
+    assert!(
+        said.contains(ISOLATION_UNPROVEN) && said.contains("is another directory"),
+        "the next start was refused as another directory at the work directory's place: {said}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
