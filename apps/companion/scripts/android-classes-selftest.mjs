@@ -1125,6 +1125,31 @@ expectNames(
   [{ ...application(), deflate: true }, { ...library(), deflate: true }],
   'nothing'
 )
+// The directory also gives the CRC-32 of each member's bytes, which a member that was changed after
+// the archive was made no longer has, whatever size it keeps.
+const CRC_MISMATCH = `refused: ${MEDIA}: the member's bytes do not match the CRC-32 its directory gives`
+{
+  const path = join(work, 'members-changed-stored.apk')
+  const whole = zip([filler, application(), library()])
+  // The last letter of the class name the library carries, changed to another letter.
+  const at = whole.indexOf(Buffer.from(JNI_ZERO)) + JNI_ZERO.length - 1
+  held('the class name is found in the stored library', 'true', String(at >= JNI_ZERO.length))
+  whole[at] ^= 0x01
+  writeFileSync(path, whole)
+  let answer
+  try {
+    answer = nativeNames(path).problems.join('; ') || 'nothing'
+  } catch (failure) {
+    answer = `refused: ${failure.message}`
+  }
+  held('a stored member whose bytes changed after the directory was written is refused', CRC_MISMATCH, answer)
+}
+expectNames(
+  'a compressed member whose bytes are not the ones its directory gives the CRC-32 of is refused',
+  'members-changed-deflated.apk',
+  [application(), { ...library(), deflate: true, claimCrc: 0x12345678 }],
+  CRC_MISMATCH
+)
 
 // -- a dex file that cannot be read in full ------------------------------------------------------
 // An offset, an index or a count that runs off the end of the file reads as zeros, and a class

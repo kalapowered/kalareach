@@ -3,7 +3,7 @@
 // shared library that carries its dynamic symbols and whatever bytes a case puts in it, and a
 // stored zip. They are not archives any runtime would accept.
 import { Buffer } from 'node:buffer'
-import { deflateRawSync } from 'node:zlib'
+import { crc32, deflateRawSync } from 'node:zlib'
 
 /** A uleb128 of a small value. */
 export function uleb(value) {
@@ -320,7 +320,8 @@ export function elf({
  * A member with `deflate: true` is compressed, and `cutBy` drops that many bytes off the end of its
  * compressed data, which the directory then gives as its size (a stream that ends too soon).
  * `claimCompressed` and `claimUncompressed` are the sizes the central directory gives for it when
- * they are not the true ones, which is how a member that the archive cannot give in full is made.
+ * they are not the true ones, which is how a member that the archive cannot give in full is made,
+ * and `claimCrc` is the CRC-32 it gives when that is not the one of the member's bytes.
  */
 export function zip(members, comment = Buffer.alloc(0)) {
   const pieces = []
@@ -331,10 +332,12 @@ export function zip(members, comment = Buffer.alloc(0)) {
     const whole = member.deflate ? deflateRawSync(member.bytes) : member.bytes
     const data = member.cutBy ? whole.subarray(0, whole.length - member.cutBy) : whole
     const method = member.deflate ? 8 : 0
+    const crc = member.claimCrc ?? crc32(member.bytes)
     const local = Buffer.alloc(30)
     local.writeUInt32LE(0x04034b50, 0)
     local.writeUInt16LE(20, 4)
     local.writeUInt16LE(method, 8)
+    local.writeUInt32LE(crc, 14)
     local.writeUInt32LE(data.length, 18)
     local.writeUInt32LE(member.bytes.length, 22)
     local.writeUInt16LE(name.length, 26)
@@ -343,6 +346,7 @@ export function zip(members, comment = Buffer.alloc(0)) {
     entry.writeUInt32LE(0x02014b50, 0)
     entry.writeUInt16LE(20, 6)
     entry.writeUInt16LE(method, 10)
+    entry.writeUInt32LE(crc, 16)
     entry.writeUInt32LE(member.claimCompressed ?? data.length, 20)
     entry.writeUInt32LE(member.claimUncompressed ?? member.bytes.length, 24)
     entry.writeUInt16LE(name.length, 28)

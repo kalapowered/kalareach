@@ -23,7 +23,7 @@
 // that name, by the artefact's dex. The libraries come from the artefact itself, so a library that
 // is updated brings its new names with it.
 import { Buffer } from 'node:buffer'
-import { inflateRawSync } from 'node:zlib'
+import { crc32, inflateRawSync } from 'node:zlib'
 import {
   closeSync,
   existsSync,
@@ -135,6 +135,7 @@ function entries(directory, count) {
     found.push({
       name: directory.subarray(at + 46, at + 46 + nameLength).toString('utf8'),
       method: directory.readUInt16LE(at + 10),
+      crc: directory.readUInt32LE(at + 16),
       compressedSize: directory.readUInt32LE(at + 20),
       uncompressedSize: directory.readUInt32LE(at + 24),
       headerAt: directory.readUInt32LE(at + 42)
@@ -145,7 +146,7 @@ function entries(directory, count) {
 }
 
 /**
- * Every member of a zip archive, as name, offset, method and sizes.
+ * Every member of a zip archive, as name, offset, method, CRC-32 and sizes.
  *
  * The end-of-central-directory record is the last thing in the file, after an archive comment of
  * up to 65535 bytes. Its signature is four bytes, so the same four bytes can sit inside that
@@ -187,7 +188,8 @@ function members(handle, size) {
 
 /**
  * One member's bytes, in full or not at all: a member that the archive ends inside, or whose bytes
- * are not the size its directory gives, is refused, since what was read would be a part of it.
+ * are not the size its directory gives or do not have the CRC-32 it gives, is refused, since what
+ * was read would be a part of it or another member's.
  */
 function contents(handle, member, archiveSize) {
   const header = readAt(handle, member.headerAt, 30)
@@ -222,6 +224,9 @@ function contents(handle, member, archiveSize) {
     throw new Error(
       `${member.name}: the member is ${bytes.length} bytes, and its directory gives ${member.uncompressedSize}`
     )
+  }
+  if (crc32(bytes) !== member.crc) {
+    throw new Error(`${member.name}: the member's bytes do not match the CRC-32 its directory gives`)
   }
   return bytes
 }
