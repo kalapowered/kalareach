@@ -612,7 +612,8 @@ pub fn parse_r4(output: &Output<'_>) -> Result<Vec<Entry>, Refusal> {
 
 /// Whether the last component of a path is one that Git reads attributes from on a Windows
 /// file system: `.gitattributes` in any case, with the trailing dots and spaces Windows drops,
-/// or the short name NTFS gives it. Over-matching is safe: it only makes the scan read more.
+/// or a short name NTFS gives it: `gitatt~N`, or `gi7d29~N` once the first names are taken.
+/// Over-matching is safe: it only makes the scan read more.
 fn names_attributes(path: &[u8]) -> bool {
     let name = path.rsplit(|b| *b == b'/').next().unwrap_or_default();
     let lower = name.to_ascii_lowercase();
@@ -624,9 +625,11 @@ fn names_attributes(path: &[u8]) -> bool {
         &lower[..end]
     };
     trimmed == b".gitattributes"
-        || trimmed
-            .strip_prefix(b"gitatt~")
-            .is_some_and(|digits| !digits.is_empty() && digits.iter().all(u8::is_ascii_digit))
+        || [&b"gitatt~"[..], b"gi7d29~"].iter().any(|prefix| {
+            trimmed
+                .strip_prefix(*prefix)
+                .is_some_and(|digits| !digits.is_empty() && digits.iter().all(u8::is_ascii_digit))
+        })
 }
 
 /// The entries whose files Git reads attributes from. A gitlink is not a file and is left out.

@@ -348,8 +348,13 @@ impl Parser<'_> {
             }
             Command::Diff | Command::Log => {
                 self.options()?;
-                self.revisions()?;
+                let revisions = self.revisions()?;
+                let before = self.argv.len();
                 self.paths(false)?;
+                // A file named like the last revision would make it ambiguous to Git.
+                if revisions && self.argv.len() == before {
+                    self.argv.push("--".to_owned());
+                }
                 self.end()
             }
             Command::Checkout => self.checkout(),
@@ -528,7 +533,9 @@ impl Parser<'_> {
                 Ok(text.to_owned())
             }
             Format::Custom(parts) => {
-                let mut text = String::new();
+                // Without a prefix, Git reads text that holds no `%` as the name of a built-in
+                // format, by prefix: `r` is `raw`. `tformat:` makes every custom format text.
+                let mut text = String::from("tformat:");
                 let sound = !parts.is_empty()
                     && parts.len() <= crate::frame::invocation::MAX_FORMAT_PARTS
                     && parts.iter().all(|part| match part {
@@ -557,7 +564,8 @@ impl Parser<'_> {
     }
 
     /// Revisions: none to two, or one range; `rev-parse` and its callers count them themselves.
-    fn revisions(&mut self) -> Result<(), Refusal> {
+    /// Whether any was taken.
+    fn revisions(&mut self) -> Result<bool, Refusal> {
         let mut plain = 0;
         let mut range = false;
         while let Some(arg) = self.args.get(self.at) {
@@ -595,7 +603,7 @@ impl Parser<'_> {
                 _ => break,
             }
         }
-        Ok(())
+        Ok(plain > 0 || range)
     }
 
     fn qualify(&self, text: &str) -> Result<String, Refusal> {

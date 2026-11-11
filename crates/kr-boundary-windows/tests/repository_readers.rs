@@ -896,6 +896,12 @@ fn the_entries_named_gitattributes_are_picked_in_every_spelling_windows_reads() 
         "GITATT~1",
         "gitatt~1",
         "d/gitatt~12",
+        // The name NTFS gives it once the first short names are taken.
+        "gi7d29~1",
+        "GI7D29~4",
+        "d/gi7d29~2",
+        "gi7d29~1 ",
+        "gi7d29~1.",
     ];
     let other = [
         ".gitattributesx",
@@ -914,6 +920,13 @@ fn the_entries_named_gitattributes_are_picked_in_every_spelling_windows_reads() 
         " .gitattributes",
         "gitatt1",
         ".gitattributes.x",
+        "gi7d29",
+        "gi7d29~",
+        "gi7d29~x",
+        "gi7d29~1x",
+        "gi7d29x~1",
+        "gi7d28~1",
+        "gi7d29-1",
     ];
     let entries: Vec<Entry> = named
         .iter()

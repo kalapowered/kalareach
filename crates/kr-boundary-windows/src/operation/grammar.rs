@@ -61,8 +61,9 @@ pub fn path(text: &str) -> Result<(), &'static str> {
     }
 }
 
-/// The names Windows reads as a device, with or without an extension, in any case.
-const DEVICES: &[&str] = &["con", "prn", "aux", "nul"];
+/// The names Windows reads as a device, with or without an extension, in any case. `CONIN$` and
+/// `CONOUT$` are the console's input and output.
+const DEVICES: &[&str] = &["con", "prn", "aux", "nul", "conin$", "conout$"];
 
 fn component(text: &str) -> bool {
     // `.` and `..` end in a dot and are refused with the names that do.
@@ -90,10 +91,17 @@ fn component(text: &str) -> bool {
     true
 }
 
+/// `COM` or `LPT` and one digit from 1 to 9, or one of the superscript digits 1, 2 and 3, which
+/// Windows reserves as well.
 fn numbered_device(stem: &str) -> bool {
     ["com", "lpt"].iter().any(|prefix| {
-        stem.strip_prefix(prefix)
-            .is_some_and(|digit| matches!(digit.as_bytes(), [b'1'..=b'9']))
+        stem.strip_prefix(prefix).is_some_and(|digit| {
+            let mut chars = digit.chars();
+            matches!(
+                (chars.next(), chars.next()),
+                (Some('1'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'), None)
+            )
+        })
     })
 }
 
