@@ -243,13 +243,26 @@ impl Expected {
     }
 
     /// The line a pass prints, so that a log shows the check ran and what it compared: the names
-    /// compared, `ok`, and how many names the shell exports. Never a value and never a digest.
+    /// compared, `ok`, how many names the shell exports, and the exported names that were not
+    /// compared, which only the entry's cleared patterns judge. Never a value and never a digest.
     #[must_use]
-    pub fn passed_line(&self, exported: usize) -> String {
+    pub fn passed_line(&self, exported: &[String]) -> String {
+        let others: Vec<&str> = exported
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !self.kept.iter().any(|(kept, _)| kept == name))
+            .collect();
         format!(
-            "{PASSED} ok: {} ({} names compared, {exported} exported names read)",
+            "{PASSED} ok: {} ({} names compared, {} exported names read; not compared, and judged \
+             only by the entry's cleared patterns: {})",
             self.names().join(", "),
-            self.kept.len()
+            self.kept.len(),
+            exported.len(),
+            if others.is_empty() {
+                "none".to_owned()
+            } else {
+                others.join(", ")
+            }
         )
     }
 
@@ -855,12 +868,40 @@ mod tests {
     #[test]
     fn a_pass_prints_the_names_it_compared_and_ok_and_no_value_and_no_digest() {
         let expected = expected(&[], &[]);
-        let line = expected.passed_line(12);
+        let exported: Vec<String> = [
+            "CODEX_HOME",
+            "E2E_RUN_MARK",
+            "HOME",
+            "PROVIDER_LOGIN",
+            "LANG",
+            "LOGNAME",
+            "SHLVL",
+            "XDG_CONFIG_HOME",
+        ]
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+        let line = expected.passed_line(&exported);
         assert!(line.starts_with(PASSED), "{line}");
         assert!(line.contains(": ok: ") && !line.contains('\n'), "{line}");
         assert!(
-            line.ends_with("(4 names compared, 12 exported names read)"),
+            line.contains("(4 names compared, 8 exported names read; not compared"),
             "{line}"
+        );
+        // The exported names that were not compared are named, and the ones that were are not
+        // named a second time as not compared.
+        let (compared, not_compared) = line.split_once("not compared").expect("a statement");
+        for name in ["LANG", "LOGNAME", "SHLVL", "XDG_CONFIG_HOME"] {
+            assert!(not_compared.contains(name), "{name} is in {line}");
+            assert!(!compared.contains(name), "{name} was compared: {line}");
+        }
+        assert!(
+            !not_compared.contains("CODEX_HOME") && !not_compared.contains("PROVIDER_LOGIN"),
+            "a name that was compared is not named as not compared: {line}"
+        );
+        assert!(
+            expected.passed_line(&exported[..4]).ends_with(": none)"),
+            "no name is left over where every exported name was compared"
         );
         for name in ["CODEX_HOME", "E2E_RUN_MARK", "HOME", "PROVIDER_LOGIN"] {
             assert!(line.contains(name), "{name} is in {line}");
