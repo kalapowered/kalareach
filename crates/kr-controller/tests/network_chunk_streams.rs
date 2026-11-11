@@ -1256,9 +1256,10 @@ async fn has_ended(raw: &RawDevice) -> bool {
 /// KR-REQ-23.21: a connection is dated by the packets its device sends on it, requests or not. A
 /// device that has made a request on a connection has sent frames the host's transport received,
 /// and the host dates the connection to the time it read them, which is later than the time it
-/// admitted it. A device that then sends nothing still sends the transport's keepalive, and the
-/// acknowledgements of the host's own, which date it again. Each wait is for the host's reading,
-/// which it makes a second after the packets arrive at the latest.
+/// counted it. A device that then sends nothing still sends the transport's keepalive, and the
+/// acknowledgements of the host's own, which date it again: the acknowledgement of the host's reply
+/// can date it once more, so the case waits for a change after that one. Each wait is for the
+/// host's reading, which it makes a second after the packets arrive at the latest.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_connection_is_dated_by_the_packets_its_device_sends_on_it() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -1268,9 +1269,12 @@ async fn a_connection_is_dated_by_the_packets_its_device_sends_on_it() {
     let admitted = host.heard_from_of(&device.record)[0];
     assert!(is_served(&device.raw).await, "the connection is served");
     until(|| host.heard_from_of(&device.record)[0] > admitted).await;
-    // No request follows. Only the keepalives of the two ends can date the connection again.
+    // No request follows. The device's acknowledgement of the host's reply can date the connection
+    // once more, and nothing but a keepalive of the two ends can date it after that.
     let after_the_request = host.heard_from_of(&device.record)[0];
     until(|| host.heard_from_of(&device.record)[0] > after_the_request).await;
+    let after_the_acknowledgement = host.heard_from_of(&device.record)[0];
+    until(|| host.heard_from_of(&device.record)[0] > after_the_acknowledgement).await;
     host.stop().await;
 }
 
@@ -1319,13 +1323,14 @@ async fn with_every_connection_live_the_first_above_the_bound_withdraws_exactly_
 /// KR-REQ-23.21: the connections whose packets no longer arrive, which are the copies a lossy path
 /// leaves of the links it replaced, are withdrawn before a connection the device still sends on,
 /// although that connection is the oldest. Every connection the device still uses sends a request
-/// after the copies went quiet and the next connection is admitted at once, before the host's
-/// periodic reading has dated those packets: they count. One of the copies has a mutation in flight, held before
+/// after the copies went quiet, and the host's periodic readings are held, so that only the reading
+/// it makes when it chooses can date those packets: they count. One of the copies has a mutation
+/// in flight, held before
 /// the service's ask: it ends with no answer, and the same action sent on a new connection settles
 /// and is made at most once, whether or not the held request committed before it was lost. The
 /// copies go in the order they were opened, one for each connection above the bound; the device's
-/// other connections stand, and so do another device's. When none of the connections is heard from
-/// any more, the oldest is the one that goes.
+/// other connections stand, and so do another device's. When every connection was heard from at one
+/// moment, the one counted first is the one that goes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_copies_a_device_left_are_withdrawn_before_the_oldest_connection_it_still_uses() {
     const COPIES: usize = 4;
@@ -1340,7 +1345,10 @@ async fn the_copies_a_device_left_are_withdrawn_before_the_oldest_connection_it_
     let bound = u32::try_from(DEVICE_LIVE_CONNECTIONS).expect("a small bound");
 
     // The copies are the first of the others, so that each is younger than the oldest connection,
-    // which is the one the device goes on using. Their packets no longer arrive.
+    // which is the one the device goes on using. Their packets no longer arrive. The periodic
+    // readings are held, so that the reading made at the choice is what dates the requests below,
+    // whatever time the case takes.
+    host.hold_the_periodic_readings(true);
     host.silence_connections_of(&device.record, 1..COPIES + 1);
     let action = ActionId::new(kr_ipc::new_uuid());
     let (session_id, _) = an_open_session(&host);
@@ -1423,8 +1431,15 @@ async fn the_copies_a_device_left_are_withdrawn_before_the_oldest_connection_it_
     }
     assert_eq!(host.connections_of(&neighbour.record), 2);
 
-    // Heard from on none of them: the oldest goes.
+    // Heard from on none of them since one moment: of connections heard from at the same moment
+    // the first counted goes, which is the oldest.
     host.silence_connections_of(&device.record, 0..DEVICE_LIVE_CONNECTIONS);
+    let stamps = host.heard_from_of(&device.record);
+    assert_eq!(stamps.len(), DEVICE_LIVE_CONNECTIONS);
+    assert!(
+        stamps.iter().all(|stamp| *stamp == stamps[0]),
+        "every connection was heard from at the same moment"
+    );
     let last = device.again(&host).await;
     assert!(
         is_served(&last).await,

@@ -1349,17 +1349,23 @@ impl Host {
         self.network.connections_of(device.device_id)
     }
 
-    /// When the host last heard from each connection of `device`, oldest connection first.
+    /// When the host last heard from each connection of `device`, the first counted first.
     #[must_use]
     pub fn heard_from_of(&self, device: &DeviceRecord) -> Vec<u64> {
         self.network.heard_from_of(device.device_id)
     }
 
-    /// Makes the connections of `device` at these places, counting the oldest as the first, stand
-    /// in for connections whose packets no longer arrive.
+    /// Makes the connections of `device` at these places, counting the first counted as the first,
+    /// stand in for connections whose packets no longer arrive, all heard from at one time, now.
     pub fn silence_connections_of(&self, device: &DeviceRecord, places: std::ops::Range<usize>) {
         self.network
             .silence_connections_of(device.device_id, places);
+    }
+
+    /// Holds the once-a-second readings of what each connection's transport has received, or lets
+    /// them run again.
+    pub fn hold_the_periodic_readings(&self, held: bool) {
+        self.network.hold_the_periodic_readings(held);
     }
 
     /// The record the host committed for `device_id`: the grant it was paired under and the keys
