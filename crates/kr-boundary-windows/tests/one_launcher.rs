@@ -93,8 +93,8 @@ fn no_code_in_the_crate_creates_a_process_but_the_launcher() {
     );
 }
 
-/// Where a function that makes a permit to resume a child is called. The journal's maker joins this
-/// list with the journal.
+/// Where a function that makes a permit to resume a child is called: the proof makes its own, and
+/// the journal makes an invocation's once the process row is durable.
 #[test]
 fn a_permit_to_resume_is_made_only_where_it_is_allowed() {
     let mut files = Vec::new();
@@ -103,6 +103,7 @@ fn a_permit_to_resume_is_made_only_where_it_is_allowed() {
         &mut files,
     );
     let mut proof = 0;
+    let mut journal = 0;
     for path in &files {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let text = code(path);
@@ -110,6 +111,10 @@ fn a_permit_to_resume_is_made_only_where_it_is_allowed() {
         let for_invocation = count(&text, "ResumePermit::for_invocation(");
         match name.as_str() {
             "proof.rs" => proof += for_proof,
+            "journal.rs" => {
+                assert_eq!(for_proof, 0, "{}", path.display());
+                journal += for_invocation;
+            }
             // The launcher's own definitions, and the cases' maker that calls the invocation's.
             "launch.rs" => assert_eq!(for_proof, 0, "{}", path.display()),
             _ => {
@@ -124,4 +129,5 @@ fn a_permit_to_resume_is_made_only_where_it_is_allowed() {
         }
     }
     assert_eq!(proof, 1, "the proof makes its permit in one place");
+    assert_eq!(journal, 1, "the journal makes its permit in one place");
 }
