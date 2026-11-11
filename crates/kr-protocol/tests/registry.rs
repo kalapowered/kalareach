@@ -163,7 +163,6 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         "upload.cancel",
         "download.begin",
         "download.chunk",
-        "transfer.streams",
         "project.list",
         "project.read",
         "project.init",
@@ -1141,6 +1140,16 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
     }
 
+    // One method section 23's table does not list: the read by which a paired device learns which
+    // data streams the host takes from it, before it begins an upload.
+    let streams = ["transfer.streams"];
+    for name in streams {
+        assert!(
+            lookup(name).is_some(),
+            "{name} is missing from the registry"
+        );
+    }
+
     assert_eq!(
         REGISTRY.len(),
         required.len()
@@ -1169,6 +1178,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + inspection.len()
             + phone.len()
             + test_reports.len()
+            + streams.len()
             + 1,
         "the registry holds the required methods and the named additions"
     );
