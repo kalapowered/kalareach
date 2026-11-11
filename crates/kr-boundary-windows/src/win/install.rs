@@ -37,11 +37,14 @@ use crate::policy::{self, Policy};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_DIRECTORY_FILE, FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
-    FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+    FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile, NtSetSecurityObject,
 };
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
     GetLastError, HANDLE, RtlNtStatusToDosError, UNICODE_STRING,
+};
+use windows_sys::Win32::Security::{
+    DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_DIRECTORY,
@@ -89,6 +92,7 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const READ_CONTROL: u32 = 0x0002_0000;
 const SYNCHRONIZE: u32 = 0x0010_0000;
+const WRITE_DAC: u32 = 0x0004_0000;
 
 /// A failure of the installation, its repair or its removal.
 #[derive(Debug, thiserror::Error)]
@@ -393,12 +397,110 @@ fn parent_refusal(parent: &Path, why: &str) -> Error {
     ))
 }
 
+/// The folder above the data directory and the data directory itself, each held open from the check
+/// to the end of the steps that go by path, so that what was checked is what those steps work in.
+///
+/// Neither handle lets another program rename or delete what it holds (they share read and write
+/// only). The data directory's handle has the right to change its list, so the protection goes on
+/// that handle and not on whatever the path names a moment later.
+pub struct DataHolds {
+    _parent: ffi::Handle,
+    data: ffi::Handle,
+}
+
+impl std::fmt::Debug for DataHolds {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("DataHolds").finish_non_exhaustive()
+    }
+}
+
+impl DataHolds {
+    /// Gives the data directory the installation's protected list, on the handle held since the
+    /// directory was made or checked. The call propagates to nothing: what the directory holds is
+    /// given its list by the steps that make it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error when the list is refused.
+    pub fn protect(&self) -> Result<(), Error> {
+        let descriptor = data_descriptor()?;
+        // SAFETY: the handle is open with the right to change the list, and the descriptor lives
+        // through the call.
+        let status = unsafe {
+            NtSetSecurityObject(
+                self.data.raw(),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                descriptor.as_ptr(),
+            )
+        };
+        if status < 0 {
+            // SAFETY: converts a status the platform just returned.
+            let code = unsafe { RtlNtStatusToDosError(status) };
+            return Err(ffi::error(code, "setting the permissions of the data directory").into());
+        }
+        Ok(())
+    }
+}
+
+/// The descriptor the data directory is made with and given: owned by the administrators, with a
+/// protected list that names the system and the administrators alone.
+fn data_descriptor() -> Result<sd::OwnedSd, Error> {
+    Ok(sd::descriptor(SdKind::DataParent, &Principals::default())?)
+}
+
+/// The refusal of a data directory that is there and is not the installation's own.
+fn data_refusal(paths: &Paths, why: &str) -> Error {
+    Error::Refused(format!(
+        "{} is the boundary's data directory (its manifest, its journal and the roots of its operations). It is refused because {why}. Whoever owns it, or can change its list, could put data of their own in it while the broker runs as the system. Remove the directory, or give it to the administrators with a protected list that names only the system and the administrators, then install again.",
+        paths.data.display()
+    ))
+}
+
+/// What the installation's own data directory must be, read on the handle that opened it: the
+/// system's own class owns it and no other account has any right on it, now or by inheritance; and
+/// its owner is the system or the administrators, and every entry of its list names one of the two.
+fn check_data_directory(paths: &Paths, made: &ffi::Handle) -> Result<(), Error> {
+    const SYSTEM: &str = "S-1-5-18";
+    const ADMINISTRATORS: &str = "S-1-5-32-544";
+    if let Some(finding) = acl::changeable_by_others_on(made, false)? {
+        return Err(data_refusal(paths, &finding));
+    }
+    let summary = sd::summary_of_handle(made)?;
+    if ![SYSTEM, ADMINISTRATORS].contains(&summary.owner.as_str()) {
+        return Err(data_refusal(
+            paths,
+            &format!("it is owned by {}", summary.owner),
+        ));
+    }
+    let Some(entries) = summary.entries else {
+        return Err(data_refusal(paths, "it has no permission list"));
+    };
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| ![SYSTEM, ADMINISTRATORS].contains(&entry.sid.as_str()))
+    {
+        return Err(data_refusal(
+            paths,
+            &format!("its permission list has an entry for {}", entry.sid),
+        ));
+    }
+    Ok(())
+}
+
 /// Holds the folder above the data directory, made first when it is not there, and makes the data
-/// directory beneath it, relative to the held folder. The folder is made in one call that carries
-/// its protected list, so that it is never there with an inherited one, and is then opened and
-/// checked like one that was there. The handle is kept until the data directory exists beneath it,
-/// so the folder that passed the check is the folder the data directory is made in.
-fn make_data_directory(paths: &Paths) -> Result<(), Error> {
+/// directory beneath it, relative to the held folder, in one call that carries the directory's own
+/// protected list, so that it is never there with the list it would take from the folder. The
+/// folder is made in one call that carries its protected list, and is then opened and checked like
+/// one that was there. A data directory that is already there is not trusted for being there: its
+/// owner and its list are read on the handle that opened it and must be the installation's own, and
+/// a link is refused. Both handles are returned, so the folder that passed the check is the folder
+/// the data directory is made in and the directory that passed is the one that is protected.
+///
+/// # Errors
+///
+/// Returns [`Error::Refused`] naming the reason when the folder or the directory is not the
+/// installation's own, and the platform's error when a call fails.
+pub fn make_data_directory(paths: &Paths) -> Result<DataHolds, Error> {
     let held = match check_data_parent(paths)? {
         Some(held) => held,
         None => {
@@ -421,23 +523,26 @@ fn make_data_directory(paths: &Paths) -> Result<(), Error> {
         MaximumLength: (units.len() * 2) as u16,
         Buffer: units.as_ptr().cast_mut(),
     };
+    let descriptor = data_descriptor()?;
     let attributes = OBJECT_ATTRIBUTES {
         Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
         RootDirectory: held.raw(),
         ObjectName: &raw const text,
         Attributes: 0,
-        SecurityDescriptor: std::ptr::null(),
+        SecurityDescriptor: descriptor.as_ptr().cast_const().cast(),
         SecurityQualityOfService: std::ptr::null(),
     };
     let mut raw: HANDLE = std::ptr::null_mut();
     let mut status_block = IO_STATUS_BLOCK::default();
-    // SAFETY: the name, the attributes and the status block live through the call, the folder's
-    // handle is open, and the call keeps none of them. A directory that is there is opened, one that
-    // is not is made, and a link is opened as the link and refused below.
+    // SAFETY: the name, the attributes, the descriptor and the status block live through the call,
+    // the folder's handle is open, and the call keeps none of them. A directory that is there is
+    // opened, one that is not is made with the descriptor, and a link is opened as the link and
+    // refused below. The handle may read and change the list, and shares read and write only, so
+    // nothing renames or deletes the directory while it is held.
     let status = unsafe {
         NtCreateFile(
             &raw mut raw,
-            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC | SYNCHRONIZE,
             &raw const attributes,
             &raw mut status_block,
             std::ptr::null(),
@@ -484,7 +589,11 @@ fn make_data_directory(paths: &Paths) -> Result<(), Error> {
             paths.data.display()
         )));
     }
-    Ok(())
+    check_data_directory(paths, &made)?;
+    Ok(DataHolds {
+        _parent: held,
+        data: made,
+    })
 }
 
 /// Makes the folder above the data directory with the protected list, in one call.
@@ -876,11 +985,10 @@ pub fn install(paths: &Paths, options: &Options, repair: bool) -> Result<(), Err
 
 fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Error> {
     let paths = run.paths.clone();
-    make_data_directory(&paths)?;
-    acl::set_protected(
-        &paths.data,
-        &sd::descriptor(SdKind::AdminDir, &Principals::default())?,
-    )?;
+    // The folder and the directory are held, and the directory's list goes on its own handle, until
+    // the directories beneath it are made and protected.
+    let holds = make_data_directory(&paths)?;
+    holds.protect()?;
     fs::create_dir_all(&paths.staging).map_err(io_error("making the staging directory"))?;
     acl::set_protected(
         &paths.staging,
@@ -925,6 +1033,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
             acl::set_protected(directory, &wanted)?;
         }
     }
+    drop(holds);
     let channel = Channel::new(&paths.staging);
     let sweep = |staging: &Path| {
         if let Ok(entries) = fs::read_dir(staging) {

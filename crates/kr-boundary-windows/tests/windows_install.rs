@@ -726,12 +726,14 @@ fn a_folder_above_the_data_directory_that_others_own_may_write_in_or_have_replac
     let _ = account::delete(&name);
     let _ = std::fs::remove_dir_all(&inherited);
 
-    // A link in its place is refused, though what it points at is the system's own.
+    // A link in its place is refused, though what it points at is the system's own and the link's
+    // own list is the installation's (it is made inside a folder that hands that list on), so that
+    // the refusal of a link is the only refusal.
+    let container = inherited_folder();
+    acl::set_protected(&container, &data_parent_descriptor()).unwrap();
     let target = inherited_folder();
-    let link = PathBuf::from(r"C:\ProgramData").join(format!(
-        "krparent-link-{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
+    acl::set_protected(&target, &data_parent_descriptor()).unwrap();
+    let link = container.join("link");
     let made = Command::new("cmd")
         .args(["/c", "mklink", "/J"])
         .arg(&link)
@@ -739,19 +741,22 @@ fn a_folder_above_the_data_directory_that_others_own_may_write_in_or_have_replac
         .output()
         .unwrap();
     assert!(made.status.success(), "{made:?}");
-    acl::set_protected(
-        &target,
-        &kr_boundary_windows::win::sd::descriptor(
-            kr_boundary_windows::win::sd::SdKind::DataParent,
-            &kr_boundary_windows::win::sd::Principals::default(),
-        )
-        .unwrap(),
-    )
-    .unwrap();
     let refused = install::check_data_parent(&paths_under(&link)).unwrap_err();
-    assert!(refused.to_string().contains("link"), "{refused}");
+    assert!(
+        refused.to_string().contains("it is a link or not a folder"),
+        "{refused}"
+    );
     let _ = std::fs::remove_dir(&link);
+    let _ = std::fs::remove_dir_all(&container);
     let _ = std::fs::remove_dir_all(&target);
+}
+
+fn data_parent_descriptor() -> kr_boundary_windows::win::sd::OwnedSd {
+    kr_boundary_windows::win::sd::descriptor(
+        kr_boundary_windows::win::sd::SdKind::DataParent,
+        &kr_boundary_windows::win::sd::Principals::default(),
+    )
+    .unwrap()
 }
 
 /// A handle on a folder, opened by the case as another program would: any sharing, and the rights
@@ -866,6 +871,120 @@ fn the_parent_folder_is_checked_on_one_handle_that_is_held_and_an_entry_of_an_un
     );
     assert_eq!(acl::changeable_by_others_on(&handle, true).unwrap(), None);
     drop(handle);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_data_directory_is_made_with_its_own_protected_list_and_one_that_is_there_is_checked_on_its_handle()
+ {
+    use kr_boundary_windows::win::sd;
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const SYSTEM: &str = "S-1-5-18";
+    const ADMINISTRATORS: &str = "S-1-5-32-544";
+    const USERS: &str = "S-1-5-32-545";
+
+    // The directory that the installation makes is protected, owned by the administrators and names
+    // the system and the administrators alone, as soon as the making call returns: before the
+    // protection step, so that no one holds a handle on a directory that took the folder's list.
+    let folder = inherited_folder();
+    acl::set_protected(&folder, &data_parent_descriptor()).unwrap();
+    let paths = paths_under(&folder);
+    let holds = install::make_data_directory(&paths).unwrap();
+    let handle = open_folder(&paths.data, READ_CONTROL);
+    let made = sd::summary_of_handle(&handle).unwrap();
+    drop(handle);
+    assert_eq!(made.owner, ADMINISTRATORS);
+    assert!(made.protected, "the directory took nothing from the folder");
+    let named: Vec<&str> = made
+        .entries
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.sid.as_str())
+        .collect();
+    assert_eq!(named, [SYSTEM, ADMINISTRATORS]);
+
+    // The two handles are held: neither the folder nor the directory can be renamed or deleted
+    // while the protection step runs, and the step works on the handle.
+    let moved = paths.data.with_extension("moved");
+    assert!(std::fs::rename(&paths.data, &moved).is_err());
+    assert!(std::fs::remove_dir(&paths.data).is_err());
+    assert!(std::fs::rename(&folder, folder.with_extension("moved")).is_err());
+    holds.protect().unwrap();
+    drop(holds);
+    std::fs::rename(&paths.data, &moved).expect("the directory moves once it is let go");
+    std::fs::rename(&moved, &paths.data).unwrap();
+
+    // A directory that is there is the installation's own: accepted.
+    install::make_data_directory(&paths).expect("the installation's own directory is accepted");
+
+    // An entry that only a child inherits, for another principal, makes the folder refused before
+    // anything is made in it.
+    let inheriting =
+        sd::descriptor_from_text("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICIIO;FA;;;BU)")
+            .unwrap();
+    let other = inherited_folder();
+    acl::set_protected(&other, &inheriting).unwrap();
+    let refused = install::make_data_directory(&paths_under(&other)).unwrap_err();
+    assert!(refused.to_string().contains(USERS), "{refused}");
+    assert!(
+        !paths_under(&other).data.exists(),
+        "nothing was made under the refused folder"
+    );
+    let _ = std::fs::remove_dir_all(&other);
+
+    // A directory that is there and has another account's entry is refused, whatever the entry's
+    // right: a person could read what the broker keeps there, or change it.
+    for entry in [
+        "(A;OICI;0x1301bf;;;BU)",
+        "(A;;0x1200a9;;;BU)",
+        "(A;OICIIO;0x100;;;BU)",
+    ] {
+        let text = format!("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA){entry}");
+        acl::set_protected(&paths.data, &sd::descriptor_from_text(&text).unwrap()).unwrap();
+        let refused = install::make_data_directory(&paths).unwrap_err();
+        let text = refused.to_string();
+        assert!(
+            text.contains("boundary's data directory"),
+            "{entry}: {text}"
+        );
+        assert!(text.contains(USERS), "{entry}: {text}");
+    }
+    acl::set_protected(&paths.data, &data_parent_descriptor()).unwrap();
+
+    // A directory that another account owns is refused whatever its list says.
+    let name = format!("krowner{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
+    let owner = account::create(&name).unwrap();
+    let status = Command::new("icacls")
+        .arg(&paths.data)
+        .args(["/setowner", &name])
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{status:?}");
+    let refused = install::make_data_directory(&paths).unwrap_err();
+    assert!(refused.to_string().contains(&owner.to_text()), "{refused}");
+    let _ = account::delete(&name);
+    let _ = std::fs::remove_dir_all(&paths.data);
+
+    // A link in its place is refused although its own list is the installation's (it is made in a
+    // folder that hands that list on), and a file is not a directory.
+    let target = inherited_folder();
+    let made = Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(&paths.data)
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+    let refused = install::make_data_directory(&paths).unwrap_err();
+    assert!(refused.to_string().contains("is a link"), "{refused}");
+    let _ = std::fs::remove_dir(&paths.data);
+    let _ = std::fs::remove_dir_all(&target);
+    std::fs::write(&paths.data, b"not a directory").unwrap();
+    assert!(install::make_data_directory(&paths).is_err());
+    let _ = std::fs::remove_file(&paths.data);
     let _ = std::fs::remove_dir_all(&folder);
 }
 
