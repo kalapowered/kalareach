@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_crypto::keys::DeviceKeys;
-use kr_protocol::envelope::{ActionTarget, ControlFrame, MutationRequest, Outcome, ParamsValue};
+#[cfg(unix)]
+use kr_protocol::envelope::MutationRequest;
+use kr_protocol::envelope::{ActionTarget, ControlFrame, Outcome, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::{StreamHeader, StreamKind, StreamResource};
 use kr_protocol::ids::{ActionId, ActorId, SessionId, TransferId};
@@ -211,6 +213,7 @@ fn chunk_frame_on(
 }
 
 /// Sends every chunk of `bytes` as part of `transfer`, on a stream the device opens for it.
+#[cfg(unix)]
 async fn send_every_chunk(host: &Host, raw: &RawDevice, transfer: TransferId, bytes: &[u8]) {
     let mut stream = raw.open_stream(header(host, raw, transfer)).await;
     for index in 0..ChunkLayout::for_length(bytes.len() as u64)
