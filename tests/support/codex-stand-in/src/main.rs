@@ -42,6 +42,9 @@ async fn main() {
         {
             let socket = &remote["unix://".len()..];
             let prompt = words.join(" ");
+            if variants.leave_a_host {
+                variants::Variants::leave();
+            }
             let status =
                 terminal::run(contract::Contract::pinned(), variants, socket, &prompt).await;
             std::process::exit(status);
