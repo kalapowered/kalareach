@@ -23,7 +23,7 @@ import { Buffer } from 'node:buffer'
 import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { deflateRawSync } from 'node:zlib'
+import zlib, { deflateRawSync } from 'node:zlib'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -1151,6 +1151,22 @@ expectNames(
   [application(), { ...library(), deflate: true, claimCrc: 0x12345678 }],
   CRC_MISMATCH
 )
+{
+  // The CRC-32 comes from `zlib.crc32`, which Node has from 22.2.0. Without it the first member read is
+  // refused by name and the reason, and not by a call of undefined.
+  const crc32 = zlib.crc32
+  zlib.crc32 = undefined
+  try {
+    expectNames(
+      'a Node without zlib.crc32 is refused by name',
+      'members-no-crc32.apk',
+      [application(), library()],
+      'refused: this check needs Node 22.2.0 or newer'
+    )
+  } finally {
+    zlib.crc32 = crc32
+  }
+}
 
 // -- a dex file that cannot be read in full ------------------------------------------------------
 // An offset, an index or a count that runs off the end of the file reads as zeros, and a class

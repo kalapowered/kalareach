@@ -395,10 +395,10 @@ cd apps/companion/src-tauri/gen/android && ./gradlew :app:compileUniversalDebugK
 # that. What the check cannot read in full is a failure and never "nothing found": an archive that
 # ends inside a member, gives it another size or gives the CRC-32 of other bytes, a library whose
 # header or symbol table is cut or does not add up, and a dex file with an offset, number or count
-# past its end or outside its data section. A minified build removes or renames a class that only
-# native code reaches, and the runtime then aborts the application when the library asks for it, so
-# only a minified package shows this. The classes of the media library are kept whole by
-# `src-tauri/gen/android/app/proguard-rules.pro`.
+# past its end or outside its data section. It needs Node 22.2.0 or newer, for the CRC-32. A minified
+# build removes or renames a class that only native code reaches, and the runtime then aborts the
+# application when the library asks for it, so only a minified package shows this. The classes of
+# the media library are kept whole by `src-tauri/gen/android/app/proguard-rules.pro`.
 # For a minified package at `apk/<flavour>/<profile>/<file>` or `bundle/<variant>/<file>` under
 # `app/build/outputs` (a package anywhere else, at another depth under it too, has no known variant,
 # and this step is left out) the check also reads the merged rules the minifier wrote

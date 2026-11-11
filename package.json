@@ -5,7 +5,7 @@
   "license": "BSD-3-Clause",
   "type": "module",
   "engines": {
-    "node": ">=22.0.0",
+    "node": ">=22.2.0",
     "pnpm": ">=11.0.0"
   },
   "packageManager": "pnpm@11.14.0",

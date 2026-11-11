@@ -75,7 +75,7 @@ Requirements for building the project:
 
 - the toolchain `rust-toolchain.toml` pins, which rustup installs on first use, with its
   `wasm32-wasip2` target for the plugin runtime's test components;
-- Node version 22 and the version of pnpm specified in `package.json`
+- Node 22.2.0 or newer and the version of pnpm specified in `package.json`
 - a C and a C++ compiler, CMake and libclang, which the description service's model runtime is
   built with, and Git and Python 3;
 - on Linux, the headers of the system WebView the companion application's backend links: WebKitGTK

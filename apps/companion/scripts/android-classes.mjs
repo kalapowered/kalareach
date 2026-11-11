@@ -23,7 +23,9 @@
 // that name, by the artefact's dex. The libraries come from the artefact itself, so a library that
 // is updated brings its new names with it.
 import { Buffer } from 'node:buffer'
-import { crc32, inflateRawSync } from 'node:zlib'
+// The module as a whole, and `crc32` read from it where it is used: a named import of a function that
+// Node before 22.2.0 lacks would fail the import itself, before anything could say why.
+import zlib, { inflateRawSync } from 'node:zlib'
 import {
   closeSync,
   existsSync,
@@ -186,6 +188,12 @@ function members(handle, size) {
   throw new Error('not a zip archive: no end-of-central-directory record')
 }
 
+/** The CRC-32 of `bytes`, by `zlib.crc32`, which Node has from 22.2.0 (the floor `package.json` gives). */
+function crcOf(bytes) {
+  if (typeof zlib.crc32 !== 'function') throw new Error('this check needs Node 22.2.0 or newer')
+  return zlib.crc32(bytes)
+}
+
 /**
  * One member's bytes, in full or not at all: a member that the archive ends inside, or whose bytes
  * are not the size its directory gives or do not have the CRC-32 it gives, is refused, since what
@@ -225,7 +233,7 @@ function contents(handle, member, archiveSize) {
       `${member.name}: the member is ${bytes.length} bytes, and its directory gives ${member.uncompressedSize}`
     )
   }
-  if (crc32(bytes) !== member.crc) {
+  if (crcOf(bytes) !== member.crc) {
     throw new Error(`${member.name}: the member's bytes do not match the CRC-32 its directory gives`)
   }
   return bytes
