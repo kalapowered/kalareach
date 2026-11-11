@@ -299,6 +299,28 @@ pub fn prove(
         Ok(record) => record,
         Err(error) => return fail(error.to_string()),
     };
+    let mut waited = String::new();
+    if let Some(after) = super::switch::wait_for_policy_event() {
+        let begun = Instant::now();
+        loop {
+            match applocker::policy_applied_after(after, &scratch.0, &environment) {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(error) => return fail(error.to_string()),
+            }
+            if begun.elapsed() >= bound || stop.is_set() {
+                return fail(format!(
+                    "the platform did not report the policy as applied in {} seconds",
+                    bound.as_secs()
+                ));
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        waited = format!(
+            ", after {:.1} s for the platform to report the policy as applied",
+            begun.elapsed().as_secs_f32()
+        );
+    }
     let started = Instant::now();
     let mut attempts = 0_u32;
     let mut last: String;
@@ -426,7 +448,7 @@ pub fn prove(
     Proof {
         ready: true,
         detail: format!(
-            "{account}: an unlisted program was refused with {REFUSED_BY_POLICY} by rule {rule} after {attempts} launch(es) in {:.1} s, Git ran, and the same program ran under the broker's own token",
+            "{account}: an unlisted program was refused with {REFUSED_BY_POLICY} by rule {rule} after {attempts} launch(es) in {:.1} s{waited}, Git ran, and the same program ran under the broker's own token",
             started.elapsed().as_secs_f32()
         ),
     }

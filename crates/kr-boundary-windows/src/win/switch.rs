@@ -64,6 +64,25 @@ pub fn proof_bound(default: std::time::Duration) -> std::time::Duration {
         })
 }
 
+/// The newest application-control record from before an installation began, when a case asks the
+/// proof to wait for the platform's "policy applied" event after that record before its first launch.
+#[cfg(feature = "testing")]
+#[must_use]
+pub fn wait_for_policy_event() -> Option<u64> {
+    super::registry::open(KEY)
+        .ok()
+        .flatten()
+        .and_then(|key| key.dword("PolicyEventAfterRecord").ok().flatten())
+        .map(u64::from)
+}
+
+/// Whether the proof waits for the policy's event: never, in a build that ships.
+#[cfg(not(feature = "testing"))]
+#[must_use]
+pub fn wait_for_policy_event() -> Option<u64> {
+    None
+}
+
 /// How long the proof waits for the policy.
 #[cfg(not(feature = "testing"))]
 #[must_use]

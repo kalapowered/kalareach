@@ -12,6 +12,9 @@ use quick_xml::{Reader, XmlVersion};
 /// The event the platform writes when it refuses a program an enforced rule denies.
 pub const BLOCKED: u32 = 8004;
 
+/// The event the platform writes when it has applied a policy.
+pub const APPLIED: u32 = 8001;
+
 /// One event of the application-control log.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LogEvent {
