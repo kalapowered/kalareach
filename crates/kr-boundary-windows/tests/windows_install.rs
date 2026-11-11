@@ -1539,8 +1539,8 @@ fn a_cancelled_receive_that_does_not_end_gives_the_call_back_at_the_deadline_and
     let text = refused.expect_err("nothing answered").to_string();
     assert!(text.contains("deadline"), "{text}");
     assert!(
-        elapsed >= bound && elapsed < bound + std::time::Duration::from_secs(2),
-        "the call came back at the deadline and the grace: {elapsed:?}"
+        elapsed >= bound && elapsed < bound + std::time::Duration::from_millis(600),
+        "the call came back at the deadline and the grace of 100 ms: {elapsed:?}"
     );
     // The transfer is still pending, so nothing more is taken on that connection.
     let again = install::ask(&mut connection, &Request::Status {})

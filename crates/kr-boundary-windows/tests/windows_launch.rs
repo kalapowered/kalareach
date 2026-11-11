@@ -1110,6 +1110,29 @@ fn a_pipe_that_a_writer_outside_the_job_holds_open_after_a_proved_end_is_an_unce
         "{held:?}"
     );
 
+    // The launch itself fails once the capture pipes exist (the process was made and ended at once)
+    // with the same writer outside: the error is the uncertain end, which says both, and not the
+    // launch's own error.
+    testing::hold_next_pipe_writer();
+    testing::fail_next_launch_after_creation();
+    let begun = Instant::now();
+    let held = run_captured(
+        proof_run(&fixture, "sleep"),
+        Instant::now() + Duration::from_secs(4),
+    )
+    .expect_err("the launch failed");
+    let took = begun.elapsed();
+    testing::release_held_pipe_writers();
+    assert!(uncertain(&held, "had also failed"), "{held:?}");
+    assert!(
+        uncertain(&held, "still open after the end of its job"),
+        "{held:?}"
+    );
+    assert!(
+        took < Duration::from_millis(4_500),
+        "the readers of a failed launch stop at the deadline: {took:?}"
+    );
+
     // The control: the same failure with no writer outside is the platform's error, as it was.
     testing::fail_next_exit_code_read();
     let failed = run_captured(
@@ -1125,16 +1148,18 @@ fn a_pipe_that_a_writer_outside_the_job_holds_open_after_a_proved_end_is_an_unce
 fn a_suspended_child_that_is_dropped_is_waited_for_only_to_the_callers_deadline() {
     let fixture = Fixture::new();
     for (left, shortest, longest) in [
+        // The wait is the deadline's, and at most the floor of 100 ms more, with room for the
+        // scheduler.
         (
             Duration::from_secs(1),
             Duration::from_millis(800),
-            Duration::from_millis(2_500),
+            Duration::from_millis(1_500),
         ),
         // A deadline that has passed still gets the floor, and no more.
         (
             Duration::ZERO,
             Duration::from_millis(80),
-            Duration::from_millis(1_500),
+            Duration::from_millis(500),
         ),
     ] {
         let job = Job::new(Limits::INVOCATION).unwrap();

@@ -129,16 +129,21 @@ pub struct Captured {
 /// system alone for the broker's own token. It belongs to no invocation, so its permit to resume
 /// is the proof's own: this is the one place that makes one.
 ///
-/// Nothing in the call waits past the deadline: the program is waited for until two seconds
-/// before it, the job's end and the pipes' end take the rest, and a program that is not shown to
-/// have ended by the deadline is an uncertain end and not a late success.
+/// The call returns by the deadline, and at most 100 ms more in the launch's cleanup of a child
+/// that never ran and in the cancel of a read that did not finish: those two waits keep a floor
+/// that the caller's deadline does not shorten. The program is waited for until two seconds before
+/// the deadline and the job's end and the pipes' end take the rest, so the caller's own promise
+/// holds inside the two seconds. A program that is not shown to have ended by the deadline is an
+/// uncertain end and not a late success.
 ///
 /// # Errors
 ///
 /// Returns [`LaunchError::NotStarted`] when the platform refuses to start the program, the other
 /// errors of [`launch`] and of the pipes, and [`LaunchError::EndUncertain`] when the job's end is
 /// not proved, when a child reported that it was not seen to end (also on a launch that failed
-/// after the process was made), or when a pipe did not reach its end after the job's end.
+/// after the process was made), or when a pipe did not reach its end after the job's end (also
+/// after a launch that failed: a writer outside the job may still hold the pipe, and the error then
+/// says both).
 pub fn run_captured(run: Run<'_>, deadline: Instant) -> Result<Captured, LaunchError> {
     if Instant::now() >= deadline {
         return Err(LaunchError::DeadlinePassed);
@@ -168,20 +173,20 @@ pub fn run_captured(run: Run<'_>, deadline: Instant) -> Result<Captured, LaunchE
         thread_descriptor: &descriptor,
         deadline: Some(deadline),
     });
-    let suspended = match launched {
-        Ok(suspended) => suspended,
-        Err(error) => return Err(after_failed_launch(&mut job, error, deadline)),
-    };
     let wait_until = deadline
         .checked_sub(END_RESERVE)
         .unwrap_or_else(Instant::now);
     let (result, out, err) = std::thread::scope(|scope| {
         // The readers stop at the deadline, so that a process that keeps the pipes open after the
-        // job's end is not waited for: the end is then not proved and the call says so.
+        // job's end is not waited for: the end is then not proved and the call says so. They read
+        // after a launch that failed too: the launch may have made a process, and a writer outside
+        // the job may hold a pipe whatever became of it.
         let out = scope.spawn(|| read_pipe(&out_read, deadline));
         let err = scope.spawn(|| read_pipe(&err_read, deadline));
-        let permit = ResumePermit::for_proof(&suspended);
-        let result = match suspended.resume(permit) {
+        let result = match launched.and_then(|suspended| {
+            let permit = ResumePermit::for_proof(&suspended);
+            suspended.resume(permit)
+        }) {
             Ok(child) => {
                 let waited = child.wait(wait_until.saturating_duration_since(Instant::now()));
                 // Anything the program started ends with the job, which also lets the pipes

@@ -108,8 +108,14 @@ pub struct Connection {
 }
 
 /// How long a cancelled transfer is waited for. The cancel ends a transfer at once where the pipe's
-/// driver answers it, so this is the one floor beyond a caller's deadline, and a transfer that has
-/// not ended by then is left to end by itself.
+/// driver answers it, and a transfer that has not ended by then is left to end by itself.
+///
+/// The rule of the deadline in the pipes and the launch: a call returns by the caller's deadline,
+/// and at most 100 ms more, once in the cancel of a transfer that did not finish (this grace) and
+/// once in the launch's cleanup of a child that never ran. A caller whose own promise rests on its
+/// deadline keeps both in its margin: the proof's cycle stops asking ten seconds before its own
+/// deadline and reads no answer after it, and a run of a program of the proof keeps two seconds
+/// before its deadline for the job's end and the pipes' end.
 const CANCEL_GRACE_MS: u32 = 100;
 
 /// Seams for the test build: a call the platform would answer is made not to be, so that a case

@@ -381,7 +381,15 @@ pub mod testing {
 /// How long a dropped suspended child is waited for when its caller gave no deadline.
 const END_WAIT_MS: u32 = 5_000;
 /// The least a child that was ended is waited for, whatever the deadline: the call that ends a
-/// process returns before the process is signalled as ended. The one floor beyond a deadline.
+/// process returns before the process is signalled as ended, and without the floor an end that is
+/// certain a moment later would be reported as uncertain and would block the tree for no gain.
+///
+/// The rule of the deadline in the launch and the pipes: a call returns by the caller's deadline,
+/// and at most 100 ms more, once in the launch's cleanup of a child that never ran (this floor) and
+/// once in the cancel of a transfer that did not finish (the pipe's grace). A caller whose own
+/// promise rests on its deadline keeps both in its margin: a run of a program of the proof keeps
+/// two seconds before its deadline for the job's end and the pipes' end, and the proof's cycle keeps
+/// ten seconds before its own.
 const END_FLOOR_MS: u32 = 100;
 
 /// Ends a child that never ran and waits for it: up to [`END_WAIT_MS`], or up to the caller's
