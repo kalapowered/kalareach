@@ -20,9 +20,9 @@ use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
 use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_CREATED_NEW_KEY,
-    REG_OPTION_VOLATILE, REG_SZ, RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegQueryValueExW,
-    RegSetValueExW,
+    HKEY, HKEY_LOCAL_MACHINE, KEY_CREATE_SUB_KEY, KEY_QUERY_VALUE, KEY_SET_VALUE,
+    REG_CREATED_NEW_KEY, REG_OPTION_VOLATILE, REG_SZ, RegCloseKey, RegCreateKeyExW, RegOpenKeyExW,
+    RegQueryValueExW, RegSetValueExW,
 };
 
 use super::ffi::{Result, error, wide};
@@ -31,6 +31,8 @@ use super::sd::{self, Principals, SdKind, Summary};
 /// The service key the installation lays, and the key under it that holds the marker.
 const SERVICE_KEY: &str = r"SYSTEM\CurrentControlSet\Services\KalaReachBoundary";
 const MARKER_KEY: &str = r"SYSTEM\CurrentControlSet\Services\KalaReachBoundary\Boot";
+/// The marker's key as a name under the service key.
+const MARKER_SUBKEY: &str = "Boot";
 const VALUE: &str = "Id";
 
 const READ_CONTROL: u32 = 0x0002_0000;
@@ -99,19 +101,12 @@ impl Drop for OpenKey {
     }
 }
 
-fn open_for_reading_the_list(subkey: &str) -> Result<Option<OpenKey>> {
+fn open_key(subkey: &str, access: u32) -> Result<Option<OpenKey>> {
     let name = wide(subkey);
     let mut key: HKEY = null_mut();
     // SAFETY: the name is NUL-terminated and the key is an out-parameter.
-    let status = unsafe {
-        RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
-            name.as_ptr(),
-            0,
-            READ_CONTROL,
-            &raw mut key,
-        )
-    };
+    let status =
+        unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, name.as_ptr(), 0, access, &raw mut key) };
     match status {
         ERROR_SUCCESS => Ok(Some(OpenKey(key))),
         ERROR_FILE_NOT_FOUND => Ok(None),
@@ -174,30 +169,34 @@ fn write_id(key: &OpenKey, id: &str) -> Result<()> {
 /// Reads the marker, making the key and the identifier when this is the first read since Windows
 /// started, and says whether it can be believed.
 ///
+/// The marker's key is made under the service key that the installation laid and never beside a
+/// missing one: a volatile key made by name makes every key above it that is missing volatile too,
+/// and the service manager cannot then store the service's own settings in a key that is volatile.
+///
 /// # Errors
 ///
-/// Returns an error when the platform refuses a call.
+/// Returns an error when the service's key does not exist, or when the platform refuses a call.
 pub fn marker() -> Result<BootMarker> {
     let mut problems = Vec::new();
-    match open_for_reading_the_list(SERVICE_KEY)? {
-        Some(parent) => {
-            if let Some(why) = who_else_can_change(&sd::summary_of_key(parent.0.cast::<c_void>())?)
-            {
-                problems.push(format!("the service key: {why}"));
-            }
-        }
-        None => problems.push("the service key does not exist".to_owned()),
+    let Some(parent) = open_key(SERVICE_KEY, READ_CONTROL | KEY_CREATE_SUB_KEY)? else {
+        return Err(error(
+            ERROR_FILE_NOT_FOUND,
+            "the service's key does not exist, so no marker is made",
+        ));
+    };
+    if let Some(why) = who_else_can_change(&sd::summary_of_key(parent.0.cast::<c_void>())?) {
+        problems.push(format!("the service key: {why}"));
     }
     let descriptor = sd::descriptor(SdKind::BootMarker, &Principals::default())?;
     let attributes = descriptor.attributes();
-    let name = wide(MARKER_KEY);
+    let name = wide(MARKER_SUBKEY);
     let mut raw: HKEY = null_mut();
     let mut disposition = 0_u32;
     // SAFETY: the name is NUL-terminated, the attributes point at a descriptor that lives through
     // the call, and the key and the disposition are out-parameters.
     let status = unsafe {
         RegCreateKeyExW(
-            HKEY_LOCAL_MACHINE,
+            parent.0,
             name.as_ptr(),
             0,
             null(),

@@ -306,9 +306,18 @@ fn installation_lays_down_and_removal_restores() {
         None
     );
     assert_eq!(acl::changeable_by_others(&paths.data, false).unwrap(), None);
+    assert_eq!(
+        acl::changeable_by_others(paths.data_parent(), false).unwrap(),
+        None,
+        "the folder above the data directory is the system's own too"
+    );
     assert!(
         !acl::describe(&paths.data).unwrap().contains(";;;BU)"),
         "no one else may read the data directory"
+    );
+    assert!(
+        acl::describe(paths.data_parent()).unwrap().contains("D:P"),
+        "the folder above the data directory takes nothing from its own parent"
     );
     for object in manifest.of_kind(ObjectKind::File) {
         let file = Path::new(&object.id);
@@ -427,6 +436,15 @@ fn installation_lays_down_and_removal_restores() {
         snapshot(),
         before,
         "the computer is as it was before the installation"
+    );
+    // Without the service there is no marker, and asking for one makes no key: a volatile service
+    // key left behind would stop the next installation from storing the service's settings.
+    assert!(boot::marker().is_err());
+    assert!(
+        registry::open(r"SYSTEM\CurrentControlSet\Services\KalaReachBoundary")
+            .unwrap()
+            .is_none(),
+        "no service key was made by asking for the marker"
     );
 }
 
@@ -631,6 +649,173 @@ fn entry_states_are_told_apart_and_a_repair_enrols_another_person() {
     let _ = account::delete(&other_name);
     assert_eq!(code, 0, "{output}");
     assert_eq!(snapshot(), before);
+}
+
+/// A folder under `%ProgramData%` as the system's setup leaves it for a new one: with the list it
+/// inherits, which lets ordinary accounts add to it.
+fn inherited_folder() -> PathBuf {
+    let folder = PathBuf::from(r"C:\ProgramData").join(format!(
+        "krparent-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ));
+    std::fs::create_dir(&folder).unwrap();
+    folder
+}
+
+fn paths_under(folder: &Path) -> Paths {
+    Paths {
+        data: folder.join("Boundary"),
+        ..Paths::system()
+    }
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_folder_above_the_data_directory_that_others_own_may_write_in_or_have_replaced_by_a_link_is_refused()
+ {
+    // Absent: nothing to refuse, and the installation makes it with its own list.
+    let absent = PathBuf::from(r"C:\ProgramData").join("krparent-absent");
+    assert!(!absent.exists());
+    install::check_data_parent(&paths_under(&absent)).expect("an absent folder is made later");
+
+    // A folder with the inherited list lets ordinary accounts add to it.
+    let inherited = inherited_folder();
+    let refused = install::check_data_parent(&paths_under(&inherited)).unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("not made by this installation"),
+        "{refused}"
+    );
+
+    // The same folder, with the installation's own list, is accepted.
+    acl::set_protected(
+        &inherited,
+        &kr_boundary_windows::win::sd::descriptor(
+            kr_boundary_windows::win::sd::SdKind::DataParent,
+            &kr_boundary_windows::win::sd::Principals::default(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    install::check_data_parent(&paths_under(&inherited)).expect("a protected folder is accepted");
+
+    // A folder that a non-administrator owns is refused whatever its list says.
+    let name = format!("krowner{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
+    let owner = account::create(&name).unwrap();
+    let status = Command::new("icacls")
+        .arg(&inherited)
+        .args(["/setowner", &name])
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{status:?}");
+    let refused = install::check_data_parent(&paths_under(&inherited)).unwrap_err();
+    assert!(refused.to_string().contains(&owner.to_text()), "{refused}");
+    let _ = account::delete(&name);
+    let _ = std::fs::remove_dir_all(&inherited);
+
+    // A link in its place is refused, though what it points at is the system's own.
+    let target = inherited_folder();
+    let link = PathBuf::from(r"C:\ProgramData").join(format!(
+        "krparent-link-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ));
+    let made = Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(&link)
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+    acl::set_protected(
+        &target,
+        &kr_boundary_windows::win::sd::descriptor(
+            kr_boundary_windows::win::sd::SdKind::DataParent,
+            &kr_boundary_windows::win::sd::Principals::default(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let refused = install::check_data_parent(&paths_under(&link)).unwrap_err();
+    assert!(refused.to_string().contains("link"), "{refused}");
+    let _ = std::fs::remove_dir(&link);
+    let _ = std::fs::remove_dir_all(&target);
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_installation_stops_before_it_lays_anything_down_when_the_parent_folder_is_not_its_own() {
+    let case = Case::new();
+    let parent = Paths::system().data_parent().to_path_buf();
+    assert!(
+        !parent.exists(),
+        "the guest has no such folder to begin with"
+    );
+    std::fs::create_dir(&parent).unwrap();
+    let before = snapshot();
+    let (code, output) = case.install();
+    let _ = std::fs::remove_dir_all(&parent);
+    assert_ne!(code, 0, "{output}");
+    assert!(output.contains("not made by this installation"), "{output}");
+    assert_eq!(snapshot(), before, "nothing was changed");
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_removal_reads_the_journal_and_the_private_roots_first_and_refuses_with_nothing_changed() {
+    use kr_boundary_windows::journal::rows::Row;
+    use kr_boundary_windows::win::journal::Journal;
+    use kr_boundary_windows::win::launch::InvocationId;
+    let case = Case::new();
+    let (code, output) = case.install();
+    assert_eq!(code, 0, "{output}");
+    let paths = Paths::system();
+    let installed = snapshot();
+
+    // An unfinished invocation in the journal.
+    let id = InvocationId([5; 16]);
+    let mut journal = Journal::create(&paths.journal, id).unwrap();
+    journal
+        .append(&Row::Begin {
+            invocation: hex::encode(id.0),
+            boot_marker: "boot".to_owned(),
+            session_luid: 1,
+            group_sid: "S-1-9-1-2-3-4".to_owned(),
+            client_sid: case.person.to_text(),
+            client_pid: 1,
+            client_creation_time: 1,
+            chain: Vec::new(),
+            tree_path: r"C:\work\project".to_owned(),
+        })
+        .unwrap();
+    drop(journal);
+    let (code, output) = setup(&["remove"], "yes\n", &[]);
+    assert_ne!(code, 0, "{output}");
+    assert!(
+        output.contains(r"C:\work\project"),
+        "the project is named: {output}"
+    );
+    assert!(output.contains("nothing was changed"), "{output}");
+    assert_eq!(snapshot(), installed, "the removal changed nothing");
+    assert!(paths.manifest.exists() && paths.journal.exists());
+
+    // A finished one is not work: only the unfinished one holds the removal.
+    // A private root that is still there holds it too.
+    let root = paths.run.join("0123456789abcdef0123456789abcdef");
+    std::fs::remove_file(paths.journal.join(format!("{}.journal", hex::encode(id.0)))).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    let (code, output) = setup(&["remove"], "yes\n", &[]);
+    assert_ne!(code, 0, "{output}");
+    assert!(
+        output.contains("a private root 0123456789abcdef0123456789abcdef"),
+        "{output}"
+    );
+    assert_eq!(snapshot(), installed, "the removal changed nothing");
+
+    // With both gone the removal runs.
+    std::fs::remove_dir(&root).unwrap();
+    let (code, output) = setup(&["remove"], "yes\n", &[]);
+    assert_eq!(code, 0, "{output}");
 }
 
 /// How long the process has existed.

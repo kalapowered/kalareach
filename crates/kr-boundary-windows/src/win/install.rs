@@ -158,6 +158,13 @@ pub struct Paths {
 }
 
 impl Paths {
+    /// The folder above the data directory, which the installation makes with its own protected
+    /// list and which no account but the system's may own, write in, delete in or change.
+    #[must_use]
+    pub fn data_parent(&self) -> &Path {
+        self.data.parent().unwrap_or(&self.data)
+    }
+
     /// The installation's places on this computer.
     #[must_use]
     pub fn system() -> Paths {
@@ -210,6 +217,7 @@ fn say(line: &str) {
 ///
 /// Returns [`Error::Refused`] naming the foreign object, or the failure of the call that looked.
 pub fn entry(paths: &Paths) -> Result<Entry, Error> {
+    check_data_parent(paths)?;
     if paths.manifest.exists() {
         let manifest = Manifest::load(&paths.manifest)?;
         return Ok(match manifest.state {
@@ -238,6 +246,78 @@ pub fn entry(paths: &Paths) -> Result<Entry, Error> {
         }
     }
     Ok(Entry::Fresh)
+}
+
+/// Refuses a folder above the data directory that the installation did not make safe: one that is a
+/// reparse point, that an account other than the system's own owns, or in which another account may
+/// write, delete or change. Whoever owns or may change that folder can rename the data directory
+/// away and put a manifest, a journal and a directory of private roots of their own in its place,
+/// which the broker, running as the system, would read by path. A folder that is not there is
+/// made with the protected list; a folder that an earlier installation made with an inherited list
+/// is refused the same way, since nothing of the earlier form is kept.
+///
+/// # Errors
+///
+/// Returns [`Error::Refused`] naming the reason, or the failure of the call that looked.
+pub fn check_data_parent(paths: &Paths) -> Result<(), Error> {
+    let parent = paths.data_parent();
+    let meta = match fs::symlink_metadata(parent) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(io_error("reading the data directory's parent folder")(
+                error,
+            ));
+        }
+    };
+    const REPARSE_POINT: u32 = 0x400;
+    if meta.file_attributes() & REPARSE_POINT != 0 || !meta.is_dir() {
+        return Err(Error::Refused(format!(
+            "{} is a link or not a folder, and the installation does not trust it",
+            parent.display()
+        )));
+    }
+    if let Some(finding) = acl::changeable_by_others(parent, false)? {
+        return Err(Error::Refused(format!(
+            "{} was not made by this installation and {finding}; remove or correct that folder, then install again",
+            parent.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Makes the folder above the data directory, in one call that carries its protected list, so that
+/// it is never there with an inherited one. A folder that is there is left as it is: it was
+/// checked.
+fn make_data_parent(parent: &Path) -> Result<(), Error> {
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+    let descriptor = sd::descriptor(SdKind::DataParent, &Principals::default())?;
+    let attributes = descriptor.attributes();
+    let wide = ffi::wide_path(parent);
+    // SAFETY: the path is NUL-terminated and the attributes point at a descriptor that lives
+    // through the call.
+    if unsafe { CreateDirectoryW(wide.as_ptr(), &raw const attributes) } == 0 {
+        // SAFETY: reads the calling thread's last error.
+        let code = unsafe { GetLastError() };
+        if code == ERROR_ALREADY_EXISTS {
+            return check_data_parent_of(parent);
+        }
+        return Err(Error::Failed(format!(
+            "making {}: Windows error {code}",
+            parent.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The check of a folder that appeared between the first look and the call that makes it.
+fn check_data_parent_of(parent: &Path) -> Result<(), Error> {
+    let paths = Paths {
+        data: parent.join("Boundary"),
+        ..Paths::system()
+    };
+    check_data_parent(&paths)
 }
 
 /// Reads the state of every kind of application control and refuses when any is in force. Anything
@@ -608,6 +688,7 @@ pub fn install(paths: &Paths, options: &Options, repair: bool) -> Result<(), Err
 
 fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Error> {
     let paths = run.paths.clone();
+    make_data_parent(paths.data_parent())?;
     fs::create_dir_all(&paths.data).map_err(io_error("making the data directory"))?;
     acl::set_protected(
         &paths.data,
@@ -630,10 +711,32 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
             None,
         )?;
         fs::create_dir_all(directory).map_err(io_error(format!("making {what}")))?;
-        acl::set_protected(
-            directory,
-            &sd::descriptor(SdKind::AdminDir, &Principals::default())?,
-        )?;
+        let wanted = sd::descriptor(SdKind::AdminDir, &Principals::default())?;
+        if directory == &paths.run {
+            // The list goes on the directory's own handle and only while it holds nothing: a repair
+            // may run while invocations hold private roots in it, and a change that propagates
+            // would reach them. A directory that is not empty keeps its list, which must already be
+            // the wanted one.
+            match acl::set_protected_when_empty(directory, &wanted)? {
+                acl::Reset::Applied => {}
+                acl::Reset::NotEmpty => {
+                    if let Some(finding) = acl::changeable_by_others(directory, false)? {
+                        return Err(Error::Refused(format!(
+                            "{} holds private roots and {finding}",
+                            directory.display()
+                        )));
+                    }
+                }
+                acl::Reset::Refused(why) => {
+                    return Err(Error::Refused(format!(
+                        "{} is not a directory the installation can use: {why}",
+                        directory.display()
+                    )));
+                }
+            }
+        } else {
+            acl::set_protected(directory, &wanted)?;
+        }
     }
     let channel = Channel::new(&paths.staging);
     let sweep = |staging: &Path| {
@@ -1033,6 +1136,8 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
             "run the setup program as an administrator".to_owned(),
         ));
     }
+    check_data_parent(paths)?;
+    refuse_while_unfinished(paths)?;
     let manifest = match fs::read(&paths.manifest) {
         Ok(bytes) => Manifest::parse(&bytes)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1237,8 +1342,15 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
             let _ = fs::remove_dir(parent);
         }
     }
-    // The journal and the private roots' parent go only when empty: a journal row or a root that
-    // is still there means a release is not finished, and the records that describe it stay.
+    // The journal and the private roots' parent go only when empty. Unfinished work was refused
+    // before the removal began; what a journal file still holds now is finished or made nothing.
+    if let Ok(entries) = fs::read_dir(&paths.journal) {
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|text| text.to_str()) == Some("journal") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
     for directory in [&paths.run, &paths.journal] {
         if directory.exists() {
             keep(
@@ -1281,6 +1393,64 @@ pub fn remove(paths: &Paths, quiet_when_empty: bool) -> Result<(), Error> {
         Err(Error::Failed(format!(
             "the removal did not finish and its records are kept: {}",
             failures.join("; ")
+        )))
+    }
+}
+
+/// Reads the journal and the directory of the private roots and refuses, before anything is
+/// changed, while one holds work that is not done: an invocation that did not finish, one that
+/// finished with a leftover, one whose file cannot be read, or a private root that is still there.
+/// The journal holds the only saved lists of an unfinished release, so nothing that could end the
+/// broker, take away its accounts or delete a file goes first.
+///
+/// # Errors
+///
+/// Returns [`Error::Refused`] naming the projects and roots, or the failure of the call that read.
+pub fn refuse_while_unfinished(paths: &Paths) -> Result<(), Error> {
+    use crate::journal::rows::Row;
+    let mut found = Vec::new();
+    match fs::read_dir(&paths.run) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry =
+                    entry.map_err(io_error("reading the directory of the private roots"))?;
+                found.push(format!(
+                    "a private root {}",
+                    entry.file_name().to_string_lossy()
+                ));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(io_error("reading the directory of the private roots")(
+                error,
+            ));
+        }
+    }
+    if paths.journal.exists() {
+        let unfinished = super::journal::replay(&paths.journal, "")
+            .map_err(|error| Error::Failed(format!("reading the journal: {error}")))?;
+        for invocation in unfinished {
+            let project = invocation
+                .rows
+                .iter()
+                .find_map(|row| match row {
+                    Row::Begin { tree_path, .. } => Some(tree_path.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "a project that is not named".to_owned());
+            found.push(format!(
+                "the invocation {} on {project} ({:?})",
+                invocation.id, invocation.standing
+            ));
+        }
+    }
+    if found.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Refused(format!(
+            "unfinished work is recorded, so nothing was changed: {}",
+            found.join("; ")
         )))
     }
 }
