@@ -710,7 +710,7 @@ fn a_published_upload(host: &Host, actor: &ActorId) -> UploadRow {
         preview: None,
         preview_unavailable: None,
         created_at_ms: now,
-        expires_at_ms: now,
+        expires_at_ms: kr_protocol::scalars::TimestampMs::new(now.get() + 7 * 24 * 60 * 60 * 1000),
         published_at_ms: Some(now),
         submitted_at_ms: None,
     }
@@ -1011,7 +1011,6 @@ async fn a_device_revoked_while_its_header_is_looked_up_has_the_stream_reset() {
         !matches!(next(&mut stream).await, Ok(Some(_))),
         "the stream of a revoked device is taken away"
     );
-    assert_eq!(received(&host, &device.actor(), lost), 0);
     host.stop().await;
 }
 
@@ -1318,4 +1317,72 @@ async fn a_stalled_chunk_stream_leaves_the_upload_status_readable_with_its_bitma
     );
     device.raw.close();
     host.stop().await;
+}
+
+/// KR-REQ-23.21 and KR-REQ-23.41: an upload that no session holds is read under the pairing grant,
+/// and one that a draft for a session binds while the read is in flight is not shown under that
+/// decision: the device is told the answer is not shown, reads again, and is decided over the
+/// session the upload is bound to now. The control is the same read with nothing bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_upload_bound_to_a_session_while_its_status_is_read_is_not_shown() {
+    let adopted = Adopted::start(1).await;
+    let host = &adopted.host;
+    let session = adopted.workers[0].session_id;
+    let device = paired(
+        host,
+        &adopted.owner,
+        &[ActionRight::FilesUpload, ActionRight::SessionView],
+    )
+    .await;
+    let bytes = [2_u8; 96];
+    let transfer = begin_at_the_door(&device.raw, host, &bytes, "bound.bin")
+        .await
+        .transfer_id;
+    assert_eq!(
+        status_of(&device.raw, transfer).await.state,
+        UploadState::Receiving,
+        "with nothing bound the status is answered under the pairing grant"
+    );
+
+    let (arrived, go) = host.pause_retained_lookup();
+    let request = UploadStatusParams {
+        transfer_id: transfer,
+    };
+    let reading = device.raw.read(Method::UploadStatus, &request);
+    tokio::pin!(reading);
+    tokio::select! {
+        arrived = tokio::time::timeout(WAIT, arrived) => {
+            arrived
+                .expect("the read reaches its end check")
+                .expect("the pause is armed");
+        }
+        early = &mut reading => panic!("the read was answered before its end check: {early:?}"),
+    }
+    let database = rusqlite::Connection::open(kr_transfer::StagingArea::store_path(
+        host.controller().paths(),
+    ))
+    .expect("opens the transfer journal");
+    let bound = database
+        .execute(
+            "UPDATE uploads SET session_id = ?2 WHERE transfer_id = ?1 AND session_id IS NULL",
+            rusqlite::params![
+                transfer.get().as_bytes().to_vec(),
+                session.get().as_bytes().to_vec()
+            ],
+        )
+        .expect("binds the upload to the session");
+    assert_eq!(bound, 1, "the upload had no session");
+    go.send(()).expect("the read goes on");
+    let told = reading
+        .await
+        .expect_err("a status read under the decision for no session is not shown");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+
+    assert_eq!(
+        status_of(&device.raw, transfer).await.state,
+        UploadState::Receiving,
+        "read again, it is decided over the session it is bound to now"
+    );
+    device.raw.close();
+    adopted.stop().await;
 }

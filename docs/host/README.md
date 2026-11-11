@@ -3343,7 +3343,10 @@ owner cannot change the bound.
 
 The transfer service performs a device's uploads under the device's own principal, which the host
 derives from the device's identity. A device sees and ends only its own uploads: another principal's
-upload, an unknown one and an expired one all get the same answer, that the transfer is unknown. An
+upload and an unknown one get the same answer, that the transfer is unknown. A device's own upload
+that has expired is still its own: `upload.status` reports its state as expired, and a chunk or a
+finish for it is refused for that state. Only the header of a chunk stream treats an expired upload
+as unknown. An
 `upload.begin` that labels the upload with another device's identity is refused `PERMISSION_DENIED`;
 the label is this device's or none. The answer to `upload.begin` shows the device the bytes its own
 principal has staged, this reservation included, and a retained copy of the answer shows the same.
@@ -3372,16 +3375,18 @@ An exact repeat of `upload.finish` or `upload.cancel` on a replacement connectio
 it was first sent in, is settled by what the action's claim says. An open claim is finished and
 nothing else is begun. A settled claim gives back the answer it was settled with, under the check
 any recorded answer is owed. An action with no claim is a first admission, which has no window on
-this connection, and it is refused `PERMISSION_DENIED` for its window. A finish whose answer was lost
+this connection, and it is refused `PERMISSION_DENIED` for its window, or `OUTCOME_UNKNOWN` when the
+host holds a route for the action, because a copy of it may have been carried out. A finish whose answer was lost
 is also read through `upload.status`, which returns the published state and the handle on any
 connection. A device that may not read the session's receipts is told `OUTCOME_UNKNOWN` for the
 answer of its own first finish or cancel of a session's upload, and reads `upload.status` to learn
 the outcome.
 
-A chunk is not settled on a replacement connection. Its exact repeat there carries the window of the
-connection that was lost, and the host refuses it for that window. The refusal is `OUTCOME_UNKNOWN`
-when the host has claimed the action, because a copy may have been carried out, and nothing is
-staged by the repeat. The device reads `upload.status`, which shows the chunks that are staged, and
+A chunk is not settled on a replacement connection. A chunk that was committed is answered from its
+record there, as any recorded answer is. An exact repeat of one with no record carries the window of
+the connection that was lost, and the host refuses it for that window. The refusal is
+`OUTCOME_UNKNOWN` when the host has claimed the action, because a copy may have been carried out,
+and nothing is staged by the repeat. The device reads `upload.status`, which shows the chunks that are staged, and
 sends the others as new actions. A chunk that the service refused at its own ask, because its stream
 was replaced, left no record: its exact repeat on the same connection is a first attempt and is
 staged.
