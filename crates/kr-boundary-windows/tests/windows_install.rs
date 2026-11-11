@@ -2160,8 +2160,12 @@ fn an_answer_of_a_later_cycle_is_never_accepted_and_no_proof_is_asked_near_the_e
     stop.set();
     server.join().unwrap();
     assert!(refused.contains("deadline"), "{refused}");
+    // The bound is the installation's deadline, counted from the cycle's beginning; the wait ends at
+    // it, and the read that sees the deadline takes a few milliseconds more. The late answer comes
+    // a second after the deadline, so a margin of half a second tells a wait that ended at the
+    // deadline from one that ended at the answer.
     assert!(
-        elapsed < bound,
+        elapsed < bound + Duration::from_millis(500),
         "the wait ended at the installation's deadline, not at the late answer: {elapsed:?}"
     );
     assert_eq!(asked.load(Ordering::SeqCst), 2);
