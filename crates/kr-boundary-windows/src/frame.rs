@@ -3,17 +3,26 @@
 //!
 //! A frame is a four-byte little-endian length and that many bytes of JSON. The length is checked
 //! against [`MAX_FRAME`] before any byte of the body is read or allocated, so a client cannot make
-//! the broker hold more than one frame's limit. The first frame of every connection says which
-//! version of this protocol the client speaks; a broker and a host update apart, so a version the
-//! broker does not speak is refused with the instruction to repair.
+//! the broker hold more than one frame's limit. The one request that carries a list of paths and a
+//! message, [`OperateRequest`], has a limit of its own, [`MAX_OPERATE_FRAME`], which
+//! [`read_request`] applies to it and to no other request. The first frame of every connection says
+//! which version of this protocol the client speaks; a broker and a host update apart, so a version
+//! the broker does not speak is refused with the instruction to repair.
 //!
-//! A message names no process, token, program or handle. The broker takes the caller's identity
-//! from the pipe, never from the message.
+//! A message names no process, token, program, variable, configuration option or handle, and a
+//! field the protocol does not name is a parse error. The broker takes the caller's identity from
+//! the pipe, never from the message.
+//!
+//! The frames of an invocation ([`InvocationRequest`] and [`InvocationReply`]) are bounded field by
+//! field as well: each has a `check` that the readers call, and the writers refuse to send what it
+//! refuses.
 
 use std::io::{self, Read, Write};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+pub mod invocation;
 
 /// The version of this protocol.
 pub const VERSION: u32 = 1;
@@ -33,9 +42,49 @@ pub enum FrameError {
     /// The frame's body is not a message of this protocol.
     #[error("the message is not one this protocol carries: {0}")]
     Malformed(String),
+    /// A field of the message is outside its bounds.
+    #[error("{0}")]
+    Field(#[from] FieldError),
     /// The connection failed.
     #[error("the connection failed: {0}")]
     Io(#[from] io::Error),
+}
+
+/// A field of a message that is outside its bounds.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum FieldError {
+    /// A text is longer than its limit.
+    #[error("the {field} is {got} long and the limit is {max}")]
+    TooLong {
+        /// Which field.
+        field: &'static str,
+        /// The limit.
+        max: usize,
+        /// The length it has.
+        got: usize,
+    },
+    /// A list has more items than its limit.
+    #[error("there are {got} {field} and the limit is {max}")]
+    TooMany {
+        /// Which field.
+        field: &'static str,
+        /// The limit.
+        max: usize,
+        /// The count it has.
+        got: usize,
+    },
+    /// A text holds a character that its field may not hold, or is empty where it may not be.
+    #[error("the {field} is not in the form this protocol carries")]
+    Form {
+        /// Which field.
+        field: &'static str,
+    },
+    /// A text that a person reads holds a character that is not printable ASCII.
+    #[error("the {field} is not printable text")]
+    NotPrintable {
+        /// Which field.
+        field: &'static str,
+    },
 }
 
 /// Writes one message as a frame.
@@ -45,18 +94,7 @@ pub enum FrameError {
 /// Returns [`FrameError::TooLong`] for a message over the limit and [`FrameError::Io`] when the
 /// connection fails.
 pub fn write<W: Write, T: Serialize>(writer: &mut W, message: &T) -> Result<(), FrameError> {
-    let body =
-        serde_json::to_vec(message).map_err(|error| FrameError::Malformed(error.to_string()))?;
-    if body.len() > MAX_FRAME {
-        return Err(FrameError::TooLong(body.len()));
-    }
-    let length = u32::try_from(body.len()).map_err(|_| FrameError::TooLong(body.len()))?;
-    let mut frame = Vec::with_capacity(4 + body.len());
-    frame.extend_from_slice(&length.to_le_bytes());
-    frame.extend_from_slice(&body);
-    writer.write_all(&frame)?;
-    writer.flush()?;
-    Ok(())
+    write_within(writer, message, MAX_FRAME)
 }
 
 /// Reads one frame and the message in it.
@@ -68,6 +106,30 @@ pub fn write<W: Write, T: Serialize>(writer: &mut W, message: &T) -> Result<(), 
 /// [`FrameError::Malformed`] for a body that is not a message, and [`FrameError::Io`] for a
 /// connection that failed or ended inside a frame.
 pub fn read<R: Read, T: DeserializeOwned>(reader: &mut R) -> Result<T, FrameError> {
+    let body = read_body(reader, MAX_FRAME)?;
+    serde_json::from_slice(&body).map_err(|error| FrameError::Malformed(error.to_string()))
+}
+
+fn write_within<W: Write, T: Serialize>(
+    writer: &mut W,
+    message: &T,
+    limit: usize,
+) -> Result<(), FrameError> {
+    let body =
+        serde_json::to_vec(message).map_err(|error| FrameError::Malformed(error.to_string()))?;
+    if body.len() > limit {
+        return Err(FrameError::TooLong(body.len()));
+    }
+    let length = u32::try_from(body.len()).map_err(|_| FrameError::TooLong(body.len()))?;
+    let mut frame = Vec::with_capacity(4 + body.len());
+    frame.extend_from_slice(&length.to_le_bytes());
+    frame.extend_from_slice(&body);
+    writer.write_all(&frame)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn read_body<R: Read>(reader: &mut R, limit: usize) -> Result<Vec<u8>, FrameError> {
     let mut length = [0_u8; 4];
     let mut got = 0;
     while got < length.len() {
@@ -80,12 +142,12 @@ pub fn read<R: Read, T: DeserializeOwned>(reader: &mut R) -> Result<T, FrameErro
         }
     }
     let length = u32::from_le_bytes(length) as usize;
-    if length > MAX_FRAME {
+    if length > limit {
         return Err(FrameError::TooLong(length));
     }
     let mut body = vec![0_u8; length];
     reader.read_exact(&mut body)?;
-    serde_json::from_slice(&body).map_err(|error| FrameError::Malformed(error.to_string()))
+    Ok(body)
 }
 
 /// Which boundary account an operation runs as.
