@@ -14,6 +14,10 @@ use kr_protocol::ids::ActorId;
 use super::output::{FrameSink, RemoteOutput, Written};
 use super::write_boundary::authority_for;
 
+/// What a case waits at most for a write to end. A host that does what the case says ends it at
+/// once: the bound only turns a write that would wait for good into a failure.
+const WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// A stream whose peer does not read: a write on it waits until the stream is revoked, and what
 /// it holds of a frame never reaches the peer.
 #[derive(Debug)]
@@ -149,10 +153,14 @@ async fn a_data_stream_write_stops_with_the_connection_and_a_revoked_stream_leav
 
     let (control, control_sink, data, data_sink) = boundaries(&controller);
     let frame = frame();
-    let (written, ()) = tokio::join!(data.write(&frame, &[], None), async {
-        data_sink.waited().await;
-        control.withdraw();
-    });
+    let (written, ()) = tokio::time::timeout(WAIT, async {
+        tokio::join!(data.write(&frame, &[], None), async {
+            data_sink.waited().await;
+            control.withdraw();
+        })
+    })
+    .await
+    .expect("the write on the data stream ended");
     assert_eq!(
         written,
         Written::Withdrawn,
@@ -166,10 +174,14 @@ async fn a_data_stream_write_stops_with_the_connection_and_a_revoked_stream_leav
     assert_eq!(*control_sink.written.lock().unwrap(), 0);
 
     let (control, control_sink, data, data_sink) = boundaries(&controller);
-    let (written, ()) = tokio::join!(data.write(&frame, &[], None), async {
-        data_sink.waited().await;
-        data_sink.revoke();
-    });
+    let (written, ()) = tokio::time::timeout(WAIT, async {
+        tokio::join!(data.write(&frame, &[], None), async {
+            data_sink.waited().await;
+            data_sink.revoke();
+        })
+    })
+    .await
+    .expect("the write on the data stream ended");
     assert_eq!(
         written,
         Written::Withdrawn,
