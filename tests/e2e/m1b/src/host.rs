@@ -1361,6 +1361,14 @@ mod shutdown_tests {
             root
         ));
         assert!(names_the_root("/tmp/kr-a --x", root));
+        assert!(names_the_root(
+            "codex resume --remote unix:///tmp/kr-a/s/gw.sock",
+            root
+        ));
+        assert!(!names_the_root(
+            "codex resume --remote unix:///tmp/kr-a-other/s/gw.sock",
+            root
+        ));
         assert!(!names_the_root(
             "/tmp/kr-a-other/b/kr-worker --session 1",
             root
