@@ -20,7 +20,8 @@ use kr_e2e_m1b::ceremony;
 use kr_e2e_m1b::device::{Device, PairedHost, Remote};
 use kr_e2e_m1b::host::{Host, document};
 use kr_e2e_m1b::run::{
-    RootPin, Run, describe, ended_within, link_below, output_within, process_table, signal,
+    PlacedDirectory, RootPin, Run, describe, ended_within, link_below, output_within,
+    process_table, signal,
 };
 use kr_e2e_m1b::shells::ManagedShell;
 use kr_e2e_m1b::window::{Window, answered};
@@ -560,11 +561,12 @@ impl ProgramStamp {
 
 /// The agent's program as the run placed it, recorded before the agent first starts: the installation
 /// the link `agent/current` names, the links in `agent/runtime`, the file the installed build's
-/// `bin/<command>` resolves to with each directory above it, and that file's stamp and digest. The
-/// agent runs in the same account and may leave another link, file or directory on the route its
-/// command is found by, so [`PlacedProgram::checked`] compares what is there now with this before
-/// each start, and the program is started by the absolute path of the file that was recorded, not by
-/// a name on a search path.
+/// `bin/<command>` resolves to with each directory above it, that file's stamp and digest, and the
+/// directory it is started in. The agent runs in the same account and may leave another link, file
+/// or directory on the route its command is found by, or in place of the directory it is started
+/// in, so [`PlacedProgram::checked`] compares what is there now with this before each start, and
+/// the program is started by the absolute path of the file that was recorded, not by a name on a
+/// search path, in the directory that was recorded and no other ([`PlacedProgram::command`]).
 #[derive(Clone, Debug)]
 pub struct PlacedProgram {
     command: String,
@@ -576,11 +578,14 @@ pub struct PlacedProgram {
     directories: Vec<(PathBuf, (u64, u64))>,
     stamp: ProgramStamp,
     digest: [u8; 32],
+    /// The directory a probe of the build is started in.
+    work: PlacedDirectory,
 }
 
 impl PlacedProgram {
     /// Records the program the installed build at `prefix` gives for `command`, the file it pins
-    /// (`pinned`, relative to the prefix), and the links [`Installation::link`] makes for `runtime`.
+    /// (`pinned`, relative to the prefix), the links [`Installation::link`] makes for `runtime`, and
+    /// the directory `work` that a start is made in.
     ///
     /// # Errors
     ///
@@ -590,6 +595,7 @@ impl PlacedProgram {
         runtime: &[PathBuf],
         command: &str,
         pinned: &str,
+        work: PlacedDirectory,
     ) -> Result<Self, String> {
         let program = std::fs::canonicalize(prefix.join("bin").join(command)).map_err(|error| {
             format!("`{command}` is not a command of the installed build: {error}")
@@ -623,6 +629,7 @@ impl PlacedProgram {
             directories,
             stamp: ProgramStamp::of(&metadata),
             digest,
+            work,
         })
     }
 
@@ -703,14 +710,17 @@ impl PlacedProgram {
     }
 
     /// A command that runs the program, with the name it is typed as as its first word, once the
-    /// route is checked ([`PlacedProgram::checked`]).
+    /// route is checked ([`PlacedProgram::checked`]), in the directory that was recorded: reached
+    /// by the walk from the pin with no link followed, compared on the same handle, and named by the
+    /// place that handle has now ([`PlacedDirectory::place_for_a_start`]).
     ///
     /// # Errors
     ///
-    /// Returns why the route is not as it was placed.
+    /// Returns why the route or the directory is not as it was placed.
     pub fn command(&self, root: &Path, pin: &RootPin) -> Result<Command, String> {
         let mut command = Command::new(self.checked(root, pin)?);
         std::os::unix::process::CommandExt::arg0(&mut command, &self.command);
+        command.current_dir(self.work.place_for_a_start(root, pin)?);
         Ok(command)
     }
 }
@@ -2029,10 +2039,17 @@ mod tests {
         let current = root.join("agent/current");
         std::os::unix::fs::symlink(&one, &current).expect("the link");
         std::os::unix::fs::symlink(&runtime, root.join("agent/runtime/node")).expect("a runtime");
+        std::fs::create_dir(root.join("w")).expect("the working directory");
         let pin = RootPin::of(&root).expect("a pin");
-        let placed =
-            PlacedProgram::record(&one, std::slice::from_ref(&runtime), "codex", "bin/codex")
-                .expect("recorded");
+        let work = PlacedDirectory::record(&root, &pin, Path::new("w")).expect("the directory");
+        let placed = PlacedProgram::record(
+            &one,
+            std::slice::from_ref(&runtime),
+            "codex",
+            "bin/codex",
+            work,
+        )
+        .expect("recorded");
         let marks = || std::fs::read_to_string(&mark).unwrap_or_default();
         let ran = |placed: &PlacedProgram| -> Result<(), String> {
             let mut command = placed.command(&root, &pin)?;
@@ -2109,6 +2126,81 @@ mod tests {
             marks(),
             "one\none\none\none\n",
             "only the placed program ever ran"
+        );
+        std::fs::remove_dir_all(&base).expect("clean up");
+    }
+
+    /// The agent's program is started in the directory that was placed, reached by the walk from the
+    /// pin with no link followed and compared on the same handle: a link left in place of the
+    /// directory (the directory itself moved aside), another directory made in its place, and no
+    /// directory at all are each a class, and the program, which writes the directory it started in
+    /// to a file when it runs, never starts outside; the placed directory, run first and again once
+    /// it is back, is the one it starts in.
+    #[test]
+    fn a_working_directory_that_is_not_the_one_placed_is_refused_and_nothing_starts_outside() {
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .expect("the temporary directory")
+            .join(format!("kr-work-{}", kr_ipc::new_uuid()));
+        let root = base.join("run");
+        std::fs::create_dir_all(root.join("agent/runtime")).expect("the run's installation");
+        std::fs::create_dir(root.join("w")).expect("the working directory");
+        let outside = base.join("outside");
+        std::fs::create_dir(&outside).expect("a directory outside the run");
+        let mark = base.join("mark");
+        let prefix = base.join("build");
+        std::fs::create_dir_all(prefix.join("bin")).expect("an installation");
+        let program = prefix.join("bin/codex");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\npwd -P >> '{}'\n", mark.display()),
+        )
+        .expect("a program");
+        std::fs::set_permissions(
+            &program,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("executable");
+        std::os::unix::fs::symlink(&prefix, root.join("agent/current")).expect("the link");
+        let pin = RootPin::of(&root).expect("a pin");
+        let work = PlacedDirectory::record(&root, &pin, Path::new("w")).expect("the directory");
+        let placed =
+            PlacedProgram::record(&prefix, &[], "codex", "bin/codex", work).expect("recorded");
+        let started_in = || std::fs::read_to_string(&mark).unwrap_or_default();
+        let ran = || -> Result<(), String> {
+            let status = placed
+                .command(&root, &pin)?
+                .status()
+                .map_err(|error| error.to_string())?;
+            assert!(status.success());
+            Ok(())
+        };
+        ran().expect("the placed directory is started in");
+        assert_eq!(started_in(), format!("{}\n", root.join("w").display()));
+        // The directory moved aside and a link to a directory outside left in its place.
+        std::fs::rename(root.join("w"), root.join("w2")).expect("the directory moves");
+        std::os::unix::fs::symlink(&outside, root.join("w")).expect("a link in its place");
+        let said = ran().expect_err("a link in place of the directory is not started in");
+        assert!(said.contains("symbolic link"), "{said}");
+        std::fs::remove_file(root.join("w")).expect("the link goes");
+        // No directory at the place at all.
+        let said = ran().expect_err("no directory is not started in");
+        assert!(said.contains("not there"), "{said}");
+        // Another directory made in its place.
+        std::fs::create_dir(root.join("w")).expect("another directory");
+        let said = ran().expect_err("another directory is not started in");
+        assert!(said.contains("another directory"), "{said}");
+        std::fs::remove_dir(root.join("w")).expect("the other directory goes");
+        std::fs::rename(root.join("w2"), root.join("w")).expect("the directory is back");
+        ran().expect("the placed directory is as it was");
+        assert_eq!(
+            started_in(),
+            format!("{0}\n{0}\n", root.join("w").display()),
+            "only the placed directory was ever started in"
+        );
+        assert_eq!(
+            std::fs::read_dir(&outside).expect("the outside").count(),
+            0,
+            "nothing was made outside"
         );
         std::fs::remove_dir_all(&base).expect("clean up");
     }

@@ -110,7 +110,7 @@ use kr_e2e_agents::stage::{
 use kr_e2e_agents::stub::RequestStub;
 use kr_e2e_m1b::device::{Device, PairedHost, Remote, RequestError};
 use kr_e2e_m1b::host::{Host, HostOptions, Preparation};
-use kr_e2e_m1b::run::Run;
+use kr_e2e_m1b::run::{PlacedDirectory, Run, binary_place};
 use kr_e2e_m1b::window::{Window, answered};
 use kr_e2e_m1b::{LIVENESS, ceremony, shells};
 use kr_ipc::paths::EnvironmentPaths;
@@ -516,8 +516,7 @@ impl Real {
                 variables
                     .iter()
                     .map(|(name, value)| (name.as_str(), value.as_str())),
-            )
-            .current_dir(run.work());
+            );
         // The probe runs in a process group that is ended whole before its output is returned, so
         // that nothing it started outlives it with the environment it was given, when the run's
         // directory is searched for the keys.
@@ -637,6 +636,9 @@ impl Real {
     }
 }
 
+/// Where the stand-in agent is placed in the run, below its directory.
+const STAND_IN_PLACE: &str = "t/codex";
+
 /// Everything a case needs besides its host.
 struct Context {
     runtime: tokio::runtime::Runtime,
@@ -673,12 +675,18 @@ impl Context {
     fn place(&mut self) {
         let run = &self.run;
         run.place_built("kr-hook", &run.binary("kr-hook"), &["--version"]);
+        // The launcher the worker gives the shell is run by every typed launch.
+        run.note_placed(&binary_place("kr-hook"))
+            .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
         let (executable, bin) = match &self.route {
             Route::StandIn => {
                 let tools = run.root().join("t");
                 kr_ipc::paths::create_private_tree(run.root(), &tools)
                     .expect("a directory for the programs");
                 run.place_built("codex-stand-in", &tools.join("codex"), &["--version"]);
+                // The shell finds the stand-in by its name on a search path, as it finds the build.
+                run.note_placed(Path::new(STAND_IN_PLACE))
+                    .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
                 (tools.join("codex"), tools)
             }
             Route::Real(real) => {
@@ -701,6 +709,8 @@ impl Context {
                     &real.build.runtime,
                     &real.build.command,
                     &real.build.pinned,
+                    PlacedDirectory::record(run.root(), run.pin(), Path::new("w"))
+                        .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}")),
                 )
                 .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
                 if real.build.launch == build::Launch::Native {
@@ -718,6 +728,24 @@ impl Context {
         };
         self.executable = executable;
         self.bin = bin;
+    }
+
+    /// Fails the case unless each executable the run placed that a typed launch runs is still the
+    /// file that was placed, right before the launch is typed: the launcher the worker gives the
+    /// shell, and, on the stand-in route, the stand-in the shell finds by name. The agent that an
+    /// earlier start ran may have replaced either by a link or another file, and the shell would run
+    /// it with the session's variables. The real route's own program is checked by
+    /// [`Real::checks_the_route`].
+    fn checks_the_placed_files(&self) {
+        let mut files = vec![binary_place("kr-hook")];
+        if matches!(self.route, Route::StandIn) {
+            files.push(PathBuf::from(STAND_IN_PLACE));
+        }
+        for file in files {
+            self.run
+                .placed_as_it_was(&file)
+                .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+        }
     }
 
     /// The distribution and version the generation lists the executable as.
@@ -1177,16 +1205,11 @@ impl Person {
     }
 
     /// Types `line`, which runs through the integration, and waits until the screen shows
-    /// `needle`. A line the shell ran as typed before the worker answered (its bound for the answer
-    /// is one second) is typed again on a cleared screen; a launcher that refused the launch fails
-    /// the case at once.
-    fn types_until_it_shows(&self, line: &str, needle: &str, why: &str) -> Vec<String> {
-        self.types_until_it_shows_checked(line, needle, why, &|| {})
-    }
-
-    /// [`Person::types_until_it_shows`], with `before_typing` called right before each time the line
-    /// is typed: each is a start of the agent, and a line that ran as typed is typed again.
-    fn types_until_it_shows_checked(
+    /// `needle`, with `before_typing` called right before each time the line is typed: each is a
+    /// start of the agent. A line the shell ran as typed before the worker answered (its bound for
+    /// the answer is one second) is typed again on a cleared screen; a launcher that refused the
+    /// launch fails the case at once.
+    fn types_until_it_shows(
         &self,
         line: &str,
         needle: &str,
@@ -1196,6 +1219,9 @@ impl Person {
         let started = Instant::now();
         let mut typed = 0_usize;
         loop {
+            // Before the screen is cleared, which waits for a shell that an agent still running holds,
+            // and again right before the typing.
+            before_typing();
             self.clears_the_screen();
             before_typing();
             self.types(line);
@@ -1695,6 +1721,7 @@ impl<'a> Session<'a> {
                     "codex",
                     ASKED,
                     "the terminal reaches the server through the gateway",
+                    &|| self.ctx.checks_the_placed_files(),
                 );
             }
             Route::Real(real) => {
@@ -1715,11 +1742,14 @@ impl<'a> Session<'a> {
                 }
                 // The shell finds the agent by its name on a search path that starts in the run, which
                 // an earlier start may have changed: the route is checked before each typing.
-                let _ = self.person.types_until_it_shows_checked(
+                let _ = self.person.types_until_it_shows(
                     &real.typed(extra),
                     &real.account.composer,
                     "the agent reaches its composer",
-                    &|| real.checks_the_route(&self.ctx.run),
+                    &|| {
+                        self.ctx.checks_the_placed_files();
+                        real.checks_the_route(&self.ctx.run);
+                    },
                 );
             }
         }
@@ -2876,6 +2906,118 @@ fn gateway_an_agent_that_rewrote_the_hosts_state_is_not_obeyed_when_the_host_sto
 #[test]
 fn gateway_an_agent_that_rewrote_the_hosts_state_is_not_obeyed_when_the_host_is_dropped() {
     an_agent_leaves_another_host_and_the_host_ends(Ending::Drop);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The files a typed launch runs.
+// ---------------------------------------------------------------------------------------------
+
+/// A stand-in agent that, once it has started, replaces the file the run placed at `replaced` by a
+/// link to a program of the case's own that leaves a mark when it runs; the host is then asked to
+/// start the agent again, as a line typed again is. Returns the text the second start ended in, and
+/// whether the case's program ever ran. The first start is the control: it went through the same
+/// check over the files as they were placed.
+fn an_agent_replaces_a_placed_file_and_is_started_again(replaced: &str) -> (String, bool) {
+    if std::env::var_os(BUILD_VARIABLE).is_some_and(|value| !value.is_empty()) {
+        // The stand-in is the agent here; a real agent is never asked to replace the run's files.
+        return (String::new(), false);
+    }
+    let shell = match shells::managed_zsh() {
+        Ok(shell) => shell,
+        Err(why) if shells::required() => panic!("the managed shell: {why}"),
+        Err(why) => {
+            eprintln!("skipping: {why}");
+            return (String::new(), false);
+        }
+    };
+    let scratch = std::fs::canonicalize(std::env::temp_dir())
+        .expect("the temporary directory")
+        .join(format!("kr-replaced-{}", kr_ipc::new_uuid()));
+    std::fs::create_dir_all(&scratch).expect("a directory for the case's programs");
+    let mark = scratch.join("mark");
+    let program = scratch.join("program.sh");
+    std::fs::write(
+        &program,
+        format!("#!/bin/sh\necho ran >> '{}'\n", mark.display()),
+    )
+    .expect("the program the link names");
+    let mut ctx = Context::new(
+        shell,
+        Route::StandIn,
+        Run::start("gateway-replaces"),
+        runtime(),
+    );
+    ctx.place();
+    let leave = scratch.join("leave.sh");
+    let place = ctx.run.root().join(replaced);
+    std::fs::write(
+        &leave,
+        format!(
+            "#!/bin/sh\n/bin/rm -f '{}'\n/bin/ln -s '{}' '{}'\n",
+            place.display(),
+            program.display(),
+            place.display()
+        ),
+    )
+    .expect("the program the stand-in runs");
+    for file in [&program, &leave] {
+        std::fs::set_permissions(file, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("executable");
+    }
+    let session = Session::open(&ctx, "answer-when-released,keep-reading,stay,leave-a-host");
+    session
+        .person
+        .types(&format!("export KR_STAND_IN_LEAVE={}", leave.display()));
+    let first = session.starts_the_agent(&[], None, &[]);
+    assert!(
+        std::fs::symlink_metadata(&place)
+            .expect("the link the stand-in made")
+            .file_type()
+            .is_symlink(),
+        "the stand-in replaced {replaced} by a link"
+    );
+    let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        session.starts_the_agent(&[], Some(first), &[])
+    }));
+    let said = match second {
+        Ok(_) => "the second start went through".to_owned(),
+        Err(panic) => panic_text(&*panic),
+    };
+    let ran = mark.exists();
+    ctx.close(&session.host);
+    drop(session);
+    std::fs::remove_dir_all(&scratch).expect("the case's programs go");
+    (said, ran)
+}
+
+/// A launcher the agent replaced by a link, after its first start, is not run by the next start:
+/// the start is refused before the line is typed.
+#[test]
+fn gateway_a_launcher_the_agent_replaced_is_not_run_by_the_next_start() {
+    let (said, ran) = an_agent_replaces_a_placed_file_and_is_started_again("b/kr-hook");
+    if said.is_empty() {
+        return;
+    }
+    assert!(
+        said.contains(ISOLATION_UNPROVEN) && said.contains("symbolic link"),
+        "the next start was refused as a replaced file: {said}"
+    );
+    assert!(!ran, "the program the replaced launcher names ran");
+}
+
+/// The stand-in the shell finds by name, replaced by a link after the first start, is not run by the
+/// next start either.
+#[test]
+fn gateway_a_stand_in_the_agent_replaced_is_not_run_by_the_next_start() {
+    let (said, ran) = an_agent_replaces_a_placed_file_and_is_started_again("t/codex");
+    if said.is_empty() {
+        return;
+    }
+    assert!(
+        said.contains(ISOLATION_UNPROVEN) && said.contains("symbolic link"),
+        "the next start was refused as a replaced file: {said}"
+    );
+    assert!(!ran, "the program the replaced stand-in names ran");
 }
 
 // ---------------------------------------------------------------------------------------------
