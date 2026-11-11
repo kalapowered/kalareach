@@ -14,7 +14,7 @@
 
 use std::fs::{self, File};
 use std::io::{self, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -281,15 +281,68 @@ fn create(path: &Path, only_new: bool) -> io::Result<File> {
 /// have made before (the file's stem, a random name and `.new`) and is made new, so that the
 /// record the broker reads by path is never one that was there before it was written.
 fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    replace_through(path, &replacement_name(path), bytes)
+}
+
+/// The name a file's replacement is written under: the file's stem, 32 random hexadecimal digits
+/// and `.new`, beside the file.
+fn replacement_name(path: &Path) -> PathBuf {
     let stem = path
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let staging = path.with_file_name(format!("{stem}-{}.new", uuid::Uuid::new_v4().simple()));
+    path.with_file_name(format!("{stem}-{}.new", uuid::Uuid::new_v4().simple()))
+}
+
+/// Writes the bytes to the replacement, which must not exist, and renames it over the file.
+fn replace_through(path: &Path, staging: &Path, bytes: &[u8]) -> io::Result<()> {
     {
-        let mut file: File = create(&staging, true)?;
+        let mut file: File = create(staging, true)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
-    fs::rename(&staging, path)
+    fs::rename(staging, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_replacement_has_a_random_name_of_its_own_every_time() {
+        let path = Path::new("data").join("manifest.json");
+        let first = replacement_name(&path);
+        let second = replacement_name(&path);
+        assert_ne!(first, second, "no fixed name");
+        assert_eq!(first.parent(), path.parent(), "beside the file");
+        let name = first.file_name().unwrap().to_string_lossy().into_owned();
+        let digits = name
+            .strip_prefix("manifest-")
+            .and_then(|rest| rest.strip_suffix(".new"))
+            .unwrap_or_default();
+        assert!(
+            digits.len() == 32
+                && digits
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "{name}"
+        );
+    }
+
+    #[test]
+    fn a_replacement_is_never_written_over_a_name_that_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        fs::write(&path, b"the record").unwrap();
+        let taken = dir.path().join("manifest-taken.new");
+        fs::write(&taken, b"another program's file").unwrap();
+        let refused = replace_through(&path, &taken, b"the new record").unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::AlreadyExists, "{refused}");
+        assert_eq!(fs::read(&taken).unwrap(), b"another program's file");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"the record",
+            "the record is as it was"
+        );
+    }
 }
