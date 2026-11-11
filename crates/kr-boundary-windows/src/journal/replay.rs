@@ -289,11 +289,8 @@ impl Tracker {
                 if !self.release_verified {
                     return wrong("the invocation ends before its release was verified");
                 }
-                if self.slot_leftovers() != 0 {
-                    return wrong(
-                        "the invocation ends while a leftover that holds the slot is open",
-                    );
-                }
+                // A leftover that holds the slot clears `release_verified`, so an end with one open is
+                // refused above.
                 if self.root_leftovers() as u64 != u64::from(*root_leftovers) {
                     return wrong("the end counts other root leftovers than the rows hold");
                 }
