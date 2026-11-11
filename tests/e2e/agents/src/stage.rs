@@ -535,34 +535,10 @@ impl Installation {
 /// The largest program [`PlacedProgram`] reads whole.
 const PROGRAM_AT_MOST: u64 = 1 << 30;
 
-/// What the system keeps of a program file, by which one that was written to, replaced or linked is
-/// told from the one that was placed: where it is, how long it is, when its bytes and its record
-/// changed.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ProgramStamp {
-    device: u64,
-    inode: u64,
-    size: u64,
-    modified: (i64, i64),
-    changed: (i64, i64),
-}
-
-impl ProgramStamp {
-    fn of(metadata: &std::fs::Metadata) -> Self {
-        Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            size: metadata.size(),
-            modified: (metadata.mtime(), metadata.mtime_nsec()),
-            changed: (metadata.ctime(), metadata.ctime_nsec()),
-        }
-    }
-}
-
 /// The agent's program as the run placed it, recorded before the agent first starts: the installation
 /// the link `agent/current` names, the links in `agent/runtime`, the file the installed build's
-/// `bin/<command>` resolves to with each directory above it, that file's stamp and digest, and the
-/// directory it is started in. The agent runs in the same account and may leave another link, file
+/// `bin/<command>` resolves to with each directory above it, that file's digest, and the directory it
+/// is started in. The agent runs in the same account and may leave another link, file
 /// or directory on the route its command is found by, or in place of the directory it is started
 /// in, so [`PlacedProgram::checked`] compares what is there now with this before each start, and
 /// the program is started by the absolute path of the file that was recorded, not by a name on a
@@ -576,7 +552,6 @@ pub struct PlacedProgram {
     /// The file the entry pins, as the system resolved it when the program was recorded.
     pinned: Option<PathBuf>,
     directories: Vec<(PathBuf, (u64, u64))>,
-    stamp: ProgramStamp,
     digest: [u8; 32],
     /// The directory a probe of the build is started in.
     work: PlacedDirectory,
@@ -627,7 +602,6 @@ impl PlacedProgram {
             program,
             pinned: std::fs::canonicalize(prefix.join(pinned)).ok(),
             directories,
-            stamp: ProgramStamp::of(&metadata),
             digest,
             work,
         })
@@ -658,7 +632,7 @@ impl PlacedProgram {
     /// path of the program: the link `agent/current` below the run's directory `root`, which `pin`
     /// names, read with no link followed, names the recorded installation; each link in
     /// `agent/runtime` is as it was; the installed build's command resolves to the recorded file
-    /// through the recorded directories; and the file has the stamp it had, or else the bytes.
+    /// through the recorded directories; and the bytes of the file, read now, are the digest recorded.
     ///
     /// # Errors
     ///
@@ -701,9 +675,7 @@ impl PlacedProgram {
         let file = std::fs::File::open(&self.program)
             .map_err(|error| said(&format!("the program cannot be opened: {error}")))?;
         let metadata = file.metadata().map_err(|error| said(&error.to_string()))?;
-        if ProgramStamp::of(&metadata) != self.stamp
-            && Self::digest_of(file, &metadata).map_err(|why| said(&why))? != self.digest
-        {
+        if Self::digest_of(file, &metadata).map_err(|why| said(&why))? != self.digest {
             return Err(said("its bytes differ"));
         }
         Ok(&self.program)
