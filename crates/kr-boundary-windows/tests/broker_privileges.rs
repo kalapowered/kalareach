@@ -15,7 +15,10 @@ mod common;
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::process::Command;
 use std::ptr::{null, null_mut};
+use std::sync::Arc;
+use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, GENERIC_READ, HANDLE, LUID};
 use windows_sys::Win32::Security::{
@@ -29,7 +32,12 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken,
 };
 
+use kr_boundary_windows::frame::{self, Request, Response};
+use kr_boundary_windows::manifest::Manifest;
+use kr_boundary_windows::win::broker::{self, Slots};
 use kr_boundary_windows::win::ffi::{Handle, wide, wide_path};
+use kr_boundary_windows::win::install::Paths;
+use kr_boundary_windows::win::pipe::{self, Connection, Stop};
 use kr_boundary_windows::win::privilege::{self, PrivGuard, Privilege};
 use kr_boundary_windows::win::root::{create_root, remove_root};
 
@@ -247,14 +255,17 @@ fn a_walk_that_fails_or_panics_leaves_its_thread_without_the_token() {
 
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
-fn a_revert_that_fails_poisons_the_thread_and_stops_the_service() {
+fn a_revert_that_fails_poisons_the_thread_and_asks_for_the_end_of_the_process() {
+    privilege::testing::stand_in_for_the_process_end();
     std::thread::spawn(|| {
         assert!(!privilege::revert_failed());
+        assert!(!privilege::testing::exit_was_asked());
         privilege::testing::fail_next_revert();
         drop(privilege::enter().unwrap());
+        assert!(privilege::revert_failed());
         assert!(
-            privilege::revert_failed(),
-            "the service is told to stop accepting requests"
+            privilege::testing::exit_was_asked(),
+            "a failed give-back asks for the end of the process at once"
         );
         assert!(
             privilege::enter().is_err(),
@@ -265,6 +276,186 @@ fn a_revert_that_fails_poisons_the_thread_and_stops_the_service() {
     })
     .join()
     .unwrap();
+}
+
+/// The name of the case the next test runs in a process of its own, and the variable that tells that
+/// process to run it.
+const CHILD_CASE: &str = "the_child_that_fails_a_revert";
+const CHILD_VARIABLE: &str = "KR_FAIL_A_REVERT_IN_THIS_PROCESS";
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_failed_revert_ends_the_process_with_the_fail_closed_exit_code_by_return_and_by_panic() {
+    for how in ["return", "panic"] {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", CHILD_CASE, "--ignored", "--nocapture"])
+            .env(CHILD_VARIABLE, how)
+            .status()
+            .expect("the case's own program starts");
+        assert_eq!(
+            status.code(),
+            Some(i32::try_from(privilege::FAIL_CLOSED_EXIT).unwrap()),
+            "a failed revert by {how} ended the process with the fail-closed code"
+        );
+    }
+}
+
+/// The program the case above starts: it gives a privilege back on purpose in a way that fails. It
+/// returns at once when it is not that program, and it exits with 0, which the parent refuses, if
+/// the process was not ended.
+#[test]
+#[ignore = "runs only as the program of the case above"]
+fn the_child_that_fails_a_revert() {
+    let Ok(how) = std::env::var(CHILD_VARIABLE) else {
+        return;
+    };
+    privilege::testing::fail_next_revert();
+    if how == "panic" {
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = privilege::enter().unwrap();
+            panic!("a forced panic");
+        }));
+    } else {
+        drop(privilege::enter().unwrap());
+    }
+    std::process::exit(0);
+}
+
+/// The broker's own loop on its own pipe in this process, as the service runs it.
+struct Served {
+    stop: Arc<Stop>,
+    thread: Option<std::thread::JoinHandle<Result<(), String>>>,
+}
+
+impl Served {
+    fn start() -> Served {
+        let stop = Stop::new().unwrap();
+        let thread = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                broker::testing::serve(Manifest::begin(), Paths::system(), &[], stop)
+            })
+        };
+        Served {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// A connection that has said hello and been answered: the pipe exists once this returns.
+    fn connect(&self) -> Connection {
+        let mut tries = 0;
+        let mut connection = loop {
+            match pipe::connect(std::process::id()) {
+                Ok(connection) => break connection,
+                Err(error) => {
+                    tries += 1;
+                    assert!(tries < 600, "the pipe could not be opened: {error}");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+        frame::write(
+            &mut connection,
+            &Request::Hello {
+                version: frame::VERSION,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            frame::read::<_, Response>(&mut connection),
+            Ok(Response::Hello { .. })
+        ));
+        connection
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        self.stop.set();
+        self.thread.take().unwrap().join().unwrap()
+    }
+}
+
+fn status(connection: &mut Connection) -> Option<Response> {
+    frame::write(connection, &Request::Status {}).ok()?;
+    frame::read::<_, Response>(connection).ok()
+}
+
+/// An administrator connection stays open while a thread fails to give a privilege back: the open
+/// connection is not served again, and no new one is.
+fn nothing_is_served_after(failure: fn()) {
+    privilege::testing::stand_in_for_the_process_end();
+    let served = Served::start();
+    let mut open = served.connect();
+    assert!(
+        matches!(status(&mut open), Some(Response::Status { .. })),
+        "the open connection is served before the failure"
+    );
+    std::thread::spawn(failure).join().unwrap();
+    assert!(privilege::revert_failed());
+    assert!(privilege::testing::exit_was_asked());
+    assert!(
+        status(&mut open).is_none(),
+        "the open connection is not served again"
+    );
+    // A connection that arrives later wakes the loop, which takes none and ends.
+    let mut late = pipe::connect(std::process::id()).expect("the pipe is still there");
+    let _ = frame::write(
+        &mut late,
+        &Request::Hello {
+            version: frame::VERSION,
+        },
+    );
+    assert!(
+        frame::read::<_, Response>(&mut late).is_err(),
+        "a new connection is not served"
+    );
+    let ended = served.finish();
+    privilege::testing::clear();
+    assert!(
+        ended.is_err(),
+        "the service's loop ends with an error and does not run on: {ended:?}"
+    );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn after_a_failed_revert_by_return_the_service_serves_nothing_more() {
+    nothing_is_served_after(|| {
+        privilege::testing::fail_next_revert();
+        drop(privilege::enter().unwrap());
+    });
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn after_a_failed_revert_by_panic_the_service_serves_nothing_more() {
+    nothing_is_served_after(|| {
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            privilege::testing::fail_next_revert();
+            let _guard = privilege::enter().unwrap();
+            panic!("a forced panic");
+        }));
+    });
+}
+
+#[test]
+fn a_slot_is_given_back_when_its_thread_returns_or_panics() {
+    let slots = Slots::new(2);
+    let first = slots.take().unwrap();
+    let second = slots.take().unwrap();
+    assert!(slots.take().is_none(), "no third slot while two are in use");
+    drop(first);
+    assert_eq!(slots.in_use(), 1);
+    let third = slots.take().expect("a returned slot is free again");
+    let panicked = std::thread::spawn(move || {
+        let _slot = third;
+        panic!("a forced panic");
+    })
+    .join();
+    assert!(panicked.is_err());
+    assert_eq!(slots.in_use(), 1, "the panicking thread gave its slot back");
+    drop(second);
+    assert_eq!(slots.in_use(), 0);
 }
 
 #[test]
@@ -342,6 +533,22 @@ fn root_with_hostile_objects(
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_least_set_of_privileges_that_removes_a_root_of_hostile_objects_is_backup_and_restore() {
+    // The service's token holds its privileges and has none of them enabled, and holds no further
+    // power that would remove a hostile object by itself: a token that has any of them enabled is
+    // not the service's form, and the case would show nothing.
+    for name in [
+        "SeBackupPrivilege",
+        "SeRestorePrivilege",
+        "SeTakeOwnershipPrivilege",
+        "SeSecurityPrivilege",
+        "SeDebugPrivilege",
+    ] {
+        assert_ne!(
+            process_state(name),
+            Some(true),
+            "{name} is not enabled on the process token the case runs under"
+        );
+    }
     let mut table = Vec::new();
     for (name, subset) in subsets() {
         let scratch = Scratch::new();
@@ -375,10 +582,13 @@ fn the_least_set_of_privileges_that_removes_a_root_of_hostile_objects_is_backup_
         works("[Backup, Restore]"),
         "backup and restore remove every hostile object"
     );
-    assert!(
-        !works("[]"),
-        "with no privilege a hostile object stays, so the privileges are needed"
-    );
+    // Every smaller subset of the pair fails, so neither privilege is spare.
+    for smaller in ["[]", "[Backup]", "[Restore]"] {
+        assert!(
+            !works(smaller),
+            "with {smaller} a hostile object stays, so both privileges are needed"
+        );
+    }
     let sufficient: Vec<&str> = table
         .iter()
         .filter(|(_, _, gone)| *gone)
