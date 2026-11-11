@@ -42,7 +42,8 @@ use kr_shell_integration::contract::requests::{
 
 use shellpkg::{
     CaseOutcome, CaseSetup, DriveObservation, Package, QualificationCase, Session, StackIndex,
-    StackLock, cases, corpus_root, record_outcomes, repository_root, settle, unsupported,
+    StackLock, cases, corpus_root, in_each_locale, record_outcomes, repository_root, settle,
+    unsupported,
 };
 
 /// Every check a case may claim. A name outside this set is a corpus that says something this
@@ -443,6 +444,34 @@ fn jobs() -> usize {
     }
 }
 
+/// Drives a case under a byte locale and under a UTF-8 locale, each named in the log, and says what
+/// the reader reported from it.
+///
+/// The editor draws differently in the two (Readline moves over unchanged characters with a
+/// control sequence in a multibyte locale), and a customisation's own bindings draw through the
+/// editor, so a check that waits for what a binding drew is made in both. What the reader reports
+/// is the package's own and does not depend on how the editor draws, so a case that narrows it
+/// differently under the second locale is a difference this run reports.
+///
+/// # Panics
+///
+/// Panics, naming the locale, when the case does not hold under one of them, or when the two runs
+/// report different exclusions.
+fn run_case_in_each_locale(case: &QualificationCase, package: &Package) -> Vec<DetachExclusion> {
+    let mut narrowed: Option<Vec<DetachExclusion>> = None;
+    in_each_locale(case.shell, &case.id, || {
+        let reported = run_case(case, package);
+        match &narrowed {
+            None => narrowed = Some(reported),
+            Some(first) => assert_eq!(
+                first, &reported,
+                "the reader reported other exclusions than under the byte locale"
+            ),
+        }
+    });
+    narrowed.expect("the byte locale is a run of every case")
+}
+
 /// What one case of the corpus came to.
 struct Qualified {
     outcome: CaseOutcome,
@@ -509,7 +538,9 @@ fn qualify(case: &QualificationCase, index: &StackIndex) -> Qualified {
     outcome.stack_versions = versions;
     outcome.checks = case.checks.clone();
     let mut failure = None;
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_case(case, &package))) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_case_in_each_locale(case, &package)
+    })) {
         Ok(narrowed) => outcome.verdict = qualified(&narrowed),
         Err(reason) => {
             let message = reason
@@ -3328,6 +3359,15 @@ fn the_packages_built_here_were_built_from_the_registers_pins() {
 #[test]
 #[ignore = "needs this tree's built Zsh package and a second build of it; it runs with --include-ignored where both are built, as continuous integration's shell-packages job and scripts/e2e-fence.sh do"]
 fn a_live_session_keeps_the_package_it_started_with() {
+    in_each_locale(
+        ShellKind::Zsh,
+        "a_live_session_keeps_the_package_it_started_with",
+        a_live_session_keeps_the_package_it_started_with_in_this_locale,
+    );
+}
+
+/// The body of [`a_live_session_keeps_the_package_it_started_with`], for the locale it is run in.
+fn a_live_session_keeps_the_package_it_started_with_in_this_locale() {
     let installed = Package::built(ShellKind::Zsh);
     let case = cases()
         .into_iter()

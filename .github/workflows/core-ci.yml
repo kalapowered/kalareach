@@ -1770,10 +1770,13 @@ jobs:
       # Section 7 qualifies the packages against the startup customisations people run, which the
       # step above fetched. The checks that need a package or a customisation are left out of an
       # ordinary run, and this job has both, so it runs them with --include-ignored, where a package
-      # or a customisation that is missing fails.
+      # or a customisation that is missing fails. Each case runs under a byte locale and under a
+      # UTF-8 locale, and a runner that lists no UTF-8 locale fails it instead of running the first
+      # alone.
       - name: Qualify the packages against the startup customisations
         env:
           KR_TEST_ARTIFACTS_DIR: /tmp/kr-shell-qualification
+          KR_REQUIRE_UTF8_LOCALE: "1"
         run: |
           # An installation a person updates holds two builds. The identity is a digest of the
           # build's inputs, so a flag that reaches the compiler makes a second package rather than
