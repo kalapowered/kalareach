@@ -409,6 +409,35 @@ pub struct KeyScan {
     /// The root of a run's scan is not the directory the run made.
     #[serde(skip)]
     pub root_changed: bool,
+    /// How many entries the scan has looked at, and what it reads at most.
+    #[serde(skip)]
+    entries: usize,
+    #[serde(skip)]
+    limits: ScanLimits,
+}
+
+/// The most bytes of one file that the key scan reads: a file above it is told as not scanned.
+const SCAN_FILE_AT_MOST: u64 = 1 << 30;
+
+/// The most entries that the key scan lists and looks at, in all: it stops there and says so.
+const SCAN_ENTRIES_AT_MOST: usize = 1_000_000;
+
+/// What a key scan reads at most.
+#[derive(Clone, Copy, Debug)]
+struct ScanLimits {
+    /// The most bytes of one file.
+    file: u64,
+    /// The most entries listed and looked at, in all.
+    entries: usize,
+}
+
+impl Default for ScanLimits {
+    fn default() -> Self {
+        Self {
+            file: SCAN_FILE_AT_MOST,
+            entries: SCAN_ENTRIES_AT_MOST,
+        }
+    }
 }
 
 impl KeyScan {
@@ -604,12 +633,23 @@ fn scan_directory(
                 return;
             }
         };
+        let room = scan.limits.entries.saturating_sub(scan.entries);
         let mut names = Vec::new();
         for entry in listing {
             match entry {
                 Ok(entry) => {
                     let name = entry.file_name();
                     if name.to_bytes() != b"." && name.to_bytes() != b".." {
+                        // A directory that lists more than the scan has room for is not listed
+                        // further, and the scan stops.
+                        if names.len() >= room {
+                            scan.entries = scan.limits.entries.saturating_add(1);
+                            scan.unread.push(format!(
+                                "{relative}: {}",
+                                not_scanned("more entries than the scan reads")
+                            ));
+                            return;
+                        }
                         names.push(name.to_owned());
                     }
                 }
@@ -619,6 +659,17 @@ fn scan_directory(
         names
     };
     for name in names {
+        scan.entries = scan.entries.saturating_add(1);
+        if scan.entries > scan.limits.entries {
+            // Told once, by the entry that went past the bound; the entries after it only stop.
+            if scan.entries == scan.limits.entries.saturating_add(1) {
+                scan.unread.push(format!(
+                    "{relative}: {}",
+                    not_scanned("more entries than the scan reads")
+                ));
+            }
+            return;
+        }
         let shown = place(&name.to_string_lossy());
         let looked = match rustix::fs::statat(directory, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
         {
@@ -748,10 +799,29 @@ fn scan_file(
         ));
         return;
     }
+    // The size comes from the handle that will be read, and no more than the bound is read
+    // through it: a file above it, sparse or not, is not read into memory.
+    let too_large = || {
+        format!(
+            "{shown}: {}",
+            not_scanned("it is larger than the scan reads")
+        )
+    };
+    if u64::try_from(opened.st_size).map_or(true, |size| size > scan.limits.file) {
+        scan.unread.push(too_large());
+        return;
+    }
     let mut file = std::fs::File::from(handle);
     let mut bytes = Vec::new();
-    if let Err(error) = file.read_to_end(&mut bytes) {
+    if let Err(error) =
+        Read::take(&mut file, scan.limits.file.saturating_add(1)).read_to_end(&mut bytes)
+    {
         scan.unread.push(format!("{shown}: {error}"));
+        return;
+    }
+    // A file that grew past the bound since its size was read is not searched.
+    if u64::try_from(bytes.len()).map_or(true, |read| read > scan.limits.file) {
+        scan.unread.push(too_large());
         return;
     }
     if holds(&bytes) {
@@ -851,6 +921,16 @@ fn scan_root(
 /// with more than one name, a root that is a link or is not the directory the run made, and a link
 /// the harness did not make.
 fn scan_files(root: &Path, values: &[&[u8]], rules: Option<&RunRules>) -> KeyScan {
+    scan_files_within(root, values, rules, ScanLimits::default())
+}
+
+/// [`scan_files`] within `limits`.
+fn scan_files_within(
+    root: &Path,
+    values: &[&[u8]],
+    rules: Option<&RunRules>,
+    limits: ScanLimits,
+) -> KeyScan {
     assert!(
         values.iter().all(|value| value.len() >= 8),
         "a key shorter than eight bytes cannot be searched for"
@@ -860,7 +940,10 @@ fn scan_files(root: &Path, values: &[&[u8]], rules: Option<&RunRules>) -> KeySca
     let finders: Vec<memchr::memmem::Finder<'_>> =
         values.iter().map(memchr::memmem::Finder::new).collect();
     let holds = |bytes: &[u8]| finders.iter().any(|finder| finder.find(bytes).is_some());
-    let mut scan = KeyScan::default();
+    let mut scan = KeyScan {
+        limits,
+        ..KeyScan::default()
+    };
     scan_root(root, rules, &holds, &mut scan);
     scan.held_by
         .sort_by(|left, right| left.path.cmp(&right.path));
@@ -2142,6 +2225,67 @@ mod tests {
             left.is_empty(),
             "a failed write leaves no temporary file: {left:?}"
         );
+    }
+
+    /// A file above the scan's bound is told as unread and none of it is read into memory, and a
+    /// scan stops at its count of entries and says so; the files within the bounds are searched.
+    #[test]
+    fn a_file_above_the_scans_bound_is_unread_and_a_scan_stops_at_its_count_of_entries() {
+        let scratch = Scratch::new("scan-bounds");
+        let run = scratch.0.join("run");
+        std::fs::create_dir_all(run.join("a")).expect("a run");
+        let key = b"the-key-value-0123456789";
+        std::fs::write(run.join("a/holds-it"), key).expect("a file that holds the key");
+        // A sparse file far over the bound, with a bound of one kilobyte.
+        let sparse = std::fs::File::create(run.join("a/sparse")).expect("a file");
+        sparse.set_len(256 << 20).expect("a sparse file");
+        let limits = ScanLimits {
+            file: 1 << 10,
+            entries: 100,
+        };
+        let scan = scan_files_within(&run, &[key], Some(&rules_for(&run, &[])), limits);
+        assert!(!scan.complete());
+        assert!(
+            scan.unread
+                .iter()
+                .any(|entry| entry.starts_with("a/sparse:")
+                    && entry.contains("not scanned: it is larger than the scan reads")),
+            "{:?}",
+            scan.unread
+        );
+        assert_eq!(
+            scan.held_by
+                .iter()
+                .map(|holder| holder.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a/holds-it"],
+            "the file within the bound was searched"
+        );
+        // More entries than the scan walks, in one directory and below it: it stops at the count,
+        // says so once, and goes on to nothing after it.
+        std::fs::remove_file(run.join("a/sparse")).expect("removed");
+        for index in 0..8 {
+            std::fs::write(run.join(format!("a/more-{index}")), b"nothing to find")
+                .expect("a file");
+        }
+        let few = ScanLimits {
+            file: 1 << 10,
+            entries: 4,
+        };
+        let scan = scan_files_within(&run, &[key], Some(&rules_for(&run, &[])), few);
+        assert!(!scan.complete());
+        assert_eq!(
+            scan.unread
+                .iter()
+                .filter(|entry| entry.contains("more entries than the scan reads"))
+                .count(),
+            1,
+            "{:?}",
+            scan.unread
+        );
+        // Within the bounds the same tree is searched whole.
+        let whole = scan_files_within(&run, &[key], Some(&rules_for(&run, &[])), limits);
+        assert!(whole.complete(), "{:?}", whole.unread);
     }
 
     /// The scan of a run's directory reads through handles and refuses what it must not read: a
