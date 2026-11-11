@@ -65,6 +65,8 @@
 # KR_PAIRING_SHOTS is where the screenshots go (default /tmp/kr-pair-phone); KR_PAIRING_GRPC_PORT is the
 # port of the Android emulator's controller (default 8754), which must be free: the camera is moved
 # through it, so a port that already answers would move another emulator's.
+# KR_IOS_PACKAGES names an absolute folder that the iOS test build keeps the Swift packages in, so
+# that builds share one copy instead of fetching one each (see scripts/lib/xcode.sh).
 #
 # The phone's logs are searched for every form of an invitation's text and secret. The folders this run
 # writes into (the output folder and the screenshots) are for the account that runs it alone, made before
@@ -86,6 +88,8 @@ esac
 
 # shellcheck source=scripts/lib/android-avd.sh
 . "$here/scripts/lib/android-avd.sh"
+# shellcheck source=scripts/lib/xcode.sh
+. "$here/scripts/lib/xcode.sh"
 
 artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/pairing-device-$platform"
 shots="${KR_PAIRING_SHOTS:-/tmp/kr-pair-phone}"
@@ -498,9 +502,10 @@ run_ios() {
 
     say "building the tests that drive it"
     local derived="$cache/ios-tests"
+    kr_shared_packages || return 2
     ( cd "$companion/src-tauri/gen/apple" && xcodebuild build-for-testing -project companion-tauri.xcodeproj \
         -scheme KalaReachUITests -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
-        -derivedDataPath "$derived" ) >"$artefacts/build-tests.log" 2>&1 \
+        -derivedDataPath "$derived" ${kr_package_options[@]+"${kr_package_options[@]}"} ) >"$artefacts/build-tests.log" 2>&1 \
         || { tail -20 "$artefacts/build-tests.log"; say "the tests did not build"; return 2; }
     local plan
     plan="$(ls "$derived"/Build/Products/*.xctestrun 2>/dev/null | head -1)"

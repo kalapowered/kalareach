@@ -6,6 +6,30 @@
 # (`/Applications/Xcode_<version>.app`, as a hosted runner has them) or is the one selected, by its
 # own version and build number. The default Xcode of a hosted runner is older than the Swift the
 # application's tests need, so the newest one builds them.
+#
+# `kr_shared_packages` sets the array `kr_package_options` to the xcodebuild options that put the
+# Swift packages in one folder that every build shares, when KR_IOS_PACKAGES names one, and to
+# nothing otherwise. A build fetches 1.3 GB of packages into a tree of its own unless it is given
+# a folder. The folder has to be an absolute path. A build that is given it uses the package
+# versions the project's `Package.resolved` records, so the shared folder never moves a pin. Only
+# the build and the tools it starts, which are children of the terminal, read the folder.
+
+kr_shared_packages() {
+    kr_package_options=()
+    if [ -z "${KR_IOS_PACKAGES:-}" ]; then
+        return 0
+    fi
+    case "$KR_IOS_PACKAGES" in
+        /*) ;;
+        *)
+            echo "KR_IOS_PACKAGES has to name an absolute path, and holds $KR_IOS_PACKAGES" >&2
+            return 2
+            ;;
+    esac
+    mkdir -p "$KR_IOS_PACKAGES" || return 2
+    # shellcheck disable=SC2034 # read by the scripts that source this file
+    kr_package_options=(-clonedSourcePackagesDirPath "$KR_IOS_PACKAGES" -onlyUsePackageVersionsFromResolvedFile)
+}
 
 kr_select_xcode() {
     local newest

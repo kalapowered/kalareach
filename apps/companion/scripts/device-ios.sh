@@ -36,6 +36,9 @@
 # And, optional: KR_TARGET=simulator to run everything on a simulator instead of the phone,
 # KR_WORK (products and the record of a session, on the internal disk), KR_RAW (the raw output of a
 # run, which is deleted when the session ends) and KR_SHOTS (the application's pictures).
+# KR_IOS_PACKAGES names an absolute folder that the test build keeps the Swift packages in, so that
+# builds share one copy instead of fetching one each; the build then uses the package versions that
+# Package.resolved records.
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -509,12 +512,20 @@ build_app() {
 build_tests() {
   mkdir -p "$work"
   write_local_xcconfig no
-  local derived="$work/tests-$target" unsigned=()
+  local derived="$work/tests-$target" unsigned=() packages=()
   # A device build is made with signing off and signed by hand afterwards.
   [ "$target" = device ] && unsigned=(CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO)
+  if [ -n "${KR_IOS_PACKAGES:-}" ]; then
+    case "$KR_IOS_PACKAGES" in
+      /*) ;;
+      *) die "KR_IOS_PACKAGES has to name an absolute path, and holds $KR_IOS_PACKAGES" ;;
+    esac
+    mkdir -p "$KR_IOS_PACKAGES" || die "the folder of the Swift packages could not be made: $KR_IOS_PACKAGES"
+    packages=(-clonedSourcePackagesDirPath "$KR_IOS_PACKAGES" -onlyUsePackageVersionsFromResolvedFile)
+  fi
   ( cd "$apple" && xcodebuild build-for-testing -project companion-tauri.xcodeproj -scheme "$tests_scheme" -sdk "$(sdk)" \
       -destination "generic/platform=$([ "$target" = device ] && echo iOS || echo 'iOS Simulator')" -derivedDataPath "$derived" \
-      ${unsigned[@]+"${unsigned[@]}"} ) \
+      ${unsigned[@]+"${unsigned[@]}"} ${packages[@]+"${packages[@]}"} ) \
     > "$work/build-tests-$target.log" 2>&1 || { tail -20 "$work/build-tests-$target.log"; die "the test build failed"; }
   local plan products="$derived/Build/Products"
   plan=$(ls "$products"/*.xctestrun 2>/dev/null | head -1)

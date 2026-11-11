@@ -40,6 +40,8 @@
 #
 # KR_PUSH_ANDROID_APK and KR_PUSH_IOS_APP name a build to install instead of making one.
 # KR_PUSH_SHOTS is where the screenshots go (default /tmp/kr-push-phone).
+# KR_IOS_PACKAGES names an absolute folder that the iOS test build keeps the Swift packages in, so
+# that builds share one copy instead of fetching one each (see scripts/lib/xcode.sh).
 #
 # Exit codes: 0 every check passed, 2 bad usage or a failed check, 3 the device is not available.
 set -uo pipefail
@@ -57,6 +59,8 @@ web="${KR_WEB_TREE:-}"
 
 # shellcheck source=scripts/lib/android-avd.sh
 . "$here/scripts/lib/android-avd.sh"
+# shellcheck source=scripts/lib/xcode.sh
+. "$here/scripts/lib/xcode.sh"
 
 artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/push-device-$platform"
 shots="${KR_PUSH_SHOTS:-/tmp/kr-push-phone}"
@@ -961,9 +965,10 @@ run_ios() {
 
     say "building the tests that drive it"
     local derived="$cache/ios-tests"
+    kr_shared_packages || return 2
     ( cd "$companion/src-tauri/gen/apple" && xcodebuild build-for-testing -project companion-tauri.xcodeproj \
         -scheme KalaReachUITests -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
-        -derivedDataPath "$derived" ) >"$artefacts/build-tests.log" 2>&1 \
+        -derivedDataPath "$derived" ${kr_package_options[@]+"${kr_package_options[@]}"} ) >"$artefacts/build-tests.log" 2>&1 \
         || { tail -20 "$artefacts/build-tests.log"; say "the tests did not build"; return 2; }
     local plan
     plan="$(ls "$derived"/Build/Products/*.xctestrun 2>/dev/null | head -1)"
