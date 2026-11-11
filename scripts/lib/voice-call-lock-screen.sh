@@ -2,7 +2,8 @@
 # shellcheck disable=SC2154  # the variables below are the calling script's, as the header says
 # The lock-screen leg of `scripts/e2e-voice-call-device.sh android lock-screen`.
 #
-# Sourced by that script. While the application holds a call, this locks the emulator's screen and
+# Sourced by that script. While the application holds a call, this first presses the microphone
+# control on the call's own screen and reads what the screen says, then locks the emulator's screen and
 # reads the lock screen the way a person and the system do: the system's own record of the call's
 # notification (`dumpsys notification`), the keyguard's state, the notification's controls on the
 # lock screen itself (`uiautomator`, which reads the system's screens), and a still of it. It then
@@ -175,10 +176,111 @@ lock_stop_through_the_shade() {
     lock_press "$dump" Stop
 }
 
+# Waits up to `$1` seconds for the call's own screen, read afresh into `$3`, to say all of `$2`:
+# words separated by a bar, each of which must be on the screen.
+screen_says() { # <seconds> <words, separated by |> <dump>
+    local seconds=$1 words=$2 dump=$3 waited=0 word ok
+    while :; do
+        lock_dump "$dump"
+        ok=1
+        while IFS= read -r word; do
+            python3 -I "$here/scripts/lib/ui-node.py" has "$dump" "$word" || ok=0
+        done < <(printf '%s\n' "$words" | tr '|' '\n')
+        [ "$ok" = 1 ] && return 0
+        [ "$waited" -lt "$seconds" ] || return 1
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
+
+# The call's own screen, before anything locks: the page the person sees while the call runs. It
+# says the microphone is on and offers to mute it; pressing that mutes the call, and the screen then
+# says the microphone is muted (not that none is available) and offers to unmute it; pressing that
+# opens the microphone again. Each press is a tap where the control is, read from the screen.
+screen_leg() {
+    local dump="$artefacts/lock-screen/screen.xml" found="" ok
+    lock_still 0-screen-before
+    # The call's own screen is under Sessions, behind "Talk to your host"; a screen that is opened
+    # while a call runs finds the call.
+    if screen_says 30 "Sessions" "$dump"; then lock_press "$dump" Sessions; fi
+    if screen_says 30 "Talk to your host" "$dump"; then lock_press "$dump" "Talk to your host"; fi
+    if screen_says 40 "Microphone on|Mute microphone" "$dump"; then ok=1; found="the screen says the microphone is on and offers to mute it"; else ok=0; found="the screen did not say so"; fi
+    lock_still 0-screen-on
+    lock_check "the call's own screen says the microphone is on and offers to mute it" "$ok" "$found"
+    [ "$ok" = 1 ] || return 0
+
+    if lock_press "$dump" "Mute microphone"; then
+        if screen_says 20 "Microphone muted|Unmute microphone" "$dump" && ! python3 -I "$here/scripts/lib/ui-node.py" has "$dump" "No microphone available"; then
+            ok=1; found="after Mute microphone the screen says the microphone is muted and offers to unmute it"
+        else
+            ok=0; found="after Mute microphone the screen does not say the microphone is muted, or says no microphone is available"
+        fi
+    else
+        ok=0; found="the Mute microphone control could not be pressed"
+    fi
+    lock_still 0-screen-muted
+    lock_check "the call's own screen says the microphone is muted and offers to unmute it" "$ok" "$found"
+    [ "$ok" = 1 ] || return 0
+
+    if lock_press "$dump" "Unmute microphone"; then
+        if screen_says 20 "Microphone on|Mute microphone" "$dump"; then
+            ok=1; found="after Unmute microphone the screen says the microphone is on and offers to mute it"
+        else
+            ok=0; found="after Unmute microphone the screen does not say the microphone is on"
+        fi
+    else
+        ok=0; found="the Unmute microphone control could not be pressed"
+    fi
+    lock_still 0-screen-unmuted
+    lock_check "the call's own screen unmutes the microphone" "$ok" "$found"
+}
+
+# When the notification of the call was last posted, from the system's record of it.
+screen_posted() {
+    lock_record | sed -n 's/.*[[:space:]]when=\([0-9][0-9]*\)\/.*/\1/p' | head -1
+}
+
+# The notification of a running call on an unlocked phone: the person swipes it away in the shade,
+# and it is back while the call runs (Android 14 and later let the person dismiss it, and a locked
+# phone would then show no controls for the call). The swipe is made where the notification's own
+# title is drawn; the system's record must hold a notification posted after the swipe.
+screen_dismiss_leg() {
+    local dump="$artefacts/lock-screen/shade.xml" before after point px py ok=0 found=""
+    before="$(screen_posted)"
+    lock_device shell cmd statusbar expand-notifications
+    sleep 2
+    lock_dump "$dump"
+    lock_still 0-shade-before
+    point="$(python3 -I "$here/scripts/lib/ui-node.py" at "$dump" "Voice call running")"
+    if [ -z "$before" ] || [ -z "$point" ]; then
+        found="the notification was not in the shade (posted: ${before:-none})"
+    else
+        read -r px py <<<"$point"
+        lock_device shell input swipe "$px" "$py" 1060 "$py" 250
+        sleep 1
+        if lock_wait 15 lock_record_has "FOREGROUND_SERVICE"; then
+            after="$(screen_posted)"
+            if [ -n "$after" ] && [ "$after" -gt "$before" ] 2>/dev/null; then
+                ok=1
+                found="the notification was swiped away in the shade and was posted again (posted $before, then $after)"
+            else
+                found="the notification was not posted again after the swipe (posted $before, then ${after:-none})"
+            fi
+        else
+            found="the notification did not come back after the swipe"
+        fi
+    fi
+    lock_device shell cmd statusbar collapse
+    lock_still 0-shade-after
+    lock_check "a notification dismissed in the shade while the call runs is posted again" "$ok" "$found"
+}
+
 # The leg. Returns 0 whatever it finds: what it finds is in its checks.
 lock_screen_leg() {
     mkdir -p "$artefacts/lock-screen"
     : >"$harness/script-checks.txt"
+    screen_leg
+    screen_dismiss_leg
     local before
     before="$(lock_device shell locksettings get-disabled 2>/dev/null | tr -d '\r')"
     printf '%s\n' "${before:-true}" >"$harness/lock-disabled-before"
@@ -316,16 +418,17 @@ detail = line.split("detail=", 1)[-1]
 # Each change is `<state>@<first look at the new state>/<last look at the earlier one>`.
 steps = re.findall(r"(open|muted)@(\d+)/(\d+)", detail)
 order = [word for word, _, _ in steps]
-if order != ["open", "muted", "open"] or not unlock_ns.isdigit():
+# The call's own screen muted and unmuted it first, and then the lock screen did.
+if order != ["open", "muted", "open", "muted", "open"] or not unlock_ns.isdigit():
     print("0 %s" % (detail or "no record"))
 else:
     # The microphone reopened after the last look that still saw it muted. If that look was made at or
     # after the credential was submitted, the reopen came after it: no look, however late, can place it
     # earlier.
     unlocked = int(unlock_ns) // 1_000_000
-    last_muted_look = int(steps[2][2])
+    last_muted_look = int(steps[4][2])
     ok = last_muted_look >= unlocked
-    print("%d the microphone was still muted %d ms after the leg submitted the credential and was seen open %d ms after it" % (ok, last_muted_look - unlocked, int(steps[2][1]) - unlocked))
+    print("%d the microphone was still muted %d ms after the leg submitted the credential and was seen open %d ms after it" % (ok, last_muted_look - unlocked, int(steps[4][1]) - unlocked))
 PY
 )"
     lock_check "the microphone stayed muted until the unlock" "${verdict%% *}" "${verdict#* }"

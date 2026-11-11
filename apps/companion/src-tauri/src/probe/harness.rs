@@ -59,9 +59,11 @@ const CONNECT_WITHIN: Duration = Duration::from_secs(60);
 /// How long a started call is given to show as running with its control attached.
 const RUN_WITHIN: Duration = Duration::from_secs(30);
 
-/// How long a call whose connection leads nowhere is given to end: the provider's connection
-/// fails after about half a minute, and native code ends the call when it does.
-const END_WITHIN: Duration = Duration::from_secs(180);
+/// How long a call is given to end: one whose connection leads nowhere fails after about half a
+/// minute and native code ends it then; one the person ends from the phone's own controls waits for
+/// the script that drives the device through its steps there (the call's own screen, then the lock
+/// screen), which take a few minutes.
+const END_WITHIN: Duration = Duration::from_secs(300);
 
 /// How long the voice service is given to be told the call is over, after the call has ended.
 const FINALISED_WITHIN: Duration = Duration::from_secs(30);

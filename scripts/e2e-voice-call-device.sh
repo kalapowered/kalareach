@@ -61,8 +61,10 @@
 # it. A leg that breaks by itself on every attempt fails, and a leg that passed only on a replay ends
 # with exit 4, partial, naming each attempt's failure: a rerun is not a pass.
 #
-# The fourth mode, `lock-screen` (Android only), runs a call against the peer and, while it is up, locks
-# the emulator's screen and reads the lock screen: the notification manager's record of the call's
+# The fourth mode, `lock-screen` (Android only), runs a call against the peer and, while it is up, first
+# reads the call's own screen and presses its microphone control (the screen says the microphone is
+# on and offers to mute it; muted, it says so and offers to unmute it; unmuted, it says it is on
+# again), and then locks the emulator's screen and reads the lock screen: the notification manager's record of the call's
 # notification, the keyguard's state and a still of the screen (under the run's evidence folder). It
 # presses the notification's controls there: Mute acts with no unlock, Unmute asks for the unlock and
 # leaves the call muted until it is given, and Stop ends the call with no unlock. The emulator's
@@ -389,6 +391,10 @@ set_required_checks() {
                 "the call runs with its control attached"
                 "native code holds the call"
                 "the call waits for the lock screen"
+                "the call's own screen says the microphone is on and offers to mute it"
+                "the call's own screen says the microphone is muted and offers to unmute it"
+                "the call's own screen unmutes the microphone"
+                "a notification dismissed in the shade while the call runs is posted again"
                 "the screen is locked"
                 "the call's notification is on the lock screen with Mute and Stop"
                 "the call's notification makes no sound and no vibration"

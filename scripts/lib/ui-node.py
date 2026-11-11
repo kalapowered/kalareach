@@ -3,6 +3,8 @@
 
     ui-node.py center <dump.xml> <label>   prints "<x> <y>" for the centre of the clickable node whose
                                           text or description is exactly <label>, or nothing
+    ui-node.py at <dump.xml> <label>      prints "<x> <y>" for the centre of the node, clickable or not,
+                                          whose text or description is exactly <label>, or nothing
     ui-node.py has <dump.xml> <text>      exits 0 when a node's text or description holds <text>
     ui-node.py ids <dump.xml> <text>      prints the resource id of each node whose text or description
                                           holds <text>
@@ -36,7 +38,7 @@ def centre(node):
 
 
 def main():
-    if len(sys.argv) != 4 or sys.argv[1] not in ("center", "has", "ids"):
+    if len(sys.argv) != 4 or sys.argv[1] not in ("center", "at", "has", "ids"):
         print(__doc__, file=sys.stderr)
         return 2
     verb, path, wanted = sys.argv[1:4]
@@ -49,7 +51,7 @@ def main():
                 print(node.get("resource-id") or "")
         return 0
     for node in every:
-        if node.get("clickable") == "true" and wanted in words(node):
+        if (verb == "at" or node.get("clickable") == "true") and wanted in words(node):
             point = centre(node)
             if point:
                 print("%d %d" % point)
