@@ -2,9 +2,10 @@
 //! fails when any other code can create a process: a second call of the platform's creation
 //! function, any other creation function, or a start through the standard library's `Command`.
 //!
-//! Two files start programs for the setup program, which runs in an administrator's own process and
-//! never in the broker: the installation's PowerShell channel and the installer's two checks. They
-//! are listed here by name and by count, so a new start there fails the case too.
+//! One file starts programs for the setup program, which runs in an administrator's own process and
+//! never in the broker: the one function that builds the command for the installation's PowerShell
+//! channel and for the installer's two checks, each with an emptied environment. It is listed here
+//! by name and by count, so a new start there fails the case too.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -43,7 +44,7 @@ fn no_code_in_the_crate_creates_a_process_but_the_launcher() {
     );
     assert!(files.len() > 20, "the sources were found: {}", files.len());
     // The setup program's own starts, by file name and number.
-    let setup_starts = [("install.rs", 2_usize), ("applocker.rs", 1_usize)];
+    let setup_starts = [("applocker.rs", 1_usize)];
     let mut launcher_calls = 0;
     for path in &files {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
