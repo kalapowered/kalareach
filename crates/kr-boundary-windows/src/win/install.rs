@@ -428,6 +428,7 @@ pub fn check_data_parent(paths: &Paths) -> Result<Option<ffi::Handle>, Error> {
             return Err(parent_refusal(
                 paths,
                 "another program holds it open: with a right to delete or rename it, or without sharing it for reading and writing, and the check needs both so that it can hold the folder against a rename or a delete",
+                ParentCure::Close,
             ));
         }
         Err(failure) => return Err(failure.into()),
@@ -451,25 +452,71 @@ pub fn check_data_parent(paths: &Paths) -> Result<Option<ffi::Handle>, Error> {
     if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
         || tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
     {
-        return Err(parent_refusal(paths, "it is a link or not a folder"));
+        return Err(parent_refusal(
+            paths,
+            "it is a link or not a folder",
+            ParentCure::MoveAside,
+        ));
     }
     if let Some(finding) = acl::changeable_by_others_on(&handle, false)? {
-        return Err(parent_refusal(paths, &finding));
+        // The handle's own owner tells whether the system's class made the folder.
+        let cure = if check_owner(&handle)?.is_some() || another_made_it(&finding) {
+            ParentCure::MoveAside
+        } else {
+            ParentCure::Correct(presence_of(&paths.data))
+        };
+        return Err(parent_refusal(paths, &finding, cure));
     }
     Ok(Some(handle))
 }
 
+/// Whether a path is there, as a lookup shows it: confirmed absent only by an answer of not found.
+/// Any other error leaves it unknown, and nothing that could destroy a record is offered then.
+enum Presence {
+    Present,
+    Absent,
+    Unknown(String),
+}
+
+fn presence_of(path: &Path) -> Presence {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Presence::Present,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Presence::Absent,
+        Err(error) => Presence::Unknown(error.to_string()),
+    }
+}
+
+/// Whether a reason, read from an object's own handle, shows that the installation did not make
+/// the object: another account owns it, or it is a link. Such an object is not corrected into
+/// place, since that would make what another account wrote the installation's own record.
+fn another_made_it(why: &str) -> bool {
+    why.starts_with("it is owned by") || why.starts_with("it is a link")
+}
+
+/// What a refusal of the folder above the data directory is cured by, which its reason decides.
+enum ParentCure {
+    /// Another program holds the folder open: closing that program cures it, and a change of owner
+    /// or list does not.
+    Close,
+    /// The handle shows that the installation did not make the folder (a link, not a folder, or an
+    /// owner that is not the system's class): move it aside, and do not correct it into place.
+    MoveAside,
+    /// The system's class owns it and its list is wrong: correct the list. Whether it holds the
+    /// data directory is known only from a lookup, which decides whether removal is offered.
+    Correct(Presence),
+}
+
 /// The refusal of a folder above the data directory: what the folder is, why it is refused and what
 /// to do.
-fn parent_refusal(paths: &Paths, why: &str) -> Error {
+fn parent_refusal(paths: &Paths, why: &str, cure: ParentCure) -> Error {
     let parent = paths.data_parent();
-    // The folder can hold the manifest, the journals and the private roots only when the data
-    // directory is in it. Then removing it would destroy what they say, and the remedy is to correct
-    // its owner and its list; a folder that holds no data directory has nothing to lose.
-    let remedy = if std::fs::symlink_metadata(&paths.data).is_ok() {
-        "Do not remove it: it holds the data directory, with the manifest, the journals and the private roots of an installation, and removing it would destroy what they say. Correct it instead: give it to the Administrators group or the system, with a protected list that only the system and the Administrators group can change, then run the setup program again."
-    } else {
-        "It holds no data directory, so removing it loses nothing: remove the folder, or give it to the Administrators group or the system with a protected list that only the system and the Administrators group can change, then run the setup program again."
+    let move_aside = "The installation did not make this folder, and it can hold files that another account wrote. Do not correct its content into place unless you know that your own installation wrote it. Move the folder aside (rename it, which keeps everything in it), then run the setup program again: the installation makes the folder new.".to_owned();
+    let remedy = match cure {
+        ParentCure::Close => "Close the program that holds it open, then run the setup program again: a change of its owner or its list does not close a handle. Do not remove it.".to_owned(),
+        ParentCure::MoveAside => move_aside,
+        ParentCure::Correct(Presence::Unknown(error)) => format!("Whether it holds the data directory could not be read ({error}), so removal is not offered: it can hold the manifest, the journals and the private roots of an installation. Correct it instead: give it to the Administrators group or the system, with a protected list that only the system and the Administrators group can change, then run the setup program again."),
+        ParentCure::Correct(Presence::Present) => "Do not remove it: it holds the data directory, with the manifest, the journals and the private roots of an installation, and removing it would destroy what they say. Correct it instead: give it to the Administrators group or the system, with a protected list that only the system and the Administrators group can change, then run the setup program again.".to_owned(),
+        ParentCure::Correct(Presence::Absent) => "It holds no data directory, so removing it loses nothing: remove the folder, or give it to the Administrators group or the system with a protected list that only the system and the Administrators group can change, then run the setup program again.".to_owned(),
     };
     Error::Refused(format!(
         "{} is the folder that holds the boundary's data (its manifest, its journal and the roots of its operations). It is refused because {why}. Whoever owns that folder, or can write or delete in it, could put data of their own in its place while the broker runs as the system. {remedy}",
@@ -608,6 +655,10 @@ fn data_descriptor() -> Result<sd::OwnedSd, Error> {
 /// Nothing the installation recorded is removed.
 const DATA_REMEDY: &str = "Make the Administrators group its owner and leave the system and the Administrators group as the only entries of its list, then run the setup program again. The manifest and the journal stay where they are. A directory that no installation made can be emptied or removed instead.";
 
+/// The words the refusal of a data directory ends with when its handle shows that the installation
+/// did not make it (another account owns it, or it is a link).
+const DATA_NOT_MADE: &str = "The installation did not make this directory, and it can hold files that another account wrote. Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside (rename it, which keeps everything in it), then run the setup program again.";
+
 /// The words the refusal of a data directory that separates names by case ends with.
 const CASE_REMEDY: &str = "Turn the flag off (`fsutil.exe file setCaseSensitiveInfo <the directory> disable`), then run the setup program again. The manifest and the journal stay where they are. A directory that no installation made can be emptied or removed instead.";
 
@@ -618,6 +669,8 @@ const CASE_SENSITIVE_WHY: &str = "it separates names that differ only by case, a
 fn data_refusal(paths: &Paths, why: &str) -> Error {
     let remedy = if why == CASE_SENSITIVE_WHY {
         CASE_REMEDY
+    } else if another_made_it(why) {
+        DATA_NOT_MADE
     } else {
         DATA_REMEDY
     };
@@ -639,9 +692,12 @@ enum Remedy {
     /// Remove the entry: it is not one the installation gives, or it is something a step left
     /// behind that holds nothing the installation records.
     Remove,
-    /// Correct the entry's owner and list: it is a record or a directory of records, and removing
-    /// it would destroy what the manifest and the journal say.
+    /// Correct the entry's owner and list: it is a record or a directory of records of the system's
+    /// own class, and removing it would destroy what the manifest and the journal say.
     Correct,
+    /// Move the entry aside: the handle shows that the installation did not make it (another
+    /// account owns it, or it is a link), so it is neither removed nor corrected into place.
+    MoveAside,
 }
 
 /// Whether the layout gives the name in the directory as a record or a directory of records: the
@@ -670,8 +726,12 @@ fn gives_a_record(paths: &Paths, dir: &Path, name: &OsStr) -> bool {
 fn entry_refusal(paths: &Paths, dir: &Path, name: &OsStr, why: &str) -> Error {
     // With no manifest there is no installation whose records these could be: what is left is
     // content to remove, and a text that says to correct it cannot be done.
-    let has_manifest = std::fs::symlink_metadata(&paths.manifest).is_ok();
-    let remedy = if has_manifest && gives_a_record(paths, dir, name) {
+    // Only a confirmed absence of the manifest makes what is left content to remove; any other
+    // answer of the lookup leaves it unknown, and nothing that could destroy a record is offered.
+    let records = gives_a_record(paths, dir, name);
+    let remedy = if records && another_made_it(why) {
+        Remedy::MoveAside
+    } else if records && !matches!(presence_of(&paths.manifest), Presence::Absent) {
         Remedy::Correct
     } else {
         Remedy::Remove
@@ -684,6 +744,10 @@ fn refusal_with(paths: &Paths, dir: &Path, name: &OsStr, why: &str, remedy: Reme
     let ending = match remedy {
         Remedy::Remove => format!(
             "Remove {}, and nothing else, then run the setup program again: the manifest and the journal stay where they are.",
+            entry.display()
+        ),
+        Remedy::MoveAside => format!(
+            "The installation did not make {}: the reason says so. Do not correct its content into place unless you know that your own installation wrote it, and do not remove it. Move it aside (rename it, which keeps everything in it), then run the setup program again.",
             entry.display()
         ),
         Remedy::Correct => format!(
