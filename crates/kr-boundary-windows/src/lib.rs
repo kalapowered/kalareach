@@ -16,6 +16,7 @@
 //! | [`manifest`] | The record of what the installation laid down, and the record of what was there before |
 //! | [`events`] | What the platform's application-control log says about a program it refused |
 //! | [`frame`] | The broker's pipe protocol: framed messages with limits, and the requests and answers |
+//! | [`journal`] | The framing of the journal's records: a length, the bytes and a checksum, with a torn tail dropped |
 //! | [`state`] | What the doctor says in each state of the installation |
 //!
 //! The calls that touch the machine live in `win`, which builds on Windows only. Everything above
@@ -31,6 +32,7 @@
 
 pub mod events;
 pub mod frame;
+pub mod journal;
 pub mod manifest;
 pub mod notice;
 pub mod policy;
