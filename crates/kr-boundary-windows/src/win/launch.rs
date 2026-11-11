@@ -52,7 +52,7 @@ use windows_sys::Win32::System::Threading::{
 use crate::env::EnvBlock;
 
 use super::ffi::{self, Handle, Sid, last, wide, wide_path};
-use super::job::{Job, Limits};
+use super::job::{Job, Limits, State};
 use super::sd::{OwnedSd, Principals, SdKind, descriptor};
 
 /// How a program that was started ended.
@@ -516,6 +516,13 @@ fn time_of(process: &Handle) -> Result<u64, ffi::Error> {
 /// created, which is how application control's refusal shows. Any other error leaves nothing
 /// started, or a child that was ended.
 pub fn launch(spec: ChildSpec<'_>) -> Result<SuspendedChild, LaunchError> {
+    // A job that has been ended is closed to new children: the platform would still take one.
+    if spec.job.state() == State::Ended {
+        return Err(LaunchError::Job(ffi::error(
+            0,
+            "the job has ended and takes no new process",
+        )));
+    }
     let input = standard(spec.stdin, GENERIC_READ)?;
     let output = standard(spec.stdout, GENERIC_WRITE)?;
     let errors = standard(spec.stderr, GENERIC_WRITE)?;

@@ -229,8 +229,8 @@ impl Job {
     /// its cap allows the list to name.
     pub fn process_ids(&self) -> Result<Vec<u32>> {
         const CAPACITY: usize = 256;
-        // The record is a count pair followed by an array of identifiers.
-        let mut storage = vec![0_usize; 2 + CAPACITY];
+        // The record is two 32-bit counts, which fill one word, then an array of identifiers.
+        let mut storage = vec![0_usize; 1 + CAPACITY];
         // SAFETY: the buffer is aligned for the record and large enough for `CAPACITY` entries.
         let queried = unsafe {
             QueryInformationJobObject(
@@ -253,7 +253,44 @@ impl Job {
                 "the job holds more processes than the list can name",
             ));
         }
-        Ok(storage[2..2 + listed].iter().map(|id| *id as u32).collect())
+        Ok(storage[1..1 + listed].iter().map(|id| *id as u32).collect())
+    }
+
+    /// A handle to the same job that may only query it, for the cases that show a launch whose job
+    /// the platform will not take a process into.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error when the handles cannot be copied.
+    #[cfg(feature = "testing")]
+    pub fn query_only_copy(&self) -> Result<Job> {
+        use windows_sys::Win32::Foundation::{DuplicateHandle, HANDLE};
+        use windows_sys::Win32::System::SystemServices::JOB_OBJECT_QUERY;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let copy = |source: &Handle, access: u32| -> Result<Handle> {
+            let mut target: HANDLE = null_mut();
+            // SAFETY: both handles are open and the copy is owned by the value made below.
+            let duplicated = unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    source.raw(),
+                    GetCurrentProcess(),
+                    &raw mut target,
+                    access,
+                    0,
+                    0,
+                )
+            };
+            if duplicated == 0 {
+                return Err(last("copying a job handle"));
+            }
+            Handle::new(target, "the copy of the job handle")
+        };
+        Ok(Job {
+            handle: copy(&self.handle, JOB_OBJECT_QUERY)?,
+            port: copy(&self.port, 0x0010_0000)?,
+            state: self.state,
+        })
     }
 
     /// Whether a process is in this job.
