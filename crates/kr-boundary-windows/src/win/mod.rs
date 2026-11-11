@@ -13,7 +13,6 @@
 //! | `job` | The job every child of an invocation is made in |
 //! | `launch` | Starting a program: the broker's one process creation |
 //! | `sd` | The security descriptors the broker makes |
-//! | `switch` | What the guest's test build can take back from a launch |
 //! | `verify` | The check that the payload was signed by the publisher |
 //! | `applocker` | PowerShell's application-control cmdlets and the event log |
 //! | `privilege` | The backup and restore privileges, held by one thread for one privileged action |
@@ -42,7 +41,6 @@ pub mod root;
 pub mod sd;
 pub mod service;
 pub mod setup;
-pub mod switch;
 pub mod token;
 pub mod verify;
 pub mod walk;
