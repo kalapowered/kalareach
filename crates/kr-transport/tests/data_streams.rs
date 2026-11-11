@@ -24,7 +24,7 @@ use futures::future::select_all;
 use iroh::endpoint::{Connection, ReadError, RecvStream, SendStream, WriteError};
 use kr_cbor::CanonicalValue;
 use kr_crypto::connect::PairedPeer;
-use kr_protocol::envelope::ParamsValue;
+use kr_protocol::envelope::{ControlEvent, ControlFrame, ParamsValue};
 use kr_protocol::frame::{StreamHeader, StreamKind, StreamResource};
 use kr_protocol::hello::ALPN;
 use kr_protocol::ids::{
@@ -256,7 +256,12 @@ impl HostHandler for ChunkHost {
                     drop(session.data_streams);
                     self.receiver_dropped.store(true, Ordering::Release);
                     self.dropped.notify_waiters();
-                    while session.control.recv().await.is_some() {}
+                    // The frames the device sends are answered with themselves, so a device can make
+                    // one round trip on the control stream.
+                    while let Some(received) = session.control.recv().await {
+                        let (frame, _) = received.into_parts();
+                        let _ = session.control.send(&frame).await;
+                    }
                 }
                 Taking::Stash => {
                     *self
@@ -1382,7 +1387,12 @@ async fn a_stream_revoked_while_queued_is_reset_and_not_handed_over() {
 /// listener's accept task ended. Here the host moves the receiver away and returns from serving
 /// at once, on a runtime with one thread, so the connection's cleanup aborts the accept task before
 /// it has run at all: the end of the streams is announced by what the accept task owned, not by
-/// anything its body did.
+/// anything its body did. The order rests on the runtime: the connection's task reaches the abort
+/// in the poll that spawned the accept task, with the runtime's per-poll budget of cooperative
+/// work (128 operations) not yet spent, as the end of a handshake spends only a few. A task that
+/// reached its `select!` with no budget left would yield first, the accept task would run, and
+/// the case would pass without testing the guard. The case cannot set that budget, which belongs to
+/// the listener's task.
 #[tokio::test(flavor = "current_thread")]
 async fn a_receiver_held_elsewhere_ends_when_the_accept_task_never_ran() {
     let listening = Harness::listen(&[StreamKind::AttachmentChunks], Taking::MoveAway, None).await;
@@ -1433,7 +1443,8 @@ async fn a_receiver_ends_when_its_connection_does() {
 /// acknowledgement comes late is sent again, with nothing new in it.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_drops_its_receiver_gives_no_more_credit() {
-    let harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::DropAfterTheGate).await;
+    let mut harness =
+        Harness::start(&[StreamKind::AttachmentChunks], Taking::DropAfterTheGate).await;
     // The streams the connection allows beside its control stream: the bulk streams, the places
     // for streams waiting for their headers, and one more.
     let granted = u8::try_from(
@@ -1469,6 +1480,34 @@ async fn a_host_that_drops_its_receiver_gives_no_more_credit() {
         // library would hand its place on as credit.
         let _ = send.reset(0u32.into());
     }
+
+    // Without the withdrawal, each stream the host frees would add a stream's credit, and the
+    // library would send it once two are free. So the first look comes after the host has received
+    // the reset of every stream, and after one round trip on the control stream: the device's
+    // frame carries its acknowledgements of the host's resets, which free the streams on the host,
+    // and the host's answer cannot overtake the credit those frees would have queued.
+    awaited("the host receiving the reset of each stream", async {
+        while harness.host_connection.stats().frame_rx.reset_stream < u64::from(granted) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    harness
+        .authorised
+        .control_writer
+        .write_message(&ControlFrame::Event(ControlEvent::Keepalive))
+        .await
+        .expect("the device writes to the control stream");
+    awaited(
+        "the host's answer on the control stream",
+        harness
+            .authorised
+            .control_reader
+            .read_message::<ControlFrame>(),
+    )
+    .await
+    .expect("the control stream is readable")
+    .expect("the host answers");
 
     let mut next = Box::pin(harness.connection.open_bi());
     assert!(
