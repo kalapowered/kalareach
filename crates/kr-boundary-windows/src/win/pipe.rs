@@ -12,19 +12,16 @@
 
 #![allow(unsafe_code)]
 
-use std::ffi::c_void;
 use std::io::{self, Read, Write};
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, LocalFree,
-    WAIT_OBJECT_0,
+    ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, WAIT_OBJECT_0,
 };
-use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::{
-    CheckTokenMembership, GetTokenInformation, RevertToSelf, SECURITY_ATTRIBUTES,
-    SID_AND_ATTRIBUTES, TOKEN_QUERY, TokenUser,
+    CheckTokenMembership, GetTokenInformation, RevertToSelf, SID_AND_ATTRIBUTES, TOKEN_QUERY,
+    TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
@@ -42,16 +39,13 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use super::ffi::{Handle, Result, Sid, error, last, wide};
+use super::sd::{self, OwnedSd, Principals, SdKind};
 
 /// The name the broker's pipe has.
 pub const NAME: &str = r"\\.\pipe\KalaReachBoundary";
 
 /// The most pipe instances the service keeps open at once.
 pub const MAX_INSTANCES: u32 = 8;
-
-/// The rights a client has on the pipe: read, write and read the attributes. Not the right to
-/// make another instance, which is the same bit as appending.
-const CLIENT_RIGHTS: &str = "0x120183";
 
 /// An event that, once set, ends every wait of every connection that holds it.
 pub struct Stop(Handle);
@@ -285,21 +279,9 @@ impl Connection {
 
 /// The pipe the service listens on.
 pub struct Listener {
-    descriptor: *mut c_void,
+    descriptor: OwnedSd,
     stop: Arc<Stop>,
     next: Option<Handle>,
-}
-
-// SAFETY: the descriptor is owned by the listener and only read to make an instance.
-unsafe impl Send for Listener {}
-
-impl Drop for Listener {
-    fn drop(&mut self) {
-        // SAFETY: the descriptor was allocated by the conversion call and is freed once.
-        unsafe {
-            LocalFree(self.descriptor);
-        }
-    }
 }
 
 impl Listener {
@@ -309,25 +291,13 @@ impl Listener {
     ///
     /// Returns the platform's error when the name is already in use or the pipe cannot be made.
     pub fn bind(people: &[Sid], stop: Arc<Stop>) -> Result<Listener> {
-        let mut list = format!("D:P(A;;GA;;;SY)(A;;{CLIENT_RIGHTS};;;BA)");
-        for person in people {
-            list.push_str(&format!("(A;;{CLIENT_RIGHTS};;;{})", person.to_text()));
-        }
-        let text = wide(&list);
-        let mut descriptor: *mut c_void = null_mut();
-        // SAFETY: the text is NUL-terminated and the descriptor is an out-parameter kept in the
-        // listener and freed when it drops.
-        unsafe {
-            if ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                text.as_ptr(),
-                1,
-                &raw mut descriptor,
-                null_mut(),
-            ) == 0
-            {
-                return Err(last("reading the pipe's permission list"));
-            }
-        }
+        let descriptor = sd::descriptor(
+            SdKind::ControlPipe,
+            &Principals {
+                persons: people.to_vec(),
+                ..Principals::default()
+            },
+        )?;
         let mut listener = Listener {
             descriptor,
             stop,
@@ -339,11 +309,7 @@ impl Listener {
 
     fn instance(&self, first: bool) -> Result<Handle> {
         let name = wide(NAME);
-        let attributes = SECURITY_ATTRIBUTES {
-            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: self.descriptor,
-            bInheritHandle: 0,
-        };
+        let attributes = self.descriptor.attributes();
         let open_mode = PIPE_ACCESS_DUPLEX
             | FILE_FLAG_OVERLAPPED
             | if first {

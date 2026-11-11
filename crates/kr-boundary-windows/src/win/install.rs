@@ -493,13 +493,18 @@ impl Run {
 
 /// The permission list of the service: the system and administrators in full, and each enrolled
 /// person only to see whether the service runs and how it is set up.
-fn service_security(persons: &[String]) -> String {
-    let mut list =
-        String::from("D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)");
-    for person in persons {
-        list.push_str(&format!("(A;;CCLCLORC;;;{person})"));
-    }
-    list
+fn service_security(persons: &[String]) -> Result<String, Error> {
+    let persons = persons
+        .iter()
+        .map(|person| Sid::parse(person))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(sd::descriptor_text(
+        SdKind::Service,
+        &Principals {
+            persons,
+            ..Principals::default()
+        },
+    )?)
 }
 
 /// Records a failed step and goes on to the next, so that one failure does not leave the rest of
@@ -805,7 +810,7 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         "Starts Git for KalaReach as its two repository boundary accounts, on behalf of the people it serves.",
         &BROKER_PRIVILEGES,
     )?;
-    broker_service.set_security(&service_security(&run.manifest.persons))?;
+    broker_service.set_security(&service_security(&run.manifest.persons)?)?;
     run.manifest.save(&paths.manifest)?;
 
     inject("service")?;

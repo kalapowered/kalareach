@@ -5,9 +5,13 @@
 //! of the boundary, so it is kept apart from the calls that apply one.
 //!
 //! The module has one kind of entry so far, construction: [`descriptor`] makes a descriptor for an
-//! object the broker is about to create. Functions that change the descriptor of an object that
-//! already exists, and the one that computes what a new object under a parent inherits, are a
-//! different kind of work and will be separate functions of this module beside it.
+//! object the broker is about to create, and [`descriptor_text`] gives the same descriptor as text
+//! for a call that takes one (the service manager). That covers the private root, the data pipes,
+//! a child's process and thread, the administrators' directories, the boot marker, the default list
+//! of an invocation's token, the control pipe and the service. Functions that change the
+//! descriptor of an object that already exists, and the one that computes what a new object under
+//! a parent inherits, are a different kind of work and will be separate functions of this module
+//! beside it.
 
 #![allow(unsafe_code)]
 
@@ -41,6 +45,12 @@ const MODIFY: &str = "0x1301bf";
 const PIPE_READ: &str = "0x120089";
 /// Read and enter, for every account.
 const READ_AND_ENTER: &str = "0x1200a9";
+/// What a client of the control pipe is given: read and write its data and read its attributes.
+/// Not the right to make another instance, which is the same bit as appending.
+const CONTROL_CLIENT: &str = "0x120183";
+/// On the service: ask its state and configuration, enumerate its dependents, and read its
+/// descriptor. What an enrolled person may do.
+const SERVICE_QUERY: &str = "CCLCLORC";
 
 /// What an object's descriptor is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,17 +81,28 @@ pub enum SdKind {
     /// with it. The list is protected, so it takes nothing from `%ProgramData%`, and no other
     /// account can create, rename or delete anything in it.
     DataParent,
+    /// The list an invocation's token gives the objects it makes when it names no list of its
+    /// own: the invocation's group and the system, with every right, and nobody else.
+    TokenDefault,
+    /// The control pipe the broker listens on: the system in full, and the administrators and
+    /// each enrolled person with the rights of a client.
+    ControlPipe,
+    /// The broker's service: the system and the administrators in full, and each enrolled person
+    /// only to see whether it runs and how it is set up.
+    Service,
 }
 
 /// The identities a descriptor names. A kind uses the ones it needs and refuses a descriptor
 /// without them.
 #[derive(Clone, Debug, Default)]
 pub struct Principals {
-    /// The invocation's group. [`SdKind::PrivateRoot`] needs it; [`SdKind::ProcessThread`] names it
-    /// when it is given.
+    /// The invocation's group. [`SdKind::PrivateRoot`] and [`SdKind::TokenDefault`] need it;
+    /// [`SdKind::ProcessThread`] names it when it is given.
     pub group: Option<Sid>,
     /// The client of a data pipe. [`SdKind::DataPipe`] needs it.
     pub client: Option<Sid>,
+    /// The enrolled people. [`SdKind::ControlPipe`] and [`SdKind::Service`] name each of them.
+    pub persons: Vec<Sid>,
     /// Whether every account may read and enter an [`SdKind::AdminDir`].
     pub users_may_read: bool,
 }
@@ -196,6 +217,25 @@ pub fn descriptor_text(kind: SdKind, principals: &Principals) -> Result<String> 
         SdKind::BootMarker => Ok("O:SYD:P(A;;KA;;;SY)(A;;KA;;;BA)".to_owned()),
         SdKind::CapturePipe => Ok("O:SYD:P(A;;GA;;;SY)".to_owned()),
         SdKind::DataParent => Ok("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)".to_owned()),
+        SdKind::TokenDefault => {
+            let group = needed(principals.group.as_ref(), "the invocation's group")?;
+            Ok(format!("D:(A;;GA;;;{})(A;;GA;;;SY)", group.to_text()))
+        }
+        SdKind::ControlPipe => {
+            let mut list = format!("D:P(A;;GA;;;SY)(A;;{CONTROL_CLIENT};;;BA)");
+            for person in &principals.persons {
+                list.push_str(&format!("(A;;{CONTROL_CLIENT};;;{})", person.to_text()));
+            }
+            Ok(list)
+        }
+        SdKind::Service => {
+            let mut list =
+                String::from("D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)");
+            for person in &principals.persons {
+                list.push_str(&format!("(A;;{SERVICE_QUERY};;;{})", person.to_text()));
+            }
+            Ok(list)
+        }
         SdKind::AdminDir => Ok(if principals.users_may_read {
             format!("D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;{READ_AND_ENTER};;;BU)")
         } else {

@@ -25,13 +25,12 @@
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::{HANDLE, LUID, LocalFree};
+use windows_sys::Win32::Foundation::{HANDLE, LUID};
 use windows_sys::Win32::Security::Authentication::Identity::{
     LSA_STRING, LsaDeregisterLogonProcess, LsaFreeReturnBuffer, LsaLogonUser,
     LsaLookupAuthenticationPackage, LsaNtStatusToWinError, LsaRegisterLogonProcess,
     MSV1_0_S4U_LOGON, SECURITY_LOGON_TYPE,
 };
-use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::{
     ACL, AdjustTokenPrivileges, AllocateLocallyUniqueId, CreateRestrictedToken, DuplicateTokenEx,
     GetSecurityDescriptorDacl, GetTokenInformation, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
@@ -46,6 +45,7 @@ use windows_sys::Win32::System::SystemServices::{
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use super::ffi::{Handle, Result, Sid, error, last, wide};
+use super::sd::{self, Principals, SdKind};
 
 /// The logon package that makes a token for a local account without its password.
 const PACKAGE: &[u8] = b"MICROSOFT_AUTHENTICATION_PACKAGE_V1_0";
@@ -380,26 +380,20 @@ pub fn boundary_token(account: &str, group: &Sid) -> Result<Handle> {
             return Err(last("making the invocation's group the token's owner"));
         }
     }
-    let list = format!("D:(A;;GA;;;{})(A;;GA;;;SY)", group.to_text());
-    let text = wide(&list);
-    let mut descriptor: *mut c_void = null_mut();
-    // SAFETY: the text is NUL-terminated; the descriptor is freed below, after the token has
-    // copied the list out of it.
+    let descriptor = sd::descriptor(
+        SdKind::TokenDefault,
+        &Principals {
+            group: Some(group.clone()),
+            ..Principals::default()
+        },
+    )?;
+    // SAFETY: the descriptor lives through the block, and the token copies the list out of it.
     unsafe {
-        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            text.as_ptr(),
-            1,
-            &raw mut descriptor,
-            null_mut(),
-        ) == 0
-        {
-            return Err(last("reading the default permission list"));
-        }
         let mut present = 0;
         let mut defaulted = 0;
         let mut dacl: *mut ACL = null_mut();
         GetSecurityDescriptorDacl(
-            descriptor,
+            descriptor.as_ptr(),
             &raw mut present,
             &raw mut dacl,
             &raw mut defaulted,
@@ -411,7 +405,6 @@ pub fn boundary_token(account: &str, group: &Sid) -> Result<Handle> {
             (&raw const default).cast(),
             size_of::<TOKEN_DEFAULT_DACL>() as u32,
         );
-        LocalFree(descriptor);
         if set == 0 {
             return Err(last("setting the token's default permission list"));
         }
