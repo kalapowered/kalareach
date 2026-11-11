@@ -305,6 +305,15 @@ fn read_ledger(path: &Path, budget: &str) -> Result<Value, String> {
             path.display()
         ));
     }
+    // A second name for the ledger is as a link is: a charge replaces this name and leaves the
+    // count under the other name as it was.
+    if stat.st_nlink != 1 {
+        return Err(format!(
+            "the ledger {} has more than one name, which is refused: a charge would replace this \
+             name and leave the old count under the other; name a ledger file that has one name",
+            path.display()
+        ));
+    }
     let mut bytes = Vec::new();
     std::fs::File::from(handle)
         .read_to_end(&mut bytes)
@@ -405,6 +414,11 @@ impl KeyScan {
 
 /// Searches every regular file under `root`, or `root` itself where it is one, for `value`, and
 /// returns where it was and what could not be read. Nothing of the value is returned or printed.
+/// The walk is made through directory handles with no link followed below `root` (a link, a socket
+/// or a pipe holds no bytes of its own to search and is read through by nothing; a name that became
+/// a link while the scan ran is told as not scanned). A place of the person's own may hold files
+/// with several names, and they are read; a run's own directory is searched by
+/// [`run_files_holding`].
 ///
 /// # Panics
 ///
@@ -422,22 +436,183 @@ pub fn files_holding(root: &Path, value: &[u8]) -> KeyScan {
 /// Panics when a value is shorter than eight bytes, which would find anything.
 #[must_use]
 pub fn files_holding_any(root: &Path, values: &[&[u8]]) -> KeyScan {
+    scan_files(root, values, false)
+}
+
+/// [`files_holding`] for a run's own directory, which holds no file with a second name: a file whose
+/// link count is not one is the same file under another name, possibly one of the person's, and is
+/// told as not scanned (which leaves the scan incomplete) and never read.
+///
+/// # Panics
+///
+/// Panics when `value` is shorter than eight bytes, which would find anything.
+#[must_use]
+pub fn run_files_holding(root: &Path, value: &[u8]) -> KeyScan {
+    run_files_holding_any(root, &[value])
+}
+
+/// [`files_holding_any`] for a run's own directory ([`run_files_holding`]).
+///
+/// # Panics
+///
+/// Panics when a value is shorter than eight bytes, which would find anything.
+#[must_use]
+pub fn run_files_holding_any(root: &Path, values: &[&[u8]]) -> KeyScan {
+    scan_files(root, values, true)
+}
+
+/// What the scan tells of an entry it did not read.
+fn not_scanned(why: &str) -> String {
+    format!("not scanned: {why}")
+}
+
+/// One directory of the scan, through its handle: every entry is looked at with `fstatat` and no
+/// link followed, a directory is opened with the same handle and no link followed and checked to be
+/// the one that was looked at, and a file is opened with no link followed, nonblocking, checked to
+/// be the regular file that was looked at (and, in a `strict` scan, to have one name, before and
+/// after it is opened), and only then read. What cannot be read is told in `scan.unread` and the
+/// walk goes on.
+fn scan_directory(
+    directory: &std::os::fd::OwnedFd,
+    relative: &str,
+    depth: usize,
+    strict: bool,
+    holds: &dyn Fn(&[u8]) -> bool,
+    scan: &mut KeyScan,
+) {
+    use crate::held::{Class, DEEPEST, opened_directory, opening_failed};
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+    let place = |name: &str| {
+        if relative.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{relative}/{name}")
+        }
+    };
+    if depth > DEEPEST {
+        scan.unread.push(format!(
+            "{relative}: {}",
+            not_scanned("the tree is too deep")
+        ));
+        return;
+    }
+    let names: Vec<std::ffi::CString> = {
+        let listing = match rustix::fs::Dir::read_from(directory) {
+            Ok(listing) => listing,
+            Err(error) => {
+                scan.unread.push(format!("{relative}: {error}"));
+                return;
+            }
+        };
+        let mut names = Vec::new();
+        for entry in listing {
+            match entry {
+                Ok(entry) => {
+                    let name = entry.file_name();
+                    if name.to_bytes() != b"." && name.to_bytes() != b".." {
+                        names.push(name.to_owned());
+                    }
+                }
+                Err(error) => scan.unread.push(format!("{relative}: {error}")),
+            }
+        }
+        names
+    };
+    for name in names {
+        let shown = place(&name.to_string_lossy());
+        let looked = match rustix::fs::statat(directory, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+        {
+            Ok(looked) => looked,
+            Err(error) => {
+                scan.unread.push(format!("{shown}: {error}"));
+                continue;
+            }
+        };
+        match FileType::from_raw_mode(looked.st_mode) {
+            FileType::Directory => match opened_directory(directory, name.as_c_str(), &looked, 0) {
+                Ok(child) => scan_directory(&child, &shown, depth + 1, strict, holds, scan),
+                Err(unlooked) => scan
+                    .unread
+                    .push(format!("{shown}: {}", not_scanned(&unlooked.to_string()))),
+            },
+            FileType::RegularFile => {
+                if strict && looked.st_nlink != 1 {
+                    scan.unread.push(format!(
+                        "{shown}: {}",
+                        not_scanned("a file with more than one name")
+                    ));
+                    continue;
+                }
+                let handle = match rustix::fs::openat(
+                    directory,
+                    name.as_c_str(),
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        let why = match opening_failed(error) {
+                            Class::Replaced => "it became a link while the scan ran".to_owned(),
+                            _ => error.to_string(),
+                        };
+                        scan.unread.push(format!("{shown}: {}", not_scanned(&why)));
+                        continue;
+                    }
+                };
+                let opened = match rustix::fs::fstat(&handle) {
+                    Ok(opened) => opened,
+                    Err(error) => {
+                        scan.unread.push(format!("{shown}: {error}"));
+                        continue;
+                    }
+                };
+                if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile
+                    || (opened.st_dev, opened.st_ino) != (looked.st_dev, looked.st_ino)
+                {
+                    scan.unread.push(format!(
+                        "{shown}: {}",
+                        not_scanned("it was replaced while the scan ran")
+                    ));
+                    continue;
+                }
+                if strict && opened.st_nlink != 1 {
+                    scan.unread.push(format!(
+                        "{shown}: {}",
+                        not_scanned("a file with more than one name")
+                    ));
+                    continue;
+                }
+                let mut file = std::fs::File::from(handle);
+                let mut bytes = Vec::new();
+                if let Err(error) = file.read_to_end(&mut bytes) {
+                    scan.unread.push(format!("{shown}: {error}"));
+                    continue;
+                }
+                if holds(&bytes) {
+                    let metadata = file.metadata().ok();
+                    scan.held_by.push(KeyHolder {
+                        path: shown,
+                        bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                        created_ms: metadata.as_ref().and_then(|meta| ms_of(meta.created())),
+                        modified_ms: metadata.as_ref().and_then(|meta| ms_of(meta.modified())),
+                    });
+                }
+            }
+            // A link, a socket or a pipe holds no bytes of its own to search, and nothing is read
+            // through it.
+            _ => {}
+        }
+    }
+}
+
+/// [`files_holding_any`] and [`run_files_holding_any`]: `strict` refuses a file with more than one
+/// name.
+fn scan_files(root: &Path, values: &[&[u8]], strict: bool) -> KeyScan {
     assert!(
         values.iter().all(|value| value.len() >= 8),
         "a key shorter than eight bytes cannot be searched for"
     );
     let single = std::fs::symlink_metadata(root).is_ok_and(|metadata| metadata.is_file());
-    let relative = |path: &Path| {
-        if single {
-            return path
-                .file_name()
-                .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
-        }
-        path.strip_prefix(root)
-            .unwrap_or(path)
-            .display()
-            .to_string()
-    };
     // Each value's searcher is made once: a run's directory holds binaries of tens of megabytes, which
     // a search window by window would take minutes over for a dozen values.
     let finders: Vec<memchr::memmem::Finder<'_>> =
@@ -445,74 +620,34 @@ pub fn files_holding_any(root: &Path, values: &[&[u8]]) -> KeyScan {
     let holds = |bytes: &[u8]| finders.iter().any(|finder| finder.find(bytes).is_some());
     let mut scan = KeyScan::default();
     if single {
+        let name = root
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
         let mut bytes = Vec::new();
         match std::fs::File::open(root).and_then(|mut file| file.read_to_end(&mut bytes)) {
             Ok(_) => {
                 if holds(&bytes) {
                     scan.held_by.push(KeyHolder {
-                        path: relative(root),
+                        path: name,
                         bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
                         created_ms: None,
                         modified_ms: None,
                     });
                 }
             }
-            Err(error) => scan.unread.push(format!("{}: {error}", relative(root))),
+            Err(error) => scan.unread.push(format!("{name}: {error}")),
         }
         return scan;
     }
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        let entries = match std::fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(error) => {
-                scan.unread
-                    .push(format!("{}: {error}", relative(&directory)));
-                continue;
-            }
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    scan.unread
-                        .push(format!("{}: {error}", relative(&directory)));
-                    continue;
-                }
-            };
-            let path = entry.path();
-            let kind = match entry.file_type() {
-                Ok(kind) => kind,
-                Err(error) => {
-                    scan.unread.push(format!("{}: {error}", relative(&path)));
-                    continue;
-                }
-            };
-            if kind.is_dir() {
-                pending.push(path);
-                continue;
-            }
-            // A link, a socket or a pipe holds no bytes of its own to search.
-            if !kind.is_file() {
-                continue;
-            }
-            let mut bytes = Vec::new();
-            if let Err(error) =
-                std::fs::File::open(&path).and_then(|mut file| file.read_to_end(&mut bytes))
-            {
-                scan.unread.push(format!("{}: {error}", relative(&path)));
-                continue;
-            }
-            if holds(&bytes) {
-                let metadata = entry.metadata().ok();
-                scan.held_by.push(KeyHolder {
-                    path: relative(&path),
-                    bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-                    created_ms: metadata.as_ref().and_then(|meta| ms_of(meta.created())),
-                    modified_ms: metadata.as_ref().and_then(|meta| ms_of(meta.modified())),
-                });
-            }
-        }
+    // The root is the harness's own choice (the run's directory, or a place of the person's); what
+    // lies below it is walked through handles.
+    match rustix::fs::open(
+        root,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(directory) => scan_directory(&directory, "", 1, strict, &holds, &mut scan),
+        Err(error) => scan.unread.push(format!(": {error}")),
     }
     scan.held_by
         .sort_by(|left, right| left.path.cmp(&right.path));
@@ -1711,6 +1846,27 @@ mod tests {
         assert_eq!(ledger.spent(), Ok(0), "the target keeps its count");
         // A file that is not a regular file is refused too.
         assert!(Ledger::at(scratch.0.clone(), "agent", 3).is_err());
+        // A second name for the ledger (a hard link) is refused as a link is, and what a charge
+        // would have replaced is left alone.
+        let alias = scratch.0.join("alias.json");
+        std::fs::hard_link(&real, &alias).expect("a second name");
+        let why = Ledger::at(alias.clone(), "agent", 3).expect_err("a ledger with two names");
+        assert!(why.contains("more than one name"), "{why}");
+        assert!(
+            Ledger::at(real.clone(), "agent", 3).is_err(),
+            "either name is refused"
+        );
+        assert!(
+            ledger.charge("1", "first").is_err(),
+            "no charge on a ledger with two names"
+        );
+        assert_eq!(
+            std::fs::read(&real).expect("the ledger"),
+            std::fs::read(&alias).expect("the other name"),
+            "both names still say the same"
+        );
+        std::fs::remove_file(&alias).expect("removed");
+        assert_eq!(ledger.spent(), Ok(0), "with one name it is read again");
 
         // The predictable names beside the ledger are not used: files there are left alone.
         let fixed = real.with_extension("next");
@@ -1764,6 +1920,64 @@ mod tests {
             left.is_empty(),
             "a failed write leaves no temporary file: {left:?}"
         );
+    }
+
+    /// The scan of a run's directory reads through handles and refuses what it must not read: a
+    /// file with a second name is told as not scanned and is not read, and a link is read through by
+    /// nothing; a place of the person's own is read though its files have several names.
+    #[test]
+    fn the_scan_of_a_run_reads_no_file_with_a_second_name_and_follows_no_link() {
+        let scratch = Scratch::new("scan");
+        let run = scratch.0.join("run");
+        let elsewhere = scratch.0.join("elsewhere");
+        std::fs::create_dir_all(run.join("a/b")).expect("a run");
+        std::fs::create_dir_all(&elsewhere).expect("outside");
+        let key = b"the-key-value-0123456789";
+        std::fs::write(run.join("a/b/holds-it"), key).expect("a file that holds the key");
+        std::fs::write(run.join("a/clean"), b"nothing to find here").expect("a clean file");
+        // A clean run: the key is found where it is, and every entry was read.
+        let scan = run_files_holding(&run, key);
+        assert!(scan.complete(), "{:?}", scan.unread);
+        assert_eq!(
+            scan.held_by
+                .iter()
+                .map(|holder| holder.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a/b/holds-it"]
+        );
+        // A file of the person's, one of whose names is in the run: not read in a run's scan, so
+        // the scan is incomplete and nothing of the file is searched.
+        std::fs::write(elsewhere.join("theirs"), key).expect("a file of the person's");
+        std::fs::hard_link(elsewhere.join("theirs"), run.join("a/second-name")).expect("a link");
+        let scan = run_files_holding(&run, key);
+        assert!(!scan.complete());
+        assert!(
+            scan.unread
+                .iter()
+                .any(|entry| entry.contains("not scanned: a file with more than one name")),
+            "{:?}",
+            scan.unread
+        );
+        assert!(
+            scan.held_by
+                .iter()
+                .all(|holder| holder.path == "a/b/holds-it"),
+            "the file with a second name was not read: {:?}",
+            scan.held_by
+        );
+        // A place of the person's own is read as it was.
+        let lenient = files_holding(&run, key);
+        assert!(lenient.complete(), "{:?}", lenient.unread);
+        assert_eq!(lenient.held_by.len(), 2);
+        std::fs::remove_file(run.join("a/second-name")).expect("removed");
+        // A symbolic link, to a file and to a directory that hold the key, is read through by
+        // nothing, and a link in a run is the harness's own and does not make the scan incomplete.
+        std::os::unix::fs::symlink(elsewhere.join("theirs"), run.join("a/linked-file"))
+            .expect("a link");
+        std::os::unix::fs::symlink(&elsewhere, run.join("a/linked-directory")).expect("a link");
+        let scan = run_files_holding(&run, key);
+        assert!(scan.complete(), "{:?}", scan.unread);
+        assert_eq!(scan.held_by.len(), 1, "{:?}", scan.held_by);
     }
 
     #[test]
