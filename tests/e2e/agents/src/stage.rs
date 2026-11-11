@@ -1184,6 +1184,16 @@ pub fn launch(
 ///
 /// Returns the refusal, which says that nothing was started.
 pub fn closed_route(expected: &Expected, command: &str, stand_in: &Path) -> Result<(), String> {
+    closed_route_of("", expected, command, stand_in)
+}
+
+/// [`closed_route`] for the build named by `which`, which leads the refusal's reason.
+fn closed_route_of(
+    which: &str,
+    expected: &Expected,
+    command: &str,
+    stand_in: &Path,
+) -> Result<(), String> {
     let digest_of = |path: &Path| {
         std::fs::read(path).map(|bytes| {
             kr_cbor::sha256(&bytes)
@@ -1194,7 +1204,7 @@ pub fn closed_route(expected: &Expected, command: &str, stand_in: &Path) -> Resu
     };
     let refused = |why: &str| {
         Err(format!(
-            "the staged parts' live route is closed until their own round: {why}, so nothing was \
+            "the staged parts' live route is closed until their own round: {which}{why}, so nothing was \
              started"
         ))
     };
@@ -1216,18 +1226,30 @@ pub fn closed_route(expected: &Expected, command: &str, stand_in: &Path) -> Resu
 }
 
 /// The check every staged part passes before it starts its first program, a probe of the build, a
-/// session or the agent: the build the part is given must be this crate's own stand-in
+/// session or the agent: every build the part can start, the pinned one and the newer one the
+/// upgrade part moves to, where the description names one, must be this crate's own stand-in
 /// ([`closed_route`]).
 ///
 /// # Errors
 ///
 /// Returns the refusal, which says that nothing was started.
 pub fn closed_for_all_but_the_stand_in(build: &crate::build::Build) -> Result<(), String> {
-    closed_route(
-        &Expected::pinned(build),
-        &build.command,
-        &built_directory().join("agent-stand-in"),
-    )
+    closed_for(build, &built_directory().join("agent-stand-in"))
+}
+
+/// [`closed_for_all_but_the_stand_in`] for the stand-in at `stand_in`.
+fn closed_for(build: &crate::build::Build, stand_in: &Path) -> Result<(), String> {
+    closed_route(&Expected::pinned(build), &build.command, stand_in)?;
+    if let Some(newer) = &build.newer {
+        // The upgrade part moves `agent/current` to this build and types launches.
+        closed_route_of(
+            "the newer build: ",
+            &Expected::newer(build, newer),
+            &build.command,
+            stand_in,
+        )?;
+    }
+    Ok(())
 }
 
 /// An agent's start that reached no first screen because the agent refused to run.
@@ -1951,6 +1973,68 @@ mod tests {
         let said = closed_route(&expected(&digest, &other), "codex", &stand_in)
             .expect_err("a file that is not the stand-in is refused");
         assert!(said.contains("live route is closed"), "{said}");
+        std::fs::remove_dir_all(&base).expect("clean up");
+    }
+
+    /// A description whose main build is the stand-in and whose newer build is not is refused where
+    /// the staged part is made: the upgrade part moves `agent/current` to the newer build and types
+    /// launches, so every build a part can start passes the closed-route check.
+    #[test]
+    fn a_part_whose_newer_build_is_not_the_stand_in_is_refused_before_anything_is_started() {
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .expect("the temporary directory")
+            .join(format!("kr-closed-newer-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&base).expect("a scratch directory");
+        let stand_in = base.join("agent-stand-in");
+        std::fs::write(&stand_in, b"the stand-in").expect("a stand-in");
+        let hex = |bytes: &[u8]| -> String {
+            kr_cbor::sha256(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        };
+        let install = |name: &str, bytes: &[u8]| -> PathBuf {
+            let prefix = base.join(name);
+            std::fs::create_dir_all(prefix.join("bin")).expect("an installation");
+            std::fs::write(prefix.join("bin/codex"), bytes).expect("the installed build");
+            prefix
+        };
+        let main = install("main", b"the stand-in");
+        let build = |newer: Option<(&Path, &str)>| -> crate::build::Build {
+            serde_json::from_value(serde_json::json!({
+                "package": "a package",
+                "application": "an application",
+                "version": "1",
+                "prefix": main,
+                "pinned": "bin/codex",
+                "sha256": hex(b"the stand-in"),
+                "command": "codex",
+                "launch": "native",
+                "ready": "ready",
+                "harmless": { "input": "x", "shows": "y" },
+                "transcript": "a transcript",
+                "newer": newer.map(|(prefix, sha256)| serde_json::json!({
+                    "version": "2",
+                    "prefix": prefix,
+                    "pinned": "bin/codex",
+                    "sha256": sha256,
+                    "ready": "ready",
+                })),
+            }))
+            .expect("a description")
+        };
+        closed_for(&build(None), &stand_in).expect("the stand-in alone is let through");
+        let copy = install("newer-stand-in", b"the stand-in");
+        closed_for(&build(Some((&copy, &hex(b"the stand-in")))), &stand_in)
+            .expect("a newer build that is the stand-in is let through");
+        let other = install("newer-other", b"another build");
+        let said = closed_for(&build(Some((&other, &hex(b"another build")))), &stand_in)
+            .expect_err("a newer build that is not the stand-in is refused");
+        assert!(said.contains("the newer build"), "{said}");
+        assert!(said.contains("nothing was started"), "{said}");
+        let said = closed_for(&build(Some((&other, &hex(b"the stand-in")))), &stand_in)
+            .expect_err("the stand-in's digest stated over another newer build is refused");
+        assert!(said.contains("the newer build"), "{said}");
         std::fs::remove_dir_all(&base).expect("clean up");
     }
 
