@@ -187,6 +187,17 @@ fn the_branch_name_grammar_is_the_one_the_tables_use() {
         "a.lockx",
         "a/locked",
         "x.lock.y",
+        // Near a device name, and not one.
+        "console",
+        "nul1",
+        "com10",
+        "comx",
+        "con1",
+        "aux1",
+        "conin",
+        "a/communal/b",
+        "prn_x",
+        "xnul",
     ] {
         assert!(is_branch_name(name), "{name:?}");
     }
@@ -202,6 +213,47 @@ fn the_branch_name_grammar_is_the_one_the_tables_use() {
         "a/b.lock", "a b", "a@{u}", "a@b", "@", "a:b", "a\\b", "a\n", "\u{e9}",
     ] {
         assert!(!is_branch_name(name), "{name:?}");
+    }
+}
+
+#[test]
+fn a_component_that_windows_reads_as_a_device_is_no_branch_name() {
+    // On Windows the file of `refs/heads/com1`, and its `.lock` file, are device paths. A name is
+    // refused by the rule of the path grammar: the text before the first dot is a device, in any
+    // case.
+    for name in [
+        "nul",
+        "con",
+        "prn",
+        "aux",
+        "NUL",
+        "Con",
+        "AuX",
+        "com0",
+        "com1",
+        "COM9",
+        "lpt0",
+        "lpt1",
+        "LPT9",
+        "aux.x",
+        "con.tar.gz",
+        "nul.txt",
+        "a/nul",
+        "a/nul/b",
+        "nul/a",
+        "x/com1.txt",
+        "a/b/LPT3.log",
+        "feature/aux",
+    ] {
+        assert!(!is_branch_name(name), "{name:?}");
+    }
+}
+
+#[test]
+fn a_head_that_names_a_device_is_refused_as_a_name() {
+    for name in ["nul", "com1", "a/aux.x"] {
+        let bytes = format!("ref: refs/heads/{name}\n");
+        assert_eq!(refused(bytes.as_bytes()), "head-name", "{name}");
     }
 }
 

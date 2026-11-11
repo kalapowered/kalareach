@@ -548,7 +548,7 @@ fn a_revision_the_grammar_takes_is_read_whole_after_the_prefix_is_added() {
     // reader takes only its own part, so none of them has a bound the other parts exceed.
     let written = format!("{}{}", "n".repeat(200), "^{commit}".repeat(4));
     assert_eq!(written.len(), 236);
-    let qualified = grammar::revision(&written).unwrap();
+    let qualified = grammar::revision(&written).unwrap().spec;
     assert_eq!(qualified.len(), 247);
     let parts = resolved(&qualified);
     let Base::Reference(reference) = &parts.base else {
@@ -878,6 +878,75 @@ fn r4_refuses_a_deadline_an_exit_code_and_a_record_that_does_not_frame() {
 }
 
 #[test]
+fn the_names_ntfs_gives_gitattributes_are_picked_exactly_as_git_matches_them() {
+    // Git's rule for an NTFS dot file (`is_ntfs_dot_generic` in `path.c`, with the name
+    // `gitattributes` and the short-name prefix `gi7d29`), as `git fsck --strict` applied it to a
+    // symbolic link of each name in Apple Git 2.50.1 and in Git 2.53.0: the two agree. `true` is a
+    // name Git matched.
+    let recorded: &[(&str, bool)] = &[
+        (".gitattributes", true),
+        (".GitAttributes", true),
+        (".gitattributes.", true),
+        (".gitattributes ", true),
+        (".gitattributes. . ", true),
+        (".gitattributes:s", true),
+        (".gitattributes::$DATA", true),
+        (".gitattributesx", false),
+        ("x.gitattributes", false),
+        (".gitattribute", false),
+        (".gitattributes.x", false),
+        (" .gitattributes", false),
+        ("gitatt~1", true),
+        ("GITATT~4", true),
+        ("gitatt~5", false),
+        ("gitatt~0", false),
+        ("gitatt~12", false),
+        ("gitatt~1 ", true),
+        ("gitatt~1.", true),
+        ("gitatt~1x", false),
+        ("gitatt~1:s", true),
+        ("gi7d29~1", true),
+        ("GI7D29~9", true),
+        ("gi7d29~10", false),
+        ("gi7d29~1 ", true),
+        ("gi7d29~0", false),
+        ("gi7d29~", false),
+        ("gi7d29x~1", false),
+        ("gi7d28~1", false),
+        ("gi7d2~10", true),
+        ("gi7d~123", true),
+        ("gi7~1234", true),
+        ("gi~12345", true),
+        ("g~123456", true),
+        ("~1234567", true),
+        ("g~1234567", false),
+        ("gi7d29~1234", false),
+        ("gi7d2~1", false),
+        ("gi7d2~1x", false),
+        ("gi7d2~123456", false),
+        ("g~1", false),
+        ("gi~1", false),
+        ("gi7d29~12", false),
+        ("gi7d29~123", false),
+        ("GI7d29~1", true),
+        ("gitatt~", false),
+        ("gitat~1", false),
+        ("gitattr~1", false),
+        ("gi7d29~1:s", true),
+        ("g~12345 .", false),
+        ("gi7d2~10 ", true),
+    ];
+    for (name, matched) in recorded {
+        let entries = [entry(0o100_644, OID, 0, format!("d/{name}").as_bytes())];
+        assert_eq!(
+            attributes_entries(&entries).len() == 1,
+            *matched,
+            "{name:?}"
+        );
+    }
+}
+
+#[test]
 fn the_entries_named_gitattributes_are_picked_in_every_spelling_windows_reads() {
     let named = [
         ".gitattributes",
@@ -890,13 +959,18 @@ fn the_entries_named_gitattributes_are_picked_in_every_spelling_windows_reads() 
         ".gitattributes. . ",
         "GITATT~1",
         "gitatt~1",
-        "d/gitatt~12",
         // The name NTFS gives it once the first short names are taken.
         "gi7d29~1",
         "GI7D29~4",
         "d/gi7d29~2",
         "gi7d29~1 ",
         "gi7d29~1.",
+        // Fall-back short names with fewer prefix bytes, and the other ends Git accepts.
+        "gi7d2~10",
+        "g~123456",
+        "~1234567",
+        ".gitattributes:stream",
+        "gi7d29~1:stream",
     ];
     let other = [
         ".gitattributesx",
@@ -922,6 +996,11 @@ fn the_entries_named_gitattributes_are_picked_in_every_spelling_windows_reads() 
         "gi7d29x~1",
         "gi7d28~1",
         "gi7d29-1",
+        // More digits than the eight bytes of a short name hold, or fewer bytes than it has.
+        "d/gitatt~12",
+        "gi7d29~10",
+        "gi7d2~1",
+        "g~1234567",
     ];
     let entries: Vec<Entry> = named
         .iter()
