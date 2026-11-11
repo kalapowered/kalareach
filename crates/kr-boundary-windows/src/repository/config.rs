@@ -463,19 +463,15 @@ fn boolean(value: Option<&[u8]>) -> Option<bool> {
     }
 }
 
-/// Whether an address starts with a transport helper's name and two colons: the letters, digits,
-/// `+`, `.` and `-` that Git reads as a scheme (a letter or digit first, possibly none at all),
-/// then `::`.
+/// Whether an address starts with a transport helper's name and two colons. Git reads a letter or
+/// digit and then letters, digits, `+`, `.` and `-` as the name; this takes any run of those
+/// characters, the empty run too, so that it refuses everything Git reads as a helper and a little
+/// more.
 fn names_helper(address: &str) -> bool {
-    let mut scheme = 0;
-    for (index, byte) in address.bytes().enumerate() {
-        let part =
-            byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'+' | b'.' | b'-'));
-        if !part {
-            break;
-        }
-        scheme = index + 1;
-    }
+    let scheme = address
+        .bytes()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'.' | b'-'))
+        .count();
     address[scheme..].starts_with("::")
 }
 

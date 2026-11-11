@@ -62,6 +62,29 @@ fn operate_json() -> Value {
 }
 
 #[test]
+fn the_bounds_are_these_numbers() {
+    assert_eq!(MAX_OPERATE_FRAME, 1_048_576);
+    assert_eq!(MAX_FRAME, 16_384);
+    assert_eq!(MAX_ARGUMENTS, 512);
+    assert_eq!(MAX_PATH_BYTES, 240);
+    assert_eq!(MAX_NAME_BYTES, 200);
+    assert_eq!(MAX_REF_NAME_BYTES, 211);
+    assert_eq!(MAX_REV_BYTES, 240);
+    assert_eq!(MAX_OID_BYTES, 64);
+    assert_eq!(MAX_MESSAGE_BYTES, 8192);
+    assert_eq!(MAX_COUNT, 1000);
+    assert_eq!(MAX_WORD_BYTES, 64);
+    assert_eq!(MAX_FORMAT_PARTS, 64);
+    assert_eq!(MAX_FORMAT_TEXT_BYTES, 256);
+    assert_eq!(MAX_IDENTITY_BYTES, 200);
+    assert_eq!(MAX_DIRECTORY_UNITS, 32_767);
+    assert_eq!(MAX_DETAIL_BYTES, 200);
+    assert_eq!(MAX_PIPE_NAME_BYTES, 256);
+    assert_eq!(MAX_NOTES, 64);
+    assert_eq!(MAX_NOTE_BYTES, 200);
+}
+
+#[test]
 fn an_operate_request_is_encoded_as_these_bytes() {
     let request = request(vec![
         Arg::Word("--oneline".to_owned()),
@@ -729,6 +752,13 @@ fn a_reply_with_a_field_the_protocol_does_not_name_is_refused() {
         json!({ "answer": "finished", "exit": 0, "ended_by": "exit", "cleanup": "clean",
                 "configuration": "same", "notes": { "items": [], "cut": 0 } }),
         json!({ "answer": "refused", "kind": "unknown-kind", "detail": "d" }),
+        json!({ "answer": "finished", "exit": 0, "ended_by": "exit",
+                "cleanup": { "failed": { "object": "a", "class": "tree", "extra": 1 } },
+                "configuration": "same", "notes": { "items": [], "cut": 0 },
+                "replaced_protected": 0 }),
+        json!({ "answer": "finished", "exit": 0, "ended_by": "exit", "cleanup": "clean",
+                "configuration": { "changed": { "name": "n", "extra": 1 } },
+                "notes": { "items": [], "cut": 0 }, "replaced_protected": 0 }),
     ] {
         assert!(
             matches!(
@@ -762,6 +792,7 @@ fn a_refusal_is_printable_text_of_at_most_two_hundred_bytes() {
         MAX_DETAIL_BYTES
     );
     assert_eq!(printable("abc", 2), "ab");
+    assert_eq!(printable("a~ \u{7f}\u{1f}", 10), "a~ ??");
     // A peer's reply that is over the limit or not printable is refused on reading, and our own
     // writer will not send it.
     for detail in [
