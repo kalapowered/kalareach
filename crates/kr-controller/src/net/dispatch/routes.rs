@@ -605,10 +605,10 @@ impl RemoteConnection {
                 // before it was read, so an upload that belongs to another by the end of the read
                 // is not shown under that decision: the device reads it again and is decided over
                 // the session it is bound to now.
-                let rebound = self
+                let rebound = !self
                     .upload_session(request)
                     .await
-                    .map_or(true, |now| now != named);
+                    .is_ok_and(|now| now == named);
                 match held {
                     Ok(()) if !rebound => answer,
                     _ => failure(request.request_id, outcome_not_shown()),
