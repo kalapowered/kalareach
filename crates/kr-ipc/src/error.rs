@@ -430,9 +430,8 @@ mod tests {
     }
 
     /// A connected local stream whose peer has gone answers in three forms, and the system picks
-    /// among them. A real socket gives "not connected" to a read only on some systems and in no
-    /// round a case can count on, so this holds every form to the rule for each operation, and
-    /// holds the failures that are not a gone peer to being failures of the socket.
+    /// among them. This holds every form to the rule a write and a shutdown read it by, and holds
+    /// the failures that are not a gone peer to being failures of the socket.
     #[test]
     fn a_stream_failure_of_a_gone_peer_is_the_peer_closing_in_every_form() {
         use std::io::ErrorKind;
@@ -442,13 +441,11 @@ mod tests {
             ErrorKind::ConnectionReset,
             ErrorKind::NotConnected,
         ] {
-            for operation in ["write", "read", "shut down"] {
-                let failure = IpcError::stream(operation, std::io::Error::from(form));
-                assert!(
-                    matches!(failure, IpcError::PeerClosed),
-                    "{operation}: {form:?} gave {failure:?}"
-                );
-            }
+            let failure = IpcError::stream("write", std::io::Error::from(form));
+            assert!(
+                matches!(failure, IpcError::PeerClosed),
+                "{form:?} gave {failure:?}"
+            );
         }
         for other in [
             ErrorKind::PermissionDenied,

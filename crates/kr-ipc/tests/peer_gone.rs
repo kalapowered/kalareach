@@ -324,7 +324,8 @@ impl Rounds {
 
 /// Writes frames to `writer` until a write fails, while `peer` is closed from another thread, and
 /// returns the failure. Both threads start together and nothing waits between the start and the
-/// close, so the writer is mid-write when the close begins.
+/// close, so the writer is writing as the close begins, though a round cannot be made to overlap
+/// it: the rounds are many for that.
 #[cfg(unix)]
 fn write_while_the_peer_closes(writer: &mut FrameWriter, peer: Ends) -> kr_ipc::error::IpcError {
     let frame = FrameWriter::encode(

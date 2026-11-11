@@ -1579,6 +1579,58 @@ mod tests {
             IpcError::PeerClosed
         ));
     }
+
+    /// A read that the system answers with a gone peer's failure ends the stream as a clean end
+    /// does, in every form of it, so the reader ends the frame in hand the same way for each. Any
+    /// other failure stays a failure of the socket, and a caller refused by its account keeps its
+    /// refusal inside it. A real socket answers a read with "not connected" on no system a case
+    /// can count on, so the answers are given to the function that reads them.
+    #[test]
+    fn a_read_that_met_a_gone_peer_ends_the_stream_in_every_form() {
+        use std::io::ErrorKind;
+
+        for form in [
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+            ErrorKind::NotConnected,
+        ] {
+            assert!(
+                matches!(bytes_read(Err(std::io::Error::from(form))), Ok(0)),
+                "{form:?}"
+            );
+        }
+        assert!(matches!(bytes_read(Ok(7)), Ok(7)));
+        for other in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidInput,
+            ErrorKind::TimedOut,
+        ] {
+            let failure = bytes_read(Err(std::io::Error::from(other)));
+            assert!(
+                matches!(
+                    failure,
+                    Err(IpcError::Socket {
+                        operation: "read",
+                        ..
+                    })
+                ),
+                "{other:?} gave {failure:?}"
+            );
+        }
+        let refusal = IpcError::PeerAccountRejected {
+            detail: "the caller runs as another account".to_owned(),
+        };
+        let refused = bytes_read(Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            refusal,
+        )))
+        .expect_err("a refusal is not the end of the stream");
+        assert_eq!(
+            refused.code(),
+            kr_protocol::error::ErrorCode::PermissionDenied,
+            "{refused:?}"
+        );
+    }
 }
 
 /// The one place in this file that calls the operating system without a safe interface.
