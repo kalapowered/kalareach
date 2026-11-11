@@ -509,13 +509,16 @@ impl Network {
 
 /// How many live connections one paired device may hold on this host at once.
 ///
-/// A device that loses its link opens a new connection while the host still holds the old one, for
-/// as long as the transport's idle timeout, so a device holds more than one for a while. A device
-/// that opened them without end would hold the host's memory, the streams of each connection and
-/// its lookups. At a fifth the host serves the new connection and withdraws the device's oldest, so
-/// a phone that reconnects while an old connection lingers is never refused. An owner cannot change
-/// the bound.
-pub const DEVICE_LIVE_CONNECTIONS: usize = 4;
+/// The companion holds one connection for its main link and one for each session it has open, and
+/// it opens at most eight sessions, so it uses nine at once. A device that loses a link opens a new
+/// connection while the host still holds the old one, for as long as the transport's idle timeout,
+/// so each of the nine may linger once beside its replacement, which makes the bound twice nine.
+/// This crate cannot see the companion's figure: a case in the companion's suite holds the two
+/// together. A device that opened connections without end would hold the host's memory, the
+/// streams of each connection and its lookups. At the first connection above the bound the host
+/// serves the new connection and withdraws the device's oldest, so a phone that reconnects while
+/// an old connection lingers is never refused. An owner cannot change the bound.
+pub const DEVICE_LIVE_CONNECTIONS: usize = 18;
 
 /// The connections this host serves for each device, oldest first.
 #[derive(Default)]

@@ -14,6 +14,7 @@ mod net_support;
 use std::task::Poll;
 use std::time::Duration;
 
+use kr_controller::service::net::DEVICE_LIVE_CONNECTIONS;
 use kr_controller::service::net::config::NetworkSettings;
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_crypto::keys::DeviceKeys;
@@ -59,11 +60,24 @@ impl Paired {
         kr_transport::listener::device_principal(&self.record.device_id)
     }
 
-    /// Connects the device again, as a device does that lost a connection.
+    /// Connects the device again, as a device does that lost a connection. The host admits a burst
+    /// of new connections across every peer and returns a place at a fixed rate, so a case that
+    /// connects more than the burst in a moment is refused until a place is returned: it tries
+    /// again until it is admitted.
     async fn again(&self, host: &Host) -> RawDevice {
-        let raw = RawDevice::connect(host, &self.device, &self.record).await;
-        raw.claim();
-        raw
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            match RawDevice::admitted(host, &self.device, &self.record).await {
+                Ok(raw) => {
+                    raw.claim();
+                    return raw;
+                }
+                Err(error) if tokio::time::Instant::now() >= deadline => {
+                    panic!("the paired device connects: {error:?}");
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
     }
 }
 
@@ -1211,34 +1225,38 @@ async fn is_served(raw: &RawDevice) -> bool {
     )
 }
 
-/// KR-REQ-23.21: a device holds at most four live connections, and the newest wins. Each of two
-/// devices holds four, which withdraws nobody, and the first device's oldest has a mutation in
-/// flight, held before the service's ask. A fifth connection of the first device is served and its
-/// oldest is withdrawn: that connection ends at the device with no answer to the held request, and
-/// the same action sent on the fifth settles and is made at most once, whether or not the withdrawn
-/// connection's request committed before it was lost. The first device's other three connections
-/// stand, and so do the second device's four until its own fifth withdraws its own oldest only.
+/// KR-REQ-23.21: a device holds at most `DEVICE_LIVE_CONNECTIONS` live connections, and the newest
+/// wins. Each of two devices holds that many, which withdraws nobody, and the first device's oldest
+/// has a mutation in flight, held before the service's ask. The first connection of the first
+/// device above the bound is served and its oldest is withdrawn: that connection ends at the device
+/// with no answer to the held request, and the same action sent on the new one settles and is made
+/// at most once, whether or not the withdrawn connection's request committed before it was lost.
+/// The first device's other connections stand, and so do the second device's until its own first
+/// above the bound withdraws its own oldest only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_fifth_connection_of_a_device_withdraws_its_oldest() {
+async fn the_first_connection_of_a_device_above_the_bound_withdraws_its_oldest() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let rights = [ActionRight::FilesUpload, ActionRight::SessionView];
     let device = paired(&host, &owner, &rights).await;
     let neighbour = paired(&host, &owner, &rights).await;
-    // The first connection of each is the one `paired` opened; three more make four.
+    // The first connection of each is the one `paired` opened; the others make the bound.
     let mut device_more = Vec::new();
     let mut neighbour_more = Vec::new();
-    for _ in 0..3 {
+    for _ in 1..DEVICE_LIVE_CONNECTIONS {
         device_more.push(device.again(&host).await);
         neighbour_more.push(neighbour.again(&host).await);
     }
-    // The control: four connections withdraw nobody.
+    // The control: a bound's worth of connections withdraws nobody.
     for raw in [&device.raw, &neighbour.raw]
         .into_iter()
         .chain(&device_more)
         .chain(&neighbour_more)
     {
-        assert!(is_served(raw).await, "four connections are all served");
+        assert!(
+            is_served(raw).await,
+            "the connections a bound allows are all served"
+        );
     }
 
     // The oldest has a mutation in flight, held before the service's ask.
@@ -1264,23 +1282,27 @@ async fn a_fifth_connection_of_a_device_withdraws_its_oldest() {
         .await;
     arrived(held).await;
 
-    // A fifth connects and is served, and the oldest is withdrawn: it ends at the device, and the
+    // One above the bound connects and is served, and the oldest is withdrawn: it ends at the device, and the
     // held request gets no answer.
-    let fifth = device.again(&host).await;
-    assert!(is_served(&fifth).await, "the fifth connection is served");
+    let above = device.again(&host).await;
+    assert!(
+        is_served(&above).await,
+        "the connection above the bound is served"
+    );
     assert_eq!(
         device.raw.answered_before_closing(request, WAIT).await,
         Some(false),
         "the oldest connection ends with no answer to its held request"
     );
-    until(|| host.connections_of(&device.record) == 4).await;
+    let bound = u32::try_from(DEVICE_LIVE_CONNECTIONS).expect("a small bound");
+    until(|| host.connections_of(&device.record) == bound).await;
     release.send(()).expect("the held request goes on");
 
-    // The same action on the fifth, presented under the window it was first sent in as a device
+    // The same action on the new connection, presented under the window it was first sent in as a device
     // does that sends it again on a later connection, settles: it is answered from the record, or
     // the device is told that its outcome is not reported. Whether the held request committed
     // before its connection's registration went is for the host to say, and it never makes two.
-    let repeated = fifth
+    let repeated = above
         .mutate_in(
             window,
             Method::DraftCreate,
@@ -1292,7 +1314,7 @@ async fn a_fifth_connection_of_a_device_withdraws_its_oldest() {
     assert!(
         repeated.is_ok()
             || matches!(&repeated, Err(error) if error.code == ErrorCode::OutcomeUnknown),
-        "the same action on the fifth connection settles: {repeated:?}"
+        "the same action on the new connection settles: {repeated:?}"
     );
     let drafts = host
         .controller()
@@ -1302,18 +1324,18 @@ async fn a_fifth_connection_of_a_device_withdraws_its_oldest() {
         .expect("the drafts are counted");
     assert!(drafts <= 1, "the action made at most one draft: {drafts}");
 
-    // The other three stand, and so do the second device's four.
+    // The others stand, and so do the second device's.
     for raw in device_more
         .iter()
-        .chain([&fifth, &neighbour.raw])
+        .chain([&above, &neighbour.raw])
         .chain(&neighbour_more)
     {
         assert!(is_served(raw).await, "no other connection was withdrawn");
     }
 
-    // The second device's fifth withdraws its own oldest and nothing of the first device's. The
+    // The second device's first above the bound withdraws its own oldest and nothing of the first device's. The
     // request named is one the connection never made, so that its end is all there is to read.
-    let neighbours_fifth = neighbour.again(&host).await;
+    let neighbours_above = neighbour.again(&host).await;
     assert_eq!(
         neighbour
             .raw
@@ -1324,10 +1346,40 @@ async fn a_fifth_connection_of_a_device_withdraws_its_oldest() {
     );
     for raw in device_more
         .iter()
-        .chain([&fifth, &neighbours_fifth])
+        .chain([&above, &neighbours_above])
         .chain(&neighbour_more)
     {
         assert!(is_served(raw).await, "no connection but the oldest ended");
     }
+    host.stop().await;
+}
+
+/// KR-REQ-23.21 and KR-REQ-19.08: a device that holds nine connections, as the companion does with
+/// its main one and one for each of eight open sessions, is answered on every one of them after the
+/// ninth is made: the bound is above what the device uses, so nothing it uses is withdrawn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_holding_nine_connections_is_answered_on_every_one() {
+    const HELD: u32 = 9;
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = paired(
+        &host,
+        &owner,
+        &[ActionRight::FilesUpload, ActionRight::SessionView],
+    )
+    .await;
+    // The first connection is the one `paired` opened.
+    let mut more = Vec::new();
+    for _ in 1..HELD {
+        more.push(device.again(&host).await);
+    }
+    for raw in std::iter::once(&device.raw).chain(&more) {
+        assert!(
+            is_served(raw).await,
+            "every one of {HELD} connections is answered"
+        );
+    }
+    assert_eq!(host.connections_of(&device.record), HELD);
     host.stop().await;
 }

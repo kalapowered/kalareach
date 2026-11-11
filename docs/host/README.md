@@ -3360,8 +3360,10 @@ chunk's admission because a fence is owed or the authority feed has refused the 
 device is told, and the stream is read no further. When the connection's authority has gone, the
 connection is closed and nothing more is written on it.
 
-A device holds at most four live connections. At a fifth the host serves the new connection and
-withdraws the oldest as a revocation withdraws a device's connections: it is closed, a request in
+A device holds at most 18 live connections: the companion's main connection and the eight it holds
+for open sessions, each of which may linger once beside its replacement after a reconnection. At
+the first connection above the bound the host serves the new connection and withdraws the oldest as
+a revocation withdraws a device's connections: it is closed, a request in
 flight on it gets no answer, and the device presents the same action on a newer connection and
 settles it as it would after any lost connection. Another device's connections are not touched. An
 owner cannot change the bound.

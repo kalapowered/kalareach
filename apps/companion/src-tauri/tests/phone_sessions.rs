@@ -1185,6 +1185,22 @@ async fn kr_req_13_03_a_draft_is_the_same_after_a_visit_to_the_terminal() {
     adopted.stop().await;
 }
 
+/// KR-REQ-19.08: the host withdraws a device's oldest connection at the first one above its bound,
+/// and the phone holds a connection for its main link and one for each opened session, each of
+/// which may linger once beside its replacement after a reconnection. The host's bound is at least
+/// twice the main connection and the most opened sessions, so no connection the phone uses is
+/// withdrawn.
+#[test]
+fn kr_req_19_08_the_hosts_bound_on_a_devices_connections_covers_the_phones_links() {
+    let bound = kr_controller::service::net::DEVICE_LIVE_CONNECTIONS;
+    let used = 1 + companion_tauri::standing::OPENED_LIMIT;
+    assert!(
+        bound >= 2 * used,
+        "the host holds {bound} connections of a device and the phone uses {used}, each of which \
+         may linger once"
+    );
+}
+
 /// KR-REQ-19.08: the phone holds at most four ambient links and eight opened ones. Five sessions
 /// asked about at once from outside any screen are all answered, with no more than four links held;
 /// a ninth session opened is refused until one is left.
