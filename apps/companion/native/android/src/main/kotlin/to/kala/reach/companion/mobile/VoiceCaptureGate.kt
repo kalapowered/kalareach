@@ -12,7 +12,9 @@ package to.kala.reach.companion.mobile
  *   that answer. A permit belongs to one generation, and a revocation naming an older generation is
  *   refused, so one that arrives late cannot touch the call that replaced the one it was about;
  * - the deadline, on this device's monotonic clock, has not passed;
- * - the person has not muted the microphone;
+ * - the person has not muted the microphone. Whatever the recorder does with the muted track, a
+ *   microphone the person muted is displayed as muted, as on the other platform, unless the system
+ *   or the route has a reason of its own that is said first;
  * - the system has not taken it: audio focus lost to another application or a phone call, or
  *   capture suspended;
  * - the audio route is settled on a device that has an input;
@@ -275,9 +277,12 @@ class VoiceCaptureGate(private val keptIntervals: Int = 64) {
             taken == Taken.SUSPENDED -> VoiceCaptureState.SUSPENDED_BY_SYSTEM
             recording == Recording.SILENCED -> VoiceCaptureState.SUSPENDED_BY_SYSTEM
             routeChanging -> VoiceCaptureState.ROUTE_CHANGING
-            !inputAvailable || !recorderRunning || recording == Recording.UNREPORTED ->
-                VoiceCaptureState.UNAVAILABLE
+            !inputAvailable -> VoiceCaptureState.UNAVAILABLE
+            // The recorder stops with the muted track and the system then lists no recording of the
+            // call, so a muted call is said to be muted before the recorder is asked about: the
+            // person's own choice is the reason it is not running, and the screen offers to undo it.
             mutedByPerson -> VoiceCaptureState.MUTED_BY_PERSON
+            !recorderRunning || recording == Recording.UNREPORTED -> VoiceCaptureState.UNAVAILABLE
             else -> VoiceCaptureState.CAPTURING
         }
     }

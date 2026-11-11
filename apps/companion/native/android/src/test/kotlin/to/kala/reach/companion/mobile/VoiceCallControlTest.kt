@@ -314,7 +314,8 @@ class VoiceCallControlTest {
      * KR-REQ-15.35 and KR-REQ-15.36: the recorder runs only while the microphone track is on, so a
      * mute stops it and the system stops listing its recording. The person's unmute turns the track
      * on again, which is what lets the recorder start and the system list it; capture comes back as a
-     * second opening and nothing is carried before it does.
+     * second opening and nothing is carried before it does. While the person's mute holds, the call
+     * says the microphone is muted, not that none is available.
      */
     @Test
     fun an_unmute_turns_the_track_on_though_the_recorder_stopped_with_it() {
@@ -325,11 +326,12 @@ class VoiceCallControlTest {
         control.recorder(false)
         control.recording(emptyList())
         assertFalse(switches.microphoneOn)
-        assertEquals(VoiceCaptureState.UNAVAILABLE, control.displayed())
+        assertEquals(VoiceCaptureState.MUTED_BY_PERSON, control.displayed())
 
         control.setMutedByPerson(false)
         assertTrue("the track is on again, so that the recorder can start", switches.microphoneOn)
         assertFalse("nothing is carried before the recorder reports", control.carries())
+        assertEquals(VoiceCaptureState.UNAVAILABLE, control.displayed())
 
         control.recorder(true)
         control.recording(heard)

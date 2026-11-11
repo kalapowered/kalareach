@@ -118,9 +118,7 @@ class VoiceCallService : android.app.Service() {
          * Tells the notification what the microphone is doing.
          *
          * The screen and the notification say the same thing about capture, because while the
-         * screen is locked the notification is the only one of the two a person can read. The one
-         * difference is a microphone the person muted, which reads as unavailable once the recorder
-         * stops with the muted track: the notification says it is muted, as its control does.
+         * screen is locked the notification is the only one of the two a person can read.
          */
         @JvmStatic
         fun publishCapture(context: Context, call: Long, state: VoiceCaptureState) {
@@ -344,17 +342,8 @@ class VoiceCallService : android.app.Service() {
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Voice call running")
             // What the microphone is doing, in the person's own words, on the one surface that
-            // exists while the screen is locked. A microphone the person muted is said to be
-            // muted, as the control beside it says: the capture state of a muted call reads as no
-            // microphone, since the recorder stops with the muted track. Any other state the
-            // system put the capture in is said as it is.
-            .setContentText(
-                if (isMuted && capture == VoiceCaptureState.UNAVAILABLE) {
-                    VoiceCaptureState.MUTED_BY_PERSON.display
-                } else {
-                    capture.display
-                },
-            )
+            // exists while the screen is locked: the call's own state, said as it is.
+            .setContentText(capture.display)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)
             .setOnlyAlertOnce(true)

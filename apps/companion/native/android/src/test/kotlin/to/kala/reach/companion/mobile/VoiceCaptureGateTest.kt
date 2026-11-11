@@ -124,6 +124,41 @@ class VoiceCaptureGateTest {
         assertTrue(gate.captureEnabled(2_700))
     }
 
+    /**
+     * KR-REQ-15.36 and KR-ACC-014: a microphone the person muted is shown as muted. The recorder
+     * stops with the muted track and the system then lists no recording of the call, and neither
+     * turns the mute into "no microphone available": the person's own choice is said as it is,
+     * whatever the recorder does, so that the screen offers to unmute it. What the system did is
+     * still said first, and a route without an input is still not a microphone the person muted.
+     */
+    @Test
+    fun a_muted_microphone_is_shown_as_muted_while_its_recorder_is_stopped() {
+        val (gate, _) = permitted()
+        gate.setMutedByPerson(true, 2_000)
+        gate.recorder(running = false, nowMs = 2_000)
+        gate.recording(VoiceCaptureGate.Recording.UNREPORTED, 2_000)
+        assertEquals(VoiceCaptureState.MUTED_BY_PERSON, gate.displayed(2_100))
+        assertFalse(gate.captureEnabled(2_100))
+        assertEquals(VoiceCaptureState.MUTED_BY_PERSON, gate.proof(2_100).state)
+
+        // The unmute is the person's: until the recorder runs again the microphone is not available.
+        gate.setMutedByPerson(false, 3_000)
+        assertEquals(VoiceCaptureState.UNAVAILABLE, gate.displayed(3_000))
+        gate.recorder(running = true, nowMs = 3_100)
+        gate.recording(VoiceCaptureGate.Recording.AUDIBLE, 3_100)
+        assertEquals(VoiceCaptureState.CAPTURING, gate.displayed(3_100))
+        assertTrue(gate.captureEnabled(3_100))
+
+        // What the system did is said before what the person did, and so is a route with no input.
+        gate.setMutedByPerson(true, 4_000)
+        gate.recorder(running = false, nowMs = 4_000)
+        gate.taken(VoiceCaptureGate.Taken.FOCUS_LOST, 4_100)
+        assertEquals(VoiceCaptureState.FOCUS_LOST, gate.displayed(4_100))
+        gate.taken(VoiceCaptureGate.Taken.NONE, 4_200)
+        gate.route(changing = false, inputAvailable = false, nowMs = 4_300)
+        assertEquals(VoiceCaptureState.UNAVAILABLE, gate.displayed(4_300))
+    }
+
     /** KR-REQ-15.35 and 15.36: a route in change or without an input keeps capture off and says so. */
     @Test
     fun a_route_change_and_a_missing_input_keep_capture_off() {
