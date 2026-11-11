@@ -11,11 +11,15 @@
 //!
 //! Stopping is the order a person's machine sees it in: every live session is closed through the
 //! daemon, the workers end, the daemon removes their jobs, and only then is the daemon asked to
-//! stop, with the interrupt it answers.
+//! stop, with the interrupt it answers. Where an agent under test has been started in the run, no
+//! `kr` is run any more, since `kr` takes its target from the run's state, which that agent may
+//! have changed: the daemon is interrupted, the jobs of the run's workers are removed and the
+//! recorded processes are ended, all by the identities the run recorded.
 
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -223,6 +227,8 @@ pub struct Host<'r> {
     /// The control socket the daemon bound, by its device and inode, once the daemon has answered:
     /// what `kr` is run against is checked to be that socket, or why it could not be recorded.
     control: Mutex<Option<Result<(i128, i128), String>>>,
+    /// Whether the agent under test has been started ([`Host::agent_starts`]).
+    agent_started: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -279,6 +285,7 @@ impl<'r> Host<'r> {
             shell_packages: options.shell_packages.clone(),
             daemon: Mutex::new(None),
             control: Mutex::new(None),
+            agent_started: AtomicBool::new(false),
         };
         // The port was free when it was chosen, and it is bound when the daemon starts: other legs
         // choose theirs meanwhile, on this machine and on a shared one, and two can choose alike.
@@ -427,6 +434,17 @@ impl<'r> Host<'r> {
                 self.daemon_said()
             ),
         }
+    }
+
+    /// Says that the agent under test is about to be started, as many times as it is started.
+    ///
+    /// From then on the harness acts on nothing it reads from the run, since the agent runs in the
+    /// same account and may leave anything in the run's tree. `kr` reads the environment's identity
+    /// and the endpoint it connects to from that tree at every call, so no `kr` is run once the
+    /// agent may have started ([`Host::kr_within`] refuses, and [`Host::command`] panics); the host
+    /// is stopped, and dropped, by ending what the run recorded by identity instead.
+    pub fn agent_starts(&self) {
+        self.agent_started.store(true, Ordering::SeqCst);
     }
 
     /// The run this host belongs to.
@@ -659,8 +677,16 @@ impl<'r> Host<'r> {
     }
 
     /// A `kr` command with this host's environment, run in the run's own directory.
+    ///
+    /// # Panics
+    ///
+    /// Panics once the agent under test has started ([`Host::agent_starts`]).
     #[must_use]
     pub fn command(&self, arguments: &[&str]) -> Command {
+        assert!(
+            !self.agent_started.load(Ordering::SeqCst),
+            "kr {arguments:?} is not run once the agent under test has started"
+        );
         let mut command = Command::new(self.run.binary("kr"));
         command
             .args(arguments)
@@ -678,8 +704,12 @@ impl<'r> Host<'r> {
     ///
     /// # Errors
     ///
-    /// Returns why it was not run or did not finish.
+    /// Returns why it was not run or did not finish; it is never run once the agent under test has
+    /// started ([`Host::agent_starts`]).
     pub fn kr_within(&self, arguments: &[&str], within: Duration) -> Result<Output, String> {
+        if self.agent_started.load(Ordering::SeqCst) {
+            return Err("the agent under test has started, and no kr is run after it".to_owned());
+        }
         self.run.placed_as_it_was(&binary_place(HARNESS_PROGRAM))?;
         self.control_socket_is_the_daemons()?;
         output_within(self.command(arguments), within)
@@ -756,6 +786,9 @@ impl<'r> Host<'r> {
     /// Returns what did not end as it should. The daemon is stopped whatever happened before.
     pub fn stop(&self) -> Result<(), String> {
         self.record_workers();
+        if self.agent_started.load(Ordering::SeqCst) {
+            return self.end_by_identity();
+        }
         let mut problems = Vec::new();
         if let Err(problem) = self.close_sessions() {
             problems.push(problem);
@@ -778,6 +811,39 @@ impl<'r> Host<'r> {
         }
         if let Err(problem) = self.stop_daemon() {
             problems.push(problem);
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems.join("; "))
+        }
+    }
+
+    /// Ends what the run started, once the agent under test has started, by what the run recorded
+    /// before: the daemon is interrupted by its identity, the jobs the service manager shows to run
+    /// this run's worker are removed, and every recorded process (the workers, and the shells and
+    /// the agent beneath them, which [`Host::record_workers`] found in the process table) is ended
+    /// by its start identity. Nothing `kr` prints, and no file of the run, decides what is ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns what did not end as it should.
+    fn end_by_identity(&self) -> Result<(), String> {
+        let mut problems = Vec::new();
+        if let Err(problem) = self.stop_daemon() {
+            problems.push(problem);
+        }
+        self.run.remove_loaded_jobs();
+        self.run.end_everything();
+        // A job the service manager started again while the workers ended is removed as well.
+        self.run.remove_loaded_jobs();
+        match self.run.loaded_jobs() {
+            Ok(loaded) if loaded.is_empty() => {}
+            Ok(loaded) => problems.push(format!(
+                "these jobs of the run's workers are still loaded: {}",
+                loaded.join(", ")
+            )),
+            Err(why) => problems.push(why),
         }
         if problems.is_empty() {
             Ok(())
@@ -880,10 +946,13 @@ impl Drop for Host<'_> {
             .as_ref()
             .is_some_and(|daemon| running(&daemon.identity));
         // A leg that failed before it stopped its host. Whatever the host started is recorded
-        // first, from its registry, so the run can end it even when the daemon no longer answers;
-        // then the same order as a clean stop, bounded.
+        // first, from the process table, so the run can end it even when the daemon no longer
+        // answers; then the same order as a clean stop, bounded, or, where the agent under test has
+        // started, the ending by identity.
         self.record_workers();
-        if running {
+        if self.agent_started.load(Ordering::SeqCst) {
+            let _ = self.end_by_identity();
+        } else if running {
             let _ = self.close_sessions();
             let _ = self.stop_daemon();
         }
@@ -1051,6 +1120,7 @@ mod shutdown_tests {
             shell_packages: None,
             daemon: Mutex::new(None),
             control: Mutex::new(None),
+            agent_started: AtomicBool::new(false),
         }
     }
 
@@ -1276,6 +1346,179 @@ mod shutdown_tests {
         drop(run);
         std::fs::remove_dir_all(&root).expect("clean up");
         std::fs::remove_dir_all(&theirs).expect("clean up");
+    }
+
+    /// What an agent under test can leave in the run's state before the host is stopped: the
+    /// environment's identity rewritten to another host's, and a socket that is not the daemon's
+    /// bound at the place that identity gives. The run's `kr` is a script that connects to that
+    /// socket, as the product's `kr` does by path, and writes a mark.
+    struct Rewritten {
+        connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        ended: std::sync::Arc<AtomicBool>,
+        accepting: Option<std::thread::JoinHandle<()>>,
+        worker: std::process::Child,
+        mark: PathBuf,
+    }
+
+    impl Rewritten {
+        fn leave(host: &Host<'_>, mark: &Path) -> Self {
+            use std::os::unix::net::UnixListener;
+            use std::os::unix::process::CommandExt as _;
+            use std::sync::Arc;
+            use std::sync::atomic::AtomicUsize;
+            let run = host.run;
+            // A process that stands for the daemon: the interrupt ends it well.
+            let child = Command::new("/bin/sh")
+                .args(["-c", "trap 'exit 0' INT; while :; do /bin/sleep 1; done"])
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("a process to stand for the daemon");
+            let identity = run
+                .record_child(child.id(), "the control daemon")
+                .expect("the process's identity");
+            *host.daemon.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some(Daemon { child, identity });
+            // A process that runs as this run's worker, with a child beneath it.
+            let worker = Command::new("/bin/sh")
+                .arg0(run.root().join("b/kr-worker"))
+                .args([
+                    "-c",
+                    "/bin/sleep 30; true",
+                    "--session",
+                    &kr_ipc::new_uuid().to_string(),
+                    "--reservation",
+                    &kr_ipc::new_uuid().to_string(),
+                ])
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("a process standing for a worker");
+            host.agent_starts();
+            // What the agent left: another identity, and a socket of another host at its place.
+            let other = EnvironmentId::new(kr_ipc::new_uuid());
+            std::fs::write(host.paths.environment_id_file(), format!("{other}\n"))
+                .expect("the identity rewritten");
+            let elsewhere = host.paths.environment(other);
+            elsewhere.create().expect("the other host's directories");
+            let place = elsewhere
+                .controller_endpoint()
+                .expect("the other host's endpoint")
+                .as_path()
+                .to_path_buf();
+            let listener = UnixListener::bind(&place).expect("the other host's socket");
+            listener.set_nonblocking(true).expect("a polling listener");
+            std::fs::write(run.home().join("socket-place"), place.display().to_string())
+                .expect("where kr connects");
+            let connections = Arc::new(AtomicUsize::new(0));
+            let ended = Arc::new(AtomicBool::new(false));
+            let accepting = {
+                let (connections, ended) = (Arc::clone(&connections), Arc::clone(&ended));
+                std::thread::spawn(move || {
+                    while !ended.load(Ordering::SeqCst) {
+                        if listener.accept().is_ok() {
+                            connections.fetch_add(1, Ordering::SeqCst);
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                })
+            };
+            Self {
+                connections,
+                ended,
+                accepting: Some(accepting),
+                worker,
+                mark: mark.to_path_buf(),
+            }
+        }
+
+        /// Checks that nothing connected to the other host's socket and no `kr` ran, and that every
+        /// process the run recorded has ended.
+        fn finish(mut self, run: &Run) {
+            std::thread::sleep(Duration::from_millis(200));
+            self.ended.store(true, Ordering::SeqCst);
+            if let Some(accepting) = self.accepting.take() {
+                accepting.join().expect("the accepting thread");
+            }
+            let _ = self.worker.wait();
+            assert_eq!(
+                self.connections.load(Ordering::SeqCst),
+                0,
+                "something connected to the socket of the host the identity named"
+            );
+            assert_eq!(runs(&self.mark), 0, "a kr was run after the agent started");
+            let alive: Vec<String> = run
+                .owned()
+                .iter()
+                .filter(|owned| running(&owned.identity))
+                .map(|owned| owned.what.clone())
+                .collect();
+            assert!(alive.is_empty(), "still running: {alive:?}");
+            assert!(
+                run.owned()
+                    .iter()
+                    .any(|owned| owned.what.starts_with("the worker of session")),
+                "the worker was recorded by its command line: {:?}",
+                run.owned().iter().map(|o| &o.what).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// A `kr` that connects to the socket named in the run's home, as the product's `kr` connects
+    /// to the endpoint it makes from the identity it reads, and writes a mark.
+    fn host_with_a_connecting_kr(root: &Path) -> (Run, PathBuf) {
+        let (run, mark) = host_with_a_kr(root);
+        let kr = root.join("b/kr");
+        std::fs::write(
+            &kr,
+            "#!/bin/sh\necho placed >> \"$HOME/ran\"\n/usr/bin/nc -U \"$(cat \"$HOME/socket-place\")\" \
+             </dev/null >/dev/null 2>&1\n",
+        )
+        .expect("a kr");
+        (run, mark)
+    }
+
+    /// After the agent under test has started, the host's stop runs no `kr`: an identity rewritten
+    /// to another host's, with that host's socket at the place it gives, is never connected to, and
+    /// the daemon, the worker and what runs beneath it, which the run recorded, are ended.
+    #[test]
+    fn a_rewritten_identity_and_another_hosts_socket_are_never_connected_to_when_the_host_stops() {
+        let root = PathBuf::from(format!(
+            "/private/tmp/kt-{}",
+            &kr_ipc::new_uuid().to_string()[..8]
+        ));
+        std::fs::create_dir_all(&root).expect("a short run directory");
+        let (run, mark) = host_with_a_connecting_kr(&root);
+        run.note_placed(Path::new("b/kr"))
+            .expect("the placed kr is recorded");
+        let host = host_over(&run);
+        let left = Rewritten::leave(&host, &mark);
+        host.record_workers();
+        let stopped = host.stop();
+        assert!(stopped.is_ok(), "the host stopped: {stopped:?}");
+        left.finish(&run);
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// The same where the host is dropped with its daemon still running, as a case that failed
+    /// leaves it.
+    #[test]
+    fn a_rewritten_identity_and_another_hosts_socket_are_never_connected_to_when_the_host_is_dropped()
+     {
+        let root = PathBuf::from(format!(
+            "/private/tmp/kt-{}",
+            &kr_ipc::new_uuid().to_string()[..8]
+        ));
+        std::fs::create_dir_all(&root).expect("a short run directory");
+        let (run, mark) = host_with_a_connecting_kr(&root);
+        run.note_placed(Path::new("b/kr"))
+            .expect("the placed kr is recorded");
+        let host = host_over(&run);
+        let left = Rewritten::leave(&host, &mark);
+        drop(host);
+        left.finish(&run);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     /// A link, or a second name, left at the daemon's log is a class in the error and none of the
