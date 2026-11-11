@@ -27,7 +27,7 @@ use crate::frame::Class;
 use crate::manifest::{GitSet, Manifest, ObjectKind};
 use crate::policy::{RULE_CHECKOUT, RULE_CONNECT};
 use crate::quote::quote_command_line;
-use crate::window::search_is_over;
+use crate::window::{Bound, bound, search_is_over};
 
 use super::applocker;
 use super::ffi::{self, Sid};
@@ -68,6 +68,14 @@ fn left_before(deadline: Instant) -> Result<Duration, Proof> {
 fn program_deadline(deadline: Instant, limit: Instant) -> Result<Instant, Proof> {
     left_before(deadline)?;
     Ok(limit.min(Instant::now() + PROGRAM_BOUND))
+}
+
+/// The deadline of one program of the search for a refusal: the search window's end, or
+/// [`PROGRAM_BOUND`] from now when that comes first, with which of the two it is. The proof's
+/// failure when no time is left.
+fn search_bound(deadline: Instant, search_until: Instant) -> Result<Bound, Proof> {
+    left_before(deadline)?;
+    Ok(bound(search_until, Instant::now() + PROGRAM_BOUND))
 }
 
 /// The result of a proof.
@@ -509,6 +517,7 @@ pub fn prove(
     let mut attempts = 0_u32;
     let mut refused = false;
     let mut over = false;
+    let mut cut_launch = false;
     let mut last = String::from("no launch was made");
     loop {
         if stop.is_set() {
@@ -519,18 +528,21 @@ pub fn prove(
             // deadline like everything else.
             let log = applocker::latest(&scratch.0, &environment, deadline)
                 .unwrap_or_else(|error| format!("unreadable: {error}"));
-            let seen = if refused {
-                "refused, but the log named no rule"
-            } else {
-                "not refused"
+            let seen = match (refused, cut_launch) {
+                (true, true) => {
+                    "refused earlier; the launch that the search's end cut had started, and was not refused"
+                }
+                (false, true) => "not refused; the launch that the search's end cut had started",
+                (true, false) => "refused, but the log named no rule",
+                (false, false) => "not refused",
             };
             return fail(format!(
                 "the policy did not show a refusal of the unlisted program to {account} by rule {rule} before the proof's deadline ({seen}; {attempts} launches in {:.0} s; the last: {last}; the application-control log last said: {log})",
                 started.elapsed().as_secs_f32()
             ));
         }
-        let by = match program_deadline(deadline, search_until) {
-            Ok(by) => by,
+        let bound = match search_bound(deadline, search_until) {
+            Ok(bound) => bound,
             Err(failed) => return failed,
         };
         attempts += 1;
@@ -541,24 +553,28 @@ pub fn prove(
             &[],
             &scratch.0,
             &environment,
-            by,
+            bound.by,
         );
         // A launch that the search's own end kept from starting is the end of the search, not a
         // failure of the proof: the log is read next, from the reserve.
-        if matches!(launched, Err(LaunchError::DeadlinePassed)) {
+        if matches!(launched, Err(LaunchError::DeadlinePassed)) && search_is_over(true, bound) {
             continue;
         }
-        // A program that began in the last moments of the search's window was cut by the window's
-        // own end, and ran for no bound of its own: the search is over, not the proof.
+        // A program that was given the window's end as its deadline and was cut at it ran for no
+        // bound of its own: the search is over, not the proof. The launch did start, and the
+        // failure's text says so. A program cut at its own bound, and every other result of a
+        // launch, is judged as it is at any time.
         if matches!(
             launched,
             Ok(Captured {
                 outcome: Outcome::TimedOut,
                 ..
             })
-        ) && search_is_over(true, Instant::now(), search_until, END_RESERVE)
+        ) && search_is_over(true, bound)
         {
             over = true;
+            cut_launch = true;
+            last = String::from("a launch cut by the end of the search had started");
             continue;
         }
         match judge_launch(launched, refused, &account, attempts) {
@@ -584,16 +600,13 @@ pub fn prove(
                         break;
                     }
                 }
-                // A query that began in the last moments of the window was cut by the window's own
-                // end; any other failure of the query is a failure of the proof until the end.
-                Err(error)
-                    if search_is_over(
-                        matches!(error, applocker::Error::TimedOut { .. }),
-                        Instant::now(),
-                        search_until,
-                        END_RESERVE,
-                    ) =>
-                {
+                // A query that was cut at the window's own end (the deadline it was given) ends the
+                // search; a query that failed to start, a pipe error, a bad exit or a cut at the
+                // query's own bound is a failure of the proof at any time.
+                Err(applocker::Error::TimedOut {
+                    by_the_deadline: true,
+                    ..
+                }) => {
                     over = true;
                 }
                 Err(error) => return fail(error.to_string()),

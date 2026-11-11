@@ -2,20 +2,36 @@
 //!
 //! The search runs programs and queries of the log inside a window that ends before the proof's
 //! deadline, so that the log's last words can still be read from the time kept after it. A run is
-//! given its deadline less a short reserve for the end of its job and of its pipes, so a program or
-//! a query that begins inside that last reserve of the window is cut at once and ends as timed out
-//! without having failed at anything. That cut is the window's own end, and the search is over then;
-//! it is not a failure of the proof, which would hide the log's last words. Every other failure of a
-//! run is a failure of the proof at any time.
+//! given the earlier of the window's end and a bound of its own, and it is cut at that deadline. A
+//! run that the window's end cut ends as timed out without having failed at anything: the search is
+//! over then, and it is not a failure of the proof, which would hide the log's last words. What cut
+//! a run is known from the deadline that it was given, never from the clock at the time it returned:
+//! a run that ended at its own bound, and every failure of a run (it could not start, a pipe failed,
+//! it ended badly), is a failure of the proof at any time, also after the window's end.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-/// Whether the search is over after a run inside it, at `now`.
-///
-/// After the window's end any result ends the search. Before it, only a run that was cut at its
-/// deadline (`cut`) does, and only when the cut can have come from the window's end: when `now`
-/// is within `reserve` of it.
+/// A run's deadline inside the window, and whether the window's end set it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bound {
+    /// The deadline the run is given.
+    pub by: Instant,
+    /// Whether that deadline is the window's end and not the run's own bound.
+    pub by_the_window: bool,
+}
+
+/// The deadline of a run that may take until `own` and must end by `window_end`.
 #[must_use]
-pub fn search_is_over(cut: bool, now: Instant, search_until: Instant, reserve: Duration) -> bool {
-    now >= search_until || (cut && now + reserve >= search_until)
+pub fn bound(window_end: Instant, own: Instant) -> Bound {
+    Bound {
+        by: window_end.min(own),
+        by_the_window: window_end <= own,
+    }
+}
+
+/// Whether the search is over after a run that was given `bound`: only a run that was cut at its
+/// deadline (`cut`), when that deadline was the window's end.
+#[must_use]
+pub fn search_is_over(cut: bool, bound: Bound) -> bool {
+    cut && bound.by_the_window
 }
