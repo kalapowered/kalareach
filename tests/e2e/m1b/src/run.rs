@@ -57,6 +57,8 @@ pub struct Owned {
 pub struct Run {
     leg: String,
     root: PathBuf,
+    /// The directory `root` named when this run made it, for the run's whole life.
+    pin: RootPin,
     owned: Mutex<Vec<Owned>>,
     /// The system's own programs seen running as another user beneath the run's processes, by
     /// number and the file each runs: not the run's to end, and checked ended at the close.
@@ -110,9 +112,15 @@ impl Run {
             let _ = std::fs::remove_dir_all(&made);
             panic!("the run's directory resolves: {error}")
         });
+        // Pinned right after it was made, before anything else could be put in its place.
+        let pin = RootPin::of(&root).unwrap_or_else(|why| {
+            let _ = std::fs::remove_dir_all(&made);
+            panic!("{why}")
+        });
         let run = Self {
             leg: leg.to_owned(),
             root,
+            pin,
             owned: Mutex::new(Vec::new()),
             system_programs: Mutex::new(Vec::new()),
             undiscovered: Mutex::new(Vec::new()),
@@ -153,6 +161,13 @@ impl Run {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The identity of the directory this run made, which a reader or a removal of the run's
+    /// directory checks the directory it is given against.
+    #[must_use]
+    pub fn pin(&self) -> &RootPin {
+        &self.pin
     }
 
     /// Where one copied binary is.
@@ -609,11 +624,214 @@ fn make_exclusively(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// The directory a run made: its device and inode from the handle opened on it right after it was
+/// made, and the place that handle then had. A mount point is never the directory a run made, and
+/// neither is another directory renamed to its path, so a directory that does not match is not the
+/// run's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RootPin {
+    device: i128,
+    inode: i128,
+    place: PathBuf,
+}
+
+/// Opens the directory at `path`, following no link at its last component.
+fn open_directory(path: &Path) -> rustix::io::Result<std::os::fd::OwnedFd> {
+    use rustix::fs::{Mode, OFlags};
+    rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+}
+
+/// The place an open file or directory has now, as the system says it, or `None` where it will not.
+#[must_use]
+pub fn current_place(handle: impl std::os::fd::AsFd) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let place = rustix::fs::getpath(handle).ok()?;
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(place.to_bytes())))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        use std::os::fd::AsRawFd as _;
+        std::fs::read_link(format!("/proc/self/fd/{}", handle.as_fd().as_raw_fd())).ok()
+    }
+}
+
+impl RootPin {
+    /// Pins the directory at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns why it could not be opened and looked at.
+    pub fn of(path: &Path) -> Result<Self, String> {
+        let said =
+            |error: rustix::io::Errno| format!("the run's directory cannot be pinned: {error}");
+        let handle = open_directory(path).map_err(said)?;
+        let stat = rustix::fs::fstat(&handle).map_err(said)?;
+        let place = current_place(&handle)
+            .ok_or_else(|| "the system names no place for the run's directory".to_owned())?;
+        Ok(Self {
+            device: i128::from(stat.st_dev),
+            inode: i128::from(stat.st_ino),
+            place,
+        })
+    }
+
+    /// Whether `handle` is the directory that was pinned.
+    #[must_use]
+    pub fn holds(&self, handle: impl std::os::fd::AsFd) -> bool {
+        rustix::fs::fstat(handle).is_ok_and(|stat| {
+            i128::from(stat.st_dev) == self.device && i128::from(stat.st_ino) == self.inode
+        })
+    }
+
+    /// Whether the open file or directory `handle` is now beneath the pinned directory's place: a
+    /// directory that was moved out of the run, or a file moved into one that was, is not.
+    #[must_use]
+    pub fn contains(&self, handle: impl std::os::fd::AsFd) -> bool {
+        current_place(handle).is_some_and(|place| place.starts_with(&self.place))
+    }
+}
+
+/// Why a run's directory was left where it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Left {
+    /// The path is not the directory the run made.
+    RootChanged,
+    /// An entry lies on another file system than the run's directory, as a mounted volume does:
+    /// nothing is entered or removed on it, and nothing else is removed either.
+    AnotherFileSystem,
+    /// The system refused a look, an opening or a removal.
+    Refused,
+}
+
+impl std::fmt::Display for Left {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::RootChanged => "the path is not the directory the run made",
+            Self::AnotherFileSystem => "an entry below it lies on another file system",
+            Self::Refused => "the system refused a look or a removal",
+        })
+    }
+}
+
+/// What became of the removal of a run's directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Removal {
+    /// The directory is gone.
+    Removed,
+    /// The directory, or part of it, is where it was.
+    Left(Left),
+}
+
+/// The deepest the removal goes.
+const DEEPEST_REMOVAL: usize = 128;
+
+/// Looks at every entry of `directory` and below, and with `remove` unlinks it, all through
+/// handles: each entry is looked at with no link followed and compared with `device`, each
+/// directory is opened with no link followed and checked to be the one that was looked at, and each
+/// entry is unlinked relative to its directory's handle. An entry on another device is entered by
+/// nothing and removed by nothing.
+fn walk_for_removal(
+    directory: &std::os::fd::OwnedFd,
+    device: rustix::fs::Dev,
+    depth: usize,
+    remove: bool,
+) -> Result<(), Left> {
+    use rustix::fs::{AtFlags, FileType};
+    if depth > DEEPEST_REMOVAL {
+        return Err(Left::Refused);
+    }
+    let mut names = Vec::new();
+    for entry in rustix::fs::Dir::read_from(directory).map_err(|_| Left::Refused)? {
+        let name = entry.map_err(|_| Left::Refused)?.file_name().to_owned();
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(name);
+        }
+    }
+    for name in names {
+        let looked = match rustix::fs::statat(directory, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+        {
+            Ok(looked) => looked,
+            Err(rustix::io::Errno::NOENT) => continue,
+            Err(_) => return Err(Left::Refused),
+        };
+        if looked.st_dev != device {
+            return Err(Left::AnotherFileSystem);
+        }
+        if FileType::from_raw_mode(looked.st_mode) == FileType::Directory {
+            let child = rustix::fs::openat(
+                directory,
+                name.as_c_str(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(|_| Left::Refused)?;
+            let opened = rustix::fs::fstat(&child).map_err(|_| Left::Refused)?;
+            if (opened.st_dev, opened.st_ino) != (looked.st_dev, looked.st_ino) {
+                return Err(Left::AnotherFileSystem);
+            }
+            walk_for_removal(&child, device, depth + 1, remove)?;
+            if remove {
+                rustix::fs::unlinkat(directory, name.as_c_str(), AtFlags::REMOVEDIR)
+                    .map_err(|_| Left::Refused)?;
+            }
+        } else if remove {
+            rustix::fs::unlinkat(directory, name.as_c_str(), AtFlags::empty())
+                .map_err(|_| Left::Refused)?;
+        }
+    }
+    Ok(())
+}
+
+/// Removes the run's directory `root` and what is below it, and only that: the directory must be the
+/// one `pin` names, and it is looked through once for an entry on another file system before
+/// anything is removed. A volume mounted below the run, or a root that is not the directory the run
+/// made, leaves the whole directory where it is, and the removal enters and removes nothing on
+/// another device in any case.
+#[must_use]
+pub fn remove_run_directory(root: &Path, pin: &RootPin) -> Removal {
+    let handle = match open_directory(root) {
+        Ok(handle) => handle,
+        Err(rustix::io::Errno::NOENT) => return Removal::Removed,
+        Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => {
+            return Removal::Left(Left::RootChanged);
+        }
+        Err(_) => return Removal::Left(Left::Refused),
+    };
+    if !pin.holds(&handle) {
+        return Removal::Left(Left::RootChanged);
+    }
+    let Ok(stat) = rustix::fs::fstat(&handle) else {
+        return Removal::Left(Left::Refused);
+    };
+    for remove in [false, true] {
+        if let Err(left) = walk_for_removal(&handle, stat.st_dev, 1, remove) {
+            return Removal::Left(left);
+        }
+    }
+    match rustix::fs::rmdir(root) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => Removal::Removed,
+        Err(_) => Removal::Left(Left::Refused),
+    }
+}
+
 impl Drop for Run {
     fn drop(&mut self) {
         let passed = *self.passed.lock().unwrap_or_else(PoisonError::into_inner);
         if passed {
-            let _ = std::fs::remove_dir_all(&self.root);
+            // Inside the run: a volume mounted below it, or a root that is no longer the directory
+            // this run made, leaves the directory where it is.
+            if let Removal::Left(why) = remove_run_directory(&self.root, &self.pin) {
+                eprintln!("the {} leg's directory is left in place: {why}", self.leg);
+            }
             return;
         }
         // A leg that failed part way. What it started is ended through the record, the jobs its
