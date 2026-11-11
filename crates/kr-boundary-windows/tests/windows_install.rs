@@ -1287,11 +1287,49 @@ fn the_removal_deletes_a_leftover_replacement_and_names_what_stayed_when_the_dat
             .any(|line| line.contains(&paths.data.display().to_string())),
         "the data directory is named: {stayed:?}"
     );
+    assert!(
+        paths.staging.exists(),
+        "staging goes last: it stays while a record stays"
+    );
     drop(held);
     // Without the hold the replacement goes with the rest, and nothing is left to name.
     assert!(install::remove_records(&paths).is_empty());
     assert!(!paths.data.exists(), "the data directory is gone");
     let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// The whole removal can be run again after a failure in its middle. Another program holds the
+/// manifest open, so the last step cannot delete it and the removal fails and names it; the manifest
+/// is still read by a second removal, which reads the policy records through the channel and needs
+/// the staging directory that the first left in place. Once the program lets go, the second removal
+/// finishes and the computer is as it was.
+#[cfg(feature = "testing")]
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_removal_that_could_not_delete_a_record_is_run_again_whole_and_finishes() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let case = Case::new();
+    let before = snapshot();
+    let (code, output) = case.install();
+    assert_eq!(code, 0, "{output}");
+    let manifest = Paths::system().manifest;
+    // Shared for reading and writing and not for deleting: the removal reads the manifest, and the
+    // call that deletes it fails.
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .open(&manifest)
+        .unwrap();
+    let (code, output) = setup(&["remove"], "yes\n", &[]);
+    drop(held);
+    assert_ne!(code, 0, "{output}");
+    assert!(
+        output.contains(&manifest.display().to_string()),
+        "the record that stayed is named: {output}"
+    );
+    let (code, output) = setup(&["remove"], "yes\n", &[]);
+    assert_eq!(code, 0, "{output}");
+    assert_eq!(snapshot(), before, "the second removal finished");
 }
 
 /// A refusal in the program directory names a remedy that cures its reason, in a repair and in a
