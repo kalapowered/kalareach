@@ -224,8 +224,8 @@ impl ReadPause {
 }
 
 /// Where this host's own tests hold the withdrawal of network connections: every deregistration
-/// that reaches it once it is armed waits there, and the first says it has arrived. They go when the
-/// test sets the end it was given to `true` or drops it.
+/// that reaches it once it is armed waits there, and the first that announces itself says it has
+/// arrived. They go when the test sets the end it was given to `true` or drops it.
 #[cfg(feature = "testing")]
 #[derive(Debug, Default)]
 struct DeregistrationHold(
@@ -246,8 +246,9 @@ impl DeregistrationHold {
         (arrival, open)
     }
 
-    /// Waits here when the hold is armed, until it is opened or its end is dropped.
-    async fn wait(&self) {
+    /// Waits here when the hold is armed, until it is opened or its end is dropped. A withdrawal
+    /// that `announce`s itself is the one whose arrival the test is told of.
+    async fn wait(&self, announce: bool) {
         let mut opened = {
             let mut armed = self
                 .0
@@ -256,8 +257,10 @@ impl DeregistrationHold {
             let Some((arrived, opened)) = armed.as_mut() else {
                 return;
             };
-            if let Some(arrived) = arrived.take() {
-                let _ = arrived.send(());
+            if announce {
+                if let Some(arrived) = arrived.take() {
+                    let _ = arrived.send(());
+                }
             }
             opened.clone()
         };

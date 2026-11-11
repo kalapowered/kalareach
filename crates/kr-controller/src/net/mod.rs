@@ -445,12 +445,21 @@ impl Network {
         self.guard.host.revoke_device(device_id).await
     }
 
-    /// How many frames of a data stream have begun to wait for the gate of their transfer, as a
-    /// count a suite can wait on to know the one it is holding behind another has reached it.
+    /// How many frames of a data stream have found the gate of their transfer held and begun to
+    /// wait for it, as a count a suite can wait on to know that the frame it is holding behind
+    /// another has found the gate held.
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn chunk_gate_waits(&self) -> tokio::sync::watch::Receiver<u64> {
         self.guard.host.chunks.gate_waits()
+    }
+
+    /// How many tasks that serve a data stream have ended, however they ended, as a count a suite
+    /// can wait on to know that the task of a stream it dropped is gone.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn chunk_tasks_ended(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.guard.host.chunks.tasks_ended()
     }
 
     /// Holds the next frame of a data stream that has taken its transfer's gate, before it asks
@@ -662,7 +671,10 @@ impl HostHandler for NetworkHost {
         if let Some(controller) = self.controller.upgrade() {
             tokio::spawn(async move {
                 #[cfg(feature = "testing")]
-                controller.before_a_connection_is_deregistered.wait().await;
+                controller
+                    .before_a_connection_is_deregistered
+                    .wait(true)
+                    .await;
                 controller.deregister(connection_id);
             });
         }
@@ -1653,7 +1665,10 @@ impl Drop for ConnectionGuard {
         tokio::spawn(async move {
             remote.release().await;
             #[cfg(feature = "testing")]
-            controller.before_a_connection_is_deregistered.wait().await;
+            controller
+                .before_a_connection_is_deregistered
+                .wait(false)
+                .await;
             controller.deregister(connection_id);
         });
     }
