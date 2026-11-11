@@ -95,13 +95,14 @@ impl Run {
         // temporary directory there is 57 of them. A socket a worker binds for a command it
         // integrates lies 42 bytes below the run's directory, which would make it 111 bytes.
         // `/tmp` is on the internal disk there as well.
-        let suffix = kr_ipc::new_uuid().to_string();
         let base = if cfg!(target_os = "macos") {
             PathBuf::from("/tmp")
         } else {
             std::env::temp_dir()
         };
-        let made = base.join(format!("krm-{}", &suffix[..8]));
+        // Made by this call and no other: a directory that was there is never taken, so what a
+        // failed start or a passed run removes is only what this run made.
+        let made = made_root(&base, || kr_ipc::new_uuid().to_string());
         kr_ipc::paths::create_private_tree(&made, &made)
             .expect("an owner-only directory for this run on the internal disk");
         let root = std::fs::canonicalize(&made).unwrap_or_else(|error| {
@@ -568,6 +569,43 @@ impl Run {
             }
         }
         Ok(labels)
+    }
+}
+
+/// Makes the run's root directory under `base`, owner-only, named `krm-` and the first eight
+/// characters of a name from `names`, and returns it. The directory is created exclusively: a name
+/// that is taken, by a directory of another run or by anything else, is left as it is and the next
+/// name is tried, so the directory returned is one this call made.
+///
+/// # Panics
+///
+/// Panics when the directory cannot be made for a reason other than its name being taken, or when
+/// sixty-four names are all taken.
+fn made_root(base: &Path, mut names: impl FnMut() -> String) -> PathBuf {
+    for _ in 0..64 {
+        let made = base.join(format!("krm-{}", &names()[..8]));
+        match make_exclusively(&made) {
+            Ok(()) => return made,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                panic!("an owner-only directory for this run on the internal disk: {error}")
+            }
+        }
+    }
+    panic!("the run's directory has no free name among sixty-four tries")
+}
+
+/// Creates the one directory `path`, owner-only where the platform has modes, and fails with
+/// `AlreadyExists` where anything is at `path`, a symbolic link included.
+fn make_exclusively(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(path)
     }
 }
 
@@ -1042,5 +1080,30 @@ mod tests {
             None,
             "only a refusal is taken for another user"
         );
+    }
+}
+
+#[cfg(test)]
+mod root_tests {
+    use super::*;
+
+    #[test]
+    fn a_root_that_was_there_is_left_as_it_is_and_another_name_is_taken() {
+        let base = std::env::temp_dir().join(format!("kr-run-root-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&base).expect("a scratch directory");
+        // A directory of another run, owner-only, which a start that took it would remove.
+        let taken = base.join("krm-aaaaaaaa");
+        make_exclusively(&taken).expect("a directory of another run");
+        std::fs::write(taken.join("kept"), b"evidence").expect("a file in it");
+        // A name taken by a link is taken too.
+        std::os::unix::fs::symlink(&taken, base.join("krm-bbbbbbbb")).expect("a link");
+        let mut names = ["aaaaaaaa", "bbbbbbbb", "cccccccc"].into_iter();
+        let made = made_root(&base, || names.next().expect("a name").to_owned());
+        assert_eq!(made, base.join("krm-cccccccc"));
+        assert!(
+            taken.join("kept").is_file(),
+            "the other run's directory is untouched"
+        );
+        std::fs::remove_dir_all(&base).expect("clean up");
     }
 }
