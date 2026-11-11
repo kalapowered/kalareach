@@ -14,48 +14,65 @@
 //
 // Text is written as the hexadecimal of its UTF-8 bytes. Each line is written whole, so a reader
 // takes the lines that end in a line feed and leaves a last one that does not.
+//
+// Nothing here is shared through a top-level binding: the log and the given text are handed to the
+// object that uses them, and the statements at the end only start the program. That is what keeps
+// the file valid for every Swift compiler and language mode that can build it.
 
 import AppKit
-
-let arguments = CommandLine.arguments
-guard arguments.count == 3 else {
-    FileHandle.standardError.write(Data("usage: desktop_window <log file> <given text>\n".utf8))
-    exit(2)
-}
-let given = arguments[2]
-
-guard FileManager.default.createFile(atPath: arguments[1], contents: nil),
-    let log = FileHandle(forWritingAtPath: arguments[1])
-else {
-    FileHandle.standardError.write(Data("desktop_window: the log could not be made\n".utf8))
-    exit(2)
-}
 
 func hex(_ text: String) -> String {
     text.utf8.map { String(format: "%02x", $0) }.joined()
 }
 
-// A line that cannot be written ends the program: a log with a line missing would pass for one
-// that says nothing happened.
-func record(_ line: String) {
-    do {
-        try log.write(contentsOf: Data((line + "\n").utf8))
-    } catch {
-        FileHandle.standardError.write(
-            Data("desktop_window: the log could not be written: \(error)\n".utf8))
-        exit(3)
+func fail(_ message: String, status: Int32) -> Never {
+    FileHandle.standardError.write(Data("desktop_window: \(message)\n".utf8))
+    exit(status)
+}
+
+/// The log, one line at a time.
+///
+/// A line that cannot be written ends the program: a log with a line missing would pass for one
+/// that says nothing happened.
+final class Recorder {
+    private let handle: FileHandle
+
+    init(path: String) {
+        guard FileManager.default.createFile(atPath: path, contents: nil),
+            let handle = FileHandle(forWritingAtPath: path)
+        else {
+            fail("the log could not be made", status: 2)
+        }
+        self.handle = handle
+    }
+
+    func record(_ line: String) {
+        do {
+            try handle.write(contentsOf: Data((line + "\n").utf8))
+        } catch {
+            fail("the log could not be written: \(error)", status: 3)
+        }
     }
 }
 
+@MainActor
 final class Window: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
-    let window = NSWindow(
+    private let given: String
+    private let recorder: Recorder
+    private let window = NSWindow(
         contentRect: NSRect(x: 240, y: 240, width: 420, height: 80),
         styleMask: [.titled],
         backing: .buffered,
         defer: false
     )
-    let field = NSTextField(frame: NSRect(x: 20, y: 24, width: 380, height: 28))
-    var focused: Bool?
+    private let field = NSTextField(frame: NSRect(x: 20, y: 24, width: 380, height: 28))
+    private var focused: Bool?
+
+    init(given: String, recorder: Recorder) {
+        self.given = given
+        self.recorder = recorder
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         window.title = "kalareach test window"
@@ -63,7 +80,7 @@ final class Window: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         field.isEditable = true
         field.delegate = self
         window.contentView?.addSubview(field)
-        record("text \(hex(given))")
+        recorder.record("text \(hex(given))")
 
         let names = [
             NSApplication.didBecomeActiveNotification,
@@ -72,19 +89,21 @@ final class Window: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             NSWindow.didResignKeyNotification,
         ]
         for name in names {
-            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) {
-                [weak self] _ in self?.report()
-            }
+            NotificationCenter.default.addObserver(
+                self, selector: #selector(stateChanged(_:)), name: name, object: nil)
         }
         // Local monitors see what reaches this application and nothing sent to another one.
         let kinds: NSEvent.EventTypeMask = [
             .keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel,
         ]
-        NSEvent.addLocalMonitorForEvents(matching: kinds) { event in
+        _ = NSEvent.addLocalMonitorForEvents(matching: kinds) { [recorder] event in
             switch event.type {
-            case .keyDown: record("key \(hex(event.characters ?? "")) \(event.keyCode)")
-            case .scrollWheel: record("scroll")
-            default: record("mouse \(event.type.rawValue)")
+            case .keyDown:
+                recorder.record("key \(hex(event.characters ?? "")) \(event.keyCode)")
+            case .scrollWheel:
+                recorder.record("scroll")
+            default:
+                recorder.record("mouse \(event.type.rawValue)")
             }
             return event
         }
@@ -99,9 +118,17 @@ final class Window: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         report()
         // The state is read again as well as on the notifications, because the field starts
         // editing a moment after the window becomes key and nothing announces that.
-        Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
-            self?.report()
-        }
+        Timer.scheduledTimer(
+            timeInterval: 0.2, target: self, selector: #selector(tick(_:)), userInfo: nil,
+            repeats: true)
+    }
+
+    @objc private func stateChanged(_ notification: Notification) {
+        report()
+    }
+
+    @objc private func tick(_ timer: Timer) {
+        report()
     }
 
     // A text change is written once it is settled: text still being composed is marked text.
@@ -109,13 +136,13 @@ final class Window: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         if let view = field.currentEditor() as? NSTextView, view.hasMarkedText() {
             return
         }
-        record("text \(hex(field.stringValue))")
+        recorder.record("text \(hex(field.stringValue))")
     }
 
     // Makes the field editor take what is typed as it is typed. A person's settings can offer
     // inline predictions and rewrite what was typed (corrections, replacements, completions, quotes
     // and dashes), and either would put in the field a character that no key produced.
-    func plain(_ editor: NSText) {
+    private func plain(_ editor: NSText) {
         guard let view = editor as? NSTextView else { return }
         if #available(macOS 14.0, *) {
             view.inlinePredictionType = .no
@@ -135,7 +162,7 @@ final class Window: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     // it was made first responder starts editing only once the window is key, so it is asked
     // again here, where the window is. The insertion point is put at the end of the text each time
     // typing begins to land, so that what is typed adds to the given text and does not replace it.
-    func report() {
+    private func report() {
         if NSApp.isActive && window.isKeyWindow && field.currentEditor() == nil {
             _ = window.makeFirstResponder(field)
         }
@@ -146,16 +173,25 @@ final class Window: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         if now != focused {
             if now, let editor {
                 plain(editor)
-                editor.selectedRange = NSRange(location: (field.stringValue as NSString).length, length: 0)
+                editor.selectedRange = NSRange(
+                    location: (field.stringValue as NSString).length, length: 0)
             }
             focused = now
-            record("focus \(now ? 1 : 0)")
+            recorder.record("focus \(now ? 1 : 0)")
         }
     }
 }
 
-let application = NSApplication.shared
-application.setActivationPolicy(.regular)
-let delegate = Window()
-application.delegate = delegate
-application.run()
+guard CommandLine.arguments.count == 3 else {
+    fail("usage: desktop_window <log file> <given text>", status: 2)
+}
+// The program starts on the main thread, which is the main actor: Swift 6 treats the statements
+// of this file that way and Swift 5 does not say so, and this makes both read the same.
+MainActor.assumeIsolated {
+    let delegate = Window(
+        given: CommandLine.arguments[2], recorder: Recorder(path: CommandLine.arguments[1]))
+    let application = NSApplication.shared
+    application.setActivationPolicy(.regular)
+    application.delegate = delegate
+    application.run()
+}
