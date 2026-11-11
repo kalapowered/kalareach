@@ -122,7 +122,7 @@ fn a_macro_definition_is_refused_wherever_it_starts_a_line() {
 #[test]
 fn the_scan_reads_a_line_as_git_could_and_more() {
     // Any byte up to the space can end a piece, so none of these hides an attribute.
-    for separator in ["\t", "\r", "\x0b", "\x0c", "\0", "\x01", "\x1f", "  "] {
+    for separator in ["\t", "\r", "\x0b", "\x0c", "\0", "\x01", "\x1f", "\x7f", "  "] {
         let line = format!("*.x{separator}filter=lfs\n");
         assert_eq!(rule(&line), RULE_FILTER, "{separator:?}");
         let line = format!("*.x text{separator}diff=foo\n");
