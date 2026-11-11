@@ -180,7 +180,7 @@ lock_stop_through_the_shade() {
 # Waits up to `$1` seconds for the call's own screen, read afresh into `$3`, to say all of `$2`:
 # words separated by a bar, each of which must be on the screen.
 screen_says() { # <seconds> <words, separated by |> <dump>
-    local seconds=$1 words=$2 dump=$3 word ok until=$((SECONDS + $1))
+    local words=$2 dump=$3 word ok until=$((SECONDS + $1))
     while :; do
         lock_dump "$dump"
         ok=1
@@ -243,14 +243,13 @@ screen_posted() {
 # Waits until the notification has read as posted at one time for three looks in a row, and prints
 # that time: a capture change that lands during the swipe below must not pass for its republication.
 screen_posted_still() {
-    local last="" same=0 now tries=0
-    while [ "$tries" -lt 30 ]; do
+    local last="" same=0 now until=$((SECONDS + 30))
+    while [ "$SECONDS" -lt "$until" ]; do
         now="$(screen_posted)"
         if [ -n "$now" ] && [ "$now" = "$last" ]; then same=$((same + 1)); else same=0; fi
         if [ "$same" -ge 3 ]; then printf '%s\n' "$now"; return 0; fi
         last="$now"
         sleep 1
-        tries=$((tries + 1))
     done
     return 1
 }
@@ -261,7 +260,7 @@ screen_posted_still() {
 # notification's own title is drawn, after the notification has stopped changing; the system's
 # record must then hold a notification, carrying the foreground-service flag, posted after the swipe.
 screen_dismiss_leg() {
-    local dump="$artefacts/lock-screen/shade.xml" before after point px py width ok=0 found="" waited=0
+    local dump="$artefacts/lock-screen/shade.xml" before after point px py width ok=0 found="" until
     lock_device shell cmd statusbar expand-notifications
     sleep 2
     lock_dump "$dump"
@@ -275,7 +274,8 @@ screen_dismiss_leg() {
         read -r px py <<<"$point"
         lock_device shell input swipe "$px" "$py" "$((width - 20))" "$py" 250
         found="the notification was swiped away in the shade and was not posted again (posted $before)"
-        while [ "$waited" -lt 20 ]; do
+        until=$((SECONDS + 20))
+        while [ "$SECONDS" -lt "$until" ]; do
             after="$(screen_posted)"
             if [ -n "$after" ] && [ "$after" -gt "$before" ] 2>/dev/null && lock_record_has "FOREGROUND_SERVICE"; then
                 ok=1
@@ -283,7 +283,6 @@ screen_dismiss_leg() {
                 break
             fi
             sleep 1
-            waited=$((waited + 1))
         done
     fi
     lock_device shell cmd statusbar collapse
