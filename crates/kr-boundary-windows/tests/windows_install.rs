@@ -737,6 +737,21 @@ fn a_folder_above_the_data_directory_that_others_own_may_write_in_or_have_replac
     );
     assert!(text.contains("is refused because"), "why: {text}");
     assert!(text.contains("Remove the folder"), "what to do: {text}");
+    assert!(text.contains("holds no data directory"), "{text}");
+
+    // The same refusal for a folder that holds the data directory, with its manifest, journals and
+    // roots, never says to remove it: it says what to correct.
+    std::fs::create_dir(inherited.join("Boundary")).unwrap();
+    let text = install::check_data_parent(&paths_under(&inherited))
+        .unwrap_err()
+        .to_string();
+    assert!(text.contains("is refused because"), "why: {text}");
+    assert!(!text.contains("Remove the folder"), "{text}");
+    assert!(!text.contains("remove the folder"), "{text}");
+    assert!(text.contains("Do not remove it"), "{text}");
+    assert!(text.contains("Correct it instead"), "{text}");
+    assert!(text.contains("protected list"), "{text}");
+    std::fs::remove_dir(inherited.join("Boundary")).unwrap();
 
     // The same folder, with the installation's own list, is accepted.
     acl::set_protected(

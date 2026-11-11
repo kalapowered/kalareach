@@ -395,7 +395,7 @@ pub fn check_data_parent(paths: &Paths) -> Result<Option<ffi::Handle>, Error> {
         }
         Err(failure) if failure.code == ERROR_SHARING_VIOLATION => {
             return Err(parent_refusal(
-                parent,
+                paths,
                 "another program holds it open: with a right to delete or rename it, or without sharing it for reading and writing, and the check needs both so that it can hold the folder against a rename or a delete",
             ));
         }
@@ -420,19 +420,28 @@ pub fn check_data_parent(paths: &Paths) -> Result<Option<ffi::Handle>, Error> {
     if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
         || tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
     {
-        return Err(parent_refusal(parent, "it is a link or not a folder"));
+        return Err(parent_refusal(paths, "it is a link or not a folder"));
     }
     if let Some(finding) = acl::changeable_by_others_on(&handle, false)? {
-        return Err(parent_refusal(parent, &finding));
+        return Err(parent_refusal(paths, &finding));
     }
     Ok(Some(handle))
 }
 
 /// The refusal of a folder above the data directory: what the folder is, why it is refused and what
 /// to do.
-fn parent_refusal(parent: &Path, why: &str) -> Error {
+fn parent_refusal(paths: &Paths, why: &str) -> Error {
+    let parent = paths.data_parent();
+    // The folder can hold the manifest, the journals and the private roots only when the data
+    // directory is in it. Then removing it would destroy what they say, and the remedy is to correct
+    // its owner and its list; a folder that holds no data directory has nothing to lose.
+    let remedy = if std::fs::symlink_metadata(&paths.data).is_ok() {
+        "Do not remove it: it holds the data directory, with the manifest, the journals and the private roots of an installation, and removing it would destroy what they say. Correct it instead: give it to the Administrators group or the system, with a protected list that only the system and the Administrators group can change, then run the setup program again."
+    } else {
+        "It holds no data directory, so removing it loses nothing: remove the folder, or give it to the Administrators group or the system with a protected list that only the system and the Administrators group can change, then run the setup program again."
+    };
     Error::Refused(format!(
-        "{} is the folder that holds the boundary's data (its manifest, its journal and the roots of its operations). It is refused because {why}. Whoever owns that folder, or can write or delete in it, could put data of their own in its place while the broker runs as the system. Remove the folder, or give it to the system with a protected list that only the system and the administrators can change, then install again.",
+        "{} is the folder that holds the boundary's data (its manifest, its journal and the roots of its operations). It is refused because {why}. Whoever owns that folder, or can write or delete in it, could put data of their own in its place while the broker runs as the system. {remedy}",
         parent.display()
     ))
 }
