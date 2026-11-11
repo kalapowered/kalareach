@@ -681,12 +681,13 @@ fn a_folder_above_the_data_directory_that_others_own_may_write_in_or_have_replac
     // A folder with the inherited list lets ordinary accounts add to it.
     let inherited = inherited_folder();
     let refused = install::check_data_parent(&paths_under(&inherited)).unwrap_err();
+    let text = refused.to_string();
     assert!(
-        refused
-            .to_string()
-            .contains("not made by this installation"),
-        "{refused}"
+        text.contains("holds the boundary's data"),
+        "what the folder is: {text}"
     );
+    assert!(text.contains("is refused because"), "why: {text}");
+    assert!(text.contains("Remove the folder"), "what to do: {text}");
 
     // The same folder, with the installation's own list, is accepted.
     acl::set_protected(
@@ -756,7 +757,8 @@ fn the_installation_stops_before_it_lays_anything_down_when_the_parent_folder_is
     let (code, output) = case.install();
     let _ = std::fs::remove_dir_all(&parent);
     assert_ne!(code, 0, "{output}");
-    assert!(output.contains("not made by this installation"), "{output}");
+    assert!(output.contains("is refused because"), "{output}");
+    assert!(output.contains("Remove the folder"), "{output}");
     assert_eq!(snapshot(), before, "nothing was changed");
 }
 
@@ -816,6 +818,122 @@ fn the_removal_reads_the_journal_and_the_private_roots_first_and_refuses_with_no
     std::fs::remove_dir(&root).unwrap();
     let (code, output) = setup(&["remove"], "yes\n", &[]);
     assert_eq!(code, 0, "{output}");
+}
+
+/// The calls the installation made on the Application Identity service, as the test build of the
+/// setup program records them in the file that `KR_BOUNDARY_CALL_LOG` names.
+fn recorded_calls(log: &Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn call_log() -> PathBuf {
+    let log = std::env::temp_dir().join(format!(
+        "krcalls-{}.txt",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ));
+    let _ = std::fs::remove_file(&log);
+    log
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn an_application_identity_service_that_already_runs_is_never_stopped_and_the_event_after_the_write_is_awaited()
+ {
+    let case = Case::new();
+    let manager = service::manager().unwrap();
+    let appid = manager.open("AppIDSvc").unwrap().unwrap();
+    let original = snapshot();
+    assert!(
+        !original.appid_running,
+        "the guest begins with the service stopped"
+    );
+    appid.start().unwrap();
+    appid
+        .wait_for(false, std::time::Duration::from_secs(60))
+        .unwrap();
+    let log = call_log();
+    let (code, output) = case.payload(
+        "payload",
+        &[("KR_BOUNDARY_CALL_LOG", log.to_str().unwrap())],
+    );
+    assert_eq!(code, 0, "{output}");
+    let calls = recorded_calls(&log);
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call == "appid stop" || call == "appid start"),
+        "a running service is neither stopped nor started: {calls:?}"
+    );
+    assert!(output.contains("already running"), "{output}");
+    assert!(
+        !output.contains("application control has started"),
+        "no first event of an earlier life is waited for or trusted: {output}"
+    );
+    let written = output
+        .find("the policy is written")
+        .expect("the policy is written");
+    let applied = output
+        .find("the platform has applied the policy")
+        .expect("the event after the write is awaited");
+    assert!(written < applied, "{output}");
+    let (code, output) = setup(&["remove"], "yes\n", &[]);
+    assert_eq!(code, 0, "{output}");
+    assert!(
+        manager
+            .open("AppIDSvc")
+            .unwrap()
+            .unwrap()
+            .status()
+            .unwrap()
+            .running(),
+        "the removal leaves a service it did not start running"
+    );
+    appid.stop().unwrap();
+    appid
+        .wait_for(true, std::time::Duration::from_secs(60))
+        .unwrap();
+    assert_eq!(snapshot(), original);
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn a_stopped_application_identity_service_is_started_once_and_its_first_event_comes_before_the_write()
+ {
+    let case = Case::new();
+    let original = snapshot();
+    assert!(
+        !original.appid_running,
+        "the guest begins with the service stopped"
+    );
+    let log = call_log();
+    let (code, output) = case.payload(
+        "payload",
+        &[("KR_BOUNDARY_CALL_LOG", log.to_str().unwrap())],
+    );
+    assert_eq!(code, 0, "{output}");
+    let calls = recorded_calls(&log);
+    assert_eq!(
+        calls.iter().filter(|call| *call == "appid start").count(),
+        1,
+        "{calls:?}"
+    );
+    assert!(!calls.iter().any(|call| call == "appid stop"), "{calls:?}");
+    let started = output
+        .find("application control has started")
+        .expect("the service's first event is awaited");
+    let written = output
+        .find("the policy is written")
+        .expect("the policy is written");
+    assert!(started < written, "{output}");
+    let (code, output) = setup(&["remove"], "yes\n", &[]);
+    assert_eq!(code, 0, "{output}");
+    assert_eq!(snapshot(), original);
+    let _ = std::fs::remove_file(&log);
 }
 
 /// How long the process has existed.
