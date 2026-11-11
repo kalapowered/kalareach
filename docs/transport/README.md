@@ -539,10 +539,19 @@ against the connection: no bulk slot, no registry entry.
 
 A stream that passes goes to the host through `AuthorisedSession::data_streams` (`DataStreams`), a
 queue of four (`listener::DATA_STREAM_QUEUE_DEPTH`). A full queue and a receiver that was dropped
-each reset the stream, and dropping `DataStreams` resets every stream still queued (one whose send
-raced the drop is reset when the connection's accept task ends, at the latest). A host that
-never reads the queue holds at most four streams for a device that opens them, each with a bulk
-slot, a registry entry and its flow-control credit, until the connection ends, and resets the rest. What a header names beyond this, the environment, the transfer and the
+each reset the stream, and dropping `DataStreams` resets every stream still queued and ends the
+accept task's work for the host: the headers it was reading are dropped and their streams reset,
+and a stream that arrives afterwards is reset as it is accepted. The queue is one structure under
+one lock, so a stream is either queued before the receiver goes, and is reset with the rest, or is
+refused after and reset by the task that tried to queue it; none is left in a queue nobody reads.
+`DataStreams::recv` resets and skips a stream that was revoked while it waited, because its
+connection lost its control stream, so a host is never handed a stream whose connection has gone,
+but a stream it is handed can be revoked after `recv` returns. A host that never calls `recv`
+leaves its device at the control stream (see "Stream limits"). A host that reads once and stops
+holds at most four streams for a device that opens them, each with a bulk slot, a registry entry
+and its flow-control credit, until the connection ends, and resets the rest. The four places in
+the queue are the connection's bulk slots and not four streams beyond them: a queued stream already
+holds its slot. What a header names beyond this, the environment, the transfer and the
 right to use it, is the host's to decide when it receives the stream. A lookup it makes for that runs
 under the admission deadline, which the session carries as `AuthorisedSession::deadlines`.
 
@@ -565,7 +574,8 @@ writable at that moment. An attempt that is already handing bytes over when anot
 the stream is not stopped, and no later one is made. `write_message` and `write_payload` do not ask
 at each attempt: they race the revocation, and a write that wins the race can still go after it. A
 revocation, a deadline or a refused reservation ends the write with an error, never with
-`Ok(false)`, which means only that the caller's own check refused.
+`Ok(false)`, which means only that the caller's own check refused. A host sends every answer on a
+data stream through `write_message_while`, so that a revocation stops it.
 A refusal leaves the stream reset and revokes it, so the half that reads stops too. A read or a
 write that is dropped before it ends, because a caller raced it in a `select!`, leaves part of a
 frame consumed or sent and revokes the stream for the same reason: end a stream by revoking its
@@ -604,7 +614,10 @@ and an idle or stall deadline also stops its receiving side. Revocation resets e
 dropped, so the host ends a stream it cut by dropping it, and the device sees a reset, never a clean
 end. A registry made
 without deadlines, which is how a client opens its streams, waits for its peer as long as the peer
-takes.
+takes. That includes the open itself: `StreamRegistry::open` waits for the host's stream credit
+while it holds the bulk slot, then writes the header, and neither step has a deadline, so a client
+puts one bound around the whole of it, the open, the header write and the wait for the host's
+answer.
 
 ### Stream limits
 
@@ -614,14 +627,18 @@ could otherwise hold them, so bidirectional streams are limited in two steps.
 
 A listening endpoint starts every connection with room for one bidirectional stream: the one the
 handshake runs on, which is the control stream once the connection is authorised. A peer that opens
-a second one waits for credit the host does not give. When the listener authorises a connection for
-a host that takes data streams (`ListenerConfig::accepted_kinds` names a kind), it raises the limit
-with the library's `Connection::set_max_concurrent_bi_streams` to the control stream, the bulk
-streams the host allows, the places for streams that are waiting for their headers and one more: 10
-with the default of four bulk streams. The library grants the difference at once, and a stream the
-peer was waiting to open is opened when the credit arrives. A host that raises
-`SendLimits::max_bulk_streams` raises the bound with it. A host that names no kind never raises the
-limit, so its devices can open no stream but the control stream.
+a second one waits for credit the host does not give. The limit is raised the first time the host
+calls `DataStreams::recv`, which is after the host's own check of the device and not when the
+listener authorises the connection, and only for a host that takes data streams
+(`ListenerConfig::accepted_kinds` names a kind). The raise uses the library's
+`Connection::set_max_concurrent_bi_streams`, to the control stream, the bulk streams the host
+allows, the places for streams that are waiting for their headers and one more: 10 with the default
+of four bulk streams. The library grants the difference at once, and a stream the peer was waiting
+to open is opened when the credit arrives. A host that raises `SendLimits::max_bulk_streams` raises
+the bound with it. Until the first `recv` the accept task waits in the connection's accept for a
+stream the device has no credit to open, so it queues nothing and holds nothing. A host that names
+no kind, or never reads, never raises the limit, so its devices can open no stream but the control
+stream.
 
 An endpoint that only dials (`bind_dialer`) starts at none, because a host opens no stream to a
 client. `StreamRegistry::accept` on a client's connection, which kr-client's
@@ -630,12 +647,29 @@ returns an error. A caller that accepts connections itself, with `bind_listener`
 `handshake::accept`, has one stream per connection until it raises the limit with the same
 library call.
 
-What an authorised connection holds in memory is at most as many streams as the raised limit, each
-up to the library's per-stream receive window of 1.25 MB, plus one decoded frame of 1 MiB + 4 KiB for each stream whose
-frame is being read. A connection that is not authorised holds the receive window of one stream, and the library also
-buffers datagrams that a peer sends it, up to the same 1.25 MB, though the product reads none. The
-connection-wide receive window is not limited. If one is ever set, it has to stay above that bound,
-or a stalled data stream could take the credit the control stream needs.
+A connection takes no QUIC datagram from either side (`datagram_receive_buffer_size(None)`): the
+product reads none, the library would keep the unread ones of every connection up to a stream's
+receive window, and an endpoint that takes none does not tell its peer that it does, so a datagram
+a peer sends anyway ends the connection.
+
+What an authorised connection holds in memory is at most, with the defaults and counting wire
+bytes (a decoded frame can take more):
+
+- as many streams' receive windows as the raised limit, 10, each up to the library's per-stream
+  receive window of 1.25 MB: 12.5 MB;
+- one decoded frame of 1 MiB + 4 KiB for each stream whose frame is being read: the control stream
+  and the streams a host holds, which are at most four;
+- the control queue, up to `listener::CONTROL_QUEUE_DEPTH` (64) decoded control frames of up to
+  1 MiB + 4 KiB each, about 64 MiB when a host falls behind;
+- the send queue of up to 8 MiB (`MAX_SEND_QUEUE_BYTES`);
+- four header reads of at most 1 KiB each, and the connection's tasks: the accept task, the
+  control reader, the keepalive and the connection's own.
+
+No limit here spans the connections of one device: the transport does not bound how many a device
+holds, and a host that does must do so. A connection that is not authorised holds the receive
+window of one stream and the handshake's own buffers. The connection-wide receive window is not
+limited. If one is ever set, it has to stay above the stream bound, or a stalled data stream could
+take the credit the control stream needs.
 
 ### Revocation
 
@@ -644,8 +678,12 @@ renewal. Revocation reaches an operation that is already waiting: a read or writ
 stream returns at once rather than waiting for a peer that will never send, and the stream is reset
 rather than finished, so the peer sees that it was taken away instead of a clean end it might read
 as completion. A stream that was handed over and is held in a task of its own is revoked in the same
-way: its owner sees the revocation on the next read or write, and the stream is reset when the owner
-drops it. The connection's action windows are retired at the same moment, so none of them can
+way: its owner sees the revocation on a read or write that starts after it, and the stream is
+reset when the owner drops it. A read that is already waiting when the stream is revoked can still
+return a frame that finished arriving at that moment, and a plain `write_message` or
+`write_payload` that is ready can still write, so a host that relies on a stream's authority asks
+`is_revoked()` itself after each read returns and again where it acts, and sends its answers
+through `write_message_while`. The connection's action windows are retired at the same moment, so none of them can
 first-admit a request through a connection that no longer exists.
 
 The loss is acted on where it is declared. When the control stream's reader ends or a write to the
