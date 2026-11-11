@@ -74,10 +74,13 @@ pub(super) struct ChunkStreams {
     /// second chunk of the transfer into the service beside one a blocking call still has in it.
     gates: Mutex<BTreeMap<Key, Weak<tokio::sync::Mutex<()>>>>,
     lookups: Mutex<BTreeMap<ActorId, Weak<Semaphore>>>,
-    /// How many frames have begun to wait for a transfer's gate, for a suite to wait for the one it
-    /// is holding behind another.
+    /// How many frames have found their transfer's gate held and begun to wait for it, for a suite
+    /// to wait for the one it is holding behind another.
     #[cfg(feature = "testing")]
     gate_waits: tokio::sync::watch::Sender<u64>,
+    /// How many stream tasks have ended, however they ended.
+    #[cfg(feature = "testing")]
+    tasks_ended: tokio::sync::watch::Sender<u64>,
     /// Where a suite holds a frame that has the gate and has not yet asked whether its stream
     /// stands.
     #[cfg(feature = "testing")]
@@ -209,6 +212,10 @@ impl ChunkStreams {
 impl ChunkStreams {
     pub(super) fn gate_waits(&self) -> tokio::sync::watch::Receiver<u64> {
         self.gate_waits.subscribe()
+    }
+
+    pub(super) fn tasks_ended(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.tasks_ended.subscribe()
     }
 
     pub(super) fn hold_after_the_gate(
@@ -440,6 +447,17 @@ fn names(params: &ParamsValue, header: &StreamHeader) -> bool {
     )
 }
 
+/// Counts the end of a stream task, however the task ended, for a suite to wait for.
+#[cfg(feature = "testing")]
+struct TaskEnd<'a>(&'a ChunkStreams);
+
+#[cfg(feature = "testing")]
+impl Drop for TaskEnd<'_> {
+    fn drop(&mut self) {
+        self.0.tasks_ended.send_modify(|ended| *ended += 1);
+    }
+}
+
 /// What serves one connection's data streams.
 pub(super) struct ChunkDoor {
     pub(super) host: Arc<NetworkHost>,
@@ -473,6 +491,8 @@ impl ChunkDoor {
 
     /// Admits one stream, and serves its frames until it ends.
     async fn serve_stream(self: Arc<Self>, stream: DataStream) {
+        #[cfg(feature = "testing")]
+        let _ended = TaskEnd(&self.host.chunks);
         let (mut reader, writer) = stream.split();
         let handle = reader.handle();
         let header = reader.header().clone();
@@ -541,10 +561,15 @@ impl ChunkDoor {
             }
             // The newer stream's first frame waits here for the older's chunk to leave the
             // service, and a stream that is revoked meanwhile leaves.
-            self.host.chunks.note_a_wait_at_a_gate();
-            let held = tokio::select! {
-                held = Arc::clone(&gate).lock_owned() => held,
-                () = handle.revoked() => break,
+            let held = match Arc::clone(&gate).try_lock_owned() {
+                Ok(held) => held,
+                Err(_) => {
+                    self.host.chunks.note_a_wait_at_a_gate();
+                    tokio::select! {
+                        held = Arc::clone(&gate).lock_owned() => held,
+                        () = handle.revoked() => break,
+                    }
+                }
             };
             #[cfg(feature = "testing")]
             self.host.chunks.after_the_gate.wait().await;
@@ -593,5 +618,55 @@ impl ChunkDoor {
             found = lookup => found.ok(),
             () = &mut deadline => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A principal and a transfer for the registry's own cases.
+    fn a_transfer() -> (ActorId, TransferId) {
+        (
+            ActorId::new("device:registry-case").expect("a principal"),
+            TransferId::new(kr_ipc::new_uuid()),
+        )
+    }
+
+    /// KR-REQ-23.21: a stream that is revoked before the registry registers it replaces nothing and
+    /// revokes nothing, so the stream of a connection that was lost while its header's lookup ran
+    /// never takes the transfer from the live stream of the device's new connection. The control is
+    /// a live stream, which replaces the older and revokes it.
+    #[test]
+    fn a_revoked_stream_replaces_nothing_and_a_live_one_replaces_the_older() {
+        let registry = Arc::new(ChunkStreams::default());
+        let (principal, transfer) = a_transfer();
+
+        let first = StreamHandle::default();
+        let standing = registry
+            .stand(&principal, transfer, &first)
+            .expect("a live stream is registered");
+        assert!(standing.stands());
+
+        let gone = StreamHandle::default();
+        gone.revoke();
+        assert!(
+            registry.stand(&principal, transfer, &gone).is_none(),
+            "a revoked stream is not registered"
+        );
+        assert!(
+            !first.is_revoked() && standing.stands(),
+            "and it left the live stream standing"
+        );
+
+        let second = StreamHandle::default();
+        let newer = registry
+            .stand(&principal, transfer, &second)
+            .expect("a newer live stream is registered");
+        assert!(
+            first.is_revoked(),
+            "the newer live stream revoked the older"
+        );
+        assert!(!standing.stands() && newer.stands());
     }
 }
