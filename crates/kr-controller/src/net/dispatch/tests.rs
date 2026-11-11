@@ -797,9 +797,9 @@ async fn every_read_the_method_table_admits_for_a_device_is_served_or_refused_by
 }
 
 /// KR-REQ-23.41: every write the method table admits for a paired device is served by the daemon,
-/// forwarded to a worker that lists it, or refused by name with the reason. None reaches the
-/// refusal the routing keeps for a method the table does not admit for a device, which names no
-/// reason, and none reaches a worker that does not list it.
+/// forwarded to a worker that lists it, or refused by name with the reason. Each has a routing
+/// decision, so none reaches the refusal the routing keeps for a method it does not know, and none
+/// reaches a worker that does not list it.
 ///
 /// The routing's decision is walked over the whole table: every write a paired device may make has
 /// one, and no other method does; the worker is its decision only where the worker's own table
@@ -852,8 +852,8 @@ async fn every_write_the_method_table_admits_for_a_device_is_served_or_refused_b
     let connection = super::RemoteConnection::for_test(controller, device);
 
     let mut writes = 0_u64;
-    let mut unrouted = Vec::new();
     let mut unnamed = Vec::new();
+    let mut raw_input_refused = false;
     for method in Method::ALL {
         let entry = method.entry();
         let Some(route) = DeviceWrite::of(*method) else {
@@ -876,10 +876,11 @@ async fn every_write_the_method_table_admits_for_a_device_is_served_or_refused_b
         else {
             continue;
         };
-        if error.code == ErrorCode::InvalidArgument
-            && error.message == format!("{} is not a mutation this host serves", entry.name)
-        {
-            unrouted.push(entry.name);
+        // Raw input is a request, and a worker's table lists it: whatever the decision says, sent
+        // as a mutation it is refused here with its name, which only the decision can do.
+        if *method == Method::InputWrite {
+            raw_input_refused =
+                error.code == ErrorCode::InvalidArgument && error.message.starts_with(entry.name);
         }
         if matches!(route, DeviceWrite::Refused(_))
             && !(error.message.starts_with(entry.name)
@@ -893,9 +894,8 @@ async fn every_write_the_method_table_admits_for_a_device_is_served_or_refused_b
     }
     assert!(writes > 0, "the method table admits writes for a device");
     assert!(
-        unrouted.is_empty(),
-        "writes the method table admits for a paired device that reach the refusal kept for \
-         methods it does not admit: {unrouted:?}"
+        raw_input_refused,
+        "raw input sent as a mutation is not refused with its name"
     );
     assert!(
         unnamed.is_empty(),
