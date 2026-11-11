@@ -63,9 +63,6 @@ static ERROR_MODE_SET: Once = Once::new();
 /// fail-fast from leaving a dump.
 pub fn init() {
     ERROR_MODE_SET.call_once(|| {
-        if super::switch::taken().default_error_mode {
-            return;
-        }
         // SAFETY: sets the process's error mode, which has no memory safety condition.
         unsafe {
             SetErrorMode(ERROR_MODE);
@@ -285,7 +282,7 @@ fn answer(mut connection: Connection, state: &State) {
                     &state.manifest,
                     class,
                     &state.paths.staging,
-                    super::switch::proof_bound(PROOF_BOUND),
+                    PROOF_BOUND,
                     &state.stop,
                 );
                 Response::Proof {
@@ -298,7 +295,7 @@ fn answer(mut connection: Connection, state: &State) {
                     &state.manifest,
                     class,
                     &state.paths.staging,
-                    super::switch::proof_bound(PROOF_BOUND),
+                    PROOF_BOUND,
                     &state.stop,
                 );
                 Response::Proof {
