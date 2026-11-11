@@ -55,6 +55,8 @@ fn a_pattern_is_not_an_attribute() {
 
 #[test]
 fn every_built_in_diff_driver_is_allowed_and_no_other_name_is() {
+    // The built-in hunk-header patterns the attribute manual of Git for Windows 2.55.0.windows.5
+    // lists, in its order.
     let expected = [
         "ada", "bash", "bibtex", "cpp", "csharp", "css", "dts", "elixir", "fortran", "fountain",
         "golang", "html", "java", "kotlin", "markdown", "matlab", "objc", "pascal", "perl", "php",
