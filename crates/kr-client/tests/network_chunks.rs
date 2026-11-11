@@ -1516,6 +1516,8 @@ struct Ending {
     inner: Arc<dyn ControlTransport>,
     ended: Arc<AtomicBool>,
     code: ErrorCode,
+    /// The opener the transport gives out instead of the inner transport's, when a case sets one.
+    opener: Option<Arc<dyn StreamOpener>>,
 }
 
 impl ControlTransport for Ending {
@@ -1543,7 +1545,7 @@ impl ControlTransport for Ending {
         self.inner.claim_receiver()
     }
     fn stream_opener(&self) -> Option<Arc<dyn StreamOpener>> {
-        self.inner.stream_opener()
+        self.opener.clone().or_else(|| self.inner.stream_opener())
     }
     fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>> {
         self.inner.recv()
@@ -1553,6 +1555,26 @@ impl ControlTransport for Ending {
     }
     fn close(&self) {
         self.inner.close();
+    }
+}
+
+/// An opener whose open waits until a case lets it go and then fails, as an open does that a
+/// sign-out cuts.
+#[derive(Debug)]
+struct CutOpener {
+    gate: Arc<tokio::sync::Notify>,
+}
+
+impl StreamOpener for CutOpener {
+    fn open(&self, _header: StreamHeader) -> TransportFuture<'_, DataStream> {
+        Box::pin(async move {
+            self.gate.notified().await;
+            Err(ClientError::ConnectionEnded)
+        })
+    }
+
+    fn revoked(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::pending())
     }
 }
 
@@ -1568,6 +1590,7 @@ async fn a_lane_stops_when_the_transport_says_this_device_ended_the_connection()
             inner: Arc::new(transport),
             ended: flag,
             code: ErrorCode::LeaseLost,
+            opener: None,
         }) as Arc<dyn ControlTransport>)
     })
     .await;
@@ -1650,6 +1673,7 @@ async fn a_sign_out_during_the_wait_for_a_window_is_told_with_its_reason() {
             inner: Arc::new(transport),
             ended: flag,
             code: ErrorCode::LeaseLost,
+            opener: None,
         }) as Arc<dyn ControlTransport>)
     })
     .await;
@@ -1699,6 +1723,7 @@ async fn a_sign_out_that_reads_as_a_refused_window_reaches_the_caller_of_send_as
             inner: Arc::new(transport),
             ended: flag,
             code: ErrorCode::PermissionDenied,
+            opener: None,
         }) as Arc<dyn ControlTransport>)
     })
     .await;
@@ -1735,4 +1760,85 @@ async fn a_sign_out_that_reads_as_a_refused_window_reaches_the_caller_of_send_as
     assert_eq!(told.code(), ErrorCode::PermissionDenied);
     session.close();
     serving.abort();
+}
+
+/// A sign-out that cuts the open of a lane's stream: the open fails with whatever the transport saw,
+/// and the lane tells the caller the reason the account's watcher recorded, as it does for any other
+/// way out.
+#[tokio::test]
+async fn a_sign_out_that_cuts_the_open_of_the_stream_is_told_with_its_reason() {
+    let script = Script::new(true);
+    let ended = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&ended);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let cut = Arc::clone(&gate);
+    let (session, _host, _client, serving) = pair_over(Arc::clone(&script), move |transport| {
+        Ok(Arc::new(Ending {
+            inner: Arc::new(transport),
+            ended: flag,
+            code: ErrorCode::LeaseLost,
+            opener: Some(Arc::new(CutOpener { gate: cut })),
+        }) as Arc<dyn ControlTransport>)
+    })
+    .await;
+    let route = ChunkRoute::network(&session, environment())
+        .await
+        .expect("a route");
+    let transfer = TransferId::new(Uuid::from_bytes([13; 16]));
+    let chunk = some_chunk(transfer);
+    let at = target();
+    let mut lane = within(route.open(transfer)).await.expect("a lane");
+    let mut sending = std::pin::pin!(lane.send_chunk(&at, &chunk, TTL));
+    assert!(
+        waits(&mut sending).await,
+        "the lane has its window and waits for the open"
+    );
+    ended.store(true, Ordering::Release);
+    gate.notify_one();
+    let told = within(sending).await.expect_err("the open is cut");
+    assert_eq!(told.code(), ErrorCode::LeaseLost, "{told}");
+    assert_eq!(script.seen(|seen| seen.chunks.len()), 0, "nothing was sent");
+    session.close();
+    serving.abort();
+}
+
+/// A network lane whose window ran out, because the host turned it down and issued none before it
+/// would have expired, has ended: it says so, and the next call on it is refused as a call on an
+/// ended lane. The lane's own reading of time is put past the window's validity, so the case waits for
+/// no time.
+#[tokio::test]
+async fn a_window_that_runs_out_while_a_lane_waits_ends_the_lane() {
+    let script = Script::new(true);
+    script.reserved(64);
+    let pair = pair(Arc::clone(&script)).await;
+    let refused = pair.session.action_window().await.action_window_id;
+    *script.ended_window.lock().expect("the script") = Some(refused);
+    let route = ChunkRoute::network(&pair.session, environment())
+        .await
+        .expect("a route");
+    let transfer = TransferId::new(Uuid::from_bytes([14; 16]));
+    let chunk = some_chunk(transfer);
+    let at = target();
+    let mut first = within(route.open(transfer)).await.expect("a lane");
+    let turned_down = within(first.send_chunk(&at, &chunk, TTL))
+        .await
+        .expect_err("the host refuses the window");
+    assert_eq!(turned_down.code(), ErrorCode::PermissionDenied);
+    drop(first);
+
+    let mut second = within(route.open(transfer)).await.expect("a lane");
+    second.hold_clock_at(Duration::from_secs(1_000));
+    let ran_out = within(second.send_chunk(&at, &chunk, TTL))
+        .await
+        .expect_err("the window ran out before another came");
+    assert!(matches!(ran_out, ClientError::NoActionWindow), "{ran_out}");
+    let ended = within(second.send_chunk(&at, &chunk, TTL))
+        .await
+        .expect_err("the lane has ended");
+    assert!(matches!(ended, ClientError::ConnectionEnded), "{ended}");
+    assert_eq!(
+        script.seen(|seen| seen.chunks.len()),
+        1,
+        "only the refused chunk was ever sent"
+    );
 }
