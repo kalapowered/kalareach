@@ -316,3 +316,149 @@ pub fn changeable_by_others(path: &Path, replacement_only: bool) -> Result<Optio
         Ok(finding)
     }
 }
+
+/// As [`changeable_by_others`], for an object that is already open: the owner and the list are read
+/// from the handle, so the answer is about the object the caller holds and not about whatever the
+/// path names a moment later. The handle needs the right to read permissions.
+///
+/// `replacement_only` narrows which rights count. With it the check is for a directory above
+/// something that must not be swapped, and only the rights that delete or take over the object count
+/// (delete child, delete, change permissions, take ownership, generic write and all, maximum
+/// allowed), since adding a sibling beside it changes nothing it holds. Without it every right that
+/// changes a file or what a directory holds counts as well (write data or add a file, append data or
+/// add a subdirectory).
+///
+/// The answer is `None` only when the owner is in the system's own class (the system, the
+/// administrators, the installer service and the creator-owner placeholder), the object has a
+/// permission list, every entry of it was read, and no entry that allows names an account outside
+/// that class for a right that counts. Anything else is a finding: another account's right, an owner
+/// outside the class, no list, and an entry of any type but a plain allow or a plain deny. A
+/// callback entry or an object entry grants by a condition or a property that this check does not
+/// evaluate, so it is refused and never skipped. An entry that allows is counted even where another
+/// entry denies, so the answer errs towards refusing.
+///
+/// # Errors
+///
+/// Returns the platform's error when the permissions cannot be read or an entry cannot be read; the
+/// caller treats that as a refusal.
+pub fn changeable_by_others_on(
+    handle: &super::ffi::Handle,
+    replacement_only: bool,
+) -> Result<Option<String>> {
+    use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
+    let mut descriptor: *mut c_void = null_mut();
+    let mut owner: *mut c_void = null_mut();
+    let mut dacl: *mut ACL = null_mut();
+    // SAFETY: the handle is open and the caller holds it through the call; the outputs are local
+    // out-parameters, and the descriptor they point into is freed below after everything borrowed
+    // from it has been read.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle.raw(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &raw mut owner,
+            null_mut(),
+            &raw mut dacl,
+            null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(error(status, "reading the permissions of an open object"));
+    }
+    // SAFETY: the call returned a valid descriptor with the owner and the list inside it, and
+    // nothing borrowed from it outlives the call below.
+    let outcome = unsafe { finding_in(owner, dacl, replacement_only) };
+    // SAFETY: the descriptor came from the platform's allocator and is freed once, after the last
+    // read.
+    unsafe {
+        LocalFree(descriptor);
+    }
+    outcome
+}
+
+/// What [`changeable_by_others_on`] says of an owner and a list that the platform returned.
+///
+/// # Safety
+///
+/// `owner` and `dacl` are each null or point into a descriptor that lives through the call.
+unsafe fn finding_in(
+    owner: *mut c_void,
+    dacl: *mut ACL,
+    replacement_only: bool,
+) -> Result<Option<String>> {
+    const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+    if owner.is_null() {
+        return Ok(Some("it has no owner".to_owned()));
+    }
+    // SAFETY: the owner points at an identifier inside the descriptor.
+    let owner_sid = unsafe { Sid::from_ptr(owner) };
+    if !system_class(&owner_sid) {
+        return Ok(Some(format!("it is owned by {}", owner_sid.to_text())));
+    }
+    if dacl.is_null() {
+        return Ok(Some(
+            "it has no permission list, so anyone may change it".to_owned(),
+        ));
+    }
+    let mut information = ACL_SIZE_INFORMATION {
+        AceCount: 0,
+        AclBytesInUse: 0,
+        AclBytesFree: 0,
+    };
+    // SAFETY: the list is valid and the buffer is the size the class asks for.
+    if unsafe {
+        GetAclInformation(
+            dacl,
+            (&raw mut information).cast(),
+            size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    } == 0
+    {
+        return Err(last("reading the size of a permission list"));
+    }
+    let mask_of_interest = if replacement_only {
+        REPLACES
+    } else {
+        CHANGES_CONTENT
+    };
+    for index in 0..information.AceCount {
+        let mut entry: *mut c_void = null_mut();
+        // SAFETY: the index is below the entry count the list reported.
+        if unsafe { GetAce(dacl, index, &raw mut entry) } == 0 {
+            return Err(last("reading an entry of a permission list"));
+        }
+        let allowed = entry.cast::<ACCESS_ALLOWED_ACE>();
+        // SAFETY: every entry begins with a header; the platform returned a pointer to a whole one.
+        let header = unsafe { (*allowed).Header };
+        if header.AceType == ACCESS_DENIED_ACE_TYPE {
+            continue;
+        }
+        if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+            return Ok(Some(format!(
+                "its permission list has an entry of type {}, which this check does not read",
+                header.AceType
+            )));
+        }
+        if header.AceFlags & INHERIT_ONLY_ACE != 0 {
+            continue;
+        }
+        // SAFETY: a plain allow entry is a header, a mask and an identifier.
+        let (sid, mask) = unsafe {
+            (
+                Sid::from_ptr((&raw mut (*allowed).SidStart).cast()),
+                (*allowed).Mask,
+            )
+        };
+        if mask & mask_of_interest != 0 && !system_class(&sid) {
+            return Ok(Some(format!(
+                "{} is allowed rights 0x{:x} on it",
+                sid.to_text(),
+                mask & mask_of_interest
+            )));
+        }
+    }
+    Ok(None)
+}
