@@ -221,14 +221,15 @@ impl Expected {
     }
 
     /// The line to type for the names the shell exports, from the one after `skipped` of its sorted
-    /// list on, whose end row carries `tag`: it also says how many names the shell exports.
+    /// list on, whose end row carries `tag`: each row carries the name's position in the shell's
+    /// list, and one row says how many names the shell exports.
     #[must_use]
     pub fn exported_line(skipped: usize, tag: usize) -> String {
         let (first, last) = (skipped + 1, skipped + PART_NAMES);
         format!(
-            "e=(${{(ko)parameters[(R)*export*]}}); for n in ${{e[{first},{last}]}}; do \
-             print -r -- \"{ROW} exported $n\"; done; print -r -- \"{ROW} total ${{#e}}\"; \
-             unset e n; print -r -- \"{ROW} end {tag}\""
+            "e=(${{(ko)parameters[(R)*export*]}}); i={skipped}; for n in ${{e[{first},{last}]}}; do \
+             i=$((i+1)); print -r -- \"{ROW} exported $i $n\"; done; \
+             print -r -- \"{ROW} total ${{#e}}\"; unset e i n; print -r -- \"{ROW} end {tag}\""
         )
     }
 
@@ -372,20 +373,39 @@ impl Expected {
 }
 
 /// What the screen's rows say of the names the shell exports: the names this part lists, and how
-/// many names the shell exports in all.
+/// many names the shell exports in all. `read` are the names the earlier parts listed, and `said`
+/// is the total those parts gave, where there were any.
+///
+/// A part is whole only when it lists exactly the names it was asked for: the ones from position
+/// `read.len() + 1` on, at most [`PART_NAMES`] and no fewer than the total leaves, each with the
+/// position the shell gave it, no name twice, and the same total as every part before it.
 ///
 /// # Errors
 ///
-/// Returns why the answer is not whole: no end row numbered `tag`, no count, or a row as wide as
-/// the screen, which a longer name would wrap.
-pub fn read_exported(tag: usize, rows: &[String]) -> Result<(Vec<String>, usize), String> {
+/// Returns why the answer is not whole: no end row numbered `tag`, no count or two, a total that
+/// changed, a row as wide as the screen (which a longer name would wrap), a part that lists more
+/// or fewer names than it was asked for, a name out of its position, or a name twice.
+pub fn read_exported(
+    tag: usize,
+    read: &[String],
+    said: Option<usize>,
+    rows: &[String],
+) -> Result<(Vec<String>, usize), String> {
     let answer = rows_before_the_end(rows, tag)?;
-    let mut names = Vec::new();
+    let mut listed = Vec::new();
     let mut total = None;
     for row in &answer {
         match row {
-            Row::Exported(name) => names.push((*name).to_owned()),
-            Row::Total(count) => total = Some(*count),
+            Row::Exported(position, name) => listed.push((*position, *name)),
+            Row::Total(count) => {
+                let earlier = total.replace(*count);
+                if earlier.is_some() {
+                    return Err(format!(
+                        "{NOT_READ_WHOLE} the screen shows two counts of the names the shell \
+                         exports"
+                    ));
+                }
+            }
             _ => {}
         }
     }
@@ -395,6 +415,11 @@ pub fn read_exported(tag: usize, rows: &[String]) -> Result<(Vec<String>, usize)
              shell exports"
         ));
     };
+    if let Some(said) = said.filter(|said| *said != total) {
+        return Err(format!(
+            "{NOT_READ_WHOLE} the shell said it exports {said} names and then {total}"
+        ));
+    }
     let columns = usize::from(kr_e2e_m1b::window::COLUMNS);
     if rows
         .iter()
@@ -404,13 +429,36 @@ pub fn read_exported(tag: usize, rows: &[String]) -> Result<(Vec<String>, usize)
             "{NOT_READ_WHOLE} a name the shell exports is as wide as the screen, which wraps it"
         ));
     }
+    let asked = PART_NAMES.min(total.saturating_sub(read.len()));
+    if listed.len() != asked {
+        return Err(format!(
+            "{NOT_READ_WHOLE} a part asked for {asked} names from position {} and the screen \
+             shows {}",
+            read.len() + 1,
+            listed.len()
+        ));
+    }
+    let mut names: Vec<String> = Vec::with_capacity(asked);
+    for (offset, (position, name)) in listed.into_iter().enumerate() {
+        if position != read.len() + offset + 1 {
+            return Err(format!(
+                "{NOT_READ_WHOLE} {name} shows at position {position} where the part's \
+                 position {} should be",
+                read.len() + offset + 1
+            ));
+        }
+        if read.iter().chain(&names).any(|earlier| earlier == name) {
+            return Err(format!("{NOT_READ_WHOLE} {name} is listed twice"));
+        }
+        names.push(name.to_owned());
+    }
     Ok((names, total))
 }
 
 /// The rows of one answer, before the row that ends it.
 enum Row<'a> {
     Value(&'a str, Reading),
-    Exported(&'a str),
+    Exported(usize, &'a str),
     Total(usize),
 }
 
@@ -432,7 +480,11 @@ fn rows_before_the_end(rows: &[String], tag: usize) -> Result<Vec<Row<'_>>, Stri
                     answer.push(Row::Value(name, Reading::Digest((*said).to_owned())));
                 }
             }
-            [first, "exported", name] if *first == ROW => answer.push(Row::Exported(name)),
+            [first, "exported", position, name] if *first == ROW => {
+                if let Ok(position) = position.parse() {
+                    answer.push(Row::Exported(position, name));
+                }
+            }
             [first, "total", count] if *first == ROW => {
                 if let Ok(count) = count.parse() {
                     answer.push(Row::Total(count));
@@ -705,18 +757,90 @@ mod tests {
         let echo = vec![expected.value_line(0, 7)];
         assert!(expected.read_values(0, 7, &echo).is_err());
         // A cut list of the exported names.
-        let exported = [format!("{ROW} exported {MARKER}"), format!("{ROW} total 3")];
-        assert!(read_exported(7, &exported).is_err(), "no end row");
-        let width = "N".repeat(usize::from(kr_e2e_m1b::window::COLUMNS) - ROW.len() - 10);
+        let exported = [
+            format!("{ROW} exported 1 {MARKER}"),
+            format!("{ROW} total 3"),
+        ];
+        assert!(
+            read_exported(7, &[], None, &exported).is_err(),
+            "no end row"
+        );
+        let width = "N".repeat(usize::from(kr_e2e_m1b::window::COLUMNS) - ROW.len() - 12);
         let wide = [
-            format!("{ROW} exported {width}"),
+            format!("{ROW} exported 1 {width}"),
             format!("{ROW} total 1"),
             format!("{ROW} end 7"),
         ];
         assert!(
-            read_exported(7, &wide).is_err(),
+            read_exported(7, &[], None, &wide).is_err(),
             "a wrapped row is not a name"
         );
+    }
+
+    /// The rows of one part of the exported names: `names` from the position after `skipped`, the
+    /// shell's `total`, and the end row `tag`.
+    fn exported_part(skipped: usize, names: &[&str], total: usize, tag: usize) -> Vec<String> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(offset, name)| format!("{ROW} exported {} {name}", skipped + offset + 1))
+            .chain([format!("{ROW} total {total}"), format!("{ROW} end {tag}")])
+            .collect()
+    }
+
+    #[test]
+    fn the_names_the_shell_exports_are_read_whole_or_the_check_refuses() {
+        let all: Vec<String> = (1..=12).map(|index| format!("NAME_{index:02}")).collect();
+        let first: Vec<&str> = all[..10].iter().map(String::as_str).collect();
+        let rest: Vec<&str> = all[10..].iter().map(String::as_str).collect();
+        // Twelve names in two parts: the first of ten, the last the rest.
+        let (names, total) =
+            read_exported(3, &[], None, &exported_part(0, &first, 12, 3)).expect("a whole part");
+        assert_eq!((names.len(), total), (10, 12));
+        let (more, total) = read_exported(4, &names, Some(12), &exported_part(10, &rest, 12, 4))
+            .expect("the last part is the rest");
+        assert_eq!((more, total), (all[10..].to_vec(), 12));
+        // The first part loses its first name: nine names where ten were asked for.
+        let lost = exported_part(0, &first[1..], 12, 3);
+        let why = read_exported(3, &[], None, &lost).expect_err("a short part is refused");
+        assert!(
+            why.contains("asked for 10") && why.contains("shows 9"),
+            "{why}"
+        );
+        // The first row scrolled away in the last part: one name where two were asked for.
+        let scrolled = exported_part(10, &rest[1..], 12, 4);
+        assert!(read_exported(4, &names, Some(12), &scrolled).is_err());
+        // A part with a name more than it was asked for.
+        let surplus = exported_part(
+            0,
+            &all[..11].iter().map(String::as_str).collect::<Vec<_>>(),
+            12,
+            3,
+        );
+        assert!(read_exported(3, &[], None, &surplus).is_err());
+        // A part that is asked for nothing, because every name was read, and lists a name.
+        let beyond = exported_part(12, &["NAME_13"], 12, 5);
+        assert!(read_exported(5, &all, Some(12), &beyond).is_err());
+        // The total changes between parts.
+        let why = read_exported(4, &names, Some(12), &exported_part(10, &rest, 13, 4))
+            .expect_err("a total that changed is refused");
+        assert!(why.contains("12") && why.contains("13"), "{why}");
+        // A part that lists a name an earlier part listed, or one twice.
+        let again = exported_part(10, &[first[0], rest[1]], 12, 4);
+        let why = read_exported(4, &names, Some(12), &again).expect_err("a repeated name");
+        assert!(why.contains("twice"), "{why}");
+        let twice = exported_part(0, &[first[0], first[0]], 2, 3);
+        assert!(read_exported(3, &[], None, &twice).is_err());
+        // Names out of the positions the shell gave them (the part starts too late or too early).
+        let late = exported_part(1, &first[1..], 12, 3);
+        assert!(read_exported(3, &[], None, &late).is_err());
+        let early = exported_part(9, &rest, 12, 4);
+        assert!(read_exported(4, &names, Some(12), &early).is_err());
+        // Two counts of the names.
+        let mut doubled = exported_part(0, &first, 12, 3);
+        doubled.insert(doubled.len() - 1, format!("{ROW} total 12"));
+        let why = read_exported(3, &[], None, &doubled).expect_err("two counts are refused");
+        assert!(why.contains("two counts"), "{why}");
     }
 
     #[test]
@@ -804,14 +928,14 @@ mod tests {
                 );
             }
             let mut exported = Vec::new();
-            let mut skipped = 0;
+            let mut said = None;
             loop {
-                let rows = ask(&Expected::exported_line(skipped, 9));
-                let (names, total) = read_exported(9, &rows).expect("a whole answer");
+                let rows = ask(&Expected::exported_line(exported.len(), 9));
+                let (names, total) =
+                    read_exported(9, &exported, said, &rows).expect("a whole answer");
+                said = Some(total);
                 exported.extend(names);
-                skipped += PART_NAMES;
-                if skipped >= total {
-                    assert_eq!(exported.len(), total);
+                if exported.len() == total {
                     break;
                 }
             }
