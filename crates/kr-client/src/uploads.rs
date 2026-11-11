@@ -214,7 +214,8 @@ pub enum Stage {
     Sending,
     /// A lane failed, or the host refused a chunk's window: the driver is reading what the host
     /// holds and will send from the first chunk it lacks, until a chunk is acknowledged. A plan
-    /// that already holds a transfer starts here, since the host's bitmap decides what it sends.
+    /// that already holds a transfer reads the host's status first and is `Resuming` from then on
+    /// until its next chunk is acknowledged, unless that status says the upload is published.
     Resuming,
     /// Every chunk is acknowledged and the handle is being published.
     Publishing,
