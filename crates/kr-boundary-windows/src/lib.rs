@@ -19,6 +19,7 @@
 //! | [`frame`] | The broker's pipe protocol: framed messages with limits, and the requests and answers |
 //! | [`env`] | The environment of every child, built from a fixed table and nothing of the caller's |
 //! | [`quote`] | A child's command line, quoted so that the platform's own splitting gives back its parts |
+//! | [`journal`] | The framing of the journal's records: a length, the bytes and a checksum, with a torn tail dropped |
 //! | [`state`] | What the doctor says in each state of the installation |
 //!
 //! The calls that touch the machine live in `win`, which builds on Windows only. Everything above
@@ -45,6 +46,7 @@ pub mod env;
 pub mod events;
 pub mod filekey;
 pub mod frame;
+pub mod journal;
 pub mod manifest;
 pub mod notice;
 pub mod policy;
