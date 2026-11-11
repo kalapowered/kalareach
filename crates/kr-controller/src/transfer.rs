@@ -161,8 +161,9 @@ pub struct TransferAdmission {
     refusal: std::sync::Mutex<Option<ProtocolError>>,
     /// Whether the service asked this admission where it begins an effect. A draft write does so
     /// only once it has found no record of the action, as a draft whose revision an earlier attempt
-    /// moved on is refused, or answered from its record, before it asks. The upload writes ask
-    /// before they have looked for a record.
+    /// moved on is refused, or answered from its record, before it asks. Each upload write looks
+    /// for its record under the store's lock before it first asks; `upload.finish` lets go of the
+    /// lock to verify the file and asks again without looking again.
     reached: AtomicBool,
 }
 
@@ -720,47 +721,38 @@ impl TransferModule {
     }
 
     /// Writes the end of each session the registry holds as closed among the sessions the drafts
-    /// `actor_id` holds open target, before a create is counted against them.
+    /// `actor_id` holds open target and `target`, the one the create names, before the create is
+    /// counted against those drafts.
     ///
     /// A session's closure queues the write that ends its drafts on a task of its own, so a create
     /// that follows closely, or a write that failed and waits for the next sweep or start, would
-    /// count drafts of a session that has ended. Every create settles its own principal's sessions
-    /// first, whatever the count is and whatever another create is doing, so a draft stops counting
-    /// when its session is recorded closed and the bound refuses only for drafts that are open. The
-    /// work is bounded by the principal's open drafts, not by the sessions the host has closed. A
-    /// pass that cannot be made does not stop the create: the service counts what it holds.
+    /// count drafts of a session that has ended, or add one for it. Each create settles, before its
+    /// count, the closed sessions its principal's open drafts target and the one it names, whatever
+    /// the count is: a draft of a session recorded closed before then stops counting, and a create
+    /// that names one is refused as the service refuses any draft for an ended session. A refusal
+    /// at the bound is kept only after a second settle and a second count ([`Self::write`]). What
+    /// remains possible is a refusal for a draft whose session closes between the registry read
+    /// and another create's insert, at the first settle and again at the second. The registry is
+    /// read once for each of those sessions, at most one more than the principal holds open
+    /// drafts; the store's reads and writes are as they are for any such write. A pass that cannot
+    /// be made leaves a line in the log and does not stop the create: the service counts what it
+    /// holds.
     pub(crate) async fn settle_closures_of_open_drafts(
         &self,
         owner: &Arc<Controller>,
         actor_id: &ActorId,
+        target: Option<SessionId>,
     ) {
         let service = Arc::clone(&self.service);
         let owner = Arc::clone(owner);
         let actor = actor_id.clone();
-        let _ = tokio::task::spawn_blocking(move || -> Result<()> {
-            let unreadable =
-                |error: kr_transfer::TransferError| ControllerError::RegistryUnavailable {
-                    detail: error.to_string(),
-                };
-            let targeted = service.open_draft_sessions(&actor).map_err(unreadable)?;
-            if targeted.is_empty() {
-                return Ok(());
-            }
-            let mut closed = std::collections::BTreeSet::new();
-            {
-                let registry = owner.registry_handle().blocking_lock();
-                for session_id in targeted {
-                    if registry.closure(session_id)?.is_some() {
-                        closed.insert(session_id);
-                    }
-                }
-            }
-            service
-                .end_session_insertions(&closed)
-                .map(|_| ())
-                .map_err(unreadable)
+        let settled = tokio::task::spawn_blocking(move || {
+            settle_closures(&owner, &service, &actor, target);
         })
         .await;
+        if settled.is_err() {
+            say_closures_unsettled();
+        }
     }
 
     /// Records that a prompt sends a draft to a session, which moves the draft's attachments, and
@@ -1077,7 +1069,10 @@ impl TransferModule {
         let answer = blocking(move || {
             // A look at the record that cannot read it says a record exists, so what it answers is
             // a copy whichever way it is told. The other places this work cannot read or write a
-            // record answer the fixed word that the outcome is unknown, which carries no record.
+            // record answer the word that the outcome is unknown, which carries no record, except
+            // a refusal the request alone decided, which is told as itself, the conflict of a
+            // reused identifier, and a store the service itself could not read, which is told as
+            // the service refused it. None of them carries another attempt's record.
             let looked_at = || {
                 let looked = kept(&service, &actor, action_id, name, digest);
                 if looked
@@ -1167,11 +1162,32 @@ impl TransferModule {
                             .upload_cancel(&actor, &typed(&params)?, Some(&performed))
                             .map_err(&told)?,
                     ),
-                    Method::DraftCreate => encode(
-                        &service
-                            .draft_create(&actor, &typed(&params)?, Some(&performed), draft_limit)
-                            .map_err(&told)?,
-                    ),
+                    Method::DraftCreate => {
+                        let params: kr_protocol::transfer::DraftCreateParams = typed(&params)?;
+                        let mut made =
+                            service.draft_create(&actor, &params, Some(&performed), draft_limit);
+                        // The refusal at a device's bound is kept as the action's outcome, so it
+                        // is not given on a count that a draft inserted for a closed session since
+                        // the door settled could have filled: the closed sessions are settled once
+                        // more, outside the count and its holds, and the create is tried once more.
+                        if draft_limit.is_some()
+                            && matches!(made, Err(kr_transfer::TransferError::QuotaExceeded { .. }))
+                        {
+                            settle_closures(
+                                &admission.controller,
+                                &service,
+                                &actor,
+                                params.session_id.0,
+                            );
+                            made = service.draft_create(
+                                &actor,
+                                &params,
+                                Some(&performed),
+                                draft_limit,
+                            );
+                        }
+                        encode(&made.map_err(&told)?)
+                    }
                     Method::DraftUpdate => encode(
                         &service
                             .draft_update(&actor, &typed(&params)?, Some(&performed))
@@ -1261,9 +1277,9 @@ impl TransferModule {
                 // the look that decides whether they begin (the record for a create, the draft's
                 // revision for the other two, which an earlier attempt's success has moved on) to
                 // that commit, so once the service has reached the place it begins an effect, a
-                // record that an attempt finds is its own. The upload writes let go of the lock
-                // while they verify a file, so another copy can record in between: any record read
-                // for them, and for every other method, is a copy.
+                // record that an attempt finds after its own success is its own. The upload writes
+                // let go of the lock while they verify a file, so another copy can record in
+                // between: any record read for them, and for every other method, is a copy.
                 Some(retained) => {
                     let performed_here = outcome.is_ok()
                         && admission.reached()
@@ -1486,6 +1502,54 @@ fn sessions_that_may_run_a_worker(
         })
         .map(|(session_id, _)| session_id)
         .collect())
+}
+
+/// The line left when the closed sessions of a device's open drafts could not all be settled before
+/// its create was counted.
+fn say_closures_unsettled() {
+    eprintln!(
+        "kr-controller: the closed sessions of a device's open drafts could not all be settled \
+         before its create was counted; the next sweep or start settles them"
+    );
+}
+
+/// Records as ended each session among those `actor`'s open drafts target, and `target`, that the
+/// registry holds a closure for ([`TransferModule::settle_closures_of_open_drafts`]).
+///
+/// It asks the registry only whether a closure exists, goes on past a session whose record cannot
+/// be read, and never holds the registry and the journal together. Whatever fails is left for the
+/// sweep and the next start, which write every closure the registry holds.
+fn settle_closures(
+    owner: &Controller,
+    service: &TransferService,
+    actor: &ActorId,
+    target: Option<SessionId>,
+) {
+    let mut failed = false;
+    let mut asked = service.open_draft_sessions(actor).unwrap_or_else(|_| {
+        failed = true;
+        std::collections::BTreeSet::new()
+    });
+    asked.extend(target);
+    let mut closed = std::collections::BTreeSet::new();
+    if !asked.is_empty() {
+        let registry = owner.registry_handle().blocking_lock();
+        for session_id in asked {
+            match registry.has_closure(session_id) {
+                Ok(true) => {
+                    closed.insert(session_id);
+                }
+                Ok(false) => {}
+                Err(_) => failed = true,
+            }
+        }
+    }
+    if !closed.is_empty() && service.end_session_insertions(&closed).is_err() {
+        failed = true;
+    }
+    if failed {
+        say_closures_unsettled();
+    }
 }
 
 /// Records every session the registry holds a closure for as ended, and fails the insertions the

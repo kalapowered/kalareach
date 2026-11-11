@@ -2870,6 +2870,23 @@ impl Registry {
         Ok(forgotten)
     }
 
+    /// Whether the registry holds a closure record for a session, without reading the record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the read fails.
+    pub fn has_closure(&self, session_id: SessionId) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT 1 FROM tombstones WHERE session_id = ?1",
+                params![session_id.get().as_bytes().as_slice()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|found| found.is_some())
+            .map_err(ControllerError::registry)
+    }
+
     /// Reads the closure record of a session that has closed.
     ///
     /// # Errors

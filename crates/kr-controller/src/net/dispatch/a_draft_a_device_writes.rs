@@ -792,14 +792,16 @@ async fn a_draft_stops_counting_when_the_registry_holds_its_session_closed() {
 /// KR-REQ-23.41: the bound refuses a create only for drafts that are open, whatever else the device
 /// is creating. The device here holds one place fewer than its bound by the registry's account, which
 /// records the closure of the session one of its drafts targets while the transfer service has not
-/// been told. Two creates that run together are both served: the one stopped inside the service,
-/// after it has been through the door, is not refused for a draft the other made while it waited.
+/// been told. Two creates that run together are both served: the one stopped after the door's
+/// settle and before the service is entered is not refused for a draft the other made while it
+/// waited. The startup sweep has ended first, so it cannot write the closure and hide the fault.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_creates_together_beside_a_closure_not_yet_written_are_both_served() {
     use crate::service::a_read_that_meets_a_worker_on_its_way_out::closure_of;
 
     let world = fake::fake_worker(None).await;
     let controller = &world.controller;
+    controller.transfer().until_a_sweep_has_ended().await;
     let (connection, _) = paired_connection(controller, 43, EVERY_RIGHT);
     let device = connection.device.principal();
     a_draft_for(&world, &device, Some(world.session_id));
@@ -844,6 +846,113 @@ async fn two_creates_together_beside_a_closure_not_yet_written_are_both_served()
     for answered in [first, second] {
         let _: DraftCreateResult = result_of(answered.expect("the create is answered").frame());
     }
+    world.serving.abort();
+}
+
+/// KR-REQ-23.41: a create that names a session the registry holds closed is refused as the service
+/// refuses any draft for an ended session, though the write that tells the transfer service of the
+/// closure has not run, and a create that names another session is served beside it. The device
+/// holds one place fewer than its bound and none of its drafts targets the closed session, so the
+/// settle finds it only by the session the create names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_that_names_a_session_the_registry_holds_closed_is_refused_for_it() {
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::closure_of;
+
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    controller.transfer().until_a_sweep_has_ended().await;
+    let (connection, _) = paired_connection(controller, 44, EVERY_RIGHT);
+    let device = connection.device.principal();
+    for _ in 1..DEVICE_OPEN_DRAFTS {
+        a_draft_for(&world, &device, None);
+    }
+    controller
+        .registry
+        .lock()
+        .await
+        .record_closure(&closure_of(world.session_id))
+        .expect("the registry records the closure");
+
+    let closed = world.session_id;
+    let refused = connection
+        .mutate(&write_naming(
+            &world,
+            &connection,
+            Method::DraftCreate,
+            1,
+            &create_params(&world, Some(closed), None, "for the closed session"),
+            Some(closed),
+        ))
+        .await;
+    assert_eq!(
+        super::tests::error_of(&refused).code,
+        ErrorCode::SessionClosed,
+        "a draft for a session recorded closed is not made"
+    );
+    let another = SessionId::new(Uuid::from_bytes([9; 16]));
+    let _: DraftCreateResult = result_of(
+        &connection
+            .mutate(&write_naming(
+                &world,
+                &connection,
+                Method::DraftCreate,
+                2,
+                &create_params(&world, Some(another), None, "for another session"),
+                Some(another),
+            ))
+            .await,
+    );
+    world.serving.abort();
+}
+
+/// KR-REQ-23.41: a refusal at the bound is kept as the action's outcome, so it is not given on a
+/// count that a draft for a closed session, inserted after the door settled, filled. The first
+/// create is stopped after the door's settle and before the service is entered; a draft for a
+/// session the registry holds closed is then made, as another create that settled before the
+/// closure was seen would make it, and the first create is served on its second try, after the
+/// closed sessions are settled once more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_is_tried_again_after_a_second_settle_before_a_refusal_at_the_bound_is_kept() {
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::closure_of;
+
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    controller.transfer().until_a_sweep_has_ended().await;
+    let (connection, _) = paired_connection(controller, 45, EVERY_RIGHT);
+    let device = connection.device.principal();
+    for _ in 1..DEVICE_OPEN_DRAFTS {
+        a_draft_for(&world, &device, None);
+    }
+    controller
+        .registry
+        .lock()
+        .await
+        .record_closure(&closure_of(world.session_id))
+        .expect("the registry records the closure");
+
+    let (arrived, release) = controller.transfer().pause_after_the_outer_check();
+    let create = connection.answer_now(ControlFrame::Mutation(Box::new(a_create_for_no_session(
+        &world,
+        &connection,
+        1,
+    ))));
+    tokio::pin!(create);
+    let waiting = tokio::task::spawn_blocking(move || arrived.recv_timeout(WAIT_BOUND));
+    tokio::pin!(waiting);
+    tokio::select! {
+        arrived = &mut waiting => {
+            arrived
+                .expect("the waiting thread finishes")
+                .expect("the create reaches the service");
+        }
+        early = &mut create => panic!("the create was answered before the service: {early:?}"),
+    }
+    // The device now holds its bound by the transfer service's account: this draft is for a
+    // session whose closure the service has not been told.
+    a_draft_for(&world, &device, Some(world.session_id));
+    release.send(()).expect("the create goes on");
+    let answered = create.await.expect("the create is answered");
+    let _: DraftCreateResult = result_of(answered.frame());
     world.serving.abort();
 }
 

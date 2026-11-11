@@ -159,7 +159,11 @@ impl RemoteConnection {
             if method == Method::DraftCreate {
                 controller
                     .transfer
-                    .settle_closures_of_open_drafts(&controller, &actor_id)
+                    .settle_closures_of_open_drafts(
+                        &controller,
+                        &actor_id,
+                        mutation.target.session_id.0,
+                    )
                     .await;
             }
             let admission =
