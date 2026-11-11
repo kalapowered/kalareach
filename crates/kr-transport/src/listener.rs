@@ -31,7 +31,7 @@ use crate::clock::{ContinuousClock, ContinuousInstant, SystemContinuousClock};
 use crate::codec::{FrameReader, FrameWriter};
 use crate::config::EndpointConfig;
 use crate::deadlines::{Deadlines, TimerDeadlines};
-use crate::endpoint::{KEEPALIVE, allow_data_streams, bind_listener};
+use crate::endpoint::{KEEPALIVE, allow_data_streams, bind_listener, withdraw_data_streams};
 use crate::error::{Result, TransportError};
 use crate::handshake::{Admitted, HostEpochs, LocalIdentity, PairedDirectory};
 use crate::preauth::{PairingSurface, PreAuthLimits};
@@ -233,6 +233,14 @@ pub trait HostHandler: PairedDirectory + Send + Sync + 'static {
     /// run, but nothing after an outstanding `await` finishes. Work that must complete — a durable
     /// commit, a dispatch marker — belongs to an owner that outlives the connection, not to this
     /// future.
+    ///
+    /// A host that takes data streams reads [`AuthorisedSession::data_streams`] on a task of its
+    /// own, and its first call to [`DataStreams::recv`] is what lets the device open streams: it
+    /// raises the connection's stream limit from the control stream's one. The listener cannot
+    /// know when the host has finished its own check of the device, so the host calls `recv` only
+    /// after that check, and never at the start of `serve`: a read task started before the check
+    /// gives a device the credit to open nine streams, each with a header task, a queue place and
+    /// a buffer, for as long as the check takes.
     fn serve(self: Arc<Self>, session: AuthorisedSession) -> BoxFuture<'static, ()>;
 
     /// Called when a connection's control stream ends.
@@ -484,11 +492,15 @@ pub struct AuthorisedSession {
     /// that fails any step, or that finds [`DATA_STREAM_QUEUE_DEPTH`] streams waiting, or whose
     /// receiver is gone, is reset. The device can open a second stream only once the host has
     /// called [`DataStreams::recv`]: a host that never reads leaves it at the control stream. A
-    /// host that reads once and then stops holds at most [`DATA_STREAM_QUEUE_DEPTH`] streams for a
-    /// device that opens them, each with its place in the queue, its bulk slot and its flow-control
-    /// credit, until the connection ends, and resets the rest; these places share the connection's
-    /// bulk slots and are not streams in addition to them. The receiver ends when the connection
-    /// does, and a stream still queued when it is dropped is reset.
+    /// host that reads once and then stops holds at most [`DATA_STREAM_QUEUE_DEPTH`] streams in the
+    /// queue for a device that opens them, each with its registry entry and its flow-control
+    /// credit, until the connection ends, and resets the rest. An attachment stream also holds one
+    /// of the connection's bulk slots, which the four places share with every other attachment
+    /// stream; a stream of a live kind holds none, so a host that accepts one can hold more
+    /// streams than the queue's depth: at most as many as the connection's stream limit allows
+    /// beside its control stream, 9 with the defaults, of which at most `max_bulk_streams` are
+    /// attachment streams. The receiver ends when the connection does, and a stream still queued
+    /// when it is dropped is reset.
     pub data_streams: DataStreams,
     /// The deadlines a data stream is held to ([`ListenerConfig::deadlines`]), for the waits a
     /// host makes on a stream's behalf: the lookup that admits it runs under
@@ -509,10 +521,13 @@ pub struct AuthorisedSession {
 /// The data streams the listener has admitted and the host has not taken yet.
 ///
 /// A connection starts with room for one stream, the control stream, and its stream limit is
-/// raised the first time the host calls [`DataStreams::recv`], which is after the host's own
-/// check of the device, so a host that names kinds in [`ListenerConfig::accepted_kinds`] and never
-/// reads leaves its devices at one stream. Until then the accept task waits for a stream the
-/// device has no credit to open.
+/// raised the first time the host calls [`DataStreams::recv`]. The listener cannot know when the
+/// host has finished its own check of the device, so that is the host's to arrange: call `recv`
+/// only after the check, never before it (see [`HostHandler::serve`]). A host that names kinds in
+/// [`ListenerConfig::accepted_kinds`] and never reads leaves its devices at one stream. Until the
+/// first call the accept task waits for a stream the device has no credit to open. Dropping the
+/// receiver takes the limit back to one: the credit the device already has stays, and the streams
+/// that end give it no more.
 ///
 /// Dropping it resets every stream still queued, so a host that stops taking streams while its
 /// connection stands tells the device each of them was taken away, instead of letting each finish
@@ -522,28 +537,34 @@ pub struct AuthorisedSession {
 #[derive(Debug)]
 pub struct DataStreams {
     queue: Arc<Handoff<Queued>>,
-    /// What raises the connection's stream limit, which the first `recv` takes.
-    raise: Option<Raise>,
+    /// The connection's stream limit, for a host that takes data streams: the first `recv` raises
+    /// it and dropping the receiver takes it back.
+    credit: Option<Credit>,
 }
 
-/// What raises a connection's stream limit for a host that takes data streams.
+/// A connection's stream limit, which a host that takes data streams raises by reading them.
 #[derive(Debug)]
-struct Raise {
+struct Credit {
     connection: Connection,
     max_bulk_streams: usize,
+    /// Set once the first `recv` has raised the limit.
+    raised: bool,
 }
 
 impl DataStreams {
     /// Returns the next admitted stream, or `None` once the connection has ended.
     ///
-    /// The first call raises the connection's stream limit, if the host names any stream kind.
-    /// A stream that was revoked while it waited in the queue, because its connection lost its
-    /// control stream, is reset and skipped, never returned: the host is not handed a stream
-    /// whose authority has gone, but a stream it is handed can be revoked after it is returned,
-    /// so the host asks [`DataStream::is_revoked`] again where it relies on it.
+    /// The first call raises the connection's stream limit, if the host names any stream kind, so
+    /// it is made only after the host's own check of the device. A stream that was revoked while
+    /// it waited in the queue, because its connection lost its control stream, is reset and
+    /// skipped, never returned. That is the only check made: a connection that has closed but
+    /// whose cleanup has not run yet has revoked nothing, and a stream the host is handed can be
+    /// revoked after it is returned, so the host asks [`DataStream::is_revoked`] again where it
+    /// relies on it.
     pub async fn recv(&mut self) -> Option<DataStream> {
-        if let Some(raise) = self.raise.take() {
-            allow_data_streams(&raise.connection, raise.max_bulk_streams);
+        if let Some(credit) = self.credit.as_mut().filter(|credit| !credit.raised) {
+            allow_data_streams(&credit.connection, credit.max_bulk_streams);
+            credit.raised = true;
         }
         loop {
             let stream = self.queue.next().await?.into_stream();
@@ -556,11 +577,25 @@ impl DataStreams {
     }
 }
 
+#[cfg(feature = "testing")]
+impl DataStreams {
+    /// How many admitted streams wait in the queue, for a case that has to know a stream reached
+    /// it before it acts on the connection.
+    #[must_use]
+    pub fn queued(&self) -> usize {
+        self.queue.lock().queued.len()
+    }
+}
+
 impl Drop for DataStreams {
     fn drop(&mut self) {
         // What was queued is dropped here, outside the queue's lock, and so reset; what the
-        // accept task tries to queue from now on is handed back to it and dropped there.
+        // accept task tries to queue from now on is handed back to it and dropped there. A
+        // device that has opened its streams is given no more credit for the ones that end.
         drop(self.queue.close_receiver());
+        if let Some(credit) = self.credit.as_ref().filter(|credit| credit.raised) {
+            withdraw_data_streams(&credit.connection);
+        }
     }
 }
 
@@ -608,10 +643,12 @@ impl<T> Handoff<T> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Queues `item`, or hands it back when the receiver is gone or the queue is full.
+    /// Queues `item`, or hands it back when the receiver is gone, the sender is done or the queue
+    /// is full. Nothing is queued after the sender is done, so a receiver that has read the end
+    /// never has an item left behind it.
     fn push(&self, item: T) -> std::result::Result<(), T> {
         let mut state = self.lock();
-        if state.receiver_gone || state.queued.len() >= state.depth {
+        if state.receiver_gone || state.sender_done || state.queued.len() >= state.depth {
             return Err(item);
         }
         state.queued.push_back(item);
@@ -664,6 +701,10 @@ impl<T> Handoff<T> {
 }
 
 /// Tells the queue its sender has ended, however the accept task ends.
+///
+/// It is made before the task is spawned and moved into it, so it runs when the task's future is
+/// dropped without ever having been polled, as well as when the future ends or is dropped part
+/// way: a receiver that the host moved to another task is told the end whichever of these happens.
 struct QueueEnds(Arc<Handoff<Queued>>);
 
 impl Drop for QueueEnds {
@@ -1181,10 +1222,11 @@ async fn serve_authorised<H: HostHandler>(
     }));
 
     // The connection started with room for one stream, the one the control stream is, and it stays
-    // so until the host first reads its data streams: the receiver raises the limit then, which is
-    // after the host's own check of the device, and only for a host that names a stream kind. A
-    // host that names none, or never reads, leaves a device's second stream waiting for credit
-    // that does not come, and the accept task below waits for a stream the device cannot open.
+    // so until the host first reads its data streams: the receiver raises the limit then, and only
+    // for a host that names a stream kind. When that is relative to the host's own check of the
+    // device is the host's to arrange. A host that names none, or never reads, leaves a device's
+    // second stream waiting for credit that does not come, and the accept task below waits for a
+    // stream the device cannot open.
     //
     // The streams the device opens are taken here, on a task the guard owns beside the keepalive
     // and the control reader, and never by the host's handler: a handler that is answering a
@@ -1192,12 +1234,17 @@ async fn serve_authorised<H: HostHandler>(
     let queue = Handoff::new(DATA_STREAM_QUEUE_DEPTH);
     let data_streams = DataStreams {
         queue: Arc::clone(&queue),
-        raise: (!state.config.accepted_kinds.is_empty()).then(|| Raise {
+        credit: (!state.config.accepted_kinds.is_empty()).then(|| Credit {
             connection: connection.clone(),
             max_bulk_streams: state.config.send_limits.max_bulk_streams,
+            raised: false,
         }),
     };
+    // Made here, and not in the task's body: a task that is aborted before its first poll never
+    // runs its body, and the receiver would wait for ever.
+    let ends = QueueEnds(Arc::clone(&queue));
     let data_accept = tokio::spawn(data_accept_loop(
+        ends,
         Arc::clone(&streams),
         connection.clone(),
         state.config.accepted_kinds.clone().into(),
@@ -1383,12 +1430,14 @@ async fn control_read_loop(
 /// as they are accepted, with no header read: what the device opened is never left waiting for a
 /// host that has stopped, and nothing the loop held stays for the rest of the connection.
 async fn data_accept_loop(
+    ends: QueueEnds,
     streams: Arc<StreamRegistry>,
     connection: Connection,
     accepted: Arc<[StreamKind]>,
     queue: Arc<Handoff<Queued>>,
 ) {
-    let _ends = QueueEnds(Arc::clone(&queue));
+    // Held for the whole of the loop; the future owns it from the moment it is made.
+    let _ends = ends;
     // Dropped when the host's receiver goes, which aborts every header read that is still waiting
     // and resets its stream.
     let mut headers = tokio::task::JoinSet::new();
@@ -1396,7 +1445,10 @@ async fn data_accept_loop(
         // Header tasks that ended are collected as the next stream arrives, so the set holds the
         // streams still waiting and those that ended since the last one.
         while headers.try_join_next().is_some() {}
+        // The receiver's closure is looked at first, so once the host has gone no further stream is
+        // taken and no header is read for one that arrives at the same moment.
         let taken = tokio::select! {
+            biased;
             () = queue.receiver_closed() => break,
             taken = streams.accept_pending(&connection) => taken,
         };
@@ -1604,9 +1656,11 @@ mod tests {
         counter.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// A send that comes after the receiver's closing is handed back to the task that made it, and
-    /// is not kept in a queue nobody reads: the interleaving a lock-free queue leaves open, a send
-    /// that has reserved its place when the receiver is dropped, does not exist here.
+    /// The two orders of a send and the receiver's closing, one after the other. One lock covers
+    /// each operation, so these are all the outcomes there are: a send before the closing is taken
+    /// by it, and a send after is handed back to the task that made it, and neither leaves the
+    /// stream in a queue nobody reads. The lock is what shows that no third order exists; the
+    /// two tests show that each of the two is handled.
     #[test]
     fn a_stream_queued_after_the_receiver_is_gone_is_handed_back() {
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1623,8 +1677,71 @@ mod tests {
         assert_eq!(dropped(&counter), 1);
     }
 
-    /// A stream queued before the receiver's closing is taken by it, whatever else is sent after:
-    /// closing hands back everything queued at once, and nothing queued is left behind.
+    /// Nothing is queued once the sender is done: a header task that finishes after the accept task
+    /// ended gets its stream back, and a receiver that has read the end never has an item left
+    /// behind it.
+    #[test]
+    fn a_stream_queued_after_the_sender_is_done_is_handed_back() {
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queue = Handoff::new(DATA_STREAM_QUEUE_DEPTH);
+        queue.finish();
+
+        let handed_back = queue.push(Counted(Arc::clone(&counter)));
+        assert!(
+            handed_back.is_err(),
+            "a stream was queued after the sender was done"
+        );
+        assert_eq!(dropped(&counter), 0, "the sender, not the queue, holds it");
+        drop(handed_back);
+        assert_eq!(dropped(&counter), 1);
+    }
+
+    /// The receiver reads what was queued before the sender was done, and then the end.
+    #[tokio::test]
+    async fn the_receiver_reads_what_was_queued_and_then_the_end() {
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queue = Handoff::new(DATA_STREAM_QUEUE_DEPTH);
+        assert!(queue.push(Counted(Arc::clone(&counter))).is_ok());
+        queue.finish();
+
+        assert!(
+            queue.next().await.is_some(),
+            "a queued item was lost at the end"
+        );
+        assert!(
+            queue.next().await.is_none(),
+            "the end did not follow the last item"
+        );
+    }
+
+    /// A receiver that is waiting is woken by an item, and by the end of the sender, and the
+    /// sender's task is woken by the receiver's closing.
+    #[tokio::test]
+    async fn a_waiting_receiver_is_woken_by_an_item_and_by_the_end() {
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queue = Handoff::new(DATA_STREAM_QUEUE_DEPTH);
+
+        let waiting = tokio::spawn({
+            let queue = Arc::clone(&queue);
+            async move { (queue.next().await.is_some(), queue.next().await.is_none()) }
+        });
+        tokio::task::yield_now().await;
+        assert!(queue.push(Counted(Arc::clone(&counter))).is_ok());
+        tokio::task::yield_now().await;
+        queue.finish();
+        assert_eq!(waiting.await.expect("the receiver's task"), (true, true));
+
+        let closed = tokio::spawn({
+            let queue = Arc::clone(&queue);
+            async move { queue.receiver_closed().await }
+        });
+        tokio::task::yield_now().await;
+        drop(queue.close_receiver());
+        closed.await.expect("the sender's wait ended");
+    }
+
+    /// A stream queued before the receiver's closing is taken by it: closing hands back everything
+    /// queued at once, and a full queue refuses what does not fit.
     #[test]
     fn closing_the_receiver_takes_everything_queued_and_leaves_nothing() {
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));

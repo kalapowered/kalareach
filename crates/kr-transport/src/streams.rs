@@ -882,10 +882,10 @@ impl StreamRegistry {
     /// opened, so a peer cannot hold open more transfers than the connection allows.
     ///
     /// The open waits for the peer's stream credit, and holds the bulk slot while it waits. A host
-    /// that takes data streams grants it when it authorises the connection, a round trip after the
-    /// handshake; a host that takes none never does, and the open then waits until the registry is
-    /// revoked or the connection ends. No deadline bounds it, so a caller that must not wait
-    /// bounds it itself.
+    /// that takes data streams grants it when it first reads them, which is after its own check of
+    /// the device and a round trip before the credit arrives; a host that takes none, or has not
+    /// read yet, does not, and the open then waits until the registry is revoked or the connection
+    /// ends. No deadline bounds it, so a caller that must not wait bounds it itself.
     ///
     /// # Errors
     ///

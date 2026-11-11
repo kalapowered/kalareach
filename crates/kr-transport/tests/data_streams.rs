@@ -38,8 +38,8 @@ use kr_transport::deadlines::{DeadlineKind, ManualDeadlines};
 use kr_transport::error::TransportError;
 use kr_transport::handshake::{self, AuthorisedConnection, PairedDirectory};
 use kr_transport::listener::{
-    AuthorisedSession, BoxFuture, DATA_STREAM_QUEUE_DEPTH, HostHandler, ListenerConfig,
-    NetworkListener, register,
+    AuthorisedSession, BoxFuture, DATA_STREAM_QUEUE_DEPTH, DataStreams, HostHandler,
+    ListenerConfig, NetworkListener, register,
 };
 use kr_transport::preauth::PairingSurface;
 use kr_transport::scheduler::{PRIORITY_BULK, SendLimits, StreamBudget};
@@ -63,8 +63,10 @@ async fn awaited<T>(what: &str, step: impl Future<Output = T>) -> T {
 /// What a test host does with the streams the listener hands it.
 ///
 /// The connection's stream limit is raised at the first `recv` of the host's receiver, so a host
-/// that is to hold streams back without reading them polls `recv` once, which raises the limit and
-/// takes nothing, and a host that has not taken streams yet does not poll it at all.
+/// that is to hold streams back without reading them polls `recv` once before it announces its
+/// session: that poll raises the limit and takes nothing, because the device has no credit to open
+/// a stream before it, and a case sends its first stream only once it has the session. A host that
+/// has not taken streams yet does not poll it at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Taking {
     /// Forwards each one to the case.
@@ -78,6 +80,15 @@ enum Taking {
     Never,
     /// Polls `recv` once and holds the receiver until the case opens the gate, and then drops it.
     DropAfterTheGate,
+    /// Polls `recv` once and keeps the receiver where the case can reach it, for a case that
+    /// reads it itself.
+    Stash,
+    /// Moves the receiver to a task of its own that reads until the connection ends, and returns
+    /// from `serve` at once.
+    MoveAway,
+    /// Moves the receiver to a task of its own that reads until the connection ends, and serves the
+    /// control stream until it ends.
+    KeepReading,
 }
 
 /// Where the host sends its session's registry and its end of the connection.
@@ -102,6 +113,12 @@ struct ChunkHost {
     /// Said once the host has dropped the receiver, for [`Taking::Never`].
     dropped: Notify,
     receiver_dropped: AtomicBool,
+    /// The receiver a host keeps for the case, for [`Taking::Stash`].
+    stash: std::sync::Mutex<Option<DataStreams>>,
+    /// Said once the task a receiver was moved to has seen the end of the streams, for
+    /// [`Taking::MoveAway`] and [`Taking::KeepReading`].
+    receiver_ended: AtomicBool,
+    ended: Notify,
     /// Set when the connection's `serve` future has been dropped.
     serve_ended: Arc<AtomicBool>,
     /// What `serve_ended` said when the host's `control_stream_lost` hook ran.
@@ -207,6 +224,18 @@ impl HostHandler for ChunkHost {
     fn serve(self: Arc<Self>, mut session: AuthorisedSession) -> BoxFuture<'static, ()> {
         Box::pin(async move {
             let _serving = SetWhenDropped(Arc::clone(&self.serve_ended));
+            // One poll raises the connection's stream limit, as any host's first read does. It
+            // takes nothing: the device has no credit to open a stream before it. The session is
+            // announced after it, so a case that sends a stream waits for it.
+            if matches!(
+                self.taking,
+                Taking::AfterTheGate | Taking::Never | Taking::DropAfterTheGate | Taking::Stash
+            ) {
+                assert!(
+                    session.data_streams.recv().now_or_never().is_none(),
+                    "the host's first read took a stream, or found the streams ended"
+                );
+            }
             if let Some(sender) = self
                 .session
                 .lock()
@@ -217,9 +246,6 @@ impl HostHandler for ChunkHost {
             }
             match self.taking {
                 Taking::Never | Taking::DropAfterTheGate => {
-                    // One poll raises the connection's stream limit, as any host's first read
-                    // does, and takes nothing.
-                    let _ = session.data_streams.recv().now_or_never();
                     if self.taking == Taking::DropAfterTheGate {
                         self.gate
                             .acquire()
@@ -232,13 +258,30 @@ impl HostHandler for ChunkHost {
                     self.dropped.notify_waiters();
                     while session.control.recv().await.is_some() {}
                 }
+                Taking::Stash => {
+                    *self
+                        .stash
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(session.data_streams);
+                    while session.control.recv().await.is_some() {}
+                }
+                Taking::MoveAway | Taking::KeepReading => {
+                    let mut receiver = session.data_streams;
+                    let host = Arc::clone(&self);
+                    tokio::spawn(async move {
+                        while receiver.recv().await.is_some() {}
+                        host.receiver_ended.store(true, Ordering::Release);
+                        host.ended.notify_waiters();
+                    });
+                    if self.taking == Taking::KeepReading {
+                        while session.control.recv().await.is_some() {}
+                    }
+                }
                 Taking::Forward | Taking::AfterTheGate | Taking::NotYet => {
                     let mut admitted = session.data_streams;
                     let host = Arc::clone(&self);
                     let forwarding = tokio::spawn(async move {
-                        if host.taking == Taking::AfterTheGate {
-                            let _ = admitted.recv().now_or_never();
-                        }
                         if matches!(host.taking, Taking::AfterTheGate | Taking::NotYet) {
                             host.gate
                                 .acquire()
@@ -315,6 +358,9 @@ impl Harness {
             hold,
             dropped: Notify::new(),
             receiver_dropped: AtomicBool::new(false),
+            stash: std::sync::Mutex::new(None),
+            receiver_ended: AtomicBool::new(false),
+            ended: Notify::new(),
             serve_ended: Arc::new(AtomicBool::new(false)),
             hook_saw_serve_ended: AtomicBool::new(false),
             hook_ran: AtomicBool::new(false),
@@ -364,7 +410,9 @@ impl Harness {
 
     /// Opens a stream the way a device does, header first, and returns its two raw halves.
     async fn raw(&self, header: &StreamHeader) -> (SendStream, RecvStream) {
-        let (mut send, recv) = self.connection.open_bi().await.expect("a stream");
+        let (mut send, recv) = awaited("a stream's credit", self.connection.open_bi())
+            .await
+            .expect("a stream");
         write_header(&mut send, header, None).await;
         (send, recv)
     }
@@ -513,7 +561,9 @@ async fn a_stream_with_half_a_header_does_not_hold_back_the_next_one() {
     let connection_id = harness.authorised.connection_id;
 
     // The first stream names a header and sends half of it, and stays open.
-    let (mut half_send, mut half_recv) = harness.connection.open_bi().await.expect("a stream");
+    let (mut half_send, mut half_recv) = awaited("a stream's credit", harness.connection.open_bi())
+        .await
+        .expect("a stream");
     let half = attachment_header(connection_id, 1);
     write_header(&mut half_send, &half, Some(12)).await;
 
@@ -1266,7 +1316,9 @@ async fn a_host_that_has_not_taken_streams_leaves_a_device_one_stream_until_it_d
 async fn a_host_that_drops_its_queue_releases_a_header_being_read() {
     let harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::DropAfterTheGate).await;
     let header = attachment_header(harness.authorised.connection_id, 1);
-    let (mut half_send, mut half_recv) = harness.connection.open_bi().await.expect("a stream");
+    let (mut half_send, mut half_recv) = awaited("a stream's credit", harness.connection.open_bi())
+        .await
+        .expect("a stream");
     write_header(&mut half_send, &header, Some(12)).await;
     awaited(
         "the listener reading the header",
@@ -1283,32 +1335,165 @@ async fn a_host_that_drops_its_queue_releases_a_header_being_read() {
 }
 
 /// A stream that was revoked while it waited in the queue is reset and skipped, and never handed to
-/// the host: the host keeps a transfer's stream where it could replace the device's live one.
+/// the host: the host keeps a transfer's stream where it could replace the device's live one. The
+/// case waits until the stream is in the queue, revokes the connection's streams, and only then
+/// lets the receiver meet it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stream_revoked_while_queued_is_reset_and_not_handed_over() {
-    let mut harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::AfterTheGate).await;
+    let harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::Stash).await;
     let (_send, mut recv) = harness
         .raw(&attachment_header(harness.authorised.connection_id, 1))
         .await;
-    awaited("the stream being admitted", async {
-        while harness.registry.is_empty() {
+    let queued = || {
+        harness
+            .host
+            .stash
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, DataStreams::queued)
+    };
+    awaited("the stream being queued", async {
+        while queued() == 0 {
             tokio::task::yield_now().await;
         }
     })
     .await;
     harness.registry.revoke_all();
 
-    harness.host.gate.add_permits(1);
-    assert_eq!(reset_code(&mut recv).await, u64::from(STREAM_REVOKED));
+    let mut receiver = harness
+        .host
+        .stash
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("the host kept its receiver");
+    let handed_over = awaited("the receiver meeting the stream", receiver.recv()).await;
     assert!(
-        harness.admitted.try_recv().is_err(),
+        handed_over.is_none(),
         "a stream that was revoked in the queue was handed to the host"
     );
-    awaited(
-        "the stream leaving the registry",
-        emptied(&harness.registry),
+    assert_eq!(reset_code(&mut recv).await, u64::from(STREAM_REVOKED));
+
+    harness.finish().await;
+}
+
+/// A receiver that the host moved to another task ends when the connection ends, whichever way the
+/// listener's accept task ended. Here the host moves the receiver away and returns from serving
+/// at once, on a runtime with one thread, so the connection's cleanup aborts the accept task before
+/// it has run at all: the end of the streams is announced by what the accept task owned, not by
+/// anything its body did.
+#[tokio::test(flavor = "current_thread")]
+async fn a_receiver_held_elsewhere_ends_when_the_accept_task_never_ran() {
+    let listening = Harness::listen(&[StreamKind::AttachmentChunks], Taking::MoveAway, None).await;
+    // The host's cleanup closes the connection as soon as the host has the session, which can cut
+    // what the device reads last: how the device's handshake ends is not what this case is about.
+    let _ = handshake::connect(
+        &listening.connection,
+        &listening.client.identity,
+        &listening.host_side.record,
     )
     .await;
+    awaited(
+        "the receiver held elsewhere seeing the streams end",
+        until_set(&listening.host.receiver_ended, &listening.host.ended),
+    )
+    .await;
+
+    listening.connection.close(0u32.into(), b"done");
+    listening.listener.shutdown().await;
+}
+
+/// A receiver reads `None` when its connection ends: the host keeps reading on a task of its own,
+/// and the end of the streams reaches it without anything else waking it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_receiver_ends_when_its_connection_does() {
+    let harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::KeepReading).await;
+    assert!(
+        !harness.host.receiver_ended.load(Ordering::Acquire),
+        "the receiver ended while its connection stood"
+    );
+
+    harness.connection.close(0u32.into(), b"done");
+    awaited(
+        "the receiver seeing the streams end",
+        until_set(&harness.host.receiver_ended, &harness.host.ended),
+    )
+    .await;
+
+    harness.finish().await;
+}
+
+/// A host that drops its receiver gives the device no more credit to open streams. The credit
+/// already sent stays, so the device can use it, and every stream it opens is reset; but the
+/// freeing of those streams, which would grant a stream each, grants nothing: the limit went back
+/// to the control stream's one with the receiver. The device opens the streams its credit allows
+/// and the host resets each; the next open still finds no credit, and the host has sent no further
+/// credit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_drops_its_receiver_gives_no_more_credit() {
+    let harness = Harness::start(&[StreamKind::AttachmentChunks], Taking::DropAfterTheGate).await;
+    // The streams the connection allows beside its control stream: the bulk streams, the places
+    // for streams waiting for their headers, and one more.
+    let granted = u8::try_from(
+        SendLimits::default().max_bulk_streams + kr_transport::streams::MAX_PENDING_HEADERS + 1,
+    )
+    .expect("a small credit");
+
+    // The credit the host's first read gave: a stream for each, opened and not yet used.
+    let mut held = Vec::new();
+    for _ in 0..granted {
+        held.push(
+            awaited(
+                "the credit the first read gave",
+                harness.connection.open_bi(),
+            )
+            .await
+            .expect("a stream"),
+        );
+    }
+    let sent_before = harness.host_connection.stats().frame_tx.max_streams_bidi;
+
+    harness.host.gate.add_permits(1);
+    awaited(
+        "the host dropping its receiver",
+        until_set(&harness.host.receiver_dropped, &harness.host.dropped),
+    )
+    .await;
+    for (send, recv) in &mut held {
+        // A byte is what announces the stream to the host. The host resets it without reading a
+        // header, so a later write of the device's can find the stream stopped.
+        let _ = send.write_all(&[0u8]).await;
+        assert_eq!(reset_code(recv).await, u64::from(STREAM_REVOKED));
+        // The device ends its half too, so the host's stream is free on both sides and the
+        // library would hand its place on as credit.
+        let _ = send.reset(0u32.into());
+    }
+
+    let mut next = Box::pin(harness.connection.open_bi());
+    assert!(
+        futures::poll!(&mut next).is_pending(),
+        "a device was given credit for a stream after the host dropped its receiver"
+    );
+    awaited("the host being told the device is blocked", async {
+        while harness
+            .host_connection
+            .stats()
+            .frame_rx
+            .streams_blocked_bidi
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(futures::poll!(&mut next).is_pending());
+    assert_eq!(
+        harness.host_connection.stats().frame_tx.max_streams_bidi,
+        sent_before,
+        "the host sent more credit after it dropped its receiver"
+    );
+    drop(next);
 
     harness.finish().await;
 }
@@ -1512,7 +1697,9 @@ async fn a_failed_control_write_revokes_the_data_streams_before_it_returns() {
     let mut authorised = handshake::connect(&connection, &client.identity, &host_side.record)
         .await
         .expect("an authorised connection");
-    let (mut send, _recv) = connection.open_bi().await.expect("a stream");
+    let (mut send, _recv) = awaited("a stream's credit", connection.open_bi())
+        .await
+        .expect("a stream");
     write_header(
         &mut send,
         &attachment_header(authorised.connection_id, 1),

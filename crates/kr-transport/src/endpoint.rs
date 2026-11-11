@@ -756,15 +756,26 @@ const fn max_peer_bidi_streams(max_bulk_streams: usize) -> u32 {
     }
 }
 
-/// Lets the peer of an authorised connection open the streams a device's transfers need.
+/// Lets the peer of a connection open the streams a device's transfers need.
 ///
-/// A connection starts with room for one bidirectional stream ([`transport_config`]); this is
-/// raised, once the connection is authorised, to [`max_peer_bidi_streams`]. The library grants the
-/// difference at once, and a stream the peer tried to open in the meantime waits for that credit
-/// and is opened when it arrives.
+/// A connection starts with room for one bidirectional stream ([`transport_config`]); this raises
+/// it to [`max_peer_bidi_streams`]. The listener calls it when the host first reads its data
+/// streams, which is after the host's own check of the device and not when the connection is
+/// authorised. The library grants the difference at once, and a stream the peer tried to open in
+/// the meantime waits for that credit and is opened when it arrives.
 pub(crate) fn allow_data_streams(connection: &Connection, max_bulk_streams: usize) {
     connection
         .set_max_concurrent_bi_streams(VarInt::from_u32(max_peer_bidi_streams(max_bulk_streams)));
+}
+
+/// Takes the peer's stream limit back to the control stream's one.
+///
+/// The credit the peer was already given stays with it, and the library gives no new credit for a
+/// stream that ends while the number of the peer's streams is at or above the limit: the peer can
+/// use what it was granted and no more. The listener calls it when the host drops its receiver of
+/// data streams.
+pub(crate) fn withdraw_data_streams(connection: &Connection) {
+    connection.set_max_concurrent_bi_streams(VarInt::from_u32(UNAUTHORISED_BIDI_STREAMS));
 }
 
 /// Returns the transport configuration every KalaReach peer connection uses, for an endpoint whose
@@ -777,9 +788,9 @@ pub(crate) fn allow_data_streams(connection: &Connection, max_bulk_streams: usiz
 /// each kind and a connection that has not been authorised yet can hold them, up to 64 such
 /// connections at once. The product uses no unidirectional stream, so a peer may open none. A
 /// listening endpoint starts every connection with one bidirectional stream
-/// ([`UNAUTHORISED_BIDI_STREAMS`]) and raises it when a host that takes data streams authorises
-/// the connection ([`allow_data_streams`]), so an unauthorised peer holds one stream's buffer and
-/// not ten. An endpoint that only dials starts at none: a host opens no stream to a client. What
+/// ([`UNAUTHORISED_BIDI_STREAMS`]) and raises it when a host that takes data streams first reads
+/// them ([`allow_data_streams`]), which is after the host's own check of the device, so a peer
+/// that is not yet admitted by the host holds one stream's buffer and not ten. An endpoint that only dials starts at none: a host opens no stream to a client. What
 /// an authorised connection can hold is then at most [`max_peer_bidi_streams`] streams, each up to
 /// the library's per-stream receive window of 1.25 MB, and one decoded frame for each stream whose
 /// frame is being read. A finite connection-wide receive window, if one is ever set, has to stay

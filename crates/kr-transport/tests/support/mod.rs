@@ -29,8 +29,8 @@ use kr_transport::window::{ActionWindowIssuer, MAX_WINDOW_VALIDITY};
 /// data streams allows.
 ///
 /// A listening endpoint starts every connection with room for one bidirectional stream, and the
-/// listener raises it when it authorises a connection for a host that takes data streams. A test
-/// that accepts connections itself, and then takes streams from them, raises it the same way.
+/// listener raises it when a host that takes data streams first reads them. A test that accepts
+/// connections itself, and then takes streams from them, raises it the same way.
 pub fn allow_streams(connection: &iroh::endpoint::Connection) {
     connection.set_max_concurrent_bi_streams(iroh::endpoint::VarInt::from_u32(16));
 }
