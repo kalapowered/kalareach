@@ -17,6 +17,9 @@
 //! | [`events`] | What the platform's application-control log says about a program it refused |
 //! | [`frame`] | The broker's pipe protocol: framed messages with limits, and the requests and answers |
 //! | [`journal`] | The framing of the journal's records: a length, the bytes and a checksum, with a torn tail dropped |
+//! | [`repository`] | What the broker reads of a repository before it starts Git, from bytes alone: its `HEAD`, its attributes and its configuration listing |
+//! | [`refusal`] | The refusal those readers give: a kind, the rule's name and a short text |
+//! | [`names`] | The grammar of the branch names and object identifiers the broker admits |
 //! | [`state`] | What the doctor says in each state of the installation |
 //!
 //! The calls that touch the machine live in `win`, which builds on Windows only. Everything above
@@ -34,8 +37,11 @@ pub mod events;
 pub mod frame;
 pub mod journal;
 pub mod manifest;
+pub mod names;
 pub mod notice;
 pub mod policy;
+pub mod refusal;
+pub mod repository;
 pub mod state;
 
 #[cfg(windows)]
