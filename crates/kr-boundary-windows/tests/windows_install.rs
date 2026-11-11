@@ -912,6 +912,146 @@ fn the_parent_folder_is_checked_on_one_handle_that_is_held_and_an_entry_of_an_un
     let _ = std::fs::remove_dir_all(&folder);
 }
 
+/// The privileges that a running process's token holds, each with whether it is enabled, by name.
+fn token_privileges_of_process(pid: u32) -> Vec<(String, bool)> {
+    use windows_sys::Win32::Foundation::{HANDLE, LUID};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, LUID_AND_ATTRIBUTES, LookupPrivilegeNameW, SE_PRIVILEGE_ENABLED,
+        TOKEN_PRIVILEGES, TOKEN_QUERY, TokenPrivileges,
+    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, OpenProcessToken};
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    // SAFETY: opens a process for a limited query; the result is checked.
+    let process = unsafe {
+        ffi::Handle::new(
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid),
+            "the service's process",
+        )
+        .unwrap()
+    };
+    let mut raw: HANDLE = std::ptr::null_mut();
+    // SAFETY: the process handle is open and the out-parameter is local.
+    assert_ne!(
+        unsafe { OpenProcessToken(process.raw(), TOKEN_QUERY, &raw mut raw) },
+        0,
+        "the service's token is opened for reading"
+    );
+    let token = ffi::Handle::new(raw, "the service's token").unwrap();
+    let mut size = 0_u32;
+    // SAFETY: asks for the size only.
+    unsafe {
+        GetTokenInformation(
+            token.raw(),
+            TokenPrivileges,
+            std::ptr::null_mut(),
+            0,
+            &raw mut size,
+        );
+    }
+    let mut buffer = vec![0_u64; (size as usize).div_ceil(8)];
+    // SAFETY: the buffer is at least `size` bytes.
+    assert_ne!(
+        unsafe {
+            GetTokenInformation(
+                token.raw(),
+                TokenPrivileges,
+                buffer.as_mut_ptr().cast(),
+                size,
+                &raw mut size,
+            )
+        },
+        0
+    );
+    // SAFETY: the buffer holds a TOKEN_PRIVILEGES: a count and that many entries.
+    let privileges = unsafe { &*buffer.as_ptr().cast::<TOKEN_PRIVILEGES>() };
+    // SAFETY: the entries follow the count and there are `PrivilegeCount` of them.
+    let entries: &[LUID_AND_ATTRIBUTES] = unsafe {
+        std::slice::from_raw_parts(
+            privileges.Privileges.as_ptr(),
+            privileges.PrivilegeCount as usize,
+        )
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            let luid: LUID = entry.Luid;
+            let mut length = 0_u32;
+            // SAFETY: asks for the length of the name only.
+            unsafe {
+                LookupPrivilegeNameW(
+                    std::ptr::null(),
+                    &raw const luid,
+                    std::ptr::null_mut(),
+                    &raw mut length,
+                );
+            }
+            let mut name = vec![0_u16; length as usize + 1];
+            length = name.len() as u32;
+            // SAFETY: the buffer is `length` units long.
+            assert_ne!(
+                unsafe {
+                    LookupPrivilegeNameW(
+                        std::ptr::null(),
+                        &raw const luid,
+                        name.as_mut_ptr(),
+                        &raw mut length,
+                    )
+                },
+                0
+            );
+            (
+                String::from_utf16_lossy(&name[..length as usize]),
+                entry.Attributes & SE_PRIVILEGE_ENABLED != 0,
+            )
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_running_services_own_token_holds_the_privileges_the_installer_requires_and_no_others() {
+    let case = Case::new();
+    let (code, output) = case.install();
+    assert_eq!(code, 0, "{output}");
+    let manager = service::manager().unwrap();
+    let broker = manager.open(SERVICE).unwrap().unwrap();
+    let status = broker.status().unwrap();
+    assert!(status.running(), "the broker's service is running");
+    let held = token_privileges_of_process(status.pid);
+    let names: Vec<&str> = held.iter().map(|(name, _)| name.as_str()).collect();
+    println!("the running service's token holds {held:?}");
+
+    // Every privilege the installer requires is held; the two that a walk enables on a thread's
+    // copy of the token are held disabled, and the process token never has them enabled.
+    for required in install::BROKER_PRIVILEGES {
+        assert!(
+            names.contains(&required),
+            "{required} is required and the service's token lacks it: {names:?}"
+        );
+    }
+    for name in ["SeBackupPrivilege", "SeRestorePrivilege"] {
+        assert_eq!(
+            held.iter()
+                .find(|(held, _)| held == name)
+                .map(|(_, on)| *on),
+            Some(false),
+            "{name} is held disabled"
+        );
+    }
+    // And nothing beyond the list: the service manager takes away every privilege that the list
+    // does not name, so none that could matter is there, the debug privilege (which a scheduled
+    // task's system token has enabled, and the guest runner's token with it) least of all.
+    for name in &names {
+        assert!(
+            install::BROKER_PRIVILEGES.contains(name),
+            "{name} is held although the installer does not require it: {names:?}"
+        );
+    }
+
+    let (code, output) = setup(&["remove"], "yes\n", &[]);
+    assert_eq!(code, 0, "{output}");
+}
+
 #[cfg(feature = "testing")]
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
@@ -1056,6 +1196,20 @@ fn the_removal_reads_the_journal_and_the_private_roots_first_and_refuses_with_no
     assert_eq!(code, 0, "{output}");
     let paths = Paths::system();
     let installed = snapshot();
+    // What only the removal's first check can show: it refuses before the broker is touched. A
+    // removal that went on would put the broker in its maintenance state first, and a later step
+    // that refuses would find the broker there.
+    let untouched = || {
+        let mut connection = install::open_session().expect("the broker still serves");
+        match install::ask(&mut connection, &Request::Status {}).unwrap() {
+            Response::Status { maintenance } => assert!(
+                !maintenance,
+                "the removal refused before it put the broker in maintenance"
+            ),
+            other => panic!("{other:?}"),
+        }
+    };
+    const REFUSAL: &str = "unfinished work is recorded, so nothing was changed";
 
     // An unfinished invocation in the journal.
     let id = InvocationId([5; 16]);
@@ -1080,9 +1234,10 @@ fn the_removal_reads_the_journal_and_the_private_roots_first_and_refuses_with_no
         output.contains(r"C:\work\project"),
         "the project is named: {output}"
     );
-    assert!(output.contains("nothing was changed"), "{output}");
+    assert!(output.contains(REFUSAL), "{output}");
     assert_eq!(snapshot(), installed, "the removal changed nothing");
     assert!(paths.manifest.exists() && paths.journal.exists());
+    untouched();
 
     // The same invocation, finished, but carrying a leftover of its private root that the sweep
     // still holds: its slot is free and the removal is still held, because a leftover is work.
@@ -1105,10 +1260,13 @@ fn the_removal_reads_the_journal_and_the_private_roots_first_and_refuses_with_no
     let (code, output) = setup(&["remove"], "yes\n", &[]);
     assert_ne!(code, 0, "{output}");
     assert!(
-        output.contains("Finished") && output.contains(r"C:\work\project"),
+        output.contains(REFUSAL)
+            && output.contains("Finished")
+            && output.contains(r"C:\work\project"),
         "a finished invocation with a root leftover holds the removal: {output}"
     );
     assert_eq!(snapshot(), installed, "the removal changed nothing");
+    untouched();
     // Once the leftover is cleared the finished journal is no work. A private root that is still
     // there holds the removal.
     journal
@@ -1122,11 +1280,13 @@ fn the_removal_reads_the_journal_and_the_private_roots_first_and_refuses_with_no
     let (code, output) = setup(&["remove"], "yes\n", &[]);
     assert_ne!(code, 0, "{output}");
     assert!(
-        output.contains("a private root 0123456789abcdef0123456789abcdef")
+        output.contains(REFUSAL)
+            && output.contains("a private root 0123456789abcdef0123456789abcdef")
             && !output.contains("the invocation"),
         "only the root holds it now: {output}"
     );
     assert_eq!(snapshot(), installed, "the removal changed nothing");
+    untouched();
 
     // With the root gone the removal runs and takes the finished journal with it.
     std::fs::remove_dir(&root).unwrap();
@@ -1221,9 +1381,14 @@ fn an_application_identity_service_that_already_runs_is_never_stopped_and_the_ev
             .any(|call| call == "appid stop" || call == "appid start"),
         "a running service is neither stopped nor started: {calls:?}"
     );
-    // The event the installation took came after the write: its record is past the one the writing
-    // process read right before it wrote, which is past everything the log held before the
-    // installation began. The order of the messages shows none of this.
+    // What the record numbers show and what they do not. The record the writing process read right
+    // before it wrote is not before everything the log held when the installation began, and the
+    // event the installation took has a higher number: it stands later in the log than that read.
+    // That is the log's order and not the cause. An application that the service had started before
+    // the write can log its own event after the read, and a cleared log restarts its numbers (the
+    // wait then fails closed). The proof that the policy refuses an unlisted program is what shows
+    // that the policy is in force; these numbers show only that the wait did not take an event that
+    // the log already held before the write.
     let (after_record, applied_record) = policy_records(&calls);
     assert!(
         after_record >= log_before_install,
@@ -1231,7 +1396,7 @@ fn an_application_identity_service_that_already_runs_is_never_stopped_and_the_ev
     );
     assert!(
         applied_record > after_record,
-        "the event is past the record read before the write: {applied_record} <= {after_record}"
+        "the event stands later in the log than the record read before the write: {applied_record} <= {after_record}"
     );
     assert!(output.contains("already running"), "{output}");
     assert!(
@@ -1292,7 +1457,7 @@ fn a_stopped_application_identity_service_is_started_once_and_its_first_event_co
     assert!(after_record >= log_before_install, "{calls:?}");
     assert!(
         applied_record > after_record,
-        "the event after the write is not one of the service's first: {applied_record} <= {after_record}"
+        "the event stands later in the log than the record read before the write: {applied_record} <= {after_record}"
     );
     assert!(!calls.iter().any(|call| call == "appid stop"), "{calls:?}");
     let started = output

@@ -1200,38 +1200,54 @@ fn a_reader_of_a_pipe_that_a_writer_keeps_supplying_stops_at_its_deadline() {
     let stop = std::sync::atomic::AtomicBool::new(false);
     let bound = Duration::from_millis(500);
     let (piped, elapsed) = std::thread::scope(|scope| {
-        let writer = scope.spawn(|| {
-            let chunk = [b'x'; 4096];
-            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                let mut written = 0_u32;
-                // SAFETY: the write end is open and the buffer is the length given.
-                let ok = unsafe {
-                    WriteFile(
-                        write.raw(),
-                        chunk.as_ptr().cast(),
-                        chunk.len() as u32,
-                        &raw mut written,
-                        std::ptr::null_mut(),
-                    )
-                };
-                if ok == 0 {
-                    break;
-                }
-            }
-        });
+        // Three writers, each with a write of a megabyte pending on a pipe that holds a few
+        // kilobytes: as the reader drains it the platform fills it from a pending write, so the
+        // pipe is never seen empty (a reader that looks at the clock only when it finds the pipe
+        // empty would never look). One writer with small writes leaves the pipe empty between them.
+        let writers: Vec<_> = (0..3)
+            .map(|_| {
+                scope.spawn(|| {
+                    let chunk = vec![b'x'; 1 << 20];
+                    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        let mut written = 0_u32;
+                        // SAFETY: the write end is open and the buffer is the length given.
+                        let ok = unsafe {
+                            WriteFile(
+                                write.raw(),
+                                chunk.as_ptr().cast(),
+                                chunk.len() as u32,
+                                &raw mut written,
+                                std::ptr::null_mut(),
+                            )
+                        };
+                        if ok == 0 {
+                            break;
+                        }
+                    }
+                })
+            })
+            .collect();
+        // Let the writers fill the pipe before the reader begins.
+        std::thread::sleep(Duration::from_millis(100));
         let begun = Instant::now();
         let piped = read_pipe(&read, begun + bound);
         let elapsed = begun.elapsed();
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        // A write that is blocked on a full pipe is released by draining it.
-        let _ = read_pipe(&read, Instant::now() + Duration::from_millis(200));
-        drop(writer);
+        // Writes that are blocked on a full pipe are released by draining it, until each writer
+        // has seen the stop.
+        while writers.iter().any(|writer| !writer.is_finished()) {
+            let _ = read_pipe(&read, Instant::now() + Duration::from_millis(50));
+        }
         (piped, elapsed)
     });
     assert!(!piped.ended, "a pipe a writer still fills has not ended");
-    assert!(!piped.bytes.is_empty(), "what was read is kept");
     assert!(
-        elapsed >= bound && elapsed < bound + Duration::from_secs(2),
+        piped.bytes.len() > 1 << 20,
+        "what was read is kept: {} bytes",
+        piped.bytes.len()
+    );
+    assert!(
+        elapsed >= bound && elapsed < bound + Duration::from_millis(500),
         "the reader returned at its deadline although data was always waiting: {elapsed:?}"
     );
 }
