@@ -935,8 +935,8 @@ fn the_names_ntfs_gives_gitattributes_are_picked_exactly_as_git_matches_them() {
         ("gi7d29~1:s", true),
         ("g~12345 .", false),
         ("gi7d2~10 ", true),
-        // Two boundaries of the fall-back loop, recorded in Apple Git 2.50.1: a 9 after the first
-        // digit, and a byte over 0x7f at a prefix position.
+        // Two boundaries of the fall-back loop, recorded in Apple Git 2.50.1 and in Git 2.53.0: a
+        // 9 after the first digit, and a byte over 0x7f at a prefix position.
         ("gi7d2~19", true),
         ("gi7dé~1", false),
     ];
