@@ -677,6 +677,10 @@ struct Unconditional {}
 ///   transport recorded (`ControlTransport::ended_by_this_device`), whatever code the lane saw:
 ///   the reason can carry `PERMISSION_DENIED`, which only a host's answer to a chunk means a window
 ///   refused.
+/// * A finish the host answers `OUTCOME_UNKNOWN`, as it does a device that may not view the session
+///   of a session-bound upload though the upload is published, is read from `upload.status` once.
+///   When that says published, the send returns the handle, and no second finish is sent;
+///   otherwise it returns the answer.
 /// * The plan records a reservation as asked for before `upload.begin` leaves
 ///   ([`Upload::reserving`]), and only a definite answer clears that: the host's result, or its
 ///   refusal. A reply that was lost, a refusal saying the outcome is unknown, a receipt with no
@@ -847,7 +851,7 @@ pub async fn send(
                 // Every chunk is acknowledged, so the lane has nothing left to carry.
                 lane = None;
                 publish(progress, plan.progress_at(Stage::Publishing));
-                let settled = session
+                let finished = session
                     .mutate(
                         Method::UploadFinish,
                         target.clone(),
@@ -856,8 +860,23 @@ pub async fn send(
                         &params,
                         requested_ttl,
                     )
-                    .await?;
-                plan.accept(Answer::Finished(Box::new(settled.to_typed()?)))?;
+                    .await;
+                match finished {
+                    Ok(settled) => plan.accept(Answer::Finished(Box::new(settled.to_typed()?)))?,
+                    // A host does not tell a device that may not view a session what became of its
+                    // first finish of a session-bound upload, though the upload is published. The
+                    // host's record decides: one read of the status, and no second finish. A
+                    // record that does not say published leaves the answer as it was.
+                    Err(error) if error.code() == kr_protocol::error::ErrorCode::OutcomeUnknown => {
+                        plan.accept(Answer::Status(Box::new(
+                            status(session, params.transfer_id).await?,
+                        )))?;
+                        if plan.handle().is_none() {
+                            return Err(error);
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             Step::Done(handle) => {
                 publish(progress, plan.progress_at(Stage::Published));

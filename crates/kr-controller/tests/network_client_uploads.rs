@@ -24,7 +24,7 @@ use kr_protocol::frame::StreamHeader;
 use kr_protocol::hello::{ActionWindow, ReceiveLimits};
 use kr_protocol::ids::{ActionId, ConnectionId, SessionId, TransferId};
 use kr_protocol::limits::UPLOAD_CHUNK_LEN;
-use kr_protocol::method::Method;
+use kr_protocol::method::{Method, MethodName};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Bytes, Digest256, DurationMs, Nullable, U64};
 use kr_protocol::transfer::{
@@ -84,14 +84,27 @@ async fn counted_session(
     device: &Device,
     record: &DeviceRecord,
 ) -> (Session, Arc<AtomicU64>) {
+    let (session, opened, _finished) = counting_session(host, device, record).await;
+    (session, opened)
+}
+
+/// A connection of the device's, as a session that counts the data streams it opens and the
+/// `upload.finish` mutations it sends.
+async fn counting_session(
+    host: &Host,
+    device: &Device,
+    record: &DeviceRecord,
+) -> (Session, Arc<AtomicU64>, Arc<AtomicU64>) {
     let opened = Arc::new(AtomicU64::new(0));
+    let finished = Arc::new(AtomicU64::new(0));
     let transport = net_support::paired_dial(host, device, record).dial().await;
     let session = Session::start(Arc::new(Counted {
         inner: Arc::new(transport),
         opened: Arc::clone(&opened),
+        finished: Arc::clone(&finished),
     }))
     .expect("a session");
-    (session, opened)
+    (session, opened, finished)
 }
 
 fn staged(host: &Host) -> u64 {
@@ -109,11 +122,13 @@ async fn status_of(session: &Session, transfer_id: TransferId) -> UploadStatusRe
         .expect("the host reads the upload's status")
 }
 
-/// A transport that counts the data streams opened through it, each once its header is written.
+/// A transport that counts the data streams opened through it, each once its header is written,
+/// and the `upload.finish` mutations sent through it.
 #[derive(Debug)]
 struct Counted {
     inner: Arc<dyn ControlTransport>,
     opened: Arc<AtomicU64>,
+    finished: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -153,6 +168,11 @@ impl ControlTransport for Counted {
         self.inner.ended_by_this_device()
     }
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
+        if let ControlFrame::Mutation(mutation) = frame
+            && mutation.method == MethodName::from(Method::UploadFinish)
+        {
+            self.finished.fetch_add(1, Ordering::AcqRel);
+        }
         self.inner.send(frame)
     }
     fn claim_receiver(&self) -> kr_client::Result<()> {
@@ -492,9 +512,8 @@ async fn a_finish_and_a_cancel_asked_again_on_a_replacement_connection_are_answe
 /// A device that may not view a session can reserve an upload bound to it and send its chunks, and the
 /// host does not tell it what became of the finish: its answer is that the outcome is not known,
 /// though the upload is published, so that the device is shown nothing of a session it may not view in
-/// an answer it could keep. The client ends the send with that answer, every chunk acknowledged and
-/// the transfer in the plan. Asked again, it reads the status, which is shown, and returns the handle
-/// without a second finish.
+/// an answer it could keep. The client reads the status, which is shown, in the same call and returns
+/// the handle: one finish is sent, and the send does not end with an error for a file that arrived.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_that_may_not_view_a_session_is_not_told_its_finish_and_reads_it_published_from_the_status()
  {
@@ -502,7 +521,7 @@ async fn a_device_that_may_not_view_a_session_is_not_told_its_finish_and_reads_i
     let host = &adopted.host;
     let session_id = adopted.workers[0].session_id;
     let (device, record) = paired(host, &adopted.owner, &[ActionRight::FilesUpload]).await;
-    let session = net_support::connect(host, &device, &record).await;
+    let (session, _opened, finished) = counting_session(host, &device, &record).await;
     let route = ChunkRoute::network(&session, host.environment_id)
         .await
         .expect("the host takes an attachment stream from a device");
@@ -510,26 +529,6 @@ async fn a_device_that_may_not_view_a_session_is_not_told_its_finish_and_reads_i
     let target = on_the_session(host, session_id);
     let mut upload = plan(host, Some(session_id), "scoped.bin", &bytes);
     let (progress, watching) = tokio::sync::watch::channel(Progress::default());
-
-    let told = within(uploads::send(
-        &session,
-        &route,
-        &target,
-        &mut upload,
-        TTL,
-        &progress,
-    ))
-    .await
-    .expect_err("the host does not say what became of the finish");
-    assert_eq!(told.code(), ErrorCode::OutcomeUnknown, "{told}");
-    let seen = *watching.borrow();
-    assert_eq!(
-        (seen.stage, seen.acknowledged_chunks, seen.chunks),
-        (Stage::Publishing, 1, 1)
-    );
-    let transfer = *upload
-        .transfer_id()
-        .expect("the reservation was answered, and the plan holds its transfer");
 
     let handle = within(uploads::send(
         &session,
@@ -540,10 +539,19 @@ async fn a_device_that_may_not_view_a_session_is_not_told_its_finish_and_reads_i
         &progress,
     ))
     .await
-    .expect("the status says the upload is published");
-    assert_eq!(handle.transfer_id, transfer);
+    .expect("the status says the upload is published, and the send returns its handle");
+    assert_eq!(
+        Some(handle.transfer_id),
+        upload.transfer_id().copied(),
+        "the handle is the upload's"
+    );
     assert_eq!(handle.content_digest, digest(&bytes));
     assert_eq!(watching.borrow().stage, Stage::Published);
+    assert_eq!(
+        finished.load(Ordering::Acquire),
+        1,
+        "the finish was sent once and not again"
+    );
     assert_eq!(staged(host), bytes.len() as u64, "one file");
     session.close();
     adopted.stop().await;
