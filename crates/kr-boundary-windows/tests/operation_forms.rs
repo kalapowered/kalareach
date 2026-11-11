@@ -7,8 +7,9 @@ use kr_boundary_windows::frame::invocation::{
     NamedFormat, Part, Placeholder, RefusedKind,
 };
 use kr_boundary_windows::operation::grammar::{
-    MAX_PATH_COMPONENTS, MAX_PATHS, MAX_REVISION_STEPS, RULE_MESSAGE_LENGTH, RULE_MESSAGE_LINES,
-    RULE_PATH, RULE_PATH_DEPTH, RULE_PATH_LENGTH, RULE_REVISION, RULE_REVISION_LENGTH,
+    MAX_PATH_COMPONENTS, MAX_PATHS, MAX_REVISION_STEPS, RULE_MESSAGE_CONTROL, RULE_MESSAGE_LENGTH,
+    RULE_MESSAGE_LINES, RULE_PATH, RULE_PATH_DEPTH, RULE_PATH_LENGTH, RULE_REVISION,
+    RULE_REVISION_LENGTH, message,
 };
 use kr_boundary_windows::operation::tables::{self, Form, GLOBAL_REFUSED, INTROSPECTION, Row};
 use kr_boundary_windows::operation::{
@@ -528,7 +529,7 @@ fn diff_takes_each_option_each_revision_form_and_paths() {
     );
 
     let one = accepted(Command::Diff, &[r("main")]);
-    assert_eq!(one.argv, with(DIFF, &["refs/heads/main"]));
+    assert_eq!(one.argv, with(DIFF, &["refs/heads/main", "--"]));
     assert_eq!(
         one.checks,
         vec![
@@ -537,14 +538,14 @@ fn diff_takes_each_option_each_revision_form_and_paths() {
         ]
     );
     let two = accepted(Command::Diff, &[w("--cached"), r("HEAD~1"), r(OID)]);
-    assert_eq!(two.argv, with(DIFF, &["--cached", "HEAD~1", OID]));
+    assert_eq!(two.argv, with(DIFF, &["--cached", "HEAD~1", OID, "--"]));
     assert_eq!(two.checks, vec![resolve("HEAD~1", 6), resolve(OID, 7)]);
 
     for (dots, text) in [(Dots::Two, ".."), (Dots::Three, "...")] {
         let line = accepted(Command::Diff, &[range("main", dots, "HEAD^")]);
         assert_eq!(
             line.argv,
-            with(DIFF, &[&format!("refs/heads/main{text}HEAD^")])
+            with(DIFF, &[&format!("refs/heads/main{text}HEAD^"), "--"])
         );
         assert_eq!(
             line.checks,
@@ -732,7 +733,7 @@ fn log_takes_each_option_each_revision_form_and_paths() {
     assert_eq!(line.writes, Writes::No);
 
     let line = accepted(Command::Log, &[r("main"), r("HEAD")]);
-    assert_eq!(line.argv, with(LOG, &["refs/heads/main", "HEAD"]));
+    assert_eq!(line.argv, with(LOG, &["refs/heads/main", "HEAD", "--"]));
     assert_eq!(
         line.checks,
         vec![
@@ -791,7 +792,10 @@ fn log_takes_a_named_format_or_a_custom_one_with_either_option() {
             Command::Log,
             &[w("--format"), custom(vec![Part::Placeholder(placeholder)])],
         );
-        assert_eq!(line.argv, with(LOG, &[&format!("--format={spelled}")]));
+        assert_eq!(
+            line.argv,
+            with(LOG, &[&format!("--format=tformat:{spelled}")])
+        );
     }
     let parts = vec![
         Part::Placeholder(Placeholder::CommitHashShort),
@@ -801,13 +805,69 @@ fn log_takes_a_named_format_or_a_custom_one_with_either_option() {
         Part::Placeholder(Placeholder::Percent),
     ];
     let line = accepted(Command::Log, &[w("--pretty"), custom(parts)]);
-    assert_eq!(line.argv, with(LOG, &["--pretty=%h by %an: 100%%"]));
+    assert_eq!(line.argv, with(LOG, &["--pretty=tformat:%h by %an: 100%%"]));
     // Text that looks like a placeholder to a reader is text without its percent sign.
     let line = accepted(
         Command::Log,
         &[w("--format"), custom(vec![text("an"), text("-x")])],
     );
-    assert_eq!(line.argv, with(LOG, &["--format=an-x"]));
+    assert_eq!(line.argv, with(LOG, &["--format=tformat:an-x"]));
+}
+
+#[test]
+fn a_custom_format_of_text_alone_is_never_the_name_of_a_built_in_format() {
+    // Git reads a format with no `%` as the name of a built-in format, by prefix and without
+    // regard to case: `r` is `raw`, `E` is `email`, `mb` is `mboxrd`, `ref` is `reference`. The
+    // broker writes every custom format with its own prefix, so the text stays text.
+    for literal in [
+        "r",
+        "E",
+        "raw",
+        "email",
+        "mb",
+        "ref",
+        "reference",
+        "oneline",
+        "an-x",
+        "tformat:",
+    ] {
+        for option in ["--format", "--pretty"] {
+            let line = accepted(Command::Log, &[w(option), custom(vec![text(literal)])]);
+            assert_eq!(
+                line.argv,
+                with(LOG, &[&format!("{option}=tformat:{literal}")]),
+                "{literal}"
+            );
+        }
+    }
+    // The named formats are names Git is meant to read as names.
+    let line = accepted(Command::Log, &[w("--format"), named(NamedFormat::Short)]);
+    assert_eq!(line.argv, with(LOG, &["--format=short"]));
+}
+
+#[test]
+fn diff_and_log_with_revisions_and_no_path_end_with_the_separator() {
+    // A file named like the identifier would make the last operand ambiguous to Git.
+    for command in [Command::Diff, Command::Log] {
+        let table = if command == Command::Diff { DIFF } else { LOG };
+        for args in [
+            vec![r("a")],
+            vec![r("a"), r("HEAD")],
+            vec![range("a", Dots::Two, "b")],
+            vec![range("a", Dots::Three, "b")],
+        ] {
+            let line = accepted(command, &args);
+            assert_eq!(line.argv.last().map(String::as_str), Some("--"), "{args:?}");
+            assert_eq!(line.argv.iter().filter(|word| *word == "--").count(), 1);
+            assert_eq!(line.argv.len(), table.len() + args.len() + 1, "{args:?}");
+        }
+        // Paths bring the separator themselves, and no revision needs none.
+        let line = accepted(command, &[r("a"), w("--"), p("x")]);
+        assert_eq!(line.argv.iter().filter(|word| *word == "--").count(), 1);
+        assert_eq!(line.argv.last().map(String::as_str), Some("x"));
+        let line = accepted(command, &[]);
+        assert_eq!(line.argv, with(table, &[]));
+    }
 }
 
 #[test]
@@ -2028,6 +2088,14 @@ fn a_path_is_relative_with_forward_slashes_and_ordinary_components() {
         "com10",
         "lpt0",
         "lptx",
+        "conin",
+        "conout",
+        "conin$x",
+        "xconout$",
+        "com¹x",
+        "x¹",
+        "lpt¹x",
+        "com⁴",
         "aux1",
         "nulx",
         "prn1",
@@ -2103,6 +2171,20 @@ fn a_path_is_relative_with_forward_slashes_and_ordinary_components() {
         "LPT1",
         "lpt9",
         "Lpt3.log",
+        "COM¹",
+        "COM²",
+        "COM³",
+        "LPT¹",
+        "LPT²",
+        "LPT³",
+        "com²",
+        "Lpt³.log",
+        "a/COM¹.txt",
+        "CONIN$",
+        "CONOUT$",
+        "conin$",
+        "Conout$.txt",
+        "a/CONOUT$",
         "con .txt",
         "\\\\?\\C:\\a",
         "\\\\.\\x",
@@ -2333,7 +2415,7 @@ fn the_identifiers_the_readers_return_take_the_place_of_the_revisions() {
     let two = "2".repeat(40);
     assert_eq!(
         line.resolved(&[one.clone(), two.clone()]).unwrap(),
-        with(DIFF, &["--cached", &one, &two])
+        with(DIFF, &["--cached", &one, &two, "--"])
     );
     let line = accepted(Command::Log, &[range("a", Dots::Two, "b"), w("--"), p("x")]);
     assert_eq!(
@@ -2343,7 +2425,7 @@ fn the_identifiers_the_readers_return_take_the_place_of_the_revisions() {
     let line = accepted(Command::Log, &[range("a", Dots::Three, "b")]);
     assert_eq!(
         line.resolved(&[one.clone(), two.clone()]).unwrap(),
-        with(LOG, &[&format!("{one}...{two}")])
+        with(LOG, &[&format!("{one}...{two}"), "--"])
     );
     // The switch resolves its branch and keeps the name: one identifier, no replacement.
     let line = accepted(Command::Checkout, &[n("main")]);
@@ -2502,4 +2584,27 @@ fn an_option_that_is_listed_but_out_of_place_is_an_order_refusal_in_any_spelling
     assert_eq!(refused(Command::Log, &[w("-")]), RULE_OPTION_UNLISTED);
     assert_eq!(refused(Command::Log, &[w("-x5")]), RULE_OPTION_UNLISTED);
     assert_eq!(refused(Command::Log, &[w("--5")]), RULE_OPTION_UNLISTED);
+}
+
+#[test]
+fn the_message_grammar_refuses_a_control_character_by_itself() {
+    // A request's control characters are refused for every element before its grammar runs, so
+    // this rule is the grammar's own and is reached by a caller of the grammar.
+    for bad in [
+        "a\u{1}b",
+        "a\u{7f}",
+        "\u{0}",
+        "a\rb",
+        "a\u{1b}[0m",
+        "\u{b}x",
+    ] {
+        assert_eq!(
+            message(bad, 100, false),
+            Err(RULE_MESSAGE_CONTROL),
+            "{bad:?}"
+        );
+    }
+    for fine in ["a\tb", "a\nb", "a\n\tb", "é"] {
+        assert_eq!(message(fine, 100, false), Ok(()), "{fine:?}");
+    }
 }
