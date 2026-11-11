@@ -588,12 +588,7 @@ impl OperateRequest {
     /// Returns the first field outside its bounds.
     pub fn check(&self) -> Result<(), FieldError> {
         let directory = &self.directory;
-        let units = if directory.len() > 4 * MAX_DIRECTORY_UNITS {
-            usize::MAX
-        } else {
-            directory.encode_utf16().count()
-        };
-        if units > MAX_DIRECTORY_UNITS {
+        if directory.encode_utf16().count() > MAX_DIRECTORY_UNITS {
             return Err(FieldError::TooLong {
                 field: "directory",
                 max: MAX_DIRECTORY_UNITS,

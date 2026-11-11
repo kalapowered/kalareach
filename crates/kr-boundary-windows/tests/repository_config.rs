@@ -1,10 +1,10 @@
 //! The configuration classifier against listings of `git config --list --null`: the listings that
 //! Git writes, and the ones a hostile repository could make it write.
 //!
-//! Three golden listings are written by hand from Git's documented defaults for Windows and for the
-//! values the table admits (`written-by-hand-*`); one is a recording of `git init` made with
-//! Apple's Git 2.50.1 on macOS (`macos-git-2.50.1-init.listing`). A recording of `init` and `clone`
-//! on the Git that Windows hosts use is still to be added.
+//! Three golden listings are written by hand from Git's documented defaults for Windows and for
+//! the values the table admits (`written-by-hand-*`); one is a recording of `git init` made with
+//! Apple's Git 2.50.1 on macOS (`macos-git-2.50.1-init.listing`). None is a recording from the Git
+//! that Windows hosts use.
 
 use kr_boundary_windows::frame::invocation::RefusedKind;
 use kr_boundary_windows::repository::config::{
@@ -603,6 +603,9 @@ fn a_key_that_is_not_in_the_table_is_refused_by_the_family_it_belongs_to() {
         ("commit.gpgsign", RULE_UNLISTED),
         ("init.defaultBranch", RULE_UNLISTED),
         ("kr.evil", RULE_UNLISTED),
+        ("foo-bar.baz-qux", RULE_UNLISTED),
+        ("core.some-thing", RULE_UNLISTED),
+        ("a-b.c.d-e", RULE_UNLISTED),
         ("foo.bar", RULE_UNLISTED),
         ("core.bare.x", RULE_UNLISTED),
         ("user.x.name", RULE_UNLISTED),
@@ -686,6 +689,10 @@ fn a_record_without_a_usable_key_is_refused() {
         b"core.\0",
         b"core..filemode\ntrue\0",
         b"remote..url\nhttps://example.com\0",
+        b"remote.a\x01b.url\nhttps://example.com\0",
+        b"remote.a\tb.url\nhttps://example.com\0",
+        b"remote.a\x7fb.url\nhttps://example.com\0",
+        b"remote.a\xc2\x85b.url\nhttps://example.com\0",
         b"core.file\x01mode\ntrue\0",
         b"core.file\tmode\ntrue\0",
         b"core.file\x7fmode\ntrue\0",
