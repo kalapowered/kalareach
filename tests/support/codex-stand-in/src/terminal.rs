@@ -316,6 +316,12 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
             }
             Frame::Notification { method } => {
                 println!("TUI: {method}");
+                if variants.answer_the_sum
+                    && method == "item/agentMessage/delta"
+                    && let Some(answer) = frame["params"]["delta"].as_str()
+                {
+                    println!("TUI: {answer}");
+                }
                 let completed = method == "turn/completed"
                     && frame["params"]["threadId"] == thread.as_str()
                     && frame["params"]["turn"]["id"] == turn.as_str();
