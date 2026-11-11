@@ -519,6 +519,47 @@ impl Server {
         .await;
     }
 
+    /// Under `write-the-record`, writes the agent's record of the turn `turn_id` of `thread_id`,
+    /// started by `request`: below `sessions/<year>/<month>/<day>` in the directory `CODEX_HOME`
+    /// names, a line that marks the turn's start and a line that holds its prompt, in the file of
+    /// the thread. Nothing is written for a turn whose input holds no text, or where `CODEX_HOME`
+    /// is not set.
+    fn writes_the_record(request: &Value, thread_id: &str, turn_id: &str) {
+        let Some(home) = std::env::var_os(crate::variants::CONFIG_VARIABLE) else {
+            return;
+        };
+        let prompt = crate::variants::prompt_of(request);
+        if prompt.trim().is_empty() {
+            return;
+        }
+        let seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        let (year, month, day) = crate::variants::civil_date(seconds);
+        let directory = std::path::Path::new(&home)
+            .join("sessions")
+            .join(format!("{year:04}"))
+            .join(format!("{month:02}"))
+            .join(format!("{day:02}"));
+        let lines = format!(
+            "{}\n{}\n",
+            json!({"type":"event_msg","payload":{"type":"task_started","turn_id":turn_id}}),
+            json!({"type":"response_item","payload":{
+                "type":"message","role":"user","content":[{"type":"input_text","text":prompt}]}}),
+        );
+        let written = std::fs::create_dir_all(&directory).and_then(|()| {
+            use std::io::Write as _;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(directory.join(format!("rollout-{thread_id}.jsonl")))
+                .and_then(|mut file| file.write_all(lines.as_bytes()))
+        });
+        if let Err(error) = written {
+            eprintln!("stand-in: the record of {turn_id} could not be written: {error}");
+        }
+    }
+
     /// Under `answer-the-sum`, writes the sum a turn's input asks for as the agent's message of
     /// that turn, worked out from the input; says nothing for an input that asks none.
     async fn answers_the_sum(&mut self, request: &Value, thread_id: &str, turn_id: &str) {
@@ -552,6 +593,9 @@ impl Server {
         }
         self.turns_made += 1;
         let turn_id = format!("turn-{}", self.turns_made);
+        if self.variants.write_the_record {
+            Self::writes_the_record(frame, &thread_id, &turn_id);
+        }
         // A turn after the first is one somebody else started, and it runs to its end at once: it
         // asks for nothing and starts nothing.
         if self.turns_made > 1 {

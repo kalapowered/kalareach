@@ -124,6 +124,13 @@ pub struct Variants {
     /// The terminal runs the program `STAND_IN_LEAVE` names once, before it connects, and goes
     /// on when it has ended.
     pub leave_a_host: bool,
+    /// The server writes the agent's record of each turn whose input holds text, as the agent's
+    /// own record is written: below `sessions/<year>/<month>/<day>` in the directory `CODEX_HOME`
+    /// names, one `.jsonl` file for the thread, and for each such turn one line that marks the
+    /// turn's start and one that holds the prompt. It writes nothing where `CODEX_HOME` is not
+    /// set, and a turn whose input is empty (the terminal's own, with no prompt typed) is no model
+    /// turn and is not recorded.
+    pub write_the_record: bool,
     /// The server answers a turn whose input asks `What is A plus B?` with the sum of the two
     /// numbers, in a message of its own before the turn ends, and the terminal writes it as a row
     /// of its own. The sum is worked out from the input.
@@ -176,6 +183,7 @@ impl Variants {
                 "hold-before-thread" => variants.hold_before_thread = true,
                 "leave-a-host" => variants.leave_a_host = true,
                 "answer-the-sum" => variants.answer_the_sum = true,
+                "write-the-record" => variants.write_the_record = true,
                 other => panic!("{VARIABLE} names a variant this program does not have: {other}"),
             }
         }
@@ -246,6 +254,45 @@ pub fn sum_asked(turn_request: &serde_json::Value) -> Option<String> {
         })
 }
 
+/// The variable that names the directory of the agent's own configuration and record.
+pub const CONFIG_VARIABLE: &str = "CODEX_HOME";
+
+/// The text of a turn's input, its items' texts joined by a line break.
+#[must_use]
+pub fn prompt_of(turn_request: &serde_json::Value) -> String {
+    turn_request["params"]["input"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// The year, month and day of the civil date `unix_seconds` after the epoch falls on, in UTC.
+#[must_use]
+pub fn civil_date(unix_seconds: u64) -> (u64, u64, u64) {
+    // The days since 1970-01-01 as a proleptic Gregorian date (Hinnant's algorithm).
+    let days = unix_seconds / 86_400 + 719_468;
+    let era = days / 146_097;
+    let day_of_era = days % 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + u64::from(month <= 2);
+    (year, month, day)
+}
+
 /// Makes `text` as long as it takes for the whole frame `frame(text)` to be `size` bytes.
 ///
 /// # Panics
@@ -261,4 +308,25 @@ pub fn padded(size: usize, frame: impl Fn(&str) -> String) -> String {
     let built = frame(&text);
     assert_eq!(built.len(), size);
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The date a second after the epoch falls on, for dates a calendar gets wrong: a leap day, the
+    /// last day before one, a century that is not a leap year's.
+    #[test]
+    fn the_civil_date_of_a_time_is_the_calendars() {
+        for (seconds, date) in [
+            (0, (1970, 1, 1)),
+            (951_782_400, (2000, 2, 29)),
+            (1_000_000_000, (2001, 9, 9)),
+            (1_709_164_799, (2024, 2, 28)),
+            (1_794_419_455, (2026, 11, 11)),
+            (4_102_444_800, (2100, 1, 1)),
+        ] {
+            assert_eq!(civil_date(seconds), date, "{seconds}");
+        }
+    }
 }
