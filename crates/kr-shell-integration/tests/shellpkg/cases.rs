@@ -4713,12 +4713,35 @@ pub fn a_revocation_in_the_same_read_binds_the_launch(kind: ShellKind) {
                 .expect("the second piece is there");
             let (typed, rest) = command.split_at(rest_at);
             session.type_bytes(typed.as_bytes());
-            std::thread::sleep(Duration::from_millis(200));
+            // The reader says before the revocation is sent that the editor holds the typed text,
+            // and after it that the revocation has been read and the text is still there. Each is
+            // the reader's own answer, not a wait for time to pass: a revocation that met an empty
+            // buffer would leave the line whole whatever it did to a full one. The editor takes
+            // typed text from the terminal on its own time, so the first answer is asked for until
+            // it says it holds the text.
+            let deadline = session.deadline_for(REPLY);
+            loop {
+                let held = session.fence_exchange_before(&enter, fence_id(17), deadline.0);
+                if !held.editor.buffer_empty {
+                    break;
+                }
+                assert!(
+                    !deadline.passed(),
+                    "the editor never took the typed text before the revocation was sent:\n{}",
+                    session.terminal_output()
+                );
+            }
             session.write_frame(&BridgeFrame::LaunchRevoked {
                 transaction,
                 reason: LaunchRejectionReason::Timeout,
             });
-            std::thread::sleep(Duration::from_millis(200));
+            let revoked = session.fence_exchange(&enter, fence_id(18));
+            assert!(
+                !revoked.editor.buffer_empty,
+                "a revocation for a finished transaction took the person's own text out of the \
+                 editor:\n{}",
+                session.terminal_output()
+            );
             assert!(
                 session.finish_line(typed, rest, "kr-typed-survived"),
                 "a revocation for a finished transaction took the person's own text out:\n{}",
