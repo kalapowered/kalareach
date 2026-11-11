@@ -15,7 +15,9 @@
 //! release says so and ends them, and nothing else is skipped; a checkout with no release tags at all fails them. They print `inside the level:` and
 //! the release they chose, or that they have none, so run them with `--nocapture` to see it.
 //! The suite is behind the `upgrade-suite` feature, because building a second tree takes minutes
-//! and a network.
+//! and a network. A tree and its build take about 12 GB, and `KR_UPGRADE_CACHE` names another
+//! absolute folder to keep them in, one that holds nothing but this suite's trees, since every
+//! folder in it that no case selects is removed.
 
 #![cfg(unix)]
 #![allow(dead_code, unused_imports)]
@@ -138,13 +140,57 @@ fn recorded(record: &str, name: &str) -> String {
         .to_owned()
 }
 
+/// The variable that names the folder trees of the release before are built and kept in, in place
+/// of the one under the person's home. Only cargo, rustc and this test process read that folder:
+/// every program a case starts is copied out of it first (see [`Previous::built`]).
+const CACHE_ROOT: &str = "KR_UPGRADE_CACHE";
+
+/// The folder the variable names, where it is set. It has to be an absolute path, since a relative
+/// one would name a different folder for each directory a run starts from.
+fn configured_cache_root(value: Option<&std::ffi::OsStr>) -> Result<Option<PathBuf>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        Ok(Some(path))
+    } else {
+        Err(format!(
+            "{CACHE_ROOT} has to name an absolute path, and holds {value:?}"
+        ))
+    }
+}
+
 /// Where trees of the release before are built and kept between runs.
 fn cache_root() -> PathBuf {
-    let home = PathBuf::from(std::env::var_os("HOME").expect("a home directory"));
-    if cfg!(target_os = "macos") {
-        home.join("Library/Caches/kalareach-upgrade")
-    } else {
-        home.join(".cache/kalareach-upgrade")
+    let configured = std::env::var_os(CACHE_ROOT);
+    match configured_cache_root(configured.as_deref()) {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            let home = PathBuf::from(std::env::var_os("HOME").expect("a home directory"));
+            if cfg!(target_os = "macos") {
+                home.join("Library/Caches/kalareach-upgrade")
+            } else {
+                home.join(".cache/kalareach-upgrade")
+            }
+        }
+        Err(reason) => panic!("{reason}"),
+    }
+}
+
+#[test]
+fn the_cache_folder_variable_takes_an_absolute_path_and_nothing_else() {
+    use std::ffi::OsStr;
+    assert_eq!(configured_cache_root(None), Ok(None));
+    assert_eq!(
+        configured_cache_root(Some(OsStr::new("/Volumes/Storage/upgrade"))),
+        Ok(Some(PathBuf::from("/Volumes/Storage/upgrade")))
+    );
+    for refused in ["upgrade", "./upgrade", "../upgrade", ""] {
+        assert!(
+            configured_cache_root(Some(OsStr::new(refused))).is_err(),
+            "{refused:?} is not an absolute path"
+        );
     }
 }
 
