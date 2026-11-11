@@ -1294,55 +1294,115 @@ fn lay_down(run: &mut Run, options: &Options, existing: bool) -> Result<(), Erro
         )));
     }
 
-    // The broker, and the proof through it. The proofs of the start-up cycle share one deadline that
-    // ends `PROOF_BOUND` after the broker's start. The broker takes its start before it reports that
-    // it runs, so counting from here ends the cycle no earlier than the broker's own count does, and
-    // nothing is added to it: the installation asks only while the cycle is open, reads each answer
-    // only until its deadline and takes none after it. A proof asked after it belongs to a later
-    // cycle, which the installation never asks for.
-    broker_service.start()?;
-    broker_service.wait_for(false, Duration::from_secs(60))?;
-    let proof_deadline = Instant::now() + PROOF_BOUND;
+    // The broker, and the proof through it: the start-up cycle's proofs, asked inside the cycle that
+    // the broker opens when it starts.
+    let cycle = ProofCycle::begin(PROOF_BOUND, PROOF_ASK_MARGIN, || {
+        broker_service.start()?;
+        Ok(broker_service.wait_for(false, Duration::from_secs(60))?)
+    })?;
     say("the broker is running");
     inject("broker")?;
     let mut session = open_session()?;
-    for class in [Class::Checkout, Class::Connect] {
-        if Instant::now() >= proof_deadline {
-            return Err(Error::Failed(format!(
-                "the start-up proof's cycle of {} seconds ended before the proof for {class:?} was asked",
-                PROOF_BOUND.as_secs()
-            )));
-        }
-        session.set_deadline(Some(proof_deadline));
-        let response = ask(&mut session, &Request::Prove { class })?;
-        if Instant::now() > proof_deadline {
-            return Err(Error::Failed(format!(
-                "the broker answered the proof for {class:?} after its deadline of {} seconds",
-                PROOF_BOUND.as_secs()
-            )));
-        }
-        match response {
-            Response::Proof {
-                ready: true,
-                detail,
-            } => say(&detail),
-            Response::Proof {
-                ready: false,
-                detail,
-            } => {
-                return Err(Error::Failed(format!("the proof failed: {detail}")));
-            }
-            other => {
-                return Err(Error::Failed(format!(
-                    "the broker answered a proof with {other:?}"
-                )));
-            }
-        }
-    }
+    cycle.prove(&mut session)?;
     run.manifest.state = InstallState::Installed;
     run.manifest.save(&paths.manifest)?;
     say("the boundary is installed and in force");
     Ok(())
+}
+
+/// How long before the end of the start-up cycle the installation stops asking for a proof: a proof
+/// asked later has too little time left to be answered inside the cycle.
+const PROOF_ASK_MARGIN: Duration = Duration::from_secs(10);
+
+/// The start-up proof's cycle as the installation counts it.
+///
+/// The broker opens its first cycle of proofs when it starts and ends it [`PROOF_BOUND`] later; a
+/// proof asked after it begins a cycle of its own, and an answer from that cycle is not the answer
+/// to anything the installation asked inside the first. The frame carries no cycle, so the
+/// installation keeps to the first by its clock: it takes its instant before it starts the broker's
+/// service, so its deadline is earlier than the broker's by at least the time the service takes to
+/// start; it asks only before the deadline less a margin; and it reads every answer only until the
+/// deadline and takes none that comes after it. An answer that was read before the installation's
+/// deadline was written before the broker's, so it belongs to the first cycle.
+pub struct ProofCycle {
+    began: Instant,
+    bound: Duration,
+    margin: Duration,
+}
+
+impl ProofCycle {
+    /// Takes the instant, then runs `start`, which starts the broker's service and waits until it
+    /// runs. The instant is taken here and not after, so that it cannot come later than the
+    /// broker's.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of `start`.
+    pub fn begin(
+        bound: Duration,
+        margin: Duration,
+        start: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<ProofCycle, Error> {
+        let began = Instant::now();
+        start()?;
+        Ok(ProofCycle {
+            began,
+            bound,
+            margin,
+        })
+    }
+
+    /// When the installation's cycle ends: no answer is read after it.
+    #[must_use]
+    pub fn deadline(&self) -> Instant {
+        self.began + self.bound
+    }
+
+    /// Asks the broker for the proof of each class, in the first cycle only.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when less than the margin is left before a request, when an answer does not
+    /// come by the deadline, and when the broker says a proof failed.
+    pub fn prove(&self, session: &mut pipe::Connection) -> Result<(), Error> {
+        let deadline = self.deadline();
+        let ask_until = deadline.checked_sub(self.margin).unwrap_or(self.began);
+        for class in [Class::Checkout, Class::Connect] {
+            if Instant::now() >= ask_until {
+                return Err(Error::Failed(format!(
+                    "the start-up proof's cycle of {} seconds had less than {} seconds left before the proof for {class:?} was asked",
+                    self.bound.as_secs(),
+                    self.margin.as_secs()
+                )));
+            }
+            session.set_deadline(Some(deadline));
+            let response = ask(session, &Request::Prove { class })?;
+            if Instant::now() > deadline {
+                return Err(Error::Failed(format!(
+                    "the broker answered the proof for {class:?} after the end of its cycle of {} seconds",
+                    self.bound.as_secs()
+                )));
+            }
+            match response {
+                Response::Proof {
+                    ready: true,
+                    detail,
+                } => say(&detail),
+                Response::Proof {
+                    ready: false,
+                    detail,
+                } => {
+                    return Err(Error::Failed(format!("the proof failed: {detail}")));
+                }
+                other => {
+                    return Err(Error::Failed(format!(
+                        "the broker answered a proof with {other:?}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// How long the installation waits for the platform's first "policy applied" event after it starts
