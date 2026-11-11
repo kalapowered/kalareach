@@ -29,6 +29,14 @@ object VoiceServiceActions {
     /** Show on the notification what the microphone is doing now. */
     const val CAPTURE = "to.kala.reach.voice.CAPTURE"
 
+    /**
+     * Post the notification again. The platform sends it when the person dismisses the notification
+     * of a call that is still running, which Android 14 and later allow for a service's
+     * notification on an unlocked phone: the notification is the only control within reach once the
+     * screen locks, so a dismissal does not leave the call without it.
+     */
+    const val REPUBLISH = "to.kala.reach.voice.REPUBLISH"
+
     /** What the service does. */
     enum class Act {
         /** Enter the foreground for the call the action names. */
@@ -45,6 +53,9 @@ object VoiceServiceActions {
 
         /** Show what the microphone of the call the service is running for is doing. */
         CAPTURE,
+
+        /** Post the notification of the call the service is running for again. */
+        REPUBLISH,
 
         /** Change nothing: the action is for a call this service is not running for. */
         IGNORE,
@@ -66,6 +77,7 @@ object VoiceServiceActions {
             action == MUTE -> Act.MUTE
             action == UNMUTE -> Act.UNMUTE
             action == CAPTURE -> Act.CAPTURE
+            action == REPUBLISH -> Act.REPUBLISH
             // Anything else, including a restart the system decided on its own, is not a call the
             // person started, and opening the microphone for it would be the silent activation
             // section 15 paragraph 22 forbids.

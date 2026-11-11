@@ -22,6 +22,7 @@ class VoiceServiceActionsTest {
             VoiceServiceActions.MUTE,
             VoiceServiceActions.UNMUTE,
             VoiceServiceActions.CAPTURE,
+            VoiceServiceActions.REPUBLISH,
         )) {
             assertEquals(action, VoiceServiceActions.Act.IGNORE, VoiceServiceActions.decide(action, old, current))
         }
@@ -41,6 +42,20 @@ class VoiceServiceActionsTest {
             VoiceServiceActions.decide(VoiceServiceActions.CAPTURE, current, current),
         )
         assertEquals(VoiceServiceActions.Act.START, VoiceServiceActions.decide(VoiceServiceActions.START, current, null))
+    }
+
+    /**
+     * KR-ACC-014: a dismissal of the notification of a call that still runs posts it again, so the
+     * lock screen keeps its controls; one that names another call, or reaches a service with no
+     * call, never does.
+     */
+    @Test
+    fun a_dismissal_of_the_running_calls_notification_posts_it_again() {
+        assertEquals(
+            VoiceServiceActions.Act.REPUBLISH,
+            VoiceServiceActions.decide(VoiceServiceActions.REPUBLISH, current, current),
+        )
+        assertEquals(VoiceServiceActions.Act.END, VoiceServiceActions.decide(VoiceServiceActions.REPUBLISH, current, null))
     }
 
     /** A service running for no call ends itself for anything but a start or a stop. */

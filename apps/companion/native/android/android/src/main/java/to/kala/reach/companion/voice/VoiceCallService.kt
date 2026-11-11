@@ -72,6 +72,9 @@ class VoiceCallService : android.app.Service() {
         /** Republish the notification with what the microphone is doing now. */
         const val ACTION_CAPTURE = VoiceServiceActions.CAPTURE
 
+        /** Post the notification again, after the person dismissed it while the call runs. */
+        const val ACTION_REPUBLISH = VoiceServiceActions.REPUBLISH
+
         /** The capture state carried by [ACTION_CAPTURE]. */
         const val EXTRA_CAPTURE = "capture"
 
@@ -223,6 +226,7 @@ class VoiceCallService : android.app.Service() {
                 val word = intent?.getStringExtra(EXTRA_CAPTURE)
                 VoiceCaptureState.entries.firstOrNull { it.name == word }?.let { capture = it }
             }
+            VoiceServiceActions.Act.REPUBLISH -> if (running) publish()
             VoiceServiceActions.Act.IGNORE -> Unit
             // Anything else, including a restart the system decided on its own, is not a call the
             // person started. Opening the microphone here would be exactly the silent activation
@@ -346,6 +350,11 @@ class VoiceCallService : android.app.Service() {
             .setContentText(capture.display)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)
+            // From Android 14 the platform lets the person dismiss an ongoing service notification
+            // on an unlocked phone, and a locked phone then shows no controls for the call until
+            // something posts it again. The call keeps its microphone service, so a dismissal
+            // posts the notification again.
+            .setDeleteIntent(pending(ACTION_REPUBLISH, 4))
             .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
