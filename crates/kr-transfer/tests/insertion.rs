@@ -82,6 +82,7 @@ fn bind(
                 contribution: contribution(&handle, method),
             },
             None,
+            None,
         )
         .expect("binds the attachment");
     (bound.draft, handle)
@@ -534,6 +535,7 @@ fn an_offer_is_reported_by_its_owner_once_and_its_grant_goes_with_the_report() {
                 contribution: contribution(&handle, InsertionMethod::TypedSubmission),
             },
             None,
+            None,
         )
         .expect_err("an accepted attachment");
     assert_eq!(rebound.code(), ErrorCode::DraftConflict);
@@ -711,6 +713,7 @@ fn an_unknown_offer_is_offered_again_as_a_new_attempt() {
                 contribution: contribution(&handle, InsertionMethod::TypedSubmission),
             },
             None,
+            None,
         )
         .expect("binds it again");
     assert_eq!(rebound.draft.attachments.len(), 1, "one binding");
@@ -772,6 +775,7 @@ fn a_draft_with_an_offer_in_flight_is_neither_sent_nor_rebound() {
                 transfer_id: handle.transfer_id,
                 contribution: contribution(&handle, InsertionMethod::TypedSubmission),
             },
+            None,
             None,
         )
         .expect_err("a binding being offered");

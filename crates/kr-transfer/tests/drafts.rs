@@ -159,6 +159,7 @@ fn transfer_insertion_and_submission_are_three_separate_actions() {
                 contribution: contribution(&handle, InsertionMethod::TypedSubmission),
             },
             None,
+            None,
         )
         .expect("binds the attachment");
     assert_eq!(bound.attachment.state, InsertionState::Recorded);
@@ -235,6 +236,7 @@ fn a_contribution_declares_what_it_accepts_and_the_host_checks_it() {
                 },
             },
             None,
+            None,
         )
         .expect_err("refuses a type the operation does not accept");
     assert_eq!(wrong_type.code(), ErrorCode::InvalidArgument);
@@ -252,6 +254,7 @@ fn a_contribution_declares_what_it_accepts_and_the_host_checks_it() {
                     ..contribution(&handle, InsertionMethod::TypedSubmission)
                 },
             },
+            None,
             None,
         )
         .expect_err("refuses a file above the selected model's limit");
@@ -271,6 +274,7 @@ fn a_contribution_declares_what_it_accepts_and_the_host_checks_it() {
                 },
             },
             None,
+            None,
         )
         .expect_err("refuses an operation that accepts nothing");
     assert_eq!(none_accepted.code(), ErrorCode::InvalidArgument);
@@ -289,6 +293,7 @@ fn a_contribution_declares_what_it_accepts_and_the_host_checks_it() {
                 },
             },
             None,
+            None,
         )
         .expect("binds the attachment");
 
@@ -306,6 +311,7 @@ fn a_contribution_declares_what_it_accepts_and_the_host_checks_it() {
                     ..contribution(&second, InsertionMethod::TypedSubmission)
                 },
             },
+            None,
             None,
         )
         .expect_err("refuses more attachments than the operation accepts");
@@ -333,6 +339,7 @@ fn a_failed_insertion_keeps_the_draft_and_the_upload_and_only_evidence_accepts()
                 transfer_id: handle.transfer_id,
                 contribution: contribution(&handle, InsertionMethod::TypedSubmission),
             },
+            None,
             None,
         )
         .expect("binds the attachment");
@@ -384,6 +391,7 @@ fn a_failed_insertion_keeps_the_draft_and_the_upload_and_only_evidence_accepts()
                 transfer_id: handle.transfer_id,
                 contribution: contribution(&handle, InsertionMethod::TypedSubmission),
             },
+            None,
             None,
         )
         .expect("binds it again, as a new attempt of the same binding");
@@ -470,6 +478,7 @@ fn unsupported_media_is_never_offered_as_a_model_image() {
                 },
             },
             None,
+            None,
         )
         .expect_err("refuses to present a file as a model image");
     assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
@@ -485,6 +494,7 @@ fn unsupported_media_is_never_offered_as_a_model_image() {
                 transfer_id: handle.transfer_id,
                 contribution: contribution(&handle, InsertionMethod::ManualTerminalWorkflow),
             },
+            None,
             None,
         )
         .expect("binds it as a file");
@@ -519,6 +529,7 @@ fn a_binding_needs_a_published_attachment_and_the_current_revision() {
                 },
             },
             None,
+            None,
         )
         .expect_err("refuses an attachment that is not published");
     assert_eq!(unpublished.code(), ErrorCode::ResourceUnavailable);
@@ -541,6 +552,7 @@ fn a_binding_needs_a_published_attachment_and_the_current_revision() {
                 contribution: contribution(&handle, InsertionMethod::TypedSubmission),
             },
             None,
+            None,
         )
         .expect_err("refuses a stale revision");
     assert_eq!(stale.code(), ErrorCode::DraftConflict);
@@ -554,6 +566,7 @@ fn a_binding_needs_a_published_attachment_and_the_current_revision() {
                 transfer_id: handle.transfer_id,
                 contribution: contribution(&handle, InsertionMethod::TypedSubmission),
             },
+            None,
             None,
         )
         .expect("binds at the current revision");
@@ -609,6 +622,7 @@ fn a_binding_needs_one_principal_and_one_session() {
                 contribution: contribution(&handle, InsertionMethod::TypedSubmission),
             },
             None,
+            None,
         )
         .expect_err("refuses another session's draft");
     assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
@@ -642,6 +656,7 @@ fn a_binding_needs_one_principal_and_one_session() {
                 transfer_id: handle.transfer_id,
                 contribution: contribution(&handle, InsertionMethod::TypedSubmission),
             },
+            None,
             None,
         )
         .expect_err("refuses another principal's attachment");
@@ -679,6 +694,7 @@ fn a_binding_needs_one_principal_and_one_session() {
                 contribution: contribution(&handle, InsertionMethod::TypedSubmission),
             },
             None,
+            None,
         )
         .expect("binds the attachment");
 }
@@ -700,6 +716,7 @@ fn a_read_grant_is_narrow_and_expires() {
                 transfer_id: handle.transfer_id,
                 contribution: contribution(&handle, InsertionMethod::ManualTerminalWorkflow),
             },
+            None,
             None,
         )
         .expect("binds the attachment");
@@ -754,6 +771,7 @@ fn a_declared_external_destination_is_recorded_and_disclosed() {
                 contribution: declared.clone(),
             },
             None,
+            None,
         )
         .expect("binds the attachment");
     assert_eq!(
@@ -789,6 +807,7 @@ fn a_declared_external_destination_is_recorded_and_disclosed() {
                 contribution: blank.clone(),
             },
             None,
+            None,
         )
         .expect_err("refuses an unnamed destination");
     assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
@@ -807,6 +826,7 @@ fn a_declared_external_destination_is_recorded_and_disclosed() {
                 expected_revision: reread.revision,
                 contribution: long,
             },
+            None,
             None,
         )
         .expect_err("refuses an unbounded destination");
@@ -878,6 +898,7 @@ fn ending_a_session_fails_only_the_insertions_its_agent_never_confirmed() {
                     transfer_id: handle.transfer_id,
                     contribution: contribution(&handle, InsertionMethod::TypedSubmission),
                 },
+                None,
                 None,
             )
             .expect("binds the attachment");
@@ -1004,6 +1025,7 @@ fn ending_a_session_fails_only_the_insertions_its_agent_never_confirmed() {
                 contribution: contribution(&owned, InsertionMethod::TypedSubmission),
             },
             None,
+            None,
         )
         .expect_err("an upload of an ended session");
     assert_eq!(refusal.code(), ErrorCode::SessionClosed);
@@ -1045,6 +1067,7 @@ fn ending_a_session_fails_an_insertion_whose_upload_it_owns_though_the_draft_nam
                     transfer_id: handle.transfer_id,
                     contribution: contribution(handle, InsertionMethod::TypedSubmission),
                 },
+                None,
                 None,
             )
             .expect("binds the attachment")
@@ -1109,6 +1132,7 @@ fn ending_a_session_fails_its_unconfirmed_insertion_and_leaves_a_full_draft_read
                 transfer_id: handle.transfer_id,
                 contribution: contribution(&handle, InsertionMethod::TypedSubmission),
             },
+            None,
             None,
         )
         .expect("binds the attachment")
@@ -1194,6 +1218,7 @@ fn ending_a_session_fails_its_unconfirmed_insertion_and_leaves_a_full_draft_read
                 contribution: contribution(&late, InsertionMethod::TypedSubmission),
             },
             None,
+            None,
         )
         .expect_err("a binding for an ended session is refused");
     assert_eq!(refusal.code(), ErrorCode::SessionClosed);
@@ -1221,6 +1246,7 @@ fn a_binding_recorded_for_an_already_ended_session_is_failed_when_the_session_is
                 transfer_id: handle.transfer_id,
                 contribution: contribution(&handle, InsertionMethod::TypedSubmission),
             },
+            None,
             None,
         )
         .expect("binds the attachment");
@@ -1295,6 +1321,7 @@ fn ending_a_session_fails_an_insertion_by_its_draft_when_its_upload_names_no_ses
                     transfer_id: handle.transfer_id,
                     contribution: contribution(&handle, InsertionMethod::TypedSubmission),
                 },
+                None,
                 None,
             )
             .expect("binds the attachment")
@@ -1463,6 +1490,7 @@ fn a_draft_action_reused_with_another_payload_is_an_id_conflict() {
                 "agent.draft.add_attachment",
                 b"one",
             )),
+            None,
         )
         .expect("binds the first attachment");
     let reused = harness
@@ -1476,6 +1504,7 @@ fn a_draft_action_reused_with_another_payload_is_an_id_conflict() {
                 "agent.draft.add_attachment",
                 b"other",
             )),
+            None,
         )
         .expect_err("the identifier belongs to the first binding");
     assert_eq!(reused.code(), ErrorCode::IdConflict);
@@ -1502,6 +1531,7 @@ fn a_draft_action_reused_with_another_payload_is_an_id_conflict() {
                 "agent.draft.add_attachment",
                 b"one",
             )),
+            None,
         )
         .expect("a repeat is answered");
     assert_eq!(repeated.draft.revision, bound.draft.revision);
@@ -1784,6 +1814,7 @@ fn bound_and_offered(
                 transfer_id: handle.transfer_id,
                 contribution: contribution(&handle, method),
             },
+            None,
             None,
         )
         .expect("binds the attachment");
@@ -2126,6 +2157,118 @@ fn a_draft_whose_every_file_the_agent_took_stops_counting_and_every_other_goes_o
         refused.to_string().contains("draft.discard"),
         "the words name how a place is freed: {refused}"
     );
+}
+
+/// Binds `handle` to `draft` for the actor of the harness, with at most `limit` open drafts.
+fn bind_with_limit(
+    harness: &Harness,
+    draft: &kr_protocol::transfer::DraftRecord,
+    handle: &AttachmentHandle,
+    limit: Option<u64>,
+) -> Result<kr_protocol::transfer::AgentDraftAddAttachmentResult, kr_transfer::TransferError> {
+    harness.service.draft_add_attachment(
+        &harness.actor,
+        &AgentDraftAddAttachmentParams {
+            draft_id: draft.draft_id,
+            expected_revision: draft.revision,
+            transfer_id: handle.transfer_id,
+            contribution: contribution(handle, InsertionMethod::TypedSubmission),
+        },
+        None,
+        limit,
+    )
+}
+
+/// KR-REQ-23.41: a binding that brings a draft whose files the agent took back into the count asks
+/// the bound as a create does, so a device cannot pass its bound by binding another file to such a
+/// draft. A device holding the bound is refused with the quota code in the bound's words and
+/// nothing is written; it ends a draft, and the same binding is served. A binding to a draft that
+/// already counts changes no count and is served at the bound, another device's places are not the
+/// device's own, and the person at this machine has no bound.
+#[test]
+fn a_binding_that_brings_a_spent_draft_back_into_the_count_asks_the_bound() {
+    let harness = Harness::create();
+    let device = harness.actor.clone();
+    let other = kr_protocol::ids::ActorId::new("device:other").expect("a principal");
+    let open =
+        |actor: &kr_protocol::ids::ActorId| harness.service.open_drafts(actor).expect("counts");
+    for _ in 0..3 {
+        a_sessionless_draft(&harness, &other, Some(3)).expect("a place is free");
+    }
+
+    let spent = draft(&harness);
+    let (spent, _) = bound_and_offered(
+        &harness,
+        &spent,
+        InsertionMethod::TypedSubmission,
+        Offered::Accepted,
+        1,
+    );
+    assert_eq!(
+        open(&device),
+        0,
+        "every file taken: the draft takes no place"
+    );
+    let counting = (0..3)
+        .map(|_| a_sessionless_draft(&harness, &device, Some(3)).expect("a place is free"))
+        .collect::<Vec<_>>();
+    assert_eq!(open(&device), 3, "the device holds its bound");
+
+    // The control: a draft that already counts is bound to at the bound, and counts as before.
+    let first = harness.publish(&pattern(80), "image/png", "first.png");
+    bind_with_limit(&harness, &counting[0], &first, Some(3))
+        .expect("a binding to a draft that counts changes no count");
+    assert_eq!(open(&device), 3);
+
+    // A binding that would make the spent draft count again is refused, and writes nothing.
+    let second = harness.publish(&pattern(81), "image/png", "second.png");
+    let refused = bind_with_limit(&harness, &spent, &second, Some(3))
+        .expect_err("the device holds its bound");
+    assert_eq!(refused.code(), ErrorCode::QuotaExceeded);
+    assert!(
+        refused.to_string().contains("3 of the 3"),
+        "the words name the bound: {refused}"
+    );
+    assert!(
+        refused.to_string().contains("draft.discard"),
+        "the words name how a place is freed: {refused}"
+    );
+    let unchanged = harness
+        .service
+        .draft(&device, spent.draft_id)
+        .expect("reads the draft");
+    assert_eq!(unchanged.revision, spent.revision, "nothing was written");
+    assert_eq!(unchanged.attachments.len(), 1);
+    assert_eq!(open(&device), 3, "the spent draft still takes no place");
+
+    // The device ends a draft; the same binding is served, though the other device holds its bound.
+    harness
+        .service
+        .draft_discard(
+            &device,
+            &DraftDiscardParams {
+                draft_id: counting[1].draft_id,
+            },
+            None,
+        )
+        .expect("ends the draft");
+    assert_eq!(open(&other), 3, "the other device's places are its own");
+    bind_with_limit(&harness, &spent, &second, Some(3)).expect("a place is free");
+    assert_eq!(open(&device), 3, "the spent draft counts again");
+    a_sessionless_draft(&harness, &device, Some(3)).expect_err("the place is taken");
+
+    // The person at this machine has no bound.
+    let owned = draft(&harness);
+    let (owned, _) = bound_and_offered(
+        &harness,
+        &owned,
+        InsertionMethod::TypedSubmission,
+        Offered::Accepted,
+        2,
+    );
+    let third = harness.publish(&pattern(82), "image/png", "third.png");
+    bind_with_limit(&harness, &owned, &third, None).expect("no bound");
+    assert_eq!(open(&device), 4);
 }
 
 /// KR-REQ-09.07 and KR-REQ-23.41: the same action asked again is answered from its record, though the

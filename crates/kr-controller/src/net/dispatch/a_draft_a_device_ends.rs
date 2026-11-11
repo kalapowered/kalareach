@@ -14,13 +14,13 @@ use kr_protocol::ids::{ActorId, DraftId, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, U64, Uuid};
 use kr_protocol::transfer::{
-    AgentDraftAddAttachmentParams, AttachmentContribution, DraftCreateResult, DraftDiscardParams,
-    DraftDiscardResult, InsertionMethod,
+    AgentDraftAddAttachmentParams, AgentDraftAddAttachmentResult, AttachmentContribution,
+    DraftCreateResult, DraftDiscardParams, DraftDiscardResult, InsertionMethod,
 };
 
 use super::a_copy_from_a_services_record::{EVERY_RIGHT, mutation_of, two_copies};
 use super::a_draft_a_device_writes::{
-    a_draft_for, create_params, result_of, the_owner, write_naming,
+    a_draft_for, create_params, manual_contribution, result_of, the_owner, write_naming,
 };
 use super::write_boundary::paired_connection;
 use crate::service::a_close_a_worker_never_answers as fake;
@@ -201,6 +201,7 @@ fn a_draft_with_a_file(
                 },
             },
             None,
+            None,
         )
         .expect("binds the file");
     (draft, handle.transfer_id)
@@ -304,6 +305,118 @@ async fn a_create_is_served_once_the_agent_has_taken_the_files_of_a_draft() {
         .service()
         .draft(&device, draft.draft_id)
         .expect("the draft whose files were taken is still there");
+    world.serving.abort();
+}
+
+/// KR-REQ-23.41: a file bound to a draft whose files the agent took makes the draft count again, so
+/// the binding is asked the bound as a create is. A device holding the bound is refused the binding
+/// with the quota code in words that name `draft.discard`, and nothing is bound; it ends one draft
+/// and the same binding is served. Another device's binding to a draft of its own is served
+/// throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_binding_that_makes_a_spent_draft_count_again_is_asked_the_bound() {
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    let service = controller.transfer().service();
+    let session = world.session_id;
+    let (connection, _) = paired_connection(controller, 56, EVERY_RIGHT);
+    let device = connection.device.principal();
+    let (spent, transfer_id) = a_draft_with_a_file(&world, &device);
+    the_agent_takes(&world, &device, spent.draft_id, transfer_id);
+    let counting = (0..DEVICE_OPEN_DRAFTS)
+        .map(|_| a_draft_for(&world, &device, None))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        service.open_drafts(&device).expect("counts"),
+        DEVICE_OPEN_DRAFTS,
+        "the device holds its bound"
+    );
+
+    let second = super::tests::a_published_attachment_for(
+        controller,
+        world.environment_id,
+        &device,
+        "second.bin",
+        Some(session),
+    );
+    let bind = |connection: &super::RemoteConnection,
+                request_id: u64,
+                draft_id: DraftId,
+                actor: &ActorId,
+                handle: &kr_protocol::transfer::AttachmentHandle| {
+        let revision = service.draft(actor, draft_id).expect("the draft").revision;
+        write_naming(
+            &world,
+            connection,
+            Method::AgentDraftAddAttachment,
+            request_id,
+            &AgentDraftAddAttachmentParams {
+                draft_id,
+                expected_revision: revision,
+                transfer_id: handle.transfer_id,
+                contribution: manual_contribution(handle),
+            },
+            Some(session),
+        )
+    };
+    let attachments = |actor: &ActorId, draft_id: DraftId| {
+        service
+            .draft(actor, draft_id)
+            .expect("the draft")
+            .attachments
+            .len()
+    };
+
+    let refused = connection
+        .mutate(&bind(&connection, 1, spent.draft_id, &device, &second))
+        .await;
+    let refusal = super::tests::error_of(&refused);
+    assert_eq!(refusal.code, ErrorCode::QuotaExceeded, "{refusal:?}");
+    assert!(
+        refusal.message.contains("draft.discard"),
+        "the words name how a place is freed: {refusal:?}"
+    );
+    assert_eq!(attachments(&device, spent.draft_id), 1, "nothing was bound");
+
+    let (another, _) = paired_connection(controller, 57, EVERY_RIGHT);
+    let another_actor = another.device.principal();
+    let (theirs, their_transfer) = a_draft_with_a_file(&world, &another_actor);
+    the_agent_takes(&world, &another_actor, theirs.draft_id, their_transfer);
+    let their_second = super::tests::a_published_attachment_for(
+        controller,
+        world.environment_id,
+        &another_actor,
+        "second.bin",
+        Some(session),
+    );
+    let _: AgentDraftAddAttachmentResult = result_of(
+        &another
+            .mutate(&bind(
+                &another,
+                1,
+                theirs.draft_id,
+                &another_actor,
+                &their_second,
+            ))
+            .await,
+    );
+
+    let _: DraftDiscardResult = result_of(
+        &connection
+            .mutate(&discard(&world, &connection, 2, counting[0].draft_id))
+            .await,
+    );
+    let _: AgentDraftAddAttachmentResult = result_of(
+        &connection
+            .mutate(&bind(&connection, 3, spent.draft_id, &device, &second))
+            .await,
+    );
+    assert_eq!(attachments(&device, spent.draft_id), 2);
+    assert_eq!(
+        service.open_drafts(&device).expect("counts"),
+        DEVICE_OPEN_DRAFTS,
+        "the draft counts again, and the device is at its bound"
+    );
     world.serving.abort();
 }
 

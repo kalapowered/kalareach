@@ -61,10 +61,11 @@ pub const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6
 /// This counts a device's drafts whose session has not ended, that no prompt has sent and whose
 /// files the agent has not all taken. A draft is open until a prompt sends it to a session, its
 /// target session ends, the agent has taken every file bound to it or the device ends it, and the
-/// service counts it against the device's own principal. The paired door refuses a device's create
-/// that names no session. The page makes one draft for each session it attaches files in, and
-/// another for each eight files, so the bound is several times what a person works in at once; a
-/// device holds at most this many open drafts, each of up to
+/// service counts it against the device's own principal. A file bound to a draft whose files the
+/// agent took makes it count again, so that binding is asked the bound as a create is. The paired
+/// door refuses a device's create that names no session. The page makes one draft for each session
+/// it attaches files in, and another for each eight files, so the bound is several times what a
+/// person works in at once; a device holds at most this many open drafts, each of up to
 /// [`kr_protocol::transfer::MAX_TRANSFER_RESULT_BYTES`] of text. The person at this machine has
 /// no bound and may make a draft with no session, and nothing a device sends changes the limit:
 /// it is a constant of this host, which an owner cannot change.
@@ -1321,7 +1322,8 @@ impl TransferModule {
     /// `device` is what a paired device is held to and shown: how many drafts it may keep open and
     /// how many uploads it may keep staged, and the bytes its own principal has staged where the
     /// environment's total is shown to anyone else. `None` is the person at this machine, whose
-    /// drafts and uploads have no bound.
+    /// drafts and uploads have no bound. A create asks the open-drafts bound, and so does a binding
+    /// that brings a draft the agent has taken every file of back into the count.
     ///
     /// The answer says whether the service read it from the record of an earlier submission of the
     /// action. A copy goes back only under the authority this attempt arrived under, asked once the
@@ -1520,9 +1522,15 @@ impl TransferModule {
                         let params: kr_protocol::transfer::AgentDraftAddAttachmentParams =
                             typed(&params)?;
                         require_declared_path(params.contribution.insertion_method)?;
+                        let draft_limit = device.map(|bounds| bounds.open_drafts);
                         encode(
                             &service
-                                .draft_add_attachment(&actor, &params, Some(&performed))
+                                .draft_add_attachment(
+                                    &actor,
+                                    &params,
+                                    Some(&performed),
+                                    draft_limit,
+                                )
                                 .map_err(&told)?,
                         )
                     }

@@ -3441,7 +3441,10 @@ is refused `SESSION_CLOSED` when that settle succeeded, unless the device alread
 where the count comes first and the refusal is `QUOTA_EXCEEDED`. A `draft.create` past the bound is
 refused `QUOTA_EXCEEDED` with the bound in the message only after the closed sessions are settled
 once more and the create is tried again, and only after the service has asked the admission again,
-so a device whose authority has gone learns no count. Two things remain possible. A settle that fails in both passes leaves the drafts of closed sessions
+so a device whose authority has gone learns no count. An `agent.draft.add_attachment` that would
+bring a draft back into the count, because the agent took all its files and the binding adds
+another, is refused in the same way when the device already holds the bound; a binding to a draft
+that already counts is not asked. Two things remain possible. A settle that fails in both passes leaves the drafts of closed sessions
 counting, and the host writes a line to its log for each pass that fails. And a create can be
 refused for a draft that was not open when it began: another create of the device reads the
 registry, a session it names then closes, the create at the bound settles without a draft to point
@@ -3454,8 +3457,8 @@ action for its new attempt. The bound is one constant of this host, which an own
 and the person at this machine is held to none. A place is freed in four ways: a prompt sends the
 draft, its session ends, the agent takes every file bound to it, or the device ends it with
 `draft.discard`. A draft whose attachments are all `accepted_by_agent`, and that has at least one,
-stops counting; a draft with an attachment `inserting` or `unknown` goes on counting, because a
-retry or a report may still come for it. The bound's refusal names the ways that are the device's to
+stops counting until a file is bound to it again; a draft with an attachment `inserting` or
+`unknown` goes on counting, because a retry or a report may still come for it. The bound's refusal names the ways that are the device's to
 take or wait for. Sent and orphaned drafts stay in the journal, and each `draft.update` adds one row
 to the journal's events and a receipt that holds the updated draft for the de-duplication window.
 

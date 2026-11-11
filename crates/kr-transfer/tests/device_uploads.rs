@@ -293,6 +293,7 @@ fn an_attachment_a_prompt_has_sent_to_a_session_stops_counting() {
                     contribution: contribution(),
                 },
                 None,
+                None,
             )
             .expect("binds the attachment")
             .draft

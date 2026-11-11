@@ -126,12 +126,16 @@ A paired device's open drafts are bounded as well, at 64 for each device. A draf
 prompt sends it to a session, the session it targets closes, the agent has taken every file bound to
 it (all of its attachments are `accepted_by_agent`, and there is at least one), or the device ends
 it with `draft.discard`; a draft no longer open takes no place. A draft with an attachment
-`inserting` or `unknown` goes on counting, because a retry or a report may still come for it. `draft.create` counts the device's open drafts and
+`inserting` or `unknown` goes on counting, because a retry or a report may still come for it. A draft
+that stopped counting because the agent took its files counts again when another file is bound to it,
+so `agent.draft.add_attachment` is asked the bound as a create is: it is refused when the device
+already holds the bound and the binding would bring such a draft back, and a binding to a draft that
+already counts is not asked. `draft.create` counts the device's open drafts and
 writes the new one in one transaction under the journal's write lock, so two creates that each find
 one place left cannot both take it, and it asks the host's admission again before it counts, so a
 device whose authority has gone is never told how many it holds. Past the bound the refusal is
-`QUOTA_EXCEEDED`, with the bound and the ways a place is freed in its message. A refused create
-leaves no draft, and the service
+`QUOTA_EXCEEDED`, with the bound and the ways a place is freed in its message. A refused create or
+binding leaves no draft change, and the service
 writes no record of it. The host keeps the refusal in the transfer journal as that action's outcome,
 as it does any other refusal of the service, so the same action asked again is given the same
 refusal even when a place is free, and a device that has freed a place takes a new action for its

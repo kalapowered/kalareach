@@ -1298,6 +1298,7 @@ fn a_submitted_attachment_follows_its_sessions_retention() {
                     contribution: contribution(&handle),
                 },
                 None,
+                None,
             )
             .expect("binds the attachment");
         harness
@@ -1390,6 +1391,7 @@ fn a_draft_sent_to_a_session_holds_the_attachments_it_gets_afterwards() {
                     transfer_id: handle.transfer_id,
                     contribution: contribution(&handle),
                 },
+                None,
                 None,
             )
             .map(|bound| (handle.transfer_id, bound.attachment.handle))
@@ -1512,6 +1514,7 @@ fn an_attachment_that_belongs_to_another_session_is_not_taken_by_a_prompt_to_a_s
                 contribution: contribution(&handle),
             },
             None,
+            None,
         )
         .expect("binds the attachment");
 
@@ -1621,6 +1624,7 @@ fn a_session_retention_that_ends_early_expires_what_was_submitted_to_it() {
                 transfer_id: handle.transfer_id,
                 contribution: contribution(&handle),
             },
+            None,
             None,
         )
         .expect("binds the attachment");
@@ -2518,6 +2522,7 @@ fn the_sweep_keeps_what_a_noted_session_whose_prompts_the_host_does_not_see_name
                     contribution: contribution(handle),
                 },
                 None,
+                None,
             )
             .expect("binds the attachment");
     };
@@ -2666,6 +2671,7 @@ fn settling_the_noted_sessions_puts_what_each_names_under_its_retention_and_forg
                     contribution: contribution(handle),
                 },
                 None,
+                None,
             )
             .expect("binds the attachment");
     };
@@ -2810,6 +2816,7 @@ fn settling_does_not_name_an_attachment_by_one_the_settling_has_just_named() {
                     transfer_id: handle.transfer_id,
                     contribution: contribution(handle),
                 },
+                None,
                 None,
             )
             .expect("binds the attachment");
@@ -3055,6 +3062,7 @@ fn an_attachment_a_noted_session_names_outlasts_a_later_submission_to_another_se
                     transfer_id: handle.transfer_id,
                     contribution: contribution(handle),
                 },
+                None,
                 None,
             )
             .expect("binds the attachment");
@@ -3451,6 +3459,7 @@ fn an_attachment_bound_to_a_session_draft_becomes_that_sessions() {
                 contribution: contribution(&handle),
             },
             None,
+            None,
         )
         .expect("binds the attachment to the first session's draft");
 
@@ -3491,6 +3500,7 @@ fn an_attachment_bound_to_a_session_draft_becomes_that_sessions() {
                 expected_revision: elsewhere.revision,
                 contribution: contribution(&handle),
             },
+            None,
             None,
         )
         .expect_err("the attachment is already another session's");

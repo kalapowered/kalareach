@@ -407,6 +407,7 @@ impl Host {
                     },
                 },
                 None,
+                None,
             )
             .expect("binds the attachment");
         assert_eq!(bound.attachment.state, InsertionState::Recorded);
