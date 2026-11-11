@@ -254,6 +254,19 @@ pub fn newest_record(scratch: &Path, env: &EnvBlock) -> Result<u64, Error> {
     Ok(events.iter().map(|event| event.record).max().unwrap_or(0))
 }
 
+/// Whether the log holds the platform's "policy applied" event after a record number.
+///
+/// # Errors
+///
+/// Returns an error when the query fails or its answer cannot be read.
+pub fn policy_applied_after(record: u64, scratch: &Path, env: &EnvBlock) -> Result<bool, Error> {
+    let filter = format!(
+        "/q:*[System[(EventID={}) and (EventRecordID>{record})]]",
+        events::APPLIED
+    );
+    Ok(!query(&[&filter, "/c:1"], scratch, env)?.is_empty())
+}
+
 /// The refusals the log has recorded after a record number.
 ///
 /// # Errors
