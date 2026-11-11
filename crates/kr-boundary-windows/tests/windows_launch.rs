@@ -1225,8 +1225,9 @@ fn a_program_that_outlasts_the_deadline_is_ended_and_the_call_returns_within_it(
     );
 }
 
-/// The name a pipe has in the pipe namespace, from the platform.
-fn pipe_name(pipe: &Handle) -> Vec<u16> {
+/// How long the name is that the platform gives a pipe's handle: zero for an anonymous pipe, which
+/// has no entry in the pipe namespace and so cannot be opened by name at all.
+fn pipe_name_length(pipe: &Handle) -> usize {
     const FILE_NAME_INFO: i32 = 2;
     let mut buffer = vec![0_u8; 1024];
     // SAFETY: the pipe is open and the buffer is the length given.
@@ -1239,15 +1240,7 @@ fn pipe_name(pipe: &Handle) -> Vec<u16> {
         )
     };
     assert_ne!(ok, 0, "the pipe's name can be read");
-    let length = u32::from_le_bytes(buffer[..4].try_into().unwrap()) as usize;
-    let name: Vec<u16> = buffer[4..4 + length]
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-        .collect();
-    let mut full: Vec<u16> = r"\\.\pipe".encode_utf16().collect();
-    full.extend(name);
-    full.push(0);
-    full
+    u32::from_le_bytes(buffer[..4].try_into().unwrap()) as usize
 }
 
 #[test]
@@ -1267,36 +1260,18 @@ fn the_capture_pipe_has_an_explicit_descriptor_that_only_the_system_can_open() {
         [SYSTEM_SID],
         "the system is the only entry"
     );
-    // A sibling's token cannot open the pipe object by its name.
-    let name = pipe_name(&read);
-    let token = fixture.token.raw() as usize;
-    let denied = std::thread::spawn(move || {
-        // SAFETY: the token handle outlives the thread because the case joins it.
-        unsafe {
-            assert_ne!(ImpersonateLoggedOnUser(token as HANDLE), 0);
-        }
-        // SAFETY: the name is NUL-terminated.
-        let raw = unsafe {
-            CreateFileW(
-                name.as_ptr(),
-                0xC000_0000,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                0,
-                std::ptr::null_mut(),
-            )
-        };
-        let result = Handle::new(raw, "the capture pipe").map(|_| ());
-        // SAFETY: ends the impersonation this thread began.
-        unsafe {
-            RevertToSelf();
-        }
-        result.map_err(|error| error.code)
-    })
-    .join()
-    .unwrap();
-    assert_eq!(denied, Err(5), "access is denied to the sibling's token");
+    // The pipe is anonymous: it has no entry in the pipe namespace, so no account can open it by a
+    // name. (Opening the namespace's root, `\\.\pipe\`, succeeds for every account and says nothing
+    // of any pipe.) A pipe that has no name is reached only through a handle taken from a process
+    // that holds one, so the sibling's token must not be able to open the broker's own process with
+    // the right to duplicate a handle out of it.
+    assert_eq!(pipe_name_length(&read), 0, "the capture pipe has no name");
+    const PROCESS_DUP_HANDLE: u32 = 0x0040;
+    assert_eq!(
+        open_as(&fixture.token, std::process::id(), PROCESS_DUP_HANDLE),
+        Err(5),
+        "access is denied to the sibling's token when it asks for a handle out of this process"
+    );
 }
 
 #[test]
