@@ -1791,8 +1791,11 @@ impl RemoteConnection {
                     mutation,
                     entry.method,
                     actor_id,
-                    validated,
-                    &accepted,
+                    crate::authority::AdmittedMutation {
+                        connection_id: self.connection_id(),
+                        admitted_revision: validated,
+                        deadline: Some(accepted.deadline),
+                    },
                     own_claim,
                     on_stream,
                 )

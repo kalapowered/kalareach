@@ -6,7 +6,7 @@ use kr_protocol::actor::ActorIngress;
 use kr_protocol::authority::EffectClass;
 use kr_protocol::envelope::{ControlFrame, MutationRequest};
 use kr_protocol::error::ProtocolError;
-use kr_protocol::ids::{ActorId, AuthorityRevision};
+use kr_protocol::ids::ActorId;
 use kr_protocol::method::Method;
 
 use super::super::chunks::ChunkAdmission;
@@ -141,8 +141,7 @@ impl RemoteConnection {
         mutation: &MutationRequest,
         method: Method,
         actor_id: ActorId,
-        validated: AuthorityRevision,
-        accepted: &kr_transport::window::AcceptedDeadline,
+        carried: crate::authority::AdmittedMutation,
         own_claim: &OwnClaim,
         on_stream: Option<&Arc<ChunkAdmission>>,
     ) -> std::result::Result<Given<ControlFrame>, ProtocolError> {
@@ -153,11 +152,6 @@ impl RemoteConnection {
         if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
             return Err(refusal.into_error());
         }
-        let carried = crate::authority::AdmittedMutation {
-            connection_id: self.connection_id(),
-            admitted_revision: validated,
-            deadline: Some(accepted.deadline),
-        };
         let controller = Arc::clone(&self.controller);
         let mutation = mutation.clone();
         let request_id = mutation.request_id;
