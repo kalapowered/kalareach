@@ -862,7 +862,12 @@ impl Context {
             .as_ref()
             .expect("the work directory is recorded when the agent is placed")
             .place_for_a_start(self.run.root(), self.run.pin())
-            .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+            .unwrap_or_else(|why| {
+                panic!(
+                    "{ISOLATION_UNPROVEN} {why}. A directory that the agent moved out of the run \
+                     is outside it, and was neither scanned for keys nor removed"
+                )
+            });
         let mut files = vec![binary_place("kr-hook")];
         if matches!(self.route, Route::StandIn) {
             files.push(PathBuf::from(STAND_IN_PLACE));
@@ -2338,6 +2343,11 @@ fn ends(
         );
         evidence["keys"] = scan_evidence;
     }
+    // What a probe that moved the working directory left beside the run's root, outside the run.
+    if let (Route::Real(_), Some(root)) = (&route, &root) {
+        evidence["moved_work_directory"] =
+            serde_json::json!(removes_the_moved_work_directory(root));
+    }
     // The person's files once more, after the run's directory went: a removal that reached them
     // would show here.
     if let Route::Real(real) = &route {
@@ -2386,6 +2396,32 @@ fn ends(
             }
             std::panic::resume_unwind(panic);
         }
+    }
+}
+
+/// What a probe that moves the run's working directory out of the run leaves beside the run's
+/// root: the directory it moved, named after the root with `-moved` added. It lies outside the run,
+/// so the key scan did not read it and the run's removal did not take it. It is removed here only
+/// where it is an empty directory, by the name this derives from the run's root and no name read
+/// from the run, and what was done or left is said.
+fn removes_the_moved_work_directory(root: &Path) -> &'static str {
+    let Some(name) = root.file_name() else {
+        return "no place to look for";
+    };
+    let mut moved_name = name.to_os_string();
+    moved_name.push("-moved");
+    let moved = root.with_file_name(moved_name);
+    match std::fs::symlink_metadata(&moved) {
+        Err(_) => "none beside the run",
+        Ok(found) if found.is_dir() => {
+            if std::fs::remove_dir(&moved).is_ok() {
+                "an empty directory beside the run, removed"
+            } else {
+                "a directory beside the run that holds something or could not be removed, outside \
+                 the run and neither scanned for keys nor removed"
+            }
+        }
+        Ok(_) => "an entry beside the run that is not a directory, left in place",
     }
 }
 
@@ -3409,6 +3445,10 @@ fn gateway_a_work_directory_the_agent_moved_out_of_the_run_is_not_started_in_by_
         said.contains(ISOLATION_UNPROVEN) && said.contains("is another directory"),
         "the next start was refused as another directory at the work directory's place: {said}"
     );
+    assert!(
+        said.contains("outside it, and was neither scanned for keys nor removed"),
+        "the refusal says what became of the moved directory: {said}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3767,6 +3807,41 @@ fn gateway_a_child_outside_the_agents_group_that_cleared_its_environment_is_the_
 /// option: a launch that is not served runs as typed, with no gateway.
 /// When the check that everything the run started has ended has failed, the run is not read and the
 /// outcome says so with a class; when it passed, it is read.
+#[test]
+fn the_directory_a_move_probe_leaves_beside_the_run_is_removed_only_where_it_is_empty() {
+    let base = std::env::temp_dir().join(format!("kr-moved-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("krm-run");
+    let moved = base.join("krm-run-moved");
+    std::fs::create_dir_all(&root).expect("a run's root");
+    assert!(removes_the_moved_work_directory(&root).starts_with("none"));
+    // Empty: removed, and the run's own root is not touched.
+    std::fs::create_dir(&moved).expect("a moved directory");
+    assert!(removes_the_moved_work_directory(&root).contains("removed"));
+    assert!(!moved.exists() && root.is_dir());
+    // It holds something: left where it is, with what is in it, and said so.
+    std::fs::create_dir(&moved).expect("a moved directory");
+    std::fs::write(moved.join("theirs"), "kept").expect("a file");
+    let said = removes_the_moved_work_directory(&root);
+    assert!(
+        said.contains("holds something") && said.contains("neither scanned"),
+        "{said}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(moved.join("theirs")).expect("a file"),
+        "kept"
+    );
+    std::fs::remove_dir_all(&moved).expect("removed");
+    // A link at that name is not followed and not removed, and an empty directory it names stays.
+    let elsewhere = base.join("elsewhere");
+    std::fs::create_dir(&elsewhere).expect("a directory");
+    std::os::unix::fs::symlink(&elsewhere, &moved).expect("a link");
+    let said = removes_the_moved_work_directory(&root);
+    assert!(said.contains("not a directory"), "{said}");
+    assert!(elsewhere.is_dir() && moved.is_symlink());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn a_run_whose_processes_are_not_shown_ended_is_not_read() {
     let stop = run_may_be_read(false).expect_err("a run whose processes are not shown ended");
