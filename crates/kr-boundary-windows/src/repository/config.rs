@@ -448,7 +448,7 @@ enum Value {
     Text,
     /// One line of text that does not name a transport helper.
     Url,
-    /// A path of the tree, in the grammar of the argument tables.
+    /// A path of the tree, in the grammar of the argument tables, which has no control character.
     Path,
     /// A refspec of the characters `A-Za-z0-9._/*-`: an optional `+`, then two patterns around one
     /// colon.
@@ -483,7 +483,7 @@ impl Value {
                     true
                 }
             }
-            (Self::Path, Some(Ok(text))) => line(text) && grammar::path(text).is_ok(),
+            (Self::Path, Some(Ok(text))) => grammar::path(text).is_ok(),
             (Self::Refspec, Some(Ok(text))) => refspec(text),
             (Self::RemoteName, Some(Ok(text))) => is_branch_name(text),
             (Self::BranchRef, Some(Ok(text))) => {

@@ -417,6 +417,7 @@ fn r3_refuses_a_deadline_an_exit_code_and_a_record_that_does_not_frame() {
         format!("100644 blob {OID}\0").into_bytes(),
         format!("100644 {OID}\ta\0").into_bytes(),
         format!("100644 blob extra {OID}\ta\0").into_bytes(),
+        format!("100644 blob {OID} extra\ta\0").into_bytes(),
         format!("100644  blob {OID}\ta\0").into_bytes(),
         r3_record("100664", "blob", OID, "a"),
         r3_record("040000", "tree", OID, "a"),
