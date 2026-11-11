@@ -1761,6 +1761,22 @@ impl<'a> Session<'a> {
 /// failed and its failure goes on, as it came. `run` is none where the case failed before a run
 /// stood: there is then no directory to search and no record to count, and the person's files are
 /// looked at again and the outcome appended all the same.
+/// Whether the agent's record and the run's directory may be read: only once everything the run
+/// started is shown ended, since a process still running may be writing there. Otherwise nothing of
+/// the run is read, and the outcome says so with a class.
+fn run_may_be_read(writers_ended: bool) -> Result<(), Stop> {
+    if writers_ended {
+        Ok(())
+    } else {
+        Err((
+            "run_not_read",
+            "a process the run started was not shown ended, so the agent's record and the run's \
+             directory were not read, and the run's directory was left where it is"
+                .to_owned(),
+        ))
+    }
+}
+
 fn ends(
     route: Route,
     run: Option<Run>,
@@ -1787,13 +1803,20 @@ fn ends(
     let mut scan = None;
     let mut secrets: Vec<String> = Vec::new();
     evidence["turns"] = serde_json::json!({ "charged": 0 });
+    // When the check that everything ended has failed, neither the agent's record nor the run's
+    // directory is read, and the outcome says so.
+    let readable = run_may_be_read(writers_ended);
+    if let (Err(stop), Route::Real(_)) = (&readable, &route) {
+        stops.push(stop.clone());
+        evidence["keys"] = serde_json::json!({ "read": false });
+    }
     if let Route::Real(real) = &route {
         let (guard_stops, guard_evidence) = real.person.compare();
         stops.extend(guard_stops);
         evidence["person_files"] = guard_evidence;
         let charged = real.ledger.charged_here();
         evidence["turns"] = serde_json::json!({ "charged": charged });
-        if let Some(run) = &run {
+        if let (Some(run), Ok(())) = (&run, &readable) {
             let recorded = turns_recorded(
                 &real.account,
                 run.root(),
@@ -1851,7 +1874,7 @@ fn ends(
                 "forms_of_the_names_that_are_no_uuid": recorded.as_ref().ok().map(|found| found.forms.clone()),
             });
         }
-        if let Some(run) = &run {
+        if let (Some(run), Ok(())) = (&run, &readable) {
             let rules = scan_rules(
                 run,
                 &real.build.prefix,
@@ -2611,6 +2634,16 @@ fn gateway_a_device_prompt_over_a_running_turn_is_refused_and_reaches_nothing() 
 
 /// The package's integration serves the launches the real route types, and no launch that types an
 /// option: a launch that is not served runs as typed, with no gateway.
+/// When the check that everything the run started has ended has failed, the run is not read and the
+/// outcome says so with a class; when it passed, it is read.
+#[test]
+fn a_run_whose_processes_are_not_shown_ended_is_not_read() {
+    let stop = run_may_be_read(false).expect_err("a run whose processes are not shown ended");
+    assert_eq!(stop.0, "run_not_read");
+    assert!(stop.1.contains("not read"), "{}", stop.1);
+    assert!(run_may_be_read(true).is_ok());
+}
+
 #[test]
 fn the_launches_the_real_route_types_are_ones_the_command_integration_serves() {
     let manifest: serde_json::Value = serde_json::from_slice(
