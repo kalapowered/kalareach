@@ -462,6 +462,15 @@ async fn until(condition: impl Fn() -> bool) {
     .expect("the condition came to hold");
 }
 
+/// Fires the admission deadline once a lookup is waiting on one, and waits for a lookup to have
+/// given up because of it. A host that never starts a deadline or never lets one resolve fails the
+/// case here instead of holding it.
+async fn fire_admission(deadlines: &ManualDeadlines) {
+    tokio::time::timeout(WAIT, deadlines.fire_when_armed(DeadlineKind::Admission))
+        .await
+        .expect("an admission deadline was fired and a lookup gave up on it");
+}
+
 /// Waits for `count` lookups to arrive at the hold, and gives the end back.
 async fn lookups_arrived(
     arrivals: std::sync::mpsc::Receiver<()>,
@@ -822,7 +831,7 @@ async fn a_devices_lookups_are_held_to_two_places_across_its_connections() {
         .await;
     let arrivals = lookups_arrived(arrivals, 1).await;
     until(|| deadlines.armed(DeadlineKind::Admission) >= 4).await;
-    deadlines.fire_when_armed(DeadlineKind::Admission).await;
+    fire_admission(&deadlines).await;
     for stream in &mut streams {
         reset(stream).await;
     }
@@ -838,7 +847,7 @@ async fn a_devices_lookups_are_held_to_two_places_across_its_connections() {
     let again = device.again(&host).await;
     let mut waiting = again.open_stream(header(&host, &again, uploads[2])).await;
     until(|| deadlines.armed(DeadlineKind::Admission) >= 1).await;
-    deadlines.fire_when_armed(DeadlineKind::Admission).await;
+    fire_admission(&deadlines).await;
     reset(&mut waiting).await;
     assert!(
         arrivals.try_recv().is_err(),
