@@ -1204,51 +1204,53 @@ async fn a_chunk_with_an_unknown_outcome_is_decided_by_the_status_alone() {
     }
 }
 
+/// A transport whose account can be signed out: it says why this device ended the connection once
+/// the flag is set, as the companion's bound transport does.
+#[derive(Debug)]
+struct Ending {
+    inner: Arc<dyn ControlTransport>,
+    ended: Arc<AtomicBool>,
+}
+
+impl ControlTransport for Ending {
+    fn connection_id(&self) -> ConnectionId {
+        self.inner.connection_id()
+    }
+    fn limits(&self) -> ReceiveLimits {
+        self.inner.limits()
+    }
+    fn initial_action_window(&self) -> ActionWindow {
+        self.inner.initial_action_window()
+    }
+    fn ended_by_this_device(&self) -> Option<ProtocolError> {
+        self.ended
+            .load(Ordering::Acquire)
+            .then(|| ProtocolError::new(ErrorCode::LeaseLost, "the account signed out"))
+    }
+    fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
+        self.inner.send(frame)
+    }
+    fn claim_receiver(&self) -> kr_client::Result<()> {
+        self.inner.claim_receiver()
+    }
+    fn stream_opener(&self) -> Option<Arc<dyn StreamOpener>> {
+        self.inner.stream_opener()
+    }
+    fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>> {
+        self.inner.recv()
+    }
+    fn revoke_streams(&self) {
+        self.inner.revoke_streams();
+    }
+    fn close(&self) {
+        self.inner.close();
+    }
+}
+
 /// The lane asks the transport whether this device ended the connection before each chunk, so a
 /// sign-in that ended after the lane opened stops the next chunk with the recorded reason.
 #[tokio::test]
 async fn a_lane_stops_when_the_transport_says_this_device_ended_the_connection() {
-    #[derive(Debug)]
-    struct Ending {
-        inner: Arc<dyn ControlTransport>,
-        ended: Arc<AtomicBool>,
-    }
-
-    impl ControlTransport for Ending {
-        fn connection_id(&self) -> ConnectionId {
-            self.inner.connection_id()
-        }
-        fn limits(&self) -> ReceiveLimits {
-            self.inner.limits()
-        }
-        fn initial_action_window(&self) -> ActionWindow {
-            self.inner.initial_action_window()
-        }
-        fn ended_by_this_device(&self) -> Option<ProtocolError> {
-            self.ended
-                .load(Ordering::Acquire)
-                .then(|| ProtocolError::new(ErrorCode::LeaseLost, "the account signed out"))
-        }
-        fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
-            self.inner.send(frame)
-        }
-        fn claim_receiver(&self) -> kr_client::Result<()> {
-            self.inner.claim_receiver()
-        }
-        fn stream_opener(&self) -> Option<Arc<dyn StreamOpener>> {
-            self.inner.stream_opener()
-        }
-        fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>> {
-            self.inner.recv()
-        }
-        fn revoke_streams(&self) {
-            self.inner.revoke_streams();
-        }
-        fn close(&self) {
-            self.inner.close();
-        }
-    }
-
     let script = Script::new(true);
     let ended = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&ended);
@@ -1321,6 +1323,51 @@ async fn a_lane_stops_when_the_transport_says_this_device_ended_the_connection()
         1,
         "the second chunk was never sent"
     );
+    session.close();
+    serving.abort();
+}
+
+/// A sign-out after the lane began to wait for a window: the account's watcher records the reason
+/// and closes the connection, which revokes the lane's streams, and the lane is told the reason and
+/// not that a stream was revoked.
+#[tokio::test]
+async fn a_sign_out_during_the_wait_for_a_window_is_told_with_its_reason() {
+    let script = Script::new(true);
+    let ended = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&ended);
+    let (session, _host, _client, serving) = pair_over(Arc::clone(&script), move |transport| {
+        Ok(Arc::new(Ending {
+            inner: Arc::new(transport),
+            ended: flag,
+        }) as Arc<dyn ControlTransport>)
+    })
+    .await;
+    let refused = session.action_window().await.action_window_id;
+    *script.ended_window.lock().expect("the script") = Some(refused);
+    let route = ChunkRoute::network(&session, environment())
+        .await
+        .expect("a route");
+    let transfer = TransferId::new(Uuid::from_bytes([6; 16]));
+    let chunk = some_chunk(transfer);
+    let at = target();
+    let mut lane = within(route.open(transfer)).await.expect("a lane");
+    let first = within(lane.send_chunk(&at, &chunk, TTL))
+        .await
+        .expect_err("the host refuses the window");
+    assert_eq!(first.code(), ErrorCode::PermissionDenied);
+
+    let waiting = lane.send_chunk(&at, &chunk, TTL);
+    let signing_out = async {
+        script
+            .until("the first chunk", |seen| seen.chunks.len() == 1)
+            .await;
+        tokio::task::yield_now().await;
+        ended.store(true, Ordering::Release);
+        session.transport().revoke_streams();
+    };
+    let (second, ()) = within(async { tokio::join!(waiting, signing_out) }).await;
+    let told = second.expect_err("the wait ends with the sign-out");
+    assert_eq!(told.code(), ErrorCode::LeaseLost, "{told}");
     session.close();
     serving.abort();
 }

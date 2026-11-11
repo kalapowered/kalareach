@@ -892,7 +892,7 @@ async fn newest_window(
 }
 
 /// Where the lanes of one network route take their windows from: the windows the control
-/// connection's reader delivers, and the window the host last turned down.
+/// connection's reader delivers, and the newest window the host turned down.
 ///
 /// The marker is here and not in a lane because the driver drops a lane that failed before it sends
 /// the chunk again. A lane opened after would find the same window still the newest, send it
@@ -900,18 +900,14 @@ async fn newest_window(
 /// window with another identifier.
 struct WindowSource {
     issued: watch::Receiver<Issued>,
-    turned_down: std::sync::Mutex<std::collections::VecDeque<ActionWindowId>>,
+    turned_down: std::sync::Mutex<Option<ActionWindowId>>,
 }
-
-/// How many refused windows a route remembers. Lanes of one route answer in any order, so a late
-/// refusal of an older window must not make the route forget the refusal of the current one.
-const REMEMBERED_REFUSALS: usize = 8;
 
 impl WindowSource {
     const fn new(issued: watch::Receiver<Issued>) -> Self {
         Self {
             issued,
-            turned_down: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            turned_down: std::sync::Mutex::new(None),
         }
     }
 
@@ -919,21 +915,21 @@ impl WindowSource {
         self.turned_down
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(window)
+            .as_ref()
+            == Some(window)
     }
 
+    /// Records that the host refused `window`, when it is the newest the host issued. Lanes of one
+    /// route answer in any order, and a window that is no longer the newest is never carried
+    /// again, so the late refusal of an older one must not replace the refusal of the current one.
     fn turn_down(&self, window: &ActionWindowId) {
-        let mut remembered = self
-            .turned_down
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if remembered.contains(window) {
+        if self.issued.borrow().window.action_window_id != *window {
             return;
         }
-        if remembered.len() == REMEMBERED_REFUSALS {
-            remembered.pop_front();
-        }
-        remembered.push_back(window.clone());
+        *self
+            .turned_down
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(window.clone());
     }
 }
 
@@ -1031,12 +1027,12 @@ impl NetworkCarrier {
     /// The transport is asked each time: the sign-in the connection was opened under can end after
     /// the lane opened, and the next chunk then stops with the reason the transport recorded.
     fn usable(&mut self) -> Result<()> {
-        // Asked first: a sign-out that ended the connection also revoked its streams, and the
-        // reason the transport recorded is what the caller is told, not that a stream was revoked.
-        if let Some(reason) = self.transport.ended_by_this_device() {
-            return Err(self.end(ClientError::Host(reason)));
-        }
-        if self.ended || self.stream.as_ref().is_none_or(DataStream::is_revoked) {
+        // The transport is asked first, by `end`: a sign-out that ended the connection also revoked
+        // its streams, and the reason it recorded is what the caller is told.
+        if self.transport.ended_by_this_device().is_some()
+            || self.ended
+            || self.stream.as_ref().is_none_or(DataStream::is_revoked)
+        {
             return Err(self.end(ClientError::ConnectionEnded));
         }
         Ok(())
@@ -1044,12 +1040,18 @@ impl NetworkCarrier {
 
     /// Ends this lane: nothing more goes on it, and its stream is reset and dropped, so that the
     /// host stops waiting for a frame and the stream's bulk slot is free.
+    ///
+    /// When the transport records why this device ended the connection, that reason is what the
+    /// caller is told, whatever the lane saw first: a sign-out revokes the streams, and a lane
+    /// waiting on one sees the revocation and not the sign-out.
     fn end(&mut self, error: ClientError) -> ClientError {
         self.ended = true;
         if let Some(stream) = self.stream.take() {
             stream.reset();
         }
-        error
+        self.transport
+            .ended_by_this_device()
+            .map_or(error, ClientError::Host)
     }
 
     /// The window a call carries.
@@ -1072,9 +1074,8 @@ impl NetworkCarrier {
         };
         match waited {
             Some(Ok(window)) => Ok(window),
-            Some(Err(Unavailable::Nothing | Unavailable::RanOut)) => {
-                Err(ClientError::NoActionWindow)
-            }
+            Some(Err(Unavailable::Nothing)) => Err(ClientError::NoActionWindow),
+            Some(Err(Unavailable::RanOut)) => Err(self.end(ClientError::NoActionWindow)),
             Some(Err(Unavailable::SourceEnded)) | None => {
                 Err(self.end(ClientError::ConnectionEnded))
             }
@@ -1092,7 +1093,10 @@ impl NetworkCarrier {
         frame: &ControlFrame,
         request_id: RequestId,
     ) -> Result<ParamsValue> {
-        let Some(stream) = self.stream.as_mut().filter(|_| !self.ended) else {
+        if self.ended {
+            return Err(self.end(ClientError::ConnectionEnded));
+        }
+        let Some(stream) = self.stream.as_mut() else {
             return Err(ClientError::ConnectionEnded);
         };
         self.ended = true;
@@ -1322,9 +1326,10 @@ mod tests {
     /// the refusal of the current one, leaves the current one refused.
     #[test]
     fn a_late_refusal_of_an_older_window_leaves_the_current_one_refused() {
+        let current = ActionWindowId::new("current").expect("a window");
         let (_issued, held) = watch::channel(Issued {
             window: ActionWindow {
-                action_window_id: ActionWindowId::new("window-1").expect("a window"),
+                action_window_id: current.clone(),
                 connection_id: kr_protocol::ids::ConnectionId::new(
                     kr_protocol::scalars::Uuid::from_bytes([1; 16]),
                 ),
@@ -1336,12 +1341,13 @@ mod tests {
         });
         let source = WindowSource::new(held);
         let older = ActionWindowId::new("older").expect("a window");
-        let current = ActionWindowId::new("current").expect("a window");
         source.turn_down(&current);
         source.turn_down(&older);
         assert!(source.turned_down(&current), "the current refusal is kept");
-        assert!(source.turned_down(&older));
-        assert!(!source.turned_down(&ActionWindowId::new("fresh").expect("a window")));
+        assert!(
+            !source.turned_down(&older),
+            "an older window is never carried"
+        );
     }
 
     #[test]
