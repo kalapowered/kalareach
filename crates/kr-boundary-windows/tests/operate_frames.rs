@@ -588,6 +588,48 @@ fn an_operate_frame_may_take_a_megabyte_and_every_other_frame_sixteen_kilobytes(
 }
 
 #[test]
+fn a_frame_may_be_written_at_its_limit_and_no_longer() {
+    // A JSON string of n letters takes n + 2 bytes.
+    let mut sent = Vec::new();
+    kr_boundary_windows::frame::write(&mut sent, &"x".repeat(MAX_FRAME - 2)).unwrap();
+    assert_eq!(sent.len(), 4 + MAX_FRAME);
+    assert!(matches!(
+        kr_boundary_windows::frame::write(&mut Vec::new(), &"x".repeat(MAX_FRAME - 1)),
+        Err(FrameError::TooLong(length)) if length == MAX_FRAME + 1
+    ));
+
+    // An operate request of exactly the operate limit: messages of 8 KiB, and a last one whose
+    // length makes the frame exactly as long as the limit allows.
+    let size = |arguments: &[Arg]| {
+        serde_json::to_vec(&InvocationRequest::Operate(request(arguments.to_vec())))
+            .unwrap()
+            .len()
+    };
+    let mut arguments = Vec::new();
+    while size(&arguments) + 8192 + 40 < MAX_OPERATE_FRAME {
+        arguments.push(Arg::Message("m".repeat(MAX_MESSAGE_BYTES)));
+    }
+    // A message of n letters adds n bytes to the frame, so the last one is the difference.
+    arguments.push(Arg::Message(String::new()));
+    let empty = size(&arguments);
+    arguments.pop();
+    let length = MAX_OPERATE_FRAME - empty;
+    assert!(length <= MAX_MESSAGE_BYTES, "{length}");
+    arguments.push(Arg::Message("m".repeat(length)));
+    let at = InvocationRequest::Operate(request(arguments.clone()));
+    let mut sent = Vec::new();
+    write_request(&mut sent, &at).unwrap();
+    assert_eq!(sent.len(), 4 + MAX_OPERATE_FRAME);
+    assert_eq!(read_request(&mut Cursor::new(sent)).unwrap(), at);
+    arguments.push(Arg::Word("-".to_owned()));
+    let over = InvocationRequest::Operate(request(arguments));
+    assert!(matches!(
+        write_request(&mut Vec::new(), &over),
+        Err(FrameError::TooLong(_))
+    ));
+}
+
+#[test]
 fn a_frame_cut_short_is_a_failure_and_a_closed_connection_is_a_close() {
     let mut sent = Vec::new();
     write_request(&mut sent, &InvocationRequest::Operate(request(vec![]))).unwrap();
@@ -837,13 +879,50 @@ fn a_reply_names_are_bounded_in_every_text() {
     assert!(finished(over.clone(), at.clone()).check().is_err());
     assert!(finished(at.clone(), over).check().is_err());
     assert!(finished("tab\t".to_owned(), at).check().is_err());
-    let pipe = |name: String| InvocationReply::Accepted {
+    let pipes = |out: String, err: String| InvocationReply::Accepted {
         invocation: InvocationId::from_bytes([1; 16]),
-        stdout_pipe: name.clone(),
-        stderr_pipe: name,
+        stdout_pipe: out,
+        stderr_pipe: err,
     };
-    assert!(pipe("p".repeat(MAX_PIPE_NAME_BYTES)).check().is_ok());
-    assert!(pipe("p".repeat(MAX_PIPE_NAME_BYTES + 1)).check().is_err());
+    let at = "p".repeat(MAX_PIPE_NAME_BYTES);
+    let over = "p".repeat(MAX_PIPE_NAME_BYTES + 1);
+    assert!(pipes(at.clone(), at.clone()).check().is_ok());
+    assert!(pipes(over.clone(), at.clone()).check().is_err());
+    assert!(pipes(at.clone(), over).check().is_err());
+    assert!(pipes("o\n".to_owned(), at.clone()).check().is_err());
+    assert!(pipes(at, "e\n".to_owned()).check().is_err());
+}
+
+#[test]
+fn a_note_a_peer_sends_is_checked_like_one_made_here() {
+    let finished = |notes: Vec<String>| InvocationReply::Finished {
+        exit: Some(0),
+        ended_by: EndedBy::Exit,
+        cleanup: Cleanup::Clean,
+        configuration: ConfigurationState::Same,
+        notes: Notes {
+            items: notes,
+            cut: 0,
+        },
+        replaced_protected: 0,
+    };
+    assert!(finished(vec!["n".repeat(MAX_NOTE_BYTES)]).check().is_ok());
+    assert!(
+        finished(vec!["n".repeat(MAX_NOTE_BYTES + 1)])
+            .check()
+            .is_err()
+    );
+    assert!(
+        finished(vec!["a".to_owned(), "two\nlines".to_owned()])
+            .check()
+            .is_err()
+    );
+    assert!(finished(vec!["\u{e9}".to_owned()]).check().is_err());
+    let body = serde_json::to_vec(&finished(vec!["x".repeat(MAX_NOTE_BYTES + 1)])).unwrap();
+    assert!(matches!(
+        read_reply(&mut Cursor::new(wire(&body))),
+        Err(FrameError::Field(_))
+    ));
 }
 
 #[test]
@@ -873,6 +952,26 @@ fn notes_are_bounded_and_carry_a_mark_for_what_was_cut() {
     let dirty = Notes::bounded(["a\nb"]);
     assert_eq!(dirty.items, ["a?b"]);
     assert_eq!(dirty.cut, 0);
+}
+
+#[test]
+fn the_notes_have_exactly_the_room_of_fourteen_kilobytes_of_json() {
+    // Each note of 179 letters and 21 quotation marks takes 224 bytes of JSON with its quotes,
+    // its escapes and its comma, so 64 of them take exactly 14 KiB and all stay.
+    let note = format!("{}{}", "n".repeat(179), "\"".repeat(21));
+    assert_eq!(note.len(), MAX_NOTE_BYTES);
+    let exact = Notes::bounded(vec![note.as_str(); MAX_NOTES]);
+    assert_eq!(exact.items.len(), MAX_NOTES);
+    assert_eq!(exact.cut, 0);
+    // One byte more in the last note and it no longer fits.
+    let mut notes = vec![note.clone(); MAX_NOTES - 1];
+    notes.push(format!("{}{}", "n".repeat(178), "\"".repeat(22)));
+    let over = Notes::bounded(&notes);
+    assert_eq!((over.items.len(), over.cut), (MAX_NOTES - 1, 1));
+    // Notes of 200 quotation marks take 403 bytes each, so 35 fill the room.
+    let hostile = Notes::bounded(vec!["\"".repeat(MAX_NOTE_BYTES); MAX_NOTES]);
+    assert_eq!(hostile.items.len(), 35);
+    assert_eq!(hostile.cut, 29);
 }
 
 #[test]
