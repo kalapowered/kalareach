@@ -79,12 +79,56 @@ pub fn digest(marker: &str, name: &str, value: &str) -> String {
     bytes.extend_from_slice(name.as_bytes());
     bytes.push(0);
     bytes.extend_from_slice(value.as_bytes());
+    short_hex_of(&bytes)
+}
+
+/// The first characters of the SHA-256 of `bytes`, in hex.
+fn short_hex_of(bytes: &[u8]) -> String {
     let mut text = String::with_capacity(64);
-    for byte in kr_cbor::sha256(&bytes) {
+    for byte in kr_cbor::sha256(bytes) {
         text.push_str(&format!("{byte:02x}"));
     }
     text.truncate(DIGEST_CHARACTERS);
     text
+}
+
+/// What the parts of the answer about the exported names say of the whole list: how many names the
+/// shell exports and the digest of the whole sorted list, one name to a line. Every part must say
+/// the same, and the names read must give the digest, so that the parts are read as one list and
+/// not as pieces of lists that changed in between.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Snapshot {
+    /// How many names the shell exports.
+    pub total: usize,
+    /// The digest of the sorted names.
+    pub digest: String,
+}
+
+/// The digest of `names`, as the shell makes it of the sorted list: one name to a line.
+#[must_use]
+pub fn snapshot_digest(names: &[String]) -> String {
+    let mut bytes = Vec::new();
+    for name in names {
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(b'\n');
+    }
+    short_hex_of(&bytes)
+}
+
+/// Fails unless the `exported` names, all the parts read, are the list the shell digested.
+///
+/// # Errors
+///
+/// Returns that the names read are not the list the shell's digest stands for.
+pub fn checks_the_snapshot(exported: &[String], snapshot: &Snapshot) -> Result<(), String> {
+    if exported.len() == snapshot.total && snapshot_digest(exported) == snapshot.digest {
+        Ok(())
+    } else {
+        Err(format!(
+            "{NOT_READ_WHOLE} the names read are not the list the shell digested: the list of \
+             exported names changed while the parts were read"
+        ))
+    }
 }
 
 /// The program the shell pipes the digest's input to, by its absolute path and started with an
@@ -96,6 +140,79 @@ const fn digest_program() -> &'static str {
     } else {
         "/usr/bin/env -i /usr/bin/sha256sum"
     }
+}
+
+/// The executables the digest program runs through, by their absolute paths: a function of the
+/// session named for one of them would be run in place of it, with the value on its input.
+const fn digest_executables() -> [&'static str; 2] {
+    if cfg!(target_os = "macos") {
+        ["/usr/bin/env", "/usr/bin/shasum"]
+    } else {
+        ["/usr/bin/env", "/usr/bin/sha256sum"]
+    }
+}
+
+/// How a failure begins when the shell is in a state in which the check does not ask it for values.
+pub const SHELL_REFUSED: &str = "the session's shell is in a state in which its environment is not asked for before the first \
+     typing:";
+
+/// The names the typed lines use for their own variables, which must not exist before a line is
+/// typed: a line neither overwrites nor deletes a variable the shell had.
+const OWN_VARIABLES: &str = "krenv_t krenv_d krenv_n krenv_r krenv_e krenv_i";
+
+/// What a line that refuses prints, after the row word and `refused`: what the shell has.
+const REFUSED: &str = "refused";
+
+/// The test, in the typed lines, that a variable of the line's own name exists: made of parameter
+/// expansions alone, so that no command is run before it.
+fn own_variable_exists() -> String {
+    let tests: Vec<String> = OWN_VARIABLES
+        .split(' ')
+        .map(|name| format!("${{+parameters[{name}]}}"))
+        .collect();
+    format!("\"{}\" == *1*", tests.join(""))
+}
+
+/// The parts of a typed line that refuse a shell before any value is expanded, which put in
+/// `krenv_r` what the shell has that would give a value to something other than the digest
+/// program: a function or an alias named `builtin`, a function named for an executable the digest
+/// program runs through, a global alias (which applies to any word), and a `DEBUG` or `ZERR` trap
+/// (which runs between commands). Parameter expansions alone, but for the list of traps, which the
+/// `trap` builtin gives once `builtin` is known not to be a function.
+fn refusal_checks() -> String {
+    let [env, shasum] = digest_executables();
+    let mut checks = String::from("krenv_r=; ");
+    for (test, word) in [
+        (
+            "${+functions[builtin]} == 1".to_owned(),
+            "function:builtin".to_owned(),
+        ),
+        (
+            "${+aliases[builtin]} == 1".to_owned(),
+            "alias:builtin".to_owned(),
+        ),
+        (
+            format!("${{+functions[{env}]}} == 1"),
+            format!("function:{env}"),
+        ),
+        (
+            format!("${{+functions[{shasum}]}} == 1"),
+            format!("function:{shasum}"),
+        ),
+        (
+            "${#galiases} != 0".to_owned(),
+            "global-alias:${(j:,:k)galiases}".to_owned(),
+        ),
+    ] {
+        checks.push_str(&format!("[[ {test} ]] && krenv_r=\"$krenv_r {word}\"; "));
+    }
+    for signal in ["DEBUG", "ZERR"] {
+        checks.push_str(&format!(
+            "[[ ${{+functions[TRAP{signal}]}} == 1 || -n ${{(M)${{(f)\"$(builtin trap)\"}}:#* {signal}}} ]] \
+             && krenv_r=\"$krenv_r trap:{signal}\"; "
+        ));
+    }
+    checks
 }
 
 /// What the harness expects of the session's shell: the list it handed to `kr new`, less the names
@@ -202,10 +319,15 @@ impl Expected {
     }
 
     /// The line to type for the digests of part `part`, whose end row carries `tag`. The line holds
-    /// names and the digest program, and no value. It calls the shell's builtins by their explicit
-    /// form, so that a function or an alias of the session named `printf` or `print` is not called
-    /// with a value, and it turns tracing and echo off before any value is expanded and sets back
-    /// the ones that were on.
+    /// names and the digest program, and no value.
+    ///
+    /// Before any value is expanded it refuses a shell that has a variable of the line's own names,
+    /// a function or an alias named `builtin`, a function named for the digest program's
+    /// executables, a global alias, or a `DEBUG` or `ZERR` trap, and says what it found
+    /// ([`SHELL_REFUSED`]). Otherwise it calls the shell's builtins by their explicit form, so that
+    /// a function or an alias named `printf` or `print` is not called with a value, turns tracing
+    /// and echo off before any value is expanded, and, in an `always` block, sets back the options
+    /// that were on and unsets its own variables, also where it stops part way.
     #[must_use]
     pub fn value_line(&self, part: usize, tag: usize) -> String {
         let names: Vec<&str> = self
@@ -213,33 +335,37 @@ impl Expected {
             .iter()
             .map(|(name, _)| name.as_str())
             .collect();
-        format!(
-            "t=; [[ -o xtrace ]] && t=x; [[ -o verbose ]] && t=${{t}}v; \
-             builtin unsetopt xtrace verbose; \
-             for n in {names}; do if [[ ${{parameters[$n]}} == *export* ]]; then \
-             d=$(builtin printf '%s\\0%s\\0%s' \"${{{marker}}}\" \"$n\" \"${{(P)n}}\" | {program}); \
-             builtin print -r -- \"{ROW} value $n ${{d[1,{DIGEST_CHARACTERS}]}}\"; \
-             else builtin print -r -- \"{ROW} value $n missing\"; fi; done; builtin unset d n; \
-             [[ $t == *x* ]] && builtin setopt xtrace; [[ $t == *v* ]] && builtin setopt verbose; \
-             builtin unset t; builtin print -r -- \"{ROW} end {tag}\"",
-            names = names.join(" "),
-            marker = self.marker_name,
-            program = digest_program(),
-        )
+        let template = r#"if [[ @EXISTS@ ]]; then print -r -- "@ROW@ refused variable:krenv"; print -r -- "@ROW@ end @TAG@"; else @CHECKS@if [[ -n $krenv_r ]]; then print -r -- "@ROW@ refused$krenv_r"; print -r -- "@ROW@ end @TAG@"; unset krenv_r; else krenv_t=; [[ -o xtrace ]] && krenv_t=x; [[ -o verbose ]] && krenv_t=${krenv_t}v; builtin unsetopt xtrace verbose; { for krenv_n in @NAMES@; do if [[ ${parameters[$krenv_n]} == *export* ]]; then krenv_d=$(builtin printf '%s\0%s\0%s' "${@MARKER@}" "$krenv_n" "${(P)krenv_n}" | @PROGRAM@); builtin print -r -- "@ROW@ value $krenv_n ${krenv_d[1,@DIGITS@]}"; else builtin print -r -- "@ROW@ value $krenv_n missing"; fi; done; } always { [[ $krenv_t == *x* ]] && builtin setopt xtrace; [[ $krenv_t == *v* ]] && builtin setopt verbose; builtin unset krenv_d krenv_n krenv_t krenv_r; }; builtin print -r -- "@ROW@ end @TAG@"; fi; fi"#;
+        template
+            .replace("@EXISTS@", &own_variable_exists())
+            .replace("@CHECKS@", &refusal_checks())
+            .replace("@NAMES@", &names.join(" "))
+            .replace("@MARKER@", &self.marker_name)
+            .replace("@PROGRAM@", digest_program())
+            .replace("@DIGITS@", &DIGEST_CHARACTERS.to_string())
+            .replace("@ROW@", ROW)
+            .replace("@TAG@", &tag.to_string())
     }
 
     /// The line to type for the names the shell exports, from the one after `skipped` of its sorted
     /// list on, whose end row carries `tag`: each row carries the name's position in the shell's
-    /// list, and one row says how many names the shell exports.
+    /// list, one row says how many names the shell exports, and one carries a digest of the whole
+    /// sorted list, so that the parts are read as one snapshot ([`Snapshot`]). It holds no value,
+    /// refuses a shell that has a variable of the line's own names, and unsets its own variables
+    /// also where it stops part way.
     #[must_use]
     pub fn exported_line(skipped: usize, tag: usize) -> String {
         let (first, last) = (skipped + 1, skipped + PART_NAMES);
-        format!(
-            "e=(${{(ko)parameters[(R)*export*]}}); i={skipped}; for n in ${{e[{first},{last}]}}; do \
-             i=$((i+1)); builtin print -r -- \"{ROW} exported $i $n\"; done; \
-             builtin print -r -- \"{ROW} total ${{#e}}\"; builtin unset e i n; \
-             builtin print -r -- \"{ROW} end {tag}\""
-        )
+        let template = r#"if [[ @EXISTS@ ]]; then print -r -- "@ROW@ refused variable:krenv"; print -r -- "@ROW@ end @TAG@"; else krenv_e=(${(ko)parameters[(R)*export*]}); krenv_i=@SKIPPED@; { for krenv_n in ${krenv_e[@FIRST@,@LAST@]}; do krenv_i=$((krenv_i+1)); builtin print -r -- "@ROW@ exported $krenv_i $krenv_n"; done; builtin print -r -- "@ROW@ total ${#krenv_e}"; krenv_d=$(builtin print -rl -- "${(@)krenv_e}" | @PROGRAM@); builtin print -r -- "@ROW@ snapshot ${krenv_d[1,@DIGITS@]}"; } always { builtin unset krenv_e krenv_i krenv_n krenv_d; }; builtin print -r -- "@ROW@ end @TAG@"; fi"#;
+        template
+            .replace("@EXISTS@", &own_variable_exists())
+            .replace("@SKIPPED@", &skipped.to_string())
+            .replace("@FIRST@", &first.to_string())
+            .replace("@LAST@", &last.to_string())
+            .replace("@PROGRAM@", digest_program())
+            .replace("@DIGITS@", &DIGEST_CHARACTERS.to_string())
+            .replace("@ROW@", ROW)
+            .replace("@TAG@", &tag.to_string())
     }
 
     /// The line a pass prints, so that a log shows the check ran and what it compared: the names
@@ -293,6 +419,7 @@ impl Expected {
         rows: &[String],
     ) -> Result<Vec<(String, Reading)>, String> {
         let answer = rows_before_the_end(rows, tag)?;
+        refused_by_the_shell(&answer)?;
         let mut readings = Vec::new();
         for (name, _) in self.part(part) {
             let mut said = answer.iter().filter_map(|row| match row {
@@ -410,15 +537,18 @@ impl Expected {
 pub fn read_exported(
     tag: usize,
     read: &[String],
-    said: Option<usize>,
+    said: Option<&Snapshot>,
     rows: &[String],
-) -> Result<(Vec<String>, usize), String> {
+) -> Result<(Vec<String>, Snapshot), String> {
     let answer = rows_before_the_end(rows, tag)?;
+    refused_by_the_shell(&answer)?;
     let mut listed = Vec::new();
     let mut total = None;
+    let mut digests = Vec::new();
     for row in &answer {
         match row {
             Row::Exported(position, name) => listed.push((*position, *name)),
+            Row::Snapshot(digest) => digests.push(*digest),
             Row::Total(count) => {
                 let earlier = total.replace(*count);
                 if earlier.is_some() {
@@ -437,9 +567,30 @@ pub fn read_exported(
              shell exports"
         ));
     };
-    if let Some(said) = said.filter(|said| *said != total) {
+    let digest = match digests.as_slice() {
+        [digest]
+            if digest.len() == DIGEST_CHARACTERS
+                && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            (*digest).to_owned()
+        }
+        _ => {
+            return Err(format!(
+                "{NOT_READ_WHOLE} the screen shows no one digest of the whole list of exported \
+                 names"
+            ));
+        }
+    };
+    if let Some(said) = said.filter(|said| said.total != total) {
         return Err(format!(
-            "{NOT_READ_WHOLE} the shell said it exports {said} names and then {total}"
+            "{NOT_READ_WHOLE} the shell said it exports {} names and then {total}",
+            said.total
+        ));
+    }
+    if said.is_some_and(|said| said.digest != digest) {
+        return Err(format!(
+            "{NOT_READ_WHOLE} the shell's list of exported names is not the same in every part: \
+             it changed while the parts were read"
         ));
     }
     let columns = usize::from(kr_e2e_m1b::window::COLUMNS);
@@ -474,7 +625,7 @@ pub fn read_exported(
         }
         names.push(name.to_owned());
     }
-    Ok((names, total))
+    Ok((names, Snapshot { total, digest }))
 }
 
 /// The rows of one answer, before the row that ends it.
@@ -482,6 +633,24 @@ enum Row<'a> {
     Value(&'a str, Reading),
     Exported(usize, &'a str),
     Total(usize),
+    /// The digest of the whole sorted list of exported names, as the shell has it.
+    Snapshot(&'a str),
+    /// What the shell has that the line refuses to go on with, in the line's words.
+    Refused(Vec<&'a str>),
+}
+
+/// Fails where the shell's answer is a refusal: the line asked for no value, and says what the
+/// shell has, by name and never a value.
+fn refused_by_the_shell(answer: &[Row<'_>]) -> Result<(), String> {
+    for row in answer {
+        if let Row::Refused(found) = row {
+            return Err(format!(
+                "{SHELL_REFUSED} it has {}, so no value was expanded and nothing was compared",
+                found.join(" ")
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Reads the rows that are answer rows and that come before the row `KRENV end <tag>`.
@@ -507,6 +676,10 @@ fn rows_before_the_end(rows: &[String], tag: usize) -> Result<Vec<Row<'_>>, Stri
                     answer.push(Row::Exported(position, name));
                 }
             }
+            [first, REFUSED, found @ ..] if *first == ROW => {
+                answer.push(Row::Refused(found.to_vec()))
+            }
+            [first, "snapshot", digest] if *first == ROW => answer.push(Row::Snapshot(digest)),
             [first, "total", count] if *first == ROW => {
                 if let Ok(count) = count.parse() {
                     answer.push(Row::Total(count));
@@ -782,6 +955,7 @@ mod tests {
         let exported = [
             format!("{ROW} exported 1 {MARKER}"),
             format!("{ROW} total 3"),
+            format!("{ROW} snapshot {}", "0".repeat(DIGEST_CHARACTERS)),
         ];
         assert!(
             read_exported(7, &[], None, &exported).is_err(),
@@ -791,6 +965,7 @@ mod tests {
         let wide = [
             format!("{ROW} exported 1 {width}"),
             format!("{ROW} total 1"),
+            format!("{ROW} snapshot {}", "0".repeat(DIGEST_CHARACTERS)),
             format!("{ROW} end 7"),
         ];
         assert!(
@@ -799,29 +974,54 @@ mod tests {
         );
     }
 
+    /// The names of the list the tests' shell exports.
+    fn all_names() -> Vec<String> {
+        (1..=12).map(|index| format!("NAME_{index:02}")).collect()
+    }
+
     /// The rows of one part of the exported names: `names` from the position after `skipped`, the
-    /// shell's `total`, and the end row `tag`.
+    /// shell's `total`, the digest of its list of twelve names, and the end row `tag`.
     fn exported_part(skipped: usize, names: &[&str], total: usize, tag: usize) -> Vec<String> {
+        exported_part_of(skipped, names, total, &snapshot_digest(&all_names()), tag)
+    }
+
+    /// [`exported_part`] with the digest of the list the shell had when it made the part.
+    fn exported_part_of(
+        skipped: usize,
+        names: &[&str],
+        total: usize,
+        digest: &str,
+        tag: usize,
+    ) -> Vec<String> {
         names
             .iter()
             .enumerate()
             .map(|(offset, name)| format!("{ROW} exported {} {name}", skipped + offset + 1))
-            .chain([format!("{ROW} total {total}"), format!("{ROW} end {tag}")])
+            .chain([
+                format!("{ROW} total {total}"),
+                format!("{ROW} snapshot {digest}"),
+                format!("{ROW} end {tag}"),
+            ])
             .collect()
     }
 
     #[test]
     fn the_names_the_shell_exports_are_read_whole_or_the_check_refuses() {
-        let all: Vec<String> = (1..=12).map(|index| format!("NAME_{index:02}")).collect();
+        let all = all_names();
+        let snap = Snapshot {
+            total: 12,
+            digest: snapshot_digest(&all),
+        };
         let first: Vec<&str> = all[..10].iter().map(String::as_str).collect();
         let rest: Vec<&str> = all[10..].iter().map(String::as_str).collect();
         // Twelve names in two parts: the first of ten, the last the rest.
-        let (names, total) =
+        let (names, said) =
             read_exported(3, &[], None, &exported_part(0, &first, 12, 3)).expect("a whole part");
-        assert_eq!((names.len(), total), (10, 12));
-        let (more, total) = read_exported(4, &names, Some(12), &exported_part(10, &rest, 12, 4))
+        assert_eq!((names.len(), &said), (10, &snap));
+        let (more, said) = read_exported(4, &names, Some(&said), &exported_part(10, &rest, 12, 4))
             .expect("the last part is the rest");
-        assert_eq!((more, total), (all[10..].to_vec(), 12));
+        assert_eq!((more, &said), (all[10..].to_vec(), &snap));
+        assert_eq!(checks_the_snapshot(&all, &said), Ok(()));
         // The first part loses its first name: nine names where ten were asked for.
         let lost = exported_part(0, &first[1..], 12, 3);
         let why = read_exported(3, &[], None, &lost).expect_err("a short part is refused");
@@ -831,7 +1031,7 @@ mod tests {
         );
         // The first row scrolled away in the last part: one name where two were asked for.
         let scrolled = exported_part(10, &rest[1..], 12, 4);
-        assert!(read_exported(4, &names, Some(12), &scrolled).is_err());
+        assert!(read_exported(4, &names, Some(&snap), &scrolled).is_err());
         // A part with a name more than it was asked for.
         let surplus = exported_part(
             0,
@@ -842,14 +1042,14 @@ mod tests {
         assert!(read_exported(3, &[], None, &surplus).is_err());
         // A part that is asked for nothing, because every name was read, and lists a name.
         let beyond = exported_part(12, &["NAME_13"], 12, 5);
-        assert!(read_exported(5, &all, Some(12), &beyond).is_err());
+        assert!(read_exported(5, &all, Some(&snap), &beyond).is_err());
         // The total changes between parts.
-        let why = read_exported(4, &names, Some(12), &exported_part(10, &rest, 13, 4))
+        let why = read_exported(4, &names, Some(&snap), &exported_part(10, &rest, 13, 4))
             .expect_err("a total that changed is refused");
         assert!(why.contains("12") && why.contains("13"), "{why}");
         // A part that lists a name an earlier part listed, or one twice.
         let again = exported_part(10, &[first[0], rest[1]], 12, 4);
-        let why = read_exported(4, &names, Some(12), &again).expect_err("a repeated name");
+        let why = read_exported(4, &names, Some(&snap), &again).expect_err("a repeated name");
         assert!(why.contains("twice"), "{why}");
         let twice = exported_part(0, &[first[0], first[0]], 2, 3);
         assert!(read_exported(3, &[], None, &twice).is_err());
@@ -857,12 +1057,158 @@ mod tests {
         let late = exported_part(1, &first[1..], 12, 3);
         assert!(read_exported(3, &[], None, &late).is_err());
         let early = exported_part(9, &rest, 12, 4);
-        assert!(read_exported(4, &names, Some(12), &early).is_err());
+        assert!(read_exported(4, &names, Some(&snap), &early).is_err());
         // Two counts of the names.
         let mut doubled = exported_part(0, &first, 12, 3);
         doubled.insert(doubled.len() - 1, format!("{ROW} total 12"));
         let why = read_exported(3, &[], None, &doubled).expect_err("two counts are refused");
         assert!(why.contains("two counts"), "{why}");
+        // One name replaces another between the parts at the same total: name 3 is no longer
+        // exported and a name that sorts last is, so the second part carries another digest.
+        let mut swapped = all.clone();
+        swapped[2] = "NAME_13".to_owned();
+        swapped.sort();
+        let other = snapshot_digest(&swapped);
+        let second = exported_part_of(10, &["NAME_11", "NAME_12"], 12, &other, 4);
+        let why = read_exported(4, &names, Some(&snap), &second)
+            .expect_err("a list that changed between parts is refused");
+        assert!(why.contains("not the same in every part"), "{why}");
+        // The names read must give the digest: the parts agree with each other and not with them.
+        let wrong = Snapshot {
+            total: 12,
+            digest: other,
+        };
+        assert!(checks_the_snapshot(&all, &wrong).is_err());
+        assert!(checks_the_snapshot(&all[..11], &snap).is_err());
+        // A part with no digest, and one with two, is not read.
+        let mut none = exported_part(0, &first, 12, 3);
+        none.retain(|row| !row.contains("snapshot"));
+        assert!(read_exported(3, &[], None, &none).is_err());
+        let mut two = exported_part(0, &first, 12, 3);
+        two.insert(0, format!("{ROW} snapshot {}", snap.digest));
+        assert!(read_exported(3, &[], None, &two).is_err());
+    }
+
+    /// The system's `zsh`, or why not.
+    fn system_zsh() -> Option<&'static str> {
+        let found = ["/bin/zsh", "/usr/bin/zsh"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).exists());
+        assert!(
+            found.is_some() || !cfg!(target_os = "macos"),
+            "macOS has /bin/zsh, and this test runs the lines in it"
+        );
+        found
+    }
+
+    /// What `zsh -f` writes on its output and its error output when it runs `prelude`, then `line`,
+    /// then `after`, each on lines of their own, with `environment` and nothing else.
+    fn zsh_runs(
+        zsh: &str,
+        environment: &[(String, String)],
+        prelude: &str,
+        line: &str,
+        after: &str,
+    ) -> (String, String) {
+        let output = std::process::Command::new(zsh)
+            .args(["-f", "-c"])
+            .arg(format!(
+                "zmodload zsh/parameter; {prelude}\n{line}\n{after}"
+            ))
+            .env_clear()
+            .envs(environment.iter().cloned())
+            .output()
+            .expect("zsh runs");
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    #[test]
+    fn a_shell_in_a_state_the_line_refuses_is_refused_by_what_it_has_and_no_value_is_expanded() {
+        let Some(zsh) = system_zsh() else {
+            return;
+        };
+        let expected = expected(&[], &[]);
+        let list = the_list();
+        let given: Vec<(String, String)> = list
+            .iter()
+            .filter(|(name, _)| !host_owns_variable(name))
+            .cloned()
+            .chain([("PATH".to_owned(), "/usr/bin:/bin".to_owned())])
+            .collect();
+        let line = expected.value_line(0, 0);
+        let [env, shasum] = digest_executables();
+        for (prelude, found) in [
+            ("function builtin { \"$@\"; }", "function:builtin"),
+            ("alias builtin=echo", "alias:builtin"),
+            (
+                &format!("function {env} {{ cat; }}"),
+                &format!("function:{env}"),
+            ),
+            (
+                &format!("function {shasum} {{ cat; }}"),
+                &format!("function:{shasum}"),
+            ),
+            ("alias -g xx=yy", "global-alias:xx"),
+            ("trap : DEBUG", "trap:DEBUG"),
+            ("trap : ZERR", "trap:ZERR"),
+            ("TRAPDEBUG() { :; }", "trap:DEBUG"),
+            ("krenv_t=1", "variable:krenv"),
+            ("krenv_n=keep", "variable:krenv"),
+            ("typeset -r krenv_n", "variable:krenv"),
+        ] {
+            let (shown, error) = zsh_runs(zsh, &given, prelude, &line, "");
+            let rows: Vec<String> = shown.lines().map(str::to_owned).collect();
+            let why = expected
+                .read_values(0, 0, &rows)
+                .expect_err(&format!("{prelude}: the shell is refused"));
+            assert!(
+                why.starts_with(SHELL_REFUSED) && why.contains(found),
+                "{prelude}: {why}"
+            );
+            for (name, value) in &given {
+                assert!(
+                    value.len() < SHORTEST_VALUE_CHECKED
+                        || !(shown.contains(value.as_str()) || error.contains(value.as_str())),
+                    "{prelude}: the value of {name} was shown"
+                );
+            }
+        }
+        // A variable the shell had is neither overwritten nor deleted by a line that refuses.
+        let (shown, _) = zsh_runs(
+            zsh,
+            &given,
+            "krenv_n=keep",
+            &line,
+            "builtin print -r -- \"AFTER $krenv_n\"",
+        );
+        assert!(shown.contains("AFTER keep"), "{shown}");
+        // The lines leave no variable of their own behind where they run to their end.
+        let leftover = "(( ${+parameters[krenv_t]} + ${+parameters[krenv_d]} + ${+parameters[krenv_n]} \
+             + ${+parameters[krenv_r]} + ${+parameters[krenv_e]} + ${+parameters[krenv_i]} )) \
+             && builtin print -r -- LEFT-VARIABLE";
+        for typed in [line.clone(), Expected::exported_line(0, 0)] {
+            let (shown, error) = zsh_runs(zsh, &given, "", &typed, leftover);
+            assert!(
+                !shown.contains("LEFT-VARIABLE") && !error.contains("LEFT-VARIABLE"),
+                "{shown}"
+            );
+        }
+        // Where a line stops part way, its own variables are unset and the options that were on are
+        // set back by the block that follows its try block, which runs whatever stops the try
+        // block: that block holds the setting back and the unsetting, and the try block holds neither.
+        let (_, after) = line.split_once("} always {").expect("an always block");
+        let (tried, _) = line.split_once("} always {").expect("an always block");
+        assert!(
+            after.contains("builtin setopt xtrace") && !tried.contains("builtin setopt xtrace")
+        );
+        assert!(after.contains("builtin unset krenv_d krenv_n krenv_t krenv_r"));
+        let names = Expected::exported_line(0, 0);
+        let (tried, after) = names.split_once("} always {").expect("an always block");
+        assert!(after.contains("builtin unset krenv_e krenv_i krenv_n krenv_d"));
+        assert!(!tried.contains("builtin unset"));
     }
 
     #[test]
@@ -988,13 +1334,14 @@ mod tests {
             let mut said = None;
             loop {
                 let rows = ask(&Expected::exported_line(exported.len(), 9));
-                let (names, total) =
-                    read_exported(9, &exported, said, &rows).expect("a whole answer");
-                said = Some(total);
+                let (names, snapshot) =
+                    read_exported(9, &exported, said.as_ref(), &rows).expect("a whole answer");
                 exported.extend(names);
-                if exported.len() == total {
+                if exported.len() == snapshot.total {
+                    assert_eq!(checks_the_snapshot(&exported, &snapshot), Ok(()));
                     break;
                 }
+                said = Some(snapshot);
             }
             (Answer { readings, exported }, shown.into_inner())
         };
