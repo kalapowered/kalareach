@@ -1464,7 +1464,7 @@ impl Person {
         }
         self.clears_the_screen_of(session_environment::ROW);
         expected.judge(&readings, &exported)?;
-        Ok(expected.passed_line(exported.len()))
+        Ok(expected.passed_line(&exported))
     }
 
     /// Types one line of the environment's check on a cleared screen, and returns the screen once
