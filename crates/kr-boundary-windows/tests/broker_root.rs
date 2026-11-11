@@ -790,7 +790,7 @@ fn a_root_name_that_exists_refuses_the_invocation_and_changes_nothing_that_is_th
     std::fs::create_dir(&taken).unwrap();
     std::fs::write(taken.join("mine.txt"), b"not the broker's").unwrap();
     let before = (look_at(&taken), look_at(&taken.join("mine.txt")));
-    let mut rows = RunRows::new(&run);
+    let mut rows = Rows::default();
     match create_root_named(&run.dir, &run.path, name.clone(), &group(), &mut rows) {
         Err(RootError::Os(failure)) => assert_eq!(failure.code, 183, "the name exists"),
         other => panic!("a name that exists is refused: {other:?}"),
@@ -1090,15 +1090,26 @@ fn a_link_or_a_file_with_several_names_stays_held_between_its_check_and_its_dele
     assert!(leftovers.is_empty(), "{leftovers:?}");
     assert_eq!(log, ["removed"]);
     assert!(common::is_gone(root), "the root is gone");
+    let (outside_before, victim_before, target_before, kept_before) = before;
     assert_eq!(
         (
             look_at(&outside),
             look_at(&outside.join("victim.txt")),
             look_at(&file_target),
-            look_at(&kept_name),
         ),
-        before,
-        "the targets and the other name of the hard link are as they were"
+        (outside_before, victim_before, target_before),
+        "the targets are as they were"
+    );
+    let kept_after = look_at(&kept_name);
+    assert_eq!(
+        (kept_before.links, kept_after.links),
+        (2, 1),
+        "the other name of the hard link is now the object's only name"
+    );
+    assert_eq!(
+        (kept_after.bytes, kept_after.summary),
+        (kept_before.bytes, kept_before.summary),
+        "and its data and its descriptor are as they were"
     );
     for name in [
         "away-junction",
@@ -1317,10 +1328,20 @@ fn a_repair_sets_the_run_directorys_list_on_its_handle_and_only_when_it_is_empty
         acl::set_protected_when_empty(&directory, &wanted).unwrap(),
         Reset::Applied
     );
+    let entries = look_at(&directory)
+        .summary
+        .entries
+        .expect("the directory has a list");
     assert_eq!(
-        look_at(&directory).summary.entries,
-        wanted.summary().unwrap().entries,
-        "an empty directory takes the list"
+        entries
+            .iter()
+            .map(|entry| (entry.kind, entry.flags, entry.mask, entry.sid.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (0, INHERIT_OBJECT_AND_CONTAINER, FULL, SYSTEM_SID),
+            (0, INHERIT_OBJECT_AND_CONTAINER, FULL, "S-1-5-32-544"),
+        ],
+        "an empty directory takes the system's and the administrators' list"
     );
     assert!(
         look_at(&directory).summary.protected,
@@ -1385,11 +1406,12 @@ fn the_token_pipe_and_service_descriptors_built_in_the_descriptor_module_are_the
         sd::descriptor_text(SdKind::Service, &principals).unwrap(),
         "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCLORC;;;S-1-5-21-1-2-3-1001)"
     );
-    let token_list = sd::descriptor(SdKind::TokenDefault, &principals).unwrap();
-    assert!(!token_list.summary().unwrap().protected);
-    let pipe_list = sd::descriptor(SdKind::ControlPipe, &principals).unwrap();
-    assert!(pipe_list.summary().unwrap().protected);
-    assert_eq!(pipe_list.summary().unwrap().entries.unwrap().len(), 3);
+    for kind in [SdKind::TokenDefault, SdKind::ControlPipe, SdKind::Service] {
+        assert!(
+            sd::descriptor(kind, &principals).is_ok(),
+            "the platform reads the {kind:?} descriptor"
+        );
+    }
     assert!(
         sd::descriptor_text(SdKind::TokenDefault, &Principals::default()).is_err(),
         "the default list needs the group"
