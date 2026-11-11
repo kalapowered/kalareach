@@ -27,7 +27,7 @@ use crate::frame::Class;
 use crate::manifest::{GitSet, Manifest, ObjectKind};
 use crate::policy::{RULE_CHECKOUT, RULE_CONNECT};
 use crate::quote::quote_command_line;
-use crate::window::{Bound, bound, search_is_over};
+use crate::window::{Bound, bound, may_ask_the_log, search_is_over};
 
 use super::applocker;
 use super::ffi::{self, Sid};
@@ -585,7 +585,11 @@ pub fn prove(
             Ok(Seen::Ran(text)) => last = text,
             Err(failed) => return failed,
         }
-        if refused {
+        if refused && !may_ask_the_log(Instant::now(), search_until) {
+            // The refusal came back after the search's own end: the search is over, and the failure
+            // that follows says what it saw and what the log last said.
+            over = true;
+        } else if refused {
             match applocker::blocked_after(record, &scratch.0, &environment, search_until) {
                 Ok(events) => {
                     if events.iter().any(|event| {

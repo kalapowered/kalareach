@@ -29,6 +29,15 @@ pub fn bound(window_end: Instant, own: Instant) -> Bound {
     }
 }
 
+/// Whether the application-control log may be asked after a launch was refused: only while the
+/// search's own end has not passed. A refusal that comes back after that end is the end of the
+/// search; asking the log then would fail on the end itself, and the proof would fail with that
+/// error and not with the search's own account of its launches and the log's last words.
+#[must_use]
+pub fn may_ask_the_log(now: Instant, search_until: Instant) -> bool {
+    now < search_until
+}
+
 /// Whether the search is over after a run that was given `bound`: only a run that was cut at its
 /// deadline (`cut`), when that deadline was the window's end.
 #[must_use]
