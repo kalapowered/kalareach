@@ -485,17 +485,41 @@ impl Listening {
     }
 }
 
-/// Writes the header's length and the first `bytes` of its encoding, or all of it.
-async fn write_header(send: &mut SendStream, header: &StreamHeader, bytes: Option<usize>) {
+/// Writes the header's length and the first `bytes` of its encoding, or all of it, and says how the
+/// writes ended.
+async fn try_write_header(
+    send: &mut SendStream,
+    header: &StreamHeader,
+    bytes: Option<usize>,
+) -> Result<(), WriteError> {
     let encoded = header.encode().expect("an encoded header");
     let length = u32::try_from(encoded.len()).expect("a header fits a length");
-    send.write_all(&length.to_be_bytes())
-        .await
-        .expect("a header length");
+    send.write_all(&length.to_be_bytes()).await?;
     let sent = bytes.map_or(encoded.len(), |bytes| bytes.min(encoded.len()));
-    send.write_all(&encoded[..sent])
+    send.write_all(&encoded[..sent]).await
+}
+
+/// Writes a header to a host that takes the stream, so every write of it is taken.
+async fn write_header(send: &mut SendStream, header: &StreamHeader, bytes: Option<usize>) {
+    try_write_header(send, header, bytes)
         .await
-        .expect("the header's bytes");
+        .expect("the host took the header's writes");
+}
+
+/// Writes a whole header to a host that resets the stream without reading it, as a host whose
+/// receiver is gone does when the stream is accepted.
+///
+/// The host's reset stops the half the device writes with the revoked code as well as ending the
+/// half it reads, and the length that announces the stream is enough to start it. The stop can
+/// reach the device before the header's bytes are written, so a write that finds the stream
+/// stopped with that code is the host's reset arriving early, and the case goes on to read it. A
+/// write that ends any other way fails the case.
+async fn write_header_to_a_host_that_resets(send: &mut SendStream, header: &StreamHeader) {
+    match try_write_header(send, header, None).await {
+        Ok(()) => {}
+        Err(WriteError::Stopped(code)) if code.into_inner() == u64::from(STREAM_REVOKED) => {}
+        Err(other) => panic!("the header's writes ended other than in the host's reset: {other:?}"),
+    }
 }
 
 fn attachment_header(connection_id: ConnectionId, transfer: u8) -> StreamHeader {
@@ -713,9 +737,11 @@ async fn a_stream_for_a_host_that_dropped_its_receiver_is_reset() {
     )
     .await;
 
-    let (_send, mut recv) = harness
-        .raw(&attachment_header(harness.authorised.connection_id, 1))
-        .await;
+    let header = attachment_header(harness.authorised.connection_id, 1);
+    let (mut send, mut recv) = awaited("a stream's credit", harness.connection.open_bi())
+        .await
+        .expect("a stream");
+    write_header_to_a_host_that_resets(&mut send, &header).await;
     assert_eq!(reset_code(&mut recv).await, u64::from(STREAM_REVOKED));
     awaited(
         "the stream leaving the registry",
