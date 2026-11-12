@@ -10,7 +10,9 @@
 //!   package-relative name the rules admit, no two of them collide on a case-insensitive
 //!   filesystem, the manifest does not declare itself, and the declared sizes and file count are
 //!   inside one package's limits. A repository that declares a gigabyte never gets a fetch
-//!   started.
+//!   started. The package's `sdk_range` is tested too, by [`check_sdk_range`] when a package is
+//!   about to be fetched: a package that needs another SDK than this host implements is refused
+//!   for that, and none of it is fetched.
 //! * **Before anything is activated**, against the bytes that arrived, with
 //!   [`kr_plugin_sdk::validate::validate_package_directory`]. That is the publishing pipeline's
 //!   own validator: a package this host accepts is a package that repository's build accepted,
@@ -28,7 +30,7 @@ use kr_plugin_sdk::catalogue::IndexEntry;
 use kr_plugin_sdk::package::MANIFEST_FILE;
 use kr_plugin_sdk::paths::{CollisionKind, PackagePath, find_collisions};
 use kr_plugin_sdk::plugin::PluginManifest;
-use kr_plugin_sdk::validate::{Validated, validate_package_directory};
+use kr_plugin_sdk::validate::{Validated, sdk_range_refusal, validate_package_directory};
 
 use crate::budget::{BudgetLedger, Stage};
 use crate::error::{CatalogueError, CatalogueResult};
@@ -94,6 +96,29 @@ pub fn check_declared(entry: &IndexEntry, ledger: &BudgetLedger) -> CatalogueRes
             detail: format!("{subject}: {source}"),
         })?;
     Ok(())
+}
+
+/// Refuses a package whose declared `sdk_range` excludes the SDK version this host implements, before
+/// a byte of it is fetched.
+///
+/// This is not part of [`check_declared`], which runs on every entry of an index when a generation
+/// is taken: an index lists releases for other hosts too, and one that needs a newer SDK is a
+/// release this host skips, not a reason to refuse the repository.
+///
+/// # Errors
+///
+/// Returns [`CatalogueError::UnsafePackage`] with the finding the package check gives for the
+/// range, and nothing else.
+pub fn check_sdk_range(entry: &IndexEntry) -> CatalogueResult<()> {
+    match sdk_range_refusal(&entry.sdk_range) {
+        None => Ok(()),
+        Some(finding) => Err(CatalogueError::UnsafePackage {
+            detail: format!(
+                "{}/{} {} is not a package this host will install: {finding}",
+                entry.publisher_id, entry.plugin_name, entry.version
+            ),
+        }),
+    }
 }
 
 /// Checks the declared paths against the case-insensitive filesystems a host may sit on.

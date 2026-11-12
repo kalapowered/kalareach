@@ -3291,6 +3291,76 @@ async fn a_mirror_counts_a_corrupt_copy_it_holds_toward_the_transfer_limit() {
     assert!(store.holds_payload(digest, size).expect("readable"));
 }
 
+/// A package whose `sdk_range` excludes the SDK this host implements is refused when somebody
+/// installs it, with the range as the refusal and before any of it is fetched: the repository's
+/// generation, which lists it among releases for other hosts, is still taken.
+#[tokio::test]
+async fn a_package_that_needs_a_newer_sdk_is_refused_before_it_is_fetched() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let package = home.path().join("newer-package");
+    std::fs::create_dir_all(&package).expect("a directory");
+    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/plugins/valid/example-declarative");
+    for name in ["plugin.json", "presentation.json"] {
+        std::fs::copy(example.join(name), package.join(name)).expect("copies");
+    }
+    let manifest = package.join("plugin.json");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).expect("reads")).expect("JSON");
+    document["sdk_range"] = serde_json::json!(">=0.1.99, <0.2.0");
+    std::fs::write(
+        &manifest,
+        serde_json::to_vec_pretty(&document).expect("writes"),
+    )
+    .expect("writes");
+
+    let generation = Generation::build(
+        home.path(),
+        GenerationSpec {
+            package: Some(package),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    let metered = Metered::default();
+    catalogue.set_transport(Arc::new(metered.clone()));
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("a generation that lists a package for a newer SDK is taken");
+    let fetched = metered.fetches("/packages/");
+
+    let refusal = catalogue
+        .activate_package(
+            &repository(),
+            &plugin(),
+            &version(),
+            FetchReason::ExplicitInstall,
+        )
+        .await
+        .expect_err("the package needs a newer SDK");
+    let CatalogueError::UnsafePackage { detail } = &refusal else {
+        panic!("{refusal:?}");
+    };
+    assert!(
+        detail.contains("sdk_range >=0.1.99, <0.2.0")
+            && detail.contains(kr_plugin_sdk::version::SDK_VERSION),
+        "{detail}"
+    );
+    assert_eq!(
+        metered.fetches("/packages/"),
+        fetched,
+        "nothing of the package is fetched"
+    );
+}
+
 /// Reads the local repository, and records every address fetched with the bytes its answer
 /// delivered.
 #[derive(Clone, Debug, Default)]

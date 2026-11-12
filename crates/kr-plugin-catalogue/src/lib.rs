@@ -1958,6 +1958,9 @@ impl Catalogue {
             PackageCheck::PastALimit(limit) => return Err(limit.into()),
             PackageCheck::Missing { .. } | PackageCheck::Corrupt { .. } => {}
         }
+        // A package that needs another SDK than this host implements is refused before anything is
+        // made room for or fetched.
+        extract::check_sdk_range(&entry)?;
 
         // The package is staged whole, beside everything the cache and the packages already here
         // hold, and what it still has to fetch is cached on the way. Room for both is made before
