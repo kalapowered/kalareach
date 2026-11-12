@@ -1652,6 +1652,10 @@ fn open_the_brokers_pipe() -> Result<(), u32> {
 fn a_boundary_account_cannot_open_the_brokers_pipe_that_the_system_opens() {
     use kr_boundary_windows::win::pipe::{Listener, Stop};
     let fixture = Fixture::new();
+    assert!(
+        std::fs::metadata(kr_boundary_windows::win::pipe::NAME).is_err(),
+        "the machine is not clean: the broker's pipe is in use"
+    );
     let stop = Stop::new().unwrap();
     let mut listener = Listener::bind(&[], std::sync::Arc::clone(&stop)).unwrap();
     // A broker that takes each client and lets it go, so that the next one finds an instance.
