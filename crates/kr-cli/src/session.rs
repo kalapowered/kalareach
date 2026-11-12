@@ -62,8 +62,8 @@ pub enum AttachOutcome {
     /// The session refused what was typed here, from one write on, because the application in it
     /// asked for a keyboard encoding that console keys cannot be sent in.
     InputRefused(Shown),
-    /// The screens the session sent could not be read, as many times in a row as the retry policy
-    /// asks for them.
+    /// What the session sent could not be used, and the terminal has asked for a new subscription
+    /// as often as it may in the span it is allowed.
     OutputUnreadable,
 }
 
