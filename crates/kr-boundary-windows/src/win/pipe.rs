@@ -52,11 +52,47 @@ use crate::pipe_access;
 use super::ffi::{Handle, Result, Sid, error, last, wide};
 use super::sd::{Summary, summary_of_handle};
 
-/// The name the broker's pipe has.
-pub const NAME: &str = r"\\.\pipe\KalaReachBoundary";
+/// One of the broker's two pipes. Each has a name, a permission list, a most number of instances
+/// and its own listener and worker slots, so that nothing a connection of one does reaches the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// The pipe of the enrolled people. Its list names the system, the Administrators group and each
+    /// enrolled person, and it answers hello and status.
+    Persons,
+    /// The pipe of the installation and the removal, and of the requests that change the broker's
+    /// state or ask for a proof. Its list names the system and the Administrators group alone, so no
+    /// connection that a person can make takes one of its instances or its slots, and the wait of an
+    /// administrator for it is bounded by other elevated administrators alone.
+    Administrators,
+}
 
-/// The most pipe instances the service keeps open at once.
-pub const MAX_INSTANCES: u32 = 8;
+impl Kind {
+    /// The pipe's name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Kind::Persons => r"\\.\pipe\KalaReachBoundaryPersons",
+            Kind::Administrators => r"\\.\pipe\KalaReachBoundaryAdministrators",
+        }
+    }
+
+    /// The most instances the pipe may have at once: the broker's own, the one that waits for the next
+    /// client, and one for each connection that is served.
+    #[must_use]
+    pub const fn instances(self) -> u32 {
+        match self {
+            Kind::Persons => 8,
+            Kind::Administrators => 4,
+        }
+    }
+
+    /// The most connections served at once: two fewer than the instances, so that neither the broker's
+    /// own instance nor the one that waits for the next client is the one that is missing.
+    #[must_use]
+    pub const fn slots(self) -> usize {
+        self.instances() as usize - 2
+    }
+}
 
 /// An event that, once set, ends every wait of every connection that holds it.
 pub struct Stop(Handle);
@@ -545,6 +581,7 @@ struct Keeper {
 
 /// The pipe the service listens on.
 pub struct Listener {
+    kind: Kind,
     descriptor: Descriptor,
     stop: Arc<Stop>,
     /// The instance that waits for the next client. It is made before a connection is handed on; it
@@ -573,7 +610,9 @@ enum Refill {
 const RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
 
 impl Listener {
-    /// Makes the first instance of the pipe, refusing when the name is taken, and keeps it.
+    /// Makes the first instance of the pipe of this kind, refusing when the name is taken, and keeps
+    /// it. The people are the enrolled ones that the persons' pipe lists; the administrators' pipe
+    /// lists none.
     ///
     /// The first instance is made with the first-instance flag and a list of the system alone, and the
     /// right to change the list. The broker opens its own client end on it at once, and only then is
@@ -584,14 +623,16 @@ impl Listener {
     /// # Errors
     ///
     /// Returns the platform's error when the name is already in use or the pipe cannot be made.
-    pub fn bind(people: &[Sid], stop: Arc<Stop>) -> Result<Listener> {
+    pub fn bind(kind: Kind, people: &[Sid], stop: Arc<Stop>) -> Result<Listener> {
         let mut list = format!("D:P(A;;GA;;;SY){}", pipe_access::entry("BA"));
-        for person in people {
-            list.push_str(&pipe_access::entry(&person.to_text()));
+        if kind == Kind::Persons {
+            for person in people {
+                list.push_str(&pipe_access::entry(&person.to_text()));
+            }
         }
         let descriptor = Descriptor::from_text(&list)?;
-        let server = instance(&Descriptor::from_text(KEEPER_LIST)?, true)?;
-        let client = open_client()?;
+        let server = instance(kind, &Descriptor::from_text(KEEPER_LIST)?, true)?;
+        let client = open_client(kind)?;
         // SAFETY: the handle was made with the right to change the list, and the descriptor is
         // valid for the call.
         if unsafe {
@@ -606,6 +647,7 @@ impl Listener {
         }
         let bound = summary_of_handle(&server.0)?;
         let mut listener = Listener {
+            kind,
             descriptor,
             stop,
             next: None,
@@ -615,7 +657,7 @@ impl Listener {
             },
             bound,
         };
-        listener.next = Some(match listener.refill()? {
+        listener.next = Some(match listener.make_waiting()? {
             Refill::Waiting(waiting) => waiting,
             Refill::Busy => {
                 return Err(error(
@@ -632,6 +674,12 @@ impl Listener {
             ));
         }
         Ok(listener)
+    }
+
+    /// Which of the broker's pipes this listener serves.
+    #[must_use]
+    pub fn kind(&self) -> Kind {
+        self.kind
     }
 
     /// Whether the service has been told to stop.
@@ -653,7 +701,12 @@ impl Listener {
         if testing::take_refill_failure() {
             return Ok(Refill::Failed(error(8, "making the pipe")));
         }
-        match instance(&self.descriptor, false) {
+        self.make_waiting()
+    }
+
+    /// The attempt that [`Listener::refill`] makes, without the seam of the test build.
+    fn make_waiting(&self) -> Result<Refill> {
+        match instance(self.kind, &self.descriptor, false) {
             Ok(pipe) => match summary_of_handle(&pipe.0) {
                 Ok(shown) if self.bound != shown => Err(error(
                     0,
@@ -754,8 +807,8 @@ impl Listener {
 /// Makes one instance of the pipe with the list the descriptor holds. The first instance carries
 /// the first-instance flag, which the platform refuses when the name is taken, and the right to change
 /// its list.
-fn instance(descriptor: &Descriptor, first: bool) -> Result<Server> {
-    let name = wide(NAME);
+fn instance(kind: Kind, descriptor: &Descriptor, first: bool) -> Result<Server> {
+    let name = wide(kind.name());
     let attributes = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: descriptor.0,
@@ -774,7 +827,7 @@ fn instance(descriptor: &Descriptor, first: bool) -> Result<Server> {
             name.as_ptr(),
             open_mode,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-            MAX_INSTANCES,
+            kind.instances(),
             64 * 1024,
             64 * 1024,
             0,
@@ -787,8 +840,8 @@ fn instance(descriptor: &Descriptor, first: bool) -> Result<Server> {
 /// Opens a client end of the pipe, asking identification only, so that the server learns who is
 /// calling and cannot act as the caller, and for the rights of a client and no more, which are what
 /// the pipe's list grants it.
-fn open_client() -> Result<Handle> {
-    let name = wide(NAME);
+fn open_client(kind: Kind) -> Result<Handle> {
+    let name = wide(kind.name());
     // SAFETY: the name is NUL-terminated.
     let opened = unsafe {
         CreateFileW(
@@ -807,18 +860,19 @@ fn open_client() -> Result<Handle> {
 /// How long the installer's own connection waits for an instance of the pipe to be free.
 const BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Connects to the broker's pipe as a client and checks that the process serving it is the one
-/// the service manager reports for the service, so a program that took the name first is refused.
+/// Connects to one of the broker's pipes as a client and checks that the process serving it is the one
+/// the service manager reports for the service, so a program that took the name first is refused. The
+/// check is the same on both pipes.
 ///
 /// # Errors
 ///
 /// Returns the platform's error when the pipe cannot be opened, or an error when the server is
 /// not the expected process.
-pub fn connect(expected_server: u32) -> Result<Connection> {
-    let name = wide(NAME);
+pub fn connect(kind: Kind, expected_server: u32) -> Result<Connection> {
+    let name = wide(kind.name());
     let began = Instant::now();
     let pipe = loop {
-        match open_client() {
+        match open_client(kind) {
             Ok(pipe) => break pipe,
             Err(failure) if failure.code == ERROR_PIPE_BUSY => {
                 let left = BUSY_WAIT.saturating_sub(began.elapsed());

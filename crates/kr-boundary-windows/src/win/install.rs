@@ -2987,7 +2987,7 @@ pub fn open_session() -> Result<pipe::Connection, Error> {
             "the broker's service is not running".to_owned(),
         ));
     }
-    let mut connection = pipe::connect(status.pid)?;
+    let mut connection = pipe::connect(pipe::Kind::Administrators, status.pid)?;
     connection.set_deadline(Some(Instant::now() + HELLO_BOUND));
     let said = ask(
         &mut connection,

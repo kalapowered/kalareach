@@ -1,10 +1,13 @@
-//! The broker service: the pipe the host speaks to, the maintenance state, and the proofs.
+//! The broker service: the pipes the host and the installer speak to, the maintenance state, and the
+//! proofs.
 //!
 //! Windows runs the broker as SYSTEM with the privileges the installation named and no others.
-//! It makes its pipe first, so a program that took the name earlier stops it from starting, and
-//! it answers each connection on a thread of its own, up to a fixed number at once. The caller's
-//! identity comes from the pipe: a request that changes the state or asks for a proof needs a
-//! caller that is an elevated administrator, and no message carries a process, a token or a
+//! It makes its two pipes first, so a program that took a name earlier stops it from starting, and
+//! it answers each connection on a thread of its own, up to a fixed number at once on each pipe.
+//! The persons' pipe answers hello and status to the enrolled people. A request that changes the
+//! state or asks for a proof is served on the administrators' pipe only, whose permission list names
+//! the system and the Administrators group alone, and needs a caller that is an elevated
+//! administrator: the identity comes from the pipe, and no message carries a process, a token or a
 //! program.
 
 #![allow(unsafe_code)]
@@ -33,23 +36,20 @@ use crate::manifest::Manifest;
 
 use super::ffi::{Sid, wide};
 use super::install::{Paths, SERVICE};
-use super::pipe::{Connection, Listener, Stop};
+use super::pipe::{Connection, Kind, Listener, Stop};
 use super::proof;
 use super::token::enable_privilege;
 
-/// The most connections served at once: two fewer than the pipe may have instances, so that neither
-/// the instance that waits for the next client nor the broker's own is the one that is missing.
-const MAX_CONNECTIONS: usize = super::pipe::MAX_INSTANCES as usize - 2;
 /// How long a connection may take to send its first frame. The installer's own first message
 /// follows its open at once; a client that has had the pipe for this long and sent nothing is not
 /// waiting for an answer, and its slot goes to the next client.
 const FIRST_FRAME: std::time::Duration = std::time::Duration::from_secs(5);
-/// How long a connection of a person who is not an administrator may stay without a request. A
+/// How long a connection on the persons' pipe may stay without a request, whoever the caller is. A
 /// person's client asks for the status right after hello, so a connection that has been quiet for as
 /// long as the first frame is allowed is not waiting for an answer, and its slot goes to the next
-/// client: seven such connections would otherwise hold every slot.
+/// client: six such connections would otherwise hold every slot of that pipe.
 const PERSON_IDLE: std::time::Duration = FIRST_FRAME;
-/// How long an administrator's connection may stay without a request. The installer's removal asks
+/// How long a connection on the administrators' pipe may stay without a request. The installer's removal asks
 /// the broker for its maintenance state, then writes the policy and waits for the platform's events
 /// (each wait is bounded by 300 seconds at most) with the connection open, and asks for the release
 /// after them, so this is longer than those waits together; an administrator holds the right to
@@ -272,22 +272,55 @@ fn serve() -> Result<(), String> {
         .iter()
         .filter_map(|text| Sid::parse(text).ok())
         .collect();
-    let mut listener =
-        Listener::bind(&people, Arc::clone(&stop)).map_err(|error| error.to_string())?;
+    let mut persons = Listener::bind(Kind::Persons, &people, Arc::clone(&stop))
+        .map_err(|error| error.to_string())?;
+    let mut administrators = Listener::bind(Kind::Administrators, &[], Arc::clone(&stop))
+        .map_err(|error| error.to_string())?;
     // The cycle begins before the service reports that it runs, so a client that sees it running
     // begins its own count no earlier than the broker's.
     let state = Arc::new(State::begun(manifest, paths, Arc::clone(&stop)));
     report(SERVICE_RUNNING, 0, 0);
-    run(&mut listener, &state)
+    run_both(&mut persons, &mut administrators, &state)
 }
 
-/// Takes connections and answers each on a thread of its own, until the service is told to stop.
+/// Runs the loops of the two pipes, each on a thread of its own, under the one stop: a loop that ends
+/// for any reason sets the stop, so the other ends with it, and the service reports that it stopped
+/// only after both have.
+fn run_both(
+    persons: &mut Listener,
+    administrators: &mut Listener,
+    state: &Arc<State>,
+) -> Result<(), String> {
+    std::thread::scope(|scope| {
+        let persons = scope.spawn(|| run(persons, state));
+        let administrators = run(administrators, state);
+        let persons = persons
+            .join()
+            .unwrap_or_else(|_| Err("the persons' pipe's loop failed".to_owned()));
+        administrators.and(persons)
+    })
+}
+
+/// Sets the stop when it is dropped, a panic of a loop included, so that the other pipe's loop and
+/// the service end with it.
+struct StopWhenDropped<'a>(&'a Stop);
+
+impl Drop for StopWhenDropped<'_> {
+    fn drop(&mut self) {
+        self.0.set();
+    }
+}
+
+/// Takes the connections of one pipe and answers each on a thread of its own, up to the pipe's slots,
+/// until the service is told to stop.
 ///
 /// A thread that could not give its privileges back ends the whole process at once, so nothing here
 /// sees the latch set in a running broker. The checks are for the connections that outlive a
 /// stand-in for that end in a case: none is accepted, and none that is open is served again.
 fn run(listener: &mut Listener, state: &Arc<State>) -> Result<(), String> {
-    let slots = Slots::new(MAX_CONNECTIONS);
+    let kind = listener.kind();
+    let _ends_the_service = StopWhenDropped(&state.stop);
+    let slots = Slots::new(kind.slots());
     let mut threads = Vec::new();
     let mut ended = Ok(());
     loop {
@@ -321,7 +354,7 @@ fn run(listener: &mut Listener, state: &Arc<State>) -> Result<(), String> {
         threads.push(std::thread::spawn(move || {
             // The slot goes back when this thread ends, a panic included.
             let _slot = slot;
-            answer(connection, &shared);
+            answer(connection, &shared, kind);
         }));
         threads.retain(|thread| !thread.is_finished());
     }
@@ -346,11 +379,11 @@ pub mod testing {
 
     use super::super::ffi::Sid;
     use super::super::install::Paths;
-    use super::super::pipe::{Listener, Stop};
-    use super::{State, run};
+    use super::super::pipe::{Kind, Listener, Stop};
+    use super::{State, run_both};
 
-    /// Binds the service's pipe for these people and serves it until `stop` is set or a thread
-    /// could not give its privileges back, as the service does.
+    /// Binds the service's two pipes, the persons' for these people, and serves them until `stop` is
+    /// set or a thread could not give its privileges back, as the service does.
     ///
     /// # Errors
     ///
@@ -361,10 +394,12 @@ pub mod testing {
         people: &[Sid],
         stop: Arc<Stop>,
     ) -> Result<(), String> {
-        let mut listener =
-            Listener::bind(people, Arc::clone(&stop)).map_err(|error| error.to_string())?;
+        let mut persons = Listener::bind(Kind::Persons, people, Arc::clone(&stop))
+            .map_err(|error| error.to_string())?;
+        let mut administrators = Listener::bind(Kind::Administrators, &[], Arc::clone(&stop))
+            .map_err(|error| error.to_string())?;
         let state = Arc::new(State::begun(manifest, paths, stop));
-        run(&mut listener, &state)
+        run_both(&mut persons, &mut administrators, &state)
     }
 }
 
@@ -383,7 +418,7 @@ fn send(connection: &mut Connection, response: &Response) -> Result<(), FrameErr
 
 /// Serves one connection until it ends. Every read and every write has a deadline, so a client
 /// that sends nothing or reads nothing gives its slot back.
-fn answer(mut connection: Connection, state: &State) {
+fn answer(mut connection: Connection, state: &State, kind: Kind) {
     // The platform lets a server take on a client's identity only after it has read from the pipe,
     // so the first message is read before the caller is identified. Nothing is done with it until
     // the caller is known.
@@ -434,10 +469,9 @@ fn answer(mut connection: Connection, state: &State) {
             return;
         }
     }
-    let idle = if identity.administrator {
-        ADMINISTRATOR_IDLE
-    } else {
-        PERSON_IDLE
+    let idle = match kind {
+        Kind::Persons => PERSON_IDLE,
+        Kind::Administrators => ADMINISTRATOR_IDLE,
     };
     loop {
         // The stop is looked at before each request, besides in each read and write: a client that
@@ -463,6 +497,13 @@ fn answer(mut connection: Connection, state: &State) {
             Request::Status {} => Response::Status {
                 maintenance: state.maintenance.load(Ordering::SeqCst),
             },
+            // The state is changed and a proof is asked for on the administrators' pipe only, whoever
+            // the caller is.
+            Request::Maintenance { .. } | Request::Prove { .. } | Request::Release { .. }
+                if kind == Kind::Persons =>
+            {
+                refuse(Refusal::Caller, frame::ADMINISTRATORS_ONLY)
+            }
             Request::Maintenance { on } => {
                 if identity.administrator {
                     state.maintenance.store(on, Ordering::SeqCst);

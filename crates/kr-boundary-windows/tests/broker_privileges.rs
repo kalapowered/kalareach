@@ -351,7 +351,7 @@ impl Served {
     fn connect(&self) -> Connection {
         let mut tries = 0;
         let mut connection = loop {
-            match pipe::connect(std::process::id()) {
+            match pipe::connect(pipe::Kind::Persons, std::process::id()) {
                 Ok(connection) => break connection,
                 Err(error) => {
                     tries += 1;
@@ -403,7 +403,8 @@ fn nothing_is_served_after(failure: fn()) {
         "the open connection is not served again"
     );
     // A connection that arrives later wakes the loop, which takes none and ends.
-    let mut late = pipe::connect(std::process::id()).expect("the pipe is still there");
+    let mut late =
+        pipe::connect(pipe::Kind::Persons, std::process::id()).expect("the pipe is still there");
     let _ = frame::write(
         &mut late,
         &Request::Hello {
