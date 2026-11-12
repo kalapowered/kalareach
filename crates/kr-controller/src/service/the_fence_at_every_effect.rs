@@ -2877,3 +2877,245 @@ async fn a_fence_that_lands_after_an_ssh_hosts_helper_answered_stops_what_the_an
         "what the answer would have written was not written"
     );
 }
+
+/// KR-REQ-09.09: a refresh of an environment that no process bridge reaches answers with the row
+/// of the enrolment record and nothing the request did, so the service gives it as a copy of that
+/// record; the enrolment of that environment is the request's own effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refresh_of_an_environment_no_bridge_reaches_is_given_as_a_copy_of_its_record() {
+    use kr_protocol::identity::{
+        EnvironmentAccess, EnvironmentEnrolParams, EnvironmentRefreshParams,
+        EnvironmentRefreshResult,
+    };
+    let rig = Refreshing::start().await;
+    let actor = super::routes::local_actor(
+        rig.actor_id.clone(),
+        rig.connection_id,
+        rig.controller.generation,
+    );
+    let mut enrolment = enrolment_of(9);
+    enrolment.access = EnvironmentAccess::PairedHost;
+    let environment_id = enrolment.environment_id;
+
+    let enrol = mutation_of(
+        &rig.temp,
+        Method::EnvironmentEnrol,
+        ParamsValue::from_typed(&EnvironmentEnrolParams { enrolment }).expect("encodes"),
+    );
+    let enrolled = rig
+        .controller
+        .environment_record(&actor, false, &enrol, Method::EnvironmentEnrol, rig.carried)
+        .await;
+    assert!(
+        !enrolled.is_copied() && !enrolled.is_withheld(),
+        "an enrolment is what this request did"
+    );
+    enrolled.into_answer().expect("enrolled");
+
+    let refresh = mutation_of(
+        &rig.temp,
+        Method::EnvironmentRefresh,
+        ParamsValue::from_typed(&EnvironmentRefreshParams {
+            environment_id,
+            start: false,
+        })
+        .expect("encodes"),
+    );
+    let refreshed = rig
+        .controller
+        .environment_record(
+            &actor,
+            false,
+            &refresh,
+            Method::EnvironmentRefresh,
+            rig.carried,
+        )
+        .await;
+    assert!(
+        refreshed.is_copied(),
+        "the row of an environment no bridge reaches is the record's"
+    );
+    let result: EnvironmentRefreshResult = refreshed
+        .into_answer()
+        .expect("a refresh is answered")
+        .to_typed()
+        .expect("a result");
+    assert!(!result.started);
+    assert!(
+        result.connection.contains("process bridge"),
+        "{}",
+        result.connection
+    );
+}
+
+/// KR-REQ-09.09: an installation answers a repeat from the action record it kept, so the service
+/// gives the repeat as a copy; a record it cannot read says that a record exists, so that is a
+/// copy too. The first attempt is the request's own effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_installation_answered_from_its_record_is_given_as_a_copy() {
+    use kr_protocol::skill::{AgentTarget, AgentToolsParams, InstallScope};
+
+    /// The files under `directory` that hold a finished action's record.
+    fn action_records(directory: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(directory).expect("a directory reads") {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                action_records(&path, found);
+            } else if let Ok(text) = std::fs::read_to_string(&path)
+                && let Ok(record) = serde_json::from_str::<serde_json::Value>(&text)
+                && record.get("state").and_then(serde_json::Value::as_str) == Some("applied")
+                && record.get("digest").is_some()
+            {
+                found.push(path);
+            }
+        }
+    }
+
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let carried = crate::authority::AdmittedMutation {
+        connection_id,
+        admitted_revision: controller
+            .admitted_revision(connection_id)
+            .expect("the connection is registered"),
+        deadline: controller.clock.now().checked_add(Duration::from_secs(60)),
+    };
+    let project = tempfile::TempDir::new().expect("a project directory of this test's own");
+    let mutation = mutation_of(
+        &temp,
+        Method::AgentToolsInstall,
+        ParamsValue::from_typed(&AgentToolsParams {
+            agent: AgentTarget::Codex,
+            scope: InstallScope::Project,
+            project_dir: Nullable::some(project.path().display().to_string()),
+        })
+        .expect("encodes"),
+    );
+    let install =
+        || controller.agent_tools_change(&actor_id, &mutation, Method::AgentToolsInstall, carried);
+
+    let first = install().await;
+    assert!(
+        !first.is_copied() && !first.is_withheld(),
+        "the first attempt is what this request did"
+    );
+    first.into_answer().expect("the first attempt installs");
+
+    let repeat = install().await;
+    assert!(repeat.is_copied(), "a repeat is the record's answer");
+    repeat.into_answer().expect("a repeat is answered");
+
+    let mut records = Vec::new();
+    action_records(controller.paths.state_dir(), &mut records);
+    assert_eq!(records.len(), 1, "one action record: {records:?}");
+    std::fs::write(&records[0], "not a record").expect("the record is spoiled");
+    let unread = install().await;
+    assert!(
+        unread.is_copied(),
+        "a record this host cannot read says a record exists"
+    );
+    unread
+        .into_answer()
+        .expect_err("an unreadable record is not an answer");
+}
+
+/// KR-REQ-09.09: what `organisation.policy.apply` answers is made from the policies the host holds,
+/// which were applied earlier, so the service gives every answer of it as a copy, a refusal
+/// included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_organisation_policy_apply_answers_is_given_as_a_copy_of_the_policies_held() {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, _actor_id) = admitted(&controller).await;
+    let carried = crate::authority::AdmittedMutation {
+        connection_id,
+        admitted_revision: controller
+            .admitted_revision(connection_id)
+            .expect("the connection is registered"),
+        deadline: controller.clock.now().checked_add(Duration::from_secs(60)),
+    };
+    let given = controller
+        .organisation_policy_apply(
+            &mutation_of(&temp, Method::OrganisationPolicyApply, ParamsValue::empty()),
+            carried,
+        )
+        .await;
+    assert!(given.is_copied(), "the answer derives from policies held");
+    given
+        .into_answer()
+        .expect_err("a request that names no policy is refused");
+}
+
+/// KR-REQ-09.09: a request whose envelope and stored object name different sessions is refused from
+/// what the transfer journal stores, so that refusal is what a record says and is given back as a
+/// copy of it, not as the request's own refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_refusal_from_a_stored_subject_is_given_back_as_a_copy_of_the_record() {
+    use kr_protocol::transfer::{DraftCreateParams, DraftCreateResult, DraftUpdateParams};
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let captured = controller
+        .admitted_revision(connection_id)
+        .expect("the connection is registered");
+    let create = mutation_of(
+        &temp,
+        Method::DraftCreate,
+        ParamsValue::from_typed(&DraftCreateParams {
+            environment_id: temp.environment_id(),
+            device_id: Nullable::null(),
+            session_id: Nullable::null(),
+            application_instance_id: Nullable::null(),
+            text: "a draft that belongs to no session".to_owned(),
+        })
+        .expect("encodes"),
+    );
+    let ControlFrame::Response(response) = controller
+        .write_method(
+            &actor_id,
+            &create,
+            Method::DraftCreate,
+            connection_id,
+            None,
+            Some(accepted(&controller)),
+            Some(captured),
+        )
+        .await
+    else {
+        panic!("a create is answered with a response");
+    };
+    let Outcome::Ok(created) = response.outcome else {
+        panic!("the draft is created: {response:?}");
+    };
+    let created: DraftCreateResult = created.to_typed().expect("decodes");
+
+    let update = MutationRequest {
+        target: ActionTarget {
+            environment_id: temp.environment_id(),
+            session_id: Nullable::some(kr_protocol::ids::SessionId::new(kr_ipc::new_uuid())),
+            session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+            application_instance_id: Nullable::null(),
+            agent_binding_revision: Nullable::null(),
+        },
+        ..mutation_of(
+            &temp,
+            Method::DraftUpdate,
+            ParamsValue::from_typed(&DraftUpdateParams {
+                draft_id: created.draft.draft_id,
+                expected_revision: created.draft.revision,
+                text: "changed".to_owned(),
+            })
+            .expect("encodes"),
+        )
+    };
+    let refusal = controller
+        .transfer()
+        .check_subject_of_record(&actor_id, &update, Method::DraftUpdate)
+        .await
+        .expect("the stored subject is read")
+        .expect("the request and the draft name different sessions")
+        .copied();
+    assert!(
+        refusal.is_copied(),
+        "the refusal is what the journal stores"
+    );
+    assert_eq!(refusal.into_answer().code, ErrorCode::InvalidArgument);
+}

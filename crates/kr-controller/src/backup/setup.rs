@@ -1151,4 +1151,152 @@ mod tests {
             "the registration is taken while the store is held"
         );
     }
+
+    /// An admission that stands, and answers a repeat with the refusal of a fence while one is owed.
+    struct Fenced {
+        owed: bool,
+    }
+
+    impl SetupAdmission for Fenced {
+        fn stands(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn retained(&self) -> Result<()> {
+            if self.owed {
+                Err(ControllerError::PermissionDenied {
+                    detail: "this host owes a fence it could not raise".to_owned(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+
+        fn admitted(&self, write: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+            write()
+        }
+    }
+
+    /// A setup whose record is on disk, the call that made it, and a call for another archive.
+    struct Finished {
+        setup: BackupSetup,
+        repeat: BackupEnableParams,
+        another_archive: BackupEnableParams,
+        _directories: (tempfile::TempDir, tempfile::TempDir),
+    }
+
+    async fn a_finished_setup() -> Finished {
+        let root = tempfile::tempdir().expect("a disposable directory");
+        let runtime = tempfile::tempdir().expect("a runtime directory");
+        let backup =
+            Arc::new(BackupService::in_memory(&root.path().join("backup")).expect("a service"));
+        let origin = GatewayOrigin::new("https://storage.example").expect("an origin");
+        let writer = AuthorisationKeyPair::generate().expect("a key");
+        let owner = AuthorisationKeyPair::generate().expect("a key");
+        let producer = StoredEnvelopeKeyPair::generate().expect("a key");
+        let prepare = |archive: u8| {
+            kr_client::recovery::prepare_setup(&kr_client::recovery::SetupInputs {
+                origin: origin.as_str(),
+                archive_id: ArchiveId::new(Uuid::from_bytes([archive; 16])),
+                writer: (writer.key_id(), *writer.public()),
+                producer: (producer.key_id(), *producer.public()),
+                enabled_at_ms: TimestampMs::new(1),
+                replace: false,
+            })
+            .expect("a setup is prepared")
+            .params
+        };
+        let repeat = prepare(1);
+        let another_archive = prepare(2);
+        let record = SetupRecord {
+            archive_id: repeat.archive_id,
+            origin: origin.as_str().to_owned(),
+            account_mark: [9; 32],
+            recovery_public_key: repeat.recovery_public_key,
+            kit_fingerprint: repeat.kit_fingerprint.clone(),
+            writer_key_id: writer.key_id(),
+            producer_key_id: producer.key_id(),
+            enabled_at_ms: repeat.enabled_at_ms,
+        };
+        backup
+            .commit_setup(&record, false, TimestampMs::new(1), &|write| write())
+            .expect("the setup is recorded");
+        let setup = BackupSetup::new(
+            origin,
+            None,
+            writer,
+            owner,
+            producer,
+            Arc::new(HostAccount::new(
+                Arc::new(kr_crypto::store::MemoryStore::default()),
+                EnvironmentId::new(Uuid::from_bytes([9; 16])),
+                runtime.path(),
+                Err(SignInUnavailable::NotUsable),
+                None,
+            )),
+            backup,
+            Arc::new(Quiet::new(HeldTimer::automatic())),
+        );
+        Finished {
+            setup,
+            repeat,
+            another_archive,
+            _directories: (root, runtime),
+        }
+    }
+
+    /// KR-REQ-09.09: a repeat of a setup that finished is a copy of what the setup recorded, so
+    /// the service gives it back as a copy and, while this host owes a fence, withholds it as a
+    /// copy with the refusal of the fence in its place. The control is the repeat with nothing
+    /// owed.
+    #[tokio::test]
+    async fn a_repeat_of_a_finished_setup_is_a_copy_that_a_fence_withholds() {
+        let finished = a_finished_setup().await;
+
+        let given = finished
+            .setup
+            .enable(finished.repeat.clone(), Arc::new(Fenced { owed: false }))
+            .await;
+        assert!(given.is_copied(), "a repeat with nothing owed is a copy");
+        assert!(matches!(
+            given.into_answer(),
+            Ok(BackupEnableResult::Enabled { .. })
+        ));
+
+        let given = finished
+            .setup
+            .enable(finished.repeat, Arc::new(Fenced { owed: true }))
+            .await;
+        assert!(
+            given.is_withheld(),
+            "a repeat while a fence is owed is withheld"
+        );
+        assert!(matches!(
+            given.into_answer(),
+            Err(ControllerError::PermissionDenied { .. })
+        ));
+    }
+
+    /// KR-REQ-09.09: that a setup already stands is what the record says, so it is a copy
+    /// whichever fence this host owes, and the answer is the one the host gave before.
+    #[tokio::test]
+    async fn that_a_setup_already_stands_is_a_copy_whichever_fence_is_owed() {
+        let finished = a_finished_setup().await;
+        for owed in [false, true] {
+            let given = finished
+                .setup
+                .enable(finished.another_archive.clone(), Arc::new(Fenced { owed }))
+                .await;
+            assert!(given.is_copied(), "fence owed: {owed}");
+            assert!(
+                matches!(
+                    given.into_answer(),
+                    Ok(BackupEnableResult::Declined {
+                        cause: BackupEnableCause::AlreadySetUp {}
+                    })
+                ),
+                "fence owed: {owed}"
+            );
+        }
+    }
 }

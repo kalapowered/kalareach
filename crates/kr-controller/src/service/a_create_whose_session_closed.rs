@@ -258,6 +258,87 @@ async fn a_create_whose_session_closed_after_its_worker_reported_is_answered_fro
     assert_closed(&answered(&world, &reservation).await, world.session_id);
 }
 
+/// KR-REQ-09.09: the closure record answers a repeated close and says that a session is closed,
+/// whatever closed it, so what the daemon reads from it is the record's and is given back as a
+/// copy of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_closure_record_is_given_back_as_a_copy_when_it_answers_a_close_or_names_a_closed_session()
+ {
+    use kr_protocol::session::SessionCloseResult;
+    let (world, _reservation) = reported().await;
+    let controller = &world.controller;
+    controller
+        .retire(&closure_of(world.session_id))
+        .await
+        .expect("the closure is recorded");
+
+    let answer = controller
+        .answer_from_the_closure(world.session_id)
+        .await
+        .copied();
+    assert!(answer.is_copied(), "the closure answers a repeated close");
+    let closed: SessionCloseResult = answer
+        .into_answer()
+        .expect("a closed session's close is answered")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(closed.state, SessionState::Closed);
+
+    let refusal = controller
+        .closed_or(
+            world.session_id,
+            ControllerError::UnknownSession {
+                session: world.session_id.to_string(),
+            },
+        )
+        .await
+        .copied();
+    assert!(
+        refusal.is_copied(),
+        "the closure says the session is closed"
+    );
+    assert!(matches!(
+        refusal.into_answer(),
+        ControllerError::SessionClosed { .. }
+    ));
+}
+
+/// KR-REQ-25.19: a workflow node's create asked again, as a node run again after a restart sends
+/// it, is answered from the reservation its token holds with the session its worker describes, and
+/// a node whose admission refuses it is still told its authority has gone, not given the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workflow_nodes_create_asked_again_is_answered_from_its_reservation() {
+    let (world, reservation) = reported().await;
+    let controller = &world.controller;
+    let environment_id = controller.paths().environment_id();
+    let order = |admit: fn() -> crate::error::Result<Option<u64>>| crate::service::WorkflowCreate {
+        actor_id: reservation.actor_id.clone(),
+        token: kr_protocol::ids::ActionId::new(reservation.create_token),
+        digest: reservation.payload_digest,
+        create: create_params(environment_id),
+        command: None,
+        admit: Arc::new(move |_| admit()),
+    };
+
+    let expected = answered(&world, &reservation).await;
+    let replayed = controller
+        .workflow_session_create(order(|| Ok(None)))
+        .await
+        .expect("a node's create asked again is answered from its reservation");
+    assert_eq!(replayed.session.session_id, expected.session.session_id);
+    assert_eq!(replayed.endpoint, expected.endpoint);
+
+    let refused = controller
+        .workflow_session_create(order(|| {
+            Err(ControllerError::PermissionDenied {
+                detail: "the node's grant has gone".to_owned(),
+            })
+        }))
+        .await
+        .expect_err("a node whose authority has gone is not handed the session");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+}
+
 /// KR-REQ-09.12: a create whose worker ended before the create could describe the session, with no
 /// closure recorded yet, is answered from the closure the daemon establishes for a worker the
 /// kernel says has ended: the session closed, with no endpoint to attach to. A command that ends at

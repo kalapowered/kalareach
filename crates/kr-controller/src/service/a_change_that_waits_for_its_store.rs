@@ -1368,3 +1368,50 @@ async fn a_create_that_cannot_say_what_it_started_leaves_a_launch_forgotten_unle
         }
     }
 }
+
+/// KR-REQ-09.09: the report of a privacy change says what earlier exports left as well as what the
+/// change did, so the service gives it as a copy of what those records hold, not as its own effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_report_of_a_privacy_change_is_given_as_a_copy_of_what_earlier_exports_left() {
+    let (temp, controller, _clock) = daemon().await;
+    let (_actor, carried) = admitted(&controller).await;
+    let given = controller
+        .privacy_set(
+            &request(
+                Method::PrivacySet,
+                temp.environment_id(),
+                &PrivacySetParams { enabled: true },
+            ),
+            carried,
+        )
+        .await;
+    assert!(given.is_copied(), "the report is a copy of earlier records");
+    let report = given.into_answer().expect("privacy mode is turned on");
+    let report: kr_protocol::privacy::PrivacyReport = report.to_typed().expect("decodes");
+    assert!(report.enabled);
+}
+
+/// KR-REQ-09.09: what a removal of a retained copy answers is the list of copies privacy mode
+/// holds, which derives from earlier exports, so the service gives it as a copy, a refusal of the
+/// reference included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_answer_to_removing_a_retained_copy_is_given_as_a_copy_of_the_exports() {
+    let (temp, controller, _clock) = daemon().await;
+    let (_actor, carried) = admitted(&controller).await;
+    let given = controller
+        .privacy_retained_delete(
+            &request(
+                Method::PrivacyRetainedDelete,
+                temp.environment_id(),
+                &kr_protocol::privacy::PrivacyRetainedDeleteParams {
+                    reference: "a copy no export left".to_owned(),
+                },
+            ),
+            carried,
+        )
+        .await;
+    assert!(given.is_copied(), "the answer derives from earlier exports");
+    given
+        .into_answer()
+        .expect_err("no export left a copy of that reference");
+}

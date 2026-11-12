@@ -282,7 +282,7 @@ pub(crate) mod host_context {
 
 #[cfg(test)]
 mod tests {
-    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+    use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
     use kr_protocol::error::ErrorCode;
     use kr_protocol::ids::RequestId;
 
@@ -351,6 +351,28 @@ mod tests {
                 outcome: Outcome::Error(refusal_of(ErrorCode::PermissionDenied)),
             }))
             .names_a_reused_identifier()
+        );
+    }
+
+    /// A read that is an answer is framed for the request and stays a record; a read that is a
+    /// refusal gives nothing a door may go on with.
+    #[test]
+    fn a_read_that_is_a_refusal_gives_no_answer_to_go_on_with() {
+        let id = RequestId::new(5);
+        let answer = Recorded::read(Ok::<_, ControllerError>(ParamsValue::empty()))
+            .answered(id)
+            .expect("an answer is framed");
+        assert!(matches!(
+            answer.copied().into_answer(),
+            ControlFrame::Response(Response {
+                outcome: Outcome::Ok(_),
+                ..
+            })
+        ));
+        assert!(
+            Recorded::read(Err::<ParamsValue, _>(refusal()))
+                .answered(id)
+                .is_none()
         );
     }
 
