@@ -177,6 +177,15 @@ fn the_words_of_a_remedy_say_only_what_is_true_of_the_entry_and_the_state() {
         assert_eq!(remedy, Remedy::Remove, "{kind:?}");
         assert!(!text.contains("stay where they are"), "{kind:?}: {text}");
     }
+    // The journal is never said to stay where it is when it is the entry that is removed.
+    let text = ending(
+        Path::new("D:\\data\\journal"),
+        Remedy::Remove,
+        &Origin::System,
+        EntryKind::Journal,
+        &Presence::Present,
+    );
+    assert!(!text.contains("stay where they are"), "{text}");
     let (_, text) = said(EntryKind::UnnamedRoot, &Origin::System, &Presence::Present);
     assert!(text.contains("stay where they are"), "{text}");
     // Moved out: the next run makes new only what the installation makes.
