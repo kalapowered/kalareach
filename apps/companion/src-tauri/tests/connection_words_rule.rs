@@ -7,8 +7,8 @@
 //! in `connection::Unopened::of_link` and `Unopened::of_connection` (which share
 //! `Unopened::of_refused_connection`, the one place that reads the host's bound from a refusal), and
 //! every dialer reads the cause. A dialer that chose its words from a code or from a refusal's text
-//! would tell some cause as another, which is how three dialers came to say that a host could not
-//! be reached or was full when it was neither.
+//! would tell some cause as another, such as a host that could not be reached when it was full, or
+//! one that was full when it refused for another reason.
 //!
 //! This reads the source of every module that dials a paired host and fails, naming the place, at a
 //! line that reads a refusal's code for the capacity cause or for "for now", or tests a refusal's
