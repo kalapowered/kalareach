@@ -15,6 +15,7 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
+use companion_tauri::connection::Connection;
 use kr_protocol::agent::{AgentMutationTarget, AgentPromptParams, PromptText};
 use kr_protocol::ids::{
     ActionId, AgentBindingRevision, ApplicationInstanceId, GrantId, InvitationId, SessionId,
@@ -3094,5 +3095,341 @@ async fn kr_req_19_08_a_page_that_loads_again_leaves_its_openings() {
             json!({ "sessionId": first.to_string(), "opening": "after-1" }),
         )
         .expect("served");
+    adopted.stop().await;
+}
+
+/// The host the phone holds its main connection to.
+fn host_of(companion: &Companion) -> kr_protocol::ids::DeviceId {
+    companion
+        .device()
+        .host_in_use()
+        .expect("a host in use")
+        .host_device_id
+}
+
+/// Waits until `count` places are held on `host`.
+async fn places_held(host: kr_protocol::ids::DeviceId, count: usize) {
+    let places = companion_tauri::places::budget();
+    tokio::time::timeout(WATCHDOG, async {
+        while places.held_on(host) != count {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{count} places are held, not {}",
+            companion_tauri::places::budget().held_on(host)
+        )
+    });
+}
+
+/// KR-REQ-19.08: a link the person left keeps its place on the host's bound while a mutation it
+/// carries is in flight, and gives it back once the mutation is answered and the link closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_left_link_keeps_its_place_until_its_mutation_answers() {
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    let upstream = Arc::new(net_support::worker::HeldUpstream::default());
+    let instance = worker.register_agent_on(Arc::clone(&upstream) as _);
+    let session = worker.session_id;
+    let phone = phone_under(
+        &adopted,
+        pairing(&[ActionRight::SessionView, ActionRight::AgentPrompt]),
+    )
+    .await;
+    let companion = &phone.companion;
+    let host = host_of(companion);
+    let places = companion_tauri::places::budget();
+    let main_only = places.held_on(host);
+    open(companion, session, None, "left-with-a-mutation").expect("the session opens");
+    assert!(
+        places.held_on(host) > main_only,
+        "the opened link holds a place of its own"
+    );
+
+    let sending = companion.start_call(
+        "agent_prompt_submit",
+        json!({ "params": prompt(session, instance, "in flight"), "opening": "left-with-a-mutation" }),
+    );
+    tokio::time::timeout(WATCHDOG, async {
+        while upstream.prompts().is_empty() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the prompt reaches the agent's upstream");
+
+    leave(companion, session, "left-with-a-mutation");
+    assert!(!sending.is_finished(), "the prompt is still in flight");
+    assert!(
+        places.held_on(host) > main_only,
+        "the link that was left keeps its place while its mutation is in flight"
+    );
+
+    upstream.release();
+    tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the prompt is answered")
+        .expect("the call ran")
+        .expect("the prompt is answered");
+    places_held(host, main_only).await;
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: a dial that another opening or a leave has made no longer wanted stops, though its
+/// connection is still being made, and gives its place back at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_dial_that_is_superseded_or_left_stops_and_gives_its_place_back() {
+    let adopted = Adopted::start(1).await;
+    let session = adopted.workers[0].session_id;
+    let (phone, control) = phone_governed(&adopted, pairing(&[ActionRight::SessionView])).await;
+    let companion = &phone.companion;
+    let host = host_of(companion);
+    let places = companion_tauri::places::budget();
+    let main_only = places.held_on(host);
+
+    control.hold();
+    let first = opening_call(companion, session, None, "first");
+    held(&control, 1).await;
+    assert_eq!(
+        places.held_on(host),
+        main_only + 1,
+        "a dial holds a place while its connection is being made"
+    );
+
+    // A later opening replaces the first, which stops where it is: the connection it asked for is
+    // still held, and its place is back.
+    let second = opening_call(companion, session, None, "second");
+    held(&control, 2).await;
+    let superseded = tokio::time::timeout(WATCHDOG, first)
+        .await
+        .expect("the superseded dial stops")
+        .expect("the call ran")
+        .expect("an answer");
+    assert_eq!(superseded["state"], "superseded", "{superseded}");
+    assert_eq!(
+        places.held_on(host),
+        main_only + 1,
+        "only the second dial holds a place"
+    );
+
+    // A leave stops the second the same way.
+    leave(companion, session, "second");
+    let left = tokio::time::timeout(WATCHDOG, second)
+        .await
+        .expect("the dial that was left stops")
+        .expect("the call ran")
+        .expect("an answer");
+    assert_eq!(left["state"], "superseded", "{left}");
+    assert_eq!(places.held_on(host), main_only, "every place went back");
+    control.stop_holding();
+    control.release_all();
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: a connection the host ends gives its place back. A share's end ends the link that
+/// carried it, and the phone's main connection and its place stand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_link_the_host_ends_gives_its_place_back() {
+    let adopted = Adopted::start(2).await;
+    let (shared, own) = (&adopted.workers[0], &adopted.workers[1]);
+    let mut grant = pairing(&[ActionRight::SessionView]);
+    grant.session_selector = kr_protocol::grant::SessionSelector::These {
+        session_ids: [own.session_id].into_iter().collect(),
+    };
+    let phone = phone_under(&adopted, grant).await;
+    let companion = &phone.companion;
+    let host = host_of(companion);
+    let places = companion_tauri::places::budget();
+    let main_only = places.held_on(host);
+    let share = shared_with(
+        &adopted,
+        &phone,
+        shared.session_id,
+        RoleSelection::plain(SessionRole::Controller),
+    )
+    .await;
+    places_held(host, main_only).await;
+    open(
+        companion,
+        shared.session_id,
+        Some(share.grant_id),
+        "share-1",
+    )
+    .expect("the share opens");
+    assert!(
+        places.held_on(host) > main_only,
+        "the link the share carries holds a place"
+    );
+
+    revoke(&adopted.host, share.grant_id).await;
+    heard(companion, "share-1", |standing| {
+        standing["state"] == "ended"
+    })
+    .await;
+    places_held(host, main_only).await;
+    adopted.stop().await;
+}
+
+/// A refusal's code, as a call that failed returns it.
+fn code_of(error: &companion_tauri::error::CommandError) -> kr_protocol::error::ErrorCode {
+    error.code
+}
+
+/// KR-REQ-19.08: one place of the budget is the main link's alone. With every place the other kinds
+/// may take held, and a further dial of another kind waiting, a dial of the main link does not wait
+/// and is given its place, and the other kind is never given it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_the_main_links_dial_does_not_wait_behind_other_dials() {
+    use kr_protocol::error::ErrorCode;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_governed(&adopted, pairing(&[ActionRight::SessionView])).await;
+    let device = phone.companion.device();
+    // A host this phone holds no connection to, so that every place on it is free; the dials reach
+    // the governed link and never the real host.
+    let mut elsewhere = device.host_in_use().expect("a host in use");
+    elsewhere.host_device_id = kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid());
+    let places = companion_tauri::places::budget();
+    let others = companion_tauri::places::HOST_CONNECTIONS - 1;
+
+    control.hold();
+    let asked = control.asked();
+    let fillers: Vec<_> = (0..others)
+        .map(|_| {
+            let (device, elsewhere) = (Arc::clone(&device), elsewhere.clone());
+            tokio::spawn(async move { Connection::paired(&device, &elsewhere).await })
+        })
+        .collect();
+    held(&control, others).await;
+    assert_eq!(places.held_on(elsewhere.host_device_id), others);
+
+    let waiting = tokio::spawn({
+        let (device, elsewhere) = (Arc::clone(&device), elsewhere.clone());
+        async move { Connection::paired(&device, &elsewhere).await }
+    });
+    let main = tokio::spawn({
+        let (device, elsewhere) = (Arc::clone(&device), elsewhere.clone());
+        async move {
+            companion_tauri::places::as_the_main_link(Connection::paired(&device, &elsewhere)).await
+        }
+    });
+    // The main link's dial reaches the connection while the other kind's still waits for a place.
+    held(&control, others + 1).await;
+    assert!(!waiting.is_finished(), "the other dial is still waiting");
+
+    // The other dial is turned away when its own time limit ends, with every place still held: it
+    // was never given the main link's.
+    let turned_away = waiting
+        .await
+        .expect("the dial ran")
+        .err()
+        .expect("the other dial is refused");
+    assert_eq!(
+        code_of(&turned_away),
+        ErrorCode::ResourceUnavailable,
+        "it was never given the main link's place"
+    );
+    assert_eq!(
+        turned_away.retry,
+        kr_protocol::error::RetryCategory::Transient
+    );
+    assert_eq!(
+        control.asked() - asked,
+        others + 1,
+        "it never reached the connection"
+    );
+
+    control.refuse(Some(ErrorCode::PermissionDenied));
+    control.stop_holding();
+    control.release_all();
+    let reached = main
+        .await
+        .expect("the dial ran")
+        .err()
+        .expect("the governed link refuses");
+    assert_eq!(
+        code_of(&reached),
+        ErrorCode::PermissionDenied,
+        "the main link's dial was given its place and reached the link"
+    );
+    for filler in fillers {
+        filler.await.expect("the dial ran").err().expect("refused");
+    }
+    assert_eq!(
+        places.held_on(elsewhere.host_device_id),
+        0,
+        "every place went back"
+    );
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: callers that each hold a connection and ask for another, with every place the
+/// other kinds may take held, are each refused for now inside their own time limit with the code
+/// the host refuses with; every place goes back, and the next dial is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_holders_that_ask_for_another_connection_are_refused_and_every_place_returns()
+{
+    use kr_protocol::error::ErrorCode;
+
+    const HOLDERS: usize = 3;
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_governed(&adopted, pairing(&[ActionRight::SessionView])).await;
+    let device = phone.companion.device();
+    let paired = device.host_in_use().expect("a host in use");
+    let host = paired.host_device_id;
+    let places = companion_tauri::places::budget();
+    let main_only = places.held_on(host);
+
+    let mut holders = Vec::new();
+    for _ in 0..HOLDERS {
+        holders.push(
+            Connection::paired(&device, &paired)
+                .await
+                .expect("a connection within the budget"),
+        );
+    }
+    // The main link holds its place, and the other kinds may hold all but one more of the budget.
+    let fillers_needed = companion_tauri::places::HOST_CONNECTIONS - 1 - HOLDERS;
+    control.hold();
+    let fillers: Vec<_> = (0..fillers_needed)
+        .map(|_| {
+            let (device, paired) = (Arc::clone(&device), paired.clone());
+            tokio::spawn(async move { Connection::paired(&device, &paired).await })
+        })
+        .collect();
+    held(&control, fillers_needed).await;
+    assert_eq!(
+        places.held_on(host),
+        companion_tauri::places::HOST_CONNECTIONS,
+        "every place is held"
+    );
+
+    let asks: Vec<_> = holders
+        .iter()
+        .map(|holder| tokio::time::timeout(WATCHDOG, holder.another()))
+        .collect();
+    for ask in futures_util::future::join_all(asks).await {
+        let error = ask
+            .expect("each holder is answered inside its own time limit")
+            .err()
+            .expect("and refused");
+        assert_eq!(code_of(&error), ErrorCode::ResourceUnavailable);
+        assert_eq!(error.retry, kr_protocol::error::RetryCategory::Transient);
+    }
+
+    control.refuse(Some(ErrorCode::PermissionDenied));
+    control.stop_holding();
+    control.release_all();
+    for filler in fillers {
+        filler.await.expect("the dial ran").err().expect("refused");
+    }
+    drop(holders);
+    places_held(host, main_only).await;
+    control.refuse(None);
+    Connection::paired(&device, &paired)
+        .await
+        .expect("the next dial is made");
     adopted.stop().await;
 }

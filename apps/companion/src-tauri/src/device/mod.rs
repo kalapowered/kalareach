@@ -345,12 +345,14 @@ impl Device {
                     Some(leases) => link.presenting_membership(Arc::new(leases.clone())),
                     None => link,
                 };
-                // Every dial to a paired host takes a place from one budget first.
-                let own = crate::places::Budgeted::over(Arc::new(link), crate::places::budget());
-                match parts.link {
+                let own: Arc<dyn HostLink> = Arc::new(link);
+                let own = match parts.link {
                     Some(behind) => behind(own),
                     None => own,
-                }
+                };
+                // Every dial to a paired host takes a place from one budget first, whatever is
+                // between this application and the host.
+                crate::places::Budgeted::over(own, crate::places::budget())
             },
             hosts: Arc::new(hosts),
         };

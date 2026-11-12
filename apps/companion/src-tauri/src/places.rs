@@ -180,6 +180,13 @@ impl Places {
         })
     }
 
+    /// How many places are held on `host` now, of every kind.
+    #[must_use]
+    pub fn held_on(&self, host: DeviceId) -> usize {
+        let held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        held.get(&host).map_or(0, |count| count.main + count.others)
+    }
+
     /// Whether a place on `host` is free for `kind` now.
     fn is_free(&self, host: DeviceId, kind: Kind) -> bool {
         let held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
@@ -221,6 +228,18 @@ impl Places {
         }
     }
 }
+
+/// Whether a refusal says that a host cannot take another connection from this computer for now.
+/// It is read from the code alone: the host refuses with it when this computer holds as many
+/// connections as the host allows, and a dial that finds no place here is refused with it.
+pub(crate) fn is_no_room(code: ErrorCode) -> bool {
+    code == ErrorCode::ResourceUnavailable
+}
+
+/// What a person is told when a host cannot take another connection from this computer for now:
+/// the cause, and that the next try asks again, with no time promised.
+pub(crate) const NO_ROOM_FOR_NOW: &str = "the host cannot take another connection from this \
+                                          computer just now; this computer asks again by itself";
 
 /// What a dial that finds no place is refused with: the code a host refuses a connection with when
 /// it cannot take another for now, which every caller asks again after.
@@ -499,25 +518,23 @@ mod tests {
     }
 
     /// KR-REQ-19.08: callers that each hold a place and ask for one more, with every free place
-    /// held, are each refused for now inside their own time limit, every place goes back, and the
-    /// next dial is given one.
+    /// held, are each refused for now when their own time limit ends, every place goes back, and
+    /// the next dial is given one. No holder lets go of its place before every holder has been
+    /// answered, so none is refused for another's sake.
     #[tokio::test]
     async fn holders_that_each_ask_for_one_more_are_refused_and_every_place_returns() {
         let places = Places::new(4);
         let holders: Vec<_> = (0..3)
             .map(|_| places.try_take(host(1), Kind::Other).expect("a place"))
             .collect();
-        let asks: Vec<_> = holders
-            .into_iter()
-            .map(|place| {
+        let asks: Vec<_> = (0..holders.len())
+            .map(|_| {
                 let places = Arc::clone(&places);
                 tokio::spawn(async move {
-                    let more = places
+                    places
                         .take(host(1), Kind::Other, Duration::from_millis(100))
-                        .await;
-                    let refused = more.is_none();
-                    drop(place);
-                    refused
+                        .await
+                        .is_none()
                 })
             })
             .collect();
@@ -527,10 +544,8 @@ mod tests {
                 "refused inside its own time limit"
             );
         }
-        assert!(
-            places.held.lock().expect("the table").is_empty(),
-            "every place went back"
-        );
+        drop(holders);
+        assert_eq!(places.held_on(host(1)), 0, "every place went back");
         assert!(
             places.try_take(host(1), Kind::Other).is_some(),
             "the next dial is given one"
@@ -538,35 +553,30 @@ mod tests {
     }
 
     /// KR-REQ-19.08: a connection gives its place back when it is closed, and a dial that was
-    /// waiting for one is given it then, not when its own delay ends; a place that was never used
-    /// because the dial was cancelled goes back as well.
+    /// waiting for one is given it then, not when its own delay ends.
     #[tokio::test]
-    async fn a_place_returns_when_its_connection_is_closed_or_its_dial_cancelled() {
-        let places = Places::new(2);
-        let first = places.try_take(host(1), Kind::Main).expect("a place");
+    async fn a_place_returns_when_its_connection_is_closed() {
+        let places = Places::new(3);
+        // Two places for the other kinds, and the third is the main link's.
+        let first = places.try_take(host(1), Kind::Other).expect("a place");
+        let second = places.try_take(host(1), Kind::Other).expect("a place");
         let connection = Placed::over(Arc::new(Closed), first);
         let waiting = tokio::spawn({
             let places = Arc::clone(&places);
             async move {
                 places
-                    .take(host(1), Kind::Other, Duration::from_secs(30))
+                    .take(host(1), Kind::Other, Duration::from_secs(300))
                     .await
                     .is_some()
             }
         });
-        // The other place is the main link's, so the waiting dial gets none until the close.
         tokio::task::yield_now().await;
+        assert!(!waiting.is_finished(), "no place is free for it yet");
         connection.close();
         assert!(
             waiting.await.expect("the waiting dial ends"),
             "given the place at the close"
         );
-
-        let cancelled = places.take(host(1), Kind::Other, Duration::from_secs(30));
-        drop(cancelled);
-        assert!(
-            places.try_take(host(1), Kind::Main).is_some(),
-            "nothing was left by the dial"
-        );
+        drop(second);
     }
 }
