@@ -29,6 +29,7 @@ fn a_run_that_wrote_anything_else_reports_no_version() {
         b"git version unknown\n",
         b"git version 2.47.1\nwarning: something else\n",
         b"not git version 2.47.1\n",
+        b"2.47.1\n",
     ] {
         assert_eq!(git_version(true, text), None, "{text:?}");
     }
