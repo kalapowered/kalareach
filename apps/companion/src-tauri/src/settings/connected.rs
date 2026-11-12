@@ -557,19 +557,25 @@ mod tests {
             Listing::BudgetFull
         ));
         // The host's refusal of the connection for its bound is the host's, and not this
-        // computer's budget; a refusal of the connection for another reason is read as a refusal.
+        // computer's budget. A refusal of the connection for another reason, which is not a refusal
+        // of the question, is a connection lost: the host is not answering, and its list stays.
         assert!(matches!(
             Listing::of_link(&LinkError::ConnectionRefused(
                 kr_protocol::error::ProtocolError::new(ErrorCode::ResourceUnavailable, "full")
             )),
             Listing::HostFull
         ));
-        assert!(matches!(
-            Listing::of_link(&LinkError::ConnectionRefused(
-                kr_protocol::error::ProtocolError::new(ErrorCode::PermissionDenied, "no")
-            )),
-            Listing::Refused
-        ));
+        for code in [ErrorCode::PermissionDenied, ErrorCode::HostNotConfigured] {
+            assert!(
+                matches!(
+                    Listing::of_link(&LinkError::ConnectionRefused(
+                        kr_protocol::error::ProtocolError::new(code, "no")
+                    )),
+                    Listing::Silent
+                ),
+                "{code}: a connection refused at admission says nothing of the host's devices"
+            );
+        }
         for code in [
             // The code a host answers a request with for several causes is none of them by itself:
             // a host that cannot take another connection is told by the connection's refusal.

@@ -1556,6 +1556,34 @@ async fn a_host_that_cannot_take_another_connection_is_told_as_full_and_not_as_t
     assert_eq!(host_by(&rig.view().await, "feed")["contact"], "answered");
 }
 
+/// KR-REQ-10.46: a host that refuses this computer's connection at its admission, for a reason that
+/// is not its bound (a revocation that landed between the handshake and the admission, a daemon that
+/// has stopped while its listener accepts), is not one that will not list its devices: the host
+/// lists to the next connection. It is not answering, and the list the screen holds stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_refuses_the_connection_at_admission_is_not_answering_and_its_list_stays() {
+    use kr_protocol::error::ErrorCode;
+
+    let rig = Rig::start().await;
+    let listed = host_by(&rig.view().await, "feed");
+    assert_eq!(listed["contact"], "answered", "{listed}");
+    let phone = the_phone(&listed);
+
+    for code in [ErrorCode::PermissionDenied, ErrorCode::HostNotConfigured] {
+        rig.control.refuse_the_connection(Some(code));
+        let after = host_by(&rig.view().await, "feed");
+        assert_eq!(after["contact"], "silent", "{code:?}: {after}");
+        assert_eq!(
+            the_phone(&after)["reference"],
+            phone["reference"],
+            "{code:?}: the host's list stays"
+        );
+    }
+
+    rig.control.refuse_the_connection(None);
+    assert_eq!(host_by(&rig.view().await, "feed")["contact"], "answered");
+}
+
 /// KR-REQ-10.46: a host that does not answer is revoked on through its durable feed: the screen
 /// shows the list it last saw with its time, and the request is published and stands as sent, not
 /// done.

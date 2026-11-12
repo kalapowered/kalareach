@@ -2602,10 +2602,35 @@ async fn kr_req_19_08_a_refusal_at_the_first_open_that_does_not_repeat_leaves_th
     }
 }
 
-/// KR-REQ-19.08: a refusal of the connection at a session's first open that the next probe repeats
-/// ends the opening, with the host's words, after those two asks and no more.
+/// What the page was told of the opening `opening` so far, in the order it was told.
+fn told_of(companion: &Companion, opening: &str) -> Vec<Value> {
+    companion
+        .standing
+        .texts()
+        .iter()
+        .map(|text| serde_json::from_str::<Value>(text).expect("an event"))
+        .filter(|event| event["opening"] == opening)
+        .map(|event| event["standing"].clone())
+        .collect()
+}
+
+/// Waits until the host has been asked for `count` connections since `before`.
+async fn asked_since(control: &LinkControl, before: usize, count: usize) {
+    tokio::time::timeout(WATCHDOG, async {
+        while control.asked() - before < count {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the host was asked {} times", control.asked() - before));
+}
+
+/// KR-REQ-19.08: a refusal of the connection at its admission that repeats does not end a session's
+/// opening either: the host decided about the connection, not about the opening, so the opening
+/// stands as reconnecting, as it did when the refusal was not read, and its watch asks on, with the
+/// host's words as the reason it shows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn kr_req_19_08_a_refusal_at_the_first_open_that_repeats_ends_the_opening_with_its_words() {
+async fn kr_req_19_08_a_refusal_at_admission_that_repeats_leaves_the_opening_standing() {
     use kr_protocol::error::ErrorCode;
 
     let adopted = Adopted::start(1).await;
@@ -2617,12 +2642,94 @@ async fn kr_req_19_08_a_refusal_at_the_first_open_that_repeats_ends_the_opening_
     let before = control.asked();
     let standing = open(companion, session, None, "repeated").expect("the first open stands");
     assert_eq!(standing["state"], "reconnecting", "{standing}");
-    let told = heard(companion, "repeated", |standing| {
-        standing["state"] == "refused"
+    asked_since(&control, before, 4).await;
+    for told in told_of(companion, "repeated") {
+        assert_eq!(told["state"], "reconnecting", "never refused: {told}");
+        assert!(
+            told["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("the host refused the connection")),
+            "the host's words stay the reason: {told}"
+        );
+    }
+    control.refuse_the_connection(None);
+    let reached = heard(companion, "repeated", |standing| {
+        standing["state"] == "open"
     })
     .await;
-    assert_eq!(told["standing"]["code"], "PERMISSION_DENIED", "{told}");
-    assert_eq!(control.asked() - before, 2, "the open and one probe agreed");
+    assert_eq!(reached["standing"]["via"], "pairing", "{reached}");
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: a refusal at the handshake (a version, a pairing) is the host's decision about this
+/// device, and ends a session's first open at once with its words, as it did before the host's
+/// refusal of a connection was read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_refusal_at_the_handshake_ends_the_first_open_at_once() {
+    use kr_protocol::error::ErrorCode;
+
+    let adopted = Adopted::start(1).await;
+    let session = adopted.workers[0].session_id;
+    let (phone, control) = phone_governed(&adopted, pairing(&[ActionRight::SessionView])).await;
+    let companion = &phone.companion;
+
+    control.refuse(Some(ErrorCode::PermissionDenied));
+    let before = control.asked();
+    let refused =
+        open(companion, session, None, "handshake").expect_err("the host's refusal ends the open");
+    assert_eq!(code(&refused), "PERMISSION_DENIED", "{refused}");
+    assert_eq!(control.asked() - before, 1, "the host was asked once");
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: a device that the host revokes between its handshake and its admission is refused
+/// at admission once, and then answered as an unpaired peer, which ends each later connection as a
+/// connection lost. The opening stands, and the words the person reads stay the host's first, not a
+/// statement that the host was not reached. The revocation is the host's own: the device's record
+/// is withdrawn at the host while it holds the connection before it registers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_device_revoked_before_its_admission_keeps_the_hosts_words_at_its_first_open()
+ {
+    let adopted = Adopted::start(1).await;
+    let session = adopted.workers[0].session_id;
+    let (phone, control) = phone_governed(&adopted, pairing(&[ActionRight::SessionView])).await;
+    let companion = &phone.companion;
+    let device_id = companion.device().host_in_use().expect("a host").device_id;
+
+    let (arrived, release) = adopted.host.controller().pause_connection_registration();
+    let opening = opening_call(companion, session, None, "revoked");
+    arrived
+        .await
+        .expect("the host holds the connection before it registers it");
+    adopted
+        .host
+        .controller()
+        .revoke_device_authority(device_id, None, None)
+        .await
+        .expect("the revocation is recorded");
+    release.send(()).expect("the host is still holding it");
+    let standing = opening
+        .await
+        .expect("the call ends")
+        .expect("the first open stands");
+    assert_eq!(standing["state"], "reconnecting", "{standing}");
+    let first = standing["reason"]
+        .as_str()
+        .expect("the host's words")
+        .to_owned();
+    assert!(first.contains("withdrawn"), "the host's words: {first}");
+
+    // Each ask that follows is answered as an unpaired peer's: it does not reach the host.
+    let before = control.asked();
+    asked_since(&control, before, 3).await;
+    for told in told_of(companion, "revoked") {
+        assert_eq!(told["state"], "reconnecting", "{told}");
+        assert_eq!(
+            told["reason"],
+            first.as_str(),
+            "the first words stay: {told}"
+        );
+    }
     adopted.stop().await;
 }
 
@@ -3088,6 +3195,72 @@ async fn kr_req_19_08_a_view_whose_connection_the_host_refuses_says_why() {
     );
     control.refuse_the_connection(None);
     adopted.stop().await;
+}
+
+/// KR-REQ-19.08: a raw view's own connection that the host refuses at its admission, for a reason
+/// that is not its bound (an authority withdrawn since the handshake, a daemon that has stopped
+/// while its listener accepts), is a lost connection, as it was before the host's refusal was read:
+/// the view ends with the host's words, the host is asked again on the opening's live link, and the
+/// page opens a view again. It holds whether the refusal reaches the view before its first request
+/// is written or after the write has failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_view_whose_connection_the_host_refuses_at_admission_is_lost_and_opened_again()
+ {
+    use kr_protocol::error::ErrorCode;
+    use tauri::Manager as _;
+
+    for (n, (code, write_fails)) in [
+        (ErrorCode::PermissionDenied, false),
+        (ErrorCode::PermissionDenied, true),
+        (ErrorCode::HostNotConfigured, false),
+        (ErrorCode::HostNotConfigured, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let adopted = Adopted::start(1).await;
+        let session = adopted.workers[0].session_id;
+        let (phone, control) = phone_governed(
+            &adopted,
+            pairing(&[ActionRight::SessionView, ActionRight::TerminalInput]),
+        )
+        .await;
+        let companion = &phone.companion;
+        let opening = format!("admission-{n}");
+        open(companion, session, None, &opening).expect("opens");
+
+        control.refuse_the_connection(Some(code));
+        control.end_connections(write_fails);
+        let channel = 70 + u32::try_from(n).expect("a small number");
+        open_view(companion, session, &opening, channel).expect("a handle comes back");
+        let ended = companion
+            .state_where(channel, |state| state["state"] == "ended")
+            .await;
+        let reason = ended["reason"].as_str().expect("the view says why");
+        assert!(
+            reason.contains("the host refused the connection"),
+            "{code:?}, write fails {write_fails}: the host's words stay the reason: {reason}"
+        );
+        // The view is lost, so the host is asked on the opening's live link, and says the screen is
+        // open: the page opens a view again.
+        heard(companion, &opening, |standing| standing["state"] == "open").await;
+        assert_eq!(
+            companion
+                .app
+                .state::<companion_tauri::AppState>()
+                .paired_links()
+                .rechecks(),
+            1,
+            "{code:?}, write fails {write_fails}: the view was lost, not ended for good"
+        );
+        control.refuse_the_connection(None);
+        control.end_connections(false);
+        open_view(companion, session, &opening, channel + 10).expect("opens again");
+        companion
+            .state_where(channel + 10, |state| state["state"] == "showing")
+            .await;
+        adopted.stop().await;
+    }
 }
 
 /// KR-REQ-19.08: an answer given while the screen's link is being reached again is kept on the
@@ -3698,13 +3871,18 @@ async fn kr_req_19_08_a_connection_that_was_not_opened_says_why() {
         "the host's bound, and not a refusal of a request: {cause:?}"
     );
 
-    // The host refuses the connection for another reason: its own words, and not its bound.
+    // The host refuses the connection for another reason: not its bound, so the connection is as
+    // good as lost, with the host's own words as the reason.
     control.refuse_the_connection(Some(ErrorCode::PermissionDenied));
     let cause = dial().await.expect_err("the host refused the connection");
     assert!(
-        matches!(&cause, Unopened::Refused(Asked::Connection, error)
-            if error.code == ErrorCode::PermissionDenied),
-        "a refusal of the connection for another reason: {cause:?}"
+        cause.for_now() && !matches!(cause, Unopened::HostFull),
+        "a refusal of the connection at admission for another reason is a connection lost: {cause:?}"
+    );
+    assert_eq!(
+        cause.into_error().code,
+        ErrorCode::PermissionDenied,
+        "the host's words are kept"
     );
     control.refuse_the_connection(None);
 

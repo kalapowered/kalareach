@@ -1519,7 +1519,8 @@ async fn a_member_host_at_its_bound_is_told_as_full_and_not_as_a_failed_lease() 
         "the lease was not asked for again on a connection the host refused"
     );
 
-    // The host refuses the connection for another reason: its own words, and not its bound.
+    // The host refuses the connection for another reason: not its bound, so the connection is as
+    // good as lost, with the host's own words as the reason.
     rig.control
         .refuse_the_connection(Some(ErrorCode::PermissionDenied));
     let refused = rig
@@ -1528,9 +1529,47 @@ async fn a_member_host_at_its_bound_is_told_as_full_and_not_as_a_failed_lease() 
         .expect_err("the host refused the connection");
     let cause = Unopened::of_link(refused);
     assert!(
-        matches!(&cause, Unopened::Refused(_, error) if error.code == ErrorCode::PermissionDenied),
-        "a refusal of the connection for another reason: {cause:?}"
+        cause.for_now() && !matches!(cause, Unopened::HostFull),
+        "a refusal of the connection at admission for another reason is a connection lost: {cause:?}"
     );
+    assert_eq!(cause.into_error().code, ErrorCode::PermissionDenied);
+}
+
+/// KR-REQ-19.08: a member's host that refuses the connection at admission is told as that refusal
+/// whichever way the lease's keeper stops, and not only when it stops after it has asked the host to
+/// take the lease. A device with no lease that the host can take asks the organisation's service for
+/// one, and the service answers nothing: the keeper stops, having asked the host nothing, and the
+/// refusal that the connection holds is what the connection not being opened says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_host_at_its_bound_is_told_as_full_when_the_keeper_stops_before_it_presents() {
+    use companion_tauri::connection::Unopened;
+
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    rig.waits.until_asked(1).await;
+    let requests = rig.lease_requests();
+
+    // The lease the device holds is too short to present again, so a lease is asked for, and the
+    // service answers nothing, while the host refuses the connection for its bound.
+    rig.waits.time_passes(Duration::from_secs(14 * 60 + 30));
+    rig.refuses_the_next_lease(Moment::Hold);
+    rig.control
+        .refuse_the_connection(Some(ErrorCode::ResourceUnavailable));
+    let refused = rig
+        .dials()
+        .await
+        .expect_err("the host refused the connection");
+    let cause = Unopened::of_link(refused);
+    assert!(
+        matches!(cause, Unopened::HostFull),
+        "the host's bound, and not a lease that could not be given: {cause:?}"
+    );
+    assert_eq!(
+        rig.lease_requests(),
+        requests + 1,
+        "the service was asked once"
+    );
+    rig.served.web().release_held();
 }
 
 /// KR-REQ-17.53: a visit to a paired host, which the application makes to read a host it is not
