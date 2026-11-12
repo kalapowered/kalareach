@@ -125,6 +125,7 @@
 		F50597C0728B9212BA794BE7 /* ProbeSupportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BDF21C4FFBBC3A2A3494E9AA /* ProbeSupportTests.swift */; };
 		F683A3B4BC275D0384F922CF /* libapp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = E8C92E50E96FEA4B90C404F3 /* libapp.a */; };
 		F697279D05A86BBA5CF6FC35 /* ProbeSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = 207FF0D862E72EB40619126B /* ProbeSurface.swift */; };
+		B1C2D3E4F5A6B7C8D9E0F1A2 /* SceneProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0B1C2D3E4F5A6B7C8D9E0F1 /* SceneProbe.swift */; };
 		F81D0C2E43E5082B417A3C2B /* LayoutTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A7556962086670CA11B4113 /* LayoutTests.swift */; };
 		F8EF4A8CBBF87EBEBC5CFD35 /* PreviewDecision.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7AC19C47F70E70B5A8FF8474 /* PreviewDecision.swift */; };
 		FB45DC4A1CC59CE45D7E1CC6 /* PushTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B31F2B12399A396AD7474822 /* PushTests.swift */; };
@@ -174,6 +175,7 @@
 		18B603673931FFAFD42C9245 /* lease.rs */ = {isa = PBXFileReference; path = lease.rs; sourceTree = "<group>"; };
 		1EF0EE5BE57111CF9A3E33C1 /* device_probe.rs */ = {isa = PBXFileReference; path = device_probe.rs; sourceTree = "<group>"; };
 		207FF0D862E72EB40619126B /* ProbeSurface.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProbeSurface.swift; sourceTree = "<group>"; };
+		A0B1C2D3E4F5A6B7C8D9E0F1 /* SceneProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneProbe.swift; sourceTree = "<group>"; };
 		21EFF08FF9DFE8027EAA8B8F /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
 		233EDCC125C890EB364292DC /* state.rs */ = {isa = PBXFileReference; path = state.rs; sourceTree = "<group>"; };
 		26E279100D2D6C452A6EF59F /* RustPreviewOpener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustPreviewOpener.swift; sourceTree = "<group>"; };
@@ -419,6 +421,7 @@
 				5D97820B51FD28859F00F528 /* KRNativeLaunch.swift */,
 				2C4D68F5B5A1CA28AA156354 /* LaunchHook.m */,
 				207FF0D862E72EB40619126B /* ProbeSurface.swift */,
+				A0B1C2D3E4F5A6B7C8D9E0F1 /* SceneProbe.swift */,
 				E86AE1D9B4780BA0044B480F /* PushChallenge.swift */,
 				DE6F5BBBB1ACE619694C9064 /* PushDeviceRun.swift */,
 				BD790CB946E32C30357728DA /* PushStartup.swift */,
@@ -1069,6 +1072,7 @@
 				7940EE3C08E1537A5E3E0D2E /* PreviewOpenerJson.swift in Sources */,
 				E696F6641926E184464CDA27 /* ProbeSupport.swift in Sources */,
 				F697279D05A86BBA5CF6FC35 /* ProbeSurface.swift in Sources */,
+				B1C2D3E4F5A6B7C8D9E0F1A2 /* SceneProbe.swift in Sources */,
 				11BC20FB1AC83C09A3BA7CF8 /* PushAdapter.swift in Sources */,
 				E296093619D4C80689885181 /* PushChallenge.swift in Sources */,
 				617F4F8182D888EBECF86EC9 /* PushDeviceRun.swift in Sources */,

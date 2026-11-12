@@ -18,6 +18,8 @@ use tauri::{AppHandle, Manager as _, RunEvent};
 
 /// The runtime's events, as far as a scene concerns them.
 pub(crate) fn on_run_event(app: &AppHandle, event: &RunEvent) {
+    #[cfg(debug_assertions)]
+    trace(app, event);
     match event {
         RunEvent::ExitRequested {
             code: None, api, ..
@@ -27,14 +29,39 @@ pub(crate) fn on_run_event(app: &AppHandle, event: &RunEvent) {
     }
 }
 
+/// What a debug build says on its error stream of the events that concern a scene, for a device run
+/// that has to tell which event brought the window back. The other events are not worth a line.
+#[cfg(debug_assertions)]
+fn trace(app: &AppHandle, event: &RunEvent) {
+    let what = match event {
+        RunEvent::ExitRequested { code, .. } => format!("exit requested, code {code:?}"),
+        RunEvent::SceneRequested { .. } => "scene requested".to_owned(),
+        RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::Destroyed,
+            ..
+        } => format!("window {label} destroyed"),
+        RunEvent::Resumed => "resumed".to_owned(),
+        _ => return,
+    };
+    eprintln!(
+        "KalaReach scene probe (rust): {what}, windows={}",
+        app.webview_windows().len()
+    );
+}
+
 /// Opens the main window if the application has none, with what is tied to it.
 pub(crate) fn open_main_window_once(app: &AppHandle) {
     if !app.webview_windows().is_empty() {
+        #[cfg(debug_assertions)]
+        eprintln!("KalaReach scene probe (rust): a window exists, so none was opened");
         return;
     }
     match crate::open_main_window(app) {
         Ok(()) => {
             crate::watch_drops(app);
+            #[cfg(debug_assertions)]
+            eprintln!("KalaReach scene probe (rust): the main window was opened again");
             tracing::info!("a scene came back, so the main window was opened again");
         }
         Err(error) => {

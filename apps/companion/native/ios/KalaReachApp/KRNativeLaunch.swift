@@ -21,6 +21,7 @@ final class KRNativeLaunch: NSObject {
         debugMode = ProbeArguments.mode(from: CommandLine.arguments)?.rawValue
         DeviceProbe.applyColourMode()
         DeviceProbe.reportTextSize()
+        SceneProbe.startIfRequested()
         // The other end of a device run's call, when the run asked for one.
         AudioPeer.startIfRequested()
         #endif
