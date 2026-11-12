@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, HANDLE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE, LocalFree, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::{
@@ -28,13 +29,13 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
-    PIPE_ACCESS_DUPLEX, ReadFile, SECURITY_IDENTIFICATION, WriteFile,
+    PIPE_ACCESS_DUPLEX, ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WriteFile,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
-    ImpersonateNamedPipeClient, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
-    PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+    GetNamedPipeServerProcessId, ImpersonateNamedPipeClient, PIPE_READMODE_BYTE,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
 };
 use windows_sys::Win32::System::Threading::{
     CreateEventW, GetCurrentThread, INFINITE, OpenThreadToken, SetEvent, WaitForMultipleObjects,
@@ -44,6 +45,7 @@ use windows_sys::Win32::System::Threading::{
 use crate::pipe_access;
 
 use super::ffi::{Handle, Result, Sid, error, last, wide};
+use super::sd::{Summary, summary_of_handle};
 
 /// The name the broker's pipe has.
 pub const NAME: &str = r"\\.\pipe\KalaReachBoundary";
@@ -405,7 +407,14 @@ impl Connection {
 pub struct Listener {
     descriptor: *mut c_void,
     stop: Arc<Stop>,
+    /// The instance that waits for the next client. It is made before a connection is handed on, so
+    /// that from the bind to the end of the listener an instance of the pipe always exists and the
+    /// name is never free; it is none only while every instance the pipe may have is in use, and
+    /// then the connections hold the name.
     next: Option<Handle>,
+    /// What the first instance shows: its owner and the permission list `bind` set. Every later
+    /// instance must show the same.
+    bound: Option<Summary>,
 }
 
 // SAFETY: the descriptor is owned by the listener and only read to make an instance.
@@ -450,9 +459,44 @@ impl Listener {
             descriptor,
             stop,
             next: None,
+            bound: None,
         };
-        listener.next = Some(listener.instance(true)?);
+        let first = listener.instance(true)?;
+        listener.bound = Some(summary_of_handle(&first)?);
+        listener.next = Some(first);
         Ok(listener)
+    }
+
+    /// Whether the service has been told to stop.
+    #[must_use]
+    pub fn stopped(&self) -> bool {
+        self.stop.is_set()
+    }
+
+    /// Confirms that an instance is the pipe `bind` made: the owner and the permission list are the
+    /// ones the first instance showed. A pipe that another program made first has its own.
+    fn confirm(&self, pipe: &Handle) -> Result<()> {
+        let shown = summary_of_handle(pipe)?;
+        if self.bound.as_ref().is_some_and(|bound| *bound != shown) {
+            return Err(error(
+                0,
+                "the pipe's owner or permission list is not the one the broker set: another program made the pipe's name, so the broker stops",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Makes the instance that waits for the next client and confirms it. None when every instance
+    /// the pipe may have is in use.
+    fn refill(&self) -> Result<Option<Handle>> {
+        match self.instance(false) {
+            Ok(pipe) => {
+                self.confirm(&pipe)?;
+                Ok(Some(pipe))
+            }
+            Err(failure) if failure.code == ERROR_PIPE_BUSY => Ok(None),
+            Err(failure) => Err(failure),
+        }
     }
 
     fn instance(&self, first: bool) -> Result<Handle> {
@@ -487,52 +531,86 @@ impl Listener {
 
     /// Waits for a client, and returns `None` when the service is told to stop.
     ///
+    /// The fault of one connection ends that connection only: a client that connected and closed
+    /// before the wait, or an instance that could not be connected, is disconnected and the wait
+    /// goes on. The next instance is made before the connection is handed on.
+    ///
     /// # Errors
     ///
-    /// Returns the platform's error when the wait fails.
+    /// Returns the platform's error when the listener cannot keep the pipe's name: an instance
+    /// cannot be made or is not the pipe that was bound, or the pipe fails again and again.
     pub fn accept(&mut self) -> Result<Option<Connection>> {
-        let pipe = match self.next.take() {
-            Some(pipe) => pipe,
-            None => self.instance(false)?,
-        };
-        let mut transfer = Transfer::new(Vec::new()).map_err(|failure| {
-            error(
-                failure.raw_os_error().unwrap_or(0) as u32,
-                "making an event",
-            )
-        })?;
-        // SAFETY: the pipe is open and the record lives in `transfer`, which `wait` completes, or
-        // cancels, or keeps when the cancel does not end it.
-        let connected = unsafe { ConnectNamedPipe(pipe.raw(), transfer.record()) };
-        if connected == 0 {
-            // SAFETY: reads the calling thread's last error.
-            let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-            if code == ERROR_IO_PENDING {
-                let mut stuck = false;
-                match wait(pipe.raw(), transfer, &self.stop, None, &mut stuck) {
-                    Ok(_) => {}
-                    Err(failure) if failure.kind() == io::ErrorKind::Interrupted => {
-                        return Ok(None);
-                    }
-                    Err(failure) => {
-                        return Err(error(
-                            failure.raw_os_error().unwrap_or(0) as u32,
-                            "waiting for a client",
-                        ));
-                    }
-                }
-            } else if code != ERROR_PIPE_CONNECTED {
-                return Err(error(code, "waiting for a client"));
+        let mut failed_in_a_row = 0_u32;
+        loop {
+            if self.stop.is_set() {
+                return Ok(None);
             }
+            let pipe = match self.next.take() {
+                Some(pipe) => pipe,
+                None => match self.refill()? {
+                    Some(pipe) => pipe,
+                    None => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        continue;
+                    }
+                },
+            };
+            let mut transfer = Transfer::new(Vec::new()).map_err(|failure| {
+                error(
+                    failure.raw_os_error().unwrap_or(0) as u32,
+                    "making an event",
+                )
+            })?;
+            let mut gone = false;
+            let mut stuck = false;
+            // SAFETY: the pipe is open and the record lives in `transfer`, which `wait` completes,
+            // or cancels, or keeps when the cancel does not end it.
+            let connected = unsafe { ConnectNamedPipe(pipe.raw(), transfer.record()) };
+            if connected == 0 {
+                // SAFETY: reads the calling thread's last error.
+                let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+                if code == ERROR_IO_PENDING {
+                    match wait(pipe.raw(), transfer, &self.stop, None, &mut stuck) {
+                        Ok(_) => {}
+                        Err(failure) if failure.kind() == io::ErrorKind::Interrupted => {
+                            return Ok(None);
+                        }
+                        Err(_) => gone = true,
+                    }
+                } else if code != ERROR_PIPE_CONNECTED {
+                    gone = true;
+                }
+            }
+            if gone {
+                failed_in_a_row += 1;
+                if failed_in_a_row > 1000 {
+                    return Err(error(0, "the pipe failed a thousand times in a row"));
+                }
+                if stuck {
+                    // A transfer that did not end is left with its pipe: the next instance is new.
+                    self.next = self.refill()?;
+                } else {
+                    // SAFETY: the pipe is open; the client's end is closed or not connected.
+                    unsafe {
+                        DisconnectNamedPipe(pipe.raw());
+                    }
+                    self.next = Some(pipe);
+                }
+                continue;
+            }
+            self.next = self.refill()?;
+            return Ok(Some(Connection {
+                pipe,
+                stop: Arc::clone(&self.stop),
+                deadline: None,
+                stuck: false,
+            }));
         }
-        Ok(Some(Connection {
-            pipe,
-            stop: Arc::clone(&self.stop),
-            deadline: None,
-            stuck: false,
-        }))
     }
 }
+
+/// How long the installer's own connection waits for an instance of the pipe to be free.
+const BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Connects to the broker's pipe as a client and checks that the process serving it is the one
 /// the service manager reports for the service, so a program that took the name first is refused.
@@ -546,18 +624,39 @@ pub fn connect(expected_server: u32) -> Result<Connection> {
     // SAFETY: the name is NUL-terminated; the client asks for identification only, so the server
     // learns who is calling and cannot act as the caller, and for the rights of a client and no
     // more, which are what the pipe's list grants it.
-    let pipe = unsafe {
-        CreateFileW(
-            name.as_ptr(),
-            pipe_access::CLIENT,
-            0,
-            null(),
-            OPEN_EXISTING,
-            FILE_FLAG_OVERLAPPED | SECURITY_IDENTIFICATION,
-            null_mut(),
-        )
+    let began = Instant::now();
+    let pipe = loop {
+        // SAFETY: as above.
+        let opened = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                pipe_access::CLIENT,
+                0,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                null_mut(),
+            )
+        };
+        match Handle::new(opened, "opening the broker's pipe") {
+            Ok(pipe) => break pipe,
+            Err(failure) if failure.code == ERROR_PIPE_BUSY => {
+                let left = BUSY_WAIT.saturating_sub(began.elapsed());
+                if left.is_zero() {
+                    return Err(error(
+                        ERROR_PIPE_BUSY,
+                        "the broker's pipe stayed busy: every connection the broker serves was in use for 10 seconds",
+                    ));
+                }
+                // SAFETY: the name is NUL-terminated; the call waits until an instance listens or
+                // the time ends.
+                unsafe {
+                    WaitNamedPipeW(name.as_ptr(), left.as_millis() as u32);
+                }
+            }
+            Err(failure) => return Err(failure),
+        }
     };
-    let pipe = Handle::new(pipe, "opening the broker's pipe")?;
     let mut server = 0_u32;
     // SAFETY: the pipe is a connected client end.
     if unsafe { GetNamedPipeServerProcessId(pipe.raw(), &raw mut server) } == 0 {

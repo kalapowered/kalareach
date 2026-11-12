@@ -37,8 +37,13 @@ use super::pipe::{Connection, Listener, Stop};
 use super::proof;
 use super::token::enable_privilege;
 
-/// The most connections served at once.
-const MAX_CONNECTIONS: usize = 8;
+/// The most connections served at once: one fewer than the pipe may have instances, so that the
+/// instance that waits for the next client is never the one that is missing.
+const MAX_CONNECTIONS: usize = super::pipe::MAX_INSTANCES as usize - 1;
+/// How long a connection may take to send its first frame. The installer's own first message
+/// follows its open at once; a client that has had the pipe for this long and sent nothing is not
+/// waiting for an answer, and its slot goes to the next client.
+const FIRST_FRAME: std::time::Duration = std::time::Duration::from_secs(5);
 /// How long a cycle of proofs lasts, all the proofs of it together: the log names the rule about
 /// 170 s after the start of Windows. A cycle has one absolute deadline, and every wait, every query
 /// of the log and every program of a proof stays within it. The first cycle begins with the
@@ -270,13 +275,27 @@ fn serve() -> Result<(), String> {
 fn run(listener: &mut Listener, state: &Arc<State>) -> Result<(), String> {
     let slots = Slots::new(MAX_CONNECTIONS);
     let mut threads = Vec::new();
-    while let Some(connection) = listener.accept().map_err(|error| error.to_string())? {
+    loop {
+        // A client is taken only when a slot is free. The listener's waiting instance stays where
+        // it is meanwhile, so no client is dropped for want of a slot and the pipe's name is held.
+        let slot = loop {
+            if listener.stopped() || super::privilege::revert_failed() {
+                break None;
+            }
+            if let Some(slot) = slots.take() {
+                break Some(slot);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let Some(slot) = slot else {
+            break;
+        };
+        let Some(connection) = listener.accept().map_err(|error| error.to_string())? else {
+            break;
+        };
         if super::privilege::revert_failed() {
             break;
         }
-        let Some(slot) = slots.take() else {
-            continue;
-        };
         let shared = Arc::clone(state);
         threads.push(std::thread::spawn(move || {
             // The slot goes back when this thread ends, a panic included.
@@ -337,7 +356,13 @@ fn answer(mut connection: Connection, state: &State) {
     // The platform lets a server take on a client's identity only after it has read from the pipe,
     // so the first message is read before the caller is identified. Nothing is done with it until
     // the caller is known.
+    connection.set_deadline(Some(std::time::Instant::now() + FIRST_FRAME));
     let first = frame::read::<_, Request>(&mut connection);
+    connection.set_deadline(None);
+    // A connection that sent no first frame by its deadline, or that failed, is closed.
+    if !matches!(first, Ok(_) | Err(FrameError::Malformed(_))) {
+        return;
+    }
     let identity = match connection.identity() {
         Ok(identity) => identity,
         Err(error) => {
