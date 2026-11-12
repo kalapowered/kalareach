@@ -1612,7 +1612,9 @@ fn a_token_that_holds_the_administrators_group_deny_only_gets_no_capture_pipe() 
 /// for a few seconds.
 fn open_the_brokers_pipe() -> Result<(), u32> {
     use kr_boundary_windows::pipe_access::CLIENT;
-    use windows_sys::Win32::Foundation::{ERROR_PIPE_BUSY, GetLastError, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, GetLastError, INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_IDENTIFICATION,
     };
@@ -1637,7 +1639,8 @@ fn open_the_brokers_pipe() -> Result<(), u32> {
         }
         // SAFETY: reads the calling thread's last error.
         let code = unsafe { GetLastError() };
-        if code != ERROR_PIPE_BUSY || Instant::now() >= until {
+        // Between one client and the next, the broker's loop has no instance for a moment.
+        if !matches!(code, ERROR_PIPE_BUSY | ERROR_FILE_NOT_FOUND) || Instant::now() >= until {
             return Err(code);
         }
         std::thread::sleep(Duration::from_millis(20));
