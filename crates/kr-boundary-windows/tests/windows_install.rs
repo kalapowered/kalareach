@@ -4365,6 +4365,7 @@ fn a_client_that_connects_and_goes_before_the_server_waits_for_it_does_not_end_t
     drop(
         pipe::connect(Pipe::Persons, std::process::id()).expect("the first client opens the pipe"),
     );
+    let _stop_when_dropped = StopWhenDropped(std::sync::Arc::clone(&stop));
     let server = std::thread::spawn(move || {
         listener
             .accept()
@@ -4372,7 +4373,8 @@ fn a_client_that_connects_and_goes_before_the_server_waits_for_it_does_not_end_t
             .map_err(|failure| failure.to_string())
     });
     let second = std::thread::spawn(|| pipe::connect(Pipe::Persons, std::process::id()).map(drop));
-    let accepted = server.join().unwrap();
+    let accepted = ends_within(server, 20)
+        .unwrap_or_else(|failure| Err(format!("the accept did not return: {failure}")));
     stop.set();
     let second = second.join().unwrap();
     assert_eq!(
@@ -4804,18 +4806,12 @@ fn a_refill_that_fails_once_neither_ends_the_listener_nor_drops_the_client_in_ha
     let mut listener = Listener::bind(Pipe::Persons, &[], std::sync::Arc::clone(&stop)).unwrap();
     let first =
         pipe::connect(Pipe::Persons, std::process::id()).expect("the first client opens the pipe");
+    let _restored = RefillsRestored;
     pipe::testing::fail_refills(2);
     let served = listener
         .accept()
         .expect("the failed refill does not end the listener")
         .expect("the client in hand is served");
-    // However this case ends, the stop is set, so that no thread waits on for a client.
-    struct StopWhenDropped(std::sync::Arc<Stop>);
-    impl Drop for StopWhenDropped {
-        fn drop(&mut self) {
-            self.0.set();
-        }
-    }
     let _stop_when_dropped = StopWhenDropped(std::sync::Arc::clone(&stop));
     let server = std::thread::spawn(move || {
         listener
@@ -4824,15 +4820,8 @@ fn a_refill_that_fails_once_neither_ends_the_listener_nor_drops_the_client_in_ha
             .map_err(|failure| failure.to_string())
     });
     let second = std::thread::spawn(|| pipe::connect(Pipe::Persons, std::process::id()).map(drop));
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !server.is_finished() && std::time::Instant::now() < until {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    let accepted = if server.is_finished() {
-        server.join().unwrap()
-    } else {
-        Err("the second accept did not return in twenty seconds".to_owned())
-    };
+    let accepted = ends_within(server, 20)
+        .unwrap_or_else(|failure| Err(format!("the second accept did not return: {failure}")));
     stop.set();
     let second = second.join().unwrap();
     drop((first, served));
@@ -5042,6 +5031,29 @@ fn needs_the_system() -> bool {
     }
     eprintln!("SKIPPED: not run under this token: only the system may make the broker's pipe");
     true
+}
+
+/// Sets the stop when it is dropped, so that no thread of a case waits on for a client however the
+/// case ends.
+struct StopWhenDropped(std::sync::Arc<kr_boundary_windows::win::pipe::Stop>);
+
+impl Drop for StopWhenDropped {
+    fn drop(&mut self) {
+        self.0.set();
+    }
+}
+
+/// The result of a thread that ends by itself within `seconds`, or the reason that it did not. A
+/// thread that does not end is left to the stop that the case sets as it ends.
+fn ends_within<T>(thread: std::thread::JoinHandle<T>, seconds: u64) -> Result<T, String> {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    while !thread.is_finished() {
+        if std::time::Instant::now() >= until {
+            return Err(format!("the thread had not ended in {seconds} seconds"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(thread.join().unwrap())
 }
 
 /// A client of the loop opened like [`client_without`], that gives the reason instead of a panic when
