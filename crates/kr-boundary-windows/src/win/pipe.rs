@@ -227,7 +227,7 @@ fn wait(
                 "the other end did not answer before the deadline",
             )
         } else {
-            io::Error::new(io::ErrorKind::Interrupted, "the service is stopping")
+            stopping()
         });
     }
     let mut transferred = 0_u32;
@@ -236,6 +236,13 @@ fn wait(
         return Err(io::Error::last_os_error());
     }
     Ok((transferred, transfer))
+}
+
+/// The error of a transfer that the stop ended. It is not `Interrupted`: the frame reader, `read_exact`
+/// and `write_all` retry that kind, each retry starts a transfer that the set stop ends again at
+/// once, and the connection would never let go of the thread that serves it.
+fn stopping() -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionAborted, "the service is stopping")
 }
 
 fn stuck_error() -> io::Error {
@@ -429,6 +436,16 @@ pub struct Listener {
     bound: Option<Summary>,
 }
 
+/// What an attempt to make the waiting instance gave.
+enum Refill {
+    /// The instance, made and confirmed.
+    Waiting(Handle),
+    /// Every instance the pipe may have is in use.
+    Busy,
+    /// The instance could not be made or read; nothing of it is kept.
+    Failed(super::ffi::Error),
+}
+
 // SAFETY: the descriptor is owned by the listener and only read to make an instance.
 unsafe impl Send for Listener {}
 
@@ -485,33 +502,32 @@ impl Listener {
         self.stop.is_set()
     }
 
-    /// Confirms that an instance is the pipe `bind` made: the owner and the permission list are the
-    /// ones the first instance showed. A pipe that another program made first has its own.
-    fn confirm(&self, pipe: &Handle) -> Result<()> {
-        let shown = summary_of_handle(pipe)?;
-        if self.bound.as_ref().is_some_and(|bound| *bound != shown) {
-            return Err(error(
-                0,
-                "the pipe's owner or permission list is not the one the broker set: another program made the pipe's name, so the broker stops",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Makes the instance that waits for the next client and confirms it. None when every instance
-    /// the pipe may have is in use.
-    fn refill(&self) -> Result<Option<Handle>> {
+    /// Makes the instance that waits for the next client and confirms that it is the pipe `bind`
+    /// made: the owner and the permission list are the ones the first instance showed, where a pipe
+    /// that another program made first has its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the instance is not the pipe that was bound. An instance that
+    /// cannot be made or read is [`Refill::Failed`]: it is not used, and the caller tries again.
+    fn refill(&self) -> Result<Refill> {
         #[cfg(feature = "testing")]
         if testing::take_refill_failure() {
-            return Err(error(8, "making the pipe"));
+            return Ok(Refill::Failed(error(8, "making the pipe")));
         }
         match self.instance(false) {
-            Ok(pipe) => {
-                self.confirm(&pipe)?;
-                Ok(Some(pipe))
-            }
-            Err(failure) if failure.code == ERROR_PIPE_BUSY => Ok(None),
-            Err(failure) => Err(failure),
+            Ok(pipe) => match summary_of_handle(&pipe) {
+                Ok(shown) if self.bound.as_ref().is_some_and(|bound| *bound != shown) => {
+                    Err(error(
+                        0,
+                        "the pipe's owner or permission list is not the one the broker set: another program made the pipe's name, so the broker stops",
+                    ))
+                }
+                Ok(_) => Ok(Refill::Waiting(pipe)),
+                Err(failure) => Ok(Refill::Failed(failure)),
+            },
+            Err(failure) if failure.code == ERROR_PIPE_BUSY => Ok(Refill::Busy),
+            Err(failure) => Ok(Refill::Failed(failure)),
         }
     }
 
@@ -549,14 +565,19 @@ impl Listener {
     ///
     /// The fault of one connection ends that connection only: a client that connected and closed
     /// before the wait, or an instance that could not be connected, is disconnected and the wait
-    /// goes on. The next instance is made before the connection is handed on.
+    /// goes on. The next instance is made before the connection is handed on; when it cannot be
+    /// made, the client in hand is served all the same and the next call makes it again. At the
+    /// stop the instance that waits stays with the listener, so the name is held until the listener
+    /// is dropped.
     ///
     /// # Errors
     ///
-    /// Returns the platform's error when the listener cannot keep the pipe's name: an instance
-    /// cannot be made or is not the pipe that was bound, or the pipe fails again and again.
+    /// Returns the platform's error when the listener cannot keep the pipe's name: an instance is
+    /// not the pipe that was bound, none can be made a thousand times in a row, or the pipe fails
+    /// again and again.
     pub fn accept(&mut self) -> Result<Option<Connection>> {
         let mut failed_in_a_row = 0_u32;
+        let mut refill_failed_in_a_row = 0_u32;
         loop {
             if self.stop.is_set() {
                 return Ok(None);
@@ -564,8 +585,16 @@ impl Listener {
             let pipe = match self.next.take() {
                 Some(pipe) => pipe,
                 None => match self.refill()? {
-                    Some(pipe) => pipe,
-                    None => {
+                    Refill::Waiting(pipe) => pipe,
+                    Refill::Busy => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        continue;
+                    }
+                    Refill::Failed(failure) => {
+                        refill_failed_in_a_row += 1;
+                        if refill_failed_in_a_row > 1000 {
+                            return Err(failure);
+                        }
                         std::thread::sleep(std::time::Duration::from_millis(20));
                         continue;
                     }
@@ -588,7 +617,9 @@ impl Listener {
                 if code == ERROR_IO_PENDING {
                     match wait(pipe.raw(), transfer, &self.stop, None, &mut stuck) {
                         Ok(_) => {}
-                        Err(failure) if failure.kind() == io::ErrorKind::Interrupted => {
+                        Err(_) if self.stop.is_set() => {
+                            // The instance stays with the listener until the listener ends.
+                            self.next = Some(pipe);
                             return Ok(None);
                         }
                         Err(_) => gone = true,
@@ -602,19 +633,18 @@ impl Listener {
                 if failed_in_a_row > 1000 {
                     return Err(error(0, "the pipe failed a thousand times in a row"));
                 }
-                if stuck {
-                    // A transfer that did not end is left with its pipe: the next instance is new.
-                    self.next = self.refill()?;
-                } else {
-                    // SAFETY: the pipe is open; the client's end is closed or not connected.
-                    unsafe {
-                        DisconnectNamedPipe(pipe.raw());
-                    }
-                    self.next = Some(pipe);
+                // SAFETY: the pipe is open; the client's end is closed or not connected.
+                unsafe {
+                    DisconnectNamedPipe(pipe.raw());
                 }
+                self.next = Some(pipe);
                 continue;
             }
-            self.next = self.refill()?;
+            // Where no instance is made now (all are in use, or the platform failed once), the
+            // client in hand is served and the next call makes the instance again.
+            if let Refill::Waiting(next) = self.refill()? {
+                self.next = Some(next);
+            }
             return Ok(Some(Connection {
                 pipe,
                 stop: Arc::clone(&self.stop),
