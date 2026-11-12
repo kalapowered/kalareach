@@ -129,7 +129,10 @@ fn a_table_that_carries_a_listed_member_needs_a_range_that_starts_at_its_arrival
                 { "type": "member", "name": "id" },
             ] },
             "hidden_when": [{
-                "place": { "segments": [{ "type": "member", "name": "params" }] },
+                "place": { "segments": [
+                    { "type": "member", "name": "params" },
+                    { "type": "member", "name": "marked" },
+                ] },
                 "values": ["x"],
             }],
         }] });

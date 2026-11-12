@@ -440,7 +440,10 @@ fn kr_req_12_06_the_conditions_of_a_hidden_request_are_checked_when_the_table_is
             )],
         ),
     ]);
-    let report = validated(&fits);
+    // A table that states the member needs a range that starts at the version it arrived in.
+    let report = validate_with(&fits, |manifest| {
+        manifest.sdk_range = ">=0.1.7, <0.2.0".parse().expect("a range");
+    });
     assert!(report.is_valid(), "{:?}", report.findings);
 
     let many = with(
