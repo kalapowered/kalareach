@@ -2,14 +2,15 @@
  * The tap record of the test harness.
  *
  * Whether a tap on a message's link opens it depends on the events the platform sends for a finger
- * on the glass: which target the pointer events have, whether a click follows, and with what detail.
+ * on the glass: which target the pointer events have, whether a click follows, what it names, with
+ * what detail, and from which pointer.
  * A test that drives the application on a device taps by coordinates and cannot see the page's
  * events, so this puts them on the page as text, which the device's accessibility tree carries: the
  * events the page saw, the rectangles of the links' words, the links the host opened and where the
  * focus is. It is started by the strip, which also fills the first session with the messages the taps
  * need. The harness bundle is built only for tests, so none of this ships.
  *
- * The record listens on the document, in the capture phase, as the pane's own press handling does, so
+ * The record listens on the document, in the capture phase, as the pane's own tap handling does, so
  * that it adds nothing the platform counts as a click listener on the page's content.
  */
 
@@ -19,10 +20,16 @@ import type { FakeHostControls } from './host/fake'
 
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
-/** What the taps need on the conversation: two table rows, text after a link, and room to scroll. */
+/**
+ * What the taps need on the conversation: two table rows, text after a link, a link with another on
+ * the next line, the control of an image that has not been loaded with a link on the next line, and
+ * room to scroll.
+ */
 const TAP_MESSAGES: readonly string[] = [
   ['| Item | Notes |', '| --- | --- |', '| one | [first notes](https://example.org/table-1) |', '| two | [second notes](https://example.org/table-2) |'].join('\n'),
   '[docs](https://example.org/docs) and more words follow the link on this line, which ends the paragraph.',
+  '[the upper link](https://example.org/upper)  \n[the lower link](https://example.org/lower) is under it.',
+  '![a picture](https://example.org/picture.png)  \n[a link under the image](https://example.org/under-image)',
   ...Array.from(
     { length: 16 },
     (_, index) => `Plain words in paragraph ${String(index + 1)}, which holds no link, so that the conversation is longer than the screen and scrolls.`
@@ -51,7 +58,7 @@ const describe = (target: EventTarget | null): string => {
 
 const round = (value: number): string => (Math.round(value * 10) / 10).toString()
 
-/** The record, as three lines of text on the page and a fourth for the focus. */
+/** The record, as lines of text on the page: the events, the links' rectangles, the links opened and the focus. */
 export function TapRecord({ controls }: { readonly controls: FakeHostControls }): ReactNode {
   useEffect(() => {
     const seen: string[] = []
@@ -89,8 +96,10 @@ export function TapRecord({ controls }: { readonly controls: FakeHostControls })
     const note = (event: Event): void => {
       const at = event as MouseEvent
       order += 1
+      const pointer = event as PointerEvent
+      // The event's class, and the pointer's number and type where the event has them: `-` where it has not.
       seen.push(
-        `E ${String(order)} ${event.type} ${describe(event.target)} ${event.isTrusted ? '1' : '0'} ${String(at.detail ?? 0)} ${round(at.clientX ?? 0)} ${round(at.clientY ?? 0)}`
+        `E ${String(order)} ${event.type} ${describe(event.target)} ${event.isTrusted ? '1' : '0'} ${String(at.detail ?? 0)} ${round(at.clientX ?? 0)} ${round(at.clientY ?? 0)} ${event.constructor.name} ${typeof pointer.pointerId === 'number' ? String(pointer.pointerId) : '-'} ${pointer.pointerType || '-'}`
       )
       if (seen.length > KEPT) seen.shift()
       show()
