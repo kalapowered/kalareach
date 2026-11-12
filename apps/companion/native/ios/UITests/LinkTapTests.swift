@@ -150,10 +150,11 @@ final class LinkTapTests: HarnessTestCase {
         let openedBefore = opened().count
         let start = screenPoint(point, shift)
         let end = screenPoint(CGPoint(x: point.x + distance.dx, y: point.y + distance.dy), shift)
-        start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.2)
+        // A swipe at the system's own speed, which the page takes for a scroll.
+        start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .default, thenHoldForDuration: 0)
         Thread.sleep(forTimeInterval: 1.2)
         let seen = events().filter { $0.order > before }
-        let result = Result(label: label, events: seen, opened: Array(opened().dropFirst(openedBefore)), focus: recordText("TAPFOCUS"))
+        let result = Result(label: label, events: seen, opened: Array(opened().dropFirst(openedBefore)), focus: "\(recordText("TAPFOCUS")) scrolled \(Int(pane().top))")
         report(result, at: point)
         return result
     }
