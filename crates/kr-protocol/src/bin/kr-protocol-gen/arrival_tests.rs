@@ -464,6 +464,86 @@ fn a_listed_member_outside_the_connector_tables_definitions_fails_with_its_own_m
     );
 }
 
+/// The protocol's read-only metadata marker has no meaning in the SDK's schema: an optional member
+/// added to an SDK definition that carries it fails unless the table lists it, and passes by the
+/// table, with its name in the run, when it does.
+#[test]
+fn the_protocols_read_only_marker_means_nothing_in_the_sdk_schema() {
+    let protocol = protocol_schema();
+    let mut old = sdk_schema();
+    old["$defs"]["Marked"] = json!({
+        "type": "object",
+        "x-kalareach-read-only-metadata": true,
+        "properties": { "a": { "type": "string" } },
+    });
+    old["$defs"]["ConnectorManifest"]["properties"]["marked"] = json!({ "$ref": "#/$defs/Marked" });
+    let mut new = old.clone();
+    new["$defs"]["Marked"]["properties"]["extra"] = json!({ "type": "string" });
+
+    // The protocol's comparison passes this member; the SDK's does not.
+    assert!(
+        crate::public_contract::compare(&old, &new)
+            .expect("compares")
+            .is_empty()
+    );
+    for (name, earlier, head) in [
+        (
+            "no entry",
+            contract("0.1.6", None),
+            contract("0.1.7", Some(&[])),
+        ),
+        (
+            "no rise",
+            contract("0.1.7", None),
+            contract("0.1.7", Some(&[("Marked", "extra", "0.1.7")])),
+        ),
+    ] {
+        let outcome = compare(&old, &new, (&protocol, &protocol), &earlier, &head);
+        assert!(outcome.passed.is_empty(), "{name}: {:?}", outcome.passed);
+        assert_eq!(
+            outcome.lines,
+            vec!["Marked.extra added: a member".to_owned()],
+            "{name}"
+        );
+    }
+    let listed = compare(
+        &old,
+        &new,
+        (&protocol, &protocol),
+        &contract("0.1.6", None),
+        &contract("0.1.7", Some(&[("Marked", "extra", "0.1.7")])),
+    );
+    assert_eq!(listed.lines, Vec::<String>::new());
+    assert_eq!(
+        listed.passed,
+        vec!["Marked.extra arrived at 0.1.7, earlier release at 0.1.6".to_owned()]
+    );
+}
+
+/// A listed member passes only in a definition that is an object in both schemas: a string
+/// definition that gains `properties` is not an object gaining a member.
+#[test]
+fn a_listed_member_passes_only_in_an_object_definition() {
+    let protocol = protocol_schema();
+    let mut old = sdk_schema();
+    old["$defs"]["Label"] = json!({ "type": "string" });
+    old["$defs"]["ConnectorManifest"]["properties"]["label"] = json!({ "$ref": "#/$defs/Label" });
+    let mut new = old.clone();
+    new["$defs"]["Label"]["properties"] = json!({ "extra": { "type": "string" } });
+    let outcome = compare(
+        &old,
+        &new,
+        (&protocol, &protocol),
+        &contract("0.1.6", None),
+        &contract("0.1.7", Some(&[("Label", "extra", "0.1.7")])),
+    );
+    assert!(outcome.passed.is_empty(), "{:?}", outcome.passed);
+    assert_eq!(
+        outcome.lines,
+        vec!["Label.extra added: a member".to_owned()]
+    );
+}
+
 /// A member of a definition that the protocol schema has stays under the protocol's rule: the
 /// table cannot list it into the SDK's, whichever release the protocol schema is of.
 #[test]

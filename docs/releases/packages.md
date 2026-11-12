@@ -230,13 +230,14 @@ naming the release and each difference, in the schema (cut over both revisions' 
 root that was dropped cannot hide a change), in the tables of what the worker serves (renaming an
 event, or serving a method no longer, changes no definition of the schema), in the plugin host
 protocol and in the table of public majors. It also compares the protocol schema as a whole, every
-definition a root, and the plugin SDK schema
-(`packages/plugin-sdk/schema/kalareach-plugin-sdk.schema.json`, read from the committed file of the
-commit and of each release) with the same rule as the public contract below, and fails on each
+definition a root, with the same rule as the public contract below, and fails on each
 difference except a new method, a definition that is new, an optional member added to an object
-the earlier release marked read-only metadata, a new section of the configuration document and, in
-the plugin SDK schema only, an optional member that the SDK's arrival table lists. A
-new method is a variant added to `Method` that is one plain string constant, whose name no variant
+the earlier release marked read-only metadata, and a new section of the configuration document. It
+compares the plugin SDK schema
+(`packages/plugin-sdk/schema/kalareach-plugin-sdk.schema.json`, read from the committed file of the
+commit and of each release) in the same way, but only a definition that is new and an optional
+member that the SDK's arrival table lists pass there, and the read-only marker means nothing in it.
+A new method is a variant added to `Method` that is one plain string constant, whose name no variant
 of the earlier release had and no other variant has. Descriptions and titles are ignored. A
 release from before `worker-surface.json` has no table to compare, so its tables are left out and
 its schema, plugin host protocol and table of public majors are compared. A release of the level without the SDK schema file or the SDK's
@@ -247,15 +248,18 @@ The plugin SDK schema has one more exception, for a member that the SDK's own ar
 The table is `arrivals` in `packages/plugin-sdk/schema/package-contract.json`, generated from
 `crates/kr-plugin-sdk/src/arrivals.rs`: for each member, its definition, its name and the SDK
 version it arrived at. The check passes an optional member added to a definition, and says each one
-it passes with both versions, when all of these hold: the definition is one that neither release's
-protocol schema has, that the connector table's root (`ConnectorManifest`) reaches and that the
+it passes with both versions, when all of these hold: the definition is an object in both SDK
+schemas, one that neither release's protocol schema has, that the connector table's root (`ConnectorManifest`) reaches and that the
 package manifest's root (`PluginManifest`) does not, in the earlier release's SDK schema and in the
 commit's; the commit's table lists the member at an SDK version above the `sdk_version` that the
 earlier release's contract states; and the commit's own `sdk_version` is above that version too. A
 required member, a member the table does not list, a member listed with no rise, a member of a
 definition the protocol schema shares or the package manifest reaches, a nested member, a new
 variant, a changed type, default or bound, a removal, a lower SDK version, and an entry of an
-earlier release's table that the commit's table changes or lacks all still fail. A release from
+earlier release's table that the commit's table changes or lacks all still fail. So does every
+arrival when a definition that both SDK schemas have points a reference at another definition than
+it did, since the comparison goes by where a definition is used and not by its name; that holds for
+a reference to an equal definition and for `oneOf` branches in a new order too. A release from
 before the table has an empty one, and a release whose contract file is missing, states no SDK
 version or has a table that does not read fails the check with a message of its own. The table
 lists a member only where a package that lacks it means what it meant before, and an earlier host

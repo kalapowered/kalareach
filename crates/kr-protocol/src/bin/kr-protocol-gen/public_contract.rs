@@ -94,9 +94,8 @@ fn accepted(old: &Value, new: &Value, difference: &Difference) -> bool {
     marked && !required
 }
 
-/// Every difference between one release's schema and the head's, with every definition a root,
-/// that an earlier reader could not read.
-fn rejected(old: &Value, new: &Value) -> Result<Vec<Difference>, String> {
+/// Every difference between one release's schema and the head's, with every definition a root.
+fn all_differences(old: &Value, new: &Value) -> Result<Vec<Difference>, String> {
     let names = |schema: &Value| -> BTreeSet<String> {
         schema["$defs"]
             .as_object()
@@ -106,7 +105,13 @@ fn rejected(old: &Value, new: &Value) -> Result<Vec<Difference>, String> {
     let roots: BTreeSet<String> = names(old).union(&names(new)).cloned().collect();
     let before = cut_over(old, &roots).map_err(|error| error.to_string())?;
     let after = cut_over(new, &roots).map_err(|error| error.to_string())?;
-    Ok(differences(&before, &after)
+    Ok(differences(&before, &after))
+}
+
+/// Every difference between one release's schema and the head's, with every definition a root,
+/// that an earlier reader could not read.
+fn rejected(old: &Value, new: &Value) -> Result<Vec<Difference>, String> {
+    Ok(all_differences(old, new)?
         .into_iter()
         .filter(|difference| !accepted(old, new, difference))
         .collect())
@@ -422,8 +427,8 @@ pub struct PassedMember {
 ///
 /// * it is a member added to a definition, with no nesting: not a member of a variant, an item or
 ///   a value, and not a variant;
-/// * both SDK schemas have the definition, the earlier one without the member and the head's with
-///   it, and the head's does not require it;
+/// * both SDK schemas have the definition as an object, the earlier one without the member and the
+///   head's with it, and the head's does not require it;
 /// * neither release's protocol schema has a definition of that name, because the protocol's own
 ///   rule holds what a client of the protocol reads;
 /// * the head's table lists the member at an SDK version above the earlier release's;
@@ -463,6 +468,8 @@ fn is_a_listed_arrival(
     let has_member = new["$defs"][definition]["properties"]
         .as_object()
         .is_some_and(|members| members.contains_key(member));
+    let is_an_object =
+        |schema: &Value| schema["$defs"][definition]["type"].as_str() == Some("object");
     let required = new["$defs"][definition]
         .get("required")
         .and_then(Value::as_array)
@@ -476,6 +483,8 @@ fn is_a_listed_arrival(
     let arrived = listed.version;
     if !(has_no_member
         && has_member
+        && is_an_object(old)
+        && is_an_object(new)
         && !required
         && !shared
         && arrived > earlier.version
@@ -589,9 +598,12 @@ fn moved_reference(old: &Value, new: &Value, arrived: &[PassedMember]) -> Option
 }
 
 /// As [`compare_for_a_level`], for the plugin SDK's schema, which has its own function so that the
-/// protocol's comparison does not change. A difference passes only when the SDK's own arrival
-/// table lists it ([`is_a_listed_arrival`]); every other difference fails, as it does for the
-/// protocol schema, and so does an entry of the earlier release's table that the head's table
+/// protocol's comparison does not change. A difference passes only when it is a new definition or
+/// the SDK's own arrival table lists it ([`is_a_listed_arrival`]); every other difference fails.
+/// The protocol's read-only metadata marker (`x-kalareach-read-only-metadata`) has no meaning in
+/// the SDK's schema: an optional member added to an SDK definition that carries it is a member like
+/// any other, and fails unless it is listed. A new definition is a difference that no reader of an
+/// earlier release meets, as it is for the protocol schema. An entry of the earlier release's table that the head's table
 /// changed or lacks, since a member that passed once is not one the table may take back. A head
 /// whose SDK version is below the release's fails, and so does a head in which a definition refers
 /// to another definition than it did (the comparison goes by where a definition is used and not by
@@ -614,7 +626,12 @@ pub fn compare_sdk_for_a_level(
 ) -> Result<Vec<String>, String> {
     let mut lines = Vec::new();
     let mut arrived = Vec::new();
-    for difference in rejected(old, new)? {
+    // The protocol's read-only metadata marker has no meaning in the SDK's schema, so this does not
+    // go through `accepted`: a new definition passes, a listed member passes, and nothing else.
+    for difference in all_differences(old, new)? {
+        if difference.kind == DifferenceKind::Added && difference.detail.starts_with("a root") {
+            continue;
+        }
         match is_a_listed_arrival(old, new, protocols, earlier, head, &difference) {
             Ok(Some(member)) => arrived.push(member),
             Ok(None) => lines.push(difference.to_string()),
