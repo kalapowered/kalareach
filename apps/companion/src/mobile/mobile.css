@@ -733,8 +733,13 @@
  *
  * The area reaches half a line into the lines above and below, as a target this tall must, and over
  * plain words after the link. Each button is above plain text, so a press anywhere in its box is its
- * own; the words of each link are a layer above every button, so a press on a link's words is that
- * link's whichever neighbour's area lies under it.
+ * own. The words of each link are a layer above every button, and the layer is the link's whole
+ * lines, not only the glyphs: a press anywhere in a link's own line is that link's, whichever
+ * neighbour's area lies under it. Between two links one above the other, the press goes to the link
+ * whose line it is in, which is the link whose words are nearer: the middle between them is the
+ * boundary of their lines. Two links with one plain line between them share the reach that overlaps
+ * in that line at its middle, to within a pixel and a half. On one line, between the words of two
+ * links, the later link's area is the one that is above.
  */
 .m-node .md-link {
   --reach-block: 16px;
@@ -751,6 +756,7 @@
 }
 
 .m-node .md-link-label {
+  display: block;
   position: relative;
   z-index: 1;
 }
