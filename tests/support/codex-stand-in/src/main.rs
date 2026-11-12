@@ -23,6 +23,8 @@
 #[cfg(unix)]
 mod contract;
 #[cfg(unix)]
+mod keyboard;
+#[cfg(unix)]
 mod record;
 #[cfg(unix)]
 mod server;
