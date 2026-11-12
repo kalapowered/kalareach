@@ -1497,9 +1497,17 @@ fn a_removal_that_could_not_delete_the_earlier_state_record_a_replacement_or_sta
         let (code, output) = setup(&["remove"], "yes\n", &[]);
         drop(held);
         assert_ne!(code, 0, "{what}: {output}");
+        // A file inside `staging` is not removed alone: the directory that holds it is the one the
+        // removal could not delete, and the one it names.
+        let named = if record.starts_with(&paths.staging) {
+            paths.staging.clone()
+        } else {
+            record.clone()
+        };
         assert!(
-            output.contains(&record.display().to_string()),
-            "{what}: the record that stayed is named: {output}"
+            output.contains(&named.display().to_string()),
+            "{what}: what stayed is named ({}): {output}",
+            named.display()
         );
         assert!(
             paths.manifest.is_file(),
