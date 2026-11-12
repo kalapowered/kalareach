@@ -43,9 +43,18 @@
 //! never the binding, a turn in that thread is not the conversation's turn and its end is no
 //! completion of the conversation's, and a leave of that thread changes nothing.
 //!
+//! A request of a route that states conditions, whose message the conditions cannot be read in (the
+//! parameters are not an object: a server may take a positional array, which names no member), is
+//! neither hidden nor a selection. Its reply is never applied, and from its admission what the
+//! terminal is in is unknown, as for a selection whose outcome is lost: rich mutations wait until
+//! a later selection that can be read is answered. A member repeated inside the parameters takes
+//! its last occurrence here and in the server alike.
+//!
 //! A leave names the conversation it ends. One that names a conversation other than the bound one
 //! is not kept open either, unless a request that selects is open or the reply to one is kept: that
-//! reply may be the conversation named. A leave of the bound conversation leaves the instance with
+//! reply may be the conversation named. This holds for every table, one that states no condition
+//! included: such a table reads its selections as it always did, and its leaves of another
+//! conversation hold nothing back. A leave of the bound conversation leaves the instance with
 //! none, and no earlier selection is restored: the instance waits for the next reply that names a
 //! conversation.
 //!
@@ -74,6 +83,7 @@ use crate::broker::connectors::DECISION_SCHEMA;
 use crate::broker::error::{BrokerError, Result};
 use crate::broker::gateway::{identifier_of, member_at};
 use crate::broker::ledger::TransitionCause;
+use crate::broker::reading::RequestReading;
 use crate::broker::{Broker, BrokerState, CONVERSATION_NOT_BOUND, OnStoreFault, THREAD_NOT_READ};
 use kr_protocol::gateway::DownstreamRequestId;
 
@@ -260,12 +270,21 @@ impl BrokerState {
         let kind = match reading.as_deref() {
             Some(reading) if reading.selections.contains_key(method) => {
                 let places = reading.selections.get(method)?;
-                // A request the terminal makes for a thread of its own, that it never shows,
-                // selects nothing: its reply and that thread's leave change nothing here.
-                if places.hides(&body()) {
-                    return None;
+                match places.read(frame) {
+                    // A request the terminal makes for a thread of its own, that it never shows,
+                    // selects nothing: its reply and that thread's leave change nothing here.
+                    RequestReading::Hidden => return None,
+                    // A request the conditions cannot be tested against may have selected the
+                    // thread its reply names or not. Nothing waits for its reply, which is never
+                    // applied, and what the terminal is in is unknown until a later selection
+                    // that can be read is answered.
+                    RequestReading::Unreadable => {
+                        let seq = instance.stream.take_seq();
+                        instance.stream.hold_unknown(seq);
+                        return None;
+                    }
+                    RequestReading::Selects => Some(OpenKind::Selection(places.thread.clone())),
                 }
-                Some(OpenKind::Selection(places.thread.clone()))
             }
             Some(reading) if reading.leaves.contains_key(method) => {
                 let named_by = reading
