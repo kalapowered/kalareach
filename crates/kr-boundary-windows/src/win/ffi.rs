@@ -291,6 +291,58 @@ impl Sid {
         self.storage.as_ptr().cast_mut().cast()
     }
 
+    /// The account's name as the system resolves it, with its domain (`BUILTIN\Users`), or `None`
+    /// where it does not resolve.
+    #[must_use]
+    pub fn account_name(&self) -> Option<String> {
+        use windows_sys::Win32::Security::LookupAccountSidW;
+        let (mut name_length, mut domain_length) = (0_u32, 0_u32);
+        let mut kind: SID_NAME_USE = 0;
+        // SAFETY: the identifier is valid; with no buffers the call only reports the sizes.
+        unsafe {
+            LookupAccountSidW(
+                null(),
+                self.as_ptr(),
+                null_mut(),
+                &raw mut name_length,
+                null_mut(),
+                &raw mut domain_length,
+                &raw mut kind,
+            );
+        }
+        if name_length == 0 {
+            return None;
+        }
+        let mut name = vec![0_u16; name_length as usize];
+        let mut domain = vec![0_u16; domain_length.max(1) as usize];
+        // SAFETY: both buffers are the sizes the first call asked for.
+        let found = unsafe {
+            LookupAccountSidW(
+                null(),
+                self.as_ptr(),
+                name.as_mut_ptr(),
+                &raw mut name_length,
+                domain.as_mut_ptr(),
+                &raw mut domain_length,
+                &raw mut kind,
+            )
+        };
+        if found == 0 {
+            return None;
+        }
+        name.truncate(name_length as usize);
+        domain.truncate(domain_length as usize);
+        let (name, domain) = (
+            String::from_utf16_lossy(&name),
+            String::from_utf16_lossy(&domain),
+        );
+        Some(if domain.is_empty() {
+            name
+        } else {
+            format!("{domain}\\{name}")
+        })
+    }
+
     /// The identifier as text.
     #[must_use]
     pub fn to_text(&self) -> String {

@@ -463,11 +463,9 @@ unsafe fn finding_in(owner: *mut c_void, dacl: *mut ACL, counts: Counts) -> Resu
         };
         if mask & mask_of_interest != 0 && !system_class(&sid) {
             if counts == Counts::Above {
-                return Ok(Some(format!(
-                    "{} is allowed to {} on it (rights 0x{:x})",
-                    sid.to_text(),
-                    crate::remedy::rights_in_words(mask & mask_of_interest),
-                    mask & mask_of_interest
+                return Ok(Some(crate::remedy::rights_finding(
+                    &crate::remedy::identity_text(sid.account_name().as_deref(), &sid.to_text()),
+                    mask & mask_of_interest,
                 )));
             }
             return Ok(Some(format!(
