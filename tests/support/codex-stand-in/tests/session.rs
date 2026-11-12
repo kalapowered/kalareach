@@ -121,6 +121,10 @@ async fn the_server_runs_a_turn_and_ends_its_commands_with_its_input() {
     write(&mut stdin, &turn_request("thread-1")).await;
     assert!(next(&mut lines).await["result"]["turn"].is_object());
     assert_eq!(next(&mut lines).await["method"], "turn/started");
+    assert_eq!(next(&mut lines).await["method"], "item/started");
+    let said = next(&mut lines).await;
+    assert_eq!(said["method"], "item/completed");
+    assert_eq!(said["params"]["item"]["type"], "userMessage");
     let asked = next(&mut lines).await;
     assert_eq!(asked["method"], "item/commandExecution/requestApproval");
     write(
@@ -214,6 +218,10 @@ async fn the_server_steers_interrupts_resumes_forks_and_unsubscribes() {
     write(&mut stdin, &turn_request("thread-1")).await;
     assert_eq!(next(&mut lines).await["result"]["turn"]["id"], "turn-1");
     assert_eq!(next(&mut lines).await["method"], "turn/started");
+    assert_eq!(next(&mut lines).await["method"], "item/started");
+    let said = next(&mut lines).await;
+    assert_eq!(said["method"], "item/completed");
+    assert_eq!(said["params"]["item"]["type"], "userMessage");
     let asked = next(&mut lines).await;
     assert_eq!(asked["method"], "item/commandExecution/requestApproval");
 
@@ -273,6 +281,8 @@ async fn the_server_steers_interrupts_resumes_forks_and_unsubscribes() {
     .await;
     assert_eq!(next(&mut lines).await["result"]["turn"]["id"], "turn-2");
     assert_eq!(next(&mut lines).await["method"], "turn/started");
+    assert_eq!(next(&mut lines).await["method"], "item/started");
+    assert_eq!(next(&mut lines).await["method"], "item/completed");
     assert_eq!(next(&mut lines).await["method"], "turn/completed");
 
     // Forking makes a thread of its own; resuming one that is known answers with that thread;
@@ -1069,4 +1079,74 @@ async fn a_server_resumes_a_thread_the_agents_record_holds_and_no_other() {
     assert_eq!(refused["id"], "r2");
     assert!(refused.get("error").is_some(), "{refused}");
     let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// A thread the terminal starts for its own purposes (the title of a conversation) is described as
+/// the pinned server describes it: ephemeral, with the source the request named. The conversation's
+/// own thread is described as kept, with the source the terminal named for it. A turn in the hidden
+/// thread runs to its end at once, in turn numbers of its own, so that the conversation's turns are
+/// numbered as they were.
+#[tokio::test]
+async fn a_thread_started_for_a_title_is_marked_and_its_turn_is_not_the_conversations() {
+    let mut child = server("", None);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
+
+    write(&mut stdin, &initialize()).await;
+    assert_eq!(next(&mut lines).await["id"], "initialize");
+    assert_eq!(
+        next(&mut lines).await["method"],
+        "remoteControl/status/changed"
+    );
+    write(&mut stdin, &json!({"method":"initialized"})).await;
+
+    write(
+        &mut stdin,
+        &json!({"id":2,"method":"thread/start","params":{"ephemeral":false,"threadSource":"user"}}),
+    )
+    .await;
+    let own = next(&mut lines).await;
+    assert_eq!(own["result"]["thread"]["id"], "thread-1");
+    assert_eq!(own["result"]["thread"]["ephemeral"], false);
+    assert_eq!(own["result"]["thread"]["threadSource"], "user");
+    assert_eq!(next(&mut lines).await["method"], "thread/started");
+
+    write(
+        &mut stdin,
+        &json!({"id":"temporary-config-1","method":"config/read","params":{"includeLayers":false,"cwd":"/"}}),
+    )
+    .await;
+    assert_eq!(next(&mut lines).await["id"], "temporary-config-1");
+    write(
+        &mut stdin,
+        &json!({"id":"temporary-structured-1","method":"thread/start","params":{
+            "ephemeral":true,"threadSource":"system"}}),
+    )
+    .await;
+    let hidden = next(&mut lines).await;
+    let hidden_id = hidden["result"]["thread"]["id"]
+        .as_str()
+        .expect("an id")
+        .to_owned();
+    assert_ne!(hidden_id, "thread-1");
+    assert_eq!(hidden["result"]["thread"]["ephemeral"], true);
+    assert_eq!(hidden["result"]["thread"]["threadSource"], "system");
+    assert_eq!(next(&mut lines).await["method"], "thread/started");
+
+    // The hidden thread's turn begins and ends, and the server writes the user's message into it.
+    write(
+        &mut stdin,
+        &json!({"id":"temporary-structured-turn-1","method":"turn/start","params":{
+            "threadId":hidden_id,"input":[{"type":"text","text":"title","text_elements":[]}]}}),
+    )
+    .await;
+    assert_eq!(next(&mut lines).await["id"], "temporary-structured-turn-1");
+    assert_eq!(next(&mut lines).await["method"], "turn/started");
+    assert_eq!(next(&mut lines).await["method"], "item/started");
+    assert_eq!(next(&mut lines).await["method"], "item/completed");
+    assert_eq!(next(&mut lines).await["method"], "turn/completed");
+
+    // The conversation's first turn is still turn-1, which asks for the approval.
+    write(&mut stdin, &turn_request("thread-1")).await;
+    assert_eq!(next(&mut lines).await["result"]["turn"]["id"], "turn-1");
 }
