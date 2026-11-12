@@ -115,6 +115,21 @@ fn require_clean_guest() {
     );
 }
 
+/// The cases that make their folders under the temporary folder run as the system: under another
+/// token the temporary folder lies in the account's profile, whose folders the account itself may
+/// delete in, and the check of the folders above the trees refuses them, as it should.
+fn needs_the_system() -> bool {
+    if kr_boundary_windows::win::token::current_user()
+        .is_ok_and(|user| user.to_text() == "S-1-5-18")
+    {
+        return false;
+    }
+    eprintln!(
+        "SKIPPED: not run under this token: the case makes its folders in the system's temporary folder"
+    );
+    true
+}
+
 fn junction(link: &Path, target: &Path) {
     let made = Command::new("cmd")
         .args(["/c", "mklink", "/J"])
@@ -200,6 +215,9 @@ fn names_the_folder_and_the_right(text: &str, folder: &Path, tree: &str) {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_folder_above_the_data_parent_that_an_ordinary_account_may_delete_in_is_refused() {
+    if needs_the_system() {
+        return;
+    }
     let mut clean = Cleanup::default();
     // `above` is two folders over the data parent, so that a check that read only the nearest folder
     // above would pass.
@@ -262,6 +280,9 @@ fn a_folder_above_the_data_parent_that_an_ordinary_account_may_delete_in_is_refu
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_folder_above_the_program_top_that_an_ordinary_account_may_delete_in_is_refused() {
+    if needs_the_system() {
+        return;
+    }
     let mut clean = Cleanup::default();
     let above = inherited_folder(&mut clean);
     let middle = above.join("Middle");
@@ -287,6 +308,9 @@ fn a_folder_above_the_program_top_that_an_ordinary_account_may_delete_in_is_refu
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_link_at_the_top_of_the_program_tree_never_says_to_remove_the_link() {
+    if needs_the_system() {
+        return;
+    }
     let mut clean = Cleanup::default();
     let target = inherited_folder(&mut clean);
     parent_of(&target);
@@ -325,6 +349,9 @@ fn a_link_at_the_top_of_the_program_tree_never_says_to_remove_the_link() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_fresh_installation_with_a_folder_above_the_program_tree_that_fails_changes_nothing() {
+    if needs_the_system() {
+        return;
+    }
     let mut clean = Cleanup::default();
     let above = inherited_folder(&mut clean);
     let top = above.join("Top");
@@ -352,6 +379,9 @@ fn a_fresh_installation_with_a_folder_above_the_program_tree_that_fails_changes_
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_fresh_installation_refuses_a_link_that_points_nowhere_at_the_program_directorys_name() {
+    if needs_the_system() {
+        return;
+    }
     let mut clean = Cleanup::default();
     let (folder, paths) = data_parent_with_paths(&mut clean);
     let target = inherited_folder(&mut clean);
@@ -383,6 +413,9 @@ fn a_fresh_installation_refuses_a_link_that_points_nowhere_at_the_program_direct
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_link_above_the_data_parent_is_refused() {
+    if needs_the_system() {
+        return;
+    }
     let mut clean = Cleanup::default();
     let target = inherited_folder(&mut clean);
     owned_dir(target.join("KalaReach"));
@@ -416,6 +449,9 @@ fn a_link_above_the_data_parent_is_refused() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_substituted_drive_letter_is_refused_with_the_letter_and_the_real_path() {
+    if needs_the_system() {
+        return;
+    }
     let mut clean = Cleanup::default();
     let real = inherited_folder(&mut clean);
     let letter = ('D'..='Z')
@@ -462,6 +498,9 @@ fn a_substituted_drive_letter_is_refused_with_the_letter_and_the_real_path() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_link_that_points_nowhere_at_the_program_directorys_name_gets_the_links_own_remedy() {
+    if needs_the_system() {
+        return;
+    }
     let mut clean = Cleanup::default();
     let (_folder, paths) = data_parent_with_paths(&mut clean);
     installed_data_directory(&paths);
@@ -493,6 +532,9 @@ fn a_link_that_points_nowhere_at_the_program_directorys_name_gets_the_links_own_
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_link_in_the_program_directory_is_to_be_removed_as_the_link_itself() {
+    if needs_the_system() {
+        return;
+    }
     use kr_boundary_windows::win::fresh;
     use kr_boundary_windows::win::sd::{Principals, SdKind};
     let mut clean = Cleanup::default();
@@ -530,6 +572,9 @@ fn a_link_in_the_program_directory_is_to_be_removed_as_the_link_itself() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_journal_and_a_run_directory_made_after_the_inspection_are_left() {
+    if needs_the_system() {
+        return;
+    }
     require_clean_guest();
     let mut clean = Cleanup::default();
     let (_folder, paths) = data_parent_with_paths(&mut clean);
@@ -567,6 +612,9 @@ fn a_journal_and_a_run_directory_made_after_the_inspection_are_left() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_staging_directory_made_after_the_inspection_is_left_and_named() {
+    if needs_the_system() {
+        return;
+    }
     require_clean_guest();
     let mut clean = Cleanup::default();
     let (_folder, paths) = data_parent_with_paths(&mut clean);
@@ -610,6 +658,9 @@ fn a_staging_directory_made_after_the_inspection_is_left_and_named() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_prior_record_made_after_the_inspection_is_left_and_named() {
+    if needs_the_system() {
+        return;
+    }
     use kr_boundary_windows::manifest::{Prior, STORE_VERSION};
     use kr_boundary_windows::win::service;
     /// The Application Identity service's start value and whether it runs, as the system reports.
@@ -711,6 +762,9 @@ fn a_prior_record_made_after_the_inspection_is_left_and_named() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_removal_where_nothing_is_installed_promises_no_repair() {
+    if needs_the_system() {
+        return;
+    }
     use kr_boundary_windows::win::fresh;
     use kr_boundary_windows::win::sd::{Principals, SdKind};
     require_clean_guest();
@@ -768,6 +822,9 @@ fn a_removal_where_nothing_is_installed_promises_no_repair() {
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see windows_install.rs)"]
 fn a_known_folder_on_a_network_share_is_refused_in_both_walks() {
+    if needs_the_system() {
+        return;
+    }
     require_clean_guest();
     let mut clean = Cleanup::default();
     let folder = inherited_folder(&mut clean);
