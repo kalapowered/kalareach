@@ -44,6 +44,20 @@ const MAX_CONNECTIONS: usize = super::pipe::MAX_INSTANCES as usize - 1;
 /// follows its open at once; a client that has had the pipe for this long and sent nothing is not
 /// waiting for an answer, and its slot goes to the next client.
 const FIRST_FRAME: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a connection of a person who is not an administrator may stay without a request. A
+/// person's client asks for the status right after hello, so a connection that has been quiet for as
+/// long as the first frame is allowed is not waiting for an answer, and its slot goes to the next
+/// client: seven such connections would otherwise hold every slot.
+const PERSON_IDLE: std::time::Duration = FIRST_FRAME;
+/// How long an administrator's connection may stay without a request. The installer's removal asks
+/// the broker for its maintenance state, then writes the policy and waits for the platform's events
+/// (each wait is bounded by 300 seconds at most) with the connection open, and asks for the release
+/// after them, so this is longer than those waits together; an administrator holds the right to
+/// stop the service, so the bound only ends a connection that nobody uses any more.
+const ADMINISTRATOR_IDLE: std::time::Duration = std::time::Duration::from_secs(900);
+/// How long the write of an answer may take. An answer is a small frame that the pipe's buffer
+/// takes whole, so a write that waits this long has a client that reads nothing.
+const ANSWER_WRITE: std::time::Duration = std::time::Duration::from_secs(10);
 /// How long a cycle of proofs lasts, all the proofs of it together: the log names the rule about
 /// 170 s after the start of Windows. A cycle has one absolute deadline, and every wait, every query
 /// of the log and every program of a proof stays within it. The first cycle begins with the
@@ -275,6 +289,7 @@ fn serve() -> Result<(), String> {
 fn run(listener: &mut Listener, state: &Arc<State>) -> Result<(), String> {
     let slots = Slots::new(MAX_CONNECTIONS);
     let mut threads = Vec::new();
+    let mut ended = Ok(());
     loop {
         // A client is taken only when a slot is free. The listener's waiting instance stays where
         // it is meanwhile, so no client is dropped for want of a slot and the pipe's name is held.
@@ -290,8 +305,13 @@ fn run(listener: &mut Listener, state: &Arc<State>) -> Result<(), String> {
         let Some(slot) = slot else {
             break;
         };
-        let Some(connection) = listener.accept().map_err(|error| error.to_string())? else {
-            break;
+        let connection = match listener.accept() {
+            Ok(Some(connection)) => connection,
+            Ok(None) => break,
+            Err(failure) => {
+                ended = Err(failure.to_string());
+                break;
+            }
         };
         if super::privilege::revert_failed() {
             break;
@@ -304,13 +324,16 @@ fn run(listener: &mut Listener, state: &Arc<State>) -> Result<(), String> {
         }));
         threads.retain(|thread| !thread.is_finished());
     }
+    // However the loop ended, the connections that are open end with it, and the service reports
+    // that it stopped only after they have.
+    state.stop.set();
     for thread in threads {
         let _ = thread.join();
     }
     if super::privilege::revert_failed() {
         return Err("a thread could not give its privileges back".to_owned());
     }
-    Ok(())
+    ended
 }
 
 /// What the cases use to run the broker's loop in their own process.
@@ -351,14 +374,20 @@ fn refuse(reason: Refusal, detail: &str) -> Response {
     }
 }
 
-/// Serves one connection until it ends.
+/// Writes one answer within [`ANSWER_WRITE`].
+fn send(connection: &mut Connection, response: &Response) -> Result<(), FrameError> {
+    connection.set_deadline(Some(std::time::Instant::now() + ANSWER_WRITE));
+    frame::write(connection, response)
+}
+
+/// Serves one connection until it ends. Every read and every write has a deadline, so a client
+/// that sends nothing or reads nothing gives its slot back.
 fn answer(mut connection: Connection, state: &State) {
     // The platform lets a server take on a client's identity only after it has read from the pipe,
     // so the first message is read before the caller is identified. Nothing is done with it until
     // the caller is known.
     connection.set_deadline(Some(std::time::Instant::now() + FIRST_FRAME));
     let first = frame::read::<_, Request>(&mut connection);
-    connection.set_deadline(None);
     // A connection that sent no first frame by its deadline, or that failed, is closed.
     if !matches!(first, Ok(_) | Err(FrameError::Malformed(_))) {
         return;
@@ -366,7 +395,7 @@ fn answer(mut connection: Connection, state: &State) {
     let identity = match connection.identity() {
         Ok(identity) => identity,
         Err(error) => {
-            let _ = frame::write(
+            let _ = send(
                 &mut connection,
                 &refuse(Refusal::Failed, &error.to_string()),
             );
@@ -375,7 +404,7 @@ fn answer(mut connection: Connection, state: &State) {
     };
     match first {
         Ok(Request::Hello { version }) if version == frame::VERSION => {
-            if frame::write(
+            if send(
                 &mut connection,
                 &Response::Hello {
                     version: frame::VERSION,
@@ -387,7 +416,7 @@ fn answer(mut connection: Connection, state: &State) {
             }
         }
         Ok(Request::Hello { .. }) => {
-            let _ = frame::write(
+            let _ = send(
                 &mut connection,
                 &refuse(
                     Refusal::Version,
@@ -397,18 +426,24 @@ fn answer(mut connection: Connection, state: &State) {
             return;
         }
         _ => {
-            let _ = frame::write(
+            let _ = send(
                 &mut connection,
                 &refuse(Refusal::Malformed, "the first message must be hello"),
             );
             return;
         }
     }
+    let idle = if identity.administrator {
+        ADMINISTRATOR_IDLE
+    } else {
+        PERSON_IDLE
+    };
     loop {
+        connection.set_deadline(Some(std::time::Instant::now() + idle));
         let request = match frame::read::<_, Request>(&mut connection) {
             Ok(request) => request,
             Err(FrameError::Malformed(reason)) => {
-                let _ = frame::write(&mut connection, &refuse(Refusal::Malformed, &reason));
+                let _ = send(&mut connection, &refuse(Refusal::Malformed, &reason));
                 return;
             }
             Err(_) => return,
@@ -464,7 +499,7 @@ fn answer(mut connection: Connection, state: &State) {
                 }
             }
         };
-        if frame::write(&mut connection, &response).is_err() {
+        if send(&mut connection, &response).is_err() {
             return;
         }
     }
