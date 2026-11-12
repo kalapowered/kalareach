@@ -1431,6 +1431,10 @@ enum Cure {
     /// a name it does not give, a directory nested deeper than it makes anything): remove that
     /// entry.
     RemoveEntry,
+    /// The configuration file that the installation makes empty holds settings: remove it, and a
+    /// repair makes it again, empty. It is a name the installation gives there, so the text of
+    /// [`Cure::RemoveEntry`] does not fit it.
+    EmptyConfig,
     /// The entry could not be opened to be checked: another program holds it open or its list
     /// forbids the check.
     Open,
@@ -1457,6 +1461,10 @@ fn within_refusal(
                 Cure::OwnerAndList => "Make the Administrators group, or the system, its owner and leave the system and the Administrators group as the only accounts that may change it, then run the setup program again. Do not remove it: the manifest records it and stays where it is.".to_owned(),
                 Cure::RemoveEntry => format!(
                     "Remove {}, and nothing else: it is not something that the installation makes there, and a change of its owner or its list does not cure that. A repair makes the program files again. Then run the setup program again.",
+                    entry.display()
+                ),
+                Cure::EmptyConfig => format!(
+                    "Remove {}, and nothing else: the installation makes it empty, and a configuration that holds settings would be read by the Git that the boundary's accounts run, and a change of its owner or its list does not cure that. A repair makes it again, empty. Then run the setup program again.",
                     entry.display()
                 ),
                 Cure::Volume => format!(
@@ -1831,14 +1839,12 @@ fn inspect_within(
                 Some(_) => None,
             };
             if let Some(why) = reason {
-                return Err(within_refusal(
-                    paths,
-                    scope,
-                    dir,
-                    &shown,
-                    why,
-                    Cure::RemoveEntry,
-                ));
+                let cure = if is_git_config(paths, dir, &name) && opened.kind == Kind::File {
+                    Cure::EmptyConfig
+                } else {
+                    Cure::RemoveEntry
+                };
+                return Err(within_refusal(paths, scope, dir, &shown, why, cure));
             }
         }
         if let Some(why) = check_readable_object(&opened.handle)? {
