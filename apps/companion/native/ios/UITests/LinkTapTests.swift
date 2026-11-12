@@ -200,12 +200,14 @@ final class LinkTapTests: HarnessTestCase {
     private func scroll(to name: String) -> Link {
         for _ in 0..<10 {
             let current = link(name)
-            let screenY = (current.words.first?.midY ?? 0) + offset(of: current).dy
-            let distance = screenY - app.windows.firstMatch.frame.height * 0.45
-            if abs(distance) < 80 { return current }
-            // A drag from the middle of the pane moves the content with the finger; a drag that starts on a link scrolls too.
+            let shift = offset(of: current)
             let room = pane().room
-            let start = screenPoint(CGPoint(x: room.midX, y: room.midY), offset(of: current))
+            let screenY = (current.words.first?.midY ?? 0) + shift.dy
+            // The middle of the pane as it is now, which the keyboard can have made short.
+            let distance = screenY - (room.midY + shift.dy)
+            if abs(distance) < 60 { return current }
+            // A drag from the middle of the pane moves the content with the finger; a drag that starts on a link scrolls too.
+            let start = screenPoint(CGPoint(x: room.midX, y: room.midY), shift)
             let end = start.withOffset(CGVector(dx: 0, dy: -max(min(distance, 300), -300)))
             start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.3)
             Thread.sleep(forTimeInterval: 1.0)
@@ -292,6 +294,7 @@ final class LinkTapTests: HarnessTestCase {
         // Toward the end of the conversation if it has room that way, and toward its start if not.
         let place = pane()
         let by: CGFloat = place.top + 180 <= place.most ? -180 : 180
+        say("LINKTAP \(named): the conversation before the drag: room \(place.room), scrolled \(Int(place.top)) of \(Int(place.most))")
         let result = drag("\(named): a drag that scrolls, started on a link", from: CGPoint(x: draggedWords.midX, y: draggedWords.midY), by: CGVector(dx: 0, dy: by), shift: draggedShift)
         XCTAssertTrue(result.events.contains { $0.type == "pointercancel" }, "\(result.label): no pointercancel: \(result.events.map(\.type))")
         XCTAssertFalse(result.events.contains { $0.type == "click" }, "\(result.label): a click came")
