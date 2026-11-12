@@ -57,6 +57,8 @@ pub mod recovery;
 pub mod remote;
 pub mod retained;
 pub mod revocation;
+#[cfg(target_os = "ios")]
+mod scene;
 pub mod services;
 pub mod settings;
 pub mod setup;
@@ -174,8 +176,14 @@ pub fn run() {
             }
             Ok(())
         })
-        .run(context())
-        .expect("the companion window could not be created");
+        .build(context())
+        .expect("the companion window could not be created")
+        .run(|app, event| {
+            #[cfg(target_os = "ios")]
+            scene::on_run_event(app, &event);
+            #[cfg(not(target_os = "ios"))]
+            let _ = (app, event);
+        });
 }
 
 /// The application's context: its configuration, its capabilities and the front end it embeds.

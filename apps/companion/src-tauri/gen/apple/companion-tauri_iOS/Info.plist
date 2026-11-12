@@ -40,6 +40,23 @@
 	<string>Speak to a session on one of your hosts. The microphone is open only during a call you started, and keeps running if the screen locks during that call.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Choose a photo or a video to attach it to a session on one of your hosts.</string>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UIWindowSceneSessionRoleApplication</key>
+			<array>
+				<dict>
+					<key>UISceneConfigurationName</key>
+					<string>Default Configuration</string>
+					<key>UISceneDelegateClassName</key>
+					<string>TaoSceneDelegate</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>remote-notification</string>

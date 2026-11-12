@@ -201,6 +201,17 @@ targets:
       properties:
         LSRequiresIPhoneOS: true
         UILaunchStoryboardName: LaunchScreen
+        # The application runs on UIKit's scene life cycle, which an application built with the iOS 27
+        # SDK has to adopt or the system ends it at launch. The check reads this manifest and nothing
+        # the windowing library adds at run time, so the one window's configuration names the
+        # library's scene delegate class here. One scene only: the application holds one window and
+        # one set of state, so a second window on an iPad would be a second page over the same state.
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+          UISceneConfigurations:
+            UIWindowSceneSessionRoleApplication:
+              - UISceneConfigurationName: Default Configuration
+                UISceneDelegateClassName: TaoSceneDelegate
         UIRequiredDeviceCapabilities: [arm64, metal]
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
