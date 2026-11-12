@@ -38,7 +38,7 @@ use crate::messages;
 use crate::notice::NOTICE;
 use crate::policy::{self, Policy};
 use crate::records::{self, Records, is_hex32, is_manifest_replacement};
-use crate::remedy::{self, EntryKind, Origin, ParentCure, Presence};
+use crate::remedy::{self, EntryKind, Origin, ParentCure, Presence, Shape};
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
@@ -777,14 +777,18 @@ fn origin_of(handle: &ffi::Handle) -> Origin {
     }
 }
 
-/// What an opened entry's handle shows about who made it: a link or a file with a second name is
+/// What an opened entry's handle shows about who made it, given what the layout gives at its name:
+/// a link, a file with a second name and an object of another kind than the layout gives there are
 /// not the installation's, and any other object is read for its owner.
-fn origin_of_opened(opened: &Opened) -> Origin {
-    if opened.kind == Kind::ReparsePoint || (opened.kind == Kind::File && opened.links > 1) {
-        Origin::Foreign
-    } else {
-        origin_of(&opened.handle)
-    }
+fn origin_of_opened(opened: &Opened, kind: EntryKind) -> Origin {
+    let shape = match opened.kind {
+        Kind::ReparsePoint => Shape::Link,
+        Kind::File => Shape::File {
+            names: opened.links,
+        },
+        Kind::Directory => Shape::Directory,
+    };
+    remedy::origin_of_shape(kind, shape, &|| origin_of(&opened.handle))
 }
 
 /// What the loss of a child shows: a list that refuses the administrator, a program that holds the
@@ -1159,7 +1163,7 @@ fn inspect_data_directory(paths: &Paths, data: &DirHandle) -> Result<Inspected, 
                     READ_CONTROL
                 };
                 match data.open_child(first, access)? {
-                    Ok(opened) => origin_of_opened(&opened),
+                    Ok(opened) => origin_of_opened(&opened, kind),
                     Err(lost) => origin_of_lost(&lost),
                 }
             }
@@ -1431,7 +1435,7 @@ fn inspect_layout(
         if layout == Layout::Run && !named_roots.contains(&text) {
             // Its own handle decides: only a root that the system's class owns is named to remove.
             let origin = match held.open_child(&child, LIST | READ_CONTROL)? {
-                Ok(opened) => origin_of_opened(&opened),
+                Ok(opened) => origin_of_opened(&opened, EntryKind::UnnamedRoot),
                 Err(Lost::Gone) => continue,
                 Err(lost) => origin_of_lost(&lost),
             };
